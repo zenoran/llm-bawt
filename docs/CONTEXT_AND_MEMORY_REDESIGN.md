@@ -363,7 +363,7 @@ The in-memory history buffer grows indefinitely during a session. For practical 
 
 ### Current State
 
-The debug turn log (`debug_turn.txt`, enabled via `--debug` or `LLMBOTHUB_DEBUG_TURN_LOG`) captures:
+The debug turn log (`debug_turn.txt`, enabled via `--debug` or `LLM_BAWT_DEBUG_TURN_LOG`) captures:
 - Request messages (system prompt + history + user prompt)
 - Final response text
 - JSON dump for machine parsing

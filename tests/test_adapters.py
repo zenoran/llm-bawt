@@ -8,7 +8,7 @@ This module tests:
 """
 
 import pytest
-from llmbothub.adapters import (
+from llm_bawt.adapters import (
     ModelAdapter,
     DefaultAdapter,
     PygmalionAdapter,
@@ -232,7 +232,7 @@ class TestStopSequenceCombination:
 
     def test_stop_sequences_unique_combination(self):
         """Handler and adapter stops are combined without duplicates."""
-        from llmbothub.tools.formats.react import ReActFormatHandler
+        from llm_bawt.tools.formats.react import ReActFormatHandler
         
         handler = ReActFormatHandler()
         adapter = PygmalionAdapter()

@@ -1,7 +1,7 @@
 [project]
-name = "llmbothub"
+name = "llm-bawt"
 version = "0.1.0"
-description = "LLMBotHub - Model-agnostic LLM platform providing a unified, OpenAI-compatible API for configurable chatbots and multi-agent systems across cloud and local models."
+description = "llm-bawt - Model-agnostic LLM platform providing a unified, OpenAI-compatible API for configurable chatbots and multi-agent systems across cloud and local models."
 readme = "README.md"
 requires-python = ">=3.12"
 
@@ -63,23 +63,23 @@ search = [
 
 
 [project.scripts]
-llmbothub = "llmbothub.main:main"
-llm = "llmbothub.main:main"
-llmbothub-service = "llmbothub.service.server:main"
-llm-service = "llmbothub.service.server:main"
-llm-memory = "llmbothub.memory_debug:main"
-llm-mcp-server = "llmbothub.memory_server:run_server"
-llm-nextcloud = "llmbothub.integrations.nextcloud.cli:nextcloud_cli"
+llm-bawt = "llm_bawt.main:main"
+llm = "llm_bawt.main:main"
+llm-bawt-service = "llm_bawt.service.server:main"
+llm-service = "llm_bawt.service.server:main"
+llm-memory = "llm_bawt.memory_debug:main"
+llm-mcp-server = "llm_bawt.memory_server:run_server"
+llm-nextcloud = "llm_bawt.integrations.nextcloud.cli:nextcloud_cli"
 
-[project.entry-points."llmbothub.memory"]
-postgresql = "llmbothub.memory.postgresql:PostgreSQLMemoryBackend"
+[project.entry-points."llm_bawt.memory"]
+postgresql = "llm_bawt.memory.postgresql:PostgreSQLMemoryBackend"
 
 [tool.setuptools]
 package-dir = {"" = "src"}
 include-package-data = true
 
 [tool.setuptools.package-data]
-llmbothub = ["*.yaml"]
+llm_bawt = ["*.yaml"]
 
 [build-system]
 requires = ["setuptools>=61.0"]

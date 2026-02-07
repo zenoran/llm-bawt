@@ -13,7 +13,7 @@ services:
             - driver: nvidia
               count: all
               capabilities: [gpu]
-    container_name: llmbothub_app
+    container_name: llm-bawt-app
     env_file:
       - ./.env
     ports:
@@ -21,15 +21,15 @@ services:
       - "${SERVICE_PORT:-8642}:8642"
     volumes:
       # Mount host config directory to avoid duplication
-      - ${HOME}/.config/llmbothub:/root/.config/llmbothub
+      - ${HOME}/.config/llm-bawt:/root/.config/llm-bawt
       # Mount logs directory
       - ./.logs:/app/.logs
       # Mount bots.yaml for live updates (nextcloud provisioning, etc.)
-      - ./src/llmbothub/bots.yaml:/app/src/llmbothub/bots.yaml:ro
+      - ./src/llm_bawt/bots.yaml:/app/src/llm_bawt/bots.yaml:ro
       # Optional: mount local models
       - ${MODELS_PATH:-./models}:/app/models
       # Share host's GGUF model cache to avoid re-downloads
-      - ${LLMBOTHUB_MODEL_CACHE_DIR:-${HOME}/.cache/llmbothub/models}:/root/.cache/llmbothub/models
+      - ${LLM_BAWT_MODEL_CACHE_DIR:-${HOME}/.cache/llm-bawt/models}:/root/.cache/llm-bawt/models
       # Mount HuggingFace cache for GGUF models
       - ${HF_HOME:-${HOME}/.cache/huggingface}:/root/.cache/huggingface
     restart: unless-stopped

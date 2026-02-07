@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Quick test of profile attribute saving."""
 
-from llmbothub.utils.config import Config
-from llmbothub.profiles import ProfileManager, EntityType, AttributeCategory
+from llm_bawt.utils.config import Config
+from llm_bawt.profiles import ProfileManager, EntityType, AttributeCategory
 
 config = Config()
 manager = ProfileManager(config)

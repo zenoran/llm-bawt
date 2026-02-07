@@ -11,9 +11,9 @@ import json
 import sys
 
 # Configuration (override with env vars for local use)
-NEXTCLOUD_URL = os.getenv("LLMBOTHUB_NEXTCLOUD_URL", "https://nextcloud.example.com")
-BOT_SECRET = os.getenv("LLMBOTHUB_NEXTCLOUD_BOT_SECRET", "your-secret-here")
-CONVERSATION_TOKEN = os.getenv("LLMBOTHUB_NEXTCLOUD_ROOM_TOKEN", "your-room-token")
+NEXTCLOUD_URL = os.getenv("LLM_BAWT_NEXTCLOUD_URL", "https://nextcloud.example.com")
+BOT_SECRET = os.getenv("LLM_BAWT_NEXTCLOUD_BOT_SECRET", "your-secret-here")
+CONVERSATION_TOKEN = os.getenv("LLM_BAWT_NEXTCLOUD_ROOM_TOKEN", "your-room-token")
 
 def send_message(message: str, reference_id: str = None):
     """Send a message to Nextcloud Talk as a bot."""
@@ -75,7 +75,7 @@ if __name__ == '__main__':
         print(f"  NEXTCLOUD_URL: {NEXTCLOUD_URL}")
         print(f"  BOT_SECRET: {'*' * len(BOT_SECRET) if BOT_SECRET != 'your-secret-here' else 'NOT SET'}")
         print(f"  CONVERSATION_TOKEN: {CONVERSATION_TOKEN}")
-        print("\nSet LLMBOTHUB_NEXTCLOUD_URL, LLMBOTHUB_NEXTCLOUD_BOT_SECRET, and LLMBOTHUB_NEXTCLOUD_ROOM_TOKEN before testing.")
+        print("\nSet LLM_BAWT_NEXTCLOUD_URL, LLM_BAWT_NEXTCLOUD_BOT_SECRET, and LLM_BAWT_NEXTCLOUD_ROOM_TOKEN before testing.")
         sys.exit(1)
 
     message = ' '.join(sys.argv[1:])

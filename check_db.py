@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """Check what's in the database."""
 
-from llmbothub.utils.config import Config
-from llmbothub.profiles import ProfileManager, EntityType
+from llm_bawt.utils.config import Config
+from llm_bawt.profiles import ProfileManager, EntityType
 from sqlmodel import Session, select
-from llmbothub.profiles import ProfileAttribute, EntityProfile
+from llm_bawt.profiles import ProfileAttribute, EntityProfile
 
 config = Config()
 user_id = config.DEFAULT_USER  # Use configured user, not hardcoded "default"

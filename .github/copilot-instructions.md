@@ -1,23 +1,23 @@
-# LLMBotHub - AI Coding Agent Instructions
+# llm-bawt - AI Coding Agent Instructions
 
 > ⚠️ **IMPORTANT**: When running any tests through the LLM CLI, always use `nova` as the bot (`--bot nova` or default). **Do NOT use `mira`** for testing - Mira is a conversational companion with an unfiltered personality designed for personal use, not suitable for development/testing workflows.
 
 ## Architecture Overview
 
-LLMBotHub is a model-agnostic LLM platform providing a unified API for configurable chatbots with persistent memory. Key components:
+llm-bawt is a model-agnostic LLM platform providing a unified API for configurable chatbots with persistent memory. Key components:
 
-- **Entry Point**: `src/llmbothub/main.py` → `cli.py` (argparse-based CLI)
-- **Core Engine**: `src/llmbothub/core.py` - `LLMBotHub` class orchestrates clients, bots, memory, and history
-- **LLM Clients**: `src/llmbothub/clients/` - Abstract `LLMClient` base with implementations for OpenAI, Ollama, GGUF (llama-cpp), HuggingFace
-- **Bot System**: `src/llmbothub/bots.py` + `bots.yaml` - Personality-based AI with isolated memory per bot
-- **Memory Backend**: `src/llmbothub/memory/postgresql.py` - PostgreSQL + pgvector for semantic search
-- **Memory Extraction**: `src/llmbothub/memory/extraction/` - LLM-based fact extraction from conversations
-- **User Profiles**: `src/llmbothub/user_profile.py` - SQLModel ORM for user preferences injected into system prompts
-- **Background Service**: `src/llmbothub/service/` - Optional FastAPI service for async/background LLM queries
+- **Entry Point**: `src/llm_bawt/main.py` → `cli.py` (argparse-based CLI)
+- **Core Engine**: `src/llm_bawt/core.py` - `LLMBawt` class orchestrates clients, bots, memory, and history
+- **LLM Clients**: `src/llm_bawt/clients/` - Abstract `LLMClient` base with implementations for OpenAI, Ollama, GGUF (llama-cpp), HuggingFace
+- **Bot System**: `src/llm_bawt/bots.py` + `bots.yaml` - Personality-based AI with isolated memory per bot
+- **Memory Backend**: `src/llm_bawt/memory/postgresql.py` - PostgreSQL + pgvector for semantic search
+- **Memory Extraction**: `src/llm_bawt/memory/extraction/` - LLM-based fact extraction from conversations
+- **User Profiles**: `src/llm_bawt/user_profile.py` - SQLModel ORM for user preferences injected into system prompts
+- **Background Service**: `src/llm_bawt/service/` - Optional FastAPI service for async/background LLM queries
 
 ### Data Flow
 ```
-CLI args → Config (pydantic-settings) → LLMBotHub → LLMClient → Response
+CLI args → Config (pydantic-settings) → LLMBawt → LLMClient → Response
                                           ↓
                                HistoryManager ←→ Memory Backend
                                           ↓
@@ -27,13 +27,13 @@ CLI args → Config (pydantic-settings) → LLMBotHub → LLMClient → Response
 ## Key Patterns
 
 ### Adding a New LLM Client
-1. Create `src/llmbothub/clients/your_client.py` extending `LLMClient` from `base.py`
+1. Create `src/llm_bawt/clients/your_client.py` extending `LLMClient` from `base.py`
 2. Implement required methods: `query()`, `get_styling()`, optionally `stream_raw()` for streaming
 3. Set `SUPPORTS_STREAMING = True/False`
 4. Register in `core.py:initialize_client()` method
 
 ### Bot Configuration
-Bots are defined in `src/llmbothub/bots.yaml`. Each bot has:
+Bots are defined in `src/llm_bawt/bots.yaml`. Each bot has:
 - `slug`: Unique identifier (lowercase)
 - `name`: Display name for UI
 - `description`: Short description for `--list-bots`
@@ -48,16 +48,16 @@ Bots are defined in `src/llmbothub/bots.yaml`. Each bot has:
 - `mira`: Conversational companion (personal use only)
 
 ### Memory System
-- **Entry point plugin**: `pyproject.toml` registers `llmbothub.memory` via `discover_memory_backends()` in `core.py`
+- **Entry point plugin**: `pyproject.toml` registers `llm_bawt.memory` via `discover_memory_backends()` in `core.py`
 - **Two-tier storage**: `{bot_id}_messages` (raw history) + `{bot_id}_memories` (extracted facts with embeddings)
 - **Memory extraction**: LLM-based fact distillation via `MemoryExtractionService`
 - **Embeddings**: Local sentence-transformers (default: `all-MiniLM-L6-v2`) for semantic search
 - **Local mode** (`--local`): Bypasses database, uses filesystem-based history
 
 ### Configuration
-Config uses `pydantic-settings` with `LLMBOTHUB_` env prefix. Key files:
-- `~/.config/llmbothub/.env` - API keys and database credentials
-- `~/.config/llmbothub/models.yaml` - Model definitions
+Config uses `pydantic-settings` with `LLM_BAWT_` env prefix. Key files:
+- `~/.config/llm-bawt/.env` - API keys and database credentials
+- `~/.config/llm-bawt/models.yaml` - Model definitions
 
 **Key config sections:**
 - Memory settings: `MEMORY_N_RESULTS`, `MEMORY_MIN_RELEVANCE`, `MEMORY_DECAY_HALF_LIFE_DAYS`
@@ -68,8 +68,8 @@ Config uses `pydantic-settings` with `LLMBOTHUB_` env prefix. Key files:
 ### Background Service
 Optional FastAPI-based background service for async LLM queries:
 - Install with: `./install.sh --with-service`
-- Run with: `llm-service` or `llmbothub-service`
-- Client: `ServiceClient` in `src/llmbothub/service/client.py`
+- Run with: `llm-service` or `llm-bawt-service`
+- Client: `ServiceClient` in `src/llm_bawt/service/client.py`
 
 ## Installation & Development Setup
 
@@ -77,7 +77,7 @@ The project uses **pipx** for global installation (no venv needed other than IDE
 
 ### Fresh Install (from GitHub)
 ```bash
-curl -fsSL https://raw.githubusercontent.com/zenoran/llmbothub/main/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/zenoran/llm-bawt/main/install.sh | bash
 ```
 
 ### Development Install (editable mode)
@@ -102,12 +102,12 @@ For most changes, editable mode means changes take effect immediately. If entry 
 - `--all`: Install all optional dependencies
 - `--no-cuda`: Skip CUDA support for llama-cpp-python
 - `--local <path>`: Install from local path in editable mode
-- `--uninstall`: Remove llmbothub
+- `--uninstall`: Remove llm-bawt
 
 ### Inject Additional Dependencies
 ```bash
 # Add dev dependencies to the pipx environment
-pipx runpip llmbothub install ruff mypy pytest pytest-cov pytest-mock
+pipx runpip llm-bawt install ruff mypy pytest pytest-cov pytest-mock
 ```
 
 ## Development Commands
@@ -130,7 +130,7 @@ rg -l "import something" src/          # List files containing pattern
 - **Installation**: Uses `pipx` for global install via `install.sh` (not venv)
 - **Python command**: Always use `uv run python` (not `python` or `python3`) for running Python scripts
 - **Search tool**: `grep` is aliased to `rg` (ripgrep) - use ripgrep syntax
-- **Source layout**: All code in `src/llmbothub/` (pyproject.toml `package-dir`)
+- **Source layout**: All code in `src/llm_bawt/` (pyproject.toml `package-dir`)
 - **Logging**: Use `logging.getLogger(__name__)` - verbosity controlled by `--verbose` flag
 - **Rich output**: Use `Console` from rich for all terminal output; respect `PLAIN_OUTPUT` config
 - **Type hints**: Required throughout; checked with mypy
@@ -148,17 +148,17 @@ llm --bot nova "test"           # Explicitly use nova bot (recommended for testi
 ```
 
 ### Debug memory issues
-- Check `POSTGRES_*` env vars in `~/.config/llmbothub/.env`
+- Check `POSTGRES_*` env vars in `~/.config/llm-bawt/.env`
 - Memory tables are per-bot: `nova_messages`, `nova_memories`, etc.
 - Use `--verbose` to see memory retrieval logs
 
 ### Add a new config setting
-1. Add `Field()` to `Config` class in `src/llmbothub/utils/config.py`
-2. Use `LLMBOTHUB_` prefix for environment variable
+1. Add `Field()` to `Config` class in `src/llm_bawt/utils/config.py`
+2. Use `LLM_BAWT_` prefix for environment variable
 3. Access via `config.YOUR_SETTING` in components
 
 ### Add a new bot
-1. Add bot definition to `src/llmbothub/bots.yaml`
+1. Add bot definition to `src/llm_bawt/bots.yaml`
 2. Bot automatically becomes available via `--bot <slug>`
 3. Memory is automatically isolated per bot
 
@@ -176,7 +176,7 @@ llm --status                           # Check it works
 If dependencies are missing:
 ```bash
 # Inject missing packages into the pipx environment
-pipx runpip llmbothub install <package>
+pipx runpip llm-bawt install <package>
 ```
 
 ## Optional Dependencies

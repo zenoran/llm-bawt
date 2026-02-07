@@ -28,20 +28,20 @@ JobScheduler
 
 ## Configuration
 
-Add to `~/.config/llmbothub/.env`:
+Add to `~/.config/llm-bawt/.env`:
 
 ```bash
 # Enable/disable the scheduler
-LLMBOTHUB_SCHEDULER_ENABLED=true
+LLM_BAWT_SCHEDULER_ENABLED=true
 
 # How often to check for due jobs (seconds)
-LLMBOTHUB_SCHEDULER_CHECK_INTERVAL_SECONDS=30
+LLM_BAWT_SCHEDULER_CHECK_INTERVAL_SECONDS=30
 
 # Profile maintenance interval (minutes)
-LLMBOTHUB_PROFILE_MAINTENANCE_INTERVAL_MINUTES=60
+LLM_BAWT_PROFILE_MAINTENANCE_INTERVAL_MINUTES=60
 
 # Model to use for profile maintenance (empty = auto-select local model)
-LLMBOTHUB_PROFILE_MAINTENANCE_MODEL=
+LLM_BAWT_PROFILE_MAINTENANCE_MODEL=
 ```
 
 ## Database Schema
@@ -105,7 +105,7 @@ Default jobs are created on first startup (e.g., profile maintenance for all bot
 ## File Locations
 
 ```
-src/llmbothub/
+src/llm_bawt/
 ├── service/
 │   └── scheduler.py           # JobScheduler, ScheduledJob, JobRun, JobStatus, JobType
 ├── memory/
@@ -118,13 +118,13 @@ src/llmbothub/
 
 ```bash
 # Check job definitions
-psql -d llmbothub -c "SELECT * FROM scheduled_jobs;"
+psql -d llm_bawt -c "SELECT * FROM scheduled_jobs;"
 
 # Check recent job runs
-psql -d llmbothub -c "SELECT * FROM job_runs ORDER BY started_at DESC LIMIT 10;"
+psql -d llm_bawt -c "SELECT * FROM job_runs ORDER BY started_at DESC LIMIT 10;"
 
 # Force immediate run (set next_run_at to past)
-psql -d llmbothub -c "UPDATE scheduled_jobs SET next_run_at = NOW() - INTERVAL '1 minute';"
+psql -d llm_bawt -c "UPDATE scheduled_jobs SET next_run_at = NOW() - INTERVAL '1 minute';"
 
 # Watch service logs for job execution
 ./start.sh logs

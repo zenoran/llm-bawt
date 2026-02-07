@@ -2,11 +2,11 @@
 
 import pytest
 
-from llmbothub.tools.formats import ToolFormat, get_format_handler
-from llmbothub.tools.formats.base import ToolCallRequest
-from llmbothub.tools.formats.react import ReActFormatHandler
-from llmbothub.tools.formats.native_openai import NativeOpenAIFormatHandler
-from llmbothub.tools.formats.xml_legacy import LegacyXMLFormatHandler
+from llm_bawt.tools.formats import ToolFormat, get_format_handler
+from llm_bawt.tools.formats.base import ToolCallRequest
+from llm_bawt.tools.formats.react import ReActFormatHandler
+from llm_bawt.tools.formats.native_openai import NativeOpenAIFormatHandler
+from llm_bawt.tools.formats.xml_legacy import LegacyXMLFormatHandler
 
 
 class TestToolFormatRegistry:

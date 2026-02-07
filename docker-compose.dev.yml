@@ -7,16 +7,23 @@ services:
     # Dev mode: source mounted, manual restart needed after code changes
     # (--dev flag with auto-reload causes issues, so we skip it)
     
+    # Use host DNS so container can resolve local hostnames (e.g. postgres.home)
+    dns:
+      - 10.255.255.254
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    
     volumes:
       # Mount source code for live development
       - ./src:/app/src
       - ./server.sh:/app/server.sh
-      # Keep existing mounts
-      - ${HOME}/.config/llmbothub:/root/.config/llmbothub
+      # Config, logs, models (mirrors base compose)
+      - ${HOME}/.config/llm-bawt:/root/.config/llm-bawt
       - ./.logs:/app/.logs
       - ${MODELS_PATH:-./models}:/app/models
-      # Share host's GGUF model cache to avoid duplicate downloads
-      - ~/.cache/llmbothub/models:/root/.cache/llmbothub/models
+      # Share host caches to avoid duplicate downloads
+      - ${LLM_BAWT_MODEL_CACHE_DIR:-${HOME}/.cache/llm-bawt/models}:/root/.cache/llm-bawt/models
+      - ${HF_HOME:-${HOME}/.cache/huggingface}:/root/.cache/huggingface
 
     # Restart on failure for auto-reload
     restart: on-failure

@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
 #
-# llmbothub installer
+# llm-bawt installer
 # 
 # Usage (from GitHub):
-#   curl -fsSL https://raw.githubusercontent.com/zenoran/llmbothub/master/install.sh | bash
+#   curl -fsSL https://raw.githubusercontent.com/zenoran/llm-bawt/master/install.sh | bash
 #
 # Or with options:
-#   curl -fsSL https://raw.githubusercontent.com/zenoran/llmbothub/master/install.sh | bash -s -- --with-llama --with-hf
+#   curl -fsSL https://raw.githubusercontent.com/zenoran/llm-bawt/master/install.sh | bash -s -- --with-llama --with-hf
 #
 # Options:
 #   --with-llama    Install llama-cpp-python for local GGUF models
@@ -15,7 +15,7 @@
 #   --with-search   Install web search providers (DuckDuckGo + Tavily)
 #   --all           Install all optional dependencies
 #   --no-cuda       Skip CUDA support for llama-cpp-python
-#   --uninstall     Remove llmbothub
+#   --uninstall     Remove llm-bawt
 #
 
 set -e
@@ -35,7 +35,7 @@ INSTALL_SEARCH=false
 WITH_CUDA=true
 UNINSTALL=false
 EDITABLE=false
-REPO="git+https://github.com/zenoran/llmbothub.git"
+REPO="git+https://github.com/zenoran/llm-bawt.git"
 DEV_SYNC=false
 FORCE_REBUILD=false
 DEPS_ONLY=false  # Install only dependencies, not the project itself (for Docker layer caching)
@@ -43,13 +43,13 @@ DEPS_ONLY=false  # Install only dependencies, not the project itself (for Docker
 # Help function
 show_help() {
     cat << EOF
-llmbothub installer
+llm-bawt installer
 
 USAGE:
     ./install.sh [OPTIONS]
 
     # From GitHub (one-liner):
-    curl -fsSL https://raw.githubusercontent.com/zenoran/llmbothub/master/install.sh | bash
+    curl -fsSL https://raw.githubusercontent.com/zenoran/llm-bawt/master/install.sh | bash
 
 OPTIONS:
     -h, --help          Show this help message
@@ -59,7 +59,7 @@ OPTIONS:
                         Example: ./install.sh --local .
     --dev               Sync local .venv with all optional deps (for development)
                         Uses uv to install mcp, service, search, llama-cpp (CUDA), HF
-    --uninstall         Remove llmbothub completely
+    --uninstall         Remove llm-bawt completely
 
     Optional Dependencies:
     --with-service      Install FastAPI background service (llm-service command)
@@ -98,8 +98,8 @@ AFTER INSTALLATION:
     llm-service         Start background service (if --with-service)
 
 CONFIGURATION:
-    ~/.config/llmbothub/.env          API keys and settings
-    ~/.config/llmbothub/models.yaml   Model definitions
+    ~/.config/llm-bawt/.env          API keys and settings
+    ~/.config/llm-bawt/models.yaml   Model definitions
 
 EOF
     exit 0
@@ -170,7 +170,7 @@ while [[ $# -gt 0 ]]; do
 done
 
 echo -e "${BLUE}╭─────────────────────────────╮${NC}"
-echo -e "${BLUE}│   llmbothub Installer         │${NC}"
+echo -e "${BLUE}│   llm-bawt Installer         │${NC}"
 echo -e "${BLUE}╰─────────────────────────────╯${NC}"
 echo
 
@@ -268,9 +268,9 @@ fi
 
 # Uninstall
 if [ "$UNINSTALL" = true ]; then
-    echo -e "${YELLOW}Uninstalling llmbothub...${NC}"
-    pipx uninstall llmbothub 2>/dev/null || true
-    echo -e "${GREEN}✓ llmbothub uninstalled${NC}"
+    echo -e "${YELLOW}Uninstalling llm-bawt...${NC}"
+    pipx uninstall llm-bawt 2>/dev/null || true
+    echo -e "${GREEN}✓ llm-bawt uninstalled${NC}"
     exit 0
 fi
 
@@ -302,8 +302,8 @@ if ! command -v pipx &> /dev/null; then
 fi
 echo -e "${GREEN}✓ pipx available${NC}"
 
-# Install llmbothub
-echo -e "${BLUE}Installing llmbothub...${NC}"
+# Install llm-bawt
+echo -e "${BLUE}Installing llm-bawt...${NC}"
 
 # Build extras string based on flags
 # Always include 'memory' extra for sentence-transformers (required for embeddings)
@@ -319,9 +319,9 @@ fi
 EXTRAS=$(IFS=,; echo "${EXTRAS_LIST[*]}")
 
 # Uninstall first if already installed (clean slate for editable)
-if pipx list | grep -q "llmbothub"; then
+if pipx list | grep -q "llm-bawt"; then
     echo -e "${YELLOW}  Removing existing installation...${NC}"
-    pipx uninstall llmbothub 2>/dev/null || true
+    pipx uninstall llm-bawt 2>/dev/null || true
 fi
 
 # Build pipx install command
@@ -350,7 +350,7 @@ else
         pipx install --force "$REPO"
     fi
 fi
-echo -e "${GREEN}✓ llmbothub installed${NC}"
+echo -e "${GREEN}✓ llm-bawt installed${NC}"
 
 # Install optional dependencies
 if [ "$INSTALL_LLAMA" = true ]; then
@@ -371,33 +371,33 @@ if [ "$INSTALL_LLAMA" = true ]; then
             # sm_75=Turing, sm_80=Ampere, sm_86=Ampere, sm_89=Ada, sm_90=Hopper, sm_120=Blackwell
             CUDA_ARCHS="${CUDA_ARCHS:-75;80;86;89;90;120}" \
             CMAKE_ARGS="-DGGML_CUDA=on -DCMAKE_CUDA_ARCHITECTURES=${CUDA_ARCHS}" \
-                pipx runpip llmbothub install llama-cpp-python --force-reinstall --no-cache-dir
+                pipx runpip llm-bawt install llama-cpp-python --force-reinstall --no-cache-dir
         else
             echo -e "${YELLOW}  No CUDA detected, installing CPU-only version...${NC}"
-            pipx runpip llmbothub install llama-cpp-python
+            pipx runpip llm-bawt install llama-cpp-python
         fi
     else
         echo -e "${YELLOW}  Installing CPU-only version (--no-cuda)...${NC}"
-        pipx runpip llmbothub install llama-cpp-python
+        pipx runpip llm-bawt install llama-cpp-python
     fi
     echo -e "${GREEN}✓ llama-cpp-python installed${NC}"
 fi
 
 if [ "$INSTALL_HF" = true ]; then
     echo -e "${BLUE}Installing HuggingFace dependencies...${NC}"
-    pipx runpip llmbothub install transformers torch huggingface-hub accelerate
+    pipx runpip llm-bawt install transformers torch huggingface-hub accelerate
     echo -e "${GREEN}✓ HuggingFace dependencies installed${NC}"
 fi
 
 if [ "$INSTALL_SERVICE" = true ]; then
     echo -e "${BLUE}Installing FastAPI service dependencies...${NC}"
-    pipx runpip llmbothub install fastapi "uvicorn[standard]" httpx
+    pipx runpip llm-bawt install fastapi "uvicorn[standard]" httpx
     echo -e "${GREEN}✓ FastAPI service dependencies installed${NC}"
 fi
 
 if [ "$INSTALL_SEARCH" = true ]; then
     echo -e "${BLUE}Installing web search dependencies...${NC}"
-    pipx runpip llmbothub install ddgs tavily-python
+    pipx runpip llm-bawt install ddgs tavily-python
     echo -e "${GREEN}✓ Web search dependencies installed (DuckDuckGo + Tavily)${NC}"
 fi
 
@@ -424,7 +424,7 @@ echo -e "${GREEN}╰────────────────────
 echo
 echo -e "Commands available:"
 echo -e "  ${BLUE}llm${NC}           - Query LLM models"
-echo -e "  ${BLUE}llmbothub${NC}       - Same as llm"
+echo -e "  ${BLUE}llm-bawt${NC}       - Same as llm"
 if [ "$INSTALL_SERVICE" = true ]; then
 echo -e "  ${BLUE}llm-service${NC}   - Run background service/API"
 fi
@@ -444,8 +444,8 @@ echo
 echo -e "Web Search:"
 echo -e "  Bots with ${YELLOW}uses_search: true${NC} can now search the internet"
 echo -e "  Default: DuckDuckGo (free)"
-echo -e "  Set ${YELLOW}LLMBOTHUB_TAVILY_API_KEY${NC} in .env for production search"
+echo -e "  Set ${YELLOW}LLM_BAWT_TAVILY_API_KEY${NC} in .env for production search"
 fi
 echo
-echo -e "Configuration: ${YELLOW}~/.config/llmbothub/.env${NC}"
+echo -e "Configuration: ${YELLOW}~/.config/llm-bawt/.env${NC}"
 echo

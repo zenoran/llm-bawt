@@ -2,8 +2,8 @@
 
 from unittest.mock import Mock, patch
 
-from llmbothub.search.base import SearchProvider
-from llmbothub.search.brave_client import BraveSearchClient, is_brave_available
+from llm_bawt.search.base import SearchProvider
+from llm_bawt.search.brave_client import BraveSearchClient, is_brave_available
 
 
 class TestBraveSearchClient:
@@ -32,7 +32,7 @@ class TestBraveSearchClient:
         results = client.search("test query")
         assert results == []
 
-    @patch("llmbothub.search.brave_client.httpx.Client")
+    @patch("llm_bawt.search.brave_client.httpx.Client")
     def test_search_success(self, mock_client_class):
         """Test successful search."""
         mock_response = Mock()
@@ -61,7 +61,7 @@ class TestBraveSearchClient:
         assert results[0].url == "https://example.com"
         assert results[0].source == SearchProvider.BRAVE
 
-    @patch("llmbothub.search.brave_client.httpx.Client")
+    @patch("llm_bawt.search.brave_client.httpx.Client")
     def test_search_news(self, mock_client_class):
         """Test news search."""
         mock_response = Mock()

@@ -1,4 +1,4 @@
-# Claude Code Instructions for LLMBotHub
+# Claude Code Instructions for llm-bawt
 
 ## Project Overview
 
@@ -7,7 +7,7 @@ Model-agnostic LLM platform providing a unified, OpenAI-compatible API for confi
 ## Project Structure
 
 ```
-src/llmbothub/
+src/llm_bawt/
 ├── cli/                    # CLI package
 │   ├── app.py              # Main CLI logic, query handling
 │   ├── parser.py           # Argument parsing
@@ -15,7 +15,7 @@ src/llmbothub/
 │   ├── config_wizard.py    # Interactive config setup
 │   └── commands/           # Subcommands (status, models, profile)
 ├── core/                   # Core orchestration
-│   ├── base.py             # BaseLLMBotHub - shared logic for CLI/service
+│   ├── base.py             # BaseLLMBawt - shared logic for CLI/service
 │   ├── client.py           # Client initialization
 │   ├── pipeline.py         # RequestPipeline, PipelineContext
 │   ├── prompt_builder.py   # PromptBuilder, SectionPosition
@@ -58,7 +58,7 @@ src/llmbothub/
 ├── service/                # Background API service
 │   ├── server.py           # FastAPI server
 │   ├── api.py              # API routes
-│   ├── core.py             # ServiceLLMBotHub
+│   ├── core.py             # ServiceLLMBawt
 │   ├── client.py           # ServiceClient
 │   ├── scheduler.py        # JobScheduler, background tasks
 │   └── tasks.py            # Async task processing
@@ -139,41 +139,41 @@ Two-service stack managed by `server.sh`:
 
 ### Client Initialization
 ```python
-from llmbothub.clients import LLMClient
-from llmbothub.core import LLMBotHub
+from llm_bawt.clients import LLMClient
+from llm_bawt.core import LLMBawt
 ```
 
 ### Memory Client
 ```python
-from llmbothub.memory_server.client import MemoryClient, get_memory_client
+from llm_bawt.memory_server.client import MemoryClient, get_memory_client
 ```
 
 ### Search Client
 ```python
-from llmbothub.search import get_search_client, SearchClient
+from llm_bawt.search import get_search_client, SearchClient
 ```
 
 ### Config Access
 ```python
-from llmbothub.utils.config import Config, has_database_credentials
+from llm_bawt.utils.config import Config, has_database_credentials
 config = Config()
 ```
 
 ### Bot/Profile Management
 ```python
-from llmbothub.bots import Bot, BotManager
-from llmbothub.profiles import ProfileManager, EntityType, AttributeCategory
+from llm_bawt.bots import Bot, BotManager
+from llm_bawt.profiles import ProfileManager, EntityType, AttributeCategory
 ```
 
 ## Configuration
 
-Config location: `~/.config/llmbothub/.env`
+Config location: `~/.config/llm-bawt/.env`
 
-All settings use `LLMBOTHUB_` prefix:
-- `LLMBOTHUB_DEFAULT_MODEL_ALIAS`
-- `LLMBOTHUB_DEFAULT_BOT`
-- `LLMBOTHUB_DEFAULT_USER`
-- `LLMBOTHUB_MEMORY_SERVER_URL` (for service communication)
+All settings use `LLM_BAWT_` prefix:
+- `LLM_BAWT_DEFAULT_MODEL_ALIAS`
+- `LLM_BAWT_DEFAULT_BOT`
+- `LLM_BAWT_DEFAULT_USER`
+- `LLM_BAWT_MEMORY_SERVER_URL` (for service communication)
 
 ## Dependencies (extras)
 

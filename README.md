@@ -1,8 +1,8 @@
-# LLMBotHub
+# llm-bawt
 
 A model-agnostic LLM platform that provides a unified, OpenAI-compatible API for running configurable chatbots and multi-agent systems across cloud and local models.
 
-LLMBotHub normalizes providers (OpenAI, Ollama, GGUF), augments conversations with persistent semantic memory, and integrates MCP tools and web search — enabling consistent behavior, shared context, and extensible tooling through a single interface.
+llm-bawt normalizes providers (OpenAI, Ollama, GGUF), augments conversations with persistent semantic memory, and integrates MCP tools and web search — enabling consistent behavior, shared context, and extensible tooling through a single interface.
 
 ## Features
 
@@ -23,30 +23,30 @@ LLMBotHub normalizes providers (OpenAI, Ollama, GGUF), augments conversations wi
 
 ```bash
 # From GitHub (basic)
-curl -fsSL https://raw.githubusercontent.com/zenoran/llmbothub/main/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/zenoran/llm-bawt/main/install.sh | bash
 
 # With all optional features
-curl -fsSL https://raw.githubusercontent.com/zenoran/llmbothub/main/install.sh | bash -s -- --all
+curl -fsSL https://raw.githubusercontent.com/zenoran/llm-bawt/main/install.sh | bash -s -- --all
 
 # Local development
-git clone https://github.com/zenoran/llmbothub.git
-cd llmbothub
+git clone https://github.com/zenoran/llm-bawt.git
+cd llm-bawt
 ./install.sh --dev
 ```
 
 ### Configure
 
 ```bash
-mkdir -p ~/.config/llmbothub
+mkdir -p ~/.config/llm-bawt
 
 # API key (required for cloud models)
-echo "OPENAI_API_KEY=sk-..." >> ~/.config/llmbothub/.env
+echo "OPENAI_API_KEY=sk-..." >> ~/.config/llm-bawt/.env
 
 # PostgreSQL for persistent memory (optional)
-echo "POSTGRES_HOST=localhost" >> ~/.config/llmbothub/.env
-echo "POSTGRES_USER=llmbothub" >> ~/.config/llmbothub/.env
-echo "POSTGRES_PASSWORD=yourpassword" >> ~/.config/llmbothub/.env
-echo "POSTGRES_DATABASE=llmbothub" >> ~/.config/llmbothub/.env
+echo "POSTGRES_HOST=localhost" >> ~/.config/llm-bawt/.env
+echo "POSTGRES_USER=llm_bawt" >> ~/.config/llm-bawt/.env
+echo "POSTGRES_PASSWORD=yourpassword" >> ~/.config/llm-bawt/.env
+echo "POSTGRES_DATABASE=llm_bawt" >> ~/.config/llm-bawt/.env
 ```
 
 ### Use
@@ -96,7 +96,7 @@ llm --list-bots                       # Available bot personalities
 ### Project Structure
 
 ```
-src/llmbothub/
+src/llm_bawt/
 ├── cli/                 # CLI entry point, argument parsing, subcommands
 ├── core/                # Orchestration: pipeline, prompt builder, model lifecycle
 ├── clients/             # LLM clients: OpenAI, llama.cpp (GGUF)
@@ -124,7 +124,7 @@ Bot personalities are defined in `bots.yaml`. Each bot has its own system prompt
 | **spark** | Lightweight local assistant — no database required | No | No | No |
 | **proto** | Testing bot with separate memory for development | Yes | Yes | Yes |
 
-Custom bots can be added by editing `src/llmbothub/bots.yaml`.
+Custom bots can be added by editing `src/llm_bawt/bots.yaml`.
 
 ## Memory System
 
@@ -174,8 +174,8 @@ Two-service architecture for background operation:
 ### Setup
 
 ```bash
-git clone https://github.com/zenoran/llmbothub.git
-cd llmbothub
+git clone https://github.com/zenoran/llm-bawt.git
+cd llm-bawt
 ./install.sh --dev          # Sync .venv with all dependencies
 
 # Or with Docker (recommended)
@@ -223,28 +223,28 @@ llm --status                # Quick sanity check
 
 ## Configuration
 
-Config file: `~/.config/llmbothub/.env` — all settings use the `LLMBOTHUB_` prefix.
+Config file: `~/.config/llm-bawt/.env` — all settings use the `LLM_BAWT_` prefix.
 
 ```bash
 # Core
-LLMBOTHUB_DEFAULT_MODEL_ALIAS=gpt4     # Default model alias
-LLMBOTHUB_DEFAULT_BOT=nova              # Default bot personality
-LLMBOTHUB_DEFAULT_USER=your-user-id    # User identifier for memory
+LLM_BAWT_DEFAULT_MODEL_ALIAS=gpt4     # Default model alias
+LLM_BAWT_DEFAULT_BOT=nova              # Default bot personality
+LLM_BAWT_DEFAULT_USER=your-user-id    # User identifier for memory
 
 # Memory
-LLMBOTHUB_MEMORY_DECAY_ENABLED=true
-LLMBOTHUB_MEMORY_DECAY_HALF_LIFE_DAYS=90
-LLMBOTHUB_MEMORY_EMBEDDING_MODEL=all-MiniLM-L6-v2
+LLM_BAWT_MEMORY_DECAY_ENABLED=true
+LLM_BAWT_MEMORY_DECAY_HALF_LIFE_DAYS=90
+LLM_BAWT_MEMORY_EMBEDDING_MODEL=all-MiniLM-L6-v2
 
 # PostgreSQL
-LLMBOTHUB_POSTGRES_HOST=localhost
-LLMBOTHUB_POSTGRES_USER=llmbothub
-LLMBOTHUB_POSTGRES_PASSWORD=yourpassword
-LLMBOTHUB_POSTGRES_DATABASE=llmbothub
+LLM_BAWT_POSTGRES_HOST=localhost
+LLM_BAWT_POSTGRES_USER=llm_bawt
+LLM_BAWT_POSTGRES_PASSWORD=yourpassword
+LLM_BAWT_POSTGRES_DATABASE=llm_bawt
 
 # Search
-LLMBOTHUB_SEARCH_PROVIDER=ddgs          # ddgs, tavily, or brave
-LLMBOTHUB_TAVILY_API_KEY=tvly-...       # If using Tavily
+LLM_BAWT_SEARCH_PROVIDER=ddgs          # ddgs, tavily, or brave
+LLM_BAWT_TAVILY_API_KEY=tvly-...       # If using Tavily
 ```
 
 ## CLI Commands

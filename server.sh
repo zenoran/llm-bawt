@@ -46,15 +46,15 @@ start_memory_server() {
   fi
 
   if [[ "$LOG_MODE" == "stdout" ]]; then
-    LLMBOTHUB_LOG_PREFIX="mcp" \
-    LLMBOTHUB_MEMORY_SERVER_VERBOSE=${VERBOSE_FLAG:+1} \
-    LLMBOTHUB_MEMORY_SERVER_DEBUG=${DEBUG_FLAG:+1} \
+    LLM_BAWT_LOG_PREFIX="mcp" \
+    LLM_BAWT_MEMORY_SERVER_VERBOSE=${VERBOSE_FLAG:+1} \
+    LLM_BAWT_MEMORY_SERVER_DEBUG=${DEBUG_FLAG:+1} \
     uv run $UV_FLAGS --extra mcp llm-mcp-server --transport http --host "$MEMORY_HOST" --port "$MEMORY_PORT" &
     echo $! > "$MEMORY_PID_FILE"
   else
-    LLMBOTHUB_LOG_PREFIX="mcp" \
-    LLMBOTHUB_MEMORY_SERVER_VERBOSE=${VERBOSE_FLAG:+1} \
-    LLMBOTHUB_MEMORY_SERVER_DEBUG=${DEBUG_FLAG:+1} \
+    LLM_BAWT_LOG_PREFIX="mcp" \
+    LLM_BAWT_MEMORY_SERVER_VERBOSE=${VERBOSE_FLAG:+1} \
+    LLM_BAWT_MEMORY_SERVER_DEBUG=${DEBUG_FLAG:+1} \
     nohup uv run $UV_FLAGS --extra mcp llm-mcp-server --transport http --host "$MEMORY_HOST" --port "$MEMORY_PORT" \
       > "$LOG_DIR/memory-server.log" 2>&1 &
     echo $! > "$MEMORY_PID_FILE"
@@ -89,13 +89,13 @@ start_llm_service() {
   fi
 
   if [[ "$LOG_MODE" == "stdout" ]]; then
-    LLMBOTHUB_LOG_PREFIX="" \
-    LLMBOTHUB_MEMORY_SERVER_URL="$MEMORY_URL" \
+    LLM_BAWT_LOG_PREFIX="" \
+    LLM_BAWT_MEMORY_SERVER_URL="$MEMORY_URL" \
     uv run $UV_FLAGS --extra service --extra search --extra memory llm-service --host "$SERVICE_HOST" --port "$SERVICE_PORT" $RELOAD_FLAG $VERBOSE_FLAG $DEBUG_FLAG &
     echo $! > "$SERVICE_PID_FILE"
   else
-    LLMBOTHUB_LOG_PREFIX="" \
-    LLMBOTHUB_MEMORY_SERVER_URL="$MEMORY_URL" \
+    LLM_BAWT_LOG_PREFIX="" \
+    LLM_BAWT_MEMORY_SERVER_URL="$MEMORY_URL" \
     nohup uv run $UV_FLAGS --extra service --extra search --extra memory llm-service --host "$SERVICE_HOST" --port "$SERVICE_PORT" $RELOAD_FLAG $VERBOSE_FLAG $DEBUG_FLAG \
       > "$LOG_DIR/llm-service.log" 2>&1 &
     echo $! > "$SERVICE_PID_FILE"
