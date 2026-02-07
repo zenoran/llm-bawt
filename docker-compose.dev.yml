@@ -1,0 +1,22 @@
+# Development override for docker-compose.yml
+# Usage: docker-compose -f docker-compose.yml -f docker-compose.dev.yml up
+
+services:
+  app:
+    command: ["/app/server.sh", "start", "--stdout", "--debug"]
+    # Dev mode: source mounted, manual restart needed after code changes
+    # (--dev flag with auto-reload causes issues, so we skip it)
+    
+    volumes:
+      # Mount source code for live development
+      - ./src:/app/src
+      - ./server.sh:/app/server.sh
+      # Keep existing mounts
+      - ${HOME}/.config/llmbothub:/root/.config/llmbothub
+      - ./.logs:/app/.logs
+      - ${MODELS_PATH:-./models}:/app/models
+      # Share host's GGUF model cache to avoid duplicate downloads
+      - ~/.cache/llmbothub/models:/root/.cache/llmbothub/models
+
+    # Restart on failure for auto-reload
+    restart: on-failure
