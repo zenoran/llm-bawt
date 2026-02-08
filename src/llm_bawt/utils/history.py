@@ -104,39 +104,97 @@ class HistoryManager:
         except Exception as e:
             self.client.console.print(f"[bold red]Error saving history:[/bold red] {e}")
 
-    def get_context_messages(self):
+    def get_context_messages(self, max_tokens: int = 0):
         """Get messages to be used as context for the LLM.
 
-        Includes:
+        Includes (in order):
         - System messages (always)
-        - Recent messages (within HISTORY_DURATION)
         - Summaries of older sessions (role='summary') with time context
+        - Recent messages (within HISTORY_DURATION)
+
+        If max_tokens > 0, applies a token budget:
+        1. System messages are always included
+        2. Protected recent turns are always included (newest N pairs)
+        3. Remaining budget fills from newest-first, dropping oldest messages
+
+        Args:
+            max_tokens: Maximum token budget for the returned messages.
+                        0 = no limit (backward-compatible default).
         """
         import time
         from datetime import datetime
         
         cutoff = time.time() - self.config.HISTORY_DURATION
-        active_messages = []
+        system_messages = []
+        summary_messages = []
+        recent_messages = []
         
         for msg in self.messages:
             if msg.role == "system":
-                active_messages.append(msg)
+                system_messages.append(msg)
             elif msg.role == "summary":
                 # Add time context to summaries
                 time_ago = self._format_time_ago(msg.timestamp)
                 enhanced_content = f"[Previous conversation {time_ago}]\n{msg.content}"
-                active_messages.append(Message(
+                summary_messages.append(Message(
                     role="summary",
                     content=enhanced_content,
                     timestamp=msg.timestamp
                 ))
             elif msg.timestamp >= cutoff:
                 # Recent messages
-                active_messages.append(msg)
+                recent_messages.append(msg)
         
-        if not any(msg.role == "system" for msg in active_messages):
-            active_messages.insert(0, Message(role="system", content=self.config.SYSTEM_MESSAGE))
-        return active_messages
+        if not system_messages:
+            system_messages.append(Message(role="system", content=self.config.SYSTEM_MESSAGE))
+
+        # Without a token budget, return everything
+        if max_tokens <= 0:
+            return system_messages + summary_messages + recent_messages
+
+        # ── Token-budget enforcement ──────────────────────────────
+        protected_turns = getattr(self.config, 'MEMORY_PROTECTED_RECENT_TURNS', 3)
+        # Protect the last N user+assistant pairs (= 2*N messages from the end)
+        n_protected = min(protected_turns * 2, len(recent_messages))
+        protected = recent_messages[-n_protected:] if n_protected > 0 else []
+        droppable = recent_messages[:-n_protected] if n_protected > 0 else list(recent_messages)
+
+        def _estimate_tokens(msgs: list[Message]) -> int:
+            # ~4 chars per token + per-message overhead
+            return sum(len(m.content) // 4 + 4 for m in msgs)
+
+        # Calculate baseline usage (system + protected)
+        used = _estimate_tokens(system_messages) + _estimate_tokens(protected)
+        budget = max_tokens
+
+        # Fill from summaries (oldest context → newest)
+        included_summaries: list[Message] = []
+        max_summaries = getattr(self.config, 'SUMMARIZATION_MAX_IN_CONTEXT', 5)
+        for s in summary_messages[-max_summaries:]:
+            cost = _estimate_tokens([s])
+            if used + cost <= budget:
+                included_summaries.append(s)
+                used += cost
+
+        # Fill droppable messages (newest-first to keep recent context)
+        included_droppable: list[Message] = []
+        for msg in reversed(droppable):
+            cost = _estimate_tokens([msg])
+            if used + cost <= budget:
+                included_droppable.insert(0, msg)  # Maintain chronological order
+                used += cost
+            else:
+                # Once we can't fit one, stop (all remaining are older)
+                break
+
+        if len(included_droppable) < len(droppable):
+            dropped = len(droppable) - len(included_droppable)
+            logger.debug(
+                f"Token budget ({max_tokens}): dropped {dropped} oldest messages, "
+                f"kept {len(included_droppable)} droppable + {len(protected)} protected"
+            )
+
+        return system_messages + included_summaries + included_droppable + protected
     
     def _format_time_ago(self, timestamp: float) -> str:
         """Format a timestamp as a human-readable relative time."""

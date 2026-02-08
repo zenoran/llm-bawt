@@ -485,15 +485,27 @@ class RequestPipeline:
         
         # Conversation history
         if ctx.include_history and self.history_manager:
-            history = self.history_manager.get_context_messages()
+            # Compute token budget from the client's effective context window
+            max_context_tokens = getattr(self.config, 'MAX_CONTEXT_TOKENS', 0)
+            if max_context_tokens <= 0 and self.llm_client:
+                # Auto: reserve half context window for output, use rest for input
+                ctx_window = getattr(self.llm_client, 'effective_context_window', 0)
+                if ctx_window > 0:
+                    max_output = getattr(self.llm_client, 'effective_max_tokens', 4096)
+                    max_context_tokens = ctx_window - max_output
+
+            history = self.history_manager.get_context_messages(
+                max_tokens=max_context_tokens
+            )
             history_count = 0
             for msg in history:
-                if msg.role in ("user", "assistant"):
+                # Include user, assistant, and summary messages (summary → system for API)
+                if msg.role in ("user", "assistant", "summary"):
                     messages.append(msg)
                     history_count += 1
             
             if self.debug:
-                logger.debug(f"  Added {history_count} history messages")
+                logger.debug(f"  Added {history_count} history messages (budget: {max_context_tokens} tokens)")
         
         # Current user prompt (if not already in history)
         # History manager adds the message before this, so we check

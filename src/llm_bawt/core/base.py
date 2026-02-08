@@ -422,9 +422,20 @@ class BaseLLMBawt(ABC):
                 include_history = not self._should_skip_history(prompt)
         
         if include_history:
-            history = self.history_manager.get_context_messages()
+            # Compute token budget from the client's effective context window
+            max_context_tokens = getattr(self.config, 'MAX_CONTEXT_TOKENS', 0)
+            if max_context_tokens <= 0 and self.client:
+                ctx_window = getattr(self.client, 'effective_context_window', 0)
+                if ctx_window > 0:
+                    max_output = getattr(self.client, 'effective_max_tokens', 4096)
+                    max_context_tokens = ctx_window - max_output
+
+            history = self.history_manager.get_context_messages(
+                max_tokens=max_context_tokens
+            )
             for msg in history:
-                if msg.role in ("user", "assistant"):
+                # Include user, assistant, and summary messages (summary → system for API)
+                if msg.role in ("user", "assistant", "summary"):
                     messages.append(msg)
         else:
             # Always include current prompt when history is skipped
