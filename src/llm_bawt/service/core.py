@@ -168,7 +168,7 @@ class ServiceLLMBawt(BaseLLMBawt):
         messages: list[Message],
         plaintext_output: bool = False,
         stream: bool = False,
-    ) -> tuple[str, str]:
+    ) -> tuple[str, str, list[dict]]:
         """Execute the LLM query and return response.
         
         Handles tool calling loop if bot has tools enabled.
@@ -180,7 +180,9 @@ class ServiceLLMBawt(BaseLLMBawt):
             stream: Enable streaming output
             
         Returns:
-            Tuple of (response, tool_context). tool_context is empty if no tools used.
+            Tuple of (response, tool_context, tool_call_details).
+            tool_context is empty if no tools used.
+            tool_call_details is a list of per-call dicts for debug logging.
         """
         # Use tool loop if bot has tools enabled
         if self.bot.uses_tools and self.memory:
@@ -206,7 +208,7 @@ class ServiceLLMBawt(BaseLLMBawt):
             plaintext_output=plaintext_output,
             stream=stream,
         )
-        return response, ""
+        return response, "", []
     
     def finalize_response(
         self,

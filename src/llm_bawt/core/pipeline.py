@@ -64,6 +64,7 @@ class PipelineContext:
     messages: list["Message"] = field(default_factory=list)
     response: str = ""
     tool_context: str = ""
+    tool_call_details: list[dict] = field(default_factory=list)
     tool_format: str = "xml"
     tool_definitions: list[Any] = field(default_factory=list)
     
@@ -517,7 +518,7 @@ class RequestPipeline:
         if ctx.use_tools and self.memory_client:
             # Use tool loop
             from ..tools import query_with_tools
-            response, tool_context = query_with_tools(
+            response, tool_context, tool_call_details = query_with_tools(
                 messages=ctx.messages,
                 client=self.llm_client,
                 memory_client=self.memory_client,
@@ -535,6 +536,7 @@ class RequestPipeline:
             
             ctx.response = response
             ctx.tool_context = tool_context
+            ctx.tool_call_details = tool_call_details
         else:
             # Direct query
             ctx.response = self.llm_client.query(

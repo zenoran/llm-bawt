@@ -79,6 +79,7 @@ class ToolLoop:
         else:
             self.max_iterations = max_iterations
         self.tool_context: list[dict] = []  # Track tool interactions for history
+        self.tool_call_details: list[dict] = []  # Per-call detail for debug logging
         self.tool_format = tool_format
         self.tools = tools
         self.format_handler = get_format_handler(tool_format)
@@ -105,6 +106,7 @@ class ToolLoop:
         
         self.executor.reset_call_count()
         self.tool_context = []  # Reset tool context
+        self.tool_call_details = []  # Reset per-call details
         current_messages = messages.copy()
         handler = self.format_handler
         self._using_native_tools = self._should_use_native_tools() and client.supports_native_tools()
@@ -173,6 +175,14 @@ class ToolLoop:
                         "tools_called": [tc.name for tc in tool_calls],
                         "results": tool_summary,
                     })
+                    # Track per-call detail for debug logging
+                    for tc_req, result_text in zip(tool_calls, tool_results):
+                        self.tool_call_details.append({
+                            "tool": tc_req.name,
+                            "parameters": tc_req.arguments,
+                            "result": result_text,
+                            "iteration": iteration,
+                        })
                     
                     # Build continuation messages
                     assistant_message = self._build_assistant_message(response, tool_calls)
@@ -236,6 +246,14 @@ class ToolLoop:
                 "tools_called": [tc.name for tc in tool_calls],
                 "results": tool_summary,
             })
+            # Track per-call detail for debug logging
+            for tc_req, result_text in zip(tool_calls, tool_results):
+                self.tool_call_details.append({
+                    "tool": tc_req.name,
+                    "parameters": tc_req.arguments,
+                    "result": result_text,
+                    "iteration": iteration,
+                })
             
             # Build continuation messages
             # For ReAct format: add assistant's action, then observation as user message
@@ -260,6 +278,17 @@ class ToolLoop:
             tools = ", ".join(ctx["tools_called"])
             summaries.append(f"[Tools used: {tools}]\n{ctx['results']}")
         return "\n\n".join(summaries)
+
+    def get_tool_call_details(self) -> list[dict]:
+        """Return per-call tool details for debug logging.
+
+        Each entry contains:
+            tool: Tool name
+            parameters: Full argument dict
+            result: Result text for this specific call
+            iteration: Which tool loop iteration this occurred in
+        """
+        return list(self.tool_call_details)
     
     def _execute_tools(self, tool_calls: list, handler) -> tuple[list["Message"], list[str]]:
         """Execute a list of tool calls and return formatted results."""
@@ -429,7 +458,7 @@ def query_with_tools(
     tool_format: ToolFormat | str = ToolFormat.XML,
     tools: list | None = None,
     adapter: "ModelAdapter | None" = None,
-) -> tuple[str, str]:
+) -> tuple[str, str, list[dict]]:
     """Convenience function for tool-enabled queries.
 
     Args:
@@ -449,8 +478,9 @@ def query_with_tools(
         adapter: Model adapter for model-specific stop sequences.
 
     Returns:
-        Tuple of (final_response, tool_context_summary).
+        Tuple of (final_response, tool_context_summary, tool_call_details).
         tool_context_summary contains the tool results that should be saved to history.
+        tool_call_details is a list of per-call dicts for debug logging.
     """
     if not user_id:
         raise ValueError("user_id is required for query_with_tools")
@@ -469,4 +499,5 @@ def query_with_tools(
     )
     response = loop.run(messages, client, stream_final=stream)
     tool_context = loop.get_tool_context_summary()
-    return response, tool_context
+    tool_details = loop.get_tool_call_details()
+    return response, tool_context, tool_details
