@@ -123,6 +123,26 @@ class ServiceLLMBawt(BaseLLMBawt):
                     f"Could not download GGUF model: {repo_id}/{filename}"
                 )
             
+            # Check if this GGUF should be run through vLLM instead of llama-cpp
+            backend = self.model_definition.get("backend", "llama-cpp")
+            if backend == "vllm":
+                from ..utils.config import is_vllm_available
+                if not is_vllm_available():
+                    raise ImportError(
+                        "vllm is required for backend: vllm. "
+                        "Install with: pip install vllm"
+                    )
+                from ..clients.vllm_client import VLLMClient
+                
+                client = VLLMClient(
+                    str(model_path),  # Pass local GGUF path to vLLM
+                    config=self.config,
+                    model_definition=self.model_definition,
+                )
+                load_time_ms = (time.perf_counter() - start_time) * 1000
+                slog.model_loaded(self.resolved_model_alias, f"gguf-vllm", load_time_ms)
+                return client
+            
             # Get optional chat_format from model definition (for models like MythoMax)
             chat_format = self.model_definition.get("chat_format")
             client = LlamaCppClient(model_path, config=self.config, chat_format=chat_format, model_definition=self.model_definition)
@@ -130,10 +150,30 @@ class ServiceLLMBawt(BaseLLMBawt):
             slog.model_loaded(self.resolved_model_alias, model_type, load_time_ms)
             return client
         
+        elif model_type == "vllm":
+            from ..utils.config import is_vllm_available
+            if not is_vllm_available():
+                raise ImportError(
+                    "vllm is required for vLLM models. "
+                    "Install with: pip install vllm"
+                )
+            from ..clients.vllm_client import VLLMClient
+            
+            # model_id can be HuggingFace model ID or GGUF path (for backend: vllm)
+            model_id = self.model_definition.get("model_id", self.resolved_model_alias)
+            client = VLLMClient(
+                model_id,
+                config=self.config,
+                model_definition=self.model_definition,
+            )
+            load_time_ms = (time.perf_counter() - start_time) * 1000
+            slog.model_loaded(self.resolved_model_alias, model_type, load_time_ms)
+            return client
+        
         else:
             raise ValueError(
                 f"Unsupported model type: '{model_type}'. "
-                f"Supported types: openai, gguf"
+                f"Supported types: openai, gguf, vllm"
             )
     
     # =========================================================================

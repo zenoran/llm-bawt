@@ -54,14 +54,21 @@ RUN if [ "$WITH_CUDA" = "true" ]; then \
         uv pip install "llama-cpp-python @ git+https://github.com/abetlen/llama-cpp-python.git"; \
     fi
 
+# Install vLLM with CUDA (separate cached layer)
+RUN if [ "$WITH_CUDA" = "true" ]; then \
+        uv pip install vllm; \
+    else \
+        echo "Skipping vLLM install (requires CUDA)"; \
+    fi
+
 # NOW copy source code and other files needed for project install
 # Changes to src/ won't invalidate the venv/deps layer above
 COPY src/ ./src/
 COPY server.sh ./
 RUN chmod +x server.sh
 
-# Install the project itself (fast since deps + llama-cpp are cached)
-RUN uv sync --inexact --extra mcp --extra service --extra search --extra memory --extra huggingface
+# Install the project itself (fast since deps + llama-cpp + vllm are cached)
+RUN uv sync --inexact --extra mcp --extra service --extra search --extra memory --extra huggingface --extra vllm
 
 # Runtime stage
 FROM nvidia/cuda:12.9.1-runtime-ubuntu24.04 AS runtime

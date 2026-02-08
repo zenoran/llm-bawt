@@ -11,6 +11,7 @@
 # Options:
 #   --with-llama    Install llama-cpp-python for local GGUF models
 #   --with-hf       Install HuggingFace transformers + torch
+#   --with-vllm     Install vLLM for HuggingFace model inference (GPU only)
 #   --with-service  Install FastAPI service for background tasks & API
 #   --with-search   Install web search providers (DuckDuckGo + Tavily)
 #   --all           Install all optional dependencies
@@ -30,6 +31,7 @@ NC='\033[0m' # No Color
 # Defaults
 INSTALL_LLAMA=false
 INSTALL_HF=false
+INSTALL_VLLM=false
 INSTALL_SERVICE=false
 INSTALL_SEARCH=false
 WITH_CUDA=true
@@ -65,6 +67,7 @@ OPTIONS:
     --with-service      Install FastAPI background service (llm-service command)
     --with-llama        Install llama-cpp-python for local GGUF model inference
     --with-hf           Install HuggingFace transformers + torch
+    --with-vllm         Install vLLM for HuggingFace model inference (GPU only)
     --with-search       Install web search providers (DuckDuckGo + Tavily)
     --all               Install ALL optional dependencies
 
@@ -127,9 +130,14 @@ while [[ $# -gt 0 ]]; do
             INSTALL_SEARCH=true
             shift
             ;;
+        --with-vllm)
+            INSTALL_VLLM=true
+            shift
+            ;;
         --all)
             INSTALL_LLAMA=true
             INSTALL_HF=true
+            INSTALL_VLLM=true
             INSTALL_SERVICE=true
             INSTALL_SEARCH=true
             shift
@@ -399,6 +407,18 @@ if [ "$INSTALL_SEARCH" = true ]; then
     echo -e "${BLUE}Installing web search dependencies...${NC}"
     pipx runpip llm-bawt install ddgs tavily-python
     echo -e "${GREEN}✓ Web search dependencies installed (DuckDuckGo + Tavily)${NC}"
+fi
+
+if [ "$INSTALL_VLLM" = true ]; then
+    echo -e "${BLUE}Installing vLLM...${NC}"
+    if command -v nvcc &> /dev/null || [ -d "/usr/local/cuda" ]; then
+        echo -e "${YELLOW}  GPU detected, installing vLLM with CUDA support...${NC}"
+        pipx runpip llm-bawt install vllm
+        echo -e "${GREEN}✓ vLLM installed${NC}"
+    else
+        echo -e "${RED}✗ vLLM requires NVIDIA GPU and CUDA. Skipping.${NC}"
+        echo -e "${YELLOW}  If you have a GPU, ensure CUDA is installed and in PATH.${NC}"
+    fi
 fi
 
 # Verify installation

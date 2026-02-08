@@ -18,6 +18,7 @@ PROVIDER_OPENAI = "openai"
 PROVIDER_OLLAMA = "ollama"
 PROVIDER_GGUF = "gguf"
 PROVIDER_HF = "huggingface"
+PROVIDER_VLLM = "vllm"
 PROVIDER_UNKNOWN = "Unknown" 
 
 logger = logging.getLogger(__name__)
@@ -35,6 +36,10 @@ def is_huggingface_available() -> bool:
 def is_llama_cpp_available() -> bool:
     # Restore original or remove if too obvious
     return importlib.util.find_spec("llama_cpp") is not None
+
+def is_vllm_available() -> bool:
+    """Checks if vLLM is available."""
+    return importlib.util.find_spec("vllm") is not None
 
 def get_default_config_dir() -> Path:
     xdg_config_home = os.environ.get("XDG_CONFIG_HOME", os.path.expanduser("~/.config"))
@@ -316,6 +321,9 @@ class Config(BaseSettings):
             elif model_type == PROVIDER_HF:
                 if is_huggingface_available():
                     available_options.append(alias)
+            elif model_type == PROVIDER_VLLM:
+                if is_vllm_available():
+                    available_options.append(alias)
 
         return sorted(list(set(available_options))) # Return sorted list of unique aliases
 
@@ -369,18 +377,33 @@ class Config(BaseSettings):
         return self.LLAMA_CPP_N_GPU_LAYERS if self.LLAMA_CPP_N_GPU_LAYERS is not None else -1
 
     def get_tool_format(self, model_alias: str | None = None, model_def: Dict[str, Any] | None = None) -> str:
-        """Return the tool format for a given model alias or definition."""
+        """Return the tool format for a given model alias or definition.
+        
+        Resolution order:
+        1. Explicit tool_support field (native|react|xml|none)
+        2. Legacy tool_format override (deprecated)
+        3. Auto-detect by provider type
+        """
         if model_def is None and model_alias:
             model_def = self.defined_models.get("models", {}).get(model_alias, {})
         model_def = model_def or {}
 
+        # 1. Explicit tool_support (new)
+        tool_support = model_def.get("tool_support")
+        if tool_support in ("native", "react", "xml", "none"):
+            return tool_support
+
+        # 2. Legacy tool_format override (existing)
         tool_format = model_def.get("tool_format")
         if tool_format:
             return str(tool_format)
 
+        # 3. Auto-detect by provider type (existing + vLLM)
         model_type = model_def.get("type")
         if model_type == PROVIDER_OPENAI:
             return "native"
+        if model_type == PROVIDER_VLLM:
+            return "react"  # in-process vLLM doesn't produce tool_call objects
         if model_type in (PROVIDER_GGUF, PROVIDER_OLLAMA, PROVIDER_HF):
             return "react"
         return "xml"

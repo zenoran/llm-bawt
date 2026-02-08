@@ -46,6 +46,10 @@ llamacpp = [
     "llama-cpp-python",
 ]
 
+vllm = [
+    "vllm>=0.6.0",
+]
+
 service = [
     "fastapi>=0.109.0",
     "uvicorn[standard]>=0.27.0",

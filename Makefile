@@ -161,6 +161,12 @@ install-extras-search: check-pipx ## [pipx] Add search deps
 	pipx runpip llm-bawt install ddgs tavily-python
 	@echo "$(GREEN)✓ Search deps installed$(NC)"
 
+install-extras-vllm: check-pipx ## [pipx] Add vLLM (requires NVIDIA GPU + CUDA)
+	@echo "$(BLUE)Installing vLLM...$(NC)"
+	pipx runpip llm-bawt install vllm
+	@echo "$(GREEN)✓ vLLM installed$(NC)"
+	@echo "$(YELLOW)Note: vLLM requires NVIDIA GPU + CUDA to run$(NC)"
+
 uninstall: ## [pipx] Uninstall llm-bawt
 	@echo "$(YELLOW)Uninstalling llm-bawt...$(NC)"
 	-pipx uninstall llm-bawt 2>$(NULL) || true
@@ -188,6 +194,12 @@ else
 	uv pip install llama-cpp-python
 endif
 	@echo "$(GREEN)✓ llama-cpp-python installed$(NC)"
+
+dev-vllm: check-uv ## [uv] Add vLLM to .venv (requires NVIDIA GPU + CUDA)
+	@echo "$(BLUE)Installing vLLM into .venv...$(NC)"
+	uv pip install vllm
+	@echo "$(GREEN)✓ vLLM installed$(NC)"
+	@echo "$(YELLOW)Note: vLLM requires NVIDIA GPU + CUDA to run$(NC)"
 
 dev-run: ## [uv] Run llm from .venv (e.g. make dev-run ARGS="--status")
 	uv run llm $(ARGS)

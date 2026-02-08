@@ -10,6 +10,7 @@ from llm_bawt.utils.input_handler import MultilineInputHandler
 from llm_bawt.core import LLMBawt
 from llm_bawt.model_manager import list_models, update_models_interactive, delete_model, ModelManager, is_service_mode_enabled
 from llm_bawt.gguf_handler import handle_add_gguf
+from llm_bawt.cli.vllm_handler import handle_add_vllm
 from llm_bawt.bots import BotManager
 from llm_bawt.profiles import ProfileManager, EntityType, AttributeCategory
 from llm_bawt.utils.streaming import render_streaming_response, render_complete_response
@@ -1005,7 +1006,7 @@ def parse_arguments(config_obj: Config) -> argparse.Namespace:
     parser.add_argument("-m","--model",type=str,default=None,help=f"Model alias defined in {config_obj.MODELS_CONFIG_PATH}. Supports partial matching. (Default: bot's default or {config_obj.DEFAULT_MODEL_ALIAS or 'None'})")
     parser.add_argument("--list-models",action="store_true",help="List available model aliases defined in the configuration file and exit.")
     parser.add_argument("--add-gguf",type=str,metavar="REPO_ID",help="(Deprecated: use --add-model gguf) Add a GGUF model from a Hugging Face repo ID.")
-    parser.add_argument("--add-model",type=str,choices=['ollama', 'openai', 'gguf'],metavar="TYPE",help="Add models: 'ollama' (refresh from server), 'openai' (query API), 'gguf' (add from HuggingFace repo)")
+    parser.add_argument("--add-model",type=str,choices=['ollama', 'openai', 'gguf', 'vllm'],metavar="TYPE",help="Add models: 'ollama' (refresh from server), 'openai' (query API), 'gguf' (add from HuggingFace repo), 'vllm' (add vLLM model from HuggingFace)")
     parser.add_argument("--delete-model",type=str,metavar="ALIAS",help="Delete the specified model alias from the configuration file after confirmation.")
     parser.add_argument("--config-set", nargs=2, metavar=("KEY", "VALUE"), help="Set a configuration value (e.g., DEFAULT_MODEL_ALIAS) in the .env file.")
     parser.add_argument("--config-list", action="store_true", help="List the current effective configuration settings.")
@@ -1232,6 +1233,8 @@ def main():
                 else:
                     console.print("[red]No repo ID provided. Cancelled.[/red]")
                     success = False
+            elif args.add_model == 'vllm':
+                success = handle_add_vllm(config_obj)
             if success:
                 console.print(f"[green]Model add for '{args.add_model}' completed.[/green]")
             else:

@@ -111,8 +111,9 @@ class BaseLLMBawt(ABC):
         # Initialize LLM client - reuse existing if provided
         if existing_client is not None:
             self.client = existing_client
-            logger.debug(f"Reusing existing client for model '{resolved_model_alias}'")
+            logger.debug(f"♻️  Reusing existing client for model '{resolved_model_alias}' (no reload)")
         else:
+            logger.debug(f"🔧 Creating new client for model '{resolved_model_alias}'")
             self.client = self._initialize_client()
         
         # Log effective per-model configuration
@@ -314,7 +315,13 @@ class BaseLLMBawt(ABC):
             context_messages = self._build_context_messages(prompt)
             
             # Use tool loop if bot has tools enabled (full tools or read-only memory)
-            use_tools = (self.bot.uses_tools and self.memory) or (self.memory and not self.bot.uses_tools)
+            # Disable tools if tool_format is "none" (explicitly configured no tool support)
+            if self.tool_format == "none":
+                use_tools = False
+                if self.bot.uses_tools and self.config.VERBOSE:
+                    logger.info(f"Tool calling disabled for model {self.resolved_model_alias} (tool_format=none)")
+            else:
+                use_tools = (self.bot.uses_tools and self.memory) or (self.memory and not self.bot.uses_tools)
             if use_tools:
                 if self.bot.uses_tools:
                     tool_definitions = self._get_tool_definitions()
@@ -387,30 +394,31 @@ class BaseLLMBawt(ABC):
         # Start with a copy of the prompt builder
         builder = self._prompt_builder.copy()
         
-        # Add tool instructions
-        if self.bot.uses_tools and self.memory:
-            tool_definitions = self._get_tool_definitions()
-            tools_prompt = get_tools_prompt(
-                tools=tool_definitions,
-                tool_format=self.tool_format,
-            )
-            builder.add_section(
-                "tools",
-                tools_prompt,
-                position=SectionPosition.TOOLS,
-            )
-        elif self.memory:
-            # Non-tool memory bots get a read-only memory search tool
-            from ..tools.definitions import MEMORY_TOOL
-            tools_prompt = get_tools_prompt(
-                tools=[MEMORY_TOOL],
-                tool_format=self.tool_format,
-            )
-            builder.add_section(
-                "tools",
-                tools_prompt,
-                position=SectionPosition.TOOLS,
-            )
+        # Add tool instructions (skip if tool_format is "none")
+        if self.tool_format != "none":
+            if self.bot.uses_tools and self.memory:
+                tool_definitions = self._get_tool_definitions()
+                tools_prompt = get_tools_prompt(
+                    tools=tool_definitions,
+                    tool_format=self.tool_format,
+                )
+                builder.add_section(
+                    "tools",
+                    tools_prompt,
+                    position=SectionPosition.TOOLS,
+                )
+            elif self.memory:
+                # Non-tool memory bots get a read-only memory search tool
+                from ..tools.definitions import MEMORY_TOOL
+                tools_prompt = get_tools_prompt(
+                    tools=[MEMORY_TOOL],
+                    tool_format=self.tool_format,
+                )
+                builder.add_section(
+                    "tools",
+                    tools_prompt,
+                    position=SectionPosition.TOOLS,
+                )
 
         # Cold-start memory priming: inject top memories when history is thin
         if self.memory:
