@@ -232,9 +232,8 @@ class ServiceLLMBawt(BaseLLMBawt):
         if response:
             self.history_manager.add_message("assistant", response)
             
-            # Trigger background memory extraction
-            # Skip extraction if tools were called - the tool already handled user intent
-            if self.memory and not tool_context:
+            # Trigger background memory extraction for all memory-enabled bots
+            if self.memory:
                 self._trigger_memory_extraction(user_prompt, response)
     
     def _trigger_memory_extraction(self, user_prompt: str, assistant_response: str):

@@ -357,8 +357,8 @@ class BaseLLMBawt(ABC):
             
             if assistant_response:
                 self.history_manager.add_message("assistant", assistant_response)
-                # Memory extraction for non-tool bots
-                if self.memory and not self.bot.uses_tools:
+                # Memory extraction for all memory-enabled bots
+                if self.memory:
                     self._trigger_memory_extraction(prompt, assistant_response)
 
             # Write debug turn log if enabled
@@ -396,6 +396,17 @@ class BaseLLMBawt(ABC):
                 tools_prompt,
                 position=SectionPosition.TOOLS,
             )
+            # Cold-start memory priming: inject top memories when history is thin
+            # This gives the model immediate context about the user on first interaction
+            history_count = len(self.history_manager.messages)
+            if history_count <= 3:
+                cold_start_context = self._retrieve_cold_start_memories(prompt)
+                if cold_start_context:
+                    builder.add_section(
+                        "cold_start_memory",
+                        cold_start_context,
+                        position=SectionPosition.MEMORY_CONTEXT,
+                    )
         elif self.memory:
             # Retrieve and add memory context
             memory_context = self._retrieve_memory_context(prompt)
@@ -522,6 +533,67 @@ class BaseLLMBawt(ABC):
             logger.warning(f"Memory retrieval failed: {e}")
             return ""
     
+    def _retrieve_cold_start_memories(self, prompt: str) -> str:
+        """Retrieve a small set of high-importance memories for cold-start context.
+
+        Called when a tool-enabled bot has sparse history (≤3 messages).
+        Injects a few key facts about the user into the system prompt so the
+        model has immediate context without needing to call the memory tool first.
+
+        Args:
+            prompt: Current user prompt (used for relevance search)
+
+        Returns:
+            Formatted memory context string, or empty string if nothing found
+        """
+        if not self.memory:
+            return ""
+
+        try:
+            # Fetch a small number of high-relevance memories
+            results = self.memory.search(
+                prompt,
+                n_results=3,
+                min_relevance=self.config.MEMORY_MIN_RELEVANCE,
+            )
+
+            if not results:
+                return ""
+
+            memories = [
+                {
+                    "content": m.content,
+                    "relevance": m.relevance,
+                    "tags": m.tags,
+                    "importance": m.importance,
+                }
+                for m in results
+            ]
+
+            from ..memory.context_builder import build_memory_context_string
+
+            user_name = None
+            if self.profile_manager:
+                try:
+                    profile, _ = self.profile_manager.get_or_create_profile(
+                        EntityType.USER, self.user_id
+                    )
+                    user_name = profile.display_name
+                except Exception:
+                    pass
+
+            context = build_memory_context_string(memories, user_name=user_name)
+            if context:
+                logger.debug(
+                    f"Cold-start memory priming: injected {len(memories)} memories "
+                    f"({len(context)} chars) into system prompt"
+                )
+            return context
+
+        except Exception as e:
+            logger.warning(f"Cold-start memory retrieval failed: {e}")
+            return ""
+
     def _trigger_memory_extraction(self, user_prompt: str, assistant_response: str):
         """Trigger background memory extraction (non-blocking)."""
         def extract():
