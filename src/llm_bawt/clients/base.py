@@ -20,13 +20,33 @@ class LLMClient(ABC):
     """Abstract base class for LLM clients."""
     SUPPORTS_STREAMING = False
 
-    def __init__(self, model: str, config: Config):
+    def __init__(self, model: str, config: Config, model_definition: dict | None = None):
         self.model = model
         self.config = config
+        self.model_definition: dict = model_definition or {}
         self.bot_name: str | None = None  # Set by LLMBawt after initialization
         self.model_alias: str | None = None  # Set by LLMBawt after initialization
         force_term = not self.config.PLAIN_OUTPUT
         self.console = Console(force_terminal=force_term)
+
+    @property
+    def effective_max_tokens(self) -> int:
+        """Get the effective max output tokens for this client's model."""
+        yaml_val = self.model_definition.get("max_tokens")
+        if yaml_val is not None:
+            return int(yaml_val)
+        return self.config.MAX_TOKENS or 4096
+
+    @property
+    def effective_context_window(self) -> int:
+        """Get the effective context window for this client's model."""
+        yaml_val = self.model_definition.get("context_window")
+        if yaml_val is not None:
+            return int(yaml_val)
+        model_type = self.model_definition.get("type", "")
+        if model_type == "openai":
+            return 128000
+        return self.config.LLAMA_CPP_N_CTX or 32768
 
     def _format_panel_title(self, style: str = "green", is_service: bool = False) -> str:
         """Format the panel title as 'bot_name [model] (service)'."""

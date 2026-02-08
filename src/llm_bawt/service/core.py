@@ -93,6 +93,7 @@ class ServiceLLMBawt(BaseLLMBawt):
                 config=self.config,
                 base_url=base_url,
                 api_key=api_key,
+                model_definition=self.model_definition,
             )
             load_time_ms = (time.perf_counter() - start_time) * 1000
             slog.model_loaded(self.resolved_model_alias, model_type, load_time_ms)
@@ -124,7 +125,7 @@ class ServiceLLMBawt(BaseLLMBawt):
             
             # Get optional chat_format from model definition (for models like MythoMax)
             chat_format = self.model_definition.get("chat_format")
-            client = LlamaCppClient(model_path, config=self.config, chat_format=chat_format)
+            client = LlamaCppClient(model_path, config=self.config, chat_format=chat_format, model_definition=self.model_definition)
             load_time_ms = (time.perf_counter() - start_time) * 1000
             slog.model_loaded(self.resolved_model_alias, model_type, load_time_ms)
             return client

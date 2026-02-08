@@ -88,4 +88,5 @@ class LLMBawt(BaseLLMBawt):
             config=self.config,
             base_url=base_url,
             api_key=api_key,
+            model_definition=self.model_definition,
         )

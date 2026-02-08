@@ -121,6 +121,15 @@ class BaseLLMBawt(ABC):
         else:
             self.client = self._initialize_client()
         
+        # Log effective per-model configuration
+        if self.verbose:
+            logger.info(
+                f"Model '{resolved_model_alias}' config: "
+                f"context_window={self.client.effective_context_window}, "
+                f"max_tokens={self.client.effective_max_tokens}, "
+                f"type={self.model_definition.get('type', 'unknown')}"
+            )
+        
         # Register client with lifecycle manager
         self.model_lifecycle.register_client(resolved_model_alias, self.client)
         
