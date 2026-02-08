@@ -210,13 +210,14 @@ def estimate_max_context_from_vram(
     safety_bytes = int(safety_margin_gb * 1024 ** 3)
     weight_bytes = model_file_size_bytes
 
-    # Available VRAM for KV cache = total - weights - safety margin
-    vram_for_kv = vram_info.total_bytes - weight_bytes - safety_bytes
+    # Use free VRAM (not total) to account for other GPU consumers.
+    # Weights still need to be loaded, so subtract them from free VRAM.
+    vram_for_kv = vram_info.free_bytes - weight_bytes - safety_bytes
 
     if vram_for_kv <= 0:
         logger.warning(
             f"Model weights ({weight_bytes / 1e9:.1f}GB) + safety margin "
-            f"({safety_margin_gb:.1f}GB) exceed total VRAM ({vram_info.total_gb:.1f}GB). "
+            f"({safety_margin_gb:.1f}GB) exceed free VRAM ({vram_info.free_gb:.1f}GB). "
             f"Model may not fit in VRAM."
         )
         # Return a minimal context window rather than failing
@@ -232,7 +233,7 @@ def estimate_max_context_from_vram(
     max_tokens = max(2048, min(max_tokens, 262144))  # 2K min, 256K max
 
     logger.debug(
-        f"VRAM auto-sizing: {vram_info.total_gb:.1f}GB total, "
+        f"VRAM auto-sizing: {vram_info.total_gb:.1f}GB total, {vram_info.free_gb:.1f}GB free, "
         f"{weight_bytes / 1e9:.1f}GB weights, {safety_margin_gb:.1f}GB safety, "
         f"{vram_for_kv / 1e9:.1f}GB for KV → {max_tokens} tokens "
         f"(at {kv_bytes_per_token} bytes/token)"
@@ -321,7 +322,7 @@ def auto_size_context_window(
                 vram_info=vram_info,
                 model_file_size_gb=file_size / (1024 ** 3),
                 estimated_kv_budget_gb=(
-                    vram_info.total_bytes - file_size - int(1.5 * 1024 ** 3)
+                    vram_info.free_bytes - file_size - int(1.5 * 1024 ** 3)
                 ) / (1024 ** 3),
             )
 

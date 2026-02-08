@@ -95,6 +95,37 @@ class LlamaCppClient(LLMClient):
                 self.console.print(
                     f"[green]Model loaded:[/green] Context={ctx_size}, Batch={n_batch}, FlashAttn={flash_attn}, GPU Layers={gpu_layers if gpu_layers != -1 else 'All'}"
                 )
+        except (ValueError, RuntimeError) as e:
+            # Context window too large for available VRAM — retry with halved context
+            if "Failed to create llama_context" in str(e) and n_ctx > 4096:
+                reduced_ctx = max(4096, n_ctx // 2)
+                logger.warning(
+                    f"Context window {n_ctx} too large (VRAM exhausted). "
+                    f"Retrying with {reduced_ctx}..."
+                )
+                self.console.print(
+                    f"[yellow]⚠ Context {n_ctx} too large for available VRAM. "
+                    f"Retrying with {reduced_ctx}...[/yellow]"
+                )
+                model_load_params["n_ctx"] = reduced_ctx
+                try:
+                    with open(os.devnull, 'w') as fnull, contextlib.redirect_stderr(fnull):
+                        self.llm_model = Llama(**model_load_params)
+                    self.console.print(
+                        f"[green]Model loaded with reduced context: {reduced_ctx}[/green]"
+                    )
+                    # Update the sizing result so the rest of the system knows
+                    if self._context_sizing_result:
+                        self._context_sizing_result.context_window = reduced_ctx
+                        self._context_sizing_result.source = "auto-vram-reduced"
+                except Exception as retry_e:
+                    self.console.print(f"[bold red]Error loading GGUF model {self.model_path}:[/bold red] {retry_e}")
+                    self.console.print("Ensure model path is correct and `llama-cpp-python` is installed with appropriate hardware acceleration (e.g., BLAS, CUDA). Check library docs.")
+                    raise
+            else:
+                self.console.print(f"[bold red]Error loading GGUF model {self.model_path}:[/bold red] {e}")
+                self.console.print("Ensure model path is correct and `llama-cpp-python` is installed with appropriate hardware acceleration (e.g., BLAS, CUDA). Check library docs.")
+                raise
         except Exception as e:
             self.console.print(f"[bold red]Error loading GGUF model {self.model_path}:[/bold red] {e}")
             self.console.print("Ensure model path is correct and `llama-cpp-python` is installed with appropriate hardware acceleration (e.g., BLAS, CUDA). Check library docs.")
