@@ -302,8 +302,14 @@ class ServiceClient:
         try:
             with urllib.request.urlopen(req, timeout=60.0) as resp:
                 first_chunk = True
-                for line in resp:
-                    line = line.decode().strip()
+                # Use readline() instead of iterating the response directly.
+                # `for line in resp` uses BufferedIOBase iteration which reads
+                # in 8KB chunks before yielding, defeating streaming.
+                while True:
+                    raw_line = resp.readline()
+                    if not raw_line:
+                        break
+                    line = raw_line.decode().strip()
                     if line.startswith("data: "):
                         data = line[6:]
                         if data == "[DONE]":
