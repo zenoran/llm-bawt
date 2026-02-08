@@ -107,8 +107,8 @@ class LlamaCppClient(LLMClient):
                     fallback_sizes.append(8192)
                 if n_ctx > 4096:
                     fallback_sizes.append(4096)
-                # Deduplicate and only try values smaller than original
-                fallback_sizes = sorted(set(s for s in fallback_sizes if s < n_ctx))
+                # Deduplicate and try largest first to maximize usable context
+                fallback_sizes = sorted(set(s for s in fallback_sizes if s < n_ctx), reverse=True)
 
                 for fallback_ctx in fallback_sizes:
                     logger.warning(

@@ -148,8 +148,22 @@ def extract_profile_attributes_from_fact(
                     name = words[-1] if words else None  # Last capitalized word is often the name
             
             if name:
-                manager.set_display_name(EntityType.USER, user_id, name)
-                logger.info(f"[Profile] ✓ Set display_name to '{name}' for user {user_id}")
+                # Don't set display_name to a bot name — extraction sometimes
+                # confuses the bot's name with the user's name from conversation context
+                from llm_bawt.bots import load_bots
+                try:
+                    bot_names = {b.get("name", "").lower() for b in load_bots().values()}
+                    bot_names |= set(load_bots().keys())  # also slug names
+                except Exception:
+                    bot_names = {"nova", "mira", "spark"}  # fallback known names
+                
+                if name.lower() in bot_names:
+                    logger.warning(
+                        f"[Profile] Skipping display_name update: '{name}' matches a bot name"
+                    )
+                else:
+                    manager.set_display_name(EntityType.USER, user_id, name)
+                    logger.info(f"[Profile] ✓ Set display_name to '{name}' for user {user_id}")
 
         # Determine if this was a create or update based on timestamps
         is_new = attr.created_at == attr.updated_at

@@ -137,19 +137,18 @@ def _detect_vram_nvidia_smi() -> VRAMInfo | None:
 
 # ── KV Cache Estimation ──────────────────────────────────────────────────────
 
-# Approximate KV cache bytes per token per layer (FP16 KV cache)
-# Formula: 2 (K+V) × 2 (FP16 bytes) × head_dim × num_kv_heads
-# These are rough estimates grouped by model parameter count.
-# More precise calculation would require reading model metadata.
+# Approximate total VRAM cost per token of context (not just KV cache).
+# These include KV cache + compute buffers + attention scratch space.
+# Based on empirical measurements with llama-cpp-python + flash attention.
 _KV_BYTES_PER_TOKEN_ESTIMATES = {
     # (min_params_billions, max_params_billions): bytes_per_token
-    (0, 4): 256,         # ~0.25 KB/token (1-3B models)
-    (4, 10): 512,        # ~0.5 KB/token (7-8B models)
-    (10, 20): 1024,      # ~1 KB/token (13-14B models)
-    (20, 30): 1536,      # ~1.5 KB/token (24-27B models)
-    (30, 50): 2048,      # ~2 KB/token (32-34B models)
-    (50, 80): 3072,      # ~3 KB/token (65-70B models)
-    (80, 200): 4096,     # ~4 KB/token (72B+ models)
+    (0, 4): 512,         # ~0.5 KB/token (1-3B models)
+    (4, 10): 1024,       # ~1 KB/token (7-8B models)
+    (10, 20): 2560,      # ~2.5 KB/token (13-14B models)
+    (20, 30): 3584,      # ~3.5 KB/token (24-27B models)
+    (30, 50): 5120,      # ~5 KB/token (32-34B models)
+    (50, 80): 7168,      # ~7 KB/token (65-70B models)
+    (80, 200): 10240,    # ~10 KB/token (72B+ models)
 }
 
 
@@ -231,7 +230,7 @@ def estimate_max_context_from_vram(
     max_tokens = (max_tokens // 1024) * 1024
 
     # Clamp to reasonable range
-    max_tokens = max(2048, min(max_tokens, 262144))  # 2K min, 256K max
+    max_tokens = max(2048, min(max_tokens, 131072))  # 2K min, 128K max
 
     logger.debug(
         f"VRAM auto-sizing: {vram_info.total_gb:.1f}GB total, {vram_info.free_gb:.1f}GB free, "
