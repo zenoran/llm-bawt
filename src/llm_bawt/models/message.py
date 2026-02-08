@@ -17,12 +17,14 @@ class Message:
         timestamp: float | None = None,
         tool_calls: list[dict[str, Any]] | None = None,
         tool_call_id: str | None = None,
+        db_id: str | None = None,
     ):
         self.role = role
         self.content = content if content is not None else ""
         self.timestamp = timestamp if timestamp else time.time()
         self.tool_calls = tool_calls  # For assistant messages that make tool calls
         self.tool_call_id = tool_call_id  # For tool result messages
+        self.db_id = db_id  # Primary key from the database (when loaded from PostgreSQL)
 
     @classmethod
     def from_dict(cls, data: dict) -> 'Message':
@@ -32,7 +34,8 @@ class Message:
         timestamp = data.get("timestamp", time.time())
         tool_calls = data.get("tool_calls")
         tool_call_id = data.get("tool_call_id")
-        return cls(role, content, timestamp, tool_calls, tool_call_id)
+        db_id = data.get("db_id")
+        return cls(role, content, timestamp, tool_calls, tool_call_id, db_id=db_id)
 
     @staticmethod
     def _extract_content(data: dict) -> str:
@@ -49,6 +52,8 @@ class Message:
             d["tool_calls"] = self.tool_calls
         if self.tool_call_id:
             d["tool_call_id"] = self.tool_call_id
+        if self.db_id:
+            d["db_id"] = self.db_id
         return d
 
     def to_api_format(self) -> dict:

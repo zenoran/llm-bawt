@@ -165,16 +165,62 @@ def backfill_meaning_embeddings(
     return {"updated": updated, "failed": failed, "total": total}
 
 
+def add_recalled_history_column(backend: Any, dry_run: bool = False) -> dict:
+    """Add recalled_history boolean column to message tables if missing.
+
+    This column tracks messages that were re-inserted into context via the
+    history recall tool. Future summarization passes should skip these
+    to avoid creating duplicate summaries.
+
+    Args:
+        backend: PostgreSQLMemoryBackend instance
+        dry_run: If True, only report what would be done
+
+    Returns:
+        Dict with migration statistics
+    """
+    from sqlalchemy import text
+
+    table_name = backend._messages_table_name
+
+    with backend.engine.connect() as conn:
+        # Check if column already exists
+        check_sql = text("""
+            SELECT column_name FROM information_schema.columns
+            WHERE table_name = :table_name AND column_name = 'recalled_history'
+        """)
+        exists = conn.execute(check_sql, {"table_name": table_name}).fetchone()
+        if exists:
+            logger.debug(f"recalled_history column already exists on {table_name}")
+            return {"added": False, "already_exists": True}
+
+        if dry_run:
+            logger.debug(f"[DRY RUN] Would add recalled_history column to {table_name}")
+            return {"added": False, "dry_run": True}
+
+        alter_sql = text(f"""
+            ALTER TABLE {table_name}
+            ADD COLUMN recalled_history BOOLEAN DEFAULT FALSE
+        """)
+        conn.execute(alter_sql)
+        conn.commit()
+        logger.debug(f"Added recalled_history column to {table_name}")
+        return {"added": True}
+
+
 def run_all_migrations(backend: Any, dry_run: bool = False) -> dict:
     """Run all pending migrations."""
     results = {}
-    
+
     logger.debug("Running tag backfill...")
     results["tags"] = backfill_empty_tags(backend, dry_run=dry_run)
-    
+
     logger.debug("Running meaning embedding generation...")
     results["meaning_embeddings"] = backfill_meaning_embeddings(backend, dry_run=dry_run)
-    
+
+    logger.debug("Running recalled_history column migration...")
+    results["recalled_history"] = add_recalled_history_column(backend, dry_run=dry_run)
+
     return results
 
 

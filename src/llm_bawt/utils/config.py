@@ -172,12 +172,6 @@ class Config(BaseSettings):
         description="Brave safesearch level: off, moderate, strict"
     )
 
-    # --- Tool/History Settings --- #
-    TOOLS_SKIP_HISTORY: bool = Field(
-        default=True,
-        description="If true, tool-enabled bots do not include conversation history in the prompt (prevents stale tool results polluting context)",
-    )
-
     # --- History Summarization Settings --- #
     SUMMARIZATION_SESSION_GAP_SECONDS: int = Field(
         default=3600,
