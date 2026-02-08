@@ -1,4 +1,4 @@
-# Multi-stage build for llmbothub
+# Multi-stage build for llm-bawt
 FROM nvidia/cuda:12.9.1-devel-ubuntu24.04 AS base
 
 ENV DEBIAN_FRONTEND=noninteractive
@@ -90,7 +90,7 @@ COPY --from=base /app/pyproject.toml /app/pyproject.toml
 COPY --from=base /app/server.sh /app/server.sh
 
 # Create necessary directories
-RUN mkdir -p /app/.run /app/.logs /root/.config/llmbothub
+RUN mkdir -p /app/.run /app/.logs /root/.config/llm-bawt
 
 # Set environment variables
 ENV PATH="/app/.venv/bin:$PATH" \

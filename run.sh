@@ -6,7 +6,7 @@ COMPOSE_DEV="docker-compose.dev.yml"
 
 usage() {
   cat <<EOF
-Docker management script for llmbothub
+Docker management script for llm-bawt
 
 USAGE:
     ./start.sh [COMMAND] [OPTIONS]
@@ -83,9 +83,9 @@ case "${1:-help}" in
 
   restart)
     echo "Restarting containers..."
-    if docker compose ps | grep -q llmbothub_app; then
+    if docker compose ps | grep -q llm-bawt-app; then
       # Check if dev mode (has source mount)
-      if docker inspect llmbothub_app 2>/dev/null | grep -q "/app/src"; then
+      if docker inspect llm-bawt-app 2>/dev/null | grep -q "/app/src"; then
         docker compose -f "$COMPOSE_BASE" -f "$COMPOSE_DEV" restart
         echo "✓ Dev containers restarted"
       else

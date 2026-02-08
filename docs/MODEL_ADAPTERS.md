@@ -7,7 +7,7 @@ Model adapters handle model-specific formatting quirks, stop sequences, and outp
 ## Architecture
 
 ```
-BaseLLMBotHub.__init__()
+BaseLLMBawt.__init__()
        ↓
    ModelAdapter ←── get_adapter(model_alias, model_def)
        │                    ↓
@@ -78,7 +78,7 @@ For Dolphin models (Dolphin3.0-Llama, Dolphin-Qwen, etc.) that sometimes halluci
 Adapters are managed through a registry (`adapters/registry.py`):
 
 ```python
-from llmbothub.adapters import get_adapter
+from llm_bawt.adapters import get_adapter
 
 adapter = get_adapter(model_alias="mythomax", model_def=model_definition)
 ```
@@ -94,7 +94,7 @@ Adapters are auto-registered at module load via `_register_builtins()`.
 
 ### Core (`core/base.py`)
 
-The adapter is initialized in `BaseLLMBotHub.__init__()` and stored as `self.adapter`. It's passed to `query_with_tools()` for use in the tool loop.
+The adapter is initialized in `BaseLLMBawt.__init__()` and stored as `self.adapter`. It's passed to `query_with_tools()` for use in the tool loop.
 
 ### Tool Loop (`tools/loop.py`)
 
@@ -115,7 +115,7 @@ Same stop sequence combination plus `adapter.clean_output()` is called on the fi
 ## File Locations
 
 ```
-src/llmbothub/adapters/
+src/llm_bawt/adapters/
 ├── __init__.py     # Exports: ModelAdapter, DefaultAdapter, get_adapter, register_adapter
 ├── base.py         # ModelAdapter ABC
 ├── registry.py     # get_adapter(), register_adapter(), auto-detection

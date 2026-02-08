@@ -2,7 +2,7 @@
 
 ## Overview
 
-llmbothub supports tool calling through a dual-mode architecture: **native tool calling** for providers that support it (OpenAI) and **ReAct format** as a universal fallback for all other models (GGUF, Ollama). A legacy XML format is retained for backward compatibility.
+llm-bawt supports tool calling through a dual-mode architecture: **native tool calling** for providers that support it (OpenAI) and **ReAct format** as a universal fallback for all other models (GGUF, Ollama). A legacy XML format is retained for backward compatibility.
 
 ## Architecture
 
@@ -131,7 +131,7 @@ Native tool calling via llama-cpp-python's `chatml-function-calling` chat format
 ## File Locations
 
 ```
-src/llmbothub/tools/
+src/llm_bawt/tools/
 ├── formats/
 │   ├── __init__.py          # ToolFormat enum, get_format_handler()
 │   ├── base.py              # ToolFormatHandler ABC, ToolCallRequest

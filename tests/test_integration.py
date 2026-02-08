@@ -8,10 +8,10 @@ import pytest
 from unittest.mock import Mock, MagicMock, patch
 from typing import Iterator
 
-from llmbothub.tools.formats import ToolFormat
-from llmbothub.tools.formats.react import ReActFormatHandler
-from llmbothub.tools.loop import ToolLoop
-from llmbothub.tools.streaming import stream_with_tools
+from llm_bawt.tools.formats import ToolFormat
+from llm_bawt.tools.formats.react import ReActFormatHandler
+from llm_bawt.tools.loop import ToolLoop
+from llm_bawt.tools.streaming import stream_with_tools
 
 
 class MockMessage:
@@ -123,7 +123,7 @@ class TestToolLoopFullFlow:
         client.supports_native_tools = Mock(return_value=False)
 
         # Mock executor to avoid real tool execution
-        with patch('llmbothub.tools.loop.ToolExecutor') as mock_executor_class:
+        with patch('llm_bawt.tools.loop.ToolExecutor') as mock_executor_class:
             mock_executor = Mock()
             mock_executor.execute.return_value = "Profile: name=Nick"
             mock_executor_class.return_value = mock_executor
@@ -153,7 +153,7 @@ class TestToolLoopFullFlow:
         client.query = mock_query
         client.supports_native_tools = Mock(return_value=False)
 
-        with patch('llmbothub.tools.loop.ToolExecutor') as mock_executor_class:
+        with patch('llm_bawt.tools.loop.ToolExecutor') as mock_executor_class:
             mock_executor = Mock()
             mock_executor.execute.return_value = "Found: test data"
             mock_executor_class.return_value = mock_executor
@@ -185,7 +185,7 @@ class TestStreamingToolLoop:
                 # Second call: final response
                 yield "Your profile shows name=Nick"
 
-        with patch('llmbothub.tools.streaming.ToolExecutor') as mock_executor_class:
+        with patch('llm_bawt.tools.streaming.ToolExecutor') as mock_executor_class:
             mock_executor = Mock()
             mock_executor.execute.return_value = "name=Nick, occupation=developer"
             mock_executor_class.return_value = mock_executor
@@ -232,7 +232,7 @@ class TestStreamingToolLoop:
             else:
                 yield "Final Answer: Got it!"
 
-        with patch('llmbothub.tools.streaming.ToolExecutor') as mock_executor_class:
+        with patch('llm_bawt.tools.streaming.ToolExecutor') as mock_executor_class:
             mock_executor = Mock()
             mock_executor.execute.return_value = "profile data"
             mock_executor_class.return_value = mock_executor

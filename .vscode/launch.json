@@ -5,10 +5,10 @@
     "version": "0.2.0",
     "configurations": [
         {
-            "name": "llmbothub",
+            "name": "llm-bawt",
             "type": "debugpy",
             "request": "launch",
-            "program": "${workspaceFolder}/src/llmbothub/main.py",
+            "program": "${workspaceFolder}/src/llm_bawt/main.py",
             "console": "integratedTerminal",
             "env": {
                 "PYTHONPATH": "${workspaceFolder}/src"

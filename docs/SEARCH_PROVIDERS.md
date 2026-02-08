@@ -2,7 +2,7 @@
 
 ## Overview
 
-llmbothub supports web search through multiple providers via a pluggable search client architecture. Search results are used as context for LLM responses when the user's query benefits from current information.
+llm-bawt supports web search through multiple providers via a pluggable search client architecture. Search results are used as context for LLM responses when the user's query benefits from current information.
 
 ## Available Providers
 
@@ -17,7 +17,7 @@ llmbothub supports web search through multiple providers via a pluggable search 
 Provider selection is automatic with this priority:
 
 1. Explicit `--search-provider` CLI argument
-2. `LLMBOTHUB_SEARCH_PROVIDER` config setting
+2. `LLM_BAWT_SEARCH_PROVIDER` config setting
 3. Tavily (if API key configured)
 4. Brave (if API key configured)
 5. DuckDuckGo (free fallback, always available)
@@ -39,22 +39,22 @@ The factory function `get_search_client(config, provider, max_results)` in `sear
 
 ## Configuration
 
-Add to `~/.config/llmbothub/.env`:
+Add to `~/.config/llm-bawt/.env`:
 
 ```bash
 # Provider selection (optional - auto-selects based on available keys)
-LLMBOTHUB_SEARCH_PROVIDER=brave
+LLM_BAWT_SEARCH_PROVIDER=brave
 
 # Tavily
-LLMBOTHUB_TAVILY_API_KEY=your-key-here
+LLM_BAWT_TAVILY_API_KEY=your-key-here
 
 # Brave Search
-LLMBOTHUB_BRAVE_API_KEY=your-key-here
-LLMBOTHUB_BRAVE_SAFESEARCH=moderate    # off, moderate, strict
+LLM_BAWT_BRAVE_API_KEY=your-key-here
+LLM_BAWT_BRAVE_SAFESEARCH=moderate    # off, moderate, strict
 
 # General search settings
-LLMBOTHUB_SEARCH_MAX_RESULTS=5
-LLMBOTHUB_SEARCH_TIMEOUT=10
+LLM_BAWT_SEARCH_MAX_RESULTS=5
+LLM_BAWT_SEARCH_TIMEOUT=10
 ```
 
 ### Getting API Keys
@@ -87,7 +87,7 @@ The Tavily client (`search/tavily_client.py`) uses the `tavily-python` SDK. Supp
 ## File Locations
 
 ```
-src/llmbothub/search/
+src/llm_bawt/search/
 ├── __init__.py        # Exports: get_search_client, SearchClient, SearchResult, etc.
 ├── base.py            # SearchClient ABC, SearchResult, SearchProvider enum
 ├── factory.py         # get_search_client(), is_search_available()

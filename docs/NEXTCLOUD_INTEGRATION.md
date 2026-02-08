@@ -2,7 +2,7 @@
 
 ## Overview
 
-Multiple llmbothub bot personalities can have dedicated Nextcloud Talk rooms. A single webhook endpoint routes messages to the appropriate bot based on conversation token. Room and bot provisioning is handled by an external provisioner service.
+Multiple llm-bawt bot personalities can have dedicated Nextcloud Talk rooms. A single webhook endpoint routes messages to the appropriate bot based on conversation token. Room and bot provisioning is handled by an external provisioner service.
 
 ## Architecture
 
@@ -11,20 +11,20 @@ Nextcloud Talk Room (token: abc123)
     ↓ webhook POST
 http://localhost:8642/webhook/nextcloud
     ↓ routes by conversation_token
-llmbothub bot: nova (uses Nova personality)
+llm-bawt bot: nova (uses Nova personality)
 
 Nextcloud Talk Room (token: def456)
     ↓ webhook POST
 http://localhost:8642/webhook/nextcloud
     ↓ routes by conversation_token
-llmbothub bot: monika (uses Monika personality)
+llm-bawt bot: monika (uses Monika personality)
 ```
 
 Each bot has its own secret, conversation context, and personality. A single webhook endpoint handles all bots, routing by the `conversation_token` in the payload.
 
 ## Configuration
 
-### Bot Config (`~/.config/llmbothub/bots.yaml`)
+### Bot Config (`~/.config/llm-bawt/bots.yaml`)
 
 Each bot can have a `nextcloud:` section:
 
@@ -46,15 +46,15 @@ Nextcloud config is stored only in the user config file, not the repo `bots.yaml
 
 ### Environment Variables
 
-Add to `~/.config/llmbothub/.env`:
+Add to `~/.config/llm-bawt/.env`:
 
 ```bash
 # Provisioner service
-LLMBOTHUB_TALK_PROVISIONER_URL=http://localhost:8790
-LLMBOTHUB_TALK_PROVISIONER_TOKEN=your-token-here
+LLM_BAWT_TALK_PROVISIONER_URL=http://localhost:8790
+LLM_BAWT_TALK_PROVISIONER_TOKEN=your-token-here
 
 # Nextcloud server URL
-LLMBOTHUB_NEXTCLOUD_URL=https://nextcloud.example.com
+LLM_BAWT_NEXTCLOUD_URL=https://nextcloud.example.com
 ```
 
 ## CLI Commands
@@ -130,11 +130,11 @@ Forces config reload from disk. Called automatically by CLI commands when config
 
 ## Message Signing
 
-### Inbound (Nextcloud -> llmbothub)
+### Inbound (Nextcloud -> llm-bawt)
 
 Signature verification: `HMAC-SHA256(random + body, secret)`
 
-### Outbound (llmbothub -> Nextcloud)
+### Outbound (llm-bawt -> Nextcloud)
 
 Signature is computed over `random + messageText` (NOT the full JSON body):
 
@@ -185,7 +185,7 @@ If not using the provisioner service, register bots directly on the Nextcloud se
 
 ```bash
 sudo -u www-data php occ talk:bot:install \
-  "LLMBotHub Bot" \
+  "llm-bawt Bot" \
   "my-super-secret-key-12345" \
   "http://your-server:8642/webhook/nextcloud"
 ```
@@ -209,7 +209,7 @@ sudo -u www-data php occ talk:bot:uninstall <bot-id> # Remove a bot
 ## File Locations
 
 ```
-src/llmbothub/integrations/nextcloud/
+src/llm_bawt/integrations/nextcloud/
 ├── __init__.py       # Exports: NextcloudBot, NextcloudBotConfig, NextcloudBotManager
 ├── config.py         # NextcloudBotConfig, NextcloudBot dataclass
 ├── manager.py        # NextcloudBotManager singleton (routing, config CRUD)
@@ -218,7 +218,7 @@ src/llmbothub/integrations/nextcloud/
 └── cli.py            # Click-based CLI commands (llm-nextcloud)
 ```
 
-Service integration: `src/llmbothub/service/api.py` (webhook and admin endpoints)
+Service integration: `src/llm_bawt/service/api.py` (webhook and admin endpoints)
 
 ## Troubleshooting
 
@@ -229,7 +229,7 @@ uv run llm-nextcloud     # For local venv
 ```
 
 **Provisioning fails with 401**
-- Check `LLMBOTHUB_TALK_PROVISIONER_TOKEN` is set and correct
+- Check `LLM_BAWT_TALK_PROVISIONER_TOKEN` is set and correct
 
 **Bot not responding**
 - Check `llm-nextcloud list` shows the bot with correct config

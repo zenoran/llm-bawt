@@ -3,7 +3,7 @@
 import pytest
 from datetime import datetime, timedelta
 
-from llmbothub.service.scheduler import (
+from llm_bawt.service.scheduler import (
     ScheduledJob,
     JobRun,
     JobType,
@@ -80,7 +80,7 @@ class TestTaskFactories:
     """Tests for task factory functions."""
     
     def test_create_profile_maintenance_task(self):
-        from llmbothub.service.tasks import create_profile_maintenance_task, TaskType
+        from llm_bawt.service.tasks import create_profile_maintenance_task, TaskType
         
         task = create_profile_maintenance_task(
             entity_id="user",
@@ -94,7 +94,7 @@ class TestTaskFactories:
         assert task.user_id == "user"  # entity_id becomes user_id
     
     def test_create_maintenance_task_with_user_id(self):
-        from llmbothub.service.tasks import create_maintenance_task, TaskType
+        from llm_bawt.service.tasks import create_maintenance_task, TaskType
         
         task = create_maintenance_task(
             bot_id="nova",

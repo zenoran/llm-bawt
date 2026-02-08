@@ -4,8 +4,8 @@
 import logging
 logging.basicConfig(level=logging.DEBUG)
 
-from llmbothub.utils.config import Config
-from llmbothub.memory_server.extraction import extract_profile_attributes_from_fact, _extract_attribute_key
+from llm_bawt.utils.config import Config
+from llm_bawt.memory_server.extraction import extract_profile_attributes_from_fact, _extract_attribute_key
 
 config = Config()
 user_id = config.DEFAULT_USER  # Use configured user, not hardcoded "default"
@@ -38,7 +38,7 @@ print(f"Result: {result}")
 
 # Check what's in the database now
 print(f"\n=== Database contents for user '{user_id}' ===")
-from llmbothub.profiles import ProfileManager, EntityType
+from llm_bawt.profiles import ProfileManager, EntityType
 manager = ProfileManager(config)
 attrs = manager.get_all_attributes(EntityType.USER, user_id)
 for a in attrs:

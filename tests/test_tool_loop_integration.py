@@ -7,9 +7,9 @@ ensuring proper tool detection, execution, and response sanitization.
 import pytest
 from unittest.mock import Mock, MagicMock, patch
 
-from llmbothub.tools.loop import ToolLoop, DEFAULT_MAX_ITERATIONS
-from llmbothub.tools.formats import ToolFormat
-from llmbothub.tools.formats.base import ToolCallRequest
+from llm_bawt.tools.loop import ToolLoop, DEFAULT_MAX_ITERATIONS
+from llm_bawt.tools.formats import ToolFormat
+from llm_bawt.tools.formats.base import ToolCallRequest
 
 
 class MockMessage:
@@ -255,7 +255,7 @@ Final Answer: Found results."""
 class TestToolLoopWithMockedExecutor:
     """Tests with mocked tool executor for full loop testing."""
 
-    @patch('llmbothub.tools.loop.ToolExecutor')
+    @patch('llm_bawt.tools.loop.ToolExecutor')
     def test_tool_execution_flow(self, mock_executor_class):
         """Full tool execution flow with mocked executor."""
         # Setup mock executor

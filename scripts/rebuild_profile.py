@@ -22,12 +22,12 @@ from pathlib import Path
 # Add src to path
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
-from llmbothub.utils.config import Config
-from llmbothub.profiles import ProfileManager, EntityType
-from llmbothub.memory_server.client import MemoryClient
-from llmbothub.memory.extraction import MemoryExtractionService
-from llmbothub.memory.profile_maintenance import ProfileMaintenanceService
-from llmbothub.core.client import LLMBotHub
+from llm_bawt.utils.config import Config
+from llm_bawt.profiles import ProfileManager, EntityType
+from llm_bawt.memory_server.client import MemoryClient
+from llm_bawt.memory.extraction import MemoryExtractionService
+from llm_bawt.memory.profile_maintenance import ProfileMaintenanceService
+from llm_bawt.core.client import LLMBawt
 
 logging.basicConfig(level=logging.INFO, format="%(message)s")
 logger = logging.getLogger(__name__)
@@ -84,7 +84,7 @@ Output JSON array only:
 ]
 ```"""
 
-    from llmbothub.models.message import Message
+    from llm_bawt.models.message import Message
     
     try:
         response = llm_client.query(
@@ -338,7 +338,7 @@ def main():
         # Fall back to direct PostgreSQL access
         logger.info("Using direct PostgreSQL connection...")
         try:
-            from llmbothub.memory.postgresql import PostgreSQLMemoryBackend
+            from llm_bawt.memory.postgresql import PostgreSQLMemoryBackend
             from sqlalchemy import text
             
             pg_backend = PostgreSQLMemoryBackend(config, bot_id=args.bot)
@@ -389,15 +389,15 @@ def main():
     logger.info(f"Loading model: {model}")
     
     try:
-        # Create LLMBotHub instance to get the client
-        llmbothub = LLMBotHub(
+        # Create LLMBawt instance to get the client
+        llm_bawt = LLMBawt(
             resolved_model_alias=model,
             config=config,
             bot_id=args.bot,
             user_id=args.user,
             local_mode=True,  # Don't need database for this
         )
-        llm_client = llmbothub.client
+        llm_client = llm_bawt.client
     except Exception as e:
         logger.error(f"Failed to load model: {e}")
         import traceback
