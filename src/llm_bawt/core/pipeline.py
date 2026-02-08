@@ -347,9 +347,58 @@ class RequestPipeline:
         })
     
     def _stage_memory_retrieval(self, ctx: PipelineContext):
-        """Stage 3: Retrieve relevant memories (for non-tool bots)."""
-        # Tool bots search memories via tool calls, not upfront injection
-        if ctx.use_tools or not ctx.use_memory or not self.memory_client:
+        """Stage 3: Retrieve relevant memories.
+
+        For non-tool bots: full memory injection into system prompt.
+        For tool bots with sparse history (cold-start): inject a few
+        key memories so the model has immediate user context.
+        """
+        if not ctx.use_memory or not self.memory_client:
+            return
+
+        # Tool bots: only inject cold-start memories (sparse history)
+        if ctx.use_tools:
+            history_count = len(self.history_manager.messages) if self.history_manager else 0
+            if history_count > 3:
+                # Enough history — let the model use memory tool on-demand
+                return
+            # Cold-start: inject a small number of memories
+            try:
+                from .prompt_builder import SectionPosition
+                results = self.memory_client.search(
+                    ctx.prompt, n_results=3,
+                    min_relevance=self.config.MEMORY_MIN_RELEVANCE,
+                )
+                if results:
+                    memories = [
+                        {"content": m.content, "relevance": m.relevance,
+                         "tags": m.tags, "importance": m.importance}
+                        for m in results
+                    ]
+                    from ..memory.context_builder import build_memory_context_string
+                    user_name = None
+                    if self.profile_manager:
+                        try:
+                            from ..profiles import EntityType
+                            profile, _ = self.profile_manager.get_or_create_profile(
+                                EntityType.USER, ctx.user_id
+                            )
+                            user_name = profile.display_name
+                        except Exception:
+                            pass
+                    cold_ctx = build_memory_context_string(memories, user_name=user_name)
+                    if cold_ctx and ctx.prompt_builder:
+                        ctx.prompt_builder.add_section(
+                            "cold_start_memory",
+                            cold_ctx,
+                            position=SectionPosition.MEMORY_CONTEXT,
+                        )
+                        logger.debug(
+                            f"Cold-start memory priming: {len(memories)} memories "
+                            f"({len(cold_ctx)} chars)"
+                        )
+            except Exception as e:
+                logger.warning(f"Cold-start memory retrieval failed: {e}")
             return
         
         try:
@@ -566,14 +615,13 @@ class RequestPipeline:
                     "system", f"[Tool Results]\n{ctx.tool_context}"
                 )
         
-        # Trigger memory extraction for non-tool bots
-        # (Tool bots store memories via explicit tool calls)
-        if ctx.use_memory and not ctx.use_tools and self.memory_client:
+        # Trigger memory extraction for all memory-enabled bots
+        if ctx.use_memory and self.memory_client:
             self._trigger_memory_extraction(ctx)
         
         ctx.record_output(PipelineStage.POST_PROCESS, {
             "saved_to_history": self.history_manager is not None,
-            "extraction_triggered": ctx.use_memory and not ctx.use_tools,
+            "extraction_triggered": ctx.use_memory and self.memory_client is not None,
         })
     
     def _trigger_memory_extraction(self, ctx: PipelineContext):
