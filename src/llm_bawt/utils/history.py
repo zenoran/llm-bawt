@@ -15,6 +15,23 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+def estimate_tokens(text: str) -> int:
+    """Rough token estimate for a text string.
+
+    Uses ~4 chars per token as a fast heuristic, within 10-15%
+    of tiktoken for English text. No external dependencies.
+    """
+    return len(text) // 4
+
+
+def estimate_messages_tokens(messages: list) -> int:
+    """Estimate total tokens for a list of Message objects.
+
+    Adds a small per-message overhead for role/framing.
+    """
+    return sum(len(m.content) // 4 + 4 for m in messages)
+
+
 class HistoryManager:
     messages: list[Message] = []
     client: LLMClient
@@ -159,19 +176,17 @@ class HistoryManager:
         protected = recent_messages[-n_protected:] if n_protected > 0 else []
         droppable = recent_messages[:-n_protected] if n_protected > 0 else list(recent_messages)
 
-        def _estimate_tokens(msgs: list[Message]) -> int:
-            # ~4 chars per token + per-message overhead
-            return sum(len(m.content) // 4 + 4 for m in msgs)
-
         # Calculate baseline usage (system + protected)
-        used = _estimate_tokens(system_messages) + _estimate_tokens(protected)
+        system_cost = estimate_messages_tokens(system_messages)
+        protected_cost = estimate_messages_tokens(protected)
+        used = system_cost + protected_cost
         budget = max_tokens
 
         # Fill from summaries (oldest context → newest)
         included_summaries: list[Message] = []
         max_summaries = getattr(self.config, 'SUMMARIZATION_MAX_IN_CONTEXT', 5)
         for s in summary_messages[-max_summaries:]:
-            cost = _estimate_tokens([s])
+            cost = estimate_messages_tokens([s])
             if used + cost <= budget:
                 included_summaries.append(s)
                 used += cost
@@ -179,7 +194,7 @@ class HistoryManager:
         # Fill droppable messages (newest-first to keep recent context)
         included_droppable: list[Message] = []
         for msg in reversed(droppable):
-            cost = _estimate_tokens([msg])
+            cost = estimate_messages_tokens([msg])
             if used + cost <= budget:
                 included_droppable.insert(0, msg)  # Maintain chronological order
                 used += cost
@@ -187,12 +202,17 @@ class HistoryManager:
                 # Once we can't fit one, stop (all remaining are older)
                 break
 
-        if len(included_droppable) < len(droppable):
-            dropped = len(droppable) - len(included_droppable)
-            logger.debug(
-                f"Token budget ({max_tokens}): dropped {dropped} oldest messages, "
-                f"kept {len(included_droppable)} droppable + {len(protected)} protected"
-            )
+        dropped = len(droppable) - len(included_droppable)
+        summary_cost = estimate_messages_tokens(included_summaries)
+        droppable_cost = estimate_messages_tokens(included_droppable)
+
+        logger.debug(
+            f"Token budget: {budget} total | "
+            f"system={system_cost}, protected={protected_cost} ({len(protected)} msgs), "
+            f"summaries={summary_cost} ({len(included_summaries)} of {len(summary_messages)}), "
+            f"history={droppable_cost} ({len(included_droppable)} msgs, {dropped} dropped) | "
+            f"used={used}"
+        )
 
         return system_messages + included_summaries + included_droppable + protected
     

@@ -105,20 +105,26 @@ MEMORY_TOOL = Tool(
     ]
 )
 
-# History tool - combines search_history, get_recent_history, forget_history
+# History tool - combines search_history, get_recent_history, forget_history, recall
 HISTORY_TOOL = Tool(
     name="history",
-    description="Search, retrieve, or forget conversation messages. Use action='search' for keywords, 'recent' for date-based or last-N retrieval, 'forget' to delete.",
+    description="Search, retrieve, recall, or forget conversation messages. Use action='search' for keywords, 'recent' for date-based or last-N retrieval, 'recall' to expand a summary back to full messages, 'forget' to delete.",
     parameters=[
         ToolParameter(
             name="action",
             type="string",
-            description="'search', 'recent', or 'forget'"
+            description="'search', 'recent', 'recall', or 'forget'"
         ),
         ToolParameter(
             name="query",
             type="string",
             description="Keywords to search (for search). Omit for date-only retrieval with since/until (uses action='recent').",
+            required=False
+        ),
+        ToolParameter(
+            name="summary_id",
+            type="string",
+            description="Database ID of a summary message to expand back to full messages (for recall)",
             required=False
         ),
         ToolParameter(
@@ -401,6 +407,11 @@ Output the <tool_call> block IMMEDIATELY when needed, then STOP and wait for <to
 - TRUST tool results exactly - never contradict them
 - Before saying "I don't know" about the user: check system prompt "About the User" section, then use memory action=search
 - For date-based history queries: use ISO format dates (e.g., since="{yesterday}", until="{current_date}")
+
+### Working from summaries:
+- Older conversations may appear as summaries in your context (role='summary')
+- If you're referencing a summarized conversation and need more detail, tell the user: "I have a summary of that conversation but not the details — want me to pull up the full messages?"
+- If they say yes, use history action='recall' with the summary's ID to expand it back to the original messages
 
 {SELF_DEVELOPMENT_GUIDANCE}
 '''

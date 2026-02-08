@@ -70,6 +70,7 @@ def get_message_table_pg(bot_id: str) -> Table:
         Column("session_id", String(36), nullable=True),  # For grouping conversations
         Column("processed", Boolean, default=False),  # Whether memory extraction has run
         Column("summarized", Boolean, default=False),  # Whether this message is included in a summary
+        Column("recalled_history", Boolean, default=False),  # Whether this message was re-inserted via recall tool
         Column("summary_metadata", JSON, nullable=True),  # For role='summary' rows only
         Column("created_at", DateTime, default=datetime.utcnow),
         extend_existing=True
@@ -1959,7 +1960,7 @@ class PostgreSQLShortTermManager:
                 # Query: get recent messages OR summaries of older sessions
                 # Exclude old messages that have been summarized
                 sql = text(f"""
-                    SELECT role, content, timestamp
+                    SELECT id, role, content, timestamp
                     FROM {self._backend._messages_table_name}
                     WHERE
                         -- Recent messages (within history window)
@@ -1971,10 +1972,8 @@ class PostgreSQLShortTermManager:
                 """)
                 rows = conn.execute(sql, {"cutoff": cutoff}).fetchall()
 
-                # Filter out recent messages that are summarized
-                # (shouldn't happen normally, but be safe)
                 return [
-                    Message(role=row.role, content=row.content, timestamp=row.timestamp)
+                    Message(role=row.role, content=row.content, timestamp=row.timestamp, db_id=row.id)
                     for row in rows
                 ]
             else:
@@ -1992,7 +1991,7 @@ class PostgreSQLShortTermManager:
                     rows = session.execute(stmt).fetchall()
 
                     return [
-                        Message(role=row.role, content=row.content, timestamp=row.timestamp)
+                        Message(role=row.role, content=row.content, timestamp=row.timestamp, db_id=row.id)
                         for row in rows
                     ]
 
@@ -2023,3 +2022,70 @@ class PostgreSQLShortTermManager:
                 session.commit()
                 return True
             return False
+
+    def get_messages_for_summary(self, summary_id: str) -> list:
+        """Get the original raw messages that a summary covers.
+
+        Finds the summary by ID, extracts its timestamp range from
+        summary_metadata, and returns all user/assistant messages in
+        that range.
+
+        Args:
+            summary_id: Database ID of the summary row.
+
+        Returns:
+            List of Message objects, or empty list if not found.
+        """
+        from ..models.message import Message
+
+        with self._backend.engine.connect() as conn:
+            # Get the summary row
+            sql = text(f"""
+                SELECT id, timestamp, summary_metadata
+                FROM {self._backend._messages_table_name}
+                WHERE id = :id AND role = 'summary'
+            """)
+            row = conn.execute(sql, {"id": summary_id}).fetchone()
+            if not row:
+                return []
+
+            # Determine the time range from metadata or estimate from surrounding summaries
+            meta = row.summary_metadata or {}
+            start_ts = meta.get("start_timestamp", row.timestamp - 7200)
+            end_ts = meta.get("end_timestamp", row.timestamp)
+
+            # Fetch raw messages in this time range
+            msgs_sql = text(f"""
+                SELECT id, role, content, timestamp
+                FROM {self._backend._messages_table_name}
+                WHERE role IN ('user', 'assistant')
+                  AND timestamp >= :start AND timestamp <= :end
+                ORDER BY timestamp ASC
+            """)
+            rows = conn.execute(msgs_sql, {"start": start_ts, "end": end_ts}).fetchall()
+            return [
+                Message(role=r.role, content=r.content, timestamp=r.timestamp, db_id=r.id)
+                for r in rows
+            ]
+
+    def mark_messages_recalled(self, message_ids: list[str]) -> int:
+        """Mark messages as recalled (re-inserted from summary expansion).
+
+        Args:
+            message_ids: List of database IDs to mark.
+
+        Returns:
+            Number of rows updated.
+        """
+        if not message_ids:
+            return 0
+
+        with self._backend.engine.connect() as conn:
+            sql = text(f"""
+                UPDATE {self._backend._messages_table_name}
+                SET recalled_history = TRUE
+                WHERE id = ANY(:ids)
+            """)
+            result = conn.execute(sql, {"ids": message_ids})
+            conn.commit()
+            return result.rowcount

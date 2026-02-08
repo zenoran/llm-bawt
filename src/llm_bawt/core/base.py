@@ -17,7 +17,6 @@ import threading
 import uuid
 from abc import ABC, abstractmethod
 from datetime import datetime
-from difflib import SequenceMatcher
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -42,11 +41,6 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 console = Console()
-
-
-def _text_similarity(text1: str, text2: str) -> float:
-    """Calculate similarity ratio between two strings."""
-    return SequenceMatcher(None, text1, text2).ratio()
 
 
 class BaseLLMBawt(ABC):
@@ -319,16 +313,22 @@ class BaseLLMBawt(ABC):
             # Build context and execute via pipeline or direct method
             context_messages = self._build_context_messages(prompt)
             
-            # Use tool loop if bot has tools enabled
-            if self.bot.uses_tools and self.memory:
-                tool_definitions = self._get_tool_definitions()
+            # Use tool loop if bot has tools enabled (full tools or read-only memory)
+            use_tools = (self.bot.uses_tools and self.memory) or (self.memory and not self.bot.uses_tools)
+            if use_tools:
+                if self.bot.uses_tools:
+                    tool_definitions = self._get_tool_definitions()
+                else:
+                    # Non-tool memory bots get read-only memory search only
+                    from ..tools.definitions import MEMORY_TOOL
+                    tool_definitions = [MEMORY_TOOL]
                 assistant_response, tool_context, tool_call_details = query_with_tools(
                     messages=context_messages,
                     client=self.client,
                     memory_client=self.memory,
                     profile_manager=self.profile_manager,
-                    search_client=self.search_client,
-                    model_lifecycle=self.model_lifecycle,
+                    search_client=self.search_client if self.bot.uses_tools else None,
+                    model_lifecycle=self.model_lifecycle if self.bot.uses_tools else None,
                     config=self.config,
                     user_id=self.user_id,
                     bot_id=self.bot_id,
@@ -347,7 +347,9 @@ class BaseLLMBawt(ABC):
 
                 # Save tool context to history
                 if tool_context:
-                    self.history_manager.add_message("system", f"[Tool Results]\n{tool_context}")
+                    from datetime import datetime
+                    ts = datetime.now().strftime("%Y-%m-%d %H:%M")
+                    self.history_manager.add_message("system", f"[Tool Results @ {ts}]\n{tool_context}")
             else:
                 assistant_response = self.client.query(
                     context_messages,
@@ -385,7 +387,7 @@ class BaseLLMBawt(ABC):
         # Start with a copy of the prompt builder
         builder = self._prompt_builder.copy()
         
-        # Add tool instructions OR memory context
+        # Add tool instructions
         if self.bot.uses_tools and self.memory:
             tool_definitions = self._get_tool_definitions()
             tools_prompt = get_tools_prompt(
@@ -397,8 +399,21 @@ class BaseLLMBawt(ABC):
                 tools_prompt,
                 position=SectionPosition.TOOLS,
             )
-            # Cold-start memory priming: inject top memories when history is thin
-            # This gives the model immediate context about the user on first interaction
+        elif self.memory:
+            # Non-tool memory bots get a read-only memory search tool
+            from ..tools.definitions import MEMORY_TOOL
+            tools_prompt = get_tools_prompt(
+                tools=[MEMORY_TOOL],
+                tool_format=self.tool_format,
+            )
+            builder.add_section(
+                "tools",
+                tools_prompt,
+                position=SectionPosition.TOOLS,
+            )
+
+        # Cold-start memory priming: inject top memories when history is thin
+        if self.memory:
             history_count = len(self.history_manager.messages)
             if history_count <= 3:
                 cold_start_context = self._retrieve_cold_start_memories(prompt)
@@ -408,15 +423,6 @@ class BaseLLMBawt(ABC):
                         cold_start_context,
                         position=SectionPosition.MEMORY_CONTEXT,
                     )
-        elif self.memory:
-            # Retrieve and add memory context
-            memory_context = self._retrieve_memory_context(prompt)
-            if memory_context:
-                builder.add_section(
-                    "memory_context",
-                    memory_context,
-                    position=SectionPosition.MEMORY_CONTEXT,
-                )
         
         # Build final system message
         system_content = builder.build()
@@ -427,32 +433,20 @@ class BaseLLMBawt(ABC):
             logger.debug(f"System message: {len(system_content)} chars")
             logger.debug(f"Sections: {[s.name for s in builder.enabled_sections]}")
         
-        # Determine if we should include history
-        include_history = True
-        if self.bot.uses_tools and self.memory:
-            if getattr(self.config, "TOOLS_SKIP_HISTORY", True):
-                include_history = not self._should_skip_history(prompt)
-        
-        if include_history:
-            # Compute token budget from the client's effective context window
-            max_context_tokens = getattr(self.config, 'MAX_CONTEXT_TOKENS', 0)
-            if max_context_tokens <= 0 and self.client:
-                ctx_window = getattr(self.client, 'effective_context_window', 0)
-                if ctx_window > 0:
-                    max_output = getattr(self.client, 'effective_max_tokens', 4096)
-                    max_context_tokens = ctx_window - max_output
+        # Always include history — two-layer architecture handles context overflow
+        max_context_tokens = getattr(self.config, 'MAX_CONTEXT_TOKENS', 0)
+        if max_context_tokens <= 0 and self.client:
+            ctx_window = getattr(self.client, 'effective_context_window', 0)
+            if ctx_window > 0:
+                max_output = getattr(self.client, 'effective_max_tokens', 4096)
+                max_context_tokens = ctx_window - max_output
 
-            history = self.history_manager.get_context_messages(
-                max_tokens=max_context_tokens
-            )
-            for msg in history:
-                # Include user, assistant, and summary messages (summary → system for API)
-                if msg.role in ("user", "assistant", "summary"):
-                    messages.append(msg)
-        else:
-            # Always include current prompt when history is skipped
-            if prompt:
-                messages.append(Message(role="user", content=prompt))
+        history = self.history_manager.get_context_messages(
+            max_tokens=max_context_tokens
+        )
+        for msg in history:
+            if msg.role in ("user", "assistant", "summary"):
+                messages.append(msg)
         
         return messages
 
@@ -463,76 +457,6 @@ class BaseLLMBawt(ABC):
             include_search_tools=include_search,
             include_model_tools=include_models,
         )
-    
-    def _should_skip_history(self, prompt: str) -> bool:
-        """Return True if history should be skipped for this prompt."""
-        prompt_lower = (prompt or "").lower()
-        search_triggers = (
-            "search", "web_search", "news", "current", "today",
-            "latest", "now", "date", "time", "headline",
-        )
-        return any(token in prompt_lower for token in search_triggers)
-    
-    def _retrieve_memory_context(self, prompt: str) -> str:
-        """Retrieve relevant memories and format as context string."""
-        if not self.memory:
-            return ""
-        
-        try:
-            n_results = self.config.MEMORY_N_RESULTS
-            min_relevance = self.config.MEMORY_MIN_RELEVANCE
-            
-            memory_results = self.memory.search(
-                prompt, n_results=n_results, min_relevance=min_relevance
-            )
-            
-            if not memory_results:
-                return ""
-            
-            # Convert to dicts
-            memories = [
-                {
-                    "content": m.content,
-                    "relevance": m.relevance,
-                    "tags": m.tags,
-                    "importance": m.importance,
-                }
-                for m in memory_results
-            ]
-            
-            # Deduplicate against recent history
-            history_contents = [msg.content for msg in self.history_manager.messages[-10:]]
-            unique_memories = []
-            for mem in memories:
-                is_dup = any(
-                    _text_similarity(mem["content"], h) >= self.config.MEMORY_DEDUP_SIMILARITY
-                    for h in history_contents
-                )
-                if not is_dup:
-                    unique_memories.append(mem)
-            
-            if not unique_memories:
-                return ""
-            
-            # Format as context string
-            from ..memory.context_builder import build_memory_context_string
-            
-            # Get user's display name
-            user_name = None
-            if self.profile_manager:
-                try:
-                    profile, _ = self.profile_manager.get_or_create_profile(
-                        EntityType.USER, self.user_id
-                    )
-                    user_name = profile.display_name
-                except Exception:
-                    pass
-            
-            return build_memory_context_string(unique_memories, user_name=user_name)
-            
-        except Exception as e:
-            logger.warning(f"Memory retrieval failed: {e}")
-            return ""
     
     def _retrieve_cold_start_memories(self, prompt: str) -> str:
         """Retrieve a small set of high-importance memories for cold-start context.

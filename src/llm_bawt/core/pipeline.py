@@ -310,9 +310,7 @@ class RequestPipeline:
                 position=SectionPosition.BASE_PROMPT,
             )
         
-        # Section 4: Tools OR Memory context (mutually exclusive)
-        # Tool bots let the LLM search memories via tools; non-tool bots get
-        # memories injected directly
+        # Section 4: Tools (full set for tool bots, read-only memory for non-tool memory bots)
         if ctx.use_tools:
             from ..tools import get_tools_prompt, get_tools_list
             include_models = self.model_lifecycle is not None
@@ -334,7 +332,26 @@ class RequestPipeline:
                 tools_prompt,
                 position=SectionPosition.TOOLS,
             )
-        # Memory context is added in MEMORY_RETRIEVAL stage for non-tool bots
+        elif ctx.use_memory and self.memory_client:
+            # Non-tool memory bots get a read-only memory search tool
+            # so they can search memories on-demand instead of upfront injection
+            from ..tools import get_tools_prompt
+            from ..tools.definitions import MEMORY_TOOL
+            tool_format = self.config.get_tool_format(
+                model_alias=getattr(self.llm_client, "model_alias", None)
+            )
+            ctx.tool_format = tool_format
+            ctx.tool_definitions = [MEMORY_TOOL]
+            ctx.use_tools = True  # Enable tool loop for execution
+            tools_prompt = get_tools_prompt(
+                tools=[MEMORY_TOOL],
+                tool_format=tool_format,
+            )
+            builder.add_section(
+                "tools",
+                tools_prompt,
+                position=SectionPosition.TOOLS,
+            )
         
         ctx.prompt_builder = builder
         
@@ -348,175 +365,82 @@ class RequestPipeline:
         })
     
     def _stage_memory_retrieval(self, ctx: PipelineContext):
-        """Stage 3: Retrieve relevant memories.
+        """Stage 3: Cold-start memory priming for all memory-enabled bots.
 
-        For non-tool bots: full memory injection into system prompt.
-        For tool bots with sparse history (cold-start): inject a few
-        key memories so the model has immediate user context.
+        All memory bots use on-demand memory search via tools. This stage
+        only injects a small number of memories when history is sparse
+        (cold-start), giving the model immediate user context.
         """
         if not ctx.use_memory or not self.memory_client:
             return
 
-        # Tool bots: only inject cold-start memories (sparse history)
-        if ctx.use_tools:
-            history_count = len(self.history_manager.messages) if self.history_manager else 0
-            if history_count > 3:
-                # Enough history — let the model use memory tool on-demand
-                return
-            # Cold-start: inject a small number of memories
-            try:
-                from .prompt_builder import SectionPosition
-                results = self.memory_client.search(
-                    ctx.prompt, n_results=3,
-                    min_relevance=self.config.MEMORY_MIN_RELEVANCE,
-                )
-                if results:
-                    memories = [
-                        {"content": m.content, "relevance": m.relevance,
-                         "tags": m.tags, "importance": m.importance}
-                        for m in results
-                    ]
-                    from ..memory.context_builder import build_memory_context_string
-                    user_name = None
-                    if self.profile_manager:
-                        try:
-                            from ..profiles import EntityType
-                            profile, _ = self.profile_manager.get_or_create_profile(
-                                EntityType.USER, ctx.user_id
-                            )
-                            user_name = profile.display_name
-                        except Exception:
-                            pass
-                    cold_ctx = build_memory_context_string(memories, user_name=user_name)
-                    if cold_ctx and ctx.prompt_builder:
-                        ctx.prompt_builder.add_section(
-                            "cold_start_memory",
-                            cold_ctx,
-                            position=SectionPosition.MEMORY_CONTEXT,
-                        )
-                        logger.debug(
-                            f"Cold-start memory priming: {len(memories)} memories "
-                            f"({len(cold_ctx)} chars)"
-                        )
-            except Exception as e:
-                logger.warning(f"Cold-start memory retrieval failed: {e}")
+        history_count = len(self.history_manager.messages) if self.history_manager else 0
+        if history_count > 3:
+            # Enough history — let the model use memory tool on-demand
             return
-        
+
+        # Cold-start: inject a small number of memories
         try:
             from .prompt_builder import SectionPosition
-            
-            n_results = self.config.MEMORY_N_RESULTS
-            min_relevance = self.config.MEMORY_MIN_RELEVANCE
-            
-            memory_results = self.memory_client.search(
-                ctx.prompt,
-                n_results=n_results,
-                min_relevance=min_relevance,
+            results = self.memory_client.search(
+                ctx.prompt, n_results=3,
+                min_relevance=self.config.MEMORY_MIN_RELEVANCE,
             )
-            
-            if memory_results:
-                # Convert to dicts
+            if results:
                 memories = [
-                    {
-                        "content": m.content,
-                        "relevance": m.relevance,
-                        "tags": m.tags,
-                        "importance": m.importance,
-                    }
-                    for m in memory_results
+                    {"content": m.content, "relevance": m.relevance,
+                     "tags": m.tags, "importance": m.importance}
+                    for m in results
                 ]
-                
-                # Deduplicate against recent history
-                if self.history_manager:
-                    history_contents = [
-                        msg.content for msg in self.history_manager.messages[-10:]
-                    ]
-                    unique_memories = []
-                    from difflib import SequenceMatcher
-                    threshold = self.config.MEMORY_DEDUP_SIMILARITY
-                    for mem in memories:
-                        is_dup = any(
-                            SequenceMatcher(None, mem["content"], h).ratio() >= threshold
-                            for h in history_contents
+                from ..memory.context_builder import build_memory_context_string
+                user_name = None
+                if self.profile_manager:
+                    try:
+                        from ..profiles import EntityType
+                        profile, _ = self.profile_manager.get_or_create_profile(
+                            EntityType.USER, ctx.user_id
                         )
-                        if not is_dup:
-                            unique_memories.append(mem)
-                    memories = unique_memories
-                
-                if memories:
-                    from ..memory.context_builder import build_memory_context_string
-                    
-                    # Get user's display name
-                    user_name = None
-                    if self.profile_manager:
-                        try:
-                            from ..profiles import EntityType
-                            profile, _ = self.profile_manager.get_or_create_profile(
-                                EntityType.USER, ctx.user_id
-                            )
-                            user_name = profile.display_name
-                        except Exception:
-                            pass
-                    
-                    ctx.memory_context = build_memory_context_string(
-                        memories, user_name=user_name
+                        user_name = profile.display_name
+                    except Exception:
+                        pass
+                cold_ctx = build_memory_context_string(memories, user_name=user_name)
+                if cold_ctx and ctx.prompt_builder:
+                    ctx.prompt_builder.add_section(
+                        "cold_start_memory",
+                        cold_ctx,
+                        position=SectionPosition.MEMORY_CONTEXT,
                     )
-                    ctx.memory_results = memories
-                    
-                    # Add to prompt builder
-                    if ctx.prompt_builder:
-                        ctx.prompt_builder.add_section(
-                            "memory_context",
-                            ctx.memory_context,
-                            position=SectionPosition.MEMORY_CONTEXT,
-                        )
-                    
-                    if self.verbose:
-                        logger.info(f"Retrieved {len(memories)} memories")
-                        
+                    logger.debug(
+                        f"Cold-start memory priming: {len(memories)} memories "
+                        f"({len(cold_ctx)} chars)"
+                    )
         except Exception as e:
-            logger.warning(f"Memory retrieval failed: {e}")
-        
+            logger.warning(f"Cold-start memory retrieval failed: {e}")
+
         ctx.record_output(PipelineStage.MEMORY_RETRIEVAL, {
+            "cold_start": True,
             "memory_count": len(ctx.memory_results),
-            "context_size": len(ctx.memory_context),
         })
     
     def _stage_history_filter(self, ctx: PipelineContext):
-        """Stage 4: Decide what conversation history to include."""
+        """Stage 4: Decide what conversation history to include.
+
+        History is always included. The two-layer architecture (raw messages +
+        summaries) with token budgeting handles context overflow properly.
+        """
         ctx.include_history = True
-        
-        # For tool bots, optionally skip history for search-like prompts
-        # to avoid stale tool outputs polluting context
-        if ctx.use_tools and getattr(self.config, "TOOLS_SKIP_HISTORY", True):
-            ctx.skip_history = self._should_skip_history(ctx.prompt)
-            ctx.include_history = not ctx.skip_history
-        
-        # Apply override if set
+
+        # Apply override if set (for testing)
         if "skip_history" in self._decision_overrides:
             ctx.skip_history = self._decision_overrides["skip_history"]
             ctx.include_history = not ctx.skip_history
-        
+
         if self.debug:
             logger.debug(f"  include_history={ctx.include_history}")
-        
+
         ctx.record_output(PipelineStage.HISTORY_FILTER, {
             "include_history": ctx.include_history,
-            "skip_reason": "search_triggers" if ctx.skip_history else None,
         })
-    
-    def _should_skip_history(self, prompt: str) -> bool:
-        """Check if history should be skipped for this prompt.
-        
-        We skip history for search-like requests to prevent stale tool results
-        from polluting context.
-        """
-        prompt_lower = (prompt or "").lower()
-        search_triggers = (
-            "search", "web_search", "news", "current", "today",
-            "latest", "now", "date", "time", "headline",
-        )
-        return any(token in prompt_lower for token in search_triggers)
     
     def _stage_message_assembly(self, ctx: PipelineContext):
         """Stage 5: Assemble final messages list."""
@@ -623,10 +547,12 @@ class RequestPipeline:
         if self.history_manager:
             self.history_manager.add_message("assistant", ctx.response)
             
-            # Save tool context if present
+            # Save tool context if present (with timestamp for freshness)
             if ctx.tool_context:
+                from datetime import datetime
+                ts = datetime.now().strftime("%Y-%m-%d %H:%M")
                 self.history_manager.add_message(
-                    "system", f"[Tool Results]\n{ctx.tool_context}"
+                    "system", f"[Tool Results @ {ts}]\n{ctx.tool_context}"
                 )
         
         # Trigger memory extraction for all memory-enabled bots
