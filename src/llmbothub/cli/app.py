@@ -1688,13 +1688,11 @@ def run_app(args: argparse.Namespace, config_obj: Config, resolved_alias: str):
             if effective_model_type and effective_model_type != "openai":
                 if use_tools:
                     console.print(
-                        f"[bold red]Error: Tool usage with local models requires the background service.[/bold red]{error_detail}"
+                        f"[bold red]Service call failed for model '{resolved_alias}' (bot '{bot_id}').[/bold red]{error_detail}"
                     )
-                    console.print("[yellow]Start the service with:[/yellow] llm-service")
-                    console.print("[yellow]Or use an OpenAI-compatible model:[/yellow] llm -m gpt4o -b proto")
                 else:
                     console.print(
-                        f"[bold red]Service unavailable for local model. Start the service or use an OpenAI-compatible model.[/bold red]{error_detail}"
+                        f"[bold red]Service call failed for model '{resolved_alias}' (bot '{bot_id}').[/bold red]{error_detail}"
                     )
                 return
             # Fall back to local for OpenAI-compatible models

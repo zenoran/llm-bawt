@@ -296,6 +296,12 @@ class PostgreSQLMemoryBackend(MemoryBackend):
                 ADD COLUMN IF NOT EXISTS summarized BOOLEAN DEFAULT FALSE,
                 ADD COLUMN IF NOT EXISTS summary_metadata JSONB
             """)
+
+            # Migration: add recalled_history column to messages table
+            add_recalled_history_sql = text(f"""
+                ALTER TABLE {self._messages_table_name}
+                ADD COLUMN IF NOT EXISTS recalled_history BOOLEAN DEFAULT FALSE
+            """)
             
             try:
                 conn.execute(messages_sql)
@@ -318,6 +324,10 @@ class PostgreSQLMemoryBackend(MemoryBackend):
                     conn.execute(add_summarization_cols_sql)
                 except Exception:
                     pass  # Columns may already exist
+                try:
+                    conn.execute(add_recalled_history_sql)
+                except Exception:
+                    pass  # Column may already exist
                 conn.commit()
                 
                 # Create indexes

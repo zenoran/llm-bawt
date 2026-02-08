@@ -152,6 +152,14 @@ class ServiceClient:
             host = url
             port = DEFAULT_HTTP_PORT
         return host, port
+
+    def _format_http_error(self, method: str, url: str, status: int | None = None, body: str | None = None) -> str:
+        parts = [f"{method} {url}"]
+        if status is not None:
+            parts.append(f"HTTP {status}")
+        if body:
+            parts.append(body)
+        return " | ".join(parts)
     
     def _is_local_url(self) -> bool:
         """Check if URL points to localhost."""
@@ -275,7 +283,8 @@ class ServiceClient:
                 self.last_error = None  # Clear on success
                 return response
         except Exception as e:
-            self.last_error = str(e)
+            if not self.last_error:
+                self.last_error = str(e)
             logger.warning(f"Chat completion via service failed: {e}")
             return None
     
@@ -328,11 +337,11 @@ class ServiceClient:
                 error_body = e.read().decode()[:500]  # Read error body, limit size
             except Exception:
                 pass
-            self.last_error = f"HTTP {e.code}: {error_body}" if error_body else f"HTTP {e.code}"
+            self.last_error = self._format_http_error("POST", url, e.code, error_body)
             logger.warning(f"Service streaming failed: {self.last_error}")
             return
         except Exception as e:
-            self.last_error = str(e)
+            self.last_error = self._format_http_error("POST", url, None, str(e))
             logger.warning(f"Service streaming failed: {e}")
             return
     
@@ -375,6 +384,7 @@ class ServiceClient:
         """Make a request to the service."""
         import urllib.request
         import urllib.parse
+        import urllib.error
         
         url = f"{self.http_url}{path}"
         if params:
@@ -384,9 +394,20 @@ class ServiceClient:
         body = json.dumps(data).encode() if data else None
         
         req = urllib.request.Request(url, data=body, headers=headers, method=method)
-        
-        with urllib.request.urlopen(req, timeout=self.timeout) as resp:
-            return json.loads(resp.read().decode())
+        try:
+            with urllib.request.urlopen(req, timeout=self.timeout) as resp:
+                return json.loads(resp.read().decode())
+        except urllib.error.HTTPError as e:
+            error_body = ""
+            try:
+                error_body = e.read().decode()[:500]
+            except Exception:
+                pass
+            self.last_error = self._format_http_error(method, url, e.code, error_body)
+            raise
+        except Exception as e:
+            self.last_error = self._format_http_error(method, url, None, str(e))
+            raise
     
     async def _request_async(
         self,
@@ -408,8 +429,15 @@ class ServiceClient:
                 resp = await client.post(url, json=data, params=params)
             else:
                 raise ValueError(f"Unsupported method: {method}")
-            
-            resp.raise_for_status()
+            try:
+                resp.raise_for_status()
+            except httpx.HTTPStatusError as e:
+                body = e.response.text[:500] if e.response is not None else ""
+                self.last_error = self._format_http_error(method, url, e.response.status_code if e.response else None, body)
+                raise
+            except Exception as e:
+                self.last_error = self._format_http_error(method, url, None, str(e))
+                raise
             return resp.json()
     
     async def submit_task_async(self, task: Task) -> bool:

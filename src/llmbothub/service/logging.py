@@ -147,7 +147,8 @@ def setup_service_logging(verbose: bool = False, debug: bool = False) -> None:
         os.makedirs(log_dir, exist_ok=True)
         log_path = os.path.join(log_dir, "llm-service.debug.log")
         try:
-            with open(log_path, "a", encoding="utf-8"):
+            # Truncate the log file on restart
+            with open(log_path, "w", encoding="utf-8"):
                 pass
         except OSError as exc:
             print(f"[llmbothub] Failed to open debug log file: {log_path} ({exc})", file=sys.stderr)
@@ -191,7 +192,7 @@ def setup_service_logging(verbose: bool = False, debug: bool = False) -> None:
     for handler in logging.getLogger().handlers:
         handler.addFilter(_PrefixFilter())
         handler.setLevel(console_level)
-    if debug:
+    if verbose or debug:
         _add_debug_file_handler()
 
     # Reduce noise from third-party libraries
@@ -215,6 +216,10 @@ def setup_service_logging(verbose: bool = False, debug: bool = False) -> None:
         "huggingface_hub",
         "huggingface_hub.file_download",
         "tqdm",
+        "mcp",                        # FastMCP internal logs ("Processing request of type ...", "Terminating session: ...")
+        "mcp.server",
+        "mcp.server.lowlevel.server",
+        "mcp.server.streamable_http",
     ]
     
     # In verbose mode, suppress HTTP access logs completely (we log our own summaries)

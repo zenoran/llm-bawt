@@ -44,12 +44,14 @@ ENV LIBRARY_PATH=/usr/local/cuda/lib64/stubs:$LIBRARY_PATH
 RUN ./install.sh --dev --deps-only
 
 # Install llama-cpp-python with CUDA (separate cached layer)
+# Install from GitHub to get latest llama.cpp with newest arch support (e.g. mistral3)
+ARG LLAMA_CPP_CACHE_BUST=3
 RUN if [ "$WITH_CUDA" = "true" ]; then \
         CUDA_ARCHS="${CUDA_ARCHS:-120}" \
         CMAKE_ARGS="-DGGML_CUDA=on -DCMAKE_CUDA_ARCHITECTURES=${CUDA_ARCHS}" \
-        uv pip install llama-cpp-python --reinstall; \
+        uv pip install "llama-cpp-python @ git+https://github.com/abetlen/llama-cpp-python.git" --reinstall; \
     else \
-        uv pip install llama-cpp-python; \
+        uv pip install "llama-cpp-python @ git+https://github.com/abetlen/llama-cpp-python.git"; \
     fi
 
 # NOW copy source code and other files needed for project install
