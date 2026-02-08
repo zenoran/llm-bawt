@@ -96,32 +96,46 @@ class LlamaCppClient(LLMClient):
                     f"[green]Model loaded:[/green] Context={ctx_size}, Batch={n_batch}, FlashAttn={flash_attn}, GPU Layers={gpu_layers if gpu_layers != -1 else 'All'}"
                 )
         except (ValueError, RuntimeError) as e:
-            # Context window too large for available VRAM — retry with halved context
-            if "Failed to create llama_context" in str(e) and n_ctx > 4096:
-                reduced_ctx = max(4096, n_ctx // 2)
-                logger.warning(
-                    f"Context window {n_ctx} too large (VRAM exhausted). "
-                    f"Retrying with {reduced_ctx}..."
-                )
-                self.console.print(
-                    f"[yellow]⚠ Context {n_ctx} too large for available VRAM. "
-                    f"Retrying with {reduced_ctx}...[/yellow]"
-                )
-                model_load_params["n_ctx"] = reduced_ctx
-                try:
-                    with open(os.devnull, 'w') as fnull, contextlib.redirect_stderr(fnull):
-                        self.llm_model = Llama(**model_load_params)
-                    self.console.print(
-                        f"[green]Model loaded with reduced context: {reduced_ctx}[/green]"
+            # Context window too large for available VRAM — retry with smaller values
+            if "Failed to create llama_context" in str(e):
+                # Try progressively smaller context windows
+                fallback_sizes = []
+                global_n_ctx = self.config.LLAMA_CPP_N_CTX  # The value that used to work
+                if n_ctx != global_n_ctx and global_n_ctx > 0:
+                    fallback_sizes.append(global_n_ctx)
+                if n_ctx > 8192:
+                    fallback_sizes.append(8192)
+                if n_ctx > 4096:
+                    fallback_sizes.append(4096)
+                # Deduplicate and only try values smaller than original
+                fallback_sizes = sorted(set(s for s in fallback_sizes if s < n_ctx))
+
+                for fallback_ctx in fallback_sizes:
+                    logger.warning(
+                        f"Context window {n_ctx} failed. Retrying with {fallback_ctx}..."
                     )
-                    # Update the sizing result so the rest of the system knows
-                    if self._context_sizing_result:
-                        self._context_sizing_result.context_window = reduced_ctx
-                        self._context_sizing_result.source = "auto-vram-reduced"
-                except Exception as retry_e:
-                    self.console.print(f"[bold red]Error loading GGUF model {self.model_path}:[/bold red] {retry_e}")
-                    self.console.print("Ensure model path is correct and `llama-cpp-python` is installed with appropriate hardware acceleration (e.g., BLAS, CUDA). Check library docs.")
-                    raise
+                    self.console.print(
+                        f"[yellow]⚠ Context {n_ctx} too large. "
+                        f"Retrying with {fallback_ctx}...[/yellow]"
+                    )
+                    model_load_params["n_ctx"] = fallback_ctx
+                    try:
+                        with open(os.devnull, 'w') as fnull, contextlib.redirect_stderr(fnull):
+                            self.llm_model = Llama(**model_load_params)
+                        self.console.print(
+                            f"[green]Model loaded with context: {fallback_ctx}[/green]"
+                        )
+                        if self._context_sizing_result:
+                            self._context_sizing_result.context_window = fallback_ctx
+                            self._context_sizing_result.source = "fallback-retry"
+                        return  # Success
+                    except (ValueError, RuntimeError):
+                        continue  # Try next smaller size
+
+                # All retries failed
+                self.console.print(f"[bold red]Error loading GGUF model {self.model_path}:[/bold red] {e}")
+                self.console.print("All context window sizes failed. The model may not fit in available VRAM.")
+                raise
             else:
                 self.console.print(f"[bold red]Error loading GGUF model {self.model_path}:[/bold red] {e}")
                 self.console.print("Ensure model path is correct and `llama-cpp-python` is installed with appropriate hardware acceleration (e.g., BLAS, CUDA). Check library docs.")

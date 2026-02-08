@@ -218,10 +218,11 @@ def estimate_max_context_from_vram(
         logger.warning(
             f"Model weights ({weight_bytes / 1e9:.1f}GB) + safety margin "
             f"({safety_margin_gb:.1f}GB) exceed free VRAM ({vram_info.free_gb:.1f}GB). "
-            f"Model may not fit in VRAM."
+            f"Cannot auto-size context window from VRAM."
         )
-        # Return a minimal context window rather than failing
-        return 2048
+        # Return 0 to signal that auto-sizing cannot determine a safe value.
+        # The caller should fall back to global config or a hardcoded default.
+        return 0
 
     kv_bytes_per_token = _estimate_kv_bytes_per_token(model_size_hint, model_file_size_bytes)
     max_tokens = vram_for_kv // kv_bytes_per_token
@@ -316,25 +317,34 @@ def auto_size_context_window(
                 model_size_hint=size_hint,
             )
 
-            result = ContextSizingResult(
-                context_window=auto_ctx,
-                source="auto-vram",
-                vram_info=vram_info,
-                model_file_size_gb=file_size / (1024 ** 3),
-                estimated_kv_budget_gb=(
-                    vram_info.free_bytes - file_size - int(1.5 * 1024 ** 3)
-                ) / (1024 ** 3),
-            )
+            # auto_ctx == 0 means VRAM budget is negative (model barely fits).
+            # Fall through to global config instead of returning a bad value.
+            if auto_ctx > 0:
+                result = ContextSizingResult(
+                    context_window=auto_ctx,
+                    source="auto-vram",
+                    vram_info=vram_info,
+                    model_file_size_gb=file_size / (1024 ** 3),
+                    estimated_kv_budget_gb=(
+                        vram_info.free_bytes - file_size - int(1.5 * 1024 ** 3)
+                    ) / (1024 ** 3),
+                )
 
-            # Apply caps
-            if yaml_context_window and auto_ctx > int(yaml_context_window):
-                result.context_window = int(yaml_context_window)
-                result.source = "model-cap"
-            if native_limit and result.context_window > int(native_limit):
-                result.context_window = int(native_limit)
-                result.source = "native-limit"
+                # Apply caps
+                if yaml_context_window and auto_ctx > int(yaml_context_window):
+                    result.context_window = int(yaml_context_window)
+                    result.source = "model-cap"
+                if native_limit and result.context_window > int(native_limit):
+                    result.context_window = int(native_limit)
+                    result.source = "native-limit"
 
-            return result
+                return result
+            else:
+                logger.info(
+                    f"VRAM auto-sizing returned 0 (insufficient free VRAM for "
+                    f"confident sizing). Falling back to global config "
+                    f"(n_ctx={global_n_ctx})."
+                )
 
     # ── Fallback: no VRAM info or no model path ──
     if yaml_context_window:
