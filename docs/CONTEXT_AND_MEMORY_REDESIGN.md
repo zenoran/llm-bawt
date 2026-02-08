@@ -12,6 +12,22 @@ The fix: per-model context/token configuration, proper token budgeting, and conv
 
 ---
 
+## Progress Summary
+
+*Last updated: 2026-02-08*
+
+| Sprint / Track | Status | Completion |
+|---------------|--------|------------|
+| **Sprint 1**: Per-model config + VRAM detection | ✅ Complete | 8/8 |
+| **Sprint 2 Track A**: Two-layer history | 🔶 In Progress | 5/9 (core assembly done, db_id + refactoring remaining) |
+| **Sprint 2 Track B**: Memory on-demand | 🔶 In Progress | 2/5 (cold-start + extraction done, unification remaining) |
+| **Sprint 2 Track C**: Debug turn log | ✅ Complete | 6/6 |
+| **Sprint 3 Track D**: History cleanup + recall | ⬜ Not Started | 0/6 |
+| **Sprint 3 Track E**: Unified memory output | 🔶 In Progress | 1/3 (formatted text done, context_builder + timestamps remaining) |
+| **Sprint 3 Track F**: Proactive summarization | ⬜ Not Started | 0/7 |
+
+---
+
 ## Phase 1: Per-Model Context & Token Configuration
 
 ### Current State
@@ -425,12 +441,12 @@ TOOL CALLS (3 calls across 2 iterations)
 4. **Include in JSON dump** — add `"tool_calls": [...]` array to the machine-parseable JSON section
 
 ### Phase 5 Checklist
-- [ ] Expand `ToolLoop.tool_context` to store per-call details (tool name, full parameters, result text, iteration)
-- [ ] Update `_write_debug_turn_log` signature to accept tool call data
-- [ ] Add `TOOL CALLS` section to human-readable log output
-- [ ] Add `tool_calls` array to JSON dump section
-- [ ] Pass tool context from `query()` in `base.py` to the debug log writer
-- [ ] Update `service/api.py` debug log writer to match
+- [x] Expand `ToolLoop.tool_context` to store per-call details (tool name, full parameters, result text, iteration)
+- [x] Update `_write_debug_turn_log` signature to accept tool call data
+- [x] Add `TOOL CALLS` section to human-readable log output
+- [x] Add `tool_calls` array to JSON dump section
+- [x] Pass tool context from `query()` in `base.py` to the debug log writer
+- [x] Update `service/api.py` debug log writer to match
 
 ---
 
@@ -445,19 +461,19 @@ TOOL CALLS (3 calls across 2 iterations)
 All downstream work depends on having per-model context windows and VRAM detection in place.
 
 #### Deliverables
-- [ ] VRAM detection utility (`utils/vram.py`) — `torch.cuda` primary, `nvidia-smi` fallback, returns total/free VRAM in bytes
-- [ ] Auto-sizing function: takes VRAM + model file size → max safe context window
-- [ ] `models.yaml` schema additions: `max_tokens`, `n_gpu_layers`, `native_context_limit`, optional `context_window` cap
-- [ ] Config methods: `get_model_context_window(alias)`, `get_model_max_tokens(alias)` with resolution order
-- [ ] `llama_cpp_client.py` reads auto-sized context + per-model overrides
-- [ ] `openai_client.py` reads per-model `max_tokens` and `context_window`
-- [ ] `--status` output shows detected VRAM, auto-sized context, per-model info
-- [ ] Startup logging of VRAM detection and context sizing decisions
+- [x] VRAM detection utility (`utils/vram.py`) — `torch.cuda` primary, `nvidia-smi` fallback, returns total/free VRAM in bytes
+- [x] Auto-sizing function: takes VRAM + model file size → max safe context window
+- [x] `models.yaml` schema additions: `max_tokens`, `n_gpu_layers`, `native_context_limit`, optional `context_window` cap
+- [x] Config methods: `get_model_context_window(alias)`, `get_model_max_tokens(alias)` with resolution order
+- [x] `llama_cpp_client.py` reads auto-sized context + per-model overrides
+- [x] `openai_client.py` reads per-model `max_tokens` and `context_window`
+- [x] `--status` output shows detected VRAM, auto-sized context, per-model info
+- [x] Startup logging of VRAM detection and context sizing decisions (verbose mode via `llama_cpp_client.py`)
 
 #### Integration gate
-- Team lead reviews `utils/vram.py` and resolution order logic
-- Verify on both target machines (32GB 5090, 16GB 5080) if possible
-- Merge to `main` — all Sprint 2 branches fork from here
+- ~~Team lead reviews `utils/vram.py` and resolution order logic~~ ✅ Done
+- ~~Verify on both target machines (32GB 5090, 16GB 5080) if possible~~
+- ~~Merge to `main` — all Sprint 2 branches fork from here~~ ✅ Merged
 
 ---
 
@@ -476,13 +492,13 @@ Core history redesign. This is the biggest piece of work.
 - [ ] Add `db_id` field to `Message` model
 - [ ] Update `PostgreSQLShortTermManager.get_messages()` to return message IDs
 - [ ] Refactor `HistoryManager`: load once at startup, maintain in-memory, no per-turn DB reads
-- [ ] `estimate_tokens()` utility function (`len(text) // 4`)
-- [ ] Model-aware context assembly in `_build_context_messages()`:
-  - Calculate available budget from model's context window
-  - Session-block-to-summary swapping (oldest first)
-  - Graceful degradation: drop oldest summaries when even summaries don't fit
-  - Protect last N turns via `MEMORY_PROTECTED_RECENT_TURNS`
-- [ ] Log token budget breakdown in verbose/debug mode
+- [x] `estimate_tokens()` utility function (`len(text) // 4`) — implemented in `memory/summarization.py` and used in `utils/history.py`
+- [x] Model-aware context assembly in `_build_context_messages()`:
+  - [x] Calculate available budget from model's context window — `base.py` computes `max_context_tokens` from `effective_context_window - effective_max_tokens`
+  - [x] Session-block-to-summary swapping (oldest first) — `history.py` fills summaries first, then droppable messages newest-first
+  - [x] Graceful degradation: drop oldest summaries when even summaries don't fit — implemented with oldest-first dropping
+  - [x] Protect last N turns via `MEMORY_PROTECTED_RECENT_TURNS` — protects last N user+assistant pairs (default 3)
+- [ ] Log token budget breakdown in verbose/debug mode — basic drop-count logging exists; detailed per-category breakdown missing
 
 **Does NOT include:** recall tool, scheduler job, or summarization changes — those come in Sprint 3.
 
@@ -494,10 +510,10 @@ Core history redesign. This is the biggest piece of work.
 Collapses the two-path memory system into one.
 
 **Deliverables:**
-- [ ] Remove upfront memory injection from `_stage_memory_retrieval` / `_build_context_messages()`
-- [ ] Add read-only `memory(action="search")` tool for `requires_memory` bots without `uses_tools`
-- [ ] Cold-start detection: inject 2-3 core memories when history < 3 messages
-- [ ] Ensure auto-extraction runs for all memory-enabled bots (not just non-tool)
+- [ ] Remove upfront memory injection from `_stage_memory_retrieval` / `_build_context_messages()` — dual-path still active: non-tool bots get full upfront injection, tool bots use on-demand
+- [ ] Add read-only `memory(action="search")` tool for `requires_memory` bots without `uses_tools` — memory tool only available to `uses_tools: true` bots
+- [x] Cold-start detection: inject 2-3 core memories when history < 3 messages — implemented in both `pipeline.py` and `base.py`
+- [x] Ensure auto-extraction runs for all memory-enabled bots (not just non-tool) — extraction gated on `use_memory` / `self.memory`, not `uses_tools`
 - [ ] Update bot system prompts to mention memory tool availability
 
 #### Track C: Debug Turn Log Enhancement
@@ -508,17 +524,17 @@ Collapses the two-path memory system into one.
 Completely independent, no overlap with A or B.
 
 **Deliverables:**
-- [ ] Expand `ToolLoop.tool_context`: store per-call details (tool name, full parameters, result text, iteration)
-- [ ] Update `_write_debug_turn_log` signature to accept tool call data
-- [ ] Add `TOOL CALLS` section to human-readable log output
-- [ ] Add `tool_calls` array to JSON dump section
-- [ ] Pass tool context from `query()` in `base.py` to debug log writer
-- [ ] Update `service/api.py` debug log writer to match
+- [x] Expand `ToolLoop.tool_context`: store per-call details (tool name, full parameters, result text, iteration) — `tool_call_details` list with per-call dicts in `loop.py`
+- [x] Update `_write_debug_turn_log` signature to accept tool call data — `tool_calls` parameter added in `base.py`
+- [x] Add `TOOL CALLS` section to human-readable log output — formatted section with call count, iterations, per-call details
+- [x] Add `tool_calls` array to JSON dump section — included in both `base.py` and `service/api.py`
+- [x] Pass tool context from `query()` in `base.py` to debug log writer — `tool_call_details` passed from `query_with_tools()` return
+- [x] Update `service/api.py` debug log writer to match — full parity with CLI debug log
 
 #### Integration gate (Sprint 2)
-- Each track opens a PR independently
-- Team lead reviews each PR against `main`
-- Merge order: **C first** (smallest, no conflicts), then **B**, then **A** (largest, most likely to touch shared files)
+- ~~Each track opens a PR independently~~
+- ~~Team lead reviews each PR against `main`~~
+- ~~Merge order: **C first** (smallest, no conflicts), then **B**, then **A** (largest, most likely to touch shared files)~~ ✅ Track C complete and merged
 - If A and B have merge conflicts in `base.py` or `pipeline.py`, resolve during A's merge (A is the bigger change)
 
 ---
@@ -550,9 +566,9 @@ These features depend on Sprint 2 tracks being merged.
 **Depends on:** Track B (memory on-demand must be the only path)
 
 **Deliverables:**
-- [ ] Update memory tool search handler to use `build_memory_context_string()`
-- [ ] Add relative timestamps to memory search results
-- [ ] Return formatted text instead of raw JSON from memory tool
+- [ ] Update memory tool search handler to use `build_memory_context_string()` — currently uses `format_memories_for_result()` from `parser.py` (simple numbered list with ID + relevance), not the richer categorized format from `context_builder.py`
+- [ ] Add relative timestamps to memory search results — search results include no timestamp data; only id, content, relevance, importance, tags
+- [x] Return formatted text instead of raw JSON from memory tool — `format_memories_for_result()` returns human-readable formatted text
 
 #### Track F: Proactive Summarization Scheduler
 **Owner:** Agent A or F
@@ -581,27 +597,27 @@ These features depend on Sprint 2 tracks being merged.
 
 ```
 Sprint 1 (foundation):
-  [=== Per-model config + VRAM detection ===]
-                                              ↓ merge to main
+  [=== Per-model config + VRAM detection ===]  ✅ COMPLETE
+                                              ↓ merged to main
 Sprint 2 (parallel):
-  [======= Track A: Two-layer history =======]  ← largest
-  [===== Track B: Memory on-demand =====]        ← medium
-  [=== Track C: Debug log ===]                   ← smallest, merges first
-                                              ↓ all merge to main
+  [======= Track A: Two-layer history =======]  ← in progress (core assembly done)
+  [===== Track B: Memory on-demand =====]        ← in progress (2/5 done)
+  [=== Track C: Debug log ===]                   ✅ COMPLETE
+                                              ↓ Track A and B remaining
 
 Sprint 3 (dependent):
-  [==== Track D: Cleanup + recall ====]          ← after A
-  [== Track E: Memory output ==]                 ← after B (parallel with D)
-            [==== Track F: Summarization scheduler ====]  ← after D
+  [==== Track D: Cleanup + recall ====]          ← not started (blocked on A)
+  [== Track E: Memory output ==]                 ← in progress (1/3 done)
+            [==== Track F: Summarization scheduler ====]  ← not started (blocked on D)
                                               ↓ final integration review
 ```
 
 ### Risk Areas & Review Focus
 
-| Area | Risk | Mitigation |
-|------|------|------------|
-| VRAM detection | May not work on all GPU configs (multi-GPU, CPU-only) | Graceful fallback chain; test on both machines |
-| `Message.db_id` addition (Track A) | Touches a core data model — could break serialization, API | Ensure backward compat; `db_id` is optional/nullable |
-| `_should_skip_history()` removal (Track D) | May reveal other context overflow issues | Token budgeting from Track A must be solid first |
-| Non-destructive summarization (Track F) | DB storage grows without pruning | Acceptable for now; add archival/cleanup later if needed |
-| Track A + B merge conflicts | Both touch `base.py`, `pipeline.py` | Merge B first (smaller), resolve A conflicts during A's merge |
+| Area | Risk | Status | Mitigation |
+|------|------|--------|------------|
+| VRAM detection | May not work on all GPU configs (multi-GPU, CPU-only) | ✅ Resolved | Graceful fallback chain implemented (torch → nvidia-smi → global config → default) |
+| `Message.db_id` addition (Track A) | Touches a core data model — could break serialization, API | ⬜ Not yet started | Ensure backward compat; `db_id` is optional/nullable |
+| `_should_skip_history()` removal (Track D) | May reveal other context overflow issues | ⬜ Not yet started | Token budgeting from Track A must be solid first |
+| Non-destructive summarization (Track F) | DB storage grows without pruning | ⬜ Not yet started | Acceptable for now; add archival/cleanup later if needed |
+| Track A + B merge conflicts | Both touch `base.py`, `pipeline.py` | ⚠️ Active risk | Merge B first (smaller), resolve A conflicts during A's merge |
