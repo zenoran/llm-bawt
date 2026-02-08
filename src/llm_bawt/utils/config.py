@@ -325,6 +325,55 @@ class Config(BaseSettings):
 
         return sorted(list(set(available_options))) # Return sorted list of unique aliases
 
+    def get_model_context_window(self, model_alias: str | None = None) -> int:
+        """Get the effective context window for a model.
+
+        Resolution order:
+        1. Per-model `context_window` in models.yaml
+        2. Global LLAMA_CPP_N_CTX (for GGUF) or 128000 (for OpenAI)
+        3. Hardcoded default: 32768
+
+        Note: For GGUF models with VRAM auto-sizing, this is only the
+        static fallback. The full auto-sizing logic lives in utils/vram.py
+        and runs at model load time.
+        """
+        model_def = self.defined_models.get("models", {}).get(model_alias or "", {})
+        yaml_val = model_def.get("context_window")
+        if yaml_val is not None:
+            return int(yaml_val)
+        model_type = model_def.get("type", "")
+        if model_type == "openai":
+            return 128000
+        return self.LLAMA_CPP_N_CTX or 32768
+
+    def get_model_max_tokens(self, model_alias: str | None = None) -> int:
+        """Get the effective max output tokens for a model.
+
+        Resolution order:
+        1. Per-model `max_tokens` in models.yaml
+        2. Global MAX_TOKENS config
+        3. Hardcoded default: 4096
+        """
+        model_def = self.defined_models.get("models", {}).get(model_alias or "", {})
+        yaml_val = model_def.get("max_tokens")
+        if yaml_val is not None:
+            return int(yaml_val)
+        return self.MAX_TOKENS or 4096
+
+    def get_model_n_gpu_layers(self, model_alias: str | None = None) -> int:
+        """Get the effective n_gpu_layers for a model.
+
+        Resolution order:
+        1. Per-model `n_gpu_layers` in models.yaml
+        2. Global LLAMA_CPP_N_GPU_LAYERS config
+        3. Hardcoded default: -1 (all layers)
+        """
+        model_def = self.defined_models.get("models", {}).get(model_alias or "", {})
+        yaml_val = model_def.get("n_gpu_layers")
+        if yaml_val is not None:
+            return int(yaml_val)
+        return self.LLAMA_CPP_N_GPU_LAYERS if self.LLAMA_CPP_N_GPU_LAYERS is not None else -1
+
     def get_tool_format(self, model_alias: str | None = None, model_def: Dict[str, Any] | None = None) -> str:
         """Return the tool format for a given model alias or definition."""
         if model_def is None and model_alias:

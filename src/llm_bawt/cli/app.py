@@ -370,6 +370,61 @@ def show_status(config: Config, args: argparse.Namespace | None = None):
     console.print(Panel(main_table, title="[bold]Config[/bold] / [bold]Service[/bold]", border_style="grey39"))
     console.print()
 
+    # ── Model Info Panel ─────────────────────────────────────────
+    if model_alias and model_alias in defined_models:
+        from llm_bawt.utils.vram import detect_vram, auto_size_context_window, get_model_file_size
+
+        model_info_table = make_table()
+        model_def = defined_models[model_alias]
+        model_type = model_def.get("type", "unknown")
+
+        # Per-model settings with resolution display
+        effective_max_tokens = model_def.get("max_tokens", config.MAX_TOKENS)
+        max_tokens_source = "model" if "max_tokens" in model_def else "global"
+        model_info_table.add_row("Max Tokens", f"{effective_max_tokens} [dim]({max_tokens_source})[/dim]")
+
+        if model_type == "gguf":
+            # VRAM detection
+            vram_info = detect_vram()
+            if vram_info:
+                model_info_table.add_row("GPU", f"[green]{vram_info.gpu_name}[/green]")
+                model_info_table.add_row(
+                    "VRAM",
+                    f"{vram_info.total_gb:.1f}GB total, {vram_info.free_gb:.1f}GB free [dim]({vram_info.detection_method})[/dim]"
+                )
+            else:
+                model_info_table.add_row("GPU", "[dim]Not detected[/dim]")
+
+            # Context window auto-sizing
+            sizing = auto_size_context_window(
+                model_definition=model_def,
+                global_n_ctx=config.LLAMA_CPP_N_CTX,
+                global_max_tokens=effective_max_tokens,
+            )
+            ctx_display = f"{sizing.context_window:,} tokens [dim]({sizing.source})[/dim]"
+            model_info_table.add_row("Context", ctx_display)
+
+            # GPU layers
+            n_gpu_layers = model_def.get("n_gpu_layers", config.LLAMA_CPP_N_GPU_LAYERS)
+            gpu_layers_source = "model" if "n_gpu_layers" in model_def else "global"
+            layers_display = "All" if n_gpu_layers == -1 else str(n_gpu_layers)
+            model_info_table.add_row("GPU Layers", f"{layers_display} [dim]({gpu_layers_source})[/dim]")
+
+            # Native context limit
+            native_limit = model_def.get("native_context_limit")
+            if native_limit:
+                model_info_table.add_row("Native Limit", f"{int(native_limit):,} tokens")
+        else:
+            # OpenAI/Ollama — simpler display
+            ctx_window = model_def.get("context_window")
+            if ctx_window:
+                model_info_table.add_row("Context", f"{int(ctx_window):,} tokens [dim](model)[/dim]")
+            elif model_type == "openai":
+                model_info_table.add_row("Context", "128,000 tokens [dim](default)[/dim]")
+
+        console.print(Panel(model_info_table, title=f"[bold]Model: {model_alias}[/bold] [dim]{model_type}[/dim]", border_style="grey39"))
+        console.print()
+
     # ── Memory + Dependencies (side-by-side) ─────────────────────
     memory_table = make_table()
     long_term_count = 0

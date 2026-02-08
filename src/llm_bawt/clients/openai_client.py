@@ -30,7 +30,7 @@ class OpenAIClient(LLMClient):
     """
     SUPPORTS_STREAMING = True
 
-    def __init__(self, model: str, config: Config, base_url: str | None = None, api_key: str | None = None):
+    def __init__(self, model: str, config: Config, base_url: str | None = None, api_key: str | None = None, model_definition: dict | None = None):
         """Initialize OpenAI client.
         
         Args:
@@ -38,8 +38,9 @@ class OpenAIClient(LLMClient):
             config: Application config
             base_url: Optional custom API endpoint for OpenAI-compatible servers
             api_key: Optional API key (defaults to OPENAI_API_KEY env var)
+            model_definition: Optional model definition dict from models.yaml
         """
-        super().__init__(model, config)
+        super().__init__(model, config, model_definition=model_definition)
         self.base_url = base_url
         self.api_key = api_key or self._get_api_key()
         
@@ -121,7 +122,7 @@ class OpenAIClient(LLMClient):
         last_err: Exception | None = None
         for key in keys_to_try:
             try_payload = dict(payload)
-            self._set_token_param(try_payload, key, self.config.MAX_TOKENS)
+            self._set_token_param(try_payload, key, self.effective_max_tokens)
             attempted_without_temp_top_p = False
             try:
                 return self.client.chat.completions.create(**try_payload)

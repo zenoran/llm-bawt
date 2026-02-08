@@ -25,26 +25,46 @@ logger = logging.getLogger(__name__)
 class LlamaCppClient(LLMClient):
     """Client for running GGUF models using llama-cpp-python."""
 
-    def __init__(self, model_path: str, config: Config, chat_format: str | None = None):
+    def __init__(self, model_path: str, config: Config, chat_format: str | None = None, model_definition: dict | None = None):
         if not _llama_cpp_available:
             raise ImportError(
                 "`llama-cpp-python` not found. Install it following instructions: "
                 "https://github.com/abetlen/llama-cpp-python#installation"
             )
-        super().__init__(model_path, config) # Pass config to base class
+        super().__init__(model_path, config, model_definition=model_definition)
         self.model_path = model_path
         self.chat_format = chat_format  # Allow explicit chat format override
-        self.model = None
+        self.llm_model = None  # The loaded Llama instance
+        self._context_sizing_result = None  # Set during _load_model
         self._load_model()
 
     def _load_model(self):
         """Loads the GGUF model, suppressing C++ library stderr."""
+        from ..utils.vram import auto_size_context_window
+
         if self.config.VERBOSE:
             self.console.print(f"Loading GGUF model: [bold yellow]{self.model_path}[/bold yellow]...")
-        n_gpu_layers = self.config.LLAMA_CPP_N_GPU_LAYERS # -1 means load all possible layers to GPU
-        n_ctx = self.config.LLAMA_CPP_N_CTX # Context size
-        n_batch = getattr(self.config, 'LLAMA_CPP_N_BATCH', 2048) # Batch size for prompt processing
-        flash_attn = getattr(self.config, 'LLAMA_CPP_FLASH_ATTN', True) # Flash attention for memory efficiency
+
+        # Per-model overrides from model definition, falling back to global config
+        n_gpu_layers = self.model_definition.get("n_gpu_layers", self.config.LLAMA_CPP_N_GPU_LAYERS)
+        n_batch = getattr(self.config, 'LLAMA_CPP_N_BATCH', 2048)
+        flash_attn = getattr(self.config, 'LLAMA_CPP_FLASH_ATTN', True)
+
+        # Auto-size context window based on VRAM
+        sizing = auto_size_context_window(
+            model_definition=self.model_definition,
+            global_n_ctx=self.config.LLAMA_CPP_N_CTX,
+            global_max_tokens=self.effective_max_tokens,
+            model_path=self.model_path,
+        )
+        self._context_sizing_result = sizing
+        n_ctx = sizing.context_window
+
+        if self.config.VERBOSE:
+            self.console.print(f"[dim]Context window: {n_ctx} tokens (source: {sizing.source})[/dim]")
+            if sizing.vram_info:
+                self.console.print(f"[dim]VRAM: {sizing.vram_info}[/dim]")
+                self.console.print(f"[dim]Model weights: {sizing.model_file_size_gb:.1f}GB, KV budget: {sizing.estimated_kv_budget_gb:.1f}GB[/dim]")
 
         model_load_params = {
             "model_path": self.model_path,
@@ -67,10 +87,10 @@ class LlamaCppClient(LLMClient):
             with open(os.devnull, 'w') as fnull, contextlib.redirect_stderr(fnull):
                     if Llama is None: # Should have been caught in __init__, but double-check
                         raise ImportError("Llama class is not available from llama_cpp.")
-                    self.model = Llama(**model_load_params)
+                    self.llm_model = Llama(**model_load_params)
 
-            if self.config.VERBOSE and self.model:
-                ctx_size = getattr(self.model, 'n_ctx', 'N/A')
+            if self.config.VERBOSE and self.llm_model:
+                ctx_size = getattr(self.llm_model, 'n_ctx', 'N/A')
                 gpu_layers = model_load_params['n_gpu_layers']
                 self.console.print(
                     f"[green]Model loaded:[/green] Context={ctx_size}, Batch={n_batch}, FlashAttn={flash_attn}, GPU Layers={gpu_layers if gpu_layers != -1 else 'All'}"
@@ -86,13 +106,13 @@ class LlamaCppClient(LLMClient):
 
         Used by the API service for SSE streaming.
         """
-        if not self.model:
+        if not self.llm_model:
             raise RuntimeError("Llama.cpp model not properly initialized.")
 
         api_messages = [msg.to_api_format() for msg in messages]
         generation_params = {
             "messages": api_messages,
-            "max_tokens": self.config.MAX_TOKENS,
+            "max_tokens": self.effective_max_tokens,
             "temperature": self.config.TEMPERATURE,
             "top_p": self.config.TOP_P,
             "stream": True,
@@ -101,7 +121,7 @@ class LlamaCppClient(LLMClient):
             generation_params["stop"] = stop
 
         logger.debug(f"stream_raw: calling create_chat_completion with {len(stop) if stop else 0} stop sequences")
-        raw_stream = self.model.create_chat_completion(**generation_params)
+        raw_stream = self.llm_model.create_chat_completion(**generation_params)
         logger.debug("stream_raw: got raw_stream, iterating chunks")
         yield from self._iterate_llama_cpp_chunks(raw_stream)
 
@@ -117,7 +137,7 @@ class LlamaCppClient(LLMClient):
         Returns:
             The model's response as a string.
         """
-        if not self.model:
+        if not self.llm_model:
             error_msg = "Error: Llama.cpp model not properly initialized."
             self.console.print(f"[bold red]{error_msg}[/bold red]")
             return error_msg
@@ -126,7 +146,7 @@ class LlamaCppClient(LLMClient):
 
         generation_params = {
             "messages": api_messages,
-            "max_tokens": self.config.MAX_TOKENS,
+            "max_tokens": self.effective_max_tokens,
             "temperature": self.config.TEMPERATURE,
             "top_p": self.config.TOP_P,
             "stream": stream and not self.config.NO_STREAM,
@@ -157,7 +177,7 @@ class LlamaCppClient(LLMClient):
         panel_title, panel_border_style = self.get_styling()
         try:
             if generation_params["stream"]:
-                raw_stream = self.model.create_chat_completion(**generation_params)
+                raw_stream = self.llm_model.create_chat_completion(**generation_params)
                 response_text_final = self._handle_streaming_output(
                     stream_iterator=self._iterate_llama_cpp_chunks(raw_stream),
                     plaintext_output=plaintext_output,
@@ -166,7 +186,7 @@ class LlamaCppClient(LLMClient):
                 )
             else:
                 start_time = time.time()
-                completion = self.model.create_chat_completion(**generation_params)
+                completion = self.llm_model.create_chat_completion(**generation_params)
                 end_time = time.time()
 
                 if completion and 'choices' in completion and completion['choices']:
@@ -251,7 +271,7 @@ class LlamaCppClient(LLMClient):
             - If tool_calls is not None, it contains OpenAI-format tool calls
             - Otherwise response_content is the text response
         """
-        if not self.model:
+        if not self.llm_model:
             raise RuntimeError("Llama.cpp model not properly initialized.")
         
         # If no tools, fall back to regular query
@@ -265,7 +285,7 @@ class LlamaCppClient(LLMClient):
             "messages": api_messages,
             "tools": tools_schema,
             "tool_choice": tool_choice or "auto",
-            "max_tokens": self.config.MAX_TOKENS,
+            "max_tokens": self.effective_max_tokens,
             "temperature": self.config.TEMPERATURE,
             "top_p": self.config.TOP_P,
             "stream": False,  # Tool calls don't stream well
@@ -276,7 +296,7 @@ class LlamaCppClient(LLMClient):
         
         try:
             with open(os.devnull, 'w') as fnull, contextlib.redirect_stderr(fnull):
-                completion = self.model.create_chat_completion(**generation_params)
+                completion = self.llm_model.create_chat_completion(**generation_params)
             
             if not completion or 'choices' not in completion:
                 return "Error: No response from model", None
@@ -314,7 +334,7 @@ class LlamaCppClient(LLMClient):
             - String chunks for regular content
             - Dict with tool_calls when a tool call is detected
         """
-        if not self.model:
+        if not self.llm_model:
             raise RuntimeError("Llama.cpp model not properly initialized.")
         
         api_messages = [msg.to_api_format() for msg in messages]
@@ -323,7 +343,7 @@ class LlamaCppClient(LLMClient):
             "messages": api_messages,
             "tools": tools,
             "tool_choice": tool_choice,
-            "max_tokens": self.config.MAX_TOKENS,
+            "max_tokens": self.effective_max_tokens,
             "temperature": self.config.TEMPERATURE,
             "top_p": self.config.TOP_P,
             "stream": True,
@@ -331,7 +351,7 @@ class LlamaCppClient(LLMClient):
         
         try:
             with open(os.devnull, 'w') as fnull, contextlib.redirect_stderr(fnull):
-                stream = self.model.create_chat_completion(**generation_params)
+                stream = self.llm_model.create_chat_completion(**generation_params)
             
             accumulated_tool_calls: Dict[int, Dict[str, Any]] = {}
             
@@ -377,15 +397,15 @@ class LlamaCppClient(LLMClient):
 
     def unload(self) -> None:
         """Unload the GGUF model and free GPU/CPU memory."""
-        if self.model is None:
+        if self.llm_model is None:
             return
         
         logger.info(f"Unloading GGUF model: {self.model_path}")
         
         try:
             # Delete the model instance
-            del self.model
-            self.model = None
+            del self.llm_model
+            self.llm_model = None
             
             # Force garbage collection
             import gc
