@@ -63,6 +63,7 @@ def _write_debug_turn_log(
     model: str,
     bot_id: str,
     user_id: str,
+    tool_calls: list[dict] | None = None,
 ) -> None:
     """Write the current turn's request/response data to a debug log file.
 
@@ -102,6 +103,29 @@ def _write_debug_turn_log(
                 lines.append(f"    {content_line}")
             lines.append("")
 
+        # Tool calls section (between request and response)
+        if tool_calls:
+            total_calls = len(tool_calls)
+            iterations = max((tc.get("iteration", 1) for tc in tool_calls), default=1)
+            lines.append("─" * 40)
+            lines.append(f"TOOL CALLS ({total_calls} call{'s' if total_calls != 1 else ''} across {iterations} iteration{'s' if iterations != 1 else ''})")
+            lines.append("─" * 40)
+            for idx, tc in enumerate(tool_calls, 1):
+                lines.append(f"")
+                lines.append(f"[{idx}] Tool: {tc.get('tool', 'unknown')}")
+                params = tc.get('parameters', {})
+                if isinstance(params, dict):
+                    for pk, pv in params.items():
+                        lines.append(f"    {pk}: {pv}")
+                else:
+                    lines.append(f"    Parameters: {params}")
+                result = tc.get('result', '')
+                lines.append(f"    Result ({len(result)} chars):")
+                lines.append("    " + "─" * 36)
+                for result_line in str(result)[:2000].split("\n"):
+                    lines.append(f"    {result_line}")
+            lines.append("")
+
         # Response data
         lines.append("─" * 40)
         lines.append("RESPONSE")
@@ -129,6 +153,7 @@ def _write_debug_turn_log(
             "bot_id": bot_id,
             "user_id": user_id,
             "request": [msg_to_dict(msg) for msg in prepared_messages],
+            "tool_calls": tool_calls or [],
             "response": response,
         }
         lines.append(json.dumps(json_data, indent=2, ensure_ascii=False, default=str))
@@ -983,7 +1008,7 @@ class BackgroundService:
                 log.llm_context(prepared_messages)
                 
                 # Execute the query with prepared messages
-                response, tool_context = llm_bawt.execute_llm_query(
+                response, tool_context, tool_call_details = llm_bawt.execute_llm_query(
                     prepared_messages,
                     plaintext_output=True,
                     stream=False,
@@ -998,6 +1023,7 @@ class BackgroundService:
                         model=model_alias,
                         bot_id=bot_id,
                         user_id=user_id,
+                        tool_calls=tool_call_details,
                     )
 
                 # Check if cancelled during generation

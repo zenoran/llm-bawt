@@ -120,13 +120,15 @@ install: check-python check-pipx ## [pipx] Production install from GitHub
 install-local: check-python check-pipx ## [pipx] Editable install from local dir (minimal)
 	@echo "$(BLUE)Installing llm-bawt (editable) from local dir...$(NC)"
 	-pipx uninstall llm-bawt 2>$(NULL) || true
-	pipx install --editable ".[memory]"
+	pipx install --editable .
+	pipx runpip llm-bawt install sentence-transformers
 	@echo "$(GREEN)✓ llm-bawt installed (editable)$(NC)"
 
 install-local-all: check-python check-pipx ## [pipx] Editable install + ALL optional deps
 	@echo "$(BLUE)Installing llm-bawt (editable) with all extras...$(NC)"
 	-pipx uninstall llm-bawt 2>$(NULL) || true
-	pipx install --editable ".[memory,service,search]"
+	pipx install --editable .
+	pipx runpip llm-bawt install sentence-transformers
 	pipx runpip llm-bawt install transformers torch huggingface-hub accelerate
 	pipx runpip llm-bawt install ddgs tavily-python
 	pipx runpip llm-bawt install fastapi "uvicorn[standard]" httpx

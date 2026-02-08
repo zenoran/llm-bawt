@@ -322,7 +322,7 @@ class BaseLLMBawt(ABC):
             # Use tool loop if bot has tools enabled
             if self.bot.uses_tools and self.memory:
                 tool_definitions = self._get_tool_definitions()
-                assistant_response, tool_context = query_with_tools(
+                assistant_response, tool_context, tool_call_details = query_with_tools(
                     messages=context_messages,
                     client=self.client,
                     memory_client=self.memory,
@@ -354,6 +354,7 @@ class BaseLLMBawt(ABC):
                     plaintext_output=plaintext_output,
                     stream=stream,
                 )
+                tool_call_details = []
             
             if assistant_response:
                 self.history_manager.add_message("assistant", assistant_response)
@@ -363,7 +364,7 @@ class BaseLLMBawt(ABC):
 
             # Write debug turn log if enabled
             if self.debug:
-                self._write_debug_turn_log(context_messages, prompt, assistant_response)
+                self._write_debug_turn_log(context_messages, prompt, assistant_response, tool_call_details)
 
             return assistant_response
         
@@ -624,6 +625,7 @@ class BaseLLMBawt(ABC):
         context_messages: list[Message],
         user_prompt: str,
         assistant_response: str,
+        tool_calls: list[dict] | None = None,
     ):
         """Write the current turn's request/response data to a debug log file.
 
@@ -634,6 +636,7 @@ class BaseLLMBawt(ABC):
             context_messages: Full list of messages sent to the LLM
             user_prompt: The user's input for this turn
             assistant_response: The assistant's response
+            tool_calls: Per-call tool details from the tool loop
         """
         try:
             logs_dir = resolve_log_dir()
@@ -665,6 +668,29 @@ class BaseLLMBawt(ABC):
                     lines.append(f"    {content_line}")
                 lines.append("")
 
+            # Tool calls section (between request and response)
+            if tool_calls:
+                total_calls = len(tool_calls)
+                iterations = max((tc.get("iteration", 1) for tc in tool_calls), default=1)
+                lines.append("─" * 40)
+                lines.append(f"TOOL CALLS ({total_calls} call{'s' if total_calls != 1 else ''} across {iterations} iteration{'s' if iterations != 1 else ''})")
+                lines.append("─" * 40)
+                for idx, tc in enumerate(tool_calls, 1):
+                    lines.append(f"")
+                    lines.append(f"[{idx}] Tool: {tc.get('tool', 'unknown')}")
+                    params = tc.get('parameters', {})
+                    if isinstance(params, dict):
+                        for pk, pv in params.items():
+                            lines.append(f"    {pk}: {pv}")
+                    else:
+                        lines.append(f"    Parameters: {params}")
+                    result = tc.get('result', '')
+                    lines.append(f"    Result ({len(result)} chars):")
+                    lines.append("    " + "─" * 36)
+                    for result_line in str(result)[:2000].split("\n"):
+                        lines.append(f"    {result_line}")
+                lines.append("")
+
             # Response data
             lines.append("─" * 40)
             lines.append("RESPONSE")
@@ -684,6 +710,7 @@ class BaseLLMBawt(ABC):
                 "bot_id": self.bot_id,
                 "user_id": self.user_id,
                 "request": [msg.to_dict() for msg in context_messages],
+                "tool_calls": tool_calls or [],
                 "response": assistant_response,
             }
             lines.append(json.dumps(json_data, indent=2, ensure_ascii=False))
