@@ -1,19 +1,28 @@
 """vLLM client for high-throughput inference with HuggingFace models."""
 
-import time
+from __future__ import annotations
+
+import json
 import logging
 import os
-import contextlib
-import json
-from typing import List, Dict, Any, Iterator, Optional
+import string
+import time
+from collections.abc import Iterator
+from random import choices
+from typing import Any
 
-from rich.markdown import Markdown
-from rich.rule import Rule
 from rich.json import JSON
+from rich.rule import Rule
 
 from ..clients.base import LLMClient
-from ..utils.config import Config
 from ..models.message import Message
+from ..utils.config import Config
+
+# Disable vLLM's multiprocess engine before import — it spawns engine cores in
+# subprocesses via ZMQ/shared memory, which fails in Docker (especially WSL2).
+# With this off, vLLM uses InprocClient and runs the engine in the same process.
+# Must be set before `import vllm` since vllm.envs caches env vars at import time.
+os.environ.setdefault("VLLM_ENABLE_V1_MULTIPROCESSING", "0")
 
 try:
     from vllm import LLM, SamplingParams
@@ -24,6 +33,14 @@ except ImportError:
     _vllm_available = False
 
 logger = logging.getLogger(__name__)
+
+# Mistral tool call IDs are 9-character alphanumeric strings
+_ALPHANUMERIC = string.ascii_letters + string.digits
+
+
+def _generate_mistral_tool_id() -> str:
+    """Generate a 9-character alphanumeric tool call ID (Mistral format)."""
+    return "".join(choices(_ALPHANUMERIC, k=9))
 
 
 class VLLMClient(LLMClient):
@@ -89,9 +106,9 @@ class VLLMClient(LLMClient):
         dtype = self.model_definition.get("dtype", "auto")  # float16|bfloat16|auto
         max_model_len = self.model_definition.get("max_model_len")
         gpu_memory_utilization = self.model_definition.get("gpu_memory_utilization", 0.85)
-        enforce_eager = self.model_definition.get("enforce_eager", False)
+        enforce_eager = self.model_definition.get("enforce_eager", True)
         enable_prefix_caching = self.model_definition.get("enable_prefix_caching", True)
-        
+
         # Build vLLM engine parameters
         engine_params = {
             "model": self.model_id,
@@ -108,8 +125,9 @@ class VLLMClient(LLMClient):
         # Passing quantization when it's already in the model's config.json causes validation errors.
         if quantization and self.config.VERBOSE:
             logger.info(f"Model specifies quantization: {quantization} (vLLM will auto-detect from config)")
-        if max_model_len:
-            engine_params["max_model_len"] = max_model_len
+        # Cap context length to what's configured (or 32768 default) so vLLM
+        # doesn't try to allocate KV cache for the model's full context (e.g. 256K).
+        engine_params["max_model_len"] = max_model_len or self.effective_context_window
 
         if self.config.VERBOSE:
             log_params = {k: v for k, v in engine_params.items() if k != "model"}
@@ -137,9 +155,22 @@ class VLLMClient(LLMClient):
                 )
             
             self.llm_engine = LLM(**engine_params)
-            
+
+            # Pre-warm with a 1-token inference to compile CUDA kernels.
+            # First inference is extremely slow (~60-90s) due to kernel JIT;
+            # paying this cost at load time keeps real requests fast.
+            self.console.print(
+                "[yellow]⏳ Warming up inference engine...[/yellow]"
+            )
+            warmup_params = SamplingParams(max_tokens=1, temperature=0)
+            self.llm_engine.chat(
+                messages=[{"role": "user", "content": "hi"}],
+                sampling_params=warmup_params,
+                use_tqdm=False,
+            )
+
             load_time = time.time() - start_time
-            
+
             if self.config.VERBOSE:
                 self.console.print(
                     f"[green]✓ vLLM model loaded in {load_time:.1f}s[/green]"
@@ -154,9 +185,8 @@ class VLLMClient(LLMClient):
                     if actual_max_len:
                         self.console.print(f"[dim]Context window: {actual_max_len} tokens[/dim]")
             else:
-                # Minimal output for non-verbose mode
                 self.console.print(
-                    f"[green]✓ Model loaded[/green] [dim]({load_time:.1f}s)[/dim]"
+                    f"[green]✓ Model ready[/green] [dim]({load_time:.1f}s)[/dim]"
                 )
 
         except Exception as e:
@@ -173,15 +203,8 @@ class VLLMClient(LLMClient):
             logger.exception("vLLM model loading failed")
             raise
 
-    def _prepare_messages_for_vllm(self, messages: List[Message]) -> List[Dict[str, str]]:
-        """Convert Message objects to vLLM chat format.
-        
-        Args:
-            messages: List of Message objects
-            
-        Returns:
-            List of dicts with 'role' and 'content' keys
-        """
+    def _prepare_messages_for_vllm(self, messages: list[Message]) -> list[dict[str, str]]:
+        """Convert Message objects to vLLM chat format."""
         return [msg.to_api_format() for msg in messages]
 
     def _create_sampling_params(
@@ -220,205 +243,340 @@ class VLLMClient(LLMClient):
         
         return SamplingParams(**params)
 
+    def _generate_chat(
+        self,
+        vllm_messages: list[dict[str, str]],
+        sampling_params: "SamplingParams",
+        tools: list[dict[str, Any]] | None = None,
+    ) -> str:
+        """Generate a complete response via LLM.chat().
+
+        Uses the standard vLLM offline API which handles the full engine
+        lifecycle correctly (request submission, stepping, cleanup).
+
+        Args:
+            vllm_messages: Chat messages in vLLM dict format.
+            sampling_params: Sampling parameters.
+            tools: Optional tool schemas for chat template.
+
+        Returns:
+            The generated response text.
+        """
+        assert self.llm_engine is not None
+
+        chat_kwargs: dict[str, Any] = {"use_tqdm": False}
+        if tools:
+            chat_kwargs["tools"] = tools
+
+        outputs = self.llm_engine.chat(
+            messages=vllm_messages,
+            sampling_params=sampling_params,
+            **chat_kwargs,
+        )
+
+        if not outputs:
+            raise RuntimeError("No response from vLLM model.")
+
+        return outputs[0].outputs[0].text
+
+    def _stream_chunks(self, text: str) -> Iterator[str]:
+        """Break a complete response into word-sized chunks for streaming.
+
+        Yields:
+            Small text chunks (word + trailing whitespace).
+        """
+        import re
+        for chunk in re.findall(r'\S+\s*|\n', text):
+            yield chunk
+
     def query(
         self,
-        messages: List[Message],
+        messages: list[Message],
         plaintext_output: bool = False,
         stream: bool = True,
         stop: list[str] | str | None = None,
-        **kwargs: Any
+        **kwargs: Any,
     ) -> str:
-        """Query the vLLM model using chat template.
-        
-        Args:
-            messages: List of Message objects
-            plaintext_output: If True, return raw text without formatting
-            stream: If True, stream output token-by-token (currently no-op for vLLM)
-            stop: Stop sequences to terminate generation
-            **kwargs: Additional arguments (ignored)
-            
-        Returns:
-            Generated response as string
-        """
+        """Query the vLLM model using chat template."""
         if not self.llm_engine:
-            error_msg = "Error: vLLM model not properly initialized."
-            self.console.print(f"[bold red]{error_msg}[/bold red]")
-            return error_msg
+            raise RuntimeError("vLLM model not properly initialized.")
 
-        # Convert messages to vLLM format
         vllm_messages = self._prepare_messages_for_vllm(messages)
-        
-        # Create sampling parameters
         sampling_params = self._create_sampling_params(stop=stop)
-        
+        should_stream = stream and not self.config.NO_STREAM
+
         if self.config.VERBOSE:
             self.console.print(Rule("Querying vLLM Model", style="bright_cyan"))
             self.console.print(
                 f"[dim]Params:[/dim] [italic]max_tokens={sampling_params.max_tokens}, "
-                f"temp={sampling_params.temperature}, top_p={sampling_params.top_p}[/italic]"
+                f"temp={sampling_params.temperature}, top_p={sampling_params.top_p}, "
+                f"stream={should_stream}[/italic]"
             )
             if sampling_params.stop:
                 self.console.print(f"[dim]Stop sequences:[/dim] {sampling_params.stop}")
-            
+
             self.console.print(Rule("Request Messages", style="dim bright_cyan"))
             try:
-                payload_str = json.dumps(vllm_messages, indent=2)
-                self.console.print(JSON(payload_str))
-            except TypeError as e:
-                logger.error(f"Could not serialize messages for display: {e}")
-                import pprint
-                self.console.print(pprint.pformat(vllm_messages))
-            
+                self.console.print(JSON(json.dumps(vllm_messages, indent=2)))
+            except TypeError:
+                logger.exception("Could not serialize messages for display")
+
             self.console.print(Rule(style="bright_cyan"))
 
-        response_text = ""
         panel_title, panel_border_style = self.get_styling()
-        
-        try:
-            start_time = time.time()
-            
-            # vLLM's chat method applies the chat template automatically
-            # Returns a list of RequestOutput objects
-            outputs = self.llm_engine.chat(
-                messages=vllm_messages,
-                sampling_params=sampling_params,
-                use_tqdm=False,  # Disable progress bar
-            )
-            
-            end_time = time.time()
-            
-            # Extract the generated text
-            if outputs and len(outputs) > 0:
-                output = outputs[0]
-                response_text = output.outputs[0].text.strip()
-                
-                if self.config.VERBOSE:
-                    # Calculate tokens/sec if possible
-                    num_tokens = len(output.outputs[0].token_ids)
-                    prompt_tokens = len(output.prompt_token_ids)
-                    elapsed = end_time - start_time
-                    
-                    if elapsed > 0:
-                        tokens_per_sec = num_tokens / elapsed
-                        self.console.print(
-                            f"[dim]Generated {num_tokens} tokens "
-                            f"(prompt: {prompt_tokens}) in {elapsed:.2f}s "
-                            f"({tokens_per_sec:.2f} tokens/sec)[/dim]"
-                        )
-                    else:
-                        self.console.print(
-                            f"[dim]Generated {num_tokens} tokens (prompt: {prompt_tokens})[/dim]"
-                        )
-                
-                # Format output unless plaintext requested
-                if not plaintext_output:
-                    # Split on double newline for panel formatting
-                    parts = response_text.split("\n\n", 1)
-                    first_part = parts[0]
-                    second_part = parts[1] if len(parts) > 1 else None
-                    self._print_assistant_message(
-                        first_part,
-                        second_part=second_part,
-                        panel_title=panel_title,
-                        panel_border_style=panel_border_style
-                    )
-            else:
-                self.console.print(
-                    "[bold red]Error: No response generated by vLLM model.[/bold red]"
-                )
-                response_text = "Error: Failed to get response from vLLM model."
-        
-        except Exception as e:
-            self.console.print(f"[bold red]Error during vLLM generation:[/bold red] {e}")
-            logger.exception("Error during vLLM generation")
-            response_text = f"Error: An exception occurred during generation: {e}"
-        
-        finally:
-            if self.config.VERBOSE:
-                self.console.print(Rule(style="bright_cyan"))
-        
-        return response_text
 
-    def stream_raw(
-        self,
-        messages: List[Message],
-        stop: list[str] | str | None = None,
-        **kwargs: Any
-    ) -> Iterator[str]:
-        """Stream raw text chunks from vLLM (Phase 1: single chunk).
-        
-        Phase 1 Implementation: Returns entire response as single chunk.
-        This is used by the API service for SSE streaming.
-        
-        Phase 2 TODO: Implement true streaming using AsyncLLMEngine:
-        - Replace LLM with AsyncLLMEngine for async/await support
-        - Use engine.generate() with async iteration
-        - Yield tokens as they're generated
-        - Requires async refactor of service layer
-        
-        Args:
-            messages: List of Message objects
-            stop: Stop sequences to terminate generation
-            **kwargs: Additional arguments (ignored)
-            
-        Yields:
-            Text chunks (currently entire response in one chunk)
-        """
-        if not self.llm_engine:
-            raise RuntimeError("vLLM model not properly initialized.")
-        
-        # Phase 1: Generate complete response and yield as single chunk
-        # This matches the fallback behavior in base.py but with vLLM generation
-        vllm_messages = self._prepare_messages_for_vllm(messages)
-        sampling_params = self._create_sampling_params(stop=stop)
-        
-        logger.debug("stream_raw: Generating response (Phase 1: single chunk)")
-        
-        try:
+        if should_stream:
+            full_text = self._generate_chat(vllm_messages, sampling_params)
+            response_text = self._handle_streaming_output(
+                stream_iterator=self._stream_chunks(full_text),
+                plaintext_output=plaintext_output,
+                panel_title=panel_title,
+                panel_border_style=panel_border_style,
+            )
+        else:
+            start_time = time.time()
+
             outputs = self.llm_engine.chat(
                 messages=vllm_messages,
                 sampling_params=sampling_params,
                 use_tqdm=False,
             )
-            
-            if outputs and len(outputs) > 0:
-                response_text = outputs[0].outputs[0].text
-                yield response_text
-            else:
-                yield "Error: No response from vLLM model"
-        
-        except Exception as e:
-            logger.exception(f"Error in vLLM stream_raw: {e}")
-            yield f"Error: {e}"
+
+            elapsed = time.time() - start_time
+
+            if not outputs:
+                raise RuntimeError("No response generated by vLLM model.")
+
+            output = outputs[0]
+            response_text = output.outputs[0].text.strip()
+
+            if self.config.VERBOSE:
+                num_tokens = len(output.outputs[0].token_ids)
+                prompt_tokens = len(output.prompt_token_ids)
+
+                if elapsed > 0:
+                    tokens_per_sec = num_tokens / elapsed
+                    self.console.print(
+                        f"[dim]Generated {num_tokens} tokens "
+                        f"(prompt: {prompt_tokens}) in {elapsed:.2f}s "
+                        f"({tokens_per_sec:.2f} tokens/sec)[/dim]"
+                    )
+                else:
+                    self.console.print(
+                        f"[dim]Generated {num_tokens} tokens (prompt: {prompt_tokens})[/dim]"
+                    )
+                self.console.print(Rule(style="bright_cyan"))
+
+            if not plaintext_output:
+                parts = response_text.split("\n\n", 1)
+                first_part = parts[0]
+                second_part = parts[1] if len(parts) > 1 else None
+                self._print_assistant_message(
+                    first_part,
+                    second_part=second_part,
+                    panel_title=panel_title,
+                    panel_border_style=panel_border_style,
+                )
+
+        if self.config.VERBOSE:
+            self.console.print(Rule(style="bright_cyan"))
+
+        return response_text
+
+    def stream_raw(
+        self,
+        messages: list[Message],
+        stop: list[str] | str | None = None,
+        **kwargs: Any,
+    ) -> Iterator[str]:
+        """Stream text chunks from vLLM.
+
+        Generates full response via LLM.chat() then yields word-sized
+        chunks. vLLM V1's offline engine doesn't support true per-token
+        streaming, but chunks arrive rapidly after generation completes.
+        """
+        if not self.llm_engine:
+            raise RuntimeError("vLLM model not properly initialized.")
+
+        vllm_messages = self._prepare_messages_for_vllm(messages)
+        sampling_params = self._create_sampling_params(stop=stop)
+
+        logger.debug("stream_raw: generating response")
+
+        full_text = self._generate_chat(vllm_messages, sampling_params)
+        yield from self._stream_chunks(full_text)
 
     def supports_native_tools(self) -> bool:
-        """Return False - in-process vLLM doesn't produce OpenAI tool_call objects.
-        
-        vLLM's synchronous LLM class doesn't natively support tool calling format.
-        For tool support, would need:
-        1. OpenAI-compatible vLLM server (vllm serve) OR
-        2. Custom chat template + grammar constraints
-        
-        Current implementation uses text-based tool calling via adapters.
+        """vLLM supports native tool calling via model chat templates."""
+        return True
+
+    def stream_with_tools(
+        self,
+        messages: list[Message],
+        tools_schema: list[dict[str, Any]] | None = None,
+        tool_choice: str | dict | None = "auto",
+        stop: list[str] | str | None = None,
+    ) -> Iterator[str | dict]:
+        """Stream response with native tool support via vLLM chat API.
+
+        Generates the full response via LLM.chat(), parses tool calls,
+        then yields content as word-sized chunks. If the response contains
+        tool calls, a tool_calls dict is yielded at the end.
+
+        Yields:
+            str: Content text chunks
+            dict: {"tool_calls": [...], "content": "..."} when model calls tools
         """
-        return False
+        if not self.llm_engine:
+            raise RuntimeError("vLLM model not properly initialized.")
+
+        vllm_messages = self._prepare_messages_for_vllm(messages)
+        sampling_params = self._create_sampling_params(stop=stop)
+
+        logger.debug("stream_with_tools: generating with %d tools", len(tools_schema or []))
+
+        response_text = self._generate_chat(
+            vllm_messages, sampling_params, tools=tools_schema
+        ).strip()
+
+        logger.debug("stream_with_tools raw output: %r", response_text[:200])
+
+        # Try to parse tool calls from the complete output
+        tool_calls = self._parse_tool_calls(response_text)
+
+        if tool_calls:
+            content_before = response_text.split("[TOOL_CALLS]", 1)[0].strip()
+            if content_before:
+                yield from self._stream_chunks(content_before)
+
+            logger.info(
+                "Parsed %d tool call(s): %s",
+                len(tool_calls),
+                ", ".join(tc["function"]["name"] for tc in tool_calls),
+            )
+            yield {"tool_calls": tool_calls, "content": content_before}
+        else:
+            yield from self._stream_chunks(response_text)
+
+    def _parse_tool_calls(self, text: str) -> list[dict[str, Any]] | None:
+        """Parse tool calls from model output text.
+
+        Supports two Mistral tokenizer formats:
+        - Modern (v1.1+): [TOOL_CALLS]function_name{"arg": "value"}
+        - Legacy (pre-v1.1): [TOOL_CALLS] [{"name": "fn", "arguments": {"arg": "val"}}]
+        """
+        if "[TOOL_CALLS]" not in text:
+            return None
+
+        raw = text.split("[TOOL_CALLS]", 1)[1].strip()
+        if not raw:
+            return None
+
+        # Try legacy JSON array format first: [{"name": ..., "arguments": ...}]
+        if raw.startswith("["):
+            try:
+                calls = json.loads(raw)
+                if isinstance(calls, list):
+                    return [
+                        {
+                            "id": call.get("id", _generate_mistral_tool_id()),
+                            "type": "function",
+                            "function": {
+                                "name": call["name"],
+                                "arguments": json.dumps(call.get("arguments", {})),
+                            },
+                        }
+                        for call in calls
+                    ]
+            except (json.JSONDecodeError, KeyError):
+                pass  # Fall through to modern format parsing
+
+        # Modern format: function_name{"arg": "value"}
+        # Multiple calls are concatenated: func1{"a":1}func2{"b":2}
+        return self._parse_modern_tool_calls(raw)
+
+    def _parse_modern_tool_calls(self, raw: str) -> list[dict[str, Any]] | None:
+        """Parse modern Mistral tool call format: name{args}[name{args}...].
+
+        The function name is everything before the first '{', and arguments
+        are the JSON object that follows. Multiple tool calls are concatenated
+        with no delimiter — we track brace depth to find boundaries.
+        """
+        calls: list[dict[str, Any]] = []
+        pos = 0
+        length = len(raw)
+
+        while pos < length:
+            # Skip whitespace between tool calls
+            while pos < length and raw[pos] in " \t\n\r":
+                pos += 1
+            if pos >= length:
+                break
+
+            # Find the opening brace — everything before it is the function name
+            brace_start = raw.find("{", pos)
+            if brace_start < 0:
+                logger.warning("Modern tool call parse: no '{' found at pos %d in %r", pos, raw[pos:pos+50])
+                break
+
+            func_name = raw[pos:brace_start].strip()
+            if not func_name:
+                logger.warning("Modern tool call parse: empty function name at pos %d", pos)
+                break
+
+            # Track brace depth to find the matching closing brace
+            depth = 0
+            json_start = brace_start
+            json_end = -1
+            for i in range(brace_start, length):
+                ch = raw[i]
+                if ch == "{":
+                    depth += 1
+                elif ch == "}":
+                    depth -= 1
+                    if depth == 0:
+                        json_end = i + 1
+                        break
+
+            if json_end < 0:
+                # Unbalanced braces — try to parse what we have
+                logger.warning("Modern tool call parse: unbalanced braces for %s", func_name)
+                json_str = raw[json_start:]
+                json_end = length
+            else:
+                json_str = raw[json_start:json_end]
+
+            # Parse the JSON arguments
+            try:
+                args = json.loads(json_str)
+            except json.JSONDecodeError:
+                logger.warning("Modern tool call parse: invalid JSON for %s: %r", func_name, json_str[:100])
+                args = {}
+
+            calls.append({
+                "id": _generate_mistral_tool_id(),
+                "type": "function",
+                "function": {
+                    "name": func_name,
+                    "arguments": json.dumps(args) if isinstance(args, dict) else "{}",
+                },
+            })
+            logger.debug("Parsed tool call: %s(%s)", func_name, json_str[:80])
+
+            pos = json_end
+
+        if not calls:
+            logger.warning("Failed to parse any tool calls from modern format: %r", raw[:100])
+            return None
+
+        return calls
 
     def get_styling(self) -> tuple[str | None, str]:
-        """Return vLLM-specific styling for output formatting.
-        
-        Returns:
-            Tuple of (panel_title, border_style)
-            - panel_title: None to use bot name from base class
-            - border_style: "bright_cyan" for vLLM branding
-        """
+        """Return vLLM-specific styling for output formatting."""
         return None, "bright_cyan"
 
     def unload(self) -> None:
-        """Unload the vLLM model and free GPU memory.
-        
-        Deletes the engine, runs garbage collection, and clears CUDA cache.
-        Called by ModelLifecycleManager when switching models.
-        """
+        """Unload the vLLM model and free GPU memory."""
         if self.llm_engine is None:
             return
         

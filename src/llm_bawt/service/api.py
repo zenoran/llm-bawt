@@ -874,6 +874,7 @@ class BackgroundService:
         
         if cache_key in self._llm_bawt_cache:
             log.cache_hit("llm_bawt", f"{model_alias}/{bot_id}/{user_id}")
+            log.debug(f"Reusing cached ServiceLLMBawt instance for {cache_key}")
             return self._llm_bawt_cache[cache_key]
         
         log.cache_miss("llm_bawt", f"{model_alias}/{bot_id}/{user_id}")
@@ -1237,11 +1238,17 @@ class BackgroundService:
 
                             current_msgs = list(messages)
                             max_iterations = 5
+                            has_executed_tools = False
 
                             for iteration in range(max_iterations):
+                                # After first tool execution, don't pass tools_schema
+                                # so the model generates a text response instead of
+                                # looping on more tool calls.
+                                current_tools = None if has_executed_tools else tools_schema
+
                                 for item in llm_bawt.client.stream_with_tools(
                                     current_msgs,
-                                    tools_schema=tools_schema,
+                                    tools_schema=current_tools,
                                     tool_choice="auto",
                                 ):
                                     if isinstance(item, str):
@@ -1274,6 +1281,8 @@ class BackgroundService:
                                                 "tool_call_id": tc.get("id", ""),
                                                 "content": result,
                                             })
+
+                                        has_executed_tools = True
 
                                         # Store tool context
                                         tool_context_holder[0] = "\n\n".join(
@@ -1394,9 +1403,15 @@ class BackgroundService:
             # Start streaming in single-thread executor
             loop.run_in_executor(self._llm_executor, _stream_to_queue)
 
-            # Yield SSE chunks
+            # Yield SSE chunks (with keepalive to prevent client timeout
+            # during slow backends like vLLM first-inference)
             while True:
-                chunk = await chunk_queue.get()
+                try:
+                    chunk = await asyncio.wait_for(chunk_queue.get(), timeout=15.0)
+                except asyncio.TimeoutError:
+                    # Send SSE comment as keepalive to prevent client/proxy timeout
+                    yield ": keepalive\n\n"
+                    continue
                 
                 if chunk is None:
                     # Stream complete - flush any buffered content from emote filter

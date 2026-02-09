@@ -403,7 +403,7 @@ class Config(BaseSettings):
         if model_type == PROVIDER_OPENAI:
             return "native"
         if model_type == PROVIDER_VLLM:
-            return "react"  # in-process vLLM doesn't produce tool_call objects
+            return "native"  # tools passed via chat template, parsed from output
         if model_type in (PROVIDER_GGUF, PROVIDER_OLLAMA, PROVIDER_HF):
             return "react"
         return "xml"

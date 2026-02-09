@@ -47,7 +47,7 @@ llamacpp = [
 ]
 
 vllm = [
-    "vllm>=0.6.0",
+    "vllm>=0.15.0",
 ]
 
 service = [

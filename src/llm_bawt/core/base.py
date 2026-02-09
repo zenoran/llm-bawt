@@ -111,9 +111,9 @@ class BaseLLMBawt(ABC):
         # Initialize LLM client - reuse existing if provided
         if existing_client is not None:
             self.client = existing_client
-            logger.debug(f"♻️  Reusing existing client for model '{resolved_model_alias}' (no reload)")
+            logger.debug(f"Reusing existing client for model '{resolved_model_alias}'")
         else:
-            logger.debug(f"🔧 Creating new client for model '{resolved_model_alias}'")
+            logger.debug(f"Creating new client for model '{resolved_model_alias}'")
             self.client = self._initialize_client()
         
         # Log effective per-model configuration
