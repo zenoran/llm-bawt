@@ -3,15 +3,14 @@
 
 services:
   app:
-    command: ["/app/server.sh", "start", "--stdout", "--debug"]
+    command: ["/app/server.sh", "start", "--stdout", "--debug", "--dev"]
     # Dev mode: source mounted, manual restart needed after code changes
     # (--dev flag with auto-reload causes issues, so we skip it)
     
-    # Use host DNS so container can resolve local hostnames (e.g. postgres.home)
-    dns:
-      - 10.255.255.254
+    # Use extra_hosts for local hostnames (DNS: Docker default handles external resolution)
     extra_hosts:
       - "host.docker.internal:host-gateway"
+      - "postgres.home:10.0.2.32"
     
     volumes:
       # Mount source code for live development

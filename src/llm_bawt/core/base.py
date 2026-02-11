@@ -343,6 +343,7 @@ class BaseLLMBawt(ABC):
                     tool_format=self.tool_format,
                     tools=tool_definitions,
                     adapter=self.adapter,
+                    history_manager=self.history_manager,
                 )
 
                 # Render the final response (tool loop returns raw text, never renders)
@@ -358,11 +359,21 @@ class BaseLLMBawt(ABC):
                     ts = datetime.now().strftime("%Y-%m-%d %H:%M")
                     self.history_manager.add_message("system", f"[Tool Results @ {ts}]\n{tool_context}")
             else:
+                # Pass adapter stop sequences even without tools
+                adapter_stops = self.adapter.get_stop_sequences()
                 assistant_response = self.client.query(
                     context_messages,
                     plaintext_output=plaintext_output,
                     stream=stream,
+                    stop=adapter_stops or None,
                 )
+                # Apply adapter output cleaning as safety net
+                if assistant_response:
+                    cleaned = self.adapter.clean_output(assistant_response)
+                    if cleaned != assistant_response:
+                        logger.debug(f"Adapter '{self.adapter.name}' cleaned response: "
+                                     f"{len(assistant_response)} -> {len(cleaned)} chars")
+                        assistant_response = cleaned
                 tool_call_details = []
             
             if assistant_response:

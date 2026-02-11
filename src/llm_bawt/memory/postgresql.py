@@ -943,6 +943,8 @@ class PostgreSQLMemoryBackend(MemoryBackend):
                         "importance": importance,
                         "source_message_ids": row.source_message_ids or [],
                         "access_count": access_count,
+                        "created_at": row.created_at,
+                        "last_accessed": row.last_accessed,
                         "similarity": similarity,
                         "meaning_similarity": meaning_similarity,
                         "age_days": age_days,

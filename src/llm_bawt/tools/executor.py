@@ -17,7 +17,7 @@ import logging
 from datetime import datetime, timedelta
 from typing import Any, Callable, TYPE_CHECKING
 
-from .parser import ToolCall, format_tool_result, format_memories_for_result
+from .parser import ToolCall, format_tool_result
 from .definitions import normalize_legacy_tool_call
 
 if TYPE_CHECKING:
@@ -26,6 +26,7 @@ if TYPE_CHECKING:
     from ..search.base import SearchClient
     from ..core.model_lifecycle import ModelLifecycleManager
     from ..utils.config import Config
+    from ..utils.history import HistoryManager
 
 logger = logging.getLogger(__name__)
 
@@ -128,6 +129,7 @@ class ToolExecutor:
         config: "Config | None" = None,
         user_id: str = "",  # Required - must be passed explicitly
         bot_id: str = "nova",
+        history_manager: "HistoryManager | None" = None,
     ):
         """Initialize the executor.
 
@@ -138,6 +140,7 @@ class ToolExecutor:
             model_lifecycle: Model lifecycle manager for model switching.
             user_id: Current user ID for profile operations (required).
             bot_id: Current bot ID for bot personality operations.
+            history_manager: History manager for recall operations.
         """
         if not user_id:
             raise ValueError("user_id is required for ToolExecutor")
@@ -148,6 +151,7 @@ class ToolExecutor:
         self.config = config
         self.user_id = user_id
         self.bot_id = bot_id.lower().strip()  # Normalize to match ProfileManager
+        self._history_manager = history_manager
         self._call_count = 0
         # Get max tool calls from config (0 = unlimited)
         self._max_tool_calls = getattr(config, 'MAX_TOOL_CALLS_PER_TURN', self.DEFAULT_MAX_TOOL_CALLS) if config else self.DEFAULT_MAX_TOOL_CALLS
@@ -291,6 +295,8 @@ class ToolExecutor:
             )
 
         try:
+            from ..memory.context_builder import build_memory_context_string
+
             results = self.memory_client.search(query, n_results=n_results)
             memories = [
                 {
@@ -299,11 +305,18 @@ class ToolExecutor:
                     "relevance": r.relevance,
                     "importance": r.importance,
                     "tags": r.tags,
+                    "intent": r.intent,
+                    "stakes": r.stakes,
+                    "emotional_charge": r.emotional_charge,
+                    "created_at": r.created_at,
+                    "last_accessed": r.last_accessed,
                 }
                 for r in results
             ]
 
-            formatted = format_memories_for_result(memories)
+            formatted = build_memory_context_string(memories, user_name=self.user_id)
+            if not formatted:
+                formatted = "No memories found matching your query."
             return format_tool_result(tool_call.name, formatted)
 
         except Exception as e:

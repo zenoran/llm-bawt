@@ -517,6 +517,7 @@ class RequestPipeline:
                 tool_format=ctx.tool_format,
                 tools=ctx.tool_definitions,
                 adapter=self.adapter,
+                history_manager=self.history_manager,
             )
             
             ctx.response = response

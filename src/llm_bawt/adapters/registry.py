@@ -44,10 +44,10 @@ def _auto_detect_adapter(model_alias: str, model_def: dict | None) -> str | None
     alias_lower = model_alias.lower()
     repo_id = (model_def.get("repo_id", "") if model_def else "").lower()
 
-    # Pygmalion/MythoMax models - these have specific markers like [HUMAN], [INST]
-    if any(x in alias_lower for x in ("pygmalion", "mytho", "mythomax")):
+    # Pygmalion/MythoMax/Lewd models - these have specific markers like [HUMAN], [INST]
+    if any(x in alias_lower for x in ("pygmalion", "mytho", "mythomax", "lewd")):
         return "pygmalion"
-    if any(x in repo_id for x in ("pygmalion", "mytho", "mythomax")):
+    if any(x in repo_id for x in ("pygmalion", "mytho", "mythomax", "lewd")):
         return "pygmalion"
 
     return None

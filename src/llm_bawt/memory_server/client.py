@@ -49,8 +49,12 @@ class MemoryResult:
     importance: float = 0.5
     relevance: float = 0.0  # Only set for search results
     created_at: str | None = None
+    last_accessed: str | None = None
     source_message_ids: list[str] = field(default_factory=list)
-    
+    intent: str | None = None
+    stakes: str | None = None
+    emotional_charge: float | None = None
+
     @classmethod
     def from_dict(cls, data: dict) -> "MemoryResult":
         return cls(
@@ -60,7 +64,11 @@ class MemoryResult:
             importance=data.get("importance", 0.5),
             relevance=data.get("relevance", 0.0),
             created_at=data.get("created_at"),
+            last_accessed=data.get("last_accessed"),
             source_message_ids=data.get("source_message_ids", []),
+            intent=data.get("intent"),
+            stakes=data.get("stakes"),
+            emotional_charge=data.get("emotional_charge"),
         )
 
 

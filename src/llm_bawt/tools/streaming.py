@@ -18,6 +18,7 @@ if TYPE_CHECKING:
     from ..search.base import SearchClient
     from ..core.model_lifecycle import ModelLifecycleManager
     from ..utils.config import Config
+    from ..utils.history import HistoryManager
 
 # Use service logger if available, otherwise standard logging
 try:
@@ -119,6 +120,7 @@ def stream_with_tools(
     max_iterations: int | None = None,
     tool_format: ToolFormat | str = ToolFormat.REACT,
     adapter: "ModelAdapter | None" = None,
+    history_manager: "HistoryManager | None" = None,
 ) -> Iterator[str]:
     """Stream LLM response with tool calling support.
 
@@ -144,6 +146,7 @@ def stream_with_tools(
         max_iterations: Max tool iterations per turn.
         tool_format: Tool format to use (determines stop sequences and parsing).
         adapter: Model adapter for model-specific cleaning and stop sequences.
+        history_manager: History manager for recall operations.
 
     Yields:
         Text chunks from the LLM response (cleaned by adapter and handler).
@@ -182,6 +185,7 @@ def stream_with_tools(
         config=config,
         user_id=user_id,
         bot_id=bot_id,
+        history_manager=history_manager,
     )
     current_messages = messages.copy()
     has_executed_tools = False  # Track if we've executed tools

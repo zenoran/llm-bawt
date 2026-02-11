@@ -132,6 +132,7 @@ install-local-all: check-python check-pipx ## [pipx] Editable install + ALL opti
 	pipx runpip llm-bawt install transformers torch huggingface-hub accelerate
 	pipx runpip llm-bawt install ddgs tavily-python
 	pipx runpip llm-bawt install fastapi "uvicorn[standard]" httpx
+	pipx runpip llm-bawt install textual textual-dev pyperclip ipython
 	@echo "$(GREEN)✓ llm-bawt installed (editable, all extras)$(NC)"
 	@echo "  Run: make install-extras-llama  to add llama-cpp (CUDA-aware)"
 
@@ -161,6 +162,12 @@ install-extras-search: check-pipx ## [pipx] Add search deps
 	pipx runpip llm-bawt install ddgs tavily-python
 	@echo "$(GREEN)✓ Search deps installed$(NC)"
 
+install-extras-tui: check-pipx ## [pipx] Add TUI deps (textual, ipython)
+	@echo "$(BLUE)Installing TUI deps...$(NC)"
+	pipx runpip llm-bawt install textual textual-dev pyperclip ipython
+	@echo "$(GREEN)✓ TUI deps installed$(NC)"
+	@echo "  Run: llm-memory-tui  or  llm-memory --tui"
+
 install-extras-vllm: check-pipx ## [pipx] Add vLLM (requires NVIDIA GPU + CUDA)
 	@echo "$(BLUE)Installing vLLM...$(NC)"
 	pipx runpip llm-bawt install vllm
@@ -178,11 +185,12 @@ uninstall: ## [pipx] Uninstall llm-bawt
 
 .PHONY: dev dev-llama dev-run
 
-dev: check-uv ## [uv] Sync .venv with all extras (mcp, service, search, memory, hf)
+dev: check-uv ## [uv] Sync .venv with all extras (mcp, service, search, memory, hf, tui)
 	@echo "$(BLUE)Syncing .venv with all extras...$(NC)"
 	uv sync --inexact --extra mcp --extra service --extra search --extra memory --extra huggingface
 	@echo "$(GREEN)✓ .venv synced$(NC)"
 	@echo "  Run: uv run llm --status"
+	@echo "  Run: uv run llm-memory-tui  (TUI interface)"
 
 dev-llama: check-uv ## [uv] Add llama-cpp-python to .venv (CUDA-aware)
 ifeq ($(WITH_CUDA),true)
@@ -203,6 +211,15 @@ dev-vllm: check-uv ## [uv] Add vLLM to .venv (requires NVIDIA GPU + CUDA)
 
 dev-run: ## [uv] Run llm from .venv (e.g. make dev-run ARGS="--status")
 	uv run llm $(ARGS)
+
+dev-tui: ## [uv] Run memory TUI from .venv
+	uv run llm-memory-tui
+
+dev-tui-debug: ## [uv] Run memory TUI with textual console
+	@echo "$(BLUE)Starting TUI with debug console...$(NC)"
+	@echo "$(YELLOW)In another terminal, run: textual console$(NC)"
+	@sleep 2
+	textual run --dev src/llm_bawt/memory_tui/app.py
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # DOCKER (works identically on Linux / macOS / Windows)

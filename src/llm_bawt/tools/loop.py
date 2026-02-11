@@ -24,6 +24,7 @@ if TYPE_CHECKING:
     from ..search.base import SearchClient
     from ..core.model_lifecycle import ModelLifecycleManager
     from ..utils.config import Config
+    from ..utils.history import HistoryManager
     from ..adapters import ModelAdapter
 
 logger = logging.getLogger(__name__)
@@ -48,6 +49,7 @@ class ToolLoop:
         tool_format: ToolFormat | str = ToolFormat.XML,
         tools: list | None = None,
         adapter: "ModelAdapter | None" = None,
+        history_manager: "HistoryManager | None" = None,
     ):
         """
         Args:
@@ -60,6 +62,7 @@ class ToolLoop:
             bot_id: Current bot ID.
             max_iterations: Maximum tool call iterations per turn (None = use config default).
             adapter: Model adapter for model-specific stop sequences and output cleaning.
+            history_manager: History manager for recall operations.
         """
         if not user_id:
             raise ValueError("user_id is required for ToolLoop")
@@ -71,6 +74,7 @@ class ToolLoop:
             config=config,
             user_id=user_id,
             bot_id=bot_id,
+            history_manager=history_manager,
         )
         # Use config value if not explicitly provided (0 = unlimited, cap at reasonable max)
         if max_iterations is None:
@@ -458,6 +462,7 @@ def query_with_tools(
     tool_format: ToolFormat | str = ToolFormat.XML,
     tools: list | None = None,
     adapter: "ModelAdapter | None" = None,
+    history_manager: "HistoryManager | None" = None,
 ) -> tuple[str, str, list[dict]]:
     """Convenience function for tool-enabled queries.
 
@@ -476,6 +481,7 @@ def query_with_tools(
         tool_format: Tool format for this model.
         tools: Tool definitions to include in schema/formatting.
         adapter: Model adapter for model-specific stop sequences.
+        history_manager: History manager for recall operations.
 
     Returns:
         Tuple of (final_response, tool_context_summary, tool_call_details).
@@ -496,6 +502,7 @@ def query_with_tools(
         tool_format=tool_format,
         tools=tools,
         adapter=adapter,
+        history_manager=history_manager,
     )
     response = loop.run(messages, client, stream_final=stream)
     tool_context = loop.get_tool_context_summary()

@@ -220,6 +220,8 @@ def setup_service_logging(verbose: bool = False, debug: bool = False) -> None:
         "mcp.server",
         "mcp.server.lowlevel.server",
         "mcp.server.streamable_http",
+        "watchfiles",                 # File watcher logs — writes to debug log create feedback loop
+        "watchfiles.main",
     ]
     
     # In verbose mode, suppress HTTP access logs completely (we log our own summaries)

@@ -1,29 +1,41 @@
-# Claude Code Instructions for llm-bawt
+# llm-bawt — Agent Guide
+
+A model-agnostic LLM platform providing a unified, OpenAI-compatible API for configurable chatbots and multi-agent systems across cloud and local models.
+
+**Python 3.12+** | **uv** for dependency management | **ruff** for linting/formatting | **mypy** for type checking
+
+---
 
 ## Project Overview
 
-Model-agnostic LLM platform providing a unified, OpenAI-compatible API for configurable chatbots and multi-agent systems. Supports OpenAI, Ollama-compatible APIs, and local GGUF models with persistent semantic memory, MCP tools, and web search.
+llm-bawt normalizes providers (OpenAI, Ollama, GGUF), augments conversations with persistent semantic memory, and integrates MCP tools and web search — enabling consistent behavior, shared context, and extensible tooling through a single interface.
 
-**Python 3.12+** | **uv** for dependency management |j **ruff** for linting/formatting | **mypy** for type checking
+### Key Features
+- **Multi-Provider Support** — OpenAI, Ollama-compatible APIs, and local GGUF models
+- **Bot Personalities** — Configurable chatbot identities with isolated memory, tools, and default models (YAML-driven)
+- **Persistent Memory** — PostgreSQL + pgvector semantic memory with temporal decay and contradiction detection
+- **Tool System** — Dual-mode tool calling: native OpenAI function calling and ReAct format for local/open models
+- **Web Search** — Pluggable search providers (DuckDuckGo, Tavily, Brave)
+- **MCP Server** — Model Context Protocol memory server for cross-service memory operations
+- **Background Service** — FastAPI-based OpenAI-compatible API with async task processing
+
+---
 
 ## Project Structure
 
 ```
 src/llm_bawt/
 ├── cli/                    # CLI package
-│   ├── app.py              # Main CLI logic, query handling (1,589 lines)
+│   ├── app.py              # Main CLI logic, query handling
 │   ├── parser.py           # Argument parsing
 │   ├── main.py             # Entry point
 │   ├── config_wizard.py    # Interactive config setup
-│   └── commands/           # Subcommands
-│       ├── models.py       # List models command
-│       ├── profile.py      # Profile management command
-│       └── status.py       # System status command
+│   └── commands/           # Subcommands (models, profile, status)
 ├── core/                   # Core orchestration
 │   ├── base.py             # BaseLLMBawt - shared logic for CLI/service
 │   ├── client.py           # Client initialization
-│   ├── pipeline.py         # RequestPipeline, PipelineContext (stage-based)
-│   ├── prompt_builder.py   # PromptBuilder, SectionPosition (composable)
+│   ├── pipeline.py         # RequestPipeline (7-stage processing)
+│   ├── prompt_builder.py   # PromptBuilder, SectionPosition
 │   └── model_lifecycle.py  # Model lifecycle management
 ├── clients/                # LLM clients
 │   ├── base.py             # LLMClient ABC
@@ -37,24 +49,24 @@ src/llm_bawt/
 │   └── dolphin.py          # Observation hallucination cleanup
 ├── tools/                  # Tool/function calling system
 │   ├── definitions.py      # Tool definitions
-│   ├── executor.py         # Tool execution (1,149 lines)
+│   ├── executor.py         # Tool execution
 │   ├── loop.py             # Tool call loop handling
 │   ├── parser.py           # Tool call parsing
 │   ├── streaming.py        # Streaming with tools
 │   └── formats/            # Tool format handlers
-│       ├── base.py         # ToolFormatHandler ABC, ToolCallRequest
+│       ├── base.py         # ToolFormatHandler ABC
 │       ├── native_openai.py # Native OpenAI format
 │       ├── react.py        # ReAct format
 │       └── xml_legacy.py   # Legacy XML format
 ├── search/                 # Web search providers
-│   ├── base.py             # SearchClient ABC, SearchResult, SearchProvider enum
+│   ├── base.py             # SearchClient ABC
 │   ├── ddgs_client.py      # DuckDuckGo (free, no API key)
-│   ├── tavily_client.py    # Tavily (production, API key required)
+│   ├── tavily_client.py    # Tavily (production, API key)
 │   ├── brave_client.py     # Brave Search
 │   └── factory.py          # get_search_client()
 ├── memory/                 # Persistent semantic memory
 │   ├── base.py             # MemoryBackend ABC
-│   ├── postgresql.py       # pgvector storage, decay, search (2,025 lines)
+│   ├── postgresql.py       # pgvector storage, decay, search
 │   ├── embeddings.py       # sentence-transformers (MiniLM)
 │   ├── context_builder.py  # Memory context assembly
 │   ├── consolidation.py    # Memory consolidation
@@ -68,67 +80,44 @@ src/llm_bawt/
 ├── memory_server/          # MCP memory server
 │   ├── __main__.py         # Direct execution entry
 │   ├── server.py           # FastMCP server
-│   ├── client.py           # MemoryClient, get_memory_client()
+│   ├── client.py           # MemoryClient
 │   ├── storage.py          # Storage backend
 │   └── extraction.py       # Extraction service
 ├── service/                # Background FastAPI service
 │   ├── server.py           # FastAPI server
-│   ├── api.py              # API routes (3,504 lines)
+│   ├── api.py              # API routes
 │   ├── core.py             # ServiceLLMBawt
 │   ├── client.py           # ServiceClient
-│   ├── logging.py          # Request/response logging with Rich
-│   ├── scheduler.py        # JobScheduler, background tasks
+│   ├── logging.py          # Request/response logging
+│   ├── scheduler.py        # JobScheduler
 │   └── tasks.py            # Async task processing
 ├── integrations/           # External service integrations
 │   └── nextcloud/          # Nextcloud Talk bot routing
-│       ├── cli.py          # Nextcloud CLI
-│       ├── config.py       # Configuration
-│       ├── manager.py      # Bot manager
-│       ├── provisioner.py  # Bot provisioning
-│       └── webhook.py      # Webhook handler
 ├── models/
-│   └── message.py          # Message model (role, content, timestamps, tool_calls)
+│   └── message.py          # Message model
 ├── shared/
 │   └── logging.py          # Shared logging setup
-├── bots.py                 # Bot, BotManager (YAML-driven personalities)
-├── bots.yaml               # Bot definitions (nova, spark, mira, monika, proto)
-├── profiles.py             # ProfileManager, EntityType, AttributeCategory
+├── bots.py                 # Bot, BotManager (YAML-driven)
+├── bots.yaml               # Bot personality definitions
+├── profiles.py             # ProfileManager
 ├── model_manager.py        # Model definitions, aliases
 ├── gguf_handler.py         # GGUF model handling
 ├── memory_debug.py         # Memory debugging utility
 └── utils/
-    ├── config.py           # Config (pydantic-settings), has_database_credentials()
+    ├── config.py           # Config (pydantic-settings)
     ├── env.py              # Environment handling
-    ├── history.py          # HistoryManager, Message (file or PostgreSQL)
+    ├── history.py          # HistoryManager
     ├── input_handler.py    # MultilineInputHandler
     ├── paths.py            # Log directory resolution
     ├── streaming.py        # render_streaming_response()
-    └── vram.py             # VRAMInfo, GPU detection, context auto-sizing
+    └── vram.py             # VRAMInfo, GPU detection
 ```
 
-### Other Important Files
+---
 
-```
-├── pyproject.toml          # Project config, dependencies, entry points
-├── Dockerfile              # Multi-stage NVIDIA CUDA build
-├── docker-compose.yml      # Production Docker compose
-├── docker-compose.dev.yml  # Dev mode override (mounts ./src)
-├── .env.docker             # Docker environment template
-├── Makefile                # Cross-platform build targets
-├── install.sh              # Installer script (pipx/uv)
-├── server.sh               # MCP + LLM service management
-├── run.sh                  # Docker wrapper script (aliased as start.sh)
-├── tests/                  # Test suite (pytest)
-├── docs/                   # Extended documentation
-├── scripts/                # Utility scripts (cleanup_profile, rebuild_profile)
-└── .github/copilot-instructions.md
-```
+## Build and Development Commands
 
-## Development Workflow
-
-### Docker Development (primary)
-
-Use `./run.sh` for Docker-based development:
+### Docker Development (Recommended)
 
 ```bash
 ./run.sh dev                # Start dev mode (live source mounting from ./src)
@@ -140,7 +129,7 @@ Use `./run.sh` for Docker-based development:
 ./run.sh rebuild            # Full rebuild (only for dependency changes)
 ```
 
-### Makefile Targets (cross-platform)
+### Makefile Targets (Cross-Platform)
 
 ```bash
 make dev                    # Sync .venv with all extras (uv-based)
@@ -148,11 +137,14 @@ make docker-dev             # Docker compose dev mode
 make up                     # Docker compose production
 make down                   # Stop Docker containers
 make test                   # Run tests
+make test-cov               # Run tests with coverage
 make lint                   # Lint with ruff
 make format                 # Format with ruff
 make typecheck              # Type check with mypy
 make server-start           # Start local MCP + LLM services
 make server-stop            # Stop local services
+make clean                  # Remove build artifacts and caches
+make clean-all              # Deep clean including .venv
 ```
 
 ### Non-Docker Development
@@ -164,7 +156,9 @@ make server-stop            # Stop local services
 uv run llm --status         # Run CLI through uv
 ```
 
-## Testing
+---
+
+## Testing Instructions
 
 ```bash
 uv run pytest                               # Run all tests
@@ -172,7 +166,7 @@ uv run pytest tests/test_adapters.py        # Run specific test file
 uv run pytest --cov=src --cov-report=term-missing  # With coverage
 ```
 
-Test files live in `tests/` and use class-based organization with pytest fixtures:
+Test files in `tests/`:
 - `test_adapters.py` - Model adapter tests
 - `test_brave_search.py` - Brave search tests
 - `test_integration.py` - Integration tests
@@ -180,40 +174,51 @@ Test files live in `tests/` and use class-based organization with pytest fixture
 - `test_tool_formats.py` - Tool format tests
 - `test_tool_loop_integration.py` - Tool loop tests
 
-### Linting and Formatting
+---
 
-```bash
-uv run ruff check src/      # Lint
-uv run ruff format src/      # Format
-uv run mypy src/             # Type check
+## Code Style Guidelines
+
+### Type Annotations
+- **Required** on all public methods, properties, and dataclass fields
+- Use Python 3.10+ union syntax: `str | None` (not `Optional[str]`)
+- Use `TYPE_CHECKING` imports to avoid circular dependencies:
+  ```python
+  from typing import TYPE_CHECKING
+  if TYPE_CHECKING:
+      from ..other_module import SomeClass
+  ```
+
+### Naming Conventions
+- **Classes**: PascalCase (`RequestPipeline`, `PromptBuilder`)
+- **Functions/methods**: snake_case (`get_max_tokens()`, `format_message()`)
+- **Constants**: UPPER_SNAKE_CASE (`DEFAULT_BOT`, `PRE_PROCESS`)
+- **Private**: leading underscore (`_stage_pre_process()`, `_text_similarity()`)
+- **Bot slugs**: lowercase, no spaces
+
+### Logging
+```python
+logger = logging.getLogger(__name__)  # Module-level
 ```
+Use `logger.debug()` for internal detail, `logger.info()` for user-facing events, `logger.warning()` for recoverable issues, `logger.exception()` for caught exceptions with traceback.
 
-## CLI Commands
+### Terminal Output
+All user-facing output via **Rich** (`Console`, `Panel`, `Markdown`). Respect `PLAIN_OUTPUT` config for non-terminal contexts. Escaped brackets in Panel titles: `\[model\]`.
 
-```bash
-llm "question"              # Ask a question
-llm                         # Interactive mode
-llm -m gpt4 "question"     # Specific model alias
-llm -b nova "question"     # Specific bot personality
-llm --status                # System status
-llm --list-models           # Available models
-llm --list-bots             # Available bots
-```
+### Error Handling
+- Try/except at system boundaries (file I/O, network, database)
+- Log exceptions with `logger.exception()`
+- Graceful fallbacks: memory/search failures log warnings but don't crash queries
+- Validation errors in `__init__` with explicit `ValueError`
 
-## Service Architecture
+### Dataclasses
+Used extensively for value objects: `Message`, `SearchResult`, `PromptSection`, `VRAMInfo`, `PipelineContext`, `ToolCallRequest`, `Bot`. Use `field(default_factory=list)` for mutable defaults. `__post_init__` for validation.
 
-Two-service stack:
+### Import Style
+- Standard library → third-party → local imports
+- Relative imports within the package (`from ..utils.config import Config`)
+- Lazy imports in functions when optional dependencies may be missing
 
-1. **MCP Memory Server** (port 8001) - `llm-mcp-server`
-   - Model Context Protocol server for memory operations and fact extraction
-   - Started first; LLM service waits for it to be ready
-
-2. **LLM Service** (port 8642) - `llm-service`
-   - OpenAI-compatible REST API
-   - Async task processing with JobScheduler
-   - Health check at `GET /health`
-
-Managed by `server.sh` (local) or Docker compose.
+---
 
 ## Configuration
 
@@ -240,17 +245,24 @@ All settings use `LLM_BAWT_` prefix (pydantic-settings `env_prefix`):
 
 See `.env.docker` for a complete template with all available settings.
 
-## Dependencies (extras)
+---
 
-| Extra | Purpose | Key packages |
-|-------|---------|-------------|
-| `dev` | Development tools | ruff, mypy, pytest |
-| `memory` | Embeddings | sentence-transformers |
-| `service` | API service | fastapi, uvicorn, httpx |
-| `search` | Web search | ddgs, tavily-python |
-| `mcp` | Memory server | mcp[cli] |
-| `huggingface` | Local HF models | transformers, torch, accelerate |
-| `llamacpp` | Local GGUF models | llama-cpp-python |
+## Service Architecture
+
+Two-service stack:
+
+1. **MCP Memory Server** (port 8001) - `llm-mcp-server`
+   - Model Context Protocol server for memory operations and fact extraction
+   - Started first; LLM service waits for it to be ready
+
+2. **LLM Service** (port 8642) - `llm-service`
+   - OpenAI-compatible REST API
+   - Async task processing with JobScheduler
+   - Health check at `GET /health`
+
+Managed by `server.sh` (local) or Docker compose.
+
+---
 
 ## Entry Points
 
@@ -262,11 +274,13 @@ See `.env.docker` for a complete template with all available settings.
 | `llm-memory` | `llm_bawt.memory_debug:main` | Memory debug utility |
 | `llm-nextcloud` | `llm_bawt.integrations.nextcloud.cli:nextcloud_cli` | Nextcloud CLI |
 
+---
+
 ## Architecture Patterns
 
 ### Pipeline Pattern (`core/pipeline.py`)
 
-Request processing uses a 7-stage pipeline: PRE_PROCESS → CONTEXT_BUILD → MEMORY_RETRIEVAL → HISTORY_FILTER → MESSAGE_ASSEMBLY → EXECUTE → POST_PROCESS. Each stage is a discrete method (`_stage_*`). `PipelineContext` dataclass carries state through all stages. Hooks can be registered at any stage via `add_hook()`.
+Request processing uses a 7-stage pipeline: `PRE_PROCESS` → `CONTEXT_BUILD` → `MEMORY_RETRIEVAL` → `HISTORY_FILTER` → `MESSAGE_ASSEMBLY` → `EXECUTE` → `POST_PROCESS`. Each stage is a discrete method (`_stage_*`). `PipelineContext` dataclass carries state through all stages. Hooks can be registered at any stage via `add_hook()`.
 
 ### ABC + Registry Pattern
 
@@ -282,57 +296,13 @@ Extensible components use abstract base classes with registry/factory patterns:
 
 ### Prompt Builder (`core/prompt_builder.py`)
 
-Composable prompt assembly with ordered sections. Each `PromptSection` has a name, content, and position. `SectionPosition` defines standard orderings (USER_CONTEXT=0, BOT_TRAITS=1, etc.). Supports method chaining.
+Composable prompt assembly with ordered sections. Each `PromptSection` has a name, content, and position. `SectionPosition` defines standard orderings (`USER_CONTEXT=0`, `BOT_TRAITS=1`, etc.). Supports method chaining.
 
 ### Bot System (`bots.py` + `bots.yaml`)
 
-Bot personalities defined in YAML with slugs, system prompts, and capability flags (requires_memory, uses_tools, uses_search). User overrides via `~/.config/llm-bawt/bots.yaml` are deep-merged with repo defaults.
+Bot personalities defined in YAML with slugs, system prompts, and capability flags (`requires_memory`, `uses_tools`, `uses_search`). User overrides via `~/.config/llm-bawt/bots.yaml` are deep-merged with repo defaults.
 
-### Config Pattern (`utils/config.py`)
-
-Uses pydantic-settings `BaseSettings` with `LLM_BAWT_` prefix. All settings declared as `Field()` with descriptions and defaults. Dependency availability checked via `is_huggingface_available()`, `is_llama_cpp_available()` static methods.
-
-## Code Conventions
-
-### Type Annotations
-- **Required** on all public methods, properties, and dataclass fields
-- Use Python 3.10+ union syntax: `str | None` (not `Optional[str]`)
-- Use `TYPE_CHECKING` imports to avoid circular dependencies:
-  ```python
-  from typing import TYPE_CHECKING
-  if TYPE_CHECKING:
-      from ..other_module import SomeClass
-  ```
-
-### Naming
-- **Classes**: PascalCase (`RequestPipeline`, `PromptBuilder`)
-- **Functions/methods**: snake_case (`get_max_tokens()`, `format_message()`)
-- **Constants**: UPPER_SNAKE_CASE (`DEFAULT_BOT`, `PRE_PROCESS`)
-- **Private**: leading underscore (`_stage_pre_process()`, `_text_similarity()`)
-- **Bot slugs**: lowercase, no spaces
-
-### Logging
-```python
-logger = logging.getLogger(__name__)  # Module-level
-```
-Use `logger.debug()` for internal detail, `logger.info()` for user-facing events, `logger.warning()` for recoverable issues, `logger.exception()` for caught exceptions with traceback.
-
-### Terminal Output
-All user-facing output via **Rich** (`Console`, `Panel`, `Markdown`). Respect `PLAIN_OUTPUT` config for non-terminal contexts. Escaped brackets in Panel titles: `\[model\]`.
-
-### Error Handling
-- Try/except at system boundaries (file I/O, network, database)
-- Log exceptions with `logger.exception()`
-- Graceful fallbacks: memory/search failures log warnings but don't crash queries
-- Validation errors in `__init__` with explicit `ValueError`
-
-### Dataclasses
-Used extensively for value objects: `Message`, `SearchResult`, `PromptSection`, `VRAMInfo`, `PipelineContext`, `ToolCallRequest`, `Bot`, `MaintenanceResult`. Use `field(default_factory=list)` for mutable defaults. `__post_init__` for validation.
-
-### Import Style
-- Standard library → third-party → local imports
-- Relative imports within the package (`from ..utils.config import Config`)
-- Lazy imports in functions when optional dependencies may be missing
+---
 
 ## Common Tasks
 
@@ -366,6 +336,22 @@ Used extensively for value objects: `Message`, `SearchResult`, `PromptSection`, 
 1. Add `Field()` to `Config` class in `utils/config.py` with `LLM_BAWT_` prefix
 2. Add to `.env.docker` template with documentation comment
 
+---
+
+## Dependencies (Extras)
+
+| Extra | Purpose | Key packages |
+|-------|---------|-------------|
+| `dev` | Development tools | ruff, mypy, pytest |
+| `memory` | Embeddings | sentence-transformers |
+| `service` | API service | fastapi, uvicorn, httpx |
+| `search` | Web search | ddgs, tavily-python |
+| `mcp` | Memory server | mcp[cli] |
+| `huggingface` | Local HF models | transformers, torch, accelerate |
+| `llamacpp` | Local GGUF models | llama-cpp-python |
+
+---
+
 ## Documentation
 
 Extended docs in `docs/`:
@@ -375,3 +361,35 @@ Extended docs in `docs/`:
 - `BACKGROUND_SCHEDULER.md` - Job scheduler
 - `CONTEXT_AND_MEMORY_REDESIGN.md` - Memory system design
 - `NEXTCLOUD_INTEGRATION.md` - Nextcloud Talk integration
+
+---
+
+## Security Considerations
+
+- API keys stored in `~/.config/llm-bawt/.env` (user-only readable)
+- PostgreSQL password is the key indicator for database availability
+- Nextcloud bot secrets should be kept secure
+- Tavily/Brave API keys are optional; DuckDuckGo is free and requires no key
+- Docker containers run with GPU access when available
+
+---
+
+## Branching Strategy
+
+This project uses a Gitflow-style branching model:
+
+| Branch | Purpose |
+|--------|---------|
+| `main` | Production-ready releases. Protected — merge via PR only. |
+| `release/*` | Release candidates. Branch from `develop`, merge to `main` and back to `develop`. |
+| `develop` | Integration branch. All feature work merges here. |
+| `feature/*` | Feature branches. Branch from `develop`, PR back to `develop`. |
+| `hotfix/*` | Urgent fixes. Branch from `main`, merge to both `main` and `develop`. |
+
+**Workflow:**
+1. Create a feature branch from `develop`: `git checkout -b feature/my-feature develop`
+2. Do your work, commit, push
+3. Open a PR targeting `develop`
+4. After review and merge, `develop` accumulates features for the next release
+5. When ready to release, create `release/x.y.z` from `develop` for final testing
+6. Merge `release/x.y.z` into `main` and tag the release

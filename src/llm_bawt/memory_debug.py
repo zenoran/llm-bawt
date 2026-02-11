@@ -1030,6 +1030,7 @@ Examples:
     # General
     gen_group = parser.add_argument_group("General")
     gen_group.add_argument("--stats", action="store_true", help="Show memory and message statistics")
+    gen_group.add_argument("--tui", action="store_true", help="Launch interactive TUI interface")
 
     # Memory operations (extracted facts)
     mem_group = parser.add_argument_group("Memories (extracted facts)")
@@ -1072,6 +1073,12 @@ Examples:
         console.print("[red]Error: llm-service is not running.[/red]")
         console.print("[dim]Start it with: llm-service[/dim]")
         sys.exit(1)
+
+    # Launch TUI if requested
+    if args.tui:
+        from .memory_tui import main as tui_main
+        tui_main()
+        return
 
     console.print(f"\n[bold cyan]Memory Tool[/bold cyan] - Bot: [yellow]{args.bot}[/yellow]\n")
 

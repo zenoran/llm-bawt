@@ -35,9 +35,16 @@ class PygmalionAdapter(ModelAdapter):
         response = re.sub(r"\[HUMAN\].*?\[/HUMAN\]", "", response, flags=re.DOTALL | re.IGNORECASE)
         response = re.sub(r"\[INST\].*?\[/INST\]", "", response, flags=re.DOTALL | re.IGNORECASE)
         
-        # Step 2: Remove standalone role markers (if they slipped through stop sequences)
-        response = re.sub(r"\[/?HUMAN\]", "", response, flags=re.IGNORECASE)
-        response = re.sub(r"\[/?INST\]", "", response, flags=re.IGNORECASE)
+        # Step 2: Truncate from unpaired role markers to end of string
+        # These indicate the model started hallucinating a new conversation turn
+        response = re.sub(r"\[INST\].*", "", response, flags=re.DOTALL | re.IGNORECASE)
+        response = re.sub(r"\[HUMAN\].*", "", response, flags=re.DOTALL | re.IGNORECASE)
+        response = re.sub(r"\[/INST\].*", "", response, flags=re.DOTALL | re.IGNORECASE)
+        response = re.sub(r"\[/HUMAN\].*", "", response, flags=re.DOTALL | re.IGNORECASE)
+        
+        # Step 2b: Also truncate from other common turn markers
+        response = re.sub(r"### (?:Instruction|Human|Input):.*", "", response, flags=re.DOTALL | re.IGNORECASE)
+        response = re.sub(r"<\|im_start\|>user.*", "", response, flags=re.DOTALL | re.IGNORECASE)
         
         # Step 3: Remove BBCode formatting tags: [FONT=Arial], [/FONT], [B], [/B], etc.
         response = re.sub(r"\[\w+(?:=[^\]]+)?\]", "", response)

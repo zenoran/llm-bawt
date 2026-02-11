@@ -1343,9 +1343,15 @@ class BackgroundService:
                             bot_id=llm_bawt.bot_id,
                             tool_format=llm_bawt.tool_format,
                             adapter=adapter,
+                            history_manager=llm_bawt.history_manager,
                         )
                 else:
-                    stream_iter = llm_bawt.client.stream_raw(messages)
+                    # Pass adapter stop sequences even without tools
+                    adapter = getattr(llm_bawt, 'adapter', None)
+                    adapter_stops = adapter.get_stop_sequences() if adapter else []
+                    stream_iter = llm_bawt.client.stream_raw(
+                        messages, stop=adapter_stops or None
+                    )
                 
                 # Stream chunks to queue
                 for chunk in stream_iter:
@@ -1366,6 +1372,15 @@ class BackgroundService:
                 if full_response_holder[0] and not cancel_event.is_set():
                     # Calculate elapsed time and log with tokens/sec
                     elapsed_ms = (timing_holder[1] - timing_holder[0]) * 1000
+                    # Apply adapter output cleaning as safety net
+                    adapter = getattr(llm_bawt, 'adapter', None)
+                    if adapter:
+                        cleaned = adapter.clean_output(full_response_holder[0])
+                        if cleaned != full_response_holder[0]:
+                            log.info(f"Adapter '{adapter.name}' cleaned response: "
+                                     f"{len(full_response_holder[0])} -> {len(cleaned)} chars")
+                            full_response_holder[0] = cleaned
+                    
                     log.llm_response(full_response_holder[0], elapsed_ms=elapsed_ms)
                     llm_bawt.finalize_response(user_prompt, full_response_holder[0], tool_context_holder[0])
 

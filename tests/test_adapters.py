@@ -66,13 +66,13 @@ class TestPygmalionCleaning:
         assert adapter.clean_output("Hello [HUMAN]fake turn[/HUMAN] world") == "Hello  world"
         assert adapter.clean_output("[HUMAN]hallucinated[/HUMAN]") == ""
 
-    def test_removes_standalone_human_tags(self):
-        """Removes standalone [HUMAN] and [/HUMAN] tags (without matching close/open)."""
+    def test_truncates_from_standalone_human_tags_basic(self):
+        """Truncates from unpaired [HUMAN] or [/HUMAN] to end of string."""
         adapter = PygmalionAdapter()
         
-        # Unmatched opening tag - content after is preserved
-        assert adapter.clean_output("[HUMAN]content") == "content"
-        # Unmatched closing tag - content before is preserved
+        # Unmatched opening tag - hallucinated user turn, truncate
+        assert adapter.clean_output("[HUMAN]content") == ""
+        # Unmatched closing tag - truncate from marker
         assert adapter.clean_output("content[/HUMAN]") == "content"
 
     def test_removes_inst_tags_with_content(self):
@@ -82,12 +82,17 @@ class TestPygmalionCleaning:
         # Content inside INST blocks is removed entirely
         assert adapter.clean_output("[INST]instruction[/INST]") == ""
 
-    def test_removes_standalone_inst_tags(self):
-        """Removes standalone [INST] and [/INST] tags (without matching close/open)."""
+    def test_truncates_from_standalone_inst_tags(self):
+        """Truncates from unpaired [INST] to end of string (hallucinated turn)."""
         adapter = PygmalionAdapter()
         
-        # Unmatched opening tag - content after is preserved
-        assert adapter.clean_output("[INST]prompt") == "prompt"
+        # Unmatched opening tag - content after is hallucinated user turn, truncate all
+        assert adapter.clean_output("[INST]prompt") == ""
+        
+        # Real-world case: valid response followed by hallucinated continuation
+        assert adapter.clean_output(
+            "I'm waiting.   [INST]so i tell you and you're just gonna do nothing?"
+        ) == "I'm waiting."
 
     def test_case_insensitive(self):
         """Tag removal is case insensitive."""
@@ -97,6 +102,13 @@ class TestPygmalionCleaning:
         assert adapter.clean_output("[human]test[/human]") == ""
         assert adapter.clean_output("[Human]test[/Human]") == ""
         assert adapter.clean_output("[inst]test[/inst]") == ""
+    
+    def test_truncates_from_standalone_human_tags(self):
+        """Truncates from unpaired [HUMAN] to end of string."""
+        adapter = PygmalionAdapter()
+        
+        # Unmatched opening tag - hallucinated user turn
+        assert adapter.clean_output("Good response. [HUMAN]fake user message") == "Good response."
 
     def test_removes_bbcode_font(self):
         """Removes BBCode FONT tags."""
@@ -206,6 +218,15 @@ class TestAdapterRegistry:
         adapter = get_adapter("mythomax", {"adapter": "mythomax"})
         assert isinstance(adapter, PygmalionAdapter)
 
+    def test_get_adapter_lewd_auto_detect(self):
+        """Auto-detects PygmalionAdapter for lewd models."""
+        # By alias
+        adapter = get_adapter("lewd")
+        assert isinstance(adapter, PygmalionAdapter)
+        # By repo_id
+        adapter = get_adapter("some_model", {"repo_id": "mradermacher/LewdMistral-7B-0.2-i1-GGUF"})
+        assert isinstance(adapter, PygmalionAdapter)
+
     def test_get_adapter_unknown_uses_default(self):
         """Returns DefaultAdapter for unknown adapter name."""
         adapter = get_adapter("some_model", {"adapter": "unknown_adapter"})
@@ -244,7 +265,7 @@ class TestStopSequenceCombination:
         combined = list(set(handler_stops + adapter_stops))
         
         # Should include handler stops
-        assert "\nObservation:" in combined
+        assert "\n\nObservation:" in combined
         
         # Should include adapter stops
         assert "[HUMAN]" in combined

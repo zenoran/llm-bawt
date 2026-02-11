@@ -2,6 +2,7 @@ import os
 import json
 import time
 import logging
+import uuid
 from typing import TYPE_CHECKING
 
 from ..clients.base import LLMClient
@@ -206,12 +207,17 @@ class HistoryManager:
         summary_cost = estimate_messages_tokens(included_summaries)
         droppable_cost = estimate_messages_tokens(included_droppable)
 
+        remaining = budget - used
+
+        def pct(v: int) -> str:
+            return f"{v * 100 // budget}%" if budget > 0 else "n/a"
+
         logger.debug(
-            f"Token budget: {budget} total | "
-            f"system={system_cost}, protected={protected_cost} ({len(protected)} msgs), "
-            f"summaries={summary_cost} ({len(included_summaries)} of {len(summary_messages)}), "
-            f"history={droppable_cost} ({len(included_droppable)} msgs, {dropped} dropped) | "
-            f"used={used}"
+            f"Token budget: {budget} total | used={used} ({pct(used)}) | remaining={remaining} | "
+            f"system={system_cost} ({pct(system_cost)}), "
+            f"protected={protected_cost} ({pct(protected_cost)}, {len(protected)} msgs), "
+            f"summaries={summary_cost} ({pct(summary_cost)}, {len(included_summaries)}/{len(summary_messages)}), "
+            f"history={droppable_cost} ({pct(droppable_cost)}, {len(included_droppable)} msgs, {dropped} dropped)"
         )
 
         return system_messages + included_summaries + included_droppable + protected
@@ -265,7 +271,7 @@ class HistoryManager:
 
     def add_message(self, role, content):
         """Append a message to history and save."""
-        message = Message(role, content)
+        message = Message(role, content, db_id=str(uuid.uuid4()))
         self.messages.append(message)
         
         # Save to PostgreSQL if available, otherwise file

@@ -14,16 +14,16 @@ The fix: per-model context/token configuration, proper token budgeting, and conv
 
 ## Progress Summary
 
-*Last updated: 2026-02-08*
+*Last updated: 2026-02-09*
 
 | Sprint / Track | Status | Completion |
 |---------------|--------|------------|
 | **Sprint 1**: Per-model config + VRAM detection | ✅ Complete | 8/8 |
-| **Sprint 2 Track A**: Two-layer history | 🔶 In Progress | 5/9 (core assembly done, db_id + refactoring remaining) |
-| **Sprint 2 Track B**: Memory on-demand | 🔶 In Progress | 2/5 (cold-start + extraction done, unification remaining) |
+| **Sprint 2 Track A**: Two-layer history | ✅ Complete | 7/7 |
+| **Sprint 2 Track B**: Memory on-demand | ✅ Complete | 5/5 |
 | **Sprint 2 Track C**: Debug turn log | ✅ Complete | 6/6 |
-| **Sprint 3 Track D**: History cleanup + recall | ⬜ Not Started | 0/6 |
-| **Sprint 3 Track E**: Unified memory output | 🔶 In Progress | 1/3 (formatted text done, context_builder + timestamps remaining) |
+| **Sprint 3 Track D**: History cleanup + recall | 🔶 In Progress | 5/6 (recall tool wired, prompt guidance remaining) |
+| **Sprint 3 Track E**: Unified memory output | ✅ Complete | 3/3 |
 | **Sprint 3 Track F**: Proactive summarization | ⬜ Not Started | 0/7 |
 
 ---
@@ -489,16 +489,16 @@ After Sprint 1 merges, these three tracks can be developed **concurrently** by s
 Core history redesign. This is the biggest piece of work.
 
 **Deliverables:**
-- [ ] Add `db_id` field to `Message` model
-- [ ] Update `PostgreSQLShortTermManager.get_messages()` to return message IDs
-- [ ] Refactor `HistoryManager`: load once at startup, maintain in-memory, no per-turn DB reads
+- [x] Add `db_id` field to `Message` model — field exists, file-based history now generates UUIDs via `uuid.uuid4()`
+- [x] Update `PostgreSQLShortTermManager.get_messages()` to return message IDs — populates `db_id` from DB primary key
+- [x] Refactor `HistoryManager`: load once at startup, maintain in-memory, no per-turn DB reads — loads at init, adds incrementally
 - [x] `estimate_tokens()` utility function (`len(text) // 4`) — implemented in `memory/summarization.py` and used in `utils/history.py`
 - [x] Model-aware context assembly in `_build_context_messages()`:
   - [x] Calculate available budget from model's context window — `base.py` computes `max_context_tokens` from `effective_context_window - effective_max_tokens`
   - [x] Session-block-to-summary swapping (oldest first) — `history.py` fills summaries first, then droppable messages newest-first
   - [x] Graceful degradation: drop oldest summaries when even summaries don't fit — implemented with oldest-first dropping
   - [x] Protect last N turns via `MEMORY_PROTECTED_RECENT_TURNS` — protects last N user+assistant pairs (default 3)
-- [ ] Log token budget breakdown in verbose/debug mode — basic drop-count logging exists; detailed per-category breakdown missing
+- [x] Log token budget breakdown in verbose/debug mode — includes percentages, remaining budget, per-category breakdown
 
 **Does NOT include:** recall tool, scheduler job, or summarization changes — those come in Sprint 3.
 
@@ -510,11 +510,11 @@ Core history redesign. This is the biggest piece of work.
 Collapses the two-path memory system into one.
 
 **Deliverables:**
-- [ ] Remove upfront memory injection from `_stage_memory_retrieval` / `_build_context_messages()` — dual-path still active: non-tool bots get full upfront injection, tool bots use on-demand
-- [ ] Add read-only `memory(action="search")` tool for `requires_memory` bots without `uses_tools` — memory tool only available to `uses_tools: true` bots
+- [x] Remove upfront memory injection from `_stage_memory_retrieval` / `_build_context_messages()` — only cold-start injection (<=3 messages) remains; no upfront injection for established conversations
+- [x] Add read-only `memory(action="search")` tool for `requires_memory` bots without `uses_tools` — implemented in `base.py:402-413`
 - [x] Cold-start detection: inject 2-3 core memories when history < 3 messages — implemented in both `pipeline.py` and `base.py`
 - [x] Ensure auto-extraction runs for all memory-enabled bots (not just non-tool) — extraction gated on `use_memory` / `self.memory`, not `uses_tools`
-- [ ] Update bot system prompts to mention memory tool availability
+- [x] Update bot system prompts to mention memory tool availability — all 4 memory bots (nova, monika, mira, proto) now mention search/store/delete actions
 
 #### Track C: Debug Turn Log Enhancement
 **Owner:** Agent C (or any agent with spare capacity)
@@ -550,11 +550,11 @@ These features depend on Sprint 2 tracks being merged.
 **Depends on:** Track A (two-layer history must exist)
 
 **Deliverables:**
-- [ ] **Remove `_should_skip_history()` from `base.py` and `pipeline.py`** — always include history
-- [ ] Remove `TOOLS_SKIP_HISTORY` config setting
-- [ ] Add timestamps to tool result history entries (`[Tool Results @ {time}]`)
-- [ ] Add `history(action='recall', summary_id='...')` tool action
-- [ ] Add `recalled_history` flag to DB schema
+- [x] **Remove `_should_skip_history()` from `base.py` and `pipeline.py`** — already removed from codebase
+- [x] Remove `TOOLS_SKIP_HISTORY` config setting — already removed from codebase
+- [x] Add timestamps to tool result history entries (`[Tool Results @ {time}]`) — implemented in `base.py:352`, `pipeline.py:555`
+- [x] Add `history(action='recall', summary_id='...')` tool action — `_history_recall()` method exists, `history_manager` now wired through executor/loop/streaming
+- [x] Add `recalled_history` flag to DB schema — column in `postgresql.py:73`, migration in `migrations.py:168-208`
 - [ ] Prompt guidance: bot mentions when working from summaries
 
 **Why separate from Track A:** Track A is already large. The cleanup and recall tool are logically distinct and easier to review as a focused PR. Track A establishes the two-layer architecture; Track D adds the user-facing features on top.
@@ -566,9 +566,9 @@ These features depend on Sprint 2 tracks being merged.
 **Depends on:** Track B (memory on-demand must be the only path)
 
 **Deliverables:**
-- [ ] Update memory tool search handler to use `build_memory_context_string()` — currently uses `format_memories_for_result()` from `parser.py` (simple numbered list with ID + relevance), not the richer categorized format from `context_builder.py`
-- [ ] Add relative timestamps to memory search results — search results include no timestamp data; only id, content, relevance, importance, tags
-- [x] Return formatted text instead of raw JSON from memory tool — `format_memories_for_result()` returns human-readable formatted text
+- [x] Update memory tool search handler to use `build_memory_context_string()` — executor now uses structured context builder with categorized sections (core/concerns/preferences/background)
+- [x] Add relative timestamps to memory search results — `created_at` and `last_accessed` now threaded through postgresql.py → storage.py → client.py → executor.py
+- [x] Return formatted text instead of raw JSON from memory tool — `build_memory_context_string()` returns structured, categorized text
 
 #### Track F: Proactive Summarization Scheduler
 **Owner:** Agent A or F
@@ -600,14 +600,14 @@ Sprint 1 (foundation):
   [=== Per-model config + VRAM detection ===]  ✅ COMPLETE
                                               ↓ merged to main
 Sprint 2 (parallel):
-  [======= Track A: Two-layer history =======]  ← in progress (core assembly done)
-  [===== Track B: Memory on-demand =====]        ← in progress (2/5 done)
+  [======= Track A: Two-layer history =======]  ✅ COMPLETE
+  [===== Track B: Memory on-demand =====]        ✅ COMPLETE
   [=== Track C: Debug log ===]                   ✅ COMPLETE
-                                              ↓ Track A and B remaining
+                                              ↓ all Sprint 2 tracks done
 
 Sprint 3 (dependent):
-  [==== Track D: Cleanup + recall ====]          ← not started (blocked on A)
-  [== Track E: Memory output ==]                 ← in progress (1/3 done)
+  [==== Track D: Cleanup + recall ====]          ← in progress (5/6 — prompt guidance remaining)
+  [== Track E: Memory output ==]                 ✅ COMPLETE
             [==== Track F: Summarization scheduler ====]  ← not started (blocked on D)
                                               ↓ final integration review
 ```

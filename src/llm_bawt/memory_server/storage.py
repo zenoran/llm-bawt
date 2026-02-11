@@ -37,7 +37,11 @@ class Memory:
     source_message_ids: list[str] = field(default_factory=list)
     access_count: int = 0
     created_at: datetime | None = None
+    last_accessed: datetime | None = None
     relevance: float | None = None  # Set during search results
+    intent: str | None = None
+    stakes: str | None = None
+    emotional_charge: float | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -48,7 +52,11 @@ class Memory:
             "source_message_ids": self.source_message_ids,
             "access_count": self.access_count,
             "created_at": self.created_at.isoformat() if self.created_at else None,
+            "last_accessed": self.last_accessed.isoformat() if self.last_accessed else None,
             "relevance": self.relevance,
+            "intent": self.intent,
+            "stakes": self.stakes,
+            "emotional_charge": self.emotional_charge,
         }
 
 
@@ -197,7 +205,12 @@ class MemoryStorage:
                 importance=r.get("importance", 0.5),
                 source_message_ids=r.get("source_message_ids", []),
                 access_count=r.get("access_count", 0),
+                created_at=r.get("created_at"),
+                last_accessed=r.get("last_accessed"),
                 relevance=relevance,
+                intent=r.get("intent"),
+                stakes=r.get("stakes"),
+                emotional_charge=r.get("emotional_charge"),
             ))
         
         return memories

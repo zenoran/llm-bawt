@@ -67,10 +67,18 @@ start_llm_service() {
     return 0
   fi
 
+  # Set up dev mode flags early (needed for health check and service start)
+  RELOAD_FLAG=""
+  UV_FLAGS=""
+  if [[ "$DEV_MODE" == true ]]; then
+    RELOAD_FLAG="--reload"
+    UV_FLAGS="--no-sync"
+  fi
+
   # Wait for MCP server to be ready before starting llm-service
   echo "[llm] Waiting for MCP server..."
   for i in {1..20}; do
-    if uv run python -c "import socket; s=socket.socket(); s.settimeout(0.5); exit(0 if s.connect_ex(('127.0.0.1', $MEMORY_PORT))==0 else 1)" 2>/dev/null; then
+    if uv run $UV_FLAGS python -c "import socket; s=socket.socket(); s.settimeout(0.5); exit(0 if s.connect_ex(('127.0.0.1', $MEMORY_PORT))==0 else 1)" 2>/dev/null; then
       echo "[llm] MCP server ready"
       break
     fi
@@ -79,12 +87,7 @@ start_llm_service() {
 
   echo "[llm] Starting on ${SERVICE_HOST}:${SERVICE_PORT}..."
 
-  # Add --reload flag and --no-sync in dev mode
-  RELOAD_FLAG=""
-  UV_FLAGS=""
   if [[ "$DEV_MODE" == true ]]; then
-    RELOAD_FLAG="--reload"
-    UV_FLAGS="--no-sync"
     echo "[llm] Dev mode enabled - auto-reload on code changes"
   fi
 
