@@ -12,7 +12,7 @@ from typing import TYPE_CHECKING
 
 from rich.console import Console
 
-from ..clients import LLMClient
+from ..clients import LLMClient, GrokClient
 from ..clients.openai_client import OpenAIClient
 from ..core.base import BaseLLMBawt
 from ..utils.config import Config, is_llama_cpp_available
@@ -99,6 +99,22 @@ class ServiceLLMBawt(BaseLLMBawt):
             slog.model_loaded(self.resolved_model_alias, model_type, load_time_ms)
             return client
         
+        elif model_type == "grok":
+            if not model_id:
+                raise ValueError(
+                    f"Missing 'model_id' in definition for '{self.resolved_model_alias}'"
+                )
+            api_key = self.model_definition.get("api_key") or self.config.XAI_API_KEY
+            client = GrokClient(
+                model_id,
+                config=self.config,
+                api_key=api_key,
+                model_definition=self.model_definition,
+            )
+            load_time_ms = (time.perf_counter() - start_time) * 1000
+            slog.model_loaded(self.resolved_model_alias, model_type, load_time_ms)
+            return client
+        
         elif model_type == "gguf":
             if not is_llama_cpp_available():
                 raise ImportError(
@@ -173,7 +189,7 @@ class ServiceLLMBawt(BaseLLMBawt):
         else:
             raise ValueError(
                 f"Unsupported model type: '{model_type}'. "
-                f"Supported types: openai, gguf, vllm"
+                f"Supported types: openai, grok, gguf, vllm"
             )
     
     # =========================================================================
@@ -241,6 +257,7 @@ class ServiceLLMBawt(BaseLLMBawt):
                 tool_format=self.tool_format,
                 tools=tool_definitions,
                 adapter=self.adapter,
+                history_manager=self.history_manager,
             )
         
         response = self.client.query(

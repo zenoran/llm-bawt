@@ -6,7 +6,7 @@ pipeline components, see the other modules in this package.
 
 import logging
 
-from ..clients import LLMClient
+from ..clients import LLMClient, GrokClient
 from ..clients.openai_client import OpenAIClient
 from .base import BaseLLMBawt
 from ..utils.config import Config
@@ -60,16 +60,16 @@ class LLMBawt(BaseLLMBawt):
     def _initialize_client(self) -> LLMClient:
         """Initialize OpenAI-compatible client.
         
-        Only supports OpenAI-compatible APIs. For local GGUF models,
+        Supports OpenAI-compatible APIs and Grok (xAI). For local GGUF models,
         use the background service which has ServiceLLMBawt.
         """
         model_type = self.model_definition.get("type")
         model_id = self.model_definition.get("model_id")
         
-        if model_type != "openai":
+        if model_type not in ("openai", "grok"):
             raise ValueError(
-                f"Only 'openai' model type is supported in CLI mode. Got '{model_type}'. "
-                "Use --service flag for local models, or an OpenAI-compatible server."
+                f"Only 'openai' and 'grok' model types are supported in CLI mode. "
+                f"Got '{model_type}'. Use --service flag for local models."
             )
         
         if not model_id:
@@ -77,6 +77,21 @@ class LLMBawt(BaseLLMBawt):
                 f"Missing 'model_id' in definition for '{self.resolved_model_alias}'"
             )
         
+        # Handle Grok (xAI) models
+        if model_type == "grok":
+            api_key = self.model_definition.get("api_key") or self.config.XAI_API_KEY
+            
+            if self.verbose:
+                logger.info(f"Initializing Grok client for model: {model_id}")
+            
+            return GrokClient(
+                model_id,
+                config=self.config,
+                api_key=api_key,
+                model_definition=self.model_definition,
+            )
+        
+        # Handle OpenAI-compatible APIs
         base_url = self.model_definition.get("base_url")
         api_key = self.model_definition.get("api_key")
         

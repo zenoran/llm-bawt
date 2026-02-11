@@ -19,6 +19,7 @@ PROVIDER_OLLAMA = "ollama"
 PROVIDER_GGUF = "gguf"
 PROVIDER_HF = "huggingface"
 PROVIDER_VLLM = "vllm"
+PROVIDER_GROK = "grok"
 PROVIDER_UNKNOWN = "Unknown" 
 
 logger = logging.getLogger(__name__)
@@ -157,6 +158,9 @@ class Config(BaseSettings):
     USE_SERVICE: bool = Field(default=False, description="Route queries through the background service by default (same as --service flag)")
     SERVICE_HOST: str = Field(default="127.0.0.1", description="Host for the background service to bind to")
     SERVICE_PORT: int = Field(default=8642, description="Port for the background service to listen on")
+
+    # --- xAI (Grok) Settings --- #
+    XAI_API_KEY: str = Field(default="", description="xAI API key for Grok models (get from x.ai)")
 
     # --- Web Search Settings --- #
     SEARCH_PROVIDER: Optional[str] = Field(
@@ -308,6 +312,10 @@ class Config(BaseSettings):
             model_type = model_info.get("type")
             if model_type == PROVIDER_OPENAI:
                 available_options.append(alias)
+            elif model_type == PROVIDER_GROK:
+                # Grok requires XAI_API_KEY
+                if self.XAI_API_KEY:
+                    available_options.append(alias)
             elif model_type == PROVIDER_OLLAMA:
                 # Do not probe the Ollama server during normal execution.
                 # If the alias is defined, treat it as selectable and let actual
@@ -402,6 +410,8 @@ class Config(BaseSettings):
         model_type = model_def.get("type")
         if model_type == PROVIDER_OPENAI:
             return "native"
+        if model_type == PROVIDER_GROK:
+            return "native"  # Grok supports native tool calling
         if model_type == PROVIDER_VLLM:
             return "native"  # tools passed via chat template, parsed from output
         if model_type in (PROVIDER_GGUF, PROVIDER_OLLAMA, PROVIDER_HF):

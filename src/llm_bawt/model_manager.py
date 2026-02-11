@@ -30,6 +30,7 @@ from rich.rule import Rule
 
 from llm_bawt.utils.config import (
     PROVIDER_GGUF,
+    PROVIDER_GROK,
     PROVIDER_HF,
     PROVIDER_OLLAMA,
     PROVIDER_OPENAI,
@@ -423,7 +424,7 @@ class ModelManager:
                 if file_size:
                     parts.append(f"[dim]{file_size}[/dim]")
 
-        elif model_type in (PROVIDER_HF, PROVIDER_OLLAMA, PROVIDER_OPENAI):
+        elif model_type in (PROVIDER_HF, PROVIDER_OLLAMA, PROVIDER_OPENAI, PROVIDER_GROK):
             mid = model_info.get('model_id')
             desc = model_info.get('description')
             formatted_id_str = ""
