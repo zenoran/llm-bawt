@@ -1,0 +1,1540 @@
+"""Background task service and chat execution runtime."""
+
+import asyncio
+import json
+import os
+import threading
+import time
+import uuid
+from datetime import datetime
+from queue import PriorityQueue
+from typing import Any, AsyncIterator
+from urllib.parse import urlparse
+
+from ..bots import BotManager, StreamingEmoteFilter, get_bot, strip_emotes
+from ..utils.config import Config
+from ..utils.paths import resolve_log_dir
+from .logging import RequestContext, generate_request_id, get_service_logger
+from .schemas import (
+    ChatCompletionChoice,
+    ChatCompletionChunk,
+    ChatCompletionRequest,
+    ChatCompletionResponse,
+    ChatMessage,
+    ServiceStatusResponse,
+    UsageInfo,
+)
+from .tasks import Task, TaskResult, TaskStatus, TaskType
+
+log = get_service_logger(__name__)
+
+SERVICE_VERSION = "0.1.0"
+
+
+def _is_tcp_listening(host: str, port: int) -> bool:
+    import socket
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+            sock.settimeout(0.5)
+            return sock.connect_ex((host, port)) == 0
+    except OSError:
+        return False
+
+
+def _write_debug_turn_log(
+    prepared_messages: list,
+    user_prompt: str,
+    response: str,
+    model: str,
+    bot_id: str,
+    user_id: str,
+    tool_calls: list[dict] | None = None,
+) -> None:
+    """Write the current turn's request/response data to a debug log file.
+
+    Called when debug logging is enabled. Overwrites the file on each turn
+    to show the most recent request/response for review.
+    """
+    try:
+        logs_dir = resolve_log_dir()
+        logs_dir.mkdir(parents=True, exist_ok=True)
+
+        log_file = logs_dir / "debug_turn.txt"
+
+        # Build the log content
+        lines = []
+        lines.append("=" * 80)
+        lines.append(f"DEBUG TURN LOG - {datetime.now().isoformat()}")
+        lines.append(f"Model: {model}")
+        lines.append(f"Bot: {bot_id}")
+        lines.append(f"User: {user_id}")
+        lines.append("=" * 80)
+        lines.append("")
+
+        # Request data - all context messages
+        lines.append("─" * 40)
+        lines.append("REQUEST MESSAGES")
+        lines.append("─" * 40)
+        for i, msg in enumerate(prepared_messages):
+            role = msg.role if hasattr(msg, 'role') else msg.get('role', 'unknown')
+            content = msg.content if hasattr(msg, 'content') else msg.get('content', '')
+            timestamp = msg.timestamp if hasattr(msg, 'timestamp') else msg.get('timestamp', 0)
+            lines.append(f"\n[{i}] Role: {role}")
+            lines.append(f"    Timestamp: {timestamp}")
+            lines.append(f"    Content ({len(content)} chars):")
+            lines.append("    " + "─" * 36)
+            # Indent content for readability
+            for content_line in str(content).split("\n"):
+                lines.append(f"    {content_line}")
+            lines.append("")
+
+        # Tool calls section (between request and response)
+        if tool_calls:
+            total_calls = len(tool_calls)
+            iterations = max((tc.get("iteration", 1) for tc in tool_calls), default=1)
+            lines.append("─" * 40)
+            lines.append(f"TOOL CALLS ({total_calls} call{'s' if total_calls != 1 else ''} across {iterations} iteration{'s' if iterations != 1 else ''})")
+            lines.append("─" * 40)
+            for idx, tc in enumerate(tool_calls, 1):
+                lines.append(f"")
+                lines.append(f"[{idx}] Tool: {tc.get('tool', 'unknown')}")
+                params = tc.get('parameters', {})
+                if isinstance(params, dict):
+                    for pk, pv in params.items():
+                        lines.append(f"    {pk}: {pv}")
+                else:
+                    lines.append(f"    Parameters: {params}")
+                result = tc.get('result', '')
+                lines.append(f"    Result ({len(result)} chars):")
+                lines.append("    " + "─" * 36)
+                for result_line in str(result)[:2000].split("\n"):
+                    lines.append(f"    {result_line}")
+            lines.append("")
+
+        # Response data
+        lines.append("─" * 40)
+        lines.append("RESPONSE")
+        lines.append("─" * 40)
+        lines.append(f"Length: {len(response)} chars")
+        lines.append("")
+        lines.append(response)
+        lines.append("")
+
+        # Also dump as JSON for machine parsing
+        lines.append("─" * 40)
+        lines.append("JSON FORMAT (for parsing)")
+        lines.append("─" * 40)
+
+        def msg_to_dict(msg):
+            if hasattr(msg, 'to_dict'):
+                return msg.to_dict()
+            elif hasattr(msg, 'role'):
+                return {"role": msg.role, "content": msg.content, "timestamp": getattr(msg, 'timestamp', 0)}
+            return dict(msg) if isinstance(msg, dict) else str(msg)
+
+        json_data = {
+            "timestamp": datetime.now().isoformat(),
+            "model": model,
+            "bot_id": bot_id,
+            "user_id": user_id,
+            "request": [msg_to_dict(msg) for msg in prepared_messages],
+            "tool_calls": tool_calls or [],
+            "response": response,
+        }
+        lines.append(json.dumps(json_data, indent=2, ensure_ascii=False, default=str))
+
+        # Write to file (overwrite)
+        log_file.write_text("\n".join(lines), encoding="utf-8")
+        log.debug(f"Debug turn log written to: {log_file}")
+
+    except Exception as e:
+        log.warning(f"Failed to write debug turn log: {e}")
+
+
+_memory_mcp_thread: threading.Thread | None = None
+
+
+def _ensure_memory_mcp_server(config: Config) -> None:
+    """Ensure an MCP memory server is running and configure the service to use it.
+
+    This makes memory retrieval happen via MCP tool calls (e.g. tools/search_memories),
+    which can be logged distinctly from embedded DB access.
+    """
+    global _memory_mcp_thread
+
+    # Default to local MCP memory server for llm-service if not configured.
+    if not getattr(config, "MEMORY_SERVER_URL", None):
+        config.MEMORY_SERVER_URL = "http://127.0.0.1:8001"
+
+    parsed = urlparse(config.MEMORY_SERVER_URL)
+    host = parsed.hostname or "127.0.0.1"
+    port = parsed.port or 8001
+
+    # If something is already listening, assume it's the memory MCP server.
+    if _is_tcp_listening(host, port):
+        log.info("Memory MCP server already listening at %s", config.MEMORY_SERVER_URL)
+        return
+
+    # Start the MCP memory server in-process (HTTP transport) on a daemon thread.
+    def _run():
+        try:
+            from ..memory_server.server import run_server
+            run_server(transport="streamable-http", host=host, port=port)
+        except Exception as e:
+            log.error("Failed to start MCP memory server: %s", e)
+
+    _memory_mcp_thread = threading.Thread(target=_run, daemon=True, name="memory-mcp")
+    _memory_mcp_thread.start()
+    log.info("Started MCP memory server at %s", config.MEMORY_SERVER_URL)
+
+class BackgroundService:
+    """
+    The main background service that processes async tasks.
+    """
+    
+    def __init__(self, config: Config):
+        self.config = config
+        self.start_time = time.time()
+        self.tasks_processed = 0
+        self._task_queue: PriorityQueue = PriorityQueue()
+        self._results: dict[str, TaskResult] = {}
+        self._result_events: dict[str, asyncio.Event] = {}
+        self._shutdown_event = asyncio.Event()
+        self._worker_task: asyncio.Task | None = None
+        
+        # Initialize model lifecycle manager (singleton)
+        from ..core.model_lifecycle import get_model_lifecycle
+        self._model_lifecycle = get_model_lifecycle(config)
+        
+        # Cached LLMBawt instances keyed by (model_alias, bot_id, user_id)
+        self._llm_bawt_cache: dict[tuple[str, str, str], Any] = {}
+        self._cache_lock = asyncio.Lock()
+        
+        # Cached LLM clients keyed by model_alias only
+        # This prevents loading the same model (especially GGUF) multiple times
+        # when different bot contexts need the same underlying model
+        self._client_cache: dict[str, Any] = {}
+        
+        # Lock to serialize LLM calls - prevents CUDA crashes from concurrent access
+        # llama-cpp-python is NOT thread-safe for concurrent inference
+        self._llm_lock = asyncio.Lock()
+        
+        # Single-threaded executor for LLM calls - ensures only one runs at a time
+        from concurrent.futures import ThreadPoolExecutor
+        self._llm_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="llm")
+        
+        # Cancellation support: when a new request comes in, cancel the current one
+        # This handles the case where UI sends partial transcriptions that build up
+        self._current_generation_cancel: threading.Event | None = None
+        self._generation_done: threading.Event | None = None  # Signals when generation finishes
+        self._cancel_lock = threading.Lock()
+        
+        # Memory client cache keyed by bot_id
+        self._memory_clients: dict[tuple[str, str], Any] = {}
+        
+        # Session model overrides: when user switches model via tool, 
+        # remember it for the rest of the session. Keyed by (bot_id, user_id).
+        self._session_model_overrides: dict[tuple[str, str], str] = {}
+        
+        # Model configuration
+        self._available_models: list[str] = []
+        self._default_model: str | None = None
+        self._default_bot: str = config.DEFAULT_BOT or "nova"
+        self._load_available_models()
+        
+        # Register callback for model unload - clears caches when model changes
+        self._model_lifecycle.on_model_unloaded(self._on_model_unloaded)
+    
+    def _on_model_unloaded(self, model_alias: str):
+        """Called when a model is unloaded - clears related caches."""
+        log.debug(f"Model '{model_alias}' unloaded - clearing caches")
+        
+        # Clear client cache for this model
+        if model_alias in self._client_cache:
+            del self._client_cache[model_alias]
+        
+        # Clear all LLMBawt instances that use this model
+        keys_to_remove = [
+            key for key in self._llm_bawt_cache
+            if key[0] == model_alias
+        ]
+        for key in keys_to_remove:
+            del self._llm_bawt_cache[key]
+        
+        log.debug(f"Cleared {len(keys_to_remove)} cached instances for model '{model_alias}'")
+    
+    def _load_available_models(self):
+        """Load list of available models from config."""
+        models = self.config.defined_models.get("models", {})
+        self._available_models = list(models.keys())
+        log.debug(f"Loaded {len(self._available_models)} models from config")
+        
+        # Set default model from bot/config selection or use first available
+        bot_manager = BotManager(self.config)
+        selection = bot_manager.select_model(None, bot_slug=self._default_bot)
+        self._default_model = selection.alias
+        if not self._default_model and self._available_models:
+            self._default_model = self._available_models[0]
+
+    def _resolve_request_model(
+        self,
+        requested_model: str | None,
+        bot_id: str,
+        local_mode: bool,
+    ) -> tuple[str, list[str]]:
+        """Resolve the model alias for a request using shared bot/config logic.
+
+        Returns:
+            Tuple of (resolved_model_alias, list_of_warnings)
+        """
+        warnings: list[str] = []
+        bot_manager = BotManager(self.config)
+        selection = bot_manager.select_model(requested_model, bot_slug=bot_id, local_mode=local_mode)
+        model_alias = selection.alias
+
+        if model_alias and model_alias in self._available_models:
+            return model_alias, warnings
+
+        # If explicit model is invalid, warn and fall back
+        if model_alias and model_alias not in self._available_models:
+            fallback = bot_manager.select_model(None, bot_slug=bot_id, local_mode=local_mode)
+            if fallback.alias and fallback.alias in self._available_models:
+                msg = f"Model '{model_alias}' not available on service, using '{fallback.alias}'"
+                log.warning(msg)
+                warnings.append(msg)
+                return fallback.alias, warnings
+
+        if self._available_models:
+            fallback_model = self._available_models[0]
+            msg = f"Model '{model_alias}' not available on service, using '{fallback_model}'"
+            log.warning(msg)
+            warnings.append(msg)
+            return fallback_model, warnings
+
+        raise ValueError("No models available on service.")
+    
+    async def _start_generation(self) -> tuple[threading.Event, threading.Event]:
+        """Start a new generation, cancelling and waiting for any in-progress one.
+        
+        Returns:
+            tuple of (cancel_event, done_event):
+            - cancel_event: The generation should check this periodically and abort if set
+            - done_event: The generation MUST set this when complete (in finally block)
+        
+        This ensures only one generation runs at a time by:
+        1. Signalling the previous generation to cancel
+        2. Waiting for it to actually finish (up to 5 seconds)
+        3. Then allowing the new generation to start
+        """
+        loop = asyncio.get_event_loop()
+        
+        with self._cancel_lock:
+            # Cancel any existing generation and wait for it to finish
+            if self._current_generation_cancel is not None:
+                log.debug("Cancelling previous generation for new request")
+                self._current_generation_cancel.set()
+                
+                # Wait for the previous generation to signal it's done
+                if self._generation_done is not None:
+                    done_event = self._generation_done
+                    # Release lock while waiting to avoid deadlock
+                    self._cancel_lock.release()
+                    try:
+                        # Wait in executor to avoid blocking the event loop
+                        await loop.run_in_executor(
+                            None,  # Use default executor
+                            lambda: done_event.wait(timeout=5.0)
+                        )
+                    finally:
+                        self._cancel_lock.acquire()
+            
+            # Create new events for this generation
+            cancel_event = threading.Event()
+            done_event = threading.Event()
+            self._current_generation_cancel = cancel_event
+            self._generation_done = done_event
+            return cancel_event, done_event
+    
+    def _end_generation(self, cancel_event: threading.Event, done_event: threading.Event):
+        """Mark a generation as complete."""
+        # Signal that we're done FIRST (before acquiring lock)
+        done_event.set()
+        
+        with self._cancel_lock:
+            # Only clear if this is still the current generation
+            if self._current_generation_cancel is cancel_event:
+                self._current_generation_cancel = None
+                self._generation_done = None
+    
+    @property
+    def uptime_seconds(self) -> float:
+        return time.time() - self.start_time
+    
+    @property
+    def model_lifecycle(self):
+        """Get the model lifecycle manager for tool access."""
+        return self._model_lifecycle
+    
+    def get_memory_client(self, bot_id: str, user_id: str | None = None):
+        """Get or create memory client for a bot/user pair."""
+        cache_key = (bot_id, user_id)
+
+        if cache_key not in self._memory_clients:
+            try:
+                from ..memory_server.client import get_memory_client
+                self._memory_clients[cache_key] = get_memory_client(
+                    config=self.config,
+                    bot_id=bot_id,
+                    user_id=user_id,
+                    server_url=getattr(self.config, "MEMORY_SERVER_URL", None),
+                )
+                log.memory_operation("client_init", bot_id, details="MemoryClient created")
+            except Exception as e:
+                log.warning(f"Memory client unavailable for {bot_id}: {e}")
+                self._memory_clients[cache_key] = None
+        return self._memory_clients.get(cache_key)
+    
+    def _get_llm_bawt(self, model_alias: str, bot_id: str, user_id: str, local_mode: bool = False):
+        """Get or create an LLMBawt instance with caching.
+        
+        This method enforces single-model loading through the ModelLifecycleManager.
+        If a different model is requested, the current model will be unloaded first.
+        
+        Model selection priority:
+        1. Pending model switch (from switch_model tool) - becomes the new session model
+        2. Current session model override (from previous switch)
+        3. Model from API request
+        """
+        from .core import ServiceLLMBawt
+        
+        # Session key for model overrides (per bot+user)
+        session_key = (bot_id, user_id)
+        
+        # Check for pending model switch (from switch_model tool)
+        pending = self._model_lifecycle.clear_pending_switch()
+        if pending:
+            log.info(f"🔄 Switching to model: {pending}")
+            # Store as session override so subsequent requests use this model
+            self._session_model_overrides[session_key] = pending
+            model_alias = pending
+        elif session_key in self._session_model_overrides:
+            # Use the session model override from a previous switch
+            model_alias = self._session_model_overrides[session_key]
+            log.debug(f"Using session model override: {model_alias}")
+        
+        cache_key = (model_alias, bot_id, user_id)
+        
+        # Check if we need to switch models (different model requested)
+        current_model = self._model_lifecycle.current_model
+        if current_model and current_model != model_alias:
+            log.info(f"🔄 Model: {current_model} → {model_alias}")
+            # Unloading will trigger _on_model_unloaded callback which clears caches
+            self._model_lifecycle.unload_current_model()
+        
+        if cache_key in self._llm_bawt_cache:
+            log.cache_hit("llm_bawt", f"{model_alias}/{bot_id}/{user_id}")
+            log.debug(f"Reusing cached ServiceLLMBawt instance for {cache_key}")
+            return self._llm_bawt_cache[cache_key]
+        
+        log.cache_miss("llm_bawt", f"{model_alias}/{bot_id}/{user_id}")
+        
+        # Check if we already have a client for this model in the client cache
+        # If so, reuse it to avoid reloading GGUF models into VRAM
+        existing_client = self._client_cache.get(model_alias)
+        
+        # Get model type for logging
+        model_def = self.config.defined_models.get("models", {}).get(model_alias, {})
+        model_type = model_def.get("type", "unknown")
+        
+        # Only log model loading if we don't have the client cached
+        if not existing_client:
+            log.model_loading(model_alias, model_type, cached=False)
+        else:
+            log.model_loading(model_alias, model_type, cached=True)
+        load_start = time.time()
+        
+        try:
+            # Create a copy of config for each ServiceLLMBawt instance
+            # This is necessary because it modifies config.SYSTEM_MESSAGE
+            # based on the bot's system prompt
+            instance_config = self.config.model_copy(deep=True)
+            llm_bawt = ServiceLLMBawt(
+                resolved_model_alias=model_alias,
+                config=instance_config,
+                local_mode=local_mode,
+                bot_id=bot_id,
+                user_id=user_id,
+                existing_client=existing_client,  # Reuse cached client if available
+            )
+            self._llm_bawt_cache[cache_key] = llm_bawt
+            
+            # Also cache the client for future reuse by extraction tasks
+            if model_alias not in self._client_cache:
+                self._client_cache[model_alias] = llm_bawt.client
+            # Note: BaseLLMBawt.__init__ already registers with lifecycle manager
+            
+        except Exception as e:
+            log.model_error(model_alias, str(e))
+            raise
+        
+        return self._llm_bawt_cache[cache_key]
+    
+    def get_client(self, model_alias: str):
+        """Get LLM client for a given model (for extraction tasks).
+        
+        Uses a dedicated client cache to avoid reloading models.
+        GGUF models especially are expensive to load into VRAM,
+        so we cache the client independently from LLMBawt instances.
+        """
+        if model_alias in self._client_cache:
+            log.cache_hit("llm_client", model_alias)
+            return self._client_cache[model_alias]
+        
+        log.cache_miss("llm_client", model_alias)
+        
+        # Check if we already have an LLMBawt instance with this model
+        # and can reuse its client
+        for (cached_model, _, _), llm_bawt in self._llm_bawt_cache.items():
+            if cached_model == model_alias:
+                log.debug(f"Reusing client from existing LLMBawt instance for '{model_alias}'")
+                self._client_cache[model_alias] = llm_bawt.client
+                return llm_bawt.client
+        
+        # Need to create a new client - use spark bot (no memory overhead)
+        log.debug(f"Creating new client for model '{model_alias}' (extraction context)")
+        llm_bawt = self._get_llm_bawt(model_alias, "spark", "system", local_mode=True)
+        self._client_cache[model_alias] = llm_bawt.client
+        return llm_bawt.client
+    
+    async def chat_completion(
+        self,
+        request: ChatCompletionRequest,
+    ) -> ChatCompletionResponse | AsyncIterator[ChatCompletionChunk]:
+        """
+        Handle an OpenAI-compatible chat completion request.
+        
+        This is the main entry point for the API. It:
+        1. Uses llm_bawt's internal history + memory for context
+        2. Augments with bot system prompt and memory context (if enabled)
+        3. Runs blocking LLM calls in a thread pool
+        4. Stores messages and extracts memories for future use
+        """
+        from ..models.message import Message
+        
+        # Create request context for logging
+        ctx = RequestContext(
+            request_id=generate_request_id(),
+            method="POST",
+            path="/v1/chat/completions",
+            model=request.model,
+            bot_id=request.bot_id,
+            user_id=request.user,
+            stream=False,
+        )
+        
+        # Log incoming request (verbose mode will show the full payload)
+        log.api_request(ctx, request.model_dump(exclude_none=True))
+        
+        bot_id = request.bot_id or self._default_bot
+        user_id = request.user or self.config.DEFAULT_USER
+        local_mode = not request.augment_memory
+
+        # Resolve model using shared bot/config logic
+        try:
+            model_alias, model_warnings = self._resolve_request_model(request.model, bot_id, local_mode)
+        except Exception as e:
+            log.api_error(ctx, str(e), 400)
+            raise
+
+        ctx.model = model_alias
+
+        # Debug: Show memory settings
+        log.debug(
+            f"Memory settings: augment_memory={request.augment_memory}, "
+            f"local_mode={local_mode}, bot={bot_id}, user={user_id}"
+        )
+        
+        # Get cached LLMBawt instance
+        llm_bawt = self._get_llm_bawt(model_alias, bot_id, user_id, local_mode)
+        
+        # Get the user's prompt (last user message)
+        user_prompt = ""
+        for m in reversed(request.messages):
+            if m.role == "user":
+                user_prompt = m.content or ""
+                break
+        
+        if not user_prompt:
+            raise ValueError("No user message found in request")
+        
+        # Start new generation (cancels and waits for any previous one)
+        cancel_event, done_event = await self._start_generation()
+        
+        try:
+            # Run the blocking query in single-thread executor
+            loop = asyncio.get_event_loop()
+            llm_start_time = time.time()
+            cancelled = False
+            
+            def _do_query():
+                nonlocal cancelled
+                # Check if already cancelled before starting
+                if cancel_event.is_set():
+                    cancelled = True
+                    return ""
+                
+                # Prepare messages with history and memory context
+                prepared_messages = llm_bawt.prepare_messages_for_query(user_prompt)
+                
+                # Log what we're sending to the LLM (verbose mode)
+                log.llm_context(prepared_messages)
+                
+                # Execute the query with prepared messages
+                response, tool_context, tool_call_details = llm_bawt.execute_llm_query(
+                    prepared_messages,
+                    plaintext_output=True,
+                    stream=False,
+                )
+
+                # Write debug turn log if enabled (check config or env var)
+                if self.config.DEBUG_TURN_LOG or os.environ.get("LLM_BAWT_DEBUG_TURN_LOG"):
+                    _write_debug_turn_log(
+                        prepared_messages=prepared_messages,
+                        user_prompt=user_prompt,
+                        response=response,
+                        model=model_alias,
+                        bot_id=bot_id,
+                        user_id=user_id,
+                        tool_calls=tool_call_details,
+                    )
+
+                # Check if cancelled during generation
+                if cancel_event.is_set():
+                    log.info("Generation cancelled - newer request received")
+                    cancelled = True
+                    return ""
+
+                # Finalize (add to history, trigger memory extraction)
+                llm_bawt.finalize_response(user_prompt, response, tool_context)
+
+                return response
+            
+            response_text = await loop.run_in_executor(self._llm_executor, _do_query)
+            llm_elapsed_ms = (time.time() - llm_start_time) * 1000
+            
+            # If cancelled, return empty response (the new request will handle it)
+            if cancelled:
+                return ChatCompletionResponse(
+                    model=model_alias,
+                    choices=[
+                        ChatCompletionChoice(
+                            index=0,
+                            message=ChatMessage(role="assistant", content=""),
+                            finish_reason="cancelled",
+                        )
+                    ],
+                    usage=UsageInfo(prompt_tokens=0, completion_tokens=0, total_tokens=0),
+                )
+        finally:
+            self._end_generation(cancel_event, done_event)
+        
+        # Post-process for voice_optimized bots (strip emotes for TTS)
+        bot = get_bot(bot_id)
+        if bot and bot.voice_optimized:
+            original_len = len(response_text)
+            response_text = strip_emotes(response_text)
+            if len(response_text) != original_len:
+                log.debug(f"Stripped emotes for TTS: {original_len} -> {len(response_text)} chars")
+        
+        # Estimate token counts (rough approximation: 1 token ≈ 4 characters)
+        prompt_text = " ".join(m.content or "" for m in request.messages)
+        prompt_tokens = len(prompt_text) // 4
+        completion_tokens = len(response_text) // 4
+        total_tokens = prompt_tokens + completion_tokens
+        
+        # Log response (verbose shows content summary with tokens/sec)
+        log.llm_response(response_text, tokens=completion_tokens, elapsed_ms=llm_elapsed_ms)
+        log.api_response(ctx, status=200, tokens=total_tokens)
+        
+        # Build response
+        response = ChatCompletionResponse(
+            model=model_alias,
+            choices=[
+                ChatCompletionChoice(
+                    index=0,
+                    message=ChatMessage(role="assistant", content=response_text),
+                    finish_reason="stop",
+                )
+            ],
+            usage=UsageInfo(
+                prompt_tokens=prompt_tokens,
+                completion_tokens=completion_tokens,
+                total_tokens=total_tokens,
+            ),
+        )
+        
+        return response
+
+    async def chat_completion_stream(
+        self,
+        request: ChatCompletionRequest,
+    ) -> AsyncIterator[str]:
+        """
+        Handle a streaming chat completion request.
+        
+        Uses llm_bawt's internal history + memory for context.
+        Yields Server-Sent Events (SSE) formatted chunks.
+        """
+        import json
+        from ..models.message import Message
+        
+        # Create request context for logging
+        ctx = RequestContext(
+            request_id=generate_request_id(),
+            method="POST",
+            path="/v1/chat/completions",
+            model=request.model,
+            bot_id=request.bot_id,
+            user_id=request.user,
+            stream=True,
+        )
+        
+        # Log incoming request (verbose mode will show the full payload)
+        log.api_request(ctx, request.model_dump(exclude_none=True))
+        
+        bot_id = request.bot_id or self._default_bot
+        user_id = request.user or self.config.DEFAULT_USER
+        local_mode = not request.augment_memory
+
+        # Resolve model using shared bot/config logic
+        try:
+            model_alias, model_warnings = self._resolve_request_model(request.model, bot_id, local_mode)
+        except Exception as e:
+            log.api_error(ctx, str(e), 400)
+            raise
+
+        # Get cached LLMBawt instance
+        llm_bawt = self._get_llm_bawt(model_alias, bot_id, user_id, local_mode)
+        
+        # Get the user's prompt (last user message)
+        user_prompt = ""
+        for m in reversed(request.messages):
+            if m.role == "user":
+                user_prompt = m.content or ""
+                break
+        
+        if not user_prompt:
+            raise ValueError("No user message found in request")
+        
+        response_id = f"chatcmpl-{uuid.uuid4().hex[:12]}"
+        created = int(time.time())
+        
+        chunk_queue: asyncio.Queue = asyncio.Queue()
+        full_response_holder = [""]  # Use list to allow mutation in nested function
+        tool_context_holder = [""]  # Store tool context from native tool calls
+        timing_holder = [0.0, 0.0]  # [start_time, end_time]
+        cancelled_holder = [False]  # Track if we were cancelled
+        
+        # Capture the event loop before entering the thread
+        loop = asyncio.get_running_loop()
+        
+        # Start new generation (cancels and waits for any previous one)
+        cancel_event, done_event = await self._start_generation()
+        
+        def _stream_to_queue():
+            """Run streaming in a thread and push chunks to the async queue."""
+            try:
+                # Check if already cancelled before starting
+                if cancel_event.is_set():
+                    cancelled_holder[0] = True
+                    return
+                
+                # Use llm_bawt.prepare_messages_for_query to get full context
+                # (history from DB + memory + system prompt)
+                messages = llm_bawt.prepare_messages_for_query(user_prompt)
+                
+                # Log what we're sending to the LLM (verbose mode)
+                log.llm_context(messages)
+                
+                # Track when first token arrives
+                timing_holder[0] = time.time()
+                
+                # Choose streaming method based on whether bot uses tools
+                if llm_bawt.bot.uses_tools and llm_bawt.memory:
+                    # Check if client supports native streaming with tools (OpenAI)
+                    use_native_streaming = (
+                        llm_bawt.client.supports_native_tools()
+                        and llm_bawt.tool_format in ("native", "NATIVE_OPENAI")
+                        and hasattr(llm_bawt.client, "stream_with_tools")
+                    )
+
+                    if use_native_streaming:
+                        # Native streaming with tools - streams content AND handles tool calls
+                        from ..tools.executor import ToolExecutor
+                        from ..tools.formats import get_format_handler
+                        from ..models.message import Message as Msg
+
+                        log.debug("Using native streaming with tools")
+
+                        tool_definitions = llm_bawt._get_tool_definitions()
+                        handler = get_format_handler(llm_bawt.tool_format)
+                        tools_schema = handler.get_tools_schema(tool_definitions)
+
+                        executor = ToolExecutor(
+                            memory_client=llm_bawt.memory,
+                            profile_manager=llm_bawt.profile_manager,
+                            search_client=llm_bawt.search_client,
+                            model_lifecycle=llm_bawt.model_lifecycle,
+                            config=llm_bawt.config,
+                            user_id=llm_bawt.user_id,
+                            bot_id=llm_bawt.bot_id,
+                        )
+
+                        def native_stream_with_tool_loop():
+                            """Stream with native tool support, handling tool calls inline."""
+                            import json as _json
+                            from ..tools.parser import ToolCall
+
+                            current_msgs = list(messages)
+                            max_iterations = 5
+                            has_executed_tools = False
+
+                            for iteration in range(max_iterations):
+                                # After first tool execution, don't pass tools_schema
+                                # so the model generates a text response instead of
+                                # looping on more tool calls.
+                                current_tools = None if has_executed_tools else tools_schema
+
+                                for item in llm_bawt.client.stream_with_tools(
+                                    current_msgs,
+                                    tools_schema=current_tools,
+                                    tool_choice="auto",
+                                ):
+                                    if isinstance(item, str):
+                                        # Content chunk - yield to user immediately
+                                        yield item
+                                    elif isinstance(item, dict) and "tool_calls" in item:
+                                        # Tool calls at end of stream
+                                        tool_calls = item["tool_calls"]
+                                        content = item.get("content", "")
+
+                                        if not tool_calls:
+                                            return  # No tools, done
+
+                                        # Execute tools and log with their arguments
+                                        tool_results = []
+                                        for tc in tool_calls:
+                                            func = tc.get("function", {})
+                                            name = func.get("name", "")
+                                            args_str = func.get("arguments", "{}")
+                                            try:
+                                                args = _json.loads(args_str) if args_str else {}
+                                            except _json.JSONDecodeError:
+                                                args = {}
+
+                                            log.info(f"🔧 {name}({args})")
+
+                                            tool_call_obj = ToolCall(name=name, arguments=args, raw_text="")
+                                            result = executor.execute(tool_call_obj)
+                                            tool_results.append({
+                                                "tool_call_id": tc.get("id", ""),
+                                                "content": result,
+                                            })
+
+                                        has_executed_tools = True
+
+                                        # Store tool context
+                                        tool_context_holder[0] = "\n\n".join(
+                                            f"[{tc['function']['name']}]\n{tr['content']}"
+                                            for tc, tr in zip(tool_calls, tool_results)
+                                        )
+
+                                        # Build continuation messages
+                                        assistant_msg = Msg(
+                                            role="assistant",
+                                            content=content,
+                                            tool_calls=[
+                                                {"id": tc.get("id"), "name": tc["function"]["name"], "arguments": tc["function"]["arguments"]}
+                                                for tc in tool_calls
+                                            ],
+                                        )
+                                        current_msgs.append(assistant_msg)
+
+                                        for tc, tr in zip(tool_calls, tool_results):
+                                            current_msgs.append(Msg(
+                                                role="tool",
+                                                content=tr["content"],
+                                                tool_call_id=tr["tool_call_id"],
+                                            ))
+
+                                        # Continue to next iteration (will stream the follow-up)
+                                        break
+                                else:
+                                    # Stream finished without tool calls dict (pure content response)
+                                    return
+
+                            log.warning(f"Tool loop: max iterations ({max_iterations}) reached")
+
+                        stream_iter = native_stream_with_tool_loop()
+                    else:
+                        # Fall back to text-based streaming for non-native models (GGUF, etc.)
+                        from ..tools import stream_with_tools
+                        log.debug(f"Using stream_with_tools for tool format: {llm_bawt.tool_format}")
+                        
+                        adapter = getattr(llm_bawt, 'adapter', None)
+                        if adapter:
+                            log.debug(f"Passing adapter '{adapter.name}' to stream_with_tools")
+                        else:
+                            log.warning("No adapter found on llm_bawt instance")
+
+                        def stream_fn(msgs, stop_sequences=None):
+                            return llm_bawt.client.stream_raw(msgs, stop=stop_sequences)
+
+                        stream_iter = stream_with_tools(
+                            messages=messages,
+                            stream_fn=stream_fn,
+                            memory_client=llm_bawt.memory,
+                            profile_manager=llm_bawt.profile_manager,
+                            search_client=llm_bawt.search_client,
+                            model_lifecycle=llm_bawt.model_lifecycle,
+                            config=llm_bawt.config,
+                            user_id=llm_bawt.user_id,
+                            bot_id=llm_bawt.bot_id,
+                            tool_format=llm_bawt.tool_format,
+                            adapter=adapter,
+                            history_manager=llm_bawt.history_manager,
+                        )
+                else:
+                    # Pass adapter stop sequences even without tools
+                    adapter = getattr(llm_bawt, 'adapter', None)
+                    adapter_stops = adapter.get_stop_sequences() if adapter else []
+                    stream_iter = llm_bawt.client.stream_raw(
+                        messages, stop=adapter_stops or None
+                    )
+                
+                # Stream chunks to queue
+                for chunk in stream_iter:
+                    # Check for cancellation - new request came in
+                    if cancel_event.is_set():
+                        log.info("Generation cancelled - newer request received")
+                        cancelled_holder[0] = True
+                        return
+                    
+                    full_response_holder[0] += chunk
+                    # Put chunk in queue - use call_soon_threadsafe with captured loop
+                    loop.call_soon_threadsafe(chunk_queue.put_nowait, chunk)
+                
+                timing_holder[1] = time.time()
+                
+                # Finalize: add response to history and trigger memory extraction
+                # Only if we weren't cancelled
+                if full_response_holder[0] and not cancel_event.is_set():
+                    # Calculate elapsed time and log with tokens/sec
+                    elapsed_ms = (timing_holder[1] - timing_holder[0]) * 1000
+                    # Apply adapter output cleaning as safety net
+                    adapter = getattr(llm_bawt, 'adapter', None)
+                    if adapter:
+                        cleaned = adapter.clean_output(full_response_holder[0])
+                        if cleaned != full_response_holder[0]:
+                            log.info(f"Adapter '{adapter.name}' cleaned response: "
+                                     f"{len(full_response_holder[0])} -> {len(cleaned)} chars")
+                            full_response_holder[0] = cleaned
+                    
+                    log.llm_response(full_response_holder[0], elapsed_ms=elapsed_ms)
+                    llm_bawt.finalize_response(user_prompt, full_response_holder[0], tool_context_holder[0])
+
+                    # Write debug turn log if enabled (check config or env var)
+                    if self.config.DEBUG_TURN_LOG or os.environ.get("LLM_BAWT_DEBUG_TURN_LOG"):
+                        _write_debug_turn_log(
+                            prepared_messages=messages,
+                            user_prompt=user_prompt,
+                            response=full_response_holder[0],
+                            model=model_alias,
+                            bot_id=bot_id,
+                            user_id=user_id,
+                        )
+                    
+            except Exception as e:
+                if not cancel_event.is_set():
+                    loop.call_soon_threadsafe(chunk_queue.put_nowait, e)
+            finally:
+                loop.call_soon_threadsafe(chunk_queue.put_nowait, None)  # Sentinel
+        
+        try:
+            # Check if this bot needs emote filtering for TTS
+            bot = get_bot(bot_id)
+            emote_filter = StreamingEmoteFilter() if (bot and bot.voice_optimized) else None
+            
+            # Send service warnings (e.g. model fallback) before content
+            if model_warnings:
+                warning_data = {
+                    "object": "service.warning",
+                    "model": model_alias,
+                    "warnings": model_warnings,
+                }
+                yield f"data: {json.dumps(warning_data)}\n\n"
+
+            # Start streaming in single-thread executor
+            loop.run_in_executor(self._llm_executor, _stream_to_queue)
+
+            # Yield SSE chunks (with keepalive to prevent client timeout
+            # during slow backends like vLLM first-inference)
+            while True:
+                try:
+                    chunk = await asyncio.wait_for(chunk_queue.get(), timeout=15.0)
+                except asyncio.TimeoutError:
+                    # Send SSE comment as keepalive to prevent client/proxy timeout
+                    yield ": keepalive\n\n"
+                    continue
+                
+                if chunk is None:
+                    # Stream complete - flush any buffered content from emote filter
+                    if emote_filter:
+                        final_chunk = emote_filter.flush()
+                        if final_chunk:
+                            data = {
+                                "id": response_id,
+                                "object": "chat.completion.chunk",
+                                "created": created,
+                                "model": model_alias,
+                                "choices": [{"index": 0, "delta": {"content": final_chunk}, "finish_reason": None}],
+                            }
+                            yield f"data: {json.dumps(data)}\n\n"
+                    
+                    # Send final chunk
+                    data = {
+                        "id": response_id,
+                        "object": "chat.completion.chunk",
+                        "created": created,
+                        "model": model_alias,
+                        "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+                    }
+                    yield f"data: {json.dumps(data)}\n\n"
+                    yield "data: [DONE]\n\n"
+                    break
+                
+                if isinstance(chunk, Exception):
+                    # Error occurred
+                    raise chunk
+                
+                # Apply emote filter for voice_optimized bots
+                if emote_filter:
+                    chunk = emote_filter.process(chunk)
+                    if not chunk:
+                        # Chunk was filtered out or buffered
+                        continue
+                
+                # Normal chunk
+                data = {
+                    "id": response_id,
+                    "object": "chat.completion.chunk",
+                    "created": created,
+                    "model": model_alias,
+                    "choices": [{"index": 0, "delta": {"content": chunk}, "finish_reason": None}],
+                }
+                yield f"data: {json.dumps(data)}\n\n"
+        finally:
+            # Mark generation as complete
+            self._end_generation(cancel_event, done_event)
+
+    async def process_task(self, task: Task) -> TaskResult:
+        """Process a single background task."""
+        start_time = time.time()
+        task_type_str = task.task_type.value
+        
+        log.debug(f"Processing task {task.task_id[:8]} ({task_type_str})")
+        
+        try:
+            if task.task_type == TaskType.MEMORY_EXTRACTION:
+                result = await self._process_extraction(task)
+            elif task.task_type == TaskType.CONTEXT_COMPACTION:
+                result = await self._process_compaction(task)
+            elif task.task_type == TaskType.EMBEDDING_GENERATION:
+                result = await self._process_embeddings(task)
+            elif task.task_type == TaskType.MEANING_UPDATE:
+                result = await self._process_meaning_update(task)
+            elif task.task_type == TaskType.MEMORY_MAINTENANCE:
+                result = await self._process_maintenance(task)
+            elif task.task_type == TaskType.PROFILE_MAINTENANCE:
+                result = await self._process_profile_maintenance(task)
+            else:
+                raise ValueError(f"Unknown task type: {task.task_type}")
+            
+            elapsed_ms = (time.time() - start_time) * 1000
+            log.task_completed(task.task_id, task_type_str, elapsed_ms, result)
+            
+            return TaskResult(
+                task_id=task.task_id,
+                status=TaskStatus.COMPLETED,
+                result=result,
+                processing_time_ms=elapsed_ms,
+            )
+            
+        except Exception as e:
+            elapsed_ms = (time.time() - start_time) * 1000
+            log.task_failed(task.task_id, task_type_str, str(e), elapsed_ms)
+            return TaskResult(
+                task_id=task.task_id,
+                status=TaskStatus.FAILED,
+                error=str(e),
+                processing_time_ms=elapsed_ms,
+            )
+    
+    async def _process_extraction(self, task: Task) -> dict:
+        """Process a memory extraction task.
+        
+        Uses the same model that was used for the chat to avoid loading
+        multiple models into VRAM. The model is passed in the task payload.
+        """
+        from ..memory.extraction import MemoryExtractionService
+        
+        messages = task.payload.get("messages", [])
+        bot_id = task.bot_id
+        user_id = task.user_id
+        
+        log.debug(f"Extraction: {len(messages)} messages for {bot_id}/{user_id}")
+        
+        # Get the model from task payload (passed from chat request)
+        # This ensures we use the same model that handled the chat
+        model_to_use = task.payload.get("model")
+        
+        if not model_to_use:
+            # Fallback: no model specified in task, skip LLM extraction
+            log.debug("No model specified in extraction task - using non-LLM extraction")
+            extraction_service = MemoryExtractionService(llm_client=None)
+            use_llm = False
+        else:
+            # Get client from cache - should already be loaded from chat
+            extraction_client = None
+            if model_to_use in self._client_cache:
+                extraction_client = self._client_cache[model_to_use]
+                log.debug(f"Reusing cached client for extraction: {model_to_use}")
+            else:
+                # Check if any LLMBawt instance has this model loaded
+                for (cached_model, _, _), llm_bawt in self._llm_bawt_cache.items():
+                    if cached_model == model_to_use:
+                        extraction_client = llm_bawt.client
+                        self._client_cache[model_to_use] = extraction_client
+                        log.debug(f"Reusing client from LLMBawt instance for extraction: {model_to_use}")
+                        break
+            
+            if not extraction_client:
+                log.warning(f"Model '{model_to_use}' not in cache - skipping LLM extraction to avoid reload")
+                extraction_client = None
+            
+            extraction_service = MemoryExtractionService(llm_client=extraction_client)
+            use_llm = extraction_client is not None
+        
+        # Run extraction in the SAME single-threaded executor as chat completions
+        # This ensures extraction waits for any in-flight chat to complete
+        # The executor has max_workers=1, so operations are serialized
+        loop = asyncio.get_event_loop()
+        
+        try:
+            facts = await loop.run_in_executor(
+                self._llm_executor,  # Use the single-threaded LLM executor
+                lambda: extraction_service.extract_from_conversation(messages, use_llm=use_llm)
+            )
+        except Exception as e:
+            # Catch any llama.cpp state corruption errors
+            log.warning(f"Extraction failed (will retry without LLM): {e}")
+            # Fallback to non-LLM extraction
+            extraction_service_fallback = MemoryExtractionService(llm_client=None)
+            facts = await loop.run_in_executor(
+                self._llm_executor,
+                lambda: extraction_service_fallback.extract_from_conversation(messages, use_llm=False)
+            )
+            use_llm = False
+        
+        if not facts:
+            log.debug("Extraction: no facts found")
+            return {"facts_extracted": 0, "facts_stored": 0, "llm_used": use_llm}
+
+        log.debug(f"Extraction: {len(facts)} facts, checking duplicates")
+
+        memory_client = self.get_memory_client(bot_id, user_id)
+        stored_count = 0
+        profile_count = 0
+        skipped_count = 0
+
+        if memory_client:
+            min_importance = getattr(self.config, "MEMORY_EXTRACTION_MIN_IMPORTANCE", 0.3)
+            profile_enabled = getattr(self.config, "MEMORY_PROFILE_ATTRIBUTE_ENABLED", True)
+
+            # Filter facts by minimum importance first
+            facts = [f for f in facts if f.importance >= min_importance]
+
+            if not facts:
+                log.debug("Extraction: no facts above importance threshold")
+                return {"facts_extracted": 0, "facts_stored": 0, "llm_used": use_llm}
+
+            # Fetch existing memories to check for duplicates
+            existing_memories = memory_client.list_memories(limit=100, min_importance=0.0)
+
+            if existing_memories:
+                # Use determine_memory_actions to filter out duplicates
+                actions = extraction_service.determine_memory_actions(
+                    new_facts=facts,
+                    existing_memories=existing_memories,
+                )
+
+                # Count how many facts were skipped (duplicates)
+                skipped_count = len(facts) - len(actions)
+                if skipped_count > 0:
+                    log.debug(f"Extraction: skipped {skipped_count} duplicates")
+
+                # Process only the actions (ADD, UPDATE, DELETE)
+                for action in actions:
+                    fact = action.fact
+                    if not fact:
+                        continue
+
+                    log.debug(f"[Extraction] {action.action}: '{fact.content[:50]}...' importance={fact.importance:.2f}")
+
+                    try:
+                        if action.action == "ADD":
+                            memory_client.add_memory(
+                                content=fact.content,
+                                tags=fact.tags,
+                                importance=fact.importance,
+                                source_message_ids=fact.source_message_ids,
+                            )
+                            stored_count += 1
+                        elif action.action == "UPDATE" and action.target_memory_id:
+                            memory_client.update_memory(
+                                memory_id=action.target_memory_id,
+                                content=fact.content,
+                                importance=fact.importance,
+                                tags=fact.tags,
+                            )
+                            stored_count += 1
+                        elif action.action == "DELETE" and action.target_memory_id:
+                            memory_client.delete_memory(memory_id=action.target_memory_id)
+
+                        # Extract profile attributes for ADD and UPDATE actions
+                        if action.action in ("ADD", "UPDATE") and profile_enabled:
+                            from ..memory_server.extraction import extract_profile_attributes_from_fact
+                            if extract_profile_attributes_from_fact(
+                                fact=fact,
+                                user_id=user_id,
+                                config=self.config,
+                            ):
+                                profile_count += 1
+                    except Exception as e:
+                        log.warning(f"Failed to process memory action {action.action}: {e}")
+            else:
+                # No existing memories - store all facts directly
+                for fact in facts:
+                    log.debug(f"[Extraction] ADD (no existing): '{fact.content[:50]}...' importance={fact.importance:.2f}")
+                    try:
+                        memory_client.add_memory(
+                            content=fact.content,
+                            tags=fact.tags,
+                            importance=fact.importance,
+                            source_message_ids=fact.source_message_ids,
+                        )
+                        stored_count += 1
+                        if profile_enabled:
+                            from ..memory_server.extraction import extract_profile_attributes_from_fact
+                            if extract_profile_attributes_from_fact(
+                                fact=fact,
+                                user_id=user_id,
+                                config=self.config,
+                            ):
+                                profile_count += 1
+                    except Exception as e:
+                        log.warning(f"Failed to store memory: {e}")
+        
+        if stored_count > 0 or profile_count > 0:
+            log.info(f"💾 Stored {stored_count} memories" + (f", {profile_count} profile attrs" if profile_count > 0 else ""))
+        log.memory_operation("extraction", bot_id, count=stored_count, details=f"extracted={len(facts)}, stored={stored_count}, skipped={skipped_count}, profiles={profile_count}, llm={use_llm}")
+        return {"facts_extracted": len(facts), "facts_stored": stored_count, "facts_skipped": skipped_count, "profile_attrs": profile_count, "llm_used": use_llm}
+    
+    async def _process_compaction(self, task: Task) -> dict:
+        """Process a context compaction task."""
+        # TODO: Implement with summarization model
+        return {"compacted": False, "reason": "Not yet implemented"}
+    
+    async def _process_embeddings(self, task: Task) -> dict:
+        """Process an embedding generation task."""
+        # TODO: Implement with embedding model
+        return {"embeddings_generated": 0, "reason": "Not yet implemented"}
+
+    async def _process_meaning_update(self, task: Task) -> dict:
+        """Process a meaning update task (via MCP tools)."""
+        bot_id = task.bot_id
+        payload = task.payload
+        memory_id = payload.get("memory_id")
+        if not memory_id:
+            return {"updated": False, "reason": "No memory_id provided"}
+
+        memory_client = self.get_memory_client(bot_id)
+        if not memory_client:
+            return {"updated": False, "reason": "Memory client unavailable"}
+
+        loop = asyncio.get_event_loop()
+        success = await loop.run_in_executor(
+            None,
+            lambda: memory_client.update_memory_meaning(
+                memory_id=memory_id,
+                intent=payload.get("intent"),
+                stakes=payload.get("stakes"),
+                emotional_charge=payload.get("emotional_charge"),
+                recurrence_keywords=payload.get("recurrence_keywords"),
+                updated_tags=payload.get("updated_tags"),
+            ),
+        )
+        return {"updated": bool(success), "memory_id": memory_id}
+
+    async def _process_maintenance(self, task: Task) -> dict:
+        """Process a unified memory maintenance task.
+        
+        Uses a cached LLM client if available, otherwise runs without LLM.
+        Will NOT load a new model to avoid VRAM conflicts.
+        """
+        bot_id = task.bot_id
+        payload = task.payload
+
+        memory_client = self.get_memory_client(bot_id)
+        if not memory_client:
+            return {"error": "Memory client unavailable"}
+
+        loop = asyncio.get_event_loop()
+        result = await loop.run_in_executor(
+            None,
+            lambda: memory_client.run_maintenance(
+                run_consolidation=payload.get("run_consolidation", True),
+                run_recurrence_detection=payload.get("run_recurrence_detection", True),
+                run_decay_pruning=payload.get("run_decay_pruning", False),
+                run_orphan_cleanup=payload.get("run_orphan_cleanup", False),
+                dry_run=payload.get("dry_run", False),
+            ),
+        )
+        return result
+
+    async def _process_profile_maintenance(self, task: Task) -> dict:
+        """Process profile maintenance - consolidate attributes into summary.
+        
+        Prefers a loaded local model to avoid VRAM churn and remote providers.
+        Falls back to configured/local defaults if no cached model available.
+        """
+        from ..memory.profile_maintenance import ProfileMaintenanceService
+        from ..profiles import ProfileManager
+        
+        entity_id = task.payload.get("entity_id", task.user_id)
+        entity_type = task.payload.get("entity_type", "user")
+        dry_run = task.payload.get("dry_run", False)
+        def is_openai_model(alias: str | None) -> bool:
+            if not alias:
+                return False
+            model_def = self.config.defined_models.get("models", {}).get(alias, {})
+            return model_def.get("type") == "openai"
+        
+        def first_local_cached() -> str | None:
+            for alias in self._client_cache.keys():
+                if not is_openai_model(alias):
+                    return alias
+            for (alias, _, _), _llm_bawt in self._llm_bawt_cache.items():
+                if not is_openai_model(alias):
+                    return alias
+            return None
+        
+        def first_local_available() -> str | None:
+            for alias in self._available_models:
+                if not is_openai_model(alias):
+                    return alias
+            return None
+        
+        requested_model = task.payload.get("model") or (self.config.PROFILE_MAINTENANCE_MODEL or None)
+        model_to_use: str | None = None
+        
+        if requested_model:
+            try:
+                model_to_use, _ = self._resolve_request_model(
+                    requested_model,
+                    task.bot_id or self._default_bot,
+                    local_mode=True,
+                )
+            except Exception as e:
+                log.error(f"Failed to resolve model for profile maintenance: {e}")
+                return {"error": f"Failed to resolve model: {e}"}
+
+        # Prefer currently loaded local model if no explicit model requested
+        if not model_to_use:
+            current_model = self._model_lifecycle.current_model
+            if current_model and not is_openai_model(current_model):
+                model_to_use = current_model
+
+        # Fall back to any cached local model
+        if not model_to_use:
+            model_to_use = first_local_cached()
+
+        # Last resort: resolve a local default
+        if not model_to_use:
+            try:
+                model_to_use, _ = self._resolve_request_model(
+                    None,
+                    task.bot_id or self._default_bot,
+                    local_mode=True,
+                )
+            except Exception as e:
+                log.error(f"Failed to resolve model for profile maintenance: {e}")
+                return {"error": f"Failed to resolve model: {e}"}
+        
+        # Never use OpenAI for profile maintenance; fall back to any local model
+        if not model_to_use or is_openai_model(model_to_use):
+            fallback_local = first_local_cached() or first_local_available()
+            if fallback_local and not is_openai_model(fallback_local):
+                if model_to_use:
+                    log.warning(
+                        f"Profile maintenance requested model '{model_to_use}' is openai; "
+                        f"using local '{fallback_local}' instead"
+                    )
+                model_to_use = fallback_local
+            else:
+                err = "No local model available for profile maintenance"
+                log.error(err)
+                return {"error": err}
+        
+        log.info(f"🔧 Profile maintenance: {entity_type}/{entity_id} (model={model_to_use})")
+        
+        # Get or create profile manager
+        profile_manager = ProfileManager(self.config)
+        
+        # Get LLM client - try cached first
+        llm_client = None
+        if model_to_use and model_to_use in self._client_cache:
+            llm_client = self._client_cache[model_to_use]
+        else:
+            # Check LLMBawt cache
+            for (cached_model, _, _), llm_bawt in self._llm_bawt_cache.items():
+                if not model_to_use or cached_model == model_to_use:
+                    llm_client = llm_bawt.client
+                    break
+        
+        # If no cached client, load the default model
+        if not llm_client:
+            log.info(f"⏳ Loading model for profile maintenance: {model_to_use}")
+            try:
+                # Create an LLMBawt instance which will load the model
+                llm_bawt = self._get_llm_bawt(
+                    model_alias=model_to_use,
+                    bot_id=task.bot_id or self._default_bot,
+                    user_id=entity_id,
+                )
+                llm_client = llm_bawt.client
+            except Exception as e:
+                log.error(f"Failed to load model for profile maintenance: {e}")
+                return {"error": f"Failed to load model: {e}"}
+        
+        service = ProfileMaintenanceService(profile_manager, llm_client)
+        
+        loop = asyncio.get_event_loop()
+        result = await loop.run_in_executor(
+            self._llm_executor,  # Use same executor as extraction
+            lambda: service.run(entity_id, entity_type, dry_run)
+        )
+        
+        return {
+            "entity_id": result.entity_id,
+            "attributes_before": result.attributes_before,
+            "attributes_after": result.attributes_after,
+            "categories_updated": result.categories_updated,
+            "error": result.error,
+        }
+    
+    def submit_task(self, task: Task) -> str:
+        """Submit a task to the processing queue."""
+        from dataclasses import dataclass, field as dataclass_field
+        
+        @dataclass(order=True)
+        class PrioritizedTask:
+            priority: int
+            timestamp: float
+            task: Task = dataclass_field(compare=False)
+        
+        prioritized = PrioritizedTask(
+            priority=-task.priority,
+            timestamp=time.time(),
+            task=task,
+        )
+        self._task_queue.put(prioritized)
+        self._result_events[task.task_id] = asyncio.Event()
+        return task.task_id
+    
+    def get_result(self, task_id: str) -> TaskResult | None:
+        """Get the result of a completed task."""
+        return self._results.get(task_id)
+    
+    async def wait_for_result(self, task_id: str, timeout: float = 30.0) -> TaskResult | None:
+        """Wait for a task result with timeout."""
+        event = self._result_events.get(task_id)
+        if not event:
+            return self._results.get(task_id)
+        
+        try:
+            await asyncio.wait_for(event.wait(), timeout=timeout)
+            return self._results.get(task_id)
+        except asyncio.TimeoutError:
+            return None
+    
+    async def worker_loop(self):
+        """Main worker loop that processes tasks from the queue."""
+        log.debug("Background task worker started")
+        
+        while not self._shutdown_event.is_set():
+            try:
+                try:
+                    prioritized = await asyncio.get_event_loop().run_in_executor(
+                        None,
+                        lambda: self._task_queue.get(timeout=1.0)
+                    )
+                except Exception:
+                    continue
+                
+                task = prioritized.task
+                log.task_submitted(task.task_id, task.task_type.value, task.bot_id, task.payload)
+                
+                result = await self.process_task(task)
+                self._results[task.task_id] = result
+                self.tasks_processed += 1
+                
+                if task.task_id in self._result_events:
+                    self._result_events[task.task_id].set()
+                
+                # Cleanup old results
+                if len(self._results) > 1000:
+                    oldest = sorted(self._results.keys())[:100]
+                    for key in oldest:
+                        self._results.pop(key, None)
+                        self._result_events.pop(key, None)
+                
+            except Exception as e:
+                log.exception(f"Worker loop error: {e}")
+                await asyncio.sleep(1)
+        
+        log.debug("Background task worker stopped")
+    
+    def start_worker(self):
+        """Start the background worker task."""
+        if self._worker_task is None or self._worker_task.done():
+            self._worker_task = asyncio.create_task(self.worker_loop())
+    
+    async def shutdown(self):
+        """Gracefully shutdown the service."""
+        log.shutdown()
+        self._shutdown_event.set()
+        if self._worker_task:
+            self._worker_task.cancel()
+    
+    def get_status(self) -> ServiceStatusResponse:
+        """Get service status."""
+        current = self._model_lifecycle.current_model
+        return ServiceStatusResponse(
+            uptime_seconds=self.uptime_seconds,
+            tasks_processed=self.tasks_processed,
+            tasks_pending=self._task_queue.qsize(),
+            models_loaded=[current] if current else [],
+            current_model=current,
+            available_models=self._available_models,
+        )

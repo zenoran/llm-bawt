@@ -8,7 +8,14 @@ from llm_bawt.utils.config import Config, has_database_credentials
 from llm_bawt.utils.config import set_config_value
 from llm_bawt.utils.input_handler import MultilineInputHandler
 from llm_bawt.core import LLMBawt
-from llm_bawt.model_manager import list_models, update_models_interactive, delete_model, ModelManager, is_service_mode_enabled
+from llm_bawt.model_manager import (
+    ModelManager,
+    delete_model,
+    is_service_mode_enabled,
+    list_models,
+    set_model_context_window,
+    update_models_interactive,
+)
 from llm_bawt.gguf_handler import handle_add_gguf
 from llm_bawt.cli.vllm_handler import handle_add_vllm
 from llm_bawt.bots import BotManager
@@ -1008,6 +1015,12 @@ def parse_arguments(config_obj: Config) -> argparse.Namespace:
     parser.add_argument("--add-gguf",type=str,metavar="REPO_ID",help="(Deprecated: use --add-model gguf) Add a GGUF model from a Hugging Face repo ID.")
     parser.add_argument("--add-model",type=str,choices=['ollama', 'openai', 'gguf', 'vllm'],metavar="TYPE",help="Add models: 'ollama' (refresh from server), 'openai' (query API), 'gguf' (add from HuggingFace repo), 'vllm' (add vLLM model from HuggingFace)")
     parser.add_argument("--delete-model",type=str,metavar="ALIAS",help="Delete the specified model alias from the configuration file after confirmation.")
+    parser.add_argument(
+        "--set-context-window",
+        nargs=2,
+        metavar=("ALIAS", "TOKENS"),
+        help="Set per-model context window in models.yaml. Creates missing aliases (e.g., grok-* from --list-models).",
+    )
     parser.add_argument("--config-set", nargs=2, metavar=("KEY", "VALUE"), help="Set a configuration value (e.g., DEFAULT_MODEL_ALIAS) in the .env file.")
     parser.add_argument("--config-list", action="store_true", help="List the current effective configuration settings.")
     parser.add_argument("question", nargs="*", help="Your question for the LLM model")
@@ -1071,6 +1084,16 @@ def main():
         else:
             console.print(f"[bold red]Failed to set configuration '{key}'.[/bold red]")
             sys.exit(1)
+    elif getattr(args, "set_context_window", None):
+        alias, token_value = args.set_context_window
+        try:
+            context_window = int(token_value)
+        except ValueError:
+            console.print(f"[bold red]Invalid token count:[/bold red] '{token_value}' is not an integer.")
+            sys.exit(1)
+
+        success = set_model_context_window(alias, context_window, config_obj)
+        sys.exit(0 if success else 1)
     # Handle listing config values
     elif getattr(args, 'config_list', False):
         env_file_path = config_obj.model_config.get('env_file', 'unknown')

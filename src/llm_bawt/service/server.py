@@ -1,20 +1,7 @@
-"""
-Background service for llm-bawt.
+"""Background service compatibility re-exports."""
 
-This module re-exports from api.py for backward compatibility.
-The actual implementation is in api.py.
-
-Run with: llm-service (requires: pip install llm-bawt[service])
-"""
-
-# Re-export everything from api.py
-from .api import (
-    BackgroundService,
-    app,
-    main,
-    DEFAULT_HTTP_PORT,
-    SERVICE_VERSION,
-)
+from .api import DEFAULT_HTTP_PORT, SERVICE_VERSION, app, main
+from .background_service import BackgroundService
 
 __all__ = [
     "BackgroundService",

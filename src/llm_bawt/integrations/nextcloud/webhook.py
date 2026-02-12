@@ -170,7 +170,8 @@ async def handle_nextcloud_webhook(request: Request) -> dict:
     if message and msg_type == "Create":
         try:
             # Import here to avoid circular imports
-            from ...service.api import ChatCompletionRequest, ChatMessage, get_service
+            from ...service.dependencies import get_service
+            from ...service.schemas import ChatCompletionRequest, ChatMessage
 
             service = get_service()
 

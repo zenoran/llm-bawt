@@ -5,7 +5,7 @@ bots:
     requires_memory: true
     uses_tools: true
     uses_search: true
-    default_model: grok-4
+    default_model: grok-3
     system_prompt: |
       You are Nova, a personal AI assistant running locally on the user's machine via llm-bawt.
 

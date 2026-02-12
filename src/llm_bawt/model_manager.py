@@ -493,6 +493,54 @@ class ModelManager:
         choice = Prompt.ask("Enter number", choices=list(choices.keys()), default="1")
         return choices.get(choice)
 
+    @staticmethod
+    def _infer_provider_type(alias: str) -> str:
+        """Infer provider type for a missing model alias."""
+        normalized = alias.strip().lower()
+        if normalized.startswith("grok"):
+            return PROVIDER_GROK
+        if normalized.startswith("gpt") or normalized.startswith(("o1", "o3", "o4")):
+            return PROVIDER_OPENAI
+        return PROVIDER_OPENAI
+
+    def set_context_window(self, alias: str, context_window: int) -> bool:
+        """Set or create a model's context_window in models.yaml.
+
+        If the alias is missing, create a minimal model entry so overrides work
+        consistently, especially for service-reported models like Grok.
+        """
+        if context_window <= 0:
+            console.print("[bold red]Error:[/bold red] context_window must be a positive integer.")
+            return False
+
+        models = self.models_data.setdefault("models", {})
+        added = 0
+        updated = 0
+
+        entry = models.get(alias)
+        if entry is None:
+            provider_type = self._infer_provider_type(alias)
+            entry = {
+                "type": provider_type,
+                "model_id": alias,
+                "description": (
+                    f"{provider_type.capitalize()} model (added via --set-context-window override)"
+                ),
+            }
+            models[alias] = entry
+            added = 1
+
+        entry["context_window"] = int(context_window)
+        if not added:
+            updated = 1
+
+        if self.save_config(added=added, updated=updated):
+            console.print(
+                f"[green]Set context_window={context_window} for model alias '{alias}'.[/green]"
+            )
+            return True
+        return False
+
 
 def fetch_ollama_api_models(ollama_url: str) -> Tuple[bool, List[Dict[str, Any]]]:
     """Fetches model list from Ollama API."""
@@ -592,6 +640,11 @@ def delete_model(alias: str, config: Config) -> bool:
 
 def update_models_interactive(config: Config, provider: Optional[str] = None):
     return ModelManager(config).update_models(provider)
+
+
+def set_model_context_window(alias: str, context_window: int, config: Config) -> bool:
+    """CLI wrapper: set per-model context window override."""
+    return ModelManager(config).set_context_window(alias=alias, context_window=context_window)
 
 
 def _parse_iso(ts_str: str) -> Optional[datetime]:

@@ -54,6 +54,12 @@ def parse_arguments(config_obj: "Config") -> argparse.Namespace:
         metavar="ALIAS",
         help="Delete the specified model alias from the configuration file after confirmation."
     )
+    parser.add_argument(
+        "--set-context-window",
+        nargs=2,
+        metavar=("ALIAS", "TOKENS"),
+        help="Set per-model context window in models.yaml (creates missing aliases)."
+    )
     
     # Configuration management
     parser.add_argument(
