@@ -3568,8 +3568,12 @@ def main():
         # When using our rich logging, set uvicorn to warning to reduce noise
         uvicorn_log_level = "debug" if args.debug else "warning"
         
-        # Exclude __pycache__ and .pyc files from reload watching to prevent loops
-        reload_excludes = ["__pycache__", "*.pyc", ".git"] if args.reload else None
+        # Exclude generated/data files from reload watching to prevent feedback loops
+        reload_excludes = [
+            "__pycache__", "*.pyc", ".git",
+            ".logs", ".run", "models",
+            "*.log", "*.pid",
+        ] if args.reload else None
         
         uvicorn.run(
             "llm_bawt.service.server:app",
