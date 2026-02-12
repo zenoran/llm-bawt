@@ -157,7 +157,7 @@ class ModelManager:
             try:
                 from llm_bawt.service.client import get_service_client
 
-                service_client = get_service_client()
+                service_client = get_service_client(self.config)
                 service_url = service_client.http_url
                 if service_client.is_available(force_check=True):
                     service_available = True

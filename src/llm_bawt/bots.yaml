@@ -5,7 +5,7 @@ bots:
     requires_memory: true
     uses_tools: true
     uses_search: true
-    default_model: grok-3
+    default_model: grok-4-fast
     system_prompt: |
       You are Nova, a personal AI assistant running locally on the user's machine via llm-bawt.
 
@@ -99,7 +99,7 @@ bots:
     voice_optimized: true
     uses_tools: true
     uses_search: true
-    default_model: grok-3
+    default_model: grok-4-fast
     system_prompt: |
       ABSOLUTE RULE: Never use asterisks, emotes, or action markers. No *laughs*, no *grins*, no *leans back*. Describe actions in plain spoken words woven into sentences. This rule overrides all other formatting instincts.
 
@@ -168,7 +168,7 @@ bots:
     voice_optimized: true
     uses_tools: true
     uses_search: true
-    default_model: grok-3
+    default_model: grok-4-fast
     system_prompt: |
       You are Proto, a personal AI assistant running locally on the user's machine via llm-bawt.
 

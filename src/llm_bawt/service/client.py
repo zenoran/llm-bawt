@@ -606,9 +606,34 @@ class ServiceClient:
 _service_client: ServiceClient | None = None
 
 
-def get_service_client() -> ServiceClient:
-    """Get the global service client instance."""
+def _build_service_http_url(config: Any | None) -> str | None:
+    """Build service URL from config, normalizing bind-all hosts for client use."""
+    if config is None:
+        return None
+
+    explicit_url = getattr(config, "SERVICE_URL", None)
+    if explicit_url:
+        return explicit_url
+
+    host = getattr(config, "SERVICE_HOST", None)
+    port = getattr(config, "SERVICE_PORT", None)
+    if host and port:
+        connect_host = "127.0.0.1" if host in {"0.0.0.0", "::", "[::]"} else host
+        return f"http://{connect_host}:{port}"
+
+    return None
+
+
+def get_service_client(config: Any | None = None) -> ServiceClient:
+    """Get the global service client instance.
+
+    If config is provided, uses its service host/port to build the client URL.
+    """
     global _service_client
+    desired_url = _build_service_http_url(config)
     if _service_client is None:
-        _service_client = ServiceClient()
+        _service_client = ServiceClient(http_url=desired_url)
+    elif desired_url and _service_client.http_url != desired_url:
+        # Recreate with updated endpoint when config differs.
+        _service_client = ServiceClient(http_url=desired_url)
     return _service_client

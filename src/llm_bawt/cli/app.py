@@ -44,7 +44,8 @@ def get_service_client(config: Config | None = None):
                 config = Config()
             service_url = getattr(config, 'SERVICE_URL', None)
             if not service_url and hasattr(config, 'SERVICE_HOST') and hasattr(config, 'SERVICE_PORT'):
-                service_url = f"http://{config.SERVICE_HOST}:{config.SERVICE_PORT}"
+                host = "127.0.0.1" if config.SERVICE_HOST == "0.0.0.0" else config.SERVICE_HOST
+                service_url = f"http://{host}:{config.SERVICE_PORT}"
             _service_client = ServiceClient(http_url=service_url)
         except ImportError:
             _service_client = False  # Mark as unavailable
