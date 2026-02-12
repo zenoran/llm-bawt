@@ -74,6 +74,7 @@ class TestJobTypes:
         assert JobType.PROFILE_MAINTENANCE.value == "profile_maintenance"
         assert JobType.MEMORY_CONSOLIDATION.value == "memory_consolidation"
         assert JobType.MEMORY_DECAY.value == "memory_decay"
+        assert JobType.HISTORY_SUMMARIZATION.value == "history_summarization"
 
 
 class TestTaskFactories:
@@ -105,3 +106,20 @@ class TestTaskFactories:
         assert task.bot_id == "nova"
         assert task.user_id == "system"
         assert task.payload["run_consolidation"] is True
+
+    def test_create_history_summarization_task(self):
+        from llm_bawt.service.tasks import create_history_summarization_task, TaskType
+
+        task = create_history_summarization_task(
+            bot_id="nova",
+            user_id="system",
+            use_heuristic_fallback=False,
+            max_tokens_per_chunk=2048,
+            model="grok-4-fast",
+        )
+        assert task.task_type == TaskType.HISTORY_SUMMARIZATION
+        assert task.bot_id == "nova"
+        assert task.user_id == "system"
+        assert task.payload["use_heuristic_fallback"] is False
+        assert task.payload["max_tokens_per_chunk"] == 2048
+        assert task.payload["model"] == "grok-4-fast"

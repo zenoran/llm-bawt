@@ -1057,6 +1057,8 @@ class BackgroundService:
                 result = await self._process_maintenance(task)
             elif task.task_type == TaskType.PROFILE_MAINTENANCE:
                 result = await self._process_profile_maintenance(task)
+            elif task.task_type == TaskType.HISTORY_SUMMARIZATION:
+                result = await self._process_history_summarization(task)
             else:
                 raise ValueError(f"Unknown task type: {task.task_type}")
             
@@ -1442,6 +1444,104 @@ class BackgroundService:
             "categories_updated": result.categories_updated,
             "error": result.error,
         }
+
+    async def _process_history_summarization(self, task: Task) -> dict:
+        """Process proactive history summarization for a bot."""
+        from ..memory.summarization import (
+            HistorySummarizer,
+            SUMMARIZATION_PROMPT,
+            format_session_for_summarization,
+        )
+        from ..models.message import Message
+
+        bot_id = task.bot_id or self._default_bot
+        requested_model = task.payload.get("model") or getattr(self.config, "SUMMARIZATION_MODEL", None)
+        use_heuristic_fallback = bool(task.payload.get("use_heuristic_fallback", True))
+        max_tokens_per_chunk = int(task.payload.get("max_tokens_per_chunk", 4000))
+
+        model_alias = None
+        client = None
+
+        if requested_model and requested_model in self._client_cache:
+            model_alias = requested_model
+            client = self._client_cache[requested_model]
+        elif self._client_cache:
+            model_alias = next(iter(self._client_cache.keys()))
+            client = self._client_cache[model_alias]
+        else:
+            try:
+                model_alias, _ = self._resolve_request_model(
+                    requested_model,
+                    bot_id,
+                    local_mode=False,
+                )
+                llm_bawt = self._get_llm_bawt(
+                    model_alias=model_alias,
+                    bot_id=bot_id,
+                    user_id=task.user_id or "system",
+                )
+                client = llm_bawt.client
+            except Exception as e:
+                log.error(f"Failed to resolve/load model for history summarization: {e}")
+                client = None
+
+        def summarize_with_loaded_client(session) -> str | None:
+            if not client:
+                return None
+
+            conversation_text = format_session_for_summarization(session)
+            prompt = SUMMARIZATION_PROMPT.format(messages=conversation_text)
+
+            # Conservative budget to reduce context overflows on smaller models.
+            if len(prompt) // 4 > 6000:
+                return None
+
+            try:
+                messages = [
+                    Message(
+                        role="system",
+                        content="You are a helpful assistant that summarizes conversations concisely.",
+                    ),
+                    Message(role="user", content=prompt),
+                ]
+                response = client.query(
+                    messages=messages,
+                    max_tokens=200,
+                    temperature=0.3,
+                    plaintext_output=True,
+                    stream=False,
+                )
+                if not response:
+                    return None
+
+                lower = response.lower()
+                error_indicators = ("error:", "exception occurred", "exceed context window", "tokens exceed")
+                if any(ind in lower for ind in error_indicators):
+                    return None
+                return response.strip()
+            except Exception as e:
+                log.error(f"History summarization LLM call failed: {e}")
+                return None
+
+        summarizer = HistorySummarizer(
+            self.config,
+            bot_id=bot_id,
+            summarize_fn=summarize_with_loaded_client,
+        )
+
+        loop = asyncio.get_event_loop()
+        result = await loop.run_in_executor(
+            self._llm_executor,
+            lambda: summarizer.summarize_eligible_sessions(
+                use_heuristic_fallback=use_heuristic_fallback,
+                max_tokens_per_chunk=max_tokens_per_chunk,
+            ),
+        )
+
+        if model_alias:
+            result["model"] = model_alias
+        result["used_heuristic_fallback"] = use_heuristic_fallback
+        return result
     
     def submit_task(self, task: Task) -> str:
         """Submit a task to the processing queue."""

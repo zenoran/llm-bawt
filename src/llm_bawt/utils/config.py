@@ -152,6 +152,10 @@ class Config(BaseSettings):
     SCHEDULER_ENABLED: bool = Field(default=True, description="Enable background job scheduler")
     SCHEDULER_CHECK_INTERVAL_SECONDS: int = Field(default=30, description="How often to check for due jobs")
     PROFILE_MAINTENANCE_INTERVAL_MINUTES: int = Field(default=60, description="Run profile summarization every N minutes")
+    HISTORY_SUMMARIZATION_INTERVAL_MINUTES: int = Field(
+        default=30,
+        description="Run history summarization every N minutes",
+    )
     PROFILE_MAINTENANCE_MODEL: str = Field(default="", description="Model to use for profile summarization (empty = default)")
 
     # --- Service Settings --- #

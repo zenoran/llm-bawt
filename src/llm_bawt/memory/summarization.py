@@ -6,6 +6,7 @@ in the LLM window.
 
 Sessions are detected by timestamp gaps (default 1 hour). Sessions older
 than HISTORY_DURATION (default 30 min) are eligible for summarization.
+Summaries are non-destructive: raw messages remain in the messages table.
 """
 
 import json
@@ -141,9 +142,6 @@ def find_summarizable_sessions(
     - It ended more than history_duration_seconds ago
     - It has at least min_messages messages
     
-    Note: We don't need to track summarized messages because they are
-    moved to the forgotten table, so they won't appear in sessions.
-
     Args:
         sessions: List of Session objects
         history_duration_seconds: Sessions must be older than this to summarize
@@ -167,6 +165,25 @@ def find_summarizable_sessions(
         eligible.append(session)
 
     return eligible
+
+
+def estimate_session_token_savings(session: Session) -> int:
+    """Estimate token savings from replacing a session with a summary.
+
+    This is a heuristic for prioritization, not an exact tokenizer measurement.
+    """
+    raw_tokens = estimate_tokens(format_session_for_summarization(session))
+    # Typical summary target is short but non-trivial; clamp to a practical range.
+    expected_summary_tokens = min(200, max(48, raw_tokens // 5))
+    return max(raw_tokens - expected_summary_tokens, 0)
+
+
+def prioritize_summarizable_sessions(sessions: list[Session]) -> list[Session]:
+    """Prioritize sessions by token savings impact (largest first)."""
+    return sorted(
+        sessions,
+        key=lambda s: (-estimate_session_token_savings(s), s.start_timestamp),
+    )
 
 
 def format_session_for_summarization(session: Session) -> str:
@@ -347,7 +364,6 @@ def summarize_session_heuristic(session: Session) -> str:
 
     # Build summary with date for time context
     start_time = session.start_datetime.strftime("%Y-%m-%d")
-    start_time_full = session.start_datetime.strftime("%Y-%m-%d %H:%M")
     msg_count = session.message_count
 
     summary_parts = [f"On {start_time}: Conversation about"]
@@ -410,7 +426,7 @@ class HistorySummarizer:
         with self._backend.engine.connect() as conn:
             from sqlalchemy import text
             sql = text(f"""
-                SELECT id, role, content, timestamp, summarized, summary_metadata
+                SELECT id, role, content, timestamp, summarized, recalled_history, summary_metadata
                 FROM {self._backend._messages_table_name}
                 ORDER BY timestamp ASC
             """)
@@ -422,10 +438,47 @@ class HistorySummarizer:
                     "content": row.content,
                     "timestamp": row.timestamp,
                     "summarized": row.summarized,
+                    "recalled_history": row.recalled_history,
                     "summary_metadata": row.summary_metadata,
                 }
                 for row in rows
             ]
+
+    def _find_existing_summary_id(self, conn: Any, session: Session) -> str | None:
+        """Find an existing summary that already covers this exact message set."""
+        from sqlalchemy import text
+
+        sql = text(
+            f"""
+            SELECT id, summary_metadata
+            FROM {self._backend._messages_table_name}
+            WHERE role = 'summary'
+              AND timestamp >= :start_ts - 1
+              AND timestamp <= :end_ts + 1
+            ORDER BY timestamp DESC
+            """
+        )
+        rows = conn.execute(
+            sql,
+            {"start_ts": session.start_timestamp, "end_ts": session.end_timestamp},
+        ).fetchall()
+
+        for row in rows:
+            meta = row.summary_metadata or {}
+            if isinstance(meta, str):
+                try:
+                    meta = json.loads(meta)
+                except Exception:
+                    continue
+
+            if not isinstance(meta, dict):
+                continue
+
+            existing_ids = meta.get("message_ids", [])
+            if isinstance(existing_ids, list) and existing_ids == session.message_ids:
+                return row.id
+
+        return None
 
     def detect_all_sessions(self) -> list[Session]:
         """Detect all conversation sessions."""
@@ -434,22 +487,23 @@ class HistorySummarizer:
 
     def preview_summarizable_sessions(self) -> list[Session]:
         """Preview sessions that would be summarized (dry run).
-        
-        Since summarized messages are moved to the forgotten table,
-        we only see unsummarized messages here. No need to track
-        which messages have been summarized - they simply don't exist
-        in the messages table anymore.
         """
         messages = self._get_all_messages()
-        sessions = detect_sessions(messages, self.session_gap_seconds)
-        # Filter to only non-summary messages for session detection
-        regular_messages = [m for m in messages if m.get("role") != "summary"]
+        # Only detect sessions on raw, non-recalled, unsummarized messages.
+        regular_messages = [
+            m
+            for m in messages
+            if m.get("role") != "summary"
+            and not bool(m.get("recalled_history"))
+            and not bool(m.get("summarized"))
+        ]
         sessions = detect_sessions(regular_messages, self.session_gap_seconds)
-        return find_summarizable_sessions(
+        eligible = find_summarizable_sessions(
             sessions,
             history_duration_seconds=self.history_duration,
             min_messages=self.min_messages,
         )
+        return prioritize_summarizable_sessions(eligible)
 
     def summarize_session(
         self,
@@ -495,25 +549,27 @@ class HistorySummarizer:
         with self._backend.engine.connect() as conn:
             from sqlalchemy import text
 
-            # Move original messages to the forgotten table (preserves them for restoration)
+            existing_summary_id = self._find_existing_summary_id(conn, session)
+            if existing_summary_id:
+                return {
+                    "success": True,
+                    "summary_id": existing_summary_id,
+                    "summary_text": None,
+                    "method": "existing",
+                    "message_count": session.message_count,
+                    "created": False,
+                }
+
+            # Mark source messages as summarized, but keep them in place.
             if session.message_ids:
-                # Copy messages to forgotten table
-                copy_sql = text(f"""
-                    INSERT INTO {self._backend._forgotten_table_name}
-                    (id, role, content, timestamp, session_id, processed, created_at, forgotten_at)
-                    SELECT id, role, content, timestamp, session_id, processed, created_at, CURRENT_TIMESTAMP
-                    FROM {self._backend._messages_table_name}
+                update_sql = text(
+                    f"""
+                    UPDATE {self._backend._messages_table_name}
+                    SET summarized = TRUE
                     WHERE id = ANY(:ids)
-                    ON CONFLICT (id) DO NOTHING
-                """)
-                conn.execute(copy_sql, {"ids": session.message_ids})
-                
-                # Delete original messages
-                delete_sql = text(f"""
-                    DELETE FROM {self._backend._messages_table_name}
-                    WHERE id = ANY(:ids)
-                """)
-                conn.execute(delete_sql, {"ids": session.message_ids})
+                    """
+                )
+                conn.execute(update_sql, {"ids": session.message_ids})
 
             # Insert summary as a message with role='summary'
             # Timestamp is session end time for natural ordering
@@ -539,6 +595,7 @@ class HistorySummarizer:
             "summary_text": summary_text,
             "method": method,
             "message_count": session.message_count,
+            "created": True,
         }
 
     def summarize_eligible_sessions(
@@ -567,6 +624,8 @@ class HistorySummarizer:
         results = []
         errors = []
         total_messages = 0
+        created_count = 0
+        skipped_existing_count = 0
 
         for session in eligible:
             try:
@@ -579,8 +638,13 @@ class HistorySummarizer:
                         result = self.summarize_session(chunk, use_heuristic_fallback)
                         if result.get("success"):
                             results.append(result)
-                            total_messages += chunk.message_count
-                            logger.info(f"Summarized{chunk_label}: {chunk.message_count} messages")
+                            if result.get("created", True):
+                                created_count += 1
+                                total_messages += chunk.message_count
+                                logger.info(f"Summarized{chunk_label}: {chunk.message_count} messages")
+                            else:
+                                skipped_existing_count += 1
+                                logger.debug(f"Skipped already summarized session{chunk_label}")
                         else:
                             error_msg = result.get("error", "Unknown error")
                             errors.append(f"Session{chunk_label}: {error_msg}")
@@ -593,8 +657,9 @@ class HistorySummarizer:
                 errors.append(str(e))
 
         return {
-            "sessions_summarized": len(results),
+            "sessions_summarized": created_count,
             "messages_summarized": total_messages,
+            "sessions_skipped_existing": skipped_existing_count,
             "results": results,
             "errors": errors,
         }
@@ -669,13 +734,15 @@ class HistorySummarizer:
             message_ids = metadata.get("message_ids", [])
 
             # Unmark the original messages
+            rows_unmarked = 0
             if message_ids:
                 update_sql = text(f"""
                     UPDATE {self._backend._messages_table_name}
                     SET summarized = FALSE
                     WHERE id = ANY(:ids)
                 """)
-                conn.execute(update_sql, {"ids": message_ids})
+                update_result = conn.execute(update_sql, {"ids": message_ids})
+                rows_unmarked = int(update_result.rowcount or 0)
 
             # Delete the summary
             delete_sql = text(f"""
@@ -686,12 +753,12 @@ class HistorySummarizer:
 
             conn.commit()
 
-        logger.info(f"Deleted summary {full_id[:8]}, restored {len(message_ids)} messages")
+        logger.info(f"Deleted summary {full_id[:8]}, unmarked {rows_unmarked} source messages")
 
         return {
             "success": True,
             "summary_id": full_id,
-            "messages_restored": len(message_ids),
+            "messages_restored": rows_unmarked,
         }
 
     def get_summary_count(self) -> int:

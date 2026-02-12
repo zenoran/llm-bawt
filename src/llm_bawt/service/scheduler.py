@@ -28,6 +28,7 @@ class JobType(str, Enum):
     PROFILE_MAINTENANCE = "profile_maintenance"
     MEMORY_CONSOLIDATION = "memory_consolidation"
     MEMORY_DECAY = "memory_decay"
+    HISTORY_SUMMARIZATION = "history_summarization"
 
 
 class ScheduledJob(SQLModel, table=True):
@@ -213,7 +214,11 @@ class JobScheduler:
     
     def _create_task_for_job(self, job: ScheduledJob):
         """Create a Task from a ScheduledJob."""
-        from llm_bawt.service.tasks import create_profile_maintenance_task, create_maintenance_task
+        from llm_bawt.service.tasks import (
+            create_history_summarization_task,
+            create_maintenance_task,
+            create_profile_maintenance_task,
+        )
         
         if job.job_type == JobType.PROFILE_MAINTENANCE:
             # For profile maintenance, entity_id comes from config or is the bot's user
@@ -244,6 +249,15 @@ class JobScheduler:
                 run_recurrence_detection=False,
                 run_decay_pruning=True,
             )
+        elif job.job_type == JobType.HISTORY_SUMMARIZATION:
+            config = json.loads(job.config_json) if job.config_json else {}
+            return create_history_summarization_task(
+                bot_id=job.bot_id,
+                user_id=config.get("user_id", "system"),
+                use_heuristic_fallback=config.get("use_heuristic_fallback", True),
+                max_tokens_per_chunk=config.get("max_tokens_per_chunk", 4000),
+                model=config.get("model"),
+            )
         
         return None
 
@@ -268,3 +282,27 @@ def init_default_jobs(engine, config) -> None:
             session.add(job)
             session.commit()
             logger.debug("Created default profile maintenance job")
+
+        # Check if history summarization job exists
+        existing_history = session.exec(
+            select(ScheduledJob).where(ScheduledJob.job_type == JobType.HISTORY_SUMMARIZATION)
+        ).first()
+
+        if not existing_history:
+            default_bot = config.DEFAULT_BOT or "nova"
+            history_job = ScheduledJob(
+                job_type=JobType.HISTORY_SUMMARIZATION,
+                bot_id=default_bot,
+                enabled=config.SCHEDULER_ENABLED,
+                interval_minutes=getattr(config, "HISTORY_SUMMARIZATION_INTERVAL_MINUTES", 30),
+                config_json=json.dumps(
+                    {
+                        "user_id": "system",
+                        "use_heuristic_fallback": True,
+                        "max_tokens_per_chunk": 4000,
+                    }
+                ),
+            )
+            session.add(history_job)
+            session.commit()
+            logger.debug("Created default history summarization job")

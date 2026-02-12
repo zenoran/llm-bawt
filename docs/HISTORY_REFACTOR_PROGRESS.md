@@ -3,7 +3,7 @@
 *Tracking document for the message history and context assembly refactoring.*
 *Source design: [CONTEXT_AND_MEMORY_REDESIGN.md](CONTEXT_AND_MEMORY_REDESIGN.md)*
 
-**Last updated:** 2026-02-09
+**Last updated:** 2026-02-12
 
 ---
 
@@ -25,7 +25,7 @@
 | Unified memory tool output | Done | Uses `build_memory_context_string()` with categorized sections |
 | Memory timestamps in search | Done | `created_at`/`last_accessed` threaded through pipeline |
 | Dual assembly path consolidation | Not started | `base.py` and `pipeline.py` both assemble — architectural debt |
-| Proactive summarization scheduler | Not started | Blocked on Track D |
+| Proactive summarization scheduler | Done | Track F implemented: non-destructive summaries + scheduler job |
 
 ---
 
@@ -135,17 +135,17 @@ Same cold-start memory injection exists in both paths:
 | 2 | Timestamps on memory search results | Done | `created_at`/`last_accessed` threaded through full pipeline |
 | 3 | Formatted text (not raw JSON) | Done | Structured sections: core/concerns/preferences/background |
 
-### Sprint 3 Track F: Proactive Summarization (0/7 done)
+### Sprint 3 Track F: Proactive Summarization (7/7 done)
 
 | # | Deliverable | Status | Notes |
 |---|------------|--------|-------|
-| 1 | `HISTORY_SUMMARIZATION` JobType | Not started | |
-| 2 | TaskType + factory | Not started | |
-| 3 | Non-destructive summarization | Not started | |
-| 4 | Size-based session prioritization | Not started | |
-| 5 | Modify `HistorySummarizer` to keep originals | Not started | |
-| 6 | Seed default job in `init_default_jobs()` | Not started | |
-| 7 | Skip `recalled_history` in summarization | Not started | |
+| 1 | `HISTORY_SUMMARIZATION` JobType | Done | Added to scheduler `JobType` enum |
+| 2 | TaskType + factory | Done | Added `TaskType.HISTORY_SUMMARIZATION` + `create_history_summarization_task()` |
+| 3 | Non-destructive summarization | Done | Summaries no longer move/delete source messages |
+| 4 | Size-based session prioritization | Done | Sessions sorted by estimated token savings |
+| 5 | Modify `HistorySummarizer` to keep originals | Done | Source rows marked `summarized=TRUE`, retained in `*_messages` |
+| 6 | Seed default job in `init_default_jobs()` | Done | Default recurring summarization job added |
+| 7 | Skip `recalled_history` in summarization | Done | Recalled rows excluded from summarization candidate scan |
 
 ---
 
@@ -165,3 +165,16 @@ Same cold-start memory injection exists in both paths:
 - **E1:** Memory search metadata (`intent`, `stakes`, `emotional_charge`, `created_at`, `last_accessed`) threaded through postgresql.py → storage.py → client.py → executor.py; executor switched from `format_memories_for_result()` to `build_memory_context_string()`
 - Sprint 2 Tracks A+B now complete; Track E complete; Track D at 5/6 (prompt guidance remaining)
 - Updated both design doc and progress tracker
+
+### 2026-02-12 — Track F implementation (Codex)
+- Implemented non-destructive summarization in `memory/summarization.py` (source messages retained, marked `summarized=TRUE`)
+- Added duplicate-avoidance guard for already summarized sessions and size-based prioritization by estimated token savings
+- Added scheduler/task plumbing for proactive summarization:
+  - `JobType.HISTORY_SUMMARIZATION`
+  - `TaskType.HISTORY_SUMMARIZATION`
+  - `create_history_summarization_task()`
+  - default seeded job in `init_default_jobs()`
+- Added MCP-accessible summary-recall helpers:
+  - `get_messages_for_summary`
+  - `mark_messages_recalled`
+- Added tests for scheduler/task wiring and summarization helper behavior

@@ -396,6 +396,20 @@ async def restore_ignored_messages(bot_id: str = "default") -> int:
 
 
 @mcp.tool()
+async def get_messages_for_summary(bot_id: str = "default", summary_id: str = "") -> list[dict]:
+    """Get raw user/assistant messages referenced by a summary row."""
+    storage = _get_storage()
+    return await storage.get_messages_for_summary(bot_id=bot_id, summary_id=summary_id)
+
+
+@mcp.tool()
+async def mark_messages_recalled(bot_id: str = "default", message_ids: list[str] | None = None) -> int:
+    """Mark messages as recalled from summary expansion."""
+    storage = _get_storage()
+    return await storage.mark_messages_recalled(bot_id=bot_id, message_ids=message_ids)
+
+
+@mcp.tool()
 async def delete_memories_by_source_message_ids(bot_id: str = "default", message_ids: list[str] | None = None) -> int:
     storage = _get_storage()
     return await storage.delete_memories_by_source_message_ids(bot_id=bot_id, message_ids=message_ids)

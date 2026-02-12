@@ -18,6 +18,7 @@ class TaskType(Enum):
     MEANING_UPDATE = "meaning_update"
     MEMORY_MAINTENANCE = "memory_maintenance"
     PROFILE_MAINTENANCE = "profile_maintenance"
+    HISTORY_SUMMARIZATION = "history_summarization"
 
 
 class TaskStatus(Enum):
@@ -235,5 +236,27 @@ def create_profile_maintenance_task(
             "entity_id": entity_id,
             "entity_type": entity_type,
             "dry_run": dry_run,
+        },
+    )
+
+
+def create_history_summarization_task(
+    bot_id: str = "nova",
+    user_id: str = "system",
+    use_heuristic_fallback: bool = True,
+    max_tokens_per_chunk: int = 4000,
+    model: str | None = None,
+    priority: int = -1,
+) -> Task:
+    """Create a history summarization task."""
+    return Task(
+        task_type=TaskType.HISTORY_SUMMARIZATION,
+        bot_id=bot_id,
+        user_id=user_id,
+        priority=priority,
+        payload={
+            "use_heuristic_fallback": use_heuristic_fallback,
+            "max_tokens_per_chunk": max_tokens_per_chunk,
+            "model": model,
         },
     )

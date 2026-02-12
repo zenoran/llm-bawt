@@ -624,6 +624,37 @@ class MemoryClient:
             return bool(self._call_server("remove_last_message_if_partial", {"bot_id": self.bot_id, "role": role}))
         storage = self._get_storage()
         return bool(_run_async(storage.remove_last_message_if_partial(bot_id=self.bot_id, role=role)))
+
+    def get_messages_for_summary(self, summary_id: str) -> list[dict[str, Any]]:
+        """Get raw messages referenced by a summary row."""
+        self._ensure_initialized()
+        if self.server_url:
+            result = self._call_server(
+                "get_messages_for_summary",
+                {"bot_id": self.bot_id, "summary_id": summary_id},
+            )
+            return result if isinstance(result, list) else []
+
+        storage = self._get_storage()
+        return _run_async(storage.get_messages_for_summary(bot_id=self.bot_id, summary_id=summary_id))
+
+    def mark_messages_recalled(self, message_ids: list[str]) -> int:
+        """Mark summary-recalled messages in storage."""
+        self._ensure_initialized()
+        if self.server_url:
+            return int(
+                self._call_server(
+                    "mark_messages_recalled",
+                    {"bot_id": self.bot_id, "message_ids": message_ids},
+                )
+            )
+
+        storage = self._get_storage()
+        return int(
+            _run_async(
+                storage.mark_messages_recalled(bot_id=self.bot_id, message_ids=message_ids)
+            )
+        )
     
     def update_memory(
         self,
@@ -1149,3 +1180,20 @@ class _MCPShortTermManager:
 
     def remove_last_message_if_partial(self, role: str) -> bool:
         return bool(self._memory_client.remove_last_message_if_partial(role=role))
+
+    def get_messages_for_summary(self, summary_id: str) -> list:
+        from llm_bawt.models.message import Message
+
+        rows = self._memory_client.get_messages_for_summary(summary_id)
+        return [
+            Message(
+                role=row.get("role", ""),
+                content=row.get("content", ""),
+                timestamp=row.get("timestamp", 0.0),
+                db_id=row.get("id"),
+            )
+            for row in rows
+        ]
+
+    def mark_messages_recalled(self, message_ids: list[str]) -> int:
+        return int(self._memory_client.mark_messages_recalled(message_ids))
