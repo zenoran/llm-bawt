@@ -713,8 +713,30 @@ class BackgroundService:
             log.api_error(ctx, str(e), 400)
             raise
 
+        response_id = f"chatcmpl-{uuid.uuid4().hex[:12]}"
+        created = int(time.time())
+
         # Get cached LLMBawt instance
-        llm_bawt = self._get_llm_bawt(model_alias, bot_id, user_id, local_mode)
+        try:
+            llm_bawt = self._get_llm_bawt(model_alias, bot_id, user_id, local_mode)
+        except Exception as e:
+            log.api_error(ctx, str(e), 500)
+            warning_data = {
+                "object": "service.warning",
+                "model": model_alias,
+                "warnings": [f"request_failed: {e}"],
+            }
+            yield f"data: {json.dumps(warning_data)}\n\n"
+            data = {
+                "id": response_id,
+                "object": "chat.completion.chunk",
+                "created": created,
+                "model": model_alias,
+                "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+            }
+            yield f"data: {json.dumps(data)}\n\n"
+            yield "data: [DONE]\n\n"
+            return
         
         # Get the user's prompt (last user message)
         user_prompt = ""
@@ -724,10 +746,22 @@ class BackgroundService:
                 break
         
         if not user_prompt:
-            raise ValueError("No user message found in request")
-        
-        response_id = f"chatcmpl-{uuid.uuid4().hex[:12]}"
-        created = int(time.time())
+            warning_data = {
+                "object": "service.warning",
+                "model": model_alias,
+                "warnings": ["request_failed: No user message found in request"],
+            }
+            yield f"data: {json.dumps(warning_data)}\n\n"
+            data = {
+                "id": response_id,
+                "object": "chat.completion.chunk",
+                "created": created,
+                "model": model_alias,
+                "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+            }
+            yield f"data: {json.dumps(data)}\n\n"
+            yield "data: [DONE]\n\n"
+            return
         
         chunk_queue: asyncio.Queue = asyncio.Queue()
         full_response_holder = [""]  # Use list to allow mutation in nested function
@@ -1014,8 +1048,39 @@ class BackgroundService:
                     break
                 
                 if isinstance(chunk, Exception):
-                    # Error occurred
-                    raise chunk
+                    # Upstream stream failed; close SSE cleanly so downstream clients
+                    # don't see an incomplete chunked read protocol error.
+                    log.error("Streaming backend failed: %s", chunk)
+                    warning_data = {
+                        "object": "service.warning",
+                        "model": model_alias,
+                        "warnings": [f"stream_interrupted: {chunk}"],
+                    }
+                    yield f"data: {json.dumps(warning_data)}\n\n"
+
+                    # Flush any buffered content from emote filter.
+                    if emote_filter:
+                        final_chunk = emote_filter.flush()
+                        if final_chunk:
+                            data = {
+                                "id": response_id,
+                                "object": "chat.completion.chunk",
+                                "created": created,
+                                "model": model_alias,
+                                "choices": [{"index": 0, "delta": {"content": final_chunk}, "finish_reason": None}],
+                            }
+                            yield f"data: {json.dumps(data)}\n\n"
+
+                    data = {
+                        "id": response_id,
+                        "object": "chat.completion.chunk",
+                        "created": created,
+                        "model": model_alias,
+                        "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+                    }
+                    yield f"data: {json.dumps(data)}\n\n"
+                    yield "data: [DONE]\n\n"
+                    break
                 
                 # Apply emote filter for voice_optimized bots
                 if emote_filter:

@@ -14,7 +14,7 @@ The fix: per-model context/token configuration, proper token budgeting, and conv
 
 ## Progress Summary
 
-*Last updated: 2026-02-09*
+*Last updated: 2026-02-12*
 
 | Sprint / Track | Status | Completion |
 |---------------|--------|------------|
@@ -22,9 +22,9 @@ The fix: per-model context/token configuration, proper token budgeting, and conv
 | **Sprint 2 Track A**: Two-layer history | ✅ Complete | 7/7 |
 | **Sprint 2 Track B**: Memory on-demand | ✅ Complete | 5/5 |
 | **Sprint 2 Track C**: Debug turn log | ✅ Complete | 6/6 |
-| **Sprint 3 Track D**: History cleanup + recall | 🔶 In Progress | 5/6 (recall tool wired, prompt guidance remaining) |
+| **Sprint 3 Track D**: History cleanup + recall | 🔶 In Progress | 5/6 (prompt guidance for summaries remaining) |
 | **Sprint 3 Track E**: Unified memory output | ✅ Complete | 3/3 |
-| **Sprint 3 Track F**: Proactive summarization | ⬜ Not Started | 0/7 |
+| **Sprint 3 Track F**: Proactive summarization | ✅ Complete | 7/7 |
 
 ---
 
@@ -577,13 +577,13 @@ These features depend on Sprint 2 tracks being merged.
 **Depends on:** Track D (recall tool + `recalled_history` flag must exist)
 
 **Deliverables:**
-- [ ] Add `HISTORY_SUMMARIZATION` to `JobType` enum in `scheduler.py`
-- [ ] Add corresponding `TaskType` and factory in `tasks.py`
-- [ ] Non-destructive summarization: summary rows coexist with originals
-- [ ] Size-based session prioritization (summarize biggest token savings first)
-- [ ] Modify existing `HistorySummarizer` to stop deleting/moving originals
-- [ ] Seed default summarization job in `init_default_jobs()`
-- [ ] Skip `recalled_history` messages in summarization passes
+- [x] Add `HISTORY_SUMMARIZATION` to `JobType` enum in `scheduler.py` — `scheduler.py:31`
+- [x] Add corresponding `TaskType` and factory in `tasks.py` — `TaskType` at `tasks.py:21`, `create_history_summarization_task()` at `tasks.py:243-262`
+- [x] Non-destructive summarization: summary rows coexist with originals — `summarization.py:563-586`, originals marked `summarized=TRUE`
+- [x] Size-based session prioritization (summarize biggest token savings first) — `summarization.py:170-186`, `prioritize_summarizable_sessions()`
+- [x] Modify existing `HistorySummarizer` to stop deleting/moving originals — `summarization.py:508-599`, no delete/move
+- [x] Seed default summarization job in `init_default_jobs()` — `scheduler.py:320-342`, default 30min interval
+- [x] Skip `recalled_history` messages in summarization passes — `summarization.py:488-506`, filtered in `preview_summarizable_sessions()`
 
 #### Integration gate (Sprint 3)
 - D, E, F each open PRs as they complete
@@ -606,10 +606,10 @@ Sprint 2 (parallel):
                                               ↓ all Sprint 2 tracks done
 
 Sprint 3 (dependent):
-  [==== Track D: Cleanup + recall ====]          ← in progress (5/6 — prompt guidance remaining)
+  [==== Track D: Cleanup + recall ====]          🔶 5/6 (prompt guidance remaining)
   [== Track E: Memory output ==]                 ✅ COMPLETE
-            [==== Track F: Summarization scheduler ====]  ← not started (blocked on D)
-                                              ↓ final integration review
+            [==== Track F: Summarization scheduler ====]  ✅ COMPLETE
+                                              ↓ final integration review (D6 remaining)
 ```
 
 ### Risk Areas & Review Focus

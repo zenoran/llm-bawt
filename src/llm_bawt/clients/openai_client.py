@@ -213,6 +213,23 @@ class OpenAIClient(LLMClient):
                 body,
             )
 
+    def _is_stream_disconnect_error(self, err: Exception) -> bool:
+        """Detect transport-level stream disconnects from OpenAI-compatible backends."""
+        seen: set[int] = set()
+        current: Exception | None = err
+        while current is not None and id(current) not in seen:
+            seen.add(id(current))
+            msg = str(current).lower()
+            if (
+                "incomplete chunked read" in msg
+                or "peer closed connection without sending complete message body" in msg
+                or current.__class__.__name__ == "RemoteProtocolError"
+            ):
+                return True
+            next_exc = getattr(current, "__cause__", None) or getattr(current, "__context__", None)
+            current = next_exc if isinstance(next_exc, Exception) else None
+        return False
+
     def stream_raw(self, messages: List[Message], stop: list[str] | str | None = None, **kwargs) -> Iterator[str]:
         """Stream raw text chunks from OpenAI API without console formatting."""
         api_messages = self._prepare_api_messages(messages)
@@ -278,6 +295,7 @@ class OpenAIClient(LLMClient):
             payload["temperature"] = self.config.TEMPERATURE
             payload["top_p"] = self.config.TOP_P
 
+        yielded_any_content = False
         try:
             stream = self._chat_create_with_fallback(payload)
 
@@ -293,6 +311,7 @@ class OpenAIClient(LLMClient):
                 # Handle content
                 if delta.content:
                     content_buffer += delta.content
+                    yielded_any_content = True
                     yield delta.content
 
                 # Handle tool calls (accumulated across chunks)
@@ -319,6 +338,31 @@ class OpenAIClient(LLMClient):
                 yield {"tool_calls": sorted_calls, "content": content_buffer}
 
         except Exception as e:
+            if self._is_stream_disconnect_error(e):
+                logger.warning("Streaming with tools disconnected for model '%s': %s", self.model, e)
+                # If nothing was emitted yet, fall back to non-streaming once.
+                if not yielded_any_content:
+                    try:
+                        result, _ = self.query_with_tools(
+                            messages=messages,
+                            tools_schema=tools_schema,
+                            tool_choice=tool_choice,
+                            stop=stop,
+                        )
+                        content = result.get("content", "")
+                        if content:
+                            yield content
+                        tool_calls = result.get("tool_calls") or []
+                        if tool_calls:
+                            yield {"tool_calls": tool_calls, "content": content}
+                        return
+                    except Exception as fallback_err:
+                        logger.error(
+                            "Non-streaming fallback after stream disconnect failed for model '%s': %s",
+                            self.model,
+                            fallback_err,
+                        )
+                return
             logger.error(f"Error during OpenAI streaming with tools: {e}")
             raise
 
@@ -467,6 +511,9 @@ class OpenAIClient(LLMClient):
             logger.error(f"\nError during OpenAI stream processing: {e}")
             yield f"\nERROR: OpenAI API Error - {e}"
         except Exception as e:
+            if self._is_stream_disconnect_error(e):
+                logger.warning("Streaming disconnected for model '%s': %s", self.model, e)
+                return
             logger.error(f"\nUnexpected error during OpenAI stream iteration: {e}")
             yield f"\nERROR: Unexpected error - {e}"
 

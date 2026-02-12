@@ -9,7 +9,7 @@ from typing import Optional
 from uuid import uuid4
 
 from sqlmodel import Field, SQLModel, Session, select
-from sqlalchemy import Column, DateTime, Text
+from sqlalchemy import Column, DateTime, Text, text
 
 logger = logging.getLogger(__name__)
 
@@ -64,6 +64,40 @@ class JobRun(SQLModel, table=True):
 def create_scheduler_tables(engine) -> None:
     """Create scheduler tables if they don't exist."""
     SQLModel.metadata.create_all(engine, tables=[ScheduledJob.__table__, JobRun.__table__])
+    _migrate_postgres_jobtype_enum(engine)
+
+
+def _migrate_postgres_jobtype_enum(engine) -> None:
+    """Ensure Postgres jobtype enum includes all currently supported labels."""
+    if engine.dialect.name != "postgresql":
+        return
+
+    with engine.begin() as conn:
+        type_exists = conn.execute(
+            text("SELECT 1 FROM pg_type WHERE typname = 'jobtype'")
+        ).scalar()
+        if not type_exists:
+            return
+
+        labels = {
+            row[0]
+            for row in conn.execute(
+                text(
+                    """
+                    SELECT e.enumlabel
+                    FROM pg_enum e
+                    JOIN pg_type t ON t.oid = e.enumtypid
+                    WHERE t.typname = 'jobtype'
+                    """
+                )
+            )
+        }
+
+        needed_label = JobType.HISTORY_SUMMARIZATION.name
+        if needed_label not in labels:
+            safe_label = needed_label.replace("'", "''")
+            conn.execute(text(f"ALTER TYPE jobtype ADD VALUE IF NOT EXISTS '{safe_label}'"))
+            logger.info("Added missing enum value to jobtype: %s", needed_label)
 
 
 class JobScheduler:
