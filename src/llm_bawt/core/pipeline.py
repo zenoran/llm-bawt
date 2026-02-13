@@ -110,6 +110,7 @@ class RequestPipeline:
         memory_client: Any = None,
         profile_manager: Any = None,
         search_client: Any = None,
+        home_client: Any = None,
         model_lifecycle: Any = None,
         history_manager: Any = None,
         llm_client: Any = None,
@@ -137,6 +138,7 @@ class RequestPipeline:
         self.memory_client = memory_client
         self.profile_manager = profile_manager
         self.search_client = search_client
+        self.home_client = home_client
         self.model_lifecycle = model_lifecycle
         self.history_manager = history_manager
         self.llm_client = llm_client
@@ -247,7 +249,7 @@ class RequestPipeline:
         else:
             ctx.use_tools = (
                 getattr(self.bot, "uses_tools", False)
-                and self.memory_client is not None
+                and (self.memory_client is not None or self.home_client is not None)
             )
         
         if "use_search" in self._decision_overrides:
@@ -316,8 +318,12 @@ class RequestPipeline:
             include_models = self.model_lifecycle is not None
             tool_definitions = get_tools_list(
                 include_search_tools=ctx.use_search,
+                include_home_tools=self.home_client is not None,
                 include_model_tools=include_models,
             )
+            if self.memory_client is None:
+                disallowed = {"memory", "history", "profile", "self"}
+                tool_definitions = [t for t in tool_definitions if t.name not in disallowed]
             tool_format = self.config.get_tool_format(
                 model_alias=getattr(self.llm_client, "model_alias", None)
             )
@@ -500,7 +506,7 @@ class RequestPipeline:
             ctx.response = ""
             return
         
-        if ctx.use_tools and self.memory_client:
+        if ctx.use_tools and (self.memory_client or self.home_client):
             # Use tool loop
             from ..tools import query_with_tools
             response, tool_context, tool_call_details = query_with_tools(
@@ -509,6 +515,7 @@ class RequestPipeline:
                 memory_client=self.memory_client,
                 profile_manager=self.profile_manager,
                 search_client=self.search_client,
+                home_client=self.home_client,
                 model_lifecycle=self.model_lifecycle,
                 config=self.config,
                 user_id=ctx.user_id,
@@ -543,11 +550,11 @@ class RequestPipeline:
         """Stage 7: Post-processing (history save, memory extraction)."""
         if not ctx.response:
             return
-        
+
         # Save to history
         if self.history_manager:
             self.history_manager.add_message("assistant", ctx.response)
-            
+
             # Save tool context if present (with timestamp for freshness)
             if ctx.tool_context:
                 from datetime import datetime
@@ -555,26 +562,26 @@ class RequestPipeline:
                 self.history_manager.add_message(
                     "system", f"[Tool Results @ {ts}]\n{ctx.tool_context}"
                 )
-        
+
         # Trigger memory extraction for all memory-enabled bots
         if ctx.use_memory and self.memory_client:
             self._trigger_memory_extraction(ctx)
-        
+
         ctx.record_output(PipelineStage.POST_PROCESS, {
             "saved_to_history": self.history_manager is not None,
             "extraction_triggered": ctx.use_memory and self.memory_client is not None,
         })
-    
+
     def _trigger_memory_extraction(self, ctx: PipelineContext):
         """Trigger background memory extraction."""
         import threading
         import uuid
-        
+
         def extract():
             try:
                 from ..service import ServiceClient
                 from ..service.tasks import create_extraction_task
-                
+
                 client = ServiceClient()
                 if client.is_available():
                     task = create_extraction_task(
@@ -588,7 +595,7 @@ class RequestPipeline:
                     client.submit_task(task)
             except Exception as e:
                 logger.debug(f"Memory extraction failed: {e}")
-        
+
         thread = threading.Thread(target=extract, daemon=True)
         thread.start()
         thread.join(timeout=0.5)

@@ -3,24 +3,28 @@
 Executes tool calls by routing them to the appropriate backend
 (MCP memory server, profiles, web search, model management, etc.) and returning formatted results.
 
-Consolidated tools (7 total):
+Consolidated tools (8 total):
 - memory: action-based (search/store/delete)
 - history: action-based (search/recent/forget) with date filtering
 - profile: action-based (get/set/delete)
 - self: action-based (get/set/delete) for bot personality development
 - search: type-based (web/news)
+- home: action-based (status/query/get/set/scene) for Home Assistant
 - model: action-based (list/current/switch)
 - time: current time
 """
 
 import logging
+import re
+from difflib import SequenceMatcher
 from datetime import datetime, timedelta
-from typing import Any, Callable, TYPE_CHECKING
+from typing import Callable, TYPE_CHECKING
 
 from .parser import ToolCall, format_tool_result
 from .definitions import normalize_legacy_tool_call
 
 if TYPE_CHECKING:
+    from ..integrations.ha_mcp.client import HomeAssistantMCPClient
     from ..memory_server.client import MemoryClient
     from ..profiles import ProfileManager
     from ..search.base import SearchClient
@@ -125,6 +129,7 @@ class ToolExecutor:
         memory_client: "MemoryClient | None" = None,
         profile_manager: "ProfileManager | None" = None,
         search_client: "SearchClient | None" = None,
+        home_client: "HomeAssistantMCPClient | None" = None,
         model_lifecycle: "ModelLifecycleManager | None" = None,
         config: "Config | None" = None,
         user_id: str = "",  # Required - must be passed explicitly
@@ -147,6 +152,7 @@ class ToolExecutor:
         self.memory_client = memory_client
         self.profile_manager = profile_manager
         self.search_client = search_client
+        self.home_client = home_client
         self.model_lifecycle = model_lifecycle
         self.config = config
         self.user_id = user_id
@@ -166,6 +172,7 @@ class ToolExecutor:
             "self": self._execute_self,
             "bot_trait": self._execute_self,  # Legacy name
             "search": self._execute_search,
+            "home": self._execute_home,
             "model": self._execute_model,
             "time": self._execute_time,
 
@@ -1128,6 +1135,328 @@ class ToolExecutor:
             self.search_client = get_search_client(self.config)
         except Exception as e:
             logger.warning(f"Failed to initialize search client: {e}")
+
+    def _execute_home(self, tool_call: ToolCall) -> str:
+        """Execute Home Assistant tool."""
+        if not self.home_client:
+            self._ensure_home_client()
+        if not self.home_client:
+            return format_tool_result(
+                tool_call.name,
+                None,
+                error="Home Assistant integration not available",
+            )
+
+        action = str(tool_call.arguments.get("action", "")).strip().lower()
+        if not action:
+            return format_tool_result(
+                tool_call.name,
+                None,
+                error="Missing required parameter: action",
+            )
+
+        try:
+            if action == "status":
+                text = self.home_client.status()
+                return format_tool_result(tool_call.name, self._compact_home_text(text, max_lines=6))
+
+            if action == "query":
+                pattern = tool_call.arguments.get("pattern")
+                domain = tool_call.arguments.get("domain")
+                text = self.home_client.query(pattern=pattern, domain=domain)
+                return format_tool_result(tool_call.name, self._compact_home_text(text, max_lines=10))
+
+            if action == "get":
+                entity = str(tool_call.arguments.get("entity", "")).strip()
+                if not entity:
+                    return format_tool_result(
+                        tool_call.name,
+                        None,
+                        error="action='get' requires 'entity'",
+                    )
+                text = self.home_client.get(entity=entity)
+                attempted_resolution = False
+                if self._home_needs_resolution(text):
+                    resolved = self._home_resolve_entity(entity)
+                    if resolved:
+                        attempted_resolution = True
+                        text = self.home_client.get(entity=resolved)
+
+                if self._home_needs_resolution(text):
+                    suggestions = self._home_suggest_entities(entity)
+                    hint = ""
+                    if suggestions:
+                        hint = f" Try one of: {', '.join(suggestions)}"
+                    retry_note = " after auto-resolution" if attempted_resolution else ""
+                    return format_tool_result(
+                        tool_call.name,
+                        None,
+                        error=(
+                            f"Entity '{entity}' not found{retry_note}. "
+                            f"Call home with action='query' first to find the exact entity ID.{hint}"
+                        ),
+                    )
+                return format_tool_result(tool_call.name, self._compact_home_text(text, max_lines=8))
+
+            if action == "set":
+                entity = str(tool_call.arguments.get("entity", "")).strip()
+                state = str(tool_call.arguments.get("state", "")).strip().lower()
+                if not entity or not state:
+                    return format_tool_result(
+                        tool_call.name,
+                        None,
+                        error="action='set' requires 'entity' and 'state'",
+                    )
+                if state not in {"on", "off", "toggle"}:
+                    return format_tool_result(
+                        tool_call.name,
+                        None,
+                        error="state must be one of: on, off, toggle",
+                    )
+
+                brightness_raw = tool_call.arguments.get("brightness")
+                brightness: int | None = None
+                if brightness_raw is not None:
+                    brightness = max(0, min(100, int(brightness_raw)))
+
+                text = self.home_client.set(entity=entity, state=state, brightness=brightness)
+                attempted_resolution = False
+                if self._home_needs_resolution(text):
+                    resolved = self._home_resolve_entity(entity)
+                    if resolved:
+                        attempted_resolution = True
+                        text = self.home_client.set(entity=resolved, state=state, brightness=brightness)
+
+                if self._home_needs_resolution(text):
+                    suggestions = self._home_suggest_entities(entity)
+                    hint = ""
+                    if suggestions:
+                        hint = f" Try one of: {', '.join(suggestions)}"
+                    retry_note = " after auto-resolution" if attempted_resolution else ""
+                    return format_tool_result(
+                        tool_call.name,
+                        None,
+                        error=(
+                            f"Entity '{entity}' not found{retry_note}. "
+                            f"Call home with action='query' first to find the exact entity ID.{hint}"
+                        ),
+                    )
+                return format_tool_result(tool_call.name, self._compact_home_text(text, max_lines=5))
+
+            if action == "scene":
+                scene_name = str(
+                    tool_call.arguments.get("scene_name")
+                    or tool_call.arguments.get("name")
+                    or ""
+                ).strip()
+                if not scene_name:
+                    return format_tool_result(
+                        tool_call.name,
+                        None,
+                        error="action='scene' requires 'scene_name'",
+                    )
+                text = self.home_client.scene(name=scene_name)
+                return format_tool_result(tool_call.name, self._compact_home_text(text, max_lines=5))
+
+            return format_tool_result(
+                tool_call.name,
+                None,
+                error="Invalid action. Use: status, query, get, set, or scene.",
+            )
+
+        except Exception as e:
+            logger.error(f"Home tool failed: {e}")
+            return format_tool_result(tool_call.name, None, error=str(e))
+
+    def _ensure_home_client(self) -> None:
+        """Lazy-init Home Assistant MCP client if enabled in config."""
+        if self.home_client or not self.config:
+            return
+        if not getattr(self.config, "HA_MCP_ENABLED", False):
+            return
+        try:
+            from ..integrations.ha_mcp.client import HomeAssistantMCPClient
+
+            client = HomeAssistantMCPClient(self.config)
+            if client.available:
+                self.home_client = client
+        except Exception as e:
+            logger.warning(f"Failed to initialize Home Assistant MCP client: {e}")
+
+    @staticmethod
+    def _home_needs_resolution(text: str) -> bool:
+        lower = (text or "").lower()
+        return "not found" in lower or "multiple matches" in lower
+
+    def _home_resolve_entity(self, entity: str) -> str | None:
+        """Resolve guessed entity names to real HA entity IDs via query()."""
+        if not self.home_client:
+            return None
+
+        domain = None
+        raw = entity.strip()
+        if "." in raw:
+            domain = raw.split(".", 1)[0].strip().lower()
+
+        # Build candidate search phrases from guessed IDs/names.
+        tail = raw.split(".", 1)[1] if "." in raw else raw
+        normalized = tail.replace("_", " ").replace(".", " ").strip()
+        compact = normalized.replace(" ", "")
+        no_numbers = re.sub(r"\b\d+\b", " ", normalized).strip()
+        no_words = re.sub(r"\b(light|lights|lamp|lamps|switch|switches)\b", " ", no_numbers, flags=re.IGNORECASE)
+        room_hint = " ".join([t for t in re.split(r"\s+", no_words.strip()) if len(t) >= 3])
+        candidates = [
+            raw,
+            tail,
+            normalized,
+            compact,
+            normalized.replace("sun room", "sunroom"),
+            no_numbers,
+            room_hint,
+        ]
+        # de-dup while preserving order
+        deduped: list[str] = []
+        for c in candidates:
+            c = c.strip()
+            if c and c not in deduped:
+                deduped.append(c)
+
+        found_ids: list[str] = []
+        for candidate in deduped[:4]:
+            try:
+                result = self.home_client.query(pattern=candidate, domain=domain)
+            except Exception:
+                continue
+            ids = self._home_extract_entity_ids(result)
+            for eid in ids:
+                if eid not in found_ids:
+                    found_ids.append(eid)
+            if found_ids:
+                break
+
+        if not found_ids:
+            return None
+
+        wanted_tokens = self._home_normalized_tokens(tail)
+
+        # Rank by similarity to requested name, prefer exact domain and token overlap.
+        def score_and_overlap(eid: str) -> tuple[float, bool]:
+            eid_tail = eid.split(".", 1)[-1].lower()
+            base = SequenceMatcher(None, tail.lower(), eid_tail).ratio()
+            if domain and eid.startswith(f"{domain}."):
+                base += 0.2
+            if "all_" in eid and "light" in eid:
+                base += 0.05
+            overlap = self._home_has_token_overlap(wanted_tokens, self._home_normalized_tokens(eid_tail))
+            if overlap:
+                base += 0.3
+            return base, overlap
+
+        ranked = sorted(found_ids, key=lambda eid: score_and_overlap(eid)[0], reverse=True)
+        best = ranked[0]
+        best_score, has_overlap = score_and_overlap(best)
+        if not has_overlap or best_score < 0.55:
+            return None
+        return best
+
+    def _home_suggest_entities(self, entity: str, max_items: int = 3) -> list[str]:
+        """Return likely entity IDs for user-facing recovery hints."""
+        if not self.home_client:
+            return []
+
+        domain = None
+        raw = entity.strip()
+        if "." in raw:
+            domain = raw.split(".", 1)[0].strip().lower()
+
+        tail = raw.split(".", 1)[1] if "." in raw else raw
+        simplified = re.sub(r"\b\d+\b", " ", tail.replace("_", " ")).strip()
+        tokens = [t for t in re.split(r"\s+", simplified) if len(t) >= 3]
+        if not tokens:
+            tokens = [tail.replace("_", " ").strip()]
+
+        phrase = " ".join(tokens[:2]).strip()
+        if not phrase:
+            phrase = tail.replace("_", " ").strip()
+
+        try:
+            result = self.home_client.query(pattern=phrase, domain=domain)
+        except Exception:
+            return []
+
+        ids = self._home_extract_entity_ids(result)
+        if not ids:
+            return []
+
+        def score(eid: str) -> float:
+            return SequenceMatcher(None, tail.lower(), eid.split(".", 1)[-1].lower()).ratio()
+
+        ranked = sorted(ids, key=score, reverse=True)
+        return ranked[:max_items]
+
+    @staticmethod
+    def _home_normalized_tokens(value: str) -> list[str]:
+        """Extract meaningful normalized tokens from an entity-ish string."""
+        cleaned = value.lower().replace(".", " ").replace("_", " ")
+        cleaned = re.sub(r"\b(light|lights|lamp|lamps|switch|switches|entity|device)\b", " ", cleaned)
+        cleaned = re.sub(r"\b\d+\b", " ", cleaned)
+        parts = [p for p in re.split(r"\s+", cleaned) if len(p) >= 3]
+        normalized: list[str] = []
+        for token in parts:
+            compact = token.strip()
+            if compact and compact not in normalized:
+                normalized.append(compact)
+        joined = "".join(parts)
+        if len(joined) >= 5 and joined not in normalized:
+            normalized.append(joined)
+        return normalized
+
+    @staticmethod
+    def _home_has_token_overlap(wanted: list[str], candidate: list[str]) -> bool:
+        """True when any meaningful token overlaps between requested and candidate IDs."""
+        if not wanted or not candidate:
+            return False
+        for w in wanted:
+            for c in candidate:
+                if w == c or w in c or c in w:
+                    return True
+        return False
+
+    @staticmethod
+    def _home_extract_entity_ids(query_text: str) -> list[str]:
+        """Extract entity IDs from HA query output lines."""
+        if not query_text:
+            return []
+
+        ids: list[str] = []
+        # Matches both "(light.foo_bar)" and bare "light.foo_bar"
+        pattern = re.compile(r"\b([a-z_]+\.[a-z0-9_]+)\b")
+        for match in pattern.findall(query_text):
+            if match not in ids:
+                ids.append(match)
+        return ids
+
+    @staticmethod
+    def _compact_home_text(text: str, max_lines: int = 8, max_chars_per_line: int = 180) -> str:
+        """Trim Home Assistant MCP output to avoid prompt bloat."""
+        if not text:
+            return ""
+
+        lines: list[str] = []
+        for raw in text.splitlines():
+            line = raw.strip()
+            if not line:
+                continue
+            if len(line) > max_chars_per_line:
+                line = line[: max_chars_per_line - 3] + "..."
+            lines.append(line)
+
+        if len(lines) > max_lines:
+            remaining = len(lines) - max_lines
+            lines = lines[:max_lines]
+            lines.append(f"... (+{remaining} more lines)")
+
+        return "\n".join(lines)
 
     def _execute_model(self, tool_call: ToolCall) -> str:
         """Execute model tool - list, current, or switch models."""

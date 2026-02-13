@@ -18,7 +18,6 @@ from ..core.base import BaseLLMBawt
 from ..utils.config import Config, is_llama_cpp_available
 from ..utils.history import Message
 from ..tools import query_with_tools
-from ..bots import get_system_prompt
 from .logging import get_service_logger
 
 if TYPE_CHECKING:
@@ -156,7 +155,7 @@ class ServiceLLMBawt(BaseLLMBawt):
                     model_definition=self.model_definition,
                 )
                 load_time_ms = (time.perf_counter() - start_time) * 1000
-                slog.model_loaded(self.resolved_model_alias, f"gguf-vllm", load_time_ms)
+                slog.model_loaded(self.resolved_model_alias, "gguf-vllm", load_time_ms)
                 return client
             
             # Get optional chat_format from model definition (for models like MythoMax)
@@ -240,15 +239,23 @@ class ServiceLLMBawt(BaseLLMBawt):
             tool_context is empty if no tools used.
             tool_call_details is a list of per-call dicts for debug logging.
         """
-        # Use tool loop if bot has tools enabled
-        if self.bot.uses_tools and self.memory:
+        # Use tool loop if bot has tools enabled and at least one tool backend is available
+        if self.bot.uses_tools and (self.memory or self.home_client):
             tool_definitions = self._get_tool_definitions()
+            if not tool_definitions:
+                response = self.client.query(
+                    messages,
+                    plaintext_output=plaintext_output,
+                    stream=stream,
+                )
+                return response, "", []
             return query_with_tools(
                 messages=messages,
                 client=self.client,
                 memory_client=self.memory,
                 profile_manager=self.profile_manager,
                 search_client=self.search_client,
+                home_client=self.home_client,
                 model_lifecycle=self.model_lifecycle,
                 config=self.config,
                 user_id=self.user_id,

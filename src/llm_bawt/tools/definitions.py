@@ -3,12 +3,13 @@
 Defines the available tools that bots can use, with their descriptions
 and parameters in a format suitable for prompt injection.
 
-Consolidated tools (7 total):
+Consolidated tools (8 total):
 - memory: Search/store/delete facts (action-based)
 - history: Search/retrieve/forget messages (action-based, with date filtering)
 - profile: Get/set/delete user attributes (action-based)
 - self: Bot personality reflection and development (action-based)
 - search: Web/news search (type-based)
+- home: Home Assistant control/status (action-based)
 - model: List/current/switch models (action-based)
 - time: Get current time
 """
@@ -282,6 +283,55 @@ SEARCH_TOOL = Tool(
     ]
 )
 
+# Home Assistant tool
+HOME_TOOL = Tool(
+    name="home",
+    description="Control Home Assistant devices and scenes. Use action='status', 'query', 'get', 'set', or 'scene'.",
+    parameters=[
+        ToolParameter(
+            name="action",
+            type="string",
+            description="'status', 'query', 'get', 'set', or 'scene'",
+        ),
+        ToolParameter(
+            name="pattern",
+            type="string",
+            description="Entity search term for action='query', like 'bedroom' or 'garage'",
+            required=False,
+        ),
+        ToolParameter(
+            name="domain",
+            type="string",
+            description="Optional entity domain for action='query': light, switch, sensor, automation",
+            required=False,
+        ),
+        ToolParameter(
+            name="entity",
+            type="string",
+            description="Entity name/ID for action='get' and action='set'",
+            required=False,
+        ),
+        ToolParameter(
+            name="state",
+            type="string",
+            description="Required for action='set': on, off, or toggle",
+            required=False,
+        ),
+        ToolParameter(
+            name="brightness",
+            type="integer",
+            description="Optional brightness 0-100 for action='set' (lights only)",
+            required=False,
+        ),
+        ToolParameter(
+            name="scene_name",
+            type="string",
+            description="Scene name for action='scene', like 'chill' or 'theater'",
+            required=False,
+        ),
+    ],
+)
+
 # Model tool - combines list_models, get_current_model, switch_model
 MODEL_TOOL = Tool(
     name="model",
@@ -319,10 +369,11 @@ CORE_TOOLS = [MEMORY_TOOL, HISTORY_TOOL, PROFILE_TOOL, SELF_TOOL, TIME_TOOL]
 
 # Optional tool categories
 SEARCH_TOOLS = [SEARCH_TOOL]
+HOME_TOOLS = [HOME_TOOL]
 MODEL_TOOLS = [MODEL_TOOL]
 
 # All tools combined
-ALL_TOOLS = CORE_TOOLS + SEARCH_TOOLS + MODEL_TOOLS
+ALL_TOOLS = CORE_TOOLS + SEARCH_TOOLS + HOME_TOOLS + MODEL_TOOLS
 
 
 # =============================================================================
@@ -426,6 +477,12 @@ MODEL_GUIDANCE = '''
 - **model**: For listing or switching AI models
 '''
 
+HOME_GUIDANCE = '''
+- **home**: For home status, smart-device lookup, and device/scene control
+- Home control workflow: if user gives a natural name (e.g., "sunroom lights"), call `home` with `action='query'` first, then use the exact entity ID from query in `action='set'` or `action='get'`
+- Never guess entity IDs. If `set/get` reports not found, run `query` and retry with returned IDs.
+'''
+
 
 # =============================================================================
 # Tool Selection Functions
@@ -435,6 +492,7 @@ def get_tools_list(
     tools: list[Tool] | None = None,
     include_profile_tools: bool = True,  # Kept for API compatibility (always included in CORE)
     include_search_tools: bool = False,
+    include_home_tools: bool = False,
     include_model_tools: bool = False,
 ) -> list[Tool]:
     """Return the tool list based on selection flags."""
@@ -444,6 +502,8 @@ def get_tools_list(
     resolved = CORE_TOOLS.copy()
     if include_search_tools:
         resolved.extend(SEARCH_TOOLS)
+    if include_home_tools:
+        resolved.extend(HOME_TOOLS)
     if include_model_tools:
         resolved.extend(MODEL_TOOLS)
     return resolved
@@ -453,6 +513,7 @@ def get_tools_prompt(
     tools: list[Tool] | None = None,
     include_profile_tools: bool = True,
     include_search_tools: bool = False,
+    include_home_tools: bool = False,
     include_model_tools: bool = False,
     tool_format: ToolFormat | str = ToolFormat.XML,
 ) -> str:
@@ -462,6 +523,7 @@ def get_tools_prompt(
         tools: List of tools to include. If None, auto-selects based on flags.
         include_profile_tools: Kept for API compatibility (profile always included).
         include_search_tools: Whether to include web search tools (default False).
+        include_home_tools: Whether to include Home Assistant tools (default False).
         include_model_tools: Whether to include model management tools (default False).
         tool_format: Tool format to use for prompt instructions.
 
@@ -472,6 +534,7 @@ def get_tools_prompt(
         tools=tools,
         include_profile_tools=include_profile_tools,
         include_search_tools=include_search_tools,
+        include_home_tools=include_home_tools,
         include_model_tools=include_model_tools,
     )
 
@@ -489,6 +552,9 @@ def get_tools_prompt(
         # Add model guidance if model tools are included
         if include_model_tools or any(t.name == "model" for t in tools):
             search_guidance += MODEL_GUIDANCE
+
+        if include_home_tools or any(t.name == "home" for t in tools):
+            search_guidance += HOME_GUIDANCE
 
         return get_tool_calling_instructions(
             tools_list=tools_list,

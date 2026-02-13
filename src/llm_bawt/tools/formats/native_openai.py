@@ -49,6 +49,14 @@ class NativeOpenAIFormatHandler(ToolFormatHandler):
             if name:
                 tool_names.append(name)
         tools_list = ", ".join(tool_names) if tool_names else "(none)"
+        home_guidance = ""
+        if "home" in tool_names:
+            home_guidance = (
+                "Home tool guidance:\n"
+                "- For natural names like 'sunroom lights', call home(action='query', pattern='sunroom', domain='light') first.\n"
+                "- Use exact entity IDs returned by query in subsequent home(action='get'/'set') calls.\n"
+                "- If a set/get call reports not found, run query and retry with the suggested exact ID.\n"
+            )
         return (
             "## Tools\n\n"
             "You have access to tools. Use them when needed to answer the user.\n"
@@ -57,6 +65,7 @@ class NativeOpenAIFormatHandler(ToolFormatHandler):
             "1. Call a tool when you need missing or precise information.\n"
             "2. Do not invent tool results.\n"
             "3. If no tool is needed, respond normally.\n"
+            f"{home_guidance}"
         )
 
     def get_stop_sequences(self) -> list[str]:

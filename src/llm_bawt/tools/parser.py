@@ -65,7 +65,7 @@ class ToolCall:
 # Includes both new consolidated tools and legacy names for backward compatibility
 KNOWN_TOOLS = {
     # New consolidated tools (7 total)
-    "memory", "history", "profile", "bot_trait", "search", "model", "time",
+    "memory", "history", "profile", "bot_trait", "search", "home", "model", "time",
     # Legacy tool names (for backward compatibility)
     "search_memories", "store_memory", "delete_memory",
     "search_history", "get_recent_history", "forget_history",
@@ -107,7 +107,7 @@ ALT_PATTERNS = [
     # Inline markdown code (single backticks): `{"name": "...", "arguments": {...}}`
     re.compile(r'`(\{"name"\s*:\s*"[^"]+"\s*,\s*"arguments"\s*:\s*\{[^}]*\}\s*\})`', re.DOTALL | re.IGNORECASE),
     # Raw JSON tool call without any wrapper (last resort - only if it looks like a tool call)
-    re.compile(r'^(\{"name"\s*:\s*"(?:get_user_profile|search_memories|store_memory|delete_memory|search_history|forget_history|set_user_attribute|delete_user_attribute|web_search|news_search|list_models|get_current_model|switch_model|get_current_time)"\s*,\s*"arguments"\s*:\s*\{[^}]*\}\s*\})$', re.DOTALL | re.MULTILINE),
+    re.compile(r'^(\{"name"\s*:\s*"(?:get_user_profile|search_memories|store_memory|delete_memory|search_history|forget_history|set_user_attribute|delete_user_attribute|web_search|news_search|home|list_models|get_current_model|switch_model|get_current_time)"\s*,\s*"arguments"\s*:\s*\{[^}]*\}\s*\})$', re.DOTALL | re.MULTILINE),
 ]
 
 

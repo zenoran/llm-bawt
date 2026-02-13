@@ -245,6 +245,68 @@ def get_memory_update_prompt(existing_memories: str, new_facts: str) -> str:
     )
 
 
+# Summary-based extraction prompt — used when extracting facts from conversation
+# summaries produced by the scheduler (not raw message pairs).
+SUMMARY_EXTRACTION_PROMPT_TEMPLATE = """You are a Personal Information Organizer. Your task is to extract ONLY persistent, meaningful facts about the USER from a conversation summary.
+
+## CRITICAL RULES:
+
+1. Summaries are written in third person. Statements like "User discussed their job as a software engineer" mean the user IS a software engineer. Extract accordingly.
+2. **Most summaries have ZERO facts worth storing.** Return empty list when the summary only contains:
+   - General discussion topics with no personal details
+   - Technical troubleshooting or code review
+   - Casual conversation without identity-defining information
+3. **Only extract PERSISTENT information** — things that define who the user IS, not what they did in one conversation.
+4. Do NOT extract: conversation topics, assistant actions, temporary states, project-specific details.
+
+## What TO extract:
+- Personal details: name, age, location, occupation
+- Family/relationships: spouse, children, pets (names, details)
+- Preferences: likes, dislikes, persistent habits
+- Professional: job, skills, employer
+- Health: chronic conditions, allergies
+- Significant life events or plans
+
+## What NOT to extract:
+- What was discussed or debugged
+- Decisions made during the conversation
+- Temporary moods or states
+- Project-specific technical details
+
+## Output Format:
+
+Return JSON with a "facts" array. Each fact needs:
+- content: The fact in third person ("User...")
+- tags: From """ + str(MEMORY_TAGS) + """
+- importance: 0.0-1.0 (0.7+ for genuinely important persistent info)
+
+**OPTIONAL - ONLY for core identity traits:**
+- profile_attribute: {{"category": "fact|preference|interest", "key": "short_identifier"}}
+
+Profile attributes are ONLY for core identity: name, age, occupation, location, family/pets, chronic health, core preferences.
+NEVER use profile_attribute for: projects, tools, apps, tasks, technical details.
+
+Be EXTREMELY selective. When in doubt, return empty list.
+
+## Conversation Summary:
+Session: {start_date} to {end_date}
+
+{summary_text}
+
+Output only valid JSON:"""
+
+
+def get_summary_extraction_prompt(
+    summary_text: str, start_date: str, end_date: str
+) -> str:
+    """Get the summary extraction prompt with the summary filled in."""
+    return SUMMARY_EXTRACTION_PROMPT_TEMPLATE.format(
+        summary_text=summary_text,
+        start_date=start_date,
+        end_date=end_date,
+    )
+
+
 # Legacy aliases for backwards compatibility
 FACT_EXTRACTION_PROMPT = FACT_EXTRACTION_PROMPT_TEMPLATE
 MEMORY_UPDATE_PROMPT = MEMORY_UPDATE_PROMPT_TEMPLATE
@@ -326,7 +388,7 @@ Return a JSON object with these EXACT keys:
 ## CRITICAL RULES:
 1. **ALWAYS extract the user's name** into the "name" field if it appears ANYWHERE in the data
 2. The "name" field should be JUST the name (e.g., "Nick"), not a sentence
-3. Write other fields in third person prose ("They prefer...", "They enjoy...")
+3. Use the user's name or "he"/"she" based on available context — NEVER use "they/them" as a default
 4. Be concise - 1-3 sentences per field max
 5. Merge duplicates, resolve contradictions (prefer recent/specific info)
 6. Omit fields with no data (use null or empty string)
@@ -337,8 +399,8 @@ Return a JSON object with these EXACT keys:
 {{
   "name": "Nick",
   "identity": "Software developer in Ohio. Single, has a dog.",
-  "preferences": "Prefers direct, honest conversation. Values privacy and dislikes cold weather.",
-  "interests": "Literature, poetry, piano, Souls-like games, and Hytale.",
-  "context": "Working on an LLM chatbot with Nextcloud integration."
+  "preferences": "He prefers direct, honest conversation. Values privacy and dislikes cold weather.",
+  "interests": "He enjoys literature, poetry, piano, Souls-like games, and Hytale.",
+  "context": "Currently working on an LLM chatbot with Nextcloud integration."
 }}
 ```'''

@@ -121,6 +121,22 @@ class Config(BaseSettings):
         default=None,
         description="Optional MCP memory server base URL (Set via LLM_BAWT_MEMORY_SERVER_URL)",
     )
+    HA_MCP_ENABLED: bool = Field(
+        default=False,
+        description="Enable Home Assistant MCP integration (Set via LLM_BAWT_HA_MCP_ENABLED)",
+    )
+    HA_MCP_URL: str = Field(
+        default="http://localhost:3000",
+        description="Home Assistant MCP base URL (Set via LLM_BAWT_HA_MCP_URL)",
+    )
+    HA_MCP_TIMEOUT: int = Field(
+        default=10,
+        description="Timeout in seconds for Home Assistant MCP calls (Set via LLM_BAWT_HA_MCP_TIMEOUT)",
+    )
+    HA_MCP_AUTH_TOKEN: str = Field(
+        default="",
+        description="Optional bearer token for Home Assistant MCP (Set via LLM_BAWT_HA_MCP_AUTH_TOKEN)",
+    )
 
     # --- PostgreSQL Memory Backend Settings --- #
     POSTGRES_HOST: str = Field(default="localhost", description="PostgreSQL server hostname (Set via LLM_BAWT_POSTGRES_HOST)")

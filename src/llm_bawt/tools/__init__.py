@@ -4,12 +4,13 @@ This module provides prompt-based tool calling that works with any model,
 allowing bots to autonomously search memories, store facts, manage profiles,
 search the web, and switch models.
 
-Consolidated tools (7 total):
+Consolidated tools (8 total):
 - memory: Search/store/delete facts
 - history: Search/retrieve/forget messages (with date filtering)
 - profile: Get/set/delete user attributes
 - self: Bot personality reflection and development
 - search: Web/news search
+- home: Home Assistant control/status
 - model: List/current/switch models
 - time: Get current time
 """
@@ -21,11 +22,13 @@ from .definitions import (
     PROFILE_TOOL,
     SELF_TOOL,
     SEARCH_TOOL,
+    HOME_TOOL,
     MODEL_TOOL,
     TIME_TOOL,
     # Tool categories
     CORE_TOOLS,
     SEARCH_TOOLS,
+    HOME_TOOLS,
     MODEL_TOOLS,
     ALL_TOOLS,
     # Legacy mapping
@@ -51,11 +54,13 @@ __all__ = [
     "PROFILE_TOOL",
     "SELF_TOOL",
     "SEARCH_TOOL",
+    "HOME_TOOL",
     "MODEL_TOOL",
     "TIME_TOOL",
     # Tool categories
     "CORE_TOOLS",
     "SEARCH_TOOLS",
+    "HOME_TOOLS",
     "MODEL_TOOLS",
     "ALL_TOOLS",
     # Legacy mapping

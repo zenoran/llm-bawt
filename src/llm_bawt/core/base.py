@@ -12,13 +12,11 @@ Subclasses override _initialize_client() for their specific client types.
 
 import json
 import logging
-import os
 import threading
 import uuid
 from abc import ABC, abstractmethod
 from datetime import datetime
-from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING
 
 from rich.console import Console
 
@@ -26,13 +24,13 @@ from ..bots import Bot, BotManager
 from ..clients import LLMClient
 from ..profiles import ProfileManager, EntityType
 from ..memory_server.client import MemoryClient, get_memory_client
+from ..integrations.ha_mcp.client import HomeAssistantMCPClient
 from ..search import get_search_client, SearchClient
 from ..tools import get_tools_prompt, get_tools_list, query_with_tools
 from ..utils.config import Config, has_database_credentials
 from ..utils.paths import resolve_log_dir
 from ..utils.history import HistoryManager, Message
 from ..adapters import get_adapter, ModelAdapter
-from .pipeline import RequestPipeline, PipelineContext
 from .prompt_builder import PromptBuilder, SectionPosition
 from .model_lifecycle import ModelLifecycleManager, get_model_lifecycle
 
@@ -89,6 +87,7 @@ class BaseLLMBawt(ABC):
         self.memory: MemoryClient | None = None
         self.profile_manager: ProfileManager | None = None
         self.search_client: SearchClient | None = None
+        self.home_client: HomeAssistantMCPClient | None = None
         self.model_lifecycle: ModelLifecycleManager | None = None
         self.client: LLMClient
         self.bot: Bot
@@ -136,6 +135,9 @@ class BaseLLMBawt(ABC):
         
         # Initialize search client
         self._init_search(config)
+
+        # Initialize Home Assistant client
+        self._init_home_assistant(config)
         
         # Build system prompt
         self._init_system_prompt()
@@ -321,30 +323,56 @@ class BaseLLMBawt(ABC):
                 if self.bot.uses_tools and self.config.VERBOSE:
                     logger.info(f"Tool calling disabled for model {self.resolved_model_alias} (tool_format=none)")
             else:
-                use_tools = (self.bot.uses_tools and self.memory) or (self.memory and not self.bot.uses_tools)
+                use_tools = (self.bot.uses_tools and (self.memory is not None or self.home_client is not None)) or (
+                    self.memory and not self.bot.uses_tools
+                )
             if use_tools:
                 if self.bot.uses_tools:
                     tool_definitions = self._get_tool_definitions()
+                    if not tool_definitions:
+                        use_tools = False
                 else:
                     # Non-tool memory bots get read-only memory search only
                     from ..tools.definitions import MEMORY_TOOL
                     tool_definitions = [MEMORY_TOOL]
-                assistant_response, tool_context, tool_call_details = query_with_tools(
-                    messages=context_messages,
-                    client=self.client,
-                    memory_client=self.memory,
-                    profile_manager=self.profile_manager,
-                    search_client=self.search_client if self.bot.uses_tools else None,
-                    model_lifecycle=self.model_lifecycle if self.bot.uses_tools else None,
-                    config=self.config,
-                    user_id=self.user_id,
-                    bot_id=self.bot_id,
-                    stream=stream,
-                    tool_format=self.tool_format,
-                    tools=tool_definitions,
-                    adapter=self.adapter,
-                    history_manager=self.history_manager,
-                )
+                if use_tools:
+                    assistant_response, tool_context, tool_call_details = query_with_tools(
+                        messages=context_messages,
+                        client=self.client,
+                        memory_client=self.memory,
+                        profile_manager=self.profile_manager,
+                        search_client=self.search_client if self.bot.uses_tools else None,
+                        home_client=self.home_client if self.bot.uses_tools else None,
+                        model_lifecycle=self.model_lifecycle if self.bot.uses_tools else None,
+                        config=self.config,
+                        user_id=self.user_id,
+                        bot_id=self.bot_id,
+                        stream=stream,
+                        tool_format=self.tool_format,
+                        tools=tool_definitions,
+                        adapter=self.adapter,
+                        history_manager=self.history_manager,
+                    )
+                else:
+                    # Pass adapter stop sequences even without tools
+                    adapter_stops = self.adapter.get_stop_sequences()
+                    assistant_response = self.client.query(
+                        context_messages,
+                        plaintext_output=plaintext_output,
+                        stream=stream,
+                        stop=adapter_stops or None,
+                    )
+                    # Apply adapter output cleaning as safety net
+                    if assistant_response:
+                        cleaned = self.adapter.clean_output(assistant_response)
+                        if cleaned != assistant_response:
+                            logger.debug(
+                                f"Adapter '{self.adapter.name}' cleaned response: "
+                                f"{len(assistant_response)} -> {len(cleaned)} chars"
+                            )
+                            assistant_response = cleaned
+                    tool_call_details = []
+                    tool_context = ""
 
                 # Render the final response (tool loop returns raw text, never renders)
                 if assistant_response:
@@ -371,8 +399,10 @@ class BaseLLMBawt(ABC):
                 if assistant_response:
                     cleaned = self.adapter.clean_output(assistant_response)
                     if cleaned != assistant_response:
-                        logger.debug(f"Adapter '{self.adapter.name}' cleaned response: "
-                                     f"{len(assistant_response)} -> {len(cleaned)} chars")
+                        logger.debug(
+                            f"Adapter '{self.adapter.name}' cleaned response: "
+                            f"{len(assistant_response)} -> {len(cleaned)} chars"
+                        )
                         assistant_response = cleaned
                 tool_call_details = []
             
@@ -407,17 +437,18 @@ class BaseLLMBawt(ABC):
         
         # Add tool instructions (skip if tool_format is "none")
         if self.tool_format != "none":
-            if self.bot.uses_tools and self.memory:
+            if self.bot.uses_tools:
                 tool_definitions = self._get_tool_definitions()
-                tools_prompt = get_tools_prompt(
-                    tools=tool_definitions,
-                    tool_format=self.tool_format,
-                )
-                builder.add_section(
-                    "tools",
-                    tools_prompt,
-                    position=SectionPosition.TOOLS,
-                )
+                if tool_definitions:
+                    tools_prompt = get_tools_prompt(
+                        tools=tool_definitions,
+                        tool_format=self.tool_format,
+                    )
+                    builder.add_section(
+                        "tools",
+                        tools_prompt,
+                        position=SectionPosition.TOOLS,
+                    )
             elif self.memory:
                 # Non-tool memory bots get a read-only memory search tool
                 from ..tools.definitions import MEMORY_TOOL
@@ -471,11 +502,31 @@ class BaseLLMBawt(ABC):
 
     def _get_tool_definitions(self) -> list:
         include_search = self.search_client is not None
+        include_home = self.home_client is not None
         include_models = self.model_lifecycle is not None
-        return get_tools_list(
+        tools = get_tools_list(
             include_search_tools=include_search,
+            include_home_tools=include_home,
             include_model_tools=include_models,
         )
+        if self.memory is None:
+            disallowed = {"memory", "history", "profile", "self"}
+            tools = [t for t in tools if t.name not in disallowed]
+        return tools
+
+    def _init_home_assistant(self, config: Config):
+        """Initialize Home Assistant MCP client if enabled."""
+        if not getattr(config, "HA_MCP_ENABLED", False):
+            return
+        if not self.bot.uses_tools:
+            return
+        try:
+            client = HomeAssistantMCPClient(config)
+            if client.available:
+                self.home_client = client
+                logger.debug("Home Assistant MCP client initialized")
+        except Exception as e:
+            logger.warning(f"Failed to initialize Home Assistant MCP client: {e}")
     
     def _retrieve_cold_start_memories(self, prompt: str) -> str:
         """Retrieve a small set of high-importance memories for cold-start context.
@@ -619,7 +670,7 @@ class BaseLLMBawt(ABC):
                 lines.append(f"TOOL CALLS ({total_calls} call{'s' if total_calls != 1 else ''} across {iterations} iteration{'s' if iterations != 1 else ''})")
                 lines.append("─" * 40)
                 for idx, tc in enumerate(tool_calls, 1):
-                    lines.append(f"")
+                    lines.append("")
                     lines.append(f"[{idx}] Tool: {tc.get('tool', 'unknown')}")
                     params = tc.get('parameters', {})
                     if isinstance(params, dict):

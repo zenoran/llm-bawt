@@ -49,6 +49,7 @@ class Bot:
     default_model: str | None = None  # Default model alias for this bot
     uses_tools: bool = False  # Whether this bot can use tools (memory search, etc.)
     uses_search: bool = False  # Whether this bot can search the web
+    uses_home_assistant: bool = False  # Whether this bot can control Home Assistant via MCP
     nextcloud: dict | None = None  # Nextcloud integration config (bot_id, secret, etc.)
     
     def __post_init__(self):
@@ -161,6 +162,7 @@ def _load_bots_config() -> None:
             default_model=bot_data.get("default_model"),
             uses_tools=bot_data.get("uses_tools", False),
             uses_search=bot_data.get("uses_search", False),
+            uses_home_assistant=bot_data.get("uses_home_assistant", False),
             nextcloud=bot_data.get("nextcloud"),
         )
     

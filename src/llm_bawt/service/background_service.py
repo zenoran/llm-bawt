@@ -231,6 +231,10 @@ class BackgroundService:
         
         # Memory client cache keyed by bot_id
         self._memory_clients: dict[tuple[str, str], Any] = {}
+
+        # Extraction client (API model like Grok, separate from chat model)
+        self._extraction_client: Any | None = None
+        self._extraction_client_model: str | None = None
         
         # Session model overrides: when user switches model via tool, 
         # remember it for the rest of the session. Keyed by (bot_id, user_id).
@@ -1256,7 +1260,7 @@ class BackgroundService:
                     if not fact:
                         continue
 
-                    log.debug(f"[Extraction] {action.action}: '{fact.content[:50]}...' importance={fact.importance:.2f}")
+                    log.info(f"[Extraction] {action.action}: '{fact.content}' [{','.join(fact.tags)}] importance={fact.importance:.2f}")
 
                     try:
                         if action.action == "ADD":
@@ -1292,7 +1296,7 @@ class BackgroundService:
             else:
                 # No existing memories - store all facts directly
                 for fact in facts:
-                    log.debug(f"[Extraction] ADD (no existing): '{fact.content[:50]}...' importance={fact.importance:.2f}")
+                    log.info(f"[Extraction] ADD: '{fact.content}' [{','.join(fact.tags)}] importance={fact.importance:.2f}")
                     try:
                         memory_client.add_memory(
                             content=fact.content,
@@ -1510,8 +1514,261 @@ class BackgroundService:
             "error": result.error,
         }
 
+    def _get_extraction_client(self) -> tuple[Any | None, str | None]:
+        """Get or create the extraction client for memory extraction.
+
+        Uses ``EXTRACTION_MODEL`` from config.  Only API-based models
+        (``openai`` or ``grok`` type) are supported to avoid VRAM conflicts
+        with the local chat model.
+
+        Returns:
+            ``(client, model_alias)`` or ``(None, None)`` if unavailable.
+        """
+        if self._extraction_client is not None:
+            return self._extraction_client, self._extraction_client_model
+
+        extraction_model = getattr(self.config, "EXTRACTION_MODEL", None)
+        if not extraction_model:
+            log.debug("No EXTRACTION_MODEL configured — memory extraction will use heuristics")
+            return None, None
+
+        try:
+            model_alias, model_def = self._resolve_request_model(
+                extraction_model,
+                bot_id="nova",
+                local_mode=False,
+            )
+            model_type = model_def.get("type")
+
+            if model_type not in ("openai", "grok"):
+                log.warning(
+                    f"EXTRACTION_MODEL '{extraction_model}' is type '{model_type}'. "
+                    f"Only 'openai' and 'grok' types are supported for extraction. "
+                    f"Falling back to heuristics."
+                )
+                return None, None
+
+            llm_bawt = self._get_llm_bawt(
+                model_alias=model_alias,
+                bot_id="nova",
+                user_id="system",
+            )
+            client = llm_bawt.client
+
+            self._extraction_client = client
+            self._extraction_client_model = model_alias
+            log.info(f"Initialized extraction client: {model_alias} ({model_type})")
+            return client, model_alias
+
+        except Exception as e:
+            log.error(f"Failed to initialize extraction client for '{extraction_model}': {e}")
+            return None, None
+
+    async def _extract_from_summaries(
+        self,
+        summarization_results: list[dict],
+        bot_id: str,
+        user_id: str,
+    ) -> dict:
+        """Extract facts from newly created summaries using an API model.
+
+        Called after ``summarize_eligible_sessions()`` completes.  Only
+        processes results where ``created`` is ``True``.
+
+        Args:
+            summarization_results: Result dicts from ``HistorySummarizer``
+            bot_id: Bot whose memories are being updated
+            user_id: User identity for memory storage
+
+        Returns:
+            Stats dict with extraction outcome.
+        """
+        from ..memory.extraction.service import MemoryExtractionService, MemoryAction
+
+        extraction_client, extraction_model = self._get_extraction_client()
+        use_llm = extraction_client is not None
+
+        if not use_llm:
+            return {
+                "summaries_processed": 0,
+                "facts_extracted": 0,
+                "facts_stored": 0,
+                "extraction_method": "skipped",
+            }
+
+        extraction_service = MemoryExtractionService(llm_client=extraction_client)
+        memory_client = self.get_memory_client(bot_id, user_id)
+
+        if not memory_client:
+            log.warning("No memory client available — skipping extraction")
+            return {
+                "summaries_processed": 0,
+                "facts_extracted": 0,
+                "facts_stored": 0,
+                "extraction_method": "skipped",
+            }
+
+        min_importance = getattr(self.config, "MEMORY_EXTRACTION_MIN_IMPORTANCE", 0.5)
+        profile_enabled = getattr(self.config, "MEMORY_PROFILE_ATTRIBUTE_ENABLED", True)
+
+        total_facts = 0
+        total_stored = 0
+        summaries_processed = 0
+
+        for result in summarization_results:
+            if not result.get("created", False):
+                continue
+
+            summary_text = result.get("summary_text")
+            summary_id = result.get("summary_id")
+            session_start = result.get("session_start", 0)
+            session_end = result.get("session_end", 0)
+
+            if not summary_text or not summary_id:
+                continue
+
+            try:
+                facts = extraction_service.extract_from_summary(
+                    summary_text=summary_text,
+                    session_start=session_start,
+                    session_end=session_end,
+                    summary_id=summary_id,
+                    use_llm=use_llm,
+                )
+
+                summaries_processed += 1
+                total_facts += len(facts)
+
+                log.info(
+                    f"[Extraction] Summary {summary_id[:8]}: "
+                    f"{len(facts)} facts extracted from: {summary_text[:200]}"
+                )
+
+                if not facts:
+                    log.info(f"[Extraction] Summary {summary_id[:8]}: no facts found — skipping")
+                    self._mark_summary_extracted(bot_id, summary_id)
+                    continue
+
+                # Filter by importance
+                pre_filter = len(facts)
+                facts = [f for f in facts if f.importance >= min_importance]
+                if not facts:
+                    log.info(
+                        f"[Extraction] Summary {summary_id[:8]}: "
+                        f"all {pre_filter} facts below importance threshold ({min_importance})"
+                    )
+                    self._mark_summary_extracted(bot_id, summary_id)
+                    continue
+
+                # Deduplicate against existing memories
+                existing_memories = memory_client.list_memories(limit=100, min_importance=0.0)
+
+                if existing_memories:
+                    actions = extraction_service.determine_memory_actions(
+                        new_facts=facts,
+                        existing_memories=existing_memories,
+                    )
+                else:
+                    actions = [MemoryAction(action="ADD", fact=f) for f in facts]
+
+                for action in actions:
+                    fact = action.fact
+                    if not fact:
+                        continue
+
+                    try:
+                        tag_str = ",".join(fact.tags)
+                        if action.action == "ADD":
+                            log.info(
+                                f"[Extraction] ADD: '{fact.content}' "
+                                f"[{tag_str}] importance={fact.importance:.2f}"
+                            )
+                            memory_client.add_memory(
+                                content=fact.content,
+                                tags=fact.tags,
+                                importance=fact.importance,
+                                source_message_ids=fact.source_message_ids,
+                            )
+                            total_stored += 1
+                        elif action.action == "UPDATE" and action.target_memory_id:
+                            log.info(
+                                f"[Extraction] UPDATE ({action.target_memory_id[:8]}): "
+                                f"'{fact.content}' [{tag_str}] importance={fact.importance:.2f}"
+                            )
+                            memory_client.update_memory(
+                                memory_id=action.target_memory_id,
+                                content=fact.content,
+                                importance=fact.importance,
+                                tags=fact.tags,
+                            )
+                            total_stored += 1
+                        elif action.action == "DELETE" and action.target_memory_id:
+                            log.info(
+                                f"[Extraction] DELETE: {action.target_memory_id[:8]} "
+                                f"reason='{action.reason}'"
+                            )
+                            memory_client.delete_memory(memory_id=action.target_memory_id)
+
+                        # Profile attribute extraction
+                        if action.action in ("ADD", "UPDATE") and profile_enabled:
+                            from ..memory_server.extraction import extract_profile_attributes_from_fact
+                            extract_profile_attributes_from_fact(
+                                fact=fact,
+                                user_id=user_id,
+                                config=self.config,
+                            )
+                    except Exception as e:
+                        log.warning(f"Failed to process memory action {action.action}: {e}")
+
+                # Mark summary as extracted (crash recovery marker)
+                self._mark_summary_extracted(bot_id, summary_id)
+
+            except Exception as e:
+                log.error(f"Failed to extract from summary {summary_id[:8]}: {e}")
+                continue
+
+        log.info(
+            f"[Extraction] Done: {summaries_processed} summaries processed, "
+            f"{total_facts} facts extracted, {total_stored} stored"
+        )
+
+        return {
+            "summaries_processed": summaries_processed,
+            "facts_extracted": total_facts,
+            "facts_stored": total_stored,
+            "extraction_method": extraction_model or "heuristic",
+        }
+
+    def _mark_summary_extracted(self, bot_id: str, summary_id: str) -> None:
+        """Set ``extracted_at`` in a summary's metadata for crash recovery."""
+        try:
+            memory_client = self.get_memory_client(bot_id, "system")
+            if not memory_client:
+                return
+            backend = getattr(memory_client, "_backend", None) or getattr(memory_client, "backend", None)
+            if not backend or not hasattr(backend, "engine"):
+                return
+            from sqlalchemy import text as sa_text
+            table = f"{bot_id}_messages"
+            with backend.engine.connect() as conn:
+                conn.execute(
+                    sa_text(f"""
+                        UPDATE {table}
+                        SET summary_metadata = jsonb_set(
+                            COALESCE(summary_metadata::jsonb, '{{}}'::jsonb),
+                            '{{extracted_at}}',
+                            to_jsonb(:ts)
+                        )
+                        WHERE id = :sid AND role = 'summary'
+                    """),
+                    {"ts": datetime.utcnow().isoformat(), "sid": summary_id},
+                )
+                conn.commit()
+        except Exception as e:
+            log.debug(f"Failed to mark summary {summary_id[:8]} as extracted: {e}")
+
     async def _process_history_summarization(self, task: Task) -> dict:
-        """Process proactive history summarization for a bot."""
+        """Process proactive history summarization and extraction for a bot."""
         from ..memory.summarization import (
             HistorySummarizer,
             SUMMARIZATION_PROMPT,
@@ -1606,8 +1863,17 @@ class BackgroundService:
         if model_alias:
             result["model"] = model_alias
         result["used_heuristic_fallback"] = use_heuristic_fallback
+
+        # Phase 2: Extract memories from newly created summaries
+        extraction_results = await self._extract_from_summaries(
+            result.get("results", []),
+            bot_id=bot_id,
+            user_id=task.user_id or "system",
+        )
+        result["extraction"] = extraction_results
+
         return result
-    
+
     def submit_task(self, task: Task) -> str:
         """Submit a task to the processing queue."""
         from dataclasses import dataclass, field as dataclass_field

@@ -596,6 +596,8 @@ class HistorySummarizer:
             "method": method,
             "message_count": session.message_count,
             "created": True,
+            "session_start": session.start_timestamp,
+            "session_end": session.end_timestamp,
         }
 
     def summarize_eligible_sessions(

@@ -17,6 +17,7 @@ from .prompts import (
     MEMORY_TAGS,
     get_fact_extraction_prompt,
     get_memory_update_prompt,
+    get_summary_extraction_prompt,
     estimate_importance,
 )
 
@@ -146,6 +147,75 @@ class MemoryExtractionService:
         else:
             return self._extract_with_heuristics(messages, message_ids)
     
+    def extract_from_summary(
+        self,
+        summary_text: str,
+        session_start: float,
+        session_end: float,
+        summary_id: str,
+        use_llm: bool = True,
+    ) -> list[ExtractedFact]:
+        """Extract facts from a conversation summary.
+
+        Used by the scheduler to extract memories from pre-computed summaries
+        rather than raw message pairs. Designed for use with capable API models
+        (e.g., Grok) that produce higher quality extractions.
+
+        Args:
+            summary_text: The summary text (third-person)
+            session_start: Session start timestamp
+            session_end: Session end timestamp
+            summary_id: UUID of the summary message (used as source reference)
+            use_llm: Whether to use LLM for extraction
+
+        Returns:
+            List of ExtractedFact objects
+        """
+        if not summary_text or not summary_text.strip():
+            return []
+
+        if use_llm and self.llm_client:
+            try:
+                return self._extract_from_summary_with_llm(
+                    summary_text, session_start, session_end, summary_id
+                )
+            except Exception as e:
+                logger.warning(f"LLM summary extraction failed, falling back to heuristics: {e}")
+
+        # Heuristic fallback: treat summary as a single user message
+        fake_messages = [{"role": "user", "content": summary_text, "id": summary_id}]
+        return self._extract_with_heuristics(fake_messages, [summary_id])
+
+    def _extract_from_summary_with_llm(
+        self,
+        summary_text: str,
+        session_start: float,
+        session_end: float,
+        summary_id: str,
+    ) -> list[ExtractedFact]:
+        """Use LLM to extract facts from a conversation summary."""
+        from ...models.message import Message
+
+        start_date = datetime.fromtimestamp(session_start).strftime("%Y-%m-%d %H:%M")
+        end_date = datetime.fromtimestamp(session_end).strftime("%Y-%m-%d %H:%M")
+
+        prompt = get_summary_extraction_prompt(summary_text, start_date, end_date)
+
+        system_msg = Message(
+            role="system",
+            content="You are a memory extraction assistant. Extract persistent user facts from conversation summaries and return them as JSON.",
+        )
+        user_msg = Message(role="user", content=prompt)
+
+        response = self.llm_client.query(
+            messages=[system_msg, user_msg],
+            plaintext_output=True,
+            stream=False,
+        )
+
+        facts = self._parse_extraction_response(response, [summary_id])
+        return [self._enrich_meaning(f) for f in facts]
+
     def _format_conversation(self, messages: list[dict]) -> str:
         """Format messages into a conversation string for the prompt.
         
