@@ -1011,16 +1011,7 @@ class MemoryClient:
         
         # For DEBUG mode, log technical details
         if logger.isEnabledFor(logging.DEBUG):
-            # Truncate long content for logging
-            debug_params = {}
-            for k, v in params.items():
-                if k == "content" and isinstance(v, str) and len(v) > 100:
-                    debug_params[k] = v[:100] + f"... ({len(v)} chars)"
-                elif k == "query" and isinstance(v, str):
-                    debug_params[k] = v[:50] + "..." if len(v) > 50 else v
-                else:
-                    debug_params[k] = v
-            logger.debug("MCP request -> tools/%s params=%s", method, debug_params)
+            logger.debug("MCP request -> tools/%s params=%s", method, params)
         
         data = json.dumps(payload).encode('utf-8')
         headers = {
@@ -1101,36 +1092,16 @@ class MemoryClient:
             raise ConnectionError(f"Failed to connect to MCP server at {self.server_url}: {e}")
 
     def _log_response_debug(self, method: str, result: Any) -> None:
-        """Log response data at DEBUG level with smart truncation."""
+        """Log full response data at DEBUG level without truncation."""
         import json
         
         if result is None:
             logger.debug("MCP response: None")
             return
         
-        # For list results, show count and sample
-        if isinstance(result, list):
-            count = len(result)
-            if count == 0:
-                logger.debug("MCP response: [] (empty)")
-            elif count <= 3:
-                logger.debug("MCP response (%d items): %s", count, json.dumps(result, default=str, indent=2))
-            else:
-                # Show first 2 items as sample
-                sample = result[:2]
-                logger.debug("MCP response (%d items, showing first 2): %s", count, json.dumps(sample, default=str, indent=2))
-        elif isinstance(result, dict):
-            # For dicts, show key structure and truncate long values
-            summary = {}
-            for k, v in result.items():
-                if isinstance(v, str) and len(v) > 100:
-                    summary[k] = v[:100] + f"... ({len(v)} chars)"
-                elif isinstance(v, list) and len(v) > 3:
-                    summary[k] = f"[{len(v)} items]"
-                else:
-                    summary[k] = v
-            logger.debug("MCP response: %s", json.dumps(summary, default=str, indent=2))
-        else:
+        try:
+            logger.debug("MCP response: %s", json.dumps(result, default=str, indent=2))
+        except Exception:
             logger.debug("MCP response: %s", result)
 
 
@@ -1170,7 +1141,12 @@ class _MCPShortTermManager:
 
         rows = self._memory_client.get_messages(since_seconds=since_minutes)
         return [
-            Message(role=r.get("role", ""), content=r.get("content", ""), timestamp=r.get("timestamp", 0.0))
+            Message(
+                role=r.get("role", ""),
+                content=r.get("content", ""),
+                timestamp=r.get("timestamp", 0.0),
+                db_id=r.get("id"),
+            )
             for r in rows
         ]
 

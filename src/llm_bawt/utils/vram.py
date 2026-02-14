@@ -278,7 +278,7 @@ def auto_size_context_window(
     Args:
         model_definition: Model definition dict from models.yaml
         global_n_ctx: Global LLAMA_CPP_N_CTX config value
-        global_max_tokens: Global MAX_TOKENS config value (unused here, for reference)
+        global_max_tokens: Global MAX_OUTPUT_TOKENS config value (unused here, for reference)
         model_path: Path to the GGUF model file (for VRAM auto-sizing)
 
     Returns:

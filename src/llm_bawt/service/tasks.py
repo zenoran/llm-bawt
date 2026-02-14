@@ -11,7 +11,6 @@ import uuid
 
 class TaskType(Enum):
     """Types of tasks the background service can handle."""
-    MEMORY_EXTRACTION = "memory_extraction"
     CONTEXT_COMPACTION = "context_compaction"
     EMBEDDING_GENERATION = "embedding_generation"
     MEMORY_CONSOLIDATION = "memory_consolidation"
@@ -95,37 +94,6 @@ class TaskResult:
 
 
 # Task factory functions for common operations
-
-def create_extraction_task(
-    user_message: str,
-    assistant_message: str,
-    bot_id: str = "nova",
-    user_id: str = "",  # Required - must be passed explicitly
-    message_ids: list[str] | None = None,
-    model: str | None = None,
-) -> Task:
-    """Create a memory extraction task.
-    
-    Args:
-        model: The model alias to use for extraction. Should be the same model
-               used for the chat to avoid loading multiple models.
-    """
-    if not user_id:
-        raise ValueError("user_id is required for create_extraction_task")
-    return Task(
-        task_type=TaskType.MEMORY_EXTRACTION,
-        payload={
-            "messages": [
-                {"role": "user", "content": user_message, "id": message_ids[0] if message_ids else None},
-                {"role": "assistant", "content": assistant_message, "id": message_ids[1] if message_ids and len(message_ids) > 1 else None},
-            ],
-            "model": model,
-        },
-        bot_id=bot_id,
-        user_id=user_id,
-    )
-
-
 def create_compaction_task(
     messages: list[dict],
     target_token_count: int,

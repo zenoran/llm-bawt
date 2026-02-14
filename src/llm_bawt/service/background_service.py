@@ -96,7 +96,7 @@ def _write_debug_turn_log(
             lines.append(f"TOOL CALLS ({total_calls} call{'s' if total_calls != 1 else ''} across {iterations} iteration{'s' if iterations != 1 else ''})")
             lines.append("─" * 40)
             for idx, tc in enumerate(tool_calls, 1):
-                lines.append(f"")
+                lines.append("")
                 lines.append(f"[{idx}] Tool: {tc.get('tool', 'unknown')}")
                 params = tc.get('parameters', {})
                 if isinstance(params, dict):
@@ -455,8 +455,6 @@ class BackgroundService:
             log.model_loading(model_alias, model_type, cached=False)
         else:
             log.model_loading(model_alias, model_type, cached=True)
-        load_start = time.time()
-        
         try:
             # Create a copy of config for each ServiceLLMBawt instance
             # This is necessary because it modifies config.SYSTEM_MESSAGE
@@ -523,8 +521,6 @@ class BackgroundService:
         3. Runs blocking LLM calls in a thread pool
         4. Stores messages and extracts memories for future use
         """
-        from ..models.message import Message
-        
         # Create request context for logging
         ctx = RequestContext(
             request_id=generate_request_id(),
@@ -619,7 +615,7 @@ class BackgroundService:
                     return ""
 
                 # Finalize (add to history, trigger memory extraction)
-                llm_bawt.finalize_response(user_prompt, response, tool_context)
+                llm_bawt.finalize_response(response, tool_context)
 
                 return response
             
@@ -690,8 +686,6 @@ class BackgroundService:
         Yields Server-Sent Events (SSE) formatted chunks.
         """
         import json
-        from ..models.message import Message
-        
         # Create request context for logging
         ctx = RequestContext(
             request_id=generate_request_id(),
@@ -806,6 +800,9 @@ class BackgroundService:
                         and hasattr(llm_bawt.client, "stream_with_tools")
                     )
 
+                    # Resolve per-bot generation parameters
+                    gen_kwargs = llm_bawt._get_generation_kwargs()
+
                     if use_native_streaming:
                         # Native streaming with tools - streams content AND handles tool calls
                         from ..tools.executor import ToolExecutor
@@ -847,6 +844,7 @@ class BackgroundService:
                                     current_msgs,
                                     tools_schema=current_tools,
                                     tool_choice="auto",
+                                    **gen_kwargs,
                                 ):
                                     if isinstance(item, str):
                                         # Content chunk - yield to user immediately
@@ -926,7 +924,7 @@ class BackgroundService:
                             log.warning("No adapter found on llm_bawt instance")
 
                         def stream_fn(msgs, stop_sequences=None):
-                            return llm_bawt.client.stream_raw(msgs, stop=stop_sequences)
+                            return llm_bawt.client.stream_raw(msgs, stop=stop_sequences, **gen_kwargs)
 
                         stream_iter = stream_with_tools(
                             messages=messages,
@@ -943,11 +941,13 @@ class BackgroundService:
                             history_manager=llm_bawt.history_manager,
                         )
                 else:
+                    # Resolve per-bot generation parameters
+                    gen_kwargs = llm_bawt._get_generation_kwargs()
                     # Pass adapter stop sequences even without tools
                     adapter = getattr(llm_bawt, 'adapter', None)
                     adapter_stops = adapter.get_stop_sequences() if adapter else []
                     stream_iter = llm_bawt.client.stream_raw(
-                        messages, stop=adapter_stops or None
+                        messages, stop=adapter_stops or None, **gen_kwargs
                     )
                 
                 # Stream chunks to queue
@@ -979,7 +979,7 @@ class BackgroundService:
                             full_response_holder[0] = cleaned
                     
                     log.llm_response(full_response_holder[0], elapsed_ms=elapsed_ms)
-                    llm_bawt.finalize_response(user_prompt, full_response_holder[0], tool_context_holder[0])
+                    llm_bawt.finalize_response(full_response_holder[0], tool_context_holder[0])
 
                     # Write debug turn log if enabled (check config or env var)
                     if self.config.DEBUG_TURN_LOG or os.environ.get("LLM_BAWT_DEBUG_TURN_LOG"):
@@ -1114,9 +1114,7 @@ class BackgroundService:
         log.debug(f"Processing task {task.task_id[:8]} ({task_type_str})")
         
         try:
-            if task.task_type == TaskType.MEMORY_EXTRACTION:
-                result = await self._process_extraction(task)
-            elif task.task_type == TaskType.CONTEXT_COMPACTION:
+            if task.task_type == TaskType.CONTEXT_COMPACTION:
                 result = await self._process_compaction(task)
             elif task.task_type == TaskType.EMBEDDING_GENERATION:
                 result = await self._process_embeddings(task)
@@ -1150,176 +1148,6 @@ class BackgroundService:
                 error=str(e),
                 processing_time_ms=elapsed_ms,
             )
-    
-    async def _process_extraction(self, task: Task) -> dict:
-        """Process a memory extraction task.
-        
-        Uses the same model that was used for the chat to avoid loading
-        multiple models into VRAM. The model is passed in the task payload.
-        """
-        from ..memory.extraction import MemoryExtractionService
-        
-        messages = task.payload.get("messages", [])
-        bot_id = task.bot_id
-        user_id = task.user_id
-        
-        log.debug(f"Extraction: {len(messages)} messages for {bot_id}/{user_id}")
-        
-        # Get the model from task payload (passed from chat request)
-        # This ensures we use the same model that handled the chat
-        model_to_use = task.payload.get("model")
-        
-        if not model_to_use:
-            # Fallback: no model specified in task, skip LLM extraction
-            log.debug("No model specified in extraction task - using non-LLM extraction")
-            extraction_service = MemoryExtractionService(llm_client=None)
-            use_llm = False
-        else:
-            # Get client from cache - should already be loaded from chat
-            extraction_client = None
-            if model_to_use in self._client_cache:
-                extraction_client = self._client_cache[model_to_use]
-                log.debug(f"Reusing cached client for extraction: {model_to_use}")
-            else:
-                # Check if any LLMBawt instance has this model loaded
-                for (cached_model, _, _), llm_bawt in self._llm_bawt_cache.items():
-                    if cached_model == model_to_use:
-                        extraction_client = llm_bawt.client
-                        self._client_cache[model_to_use] = extraction_client
-                        log.debug(f"Reusing client from LLMBawt instance for extraction: {model_to_use}")
-                        break
-            
-            if not extraction_client:
-                log.warning(f"Model '{model_to_use}' not in cache - skipping LLM extraction to avoid reload")
-                extraction_client = None
-            
-            extraction_service = MemoryExtractionService(llm_client=extraction_client)
-            use_llm = extraction_client is not None
-        
-        # Run extraction in the SAME single-threaded executor as chat completions
-        # This ensures extraction waits for any in-flight chat to complete
-        # The executor has max_workers=1, so operations are serialized
-        loop = asyncio.get_event_loop()
-        
-        try:
-            facts = await loop.run_in_executor(
-                self._llm_executor,  # Use the single-threaded LLM executor
-                lambda: extraction_service.extract_from_conversation(messages, use_llm=use_llm)
-            )
-        except Exception as e:
-            # Catch any llama.cpp state corruption errors
-            log.warning(f"Extraction failed (will retry without LLM): {e}")
-            # Fallback to non-LLM extraction
-            extraction_service_fallback = MemoryExtractionService(llm_client=None)
-            facts = await loop.run_in_executor(
-                self._llm_executor,
-                lambda: extraction_service_fallback.extract_from_conversation(messages, use_llm=False)
-            )
-            use_llm = False
-        
-        if not facts:
-            log.debug("Extraction: no facts found")
-            return {"facts_extracted": 0, "facts_stored": 0, "llm_used": use_llm}
-
-        log.debug(f"Extraction: {len(facts)} facts, checking duplicates")
-
-        memory_client = self.get_memory_client(bot_id, user_id)
-        stored_count = 0
-        profile_count = 0
-        skipped_count = 0
-
-        if memory_client:
-            min_importance = getattr(self.config, "MEMORY_EXTRACTION_MIN_IMPORTANCE", 0.3)
-            profile_enabled = getattr(self.config, "MEMORY_PROFILE_ATTRIBUTE_ENABLED", True)
-
-            # Filter facts by minimum importance first
-            facts = [f for f in facts if f.importance >= min_importance]
-
-            if not facts:
-                log.debug("Extraction: no facts above importance threshold")
-                return {"facts_extracted": 0, "facts_stored": 0, "llm_used": use_llm}
-
-            # Fetch existing memories to check for duplicates
-            existing_memories = memory_client.list_memories(limit=100, min_importance=0.0)
-
-            if existing_memories:
-                # Use determine_memory_actions to filter out duplicates
-                actions = extraction_service.determine_memory_actions(
-                    new_facts=facts,
-                    existing_memories=existing_memories,
-                )
-
-                # Count how many facts were skipped (duplicates)
-                skipped_count = len(facts) - len(actions)
-                if skipped_count > 0:
-                    log.debug(f"Extraction: skipped {skipped_count} duplicates")
-
-                # Process only the actions (ADD, UPDATE, DELETE)
-                for action in actions:
-                    fact = action.fact
-                    if not fact:
-                        continue
-
-                    log.info(f"[Extraction] {action.action}: '{fact.content}' [{','.join(fact.tags)}] importance={fact.importance:.2f}")
-
-                    try:
-                        if action.action == "ADD":
-                            memory_client.add_memory(
-                                content=fact.content,
-                                tags=fact.tags,
-                                importance=fact.importance,
-                                source_message_ids=fact.source_message_ids,
-                            )
-                            stored_count += 1
-                        elif action.action == "UPDATE" and action.target_memory_id:
-                            memory_client.update_memory(
-                                memory_id=action.target_memory_id,
-                                content=fact.content,
-                                importance=fact.importance,
-                                tags=fact.tags,
-                            )
-                            stored_count += 1
-                        elif action.action == "DELETE" and action.target_memory_id:
-                            memory_client.delete_memory(memory_id=action.target_memory_id)
-
-                        # Extract profile attributes for ADD and UPDATE actions
-                        if action.action in ("ADD", "UPDATE") and profile_enabled:
-                            from ..memory_server.extraction import extract_profile_attributes_from_fact
-                            if extract_profile_attributes_from_fact(
-                                fact=fact,
-                                user_id=user_id,
-                                config=self.config,
-                            ):
-                                profile_count += 1
-                    except Exception as e:
-                        log.warning(f"Failed to process memory action {action.action}: {e}")
-            else:
-                # No existing memories - store all facts directly
-                for fact in facts:
-                    log.info(f"[Extraction] ADD: '{fact.content}' [{','.join(fact.tags)}] importance={fact.importance:.2f}")
-                    try:
-                        memory_client.add_memory(
-                            content=fact.content,
-                            tags=fact.tags,
-                            importance=fact.importance,
-                            source_message_ids=fact.source_message_ids,
-                        )
-                        stored_count += 1
-                        if profile_enabled:
-                            from ..memory_server.extraction import extract_profile_attributes_from_fact
-                            if extract_profile_attributes_from_fact(
-                                fact=fact,
-                                user_id=user_id,
-                                config=self.config,
-                            ):
-                                profile_count += 1
-                    except Exception as e:
-                        log.warning(f"Failed to store memory: {e}")
-        
-        if stored_count > 0 or profile_count > 0:
-            log.info(f"💾 Stored {stored_count} memories" + (f", {profile_count} profile attrs" if profile_count > 0 else ""))
-        log.memory_operation("extraction", bot_id, count=stored_count, details=f"extracted={len(facts)}, stored={stored_count}, skipped={skipped_count}, profiles={profile_count}, llm={use_llm}")
-        return {"facts_extracted": len(facts), "facts_stored": stored_count, "facts_skipped": skipped_count, "profile_attrs": profile_count, "llm_used": use_llm}
     
     async def _process_compaction(self, task: Task) -> dict:
         """Process a context compaction task."""
@@ -1386,8 +1214,8 @@ class BackgroundService:
     async def _process_profile_maintenance(self, task: Task) -> dict:
         """Process profile maintenance - consolidate attributes into summary.
         
-        Prefers a loaded local model to avoid VRAM churn and remote providers.
-        Falls back to configured/local defaults if no cached model available.
+        Uses configured maintenance model resolution and loads that model
+        deterministically when needed.
         """
         from ..memory.profile_maintenance import ProfileMaintenanceService
         from ..profiles import ProfileManager
@@ -1395,77 +1223,38 @@ class BackgroundService:
         entity_id = task.payload.get("entity_id", task.user_id)
         entity_type = task.payload.get("entity_type", "user")
         dry_run = task.payload.get("dry_run", False)
-        def is_openai_model(alias: str | None) -> bool:
-            if not alias:
-                return False
-            model_def = self.config.defined_models.get("models", {}).get(alias, {})
-            return model_def.get("type") == "openai"
         
-        def first_local_cached() -> str | None:
-            for alias in self._client_cache.keys():
-                if not is_openai_model(alias):
-                    return alias
-            for (alias, _, _), _llm_bawt in self._llm_bawt_cache.items():
-                if not is_openai_model(alias):
-                    return alias
-            return None
-        
-        def first_local_available() -> str | None:
-            for alias in self._available_models:
-                if not is_openai_model(alias):
-                    return alias
-            return None
-        
-        requested_model = task.payload.get("model") or (self.config.PROFILE_MAINTENANCE_MODEL or None)
-        model_to_use: str | None = None
-        
-        if requested_model:
-            try:
-                model_to_use, _ = self._resolve_request_model(
-                    requested_model,
-                    task.bot_id or self._default_bot,
-                    local_mode=True,
-                )
-            except Exception as e:
-                log.error(f"Failed to resolve model for profile maintenance: {e}")
-                return {"error": f"Failed to resolve model: {e}"}
+        requested_model = (
+            task.payload.get("model")
+            or getattr(self.config, "MAINTENANCE_MODEL", None)
+            or (self.config.PROFILE_MAINTENANCE_MODEL or None)
+            or getattr(self.config, "SUMMARIZATION_MODEL", None)
+        )
+        try:
+            model_to_use, _ = self._resolve_request_model(
+                requested_model,
+                task.bot_id or self._default_bot,
+                local_mode=False,
+            )
+        except Exception as e:
+            log.error(f"Failed to resolve model for profile maintenance: {e}")
+            return {"error": f"Failed to resolve model: {e}"}
 
-        # Prefer currently loaded local model if no explicit model requested
         if not model_to_use:
-            current_model = self._model_lifecycle.current_model
-            if current_model and not is_openai_model(current_model):
-                model_to_use = current_model
+            err = "No model available for profile maintenance"
+            log.error(err)
+            return {"error": err}
 
-        # Fall back to any cached local model
-        if not model_to_use:
-            model_to_use = first_local_cached()
+        model_def = self.config.defined_models.get("models", {}).get(model_to_use, {})
+        if model_def.get("type") == "openai" and not (self.config.OPENAI_API_KEY or self.config.XAI_API_KEY):
+            err = f"Profile maintenance model '{model_to_use}' requires API key configuration"
+            log.error(err)
+            return {"error": err}
 
-        # Last resort: resolve a local default
-        if not model_to_use:
-            try:
-                model_to_use, _ = self._resolve_request_model(
-                    None,
-                    task.bot_id or self._default_bot,
-                    local_mode=True,
-                )
-            except Exception as e:
-                log.error(f"Failed to resolve model for profile maintenance: {e}")
-                return {"error": f"Failed to resolve model: {e}"}
-        
-        # Never use OpenAI for profile maintenance; fall back to any local model
-        if not model_to_use or is_openai_model(model_to_use):
-            fallback_local = first_local_cached() or first_local_available()
-            if fallback_local and not is_openai_model(fallback_local):
-                if model_to_use:
-                    log.warning(
-                        f"Profile maintenance requested model '{model_to_use}' is openai; "
-                        f"using local '{fallback_local}' instead"
-                    )
-                model_to_use = fallback_local
-            else:
-                err = "No local model available for profile maintenance"
-                log.error(err)
-                return {"error": err}
+        if model_to_use not in self._available_models:
+            err = f"Model '{model_to_use}' unavailable for profile maintenance"
+            log.error(err)
+            return {"error": err}
         
         log.info(f"🔧 Profile maintenance: {entity_type}/{entity_id} (model={model_to_use})")
         
@@ -1492,6 +1281,7 @@ class BackgroundService:
                     model_alias=model_to_use,
                     bot_id=task.bot_id or self._default_bot,
                     user_id=entity_id,
+                    local_mode=False,
                 )
                 llm_client = llm_bawt.client
             except Exception as e:
@@ -1777,23 +1567,40 @@ class BackgroundService:
         from ..models.message import Message
 
         bot_id = task.bot_id or self._default_bot
-        requested_model = task.payload.get("model") or getattr(self.config, "SUMMARIZATION_MODEL", None)
+        requested_model = (
+            task.payload.get("model")
+            or getattr(self.config, "MAINTENANCE_MODEL", None)
+            or getattr(self.config, "SUMMARIZATION_MODEL", None)
+        )
         use_heuristic_fallback = bool(task.payload.get("use_heuristic_fallback", True))
         max_tokens_per_chunk = int(task.payload.get("max_tokens_per_chunk", 4000))
 
         model_alias = None
         client = None
 
-        if requested_model and requested_model in self._client_cache:
-            model_alias = requested_model
-            client = self._client_cache[requested_model]
+        if requested_model:
+            try:
+                model_alias, _ = self._resolve_request_model(
+                    requested_model,
+                    bot_id,
+                    local_mode=False,
+                )
+                llm_bawt = self._get_llm_bawt(
+                    model_alias=model_alias,
+                    bot_id=bot_id,
+                    user_id=task.user_id or "system",
+                )
+                client = llm_bawt.client
+            except Exception as e:
+                log.error(f"Failed to resolve/load model for history summarization: {e}")
+                client = None
         elif self._client_cache:
             model_alias = next(iter(self._client_cache.keys()))
             client = self._client_cache[model_alias]
         else:
             try:
                 model_alias, _ = self._resolve_request_model(
-                    requested_model,
+                    None,
                     bot_id,
                     local_mode=False,
                 )
@@ -1828,7 +1635,7 @@ class BackgroundService:
                 ]
                 response = client.query(
                     messages=messages,
-                    max_tokens=200,
+                    max_tokens=320,
                     temperature=0.3,
                     plaintext_output=True,
                     stream=False,
@@ -1845,10 +1652,18 @@ class BackgroundService:
                 log.error(f"History summarization LLM call failed: {e}")
                 return None
 
+        # Create a settings resolver for per-bot summarization tunables
+        from ..runtime_settings import RuntimeSettingsResolver
+        from ..bots import BotManager
+        bot_manager = BotManager(self.config)
+        bot_obj = bot_manager.get_bot(bot_id) or bot_manager.get_default_bot()
+        resolver = RuntimeSettingsResolver(config=self.config, bot=bot_obj, bot_id=bot_id)
+
         summarizer = HistorySummarizer(
             self.config,
             bot_id=bot_id,
             summarize_fn=summarize_with_loaded_client,
+            settings_getter=resolver.resolve,
         )
 
         loop = asyncio.get_event_loop()
@@ -1871,6 +1686,15 @@ class BackgroundService:
             user_id=task.user_id or "system",
         )
         result["extraction"] = extraction_results
+
+        # Summary writes change context composition; invalidate cached history views
+        # for this bot so next request reloads from DB immediately.
+        for (_model, cached_bot_id, _user), llm_bawt in self._llm_bawt_cache.items():
+            if cached_bot_id != bot_id:
+                continue
+            invalidate = getattr(llm_bawt, "invalidate_history_cache", None)
+            if callable(invalidate):
+                invalidate()
 
         return result
 

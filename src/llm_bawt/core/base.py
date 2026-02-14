@@ -12,17 +12,16 @@ Subclasses override _initialize_client() for their specific client types.
 
 import json
 import logging
-import threading
-import uuid
 from abc import ABC, abstractmethod
 from datetime import datetime
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from rich.console import Console
 
 from ..bots import Bot, BotManager
 from ..clients import LLMClient
 from ..profiles import ProfileManager, EntityType
+from ..runtime_settings import RuntimeSettingsResolver
 from ..memory_server.client import MemoryClient, get_memory_client
 from ..integrations.ha_mcp.client import HomeAssistantMCPClient
 from ..search import get_search_client, SearchClient
@@ -30,6 +29,7 @@ from ..tools import get_tools_prompt, get_tools_list, query_with_tools
 from ..utils.config import Config, has_database_credentials
 from ..utils.paths import resolve_log_dir
 from ..utils.history import HistoryManager, Message
+from ..utils.temporal import build_temporal_context
 from ..adapters import get_adapter, ModelAdapter
 from .prompt_builder import PromptBuilder, SectionPosition
 from .model_lifecycle import ModelLifecycleManager, get_model_lifecycle
@@ -94,6 +94,7 @@ class BaseLLMBawt(ABC):
         self.history_manager: HistoryManager
         self._db_available: bool = False
         self.adapter: ModelAdapter
+        self.settings: RuntimeSettingsResolver | None = None
         
         if not self.model_definition:
             raise ValueError(f"Could not find model definition for: '{resolved_model_alias}'")
@@ -129,6 +130,7 @@ class BaseLLMBawt(ABC):
         
         # Initialize bot
         self._init_bot(config)
+        self.settings = RuntimeSettingsResolver(config=config, bot=self.bot, bot_id=self.bot_id)
         
         # Initialize memory and profiles
         self._init_memory(config)
@@ -285,15 +287,30 @@ class BaseLLMBawt(ABC):
             config=self.config,
             db_backend=self.memory.get_short_term_manager() if self.memory else None,
             bot_id=self.bot_id,
+            settings_getter=self._resolve_setting,
         )
         self.load_history()
     
     def load_history(self, since_minutes: int | None = None) -> list[dict]:
         """Load conversation history."""
         if since_minutes is None:
-            since_minutes = self.config.HISTORY_DURATION
+            since_minutes = int(self._resolve_setting("history_duration_seconds", self.config.HISTORY_DURATION_SECONDS))
         self.history_manager.load_history(since_minutes=since_minutes)
         return [msg.to_dict() for msg in self.history_manager.messages]
+
+    def _resolve_setting(self, key: str, fallback: Any = None) -> Any:
+        """Resolve a runtime setting for this bot."""
+        if self.settings is None:
+            return fallback
+        return self.settings.resolve(key=key, fallback=fallback)
+
+    def _get_generation_kwargs(self) -> dict[str, Any]:
+        """Resolve per-bot generation parameters for LLM client calls."""
+        return {
+            "temperature": float(self._resolve_setting("temperature", self.config.TEMPERATURE)),
+            "top_p": float(self._resolve_setting("top_p", self.config.TOP_P)),
+            "max_tokens": int(self._resolve_setting("max_output_tokens", self.config.MAX_OUTPUT_TOKENS) or self.config.MAX_OUTPUT_TOKENS),
+        }
     
     def query(self, prompt: str, plaintext_output: bool = False, stream: bool = True) -> str:
         """Send a query to the LLM and return the response.
@@ -326,6 +343,9 @@ class BaseLLMBawt(ABC):
                 use_tools = (self.bot.uses_tools and (self.memory is not None or self.home_client is not None)) or (
                     self.memory and not self.bot.uses_tools
                 )
+            # Resolve per-bot generation parameters once for this query
+            gen_kwargs = self._get_generation_kwargs()
+
             if use_tools:
                 if self.bot.uses_tools:
                     tool_definitions = self._get_tool_definitions()
@@ -352,6 +372,7 @@ class BaseLLMBawt(ABC):
                         tools=tool_definitions,
                         adapter=self.adapter,
                         history_manager=self.history_manager,
+                        generation_kwargs=gen_kwargs,
                     )
                 else:
                     # Pass adapter stop sequences even without tools
@@ -361,6 +382,7 @@ class BaseLLMBawt(ABC):
                         plaintext_output=plaintext_output,
                         stream=stream,
                         stop=adapter_stops or None,
+                        **gen_kwargs,
                     )
                     # Apply adapter output cleaning as safety net
                     if assistant_response:
@@ -394,6 +416,7 @@ class BaseLLMBawt(ABC):
                     plaintext_output=plaintext_output,
                     stream=stream,
                     stop=adapter_stops or None,
+                    **gen_kwargs,
                 )
                 # Apply adapter output cleaning as safety net
                 if assistant_response:
@@ -405,12 +428,9 @@ class BaseLLMBawt(ABC):
                         )
                         assistant_response = cleaned
                 tool_call_details = []
-            
+
             if assistant_response:
                 self.history_manager.add_message("assistant", assistant_response)
-                # Memory extraction for all memory-enabled bots
-                if self.memory:
-                    self._trigger_memory_extraction(prompt, assistant_response)
 
             # Write debug turn log if enabled
             if self.debug:
@@ -434,6 +454,13 @@ class BaseLLMBawt(ABC):
         
         # Start with a copy of the prompt builder
         builder = self._prompt_builder.copy()
+
+        # Temporal grounding so relative-time references remain unambiguous.
+        builder.add_section(
+            "temporal_context",
+            build_temporal_context(self.history_manager.messages),
+            position=SectionPosition.DATETIME,
+        )
         
         # Add tool instructions (skip if tool_format is "none")
         if self.tool_format != "none":
@@ -484,11 +511,17 @@ class BaseLLMBawt(ABC):
             logger.debug(f"Sections: {[s.name for s in builder.enabled_sections]}")
         
         # Always include history — two-layer architecture handles context overflow
-        max_context_tokens = getattr(self.config, 'MAX_CONTEXT_TOKENS', 0)
+        max_context_tokens = int(self._resolve_setting("max_context_tokens", getattr(self.config, "MAX_CONTEXT_TOKENS", 0)) or 0)
         if max_context_tokens <= 0 and self.client:
             ctx_window = getattr(self.client, 'effective_context_window', 0)
             if ctx_window > 0:
-                max_output = getattr(self.client, 'effective_max_tokens', 4096)
+                max_output = int(
+                    self._resolve_setting(
+                        "max_output_tokens",
+                        getattr(self.client, "effective_max_tokens", 4096),
+                    )
+                    or 4096
+                )
                 max_context_tokens = ctx_window - max_output
 
         history = self.history_manager.get_context_messages(
@@ -546,10 +579,19 @@ class BaseLLMBawt(ABC):
 
         try:
             # Fetch a small number of high-relevance memories
+            n_results = max(
+                1,
+                min(
+                    10,
+                    int(self._resolve_setting("memory_n_results", 3) or 3),
+                ),
+            )
             results = self.memory.search(
                 prompt,
-                n_results=3,
-                min_relevance=self.config.MEMORY_MIN_RELEVANCE,
+                n_results=n_results,
+                min_relevance=float(
+                    self._resolve_setting("memory_min_relevance", self.config.MEMORY_MIN_RELEVANCE)
+                ),
             )
 
             if not results:
@@ -588,31 +630,6 @@ class BaseLLMBawt(ABC):
         except Exception as e:
             logger.warning(f"Cold-start memory retrieval failed: {e}")
             return ""
-
-    def _trigger_memory_extraction(self, user_prompt: str, assistant_response: str):
-        """Trigger background memory extraction (non-blocking)."""
-        def extract():
-            try:
-                from ..service import ServiceClient
-                from ..service.tasks import create_extraction_task
-
-                client = ServiceClient()
-                if client.is_available():
-                    task = create_extraction_task(
-                        user_message=user_prompt,
-                        assistant_message=assistant_response,
-                        bot_id=self.bot_id,
-                        user_id=self.user_id,
-                        message_ids=[str(uuid.uuid4()), str(uuid.uuid4())],
-                        model=self.resolved_model_alias,
-                    )
-                    client.submit_task(task)
-            except Exception as e:
-                logger.debug(f"Memory extraction failed: {e}")
-
-        thread = threading.Thread(target=extract, daemon=True)
-        thread.start()
-        thread.join(timeout=0.5)
 
     def _write_debug_turn_log(
         self,

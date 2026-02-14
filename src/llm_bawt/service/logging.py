@@ -34,7 +34,6 @@ import sys
 import time
 from contextvars import ContextVar
 from dataclasses import dataclass, field
-from functools import wraps
 from typing import Any
 from uuid import uuid4
 
@@ -546,7 +545,7 @@ class ServiceLogger:
         
         if isinstance(result, list):
             if len(result) == 0:
-                self._console.print(f"  [dim]result: (empty)[/dim]")
+                self._console.print("  [dim]result: (empty)[/dim]")
             elif is_history:
                 # Very condensed for history: just first and last
                 if len(result) == 1:
@@ -613,7 +612,7 @@ class ServiceLogger:
             import json
             try:
                 self._console.print(f"{prefix}{json.dumps(item, default=str)}")
-            except:
+            except Exception:
                 self._console.print(f"{prefix}{item}")
 
     def memory_operation(self, operation: str, bot_id: str, count: int | None = None, details: str | None = None) -> None:
@@ -628,34 +627,10 @@ class ServiceLogger:
 
     def task_submitted(self, task_id: str, task_type: str, bot_id: str, payload: dict | None = None) -> None:
         """Log background task submission with context - single line."""
-        if task_type == "memory_extraction" and payload:
-            messages = payload.get("messages", [])
-            if messages:
-                user_msgs = [m for m in messages if m.get("role") == "user"]
-                if user_msgs:
-                    content = user_msgs[-1].get("content", "")
-                    preview = " ".join(content.split())[:40] + "..." if len(content) > 40 else content
-                    self._logger.info(f"{ICONS['loading']} Extracting: \"{preview}\"")
-                    return
         self._logger.info(f"{ICONS['loading']} {task_type} queued")
 
     def task_completed(self, task_id: str, task_type: str, elapsed_ms: float, result: dict | None = None) -> None:
         """Log background task completion with meaningful results."""
-        if task_type == "memory_extraction" and isinstance(result, dict):
-            stored = result.get("facts_stored", 0)
-            profiles = result.get("profile_attrs", 0)
-            
-            if stored > 0 or profiles > 0:
-                # Only log if something was actually stored
-                parts = []
-                if stored > 0:
-                    parts.append(f"{stored} memories")
-                if profiles > 0:
-                    parts.append(f"{profiles} profile attrs")
-                self._logger.info(f"{ICONS['memory']} Extracted: {', '.join(parts)} [{elapsed_ms:.0f}ms]")
-            # If nothing stored, don't log (reduces noise)
-            return
-        
         # Generic task completion
         self._logger.info(f"{ICONS['done']} {task_type} done [{elapsed_ms:.0f}ms]")
 
@@ -723,7 +698,6 @@ class ServiceLogger:
         
         # Count messages by role
         role_counts = {"system": 0, "user": 0, "assistant": 0}
-        user_prompt = ""
         memory_content = ""
         
         for msg in messages:
@@ -741,10 +715,6 @@ class ServiceLogger:
             if role == "system" and "What You Remember" in content:
                 memory_content = content
             
-            # Capture the last user message as the prompt
-            if role == "user":
-                user_prompt = content
-        
         # Calculate history turns (user+assistant pairs, excluding current prompt)
         history_turns = min(role_counts["user"] - 1, role_counts["assistant"])
         

@@ -1,4 +1,6 @@
 import argparse
+import json
+import os
 import subprocess
 import traceback
 import sys  # Import sys for exit codes
@@ -27,6 +29,7 @@ from pathlib import Path
 from rich.table import Table
 from rich.panel import Panel
 from typing import Iterator
+import yaml
 
 console = Console()
 
@@ -388,7 +391,7 @@ def show_status(config: Config, args: argparse.Namespace | None = None):
         model_type = model_def.get("type", "unknown")
 
         # Per-model settings with resolution display
-        effective_max_tokens = model_def.get("max_tokens", config.MAX_TOKENS)
+        effective_max_tokens = model_def.get("max_tokens", config.MAX_OUTPUT_TOKENS)
         max_tokens_source = "model" if "max_tokens" in model_def else "global"
         model_info_table.add_row("Max Tokens", f"{effective_max_tokens} [dim]({max_tokens_source})[/dim]")
 
@@ -902,6 +905,244 @@ def show_users(config: Config):
     console.print()
 
 
+def _parse_runtime_setting_value(raw: str):
+    """Parse runtime setting value from CLI string input."""
+    text = (raw or "").strip()
+    if not text:
+        return ""
+    try:
+        return json.loads(text)
+    except Exception:
+        lowered = text.lower()
+        if lowered in {"true", "false"}:
+            return lowered == "true"
+        try:
+            if "." in text:
+                return float(text)
+            return int(text)
+        except Exception:
+            return text
+
+
+def show_runtime_settings(config: Config, scope: str, bot_id: str | None) -> bool:
+    """Display runtime settings from DB for global or bot scope."""
+    from llm_bawt.runtime_settings import RuntimeSettingsStore
+
+    store = RuntimeSettingsStore(config)
+    if store.engine is None:
+        console.print("[red]Runtime settings DB unavailable.[/red]")
+        return False
+
+    if scope == "global":
+        scope_id = "*"
+        title = "Runtime Settings (global)"
+    else:
+        target_bot = bot_id or config.DEFAULT_BOT
+        scope_id = target_bot
+        title = f"Runtime Settings (bot: {target_bot})"
+
+    data = store.get_scope_settings(scope, scope_id)
+    if not data:
+        console.print("[yellow]No runtime settings found for this scope.[/yellow]")
+        console.print("[dim]Tip: run `llm --settings-bootstrap` to seed DB settings from current bot/template config.[/dim]")
+        return True
+
+    table = Table(title=title)
+    table.add_column("Key", style="cyan")
+    table.add_column("Value")
+    for key, value in sorted(data.items()):
+        table.add_row(key, repr(value))
+    console.print(table)
+    return True
+
+
+def set_runtime_setting(config: Config, scope: str, bot_id: str | None, key: str, raw_value: str) -> bool:
+    """Set runtime setting in DB."""
+    from llm_bawt.runtime_settings import RuntimeSettingsStore
+
+    store = RuntimeSettingsStore(config)
+    if store.engine is None:
+        console.print("[red]Runtime settings DB unavailable.[/red]")
+        return False
+
+    scope_id = "*" if scope == "global" else (bot_id or config.DEFAULT_BOT)
+    value = _parse_runtime_setting_value(raw_value)
+    store.set_value(scope, scope_id, key, value)
+    console.print(f"[green]Set runtime setting[/green] {scope}:{scope_id} {key}={value!r}")
+    return True
+
+
+def delete_runtime_setting(config: Config, scope: str, bot_id: str | None, key: str) -> bool:
+    """Delete runtime setting from DB."""
+    from llm_bawt.runtime_settings import RuntimeSettingsStore
+
+    store = RuntimeSettingsStore(config)
+    if store.engine is None:
+        console.print("[red]Runtime settings DB unavailable.[/red]")
+        return False
+
+    scope_id = "*" if scope == "global" else (bot_id or config.DEFAULT_BOT)
+    deleted = store.delete_value(scope, scope_id, key)
+    if not deleted:
+        console.print("[yellow]No matching runtime setting found.[/yellow]")
+        return True
+    console.print(f"[green]Deleted runtime setting[/green] {scope}:{scope_id} {key}")
+    return True
+
+
+def bootstrap_runtime_settings(config: Config, bot_id: str | None, overwrite: bool = False) -> bool:
+    """Seed DB runtime settings from current config/bot effective settings."""
+    from llm_bawt.runtime_settings import RuntimeSettingsStore
+    from llm_bawt.bots import BotManager
+
+    store = RuntimeSettingsStore(config)
+    if store.engine is None:
+        console.print("[red]Runtime settings DB unavailable.[/red]")
+        return False
+
+    bot_manager = BotManager(config)
+    bots = bot_manager.list_bots()
+    if bot_id:
+        target = bot_manager.get_bot(bot_id)
+        if not target:
+            console.print(f"[red]Unknown bot: {bot_id}[/red]")
+            return False
+        bots = [target]
+
+    global_existing = store.get_scope_settings("global", "*")
+    global_map = {
+        "max_context_tokens": config.MAX_CONTEXT_TOKENS,
+        "max_output_tokens": config.MAX_OUTPUT_TOKENS,
+        "history_duration_seconds": config.HISTORY_DURATION_SECONDS,
+        "history_bridge_messages": config.HISTORY_BRIDGE_MESSAGES,
+        "history_reload_ttl_seconds": config.HISTORY_RELOAD_TTL_SECONDS,
+        "summarization_session_gap_seconds": config.SUMMARIZATION_SESSION_GAP_SECONDS,
+        "summarization_min_messages": config.SUMMARIZATION_MIN_MESSAGES,
+        "summarization_skip_low_signal": config.SUMMARIZATION_SKIP_LOW_SIGNAL,
+        "summarization_min_user_messages": config.SUMMARIZATION_MIN_USER_MESSAGES,
+        "summarization_min_content_chars": config.SUMMARIZATION_MIN_CONTENT_CHARS,
+        "summarization_min_meaningful_turns": config.SUMMARIZATION_MIN_MEANINGFUL_TURNS,
+        "summarization_max_in_context": config.SUMMARIZATION_MAX_IN_CONTEXT,
+        "summarization_compact_context": config.SUMMARIZATION_COMPACT_CONTEXT,
+        "memory_n_results": config.MEMORY_N_RESULTS,
+        "memory_protected_recent_turns": config.MEMORY_PROTECTED_RECENT_TURNS,
+        "memory_min_relevance": config.MEMORY_MIN_RELEVANCE,
+        "memory_max_token_percent": config.MEMORY_MAX_TOKEN_PERCENT,
+        "memory_dedup_similarity": config.MEMORY_DEDUP_SIMILARITY,
+        "profile_maintenance_interval_minutes": config.PROFILE_MAINTENANCE_INTERVAL_MINUTES,
+        "history_summarization_interval_minutes": config.HISTORY_SUMMARIZATION_INTERVAL_MINUTES,
+        "temperature": config.TEMPERATURE,
+        "top_p": config.TOP_P,
+    }
+
+    set_count = 0
+    skipped_count = 0
+
+    for key, value in global_map.items():
+        if (key in global_existing) and not overwrite:
+            skipped_count += 1
+            continue
+        store.set_value("global", "*", key, value)
+        set_count += 1
+
+    for bot in bots:
+        bot_existing = store.get_scope_settings("bot", bot.slug)
+        for key, value in (bot.settings or {}).items():
+            if (key in bot_existing) and not overwrite:
+                skipped_count += 1
+                continue
+            store.set_value("bot", bot.slug, key, value)
+            set_count += 1
+
+    scope_label = f"bot '{bot_id}'" if bot_id else "all bots"
+    console.print(
+        f"[green]Bootstrapped runtime settings[/green] ({scope_label}): "
+        f"set={set_count}, skipped={skipped_count}, overwrite={overwrite}"
+    )
+    return True
+
+
+def migrate_bots_to_db(config: Config) -> bool:
+    """Migrate merged YAML bot personalities to bot_profiles and settings to runtime_settings."""
+    from llm_bawt.bots import (
+        get_repo_bots_yaml_path,
+        get_user_bots_yaml_path,
+        _deep_merge,
+    )
+    from llm_bawt.runtime_settings import BotProfileStore, RuntimeSettingsStore
+
+    profile_store = BotProfileStore(config)
+    settings_store = RuntimeSettingsStore(config)
+    if profile_store.engine is None or settings_store.engine is None:
+        console.print("[red]Migration requires database access.[/red]")
+        return False
+
+    def _load_yaml(path: Path) -> dict:
+        if not path.exists():
+            return {}
+        try:
+            return yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+        except Exception as e:
+            console.print(f"[yellow]Skipping invalid YAML {path}: {e}[/yellow]")
+            return {}
+
+    repo_data = _load_yaml(get_repo_bots_yaml_path())
+    user_data = _load_yaml(get_user_bots_yaml_path())
+    merged = _deep_merge(repo_data, user_data)
+    bots_data = merged.get("bots", {}) if isinstance(merged, dict) else {}
+
+    if not isinstance(bots_data, dict) or not bots_data:
+        console.print("[yellow]No YAML bots found to migrate.[/yellow]")
+        return True
+
+    migrated_profiles = 0
+    migrated_settings = 0
+
+    for slug, bot_data in bots_data.items():
+        if not isinstance(bot_data, dict):
+            continue
+        normalized_slug = str(slug).strip().lower()
+        if not normalized_slug:
+            continue
+
+        profile_store.upsert(
+            {
+                "slug": normalized_slug,
+                "name": bot_data.get("name", normalized_slug.title()),
+                "description": bot_data.get("description", ""),
+                "system_prompt": bot_data.get("system_prompt", "You are a helpful assistant."),
+                "requires_memory": bot_data.get("requires_memory", True),
+                "voice_optimized": bot_data.get("voice_optimized", False),
+                "uses_tools": bot_data.get("uses_tools", False),
+                "uses_search": bot_data.get("uses_search", False),
+                "uses_home_assistant": bot_data.get("uses_home_assistant", False),
+                "default_model": bot_data.get("default_model"),
+                "nextcloud_config": bot_data.get("nextcloud"),
+            }
+        )
+        migrated_profiles += 1
+
+        bot_settings = bot_data.get("settings", {}) or {}
+        if isinstance(bot_settings, dict):
+            for key, value in bot_settings.items():
+                settings_store.set_value("bot", normalized_slug, key, value)
+                migrated_settings += 1
+
+    console.print(
+        "[green]Bot migration complete.[/green] "
+        f"profiles={migrated_profiles}, bot_settings={migrated_settings}"
+    )
+
+    try:
+        from llm_bawt.bots import _load_bots_config
+
+        _load_bots_config()
+    except Exception:
+        pass
+
+    return True
+
+
 def run_user_profile_setup(config: Config, user_id: str) -> bool:
     """Run interactive user profile setup wizard."""
     if not has_database_credentials(config):
@@ -1024,6 +1265,15 @@ def parse_arguments(config_obj: Config) -> argparse.Namespace:
     )
     parser.add_argument("--config-set", nargs=2, metavar=("KEY", "VALUE"), help="Set a configuration value (e.g., DEFAULT_MODEL_ALIAS) in the .env file.")
     parser.add_argument("--config-list", action="store_true", help="List the current effective configuration settings.")
+    parser.add_argument("--settings-scope", choices=["bot", "global"], default="bot", help="Scope for runtime settings operations (default: bot)")
+    parser.add_argument("--settings-list", action="store_true", help="List runtime settings from DB for selected scope")
+    parser.add_argument("--settings-set", nargs=2, metavar=("KEY", "VALUE"), help="Set runtime setting in DB for selected scope")
+    parser.add_argument("--settings-delete", metavar="KEY", help="Delete runtime setting from DB for selected scope")
+    parser.add_argument("--settings-bootstrap", action="store_true", help="Seed DB runtime settings from current bot/template/env config")
+    parser.add_argument("--settings-bootstrap-overwrite", action="store_true", help="When bootstrapping, overwrite existing DB keys")
+    parser.add_argument("--settings-edit", action="store_true", help="Edit global runtime settings in your editor and save to DB")
+    parser.add_argument("--bot-edit", metavar="SLUG", help="Edit a single bot config in your editor and save to DB")
+    parser.add_argument("--migrate-bots", action="store_true", help="Migrate merged YAML bots to bot_profiles and runtime_settings DB")
     parser.add_argument("question", nargs="*", help="Your question for the LLM model")
     parser.add_argument("--verbose", action="store_true", help="Enable verbose output")
     parser.add_argument("-dh", "--delete-history", action="store_true", help="Clear chat history")
@@ -1154,6 +1404,46 @@ def main():
         console.print(f"\n[dim]To set a value: llm --config-set KEY value[/dim]")
         console.print(f"[dim]Or edit: {env_file_path}[/dim]")
         sys.exit(0)
+    elif getattr(args, "settings_list", False):
+        ok = show_runtime_settings(config_obj, scope=args.settings_scope, bot_id=args.bot)
+        sys.exit(0 if ok else 1)
+    elif getattr(args, "settings_set", None):
+        key, value = args.settings_set
+        ok = set_runtime_setting(
+            config_obj,
+            scope=args.settings_scope,
+            bot_id=args.bot,
+            key=key,
+            raw_value=value,
+        )
+        sys.exit(0 if ok else 1)
+    elif getattr(args, "settings_delete", None):
+        ok = delete_runtime_setting(
+            config_obj,
+            scope=args.settings_scope,
+            bot_id=args.bot,
+            key=args.settings_delete,
+        )
+        sys.exit(0 if ok else 1)
+    elif getattr(args, "settings_bootstrap", False):
+        ok = bootstrap_runtime_settings(
+            config_obj,
+            bot_id=args.bot if args.settings_scope == "bot" else None,
+            overwrite=bool(getattr(args, "settings_bootstrap_overwrite", False)),
+        )
+        sys.exit(0 if ok else 1)
+    elif getattr(args, "settings_edit", False):
+        from llm_bawt.cli.bot_editor import edit_global_settings
+
+        ok = edit_global_settings(config_obj)
+        sys.exit(0 if ok else 1)
+    elif getattr(args, "bot_edit", None):
+        from llm_bawt.cli.bot_editor import edit_bot_yaml
+        ok = edit_bot_yaml(config_obj, args.bot_edit)
+        sys.exit(0 if ok else 1)
+    elif getattr(args, "migrate_bots", False):
+        ok = migrate_bots_to_db(config_obj)
+        sys.exit(0 if ok else 1)
 
     elif getattr(args, 'status', False):
         show_status(config_obj, args)

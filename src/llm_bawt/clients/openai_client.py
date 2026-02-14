@@ -117,12 +117,13 @@ class OpenAIClient(LLMClient):
     def _chat_create_with_fallback(self, payload: dict):
         """Call chat.completions.create with fallback across token param names."""
         current_key = next((k for k in self._TOKEN_PARAM_CANDIDATES if k in payload), self._initial_token_param_key())
+        current_val = payload.get(current_key, self.effective_max_tokens)
         keys_to_try = [current_key] + [k for k in self._TOKEN_PARAM_CANDIDATES if k != current_key]
 
         last_err: Exception | None = None
         for key in keys_to_try:
             try_payload = dict(payload)
-            self._set_token_param(try_payload, key, self.effective_max_tokens)
+            self._set_token_param(try_payload, key, int(current_val))
             attempted_without_temp_top_p = False
             try:
                 return self.client.chat.completions.create(**try_payload)
@@ -176,6 +177,20 @@ class OpenAIClient(LLMClient):
                 break
         if last_err:
             raise last_err
+
+    @staticmethod
+    def _as_int(value: Any, default: int) -> int:
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return default
+
+    @staticmethod
+    def _as_float(value: Any, default: float) -> float:
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return default
 
     def _log_http_error(self, err: httpx.HTTPStatusError, payload: dict) -> None:
         response = getattr(err, "response", None)
@@ -241,14 +256,13 @@ class OpenAIClient(LLMClient):
         if stop:
             payload["stop"] = stop
 
-        if self._model_requires_max_completion_tokens():
-            payload["max_completion_tokens"] = self.config.MAX_TOKENS
-        else:
-            payload["max_tokens"] = self.config.MAX_TOKENS
+        max_tokens = self._as_int(kwargs.get("max_tokens"), self.config.MAX_OUTPUT_TOKENS)
+        token_key = self._initial_token_param_key()
+        self._set_token_param(payload, token_key, max_tokens)
 
         if self._model_supports_temperature_top_p():
-            payload["temperature"] = self.config.TEMPERATURE
-            payload["top_p"] = self.config.TOP_P
+            payload["temperature"] = self._as_float(kwargs.get("temperature"), self.config.TEMPERATURE)
+            payload["top_p"] = self._as_float(kwargs.get("top_p"), self.config.TOP_P)
 
         try:
             stream = self._chat_create_with_fallback(payload)
@@ -263,6 +277,7 @@ class OpenAIClient(LLMClient):
         tools_schema: list[dict[str, Any]] | None = None,
         tool_choice: str | dict | None = "auto",
         stop: list[str] | str | None = None,
+        **kwargs: Any,
     ) -> Iterator[str | dict]:
         """Stream response with native tool support.
 
@@ -286,14 +301,13 @@ class OpenAIClient(LLMClient):
             if tool_choice is not None:
                 payload["tool_choice"] = tool_choice
 
-        if self._model_requires_max_completion_tokens():
-            payload["max_completion_tokens"] = self.config.MAX_TOKENS
-        else:
-            payload["max_tokens"] = self.config.MAX_TOKENS
+        max_tokens = self._as_int(kwargs.get("max_tokens"), self.config.MAX_OUTPUT_TOKENS)
+        token_key = self._initial_token_param_key()
+        self._set_token_param(payload, token_key, max_tokens)
 
         if self._model_supports_temperature_top_p():
-            payload["temperature"] = self.config.TEMPERATURE
-            payload["top_p"] = self.config.TOP_P
+            payload["temperature"] = self._as_float(kwargs.get("temperature"), self.config.TEMPERATURE)
+            payload["top_p"] = self._as_float(kwargs.get("top_p"), self.config.TOP_P)
 
         yielded_any_content = False
         try:
@@ -377,12 +391,16 @@ class OpenAIClient(LLMClient):
         }
         if stop:
             payload["stop"] = stop
+        response_format = kwargs.get("response_format")
+        if response_format is not None:
+            payload["response_format"] = response_format
+        max_tokens = self._as_int(kwargs.get("max_tokens"), self.config.MAX_OUTPUT_TOKENS)
         token_key = self._initial_token_param_key()
-        self._set_token_param(payload, token_key, self.config.MAX_TOKENS)
-        
+        self._set_token_param(payload, token_key, max_tokens)
+
         if self._model_supports_temperature_top_p():
-            payload["temperature"] = self.config.TEMPERATURE
-            payload["top_p"] = self.config.TOP_P
+            payload["temperature"] = self._as_float(kwargs.get("temperature"), self.config.TEMPERATURE)
+            payload["top_p"] = self._as_float(kwargs.get("top_p"), self.config.TOP_P)
 
         if self.config.VERBOSE:
             self.console.print(Rule("Querying OpenAI API", style="green"))
@@ -426,17 +444,21 @@ class OpenAIClient(LLMClient):
         }
         if stop:
             payload["stop"] = stop
+        response_format = kwargs.get("response_format")
+        if response_format is not None:
+            payload["response_format"] = response_format
         if tools_schema:
             payload["tools"] = tools_schema
             if tool_choice is not None:
                 payload["tool_choice"] = tool_choice
 
+        max_tokens = self._as_int(kwargs.get("max_tokens"), self.config.MAX_OUTPUT_TOKENS)
         token_key = self._initial_token_param_key()
-        self._set_token_param(payload, token_key, self.config.MAX_TOKENS)
+        self._set_token_param(payload, token_key, max_tokens)
 
         if self._model_supports_temperature_top_p():
-            payload["temperature"] = self.config.TEMPERATURE
-            payload["top_p"] = self.config.TOP_P
+            payload["temperature"] = self._as_float(kwargs.get("temperature"), self.config.TEMPERATURE)
+            payload["top_p"] = self._as_float(kwargs.get("top_p"), self.config.TOP_P)
 
         completion = self._chat_create_with_fallback(payload)
         message = completion.choices[0].message

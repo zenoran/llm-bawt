@@ -1,0 +1,70 @@
+"""Helpers for temporal context injection into prompts."""
+
+from __future__ import annotations
+
+from datetime import datetime, timedelta, timezone
+from typing import Any, Sequence
+
+
+def _relative_time(seconds: float) -> str:
+    if seconds < 60:
+        return "just now"
+    if seconds < 3600:
+        minutes = int(seconds // 60)
+        return f"{minutes} minute{'s' if minutes != 1 else ''} ago"
+    if seconds < 86400:
+        hours = int(seconds // 3600)
+        return f"{hours} hour{'s' if hours != 1 else ''} ago"
+    days = int(seconds // 86400)
+    if days == 1:
+        return "yesterday"
+    return f"{days} days ago"
+
+
+def _get_last_contact_epoch(history_messages: Sequence[Any]) -> float | None:
+    """Best-effort 'last time we spoke' from user/assistant messages."""
+    candidates: list[Any] = [
+        m for m in history_messages if getattr(m, "role", None) in ("user", "assistant")
+    ]
+    if not candidates:
+        return None
+    candidates.sort(key=lambda m: float(getattr(m, "timestamp", 0.0)))
+
+    # Current turn often adds a fresh user message before prompt assembly.
+    # Use the prior turn marker when available so "last contact" is meaningful.
+    latest = candidates[-1]
+    if getattr(latest, "role", None) == "user" and len(candidates) >= 2:
+        return float(getattr(candidates[-2], "timestamp", 0.0))
+    return float(getattr(latest, "timestamp", 0.0))
+
+
+def build_temporal_context(history_messages: Sequence[Any] | None = None) -> str:
+    """Return a concise temporal context block for prompt grounding."""
+    now_local = datetime.now().astimezone()
+    now_utc = datetime.now(timezone.utc)
+    tz_name = now_local.tzname() or "local"
+
+    lines = [
+        "## Temporal Context",
+        f"NOW_UTC: {now_utc.isoformat()}",
+        f"NOW_LOCAL: {now_local.isoformat()} ({tz_name})",
+        f"TODAY_LOCAL: {now_local.date().isoformat()}",
+        f"YESTERDAY_LOCAL: {(now_local.date() - timedelta(days=1)).isoformat()}",
+        f"THIS_WEEK_START_LOCAL: {(now_local.date() - timedelta(days=now_local.weekday())).isoformat()}",
+    ]
+
+    if history_messages:
+        last_contact = _get_last_contact_epoch(history_messages)
+        if last_contact is not None and last_contact > 0:
+            last_local = datetime.fromtimestamp(last_contact, tz=now_local.tzinfo)
+            delta = max(0.0, now_local.timestamp() - last_contact)
+            lines.append(f"LAST_CONTACT_AT_LOCAL: {last_local.isoformat()}")
+            lines.append(f"LAST_CONTACT_RELATIVE: {_relative_time(delta)}")
+        else:
+            lines.append("LAST_CONTACT_AT_LOCAL: unknown")
+            lines.append("LAST_CONTACT_RELATIVE: unknown")
+    else:
+        lines.append("LAST_CONTACT_AT_LOCAL: unknown")
+        lines.append("LAST_CONTACT_RELATIVE: unknown")
+
+    return "\n".join(lines)

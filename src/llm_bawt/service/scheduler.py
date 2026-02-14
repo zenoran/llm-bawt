@@ -10,6 +10,7 @@ from uuid import uuid4
 
 from sqlmodel import Field, SQLModel, Session, select
 from sqlalchemy import Column, DateTime, Text, text
+from ..runtime_settings import RuntimeSettingsResolver
 
 logger = logging.getLogger(__name__)
 
@@ -298,6 +299,7 @@ class JobScheduler:
 
 def init_default_jobs(engine, config) -> None:
     """Initialize default scheduled jobs if they don't exist."""
+    global_settings = RuntimeSettingsResolver(config=config)
     with Session(engine) as session:
         # Check if profile maintenance job exists
         existing = session.exec(
@@ -310,25 +312,53 @@ def init_default_jobs(engine, config) -> None:
                 job_type=JobType.PROFILE_MAINTENANCE,
                 bot_id="*",  # All bots
                 enabled=config.SCHEDULER_ENABLED,
-                interval_minutes=config.PROFILE_MAINTENANCE_INTERVAL_MINUTES,
+                interval_minutes=int(
+                    global_settings.resolve(
+                        "profile_maintenance_interval_minutes",
+                        config.PROFILE_MAINTENANCE_INTERVAL_MINUTES,
+                    )
+                ),
                 config_json=json.dumps({"entity_id": default_user, "entity_type": "user"}),
             )
             session.add(job)
             session.commit()
             logger.debug("Created default profile maintenance job")
 
-        # Check if history summarization job exists
-        existing_history = session.exec(
+        # Ensure history summarization jobs exist for each configured bot.
+        # Track A/Track F history behavior is bot-scoped; a single default-bot
+        # job leaves other bots (e.g., mira) without summary rows.
+        existing_history_jobs = session.exec(
             select(ScheduledJob).where(ScheduledJob.job_type == JobType.HISTORY_SUMMARIZATION)
-        ).first()
+        ).all()
+        existing_history_bot_ids = {job.bot_id for job in existing_history_jobs}
 
-        if not existing_history:
-            default_bot = config.DEFAULT_BOT or "nova"
+        # Backward compatibility: if an all-bots wildcard exists, do nothing.
+        if "*" in existing_history_bot_ids:
+            return
+
+        from llm_bawt.bots import BotManager
+
+        bot_manager = BotManager(config)
+        target_bots = [bot.slug for bot in bot_manager.list_bots()]
+        if not target_bots:
+            target_bots = [config.DEFAULT_BOT or "nova"]
+
+        created = 0
+        for bot_id in target_bots:
+            if bot_id in existing_history_bot_ids:
+                continue
+            bot_settings = RuntimeSettingsResolver(config=config, bot_id=bot_id)
+
             history_job = ScheduledJob(
                 job_type=JobType.HISTORY_SUMMARIZATION,
-                bot_id=default_bot,
+                bot_id=bot_id,
                 enabled=config.SCHEDULER_ENABLED,
-                interval_minutes=getattr(config, "HISTORY_SUMMARIZATION_INTERVAL_MINUTES", 30),
+                interval_minutes=int(
+                    bot_settings.resolve(
+                        "history_summarization_interval_minutes",
+                        getattr(config, "HISTORY_SUMMARIZATION_INTERVAL_MINUTES", 30),
+                    )
+                ),
                 config_json=json.dumps(
                     {
                         "user_id": "system",
@@ -338,5 +368,8 @@ def init_default_jobs(engine, config) -> None:
                 ),
             )
             session.add(history_job)
+            created += 1
+
+        if created:
             session.commit()
-            logger.debug("Created default history summarization job")
+            logger.debug("Created %d history summarization job(s)", created)

@@ -6,7 +6,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 import yaml
-from pydantic import Field
+from pydantic import BaseModel, Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from rich.console import Console
 
@@ -95,9 +95,56 @@ def get_dotenv_path() -> Path:
 
 DOTENV_PATH = get_dotenv_path()
 
-class Config(BaseSettings):
+
+class RuntimeTunables(BaseModel):
+    """Per-bot runtime tunables — introspectable for help text and field metadata.
+
+    These are the settings that can be overridden per-bot via DB or YAML.
+    Runtime settings keys are just the lowercase field name (e.g. MAX_OUTPUT_TOKENS -> max_output_tokens).
+    """
+
+    # --- Context & History --- #
+    MAX_CONTEXT_TOKENS: int = Field(default=0, description="Total token budget for the prompt (system + history + memory). 0 = auto from model context window.")
+    MAX_OUTPUT_TOKENS: int = Field(default=1024 * 4, description="Max tokens the model may generate per reply")
+    HISTORY_DURATION_SECONDS: int = Field(default=60 * 30, description="How far back (seconds) to load raw chat history. Older messages only available as summaries. (1800 = 30 min)")
+    HISTORY_BRIDGE_MESSAGES: int = Field(default=4, description="Most-recent messages always kept in context even beyond the duration window")
+    HISTORY_RELOAD_TTL_SECONDS: float = Field(default=2.0, description="How long service history cache stays fresh before reloading from DB (0 = every request)")
+
+    # --- Summarization --- #
+    SUMMARIZATION_SESSION_GAP_SECONDS: int = Field(default=3600, description="Gap (seconds) between messages that splits history into separate sessions (3600 = 1 hr)")
+    SUMMARIZATION_MIN_MESSAGES: int = Field(default=4, description="Minimum messages a session must have to be worth summarizing")
+    SUMMARIZATION_SKIP_LOW_SIGNAL: bool = Field(default=True, description="Skip low-value sessions (greetings/tests/noise) during summarization")
+    SUMMARIZATION_MIN_USER_MESSAGES: int = Field(default=2, description="Minimum user messages required before a session can be summarized")
+    SUMMARIZATION_MIN_CONTENT_CHARS: int = Field(default=160, description="Minimum total user+assistant content chars required for summarization")
+    SUMMARIZATION_MIN_MEANINGFUL_TURNS: int = Field(default=3, description="Minimum substantial user/assistant turns required for summarization")
+    SUMMARIZATION_MAX_IN_CONTEXT: int = Field(default=5, description="Max past session summaries injected into the prompt")
+    SUMMARIZATION_COMPACT_CONTEXT: bool = Field(default=True, description="Use shorter summary representations in the prompt to save tokens")
+
+    # --- Memory Retrieval --- #
+    MEMORY_N_RESULTS: int = Field(default=10, description="Semantic-memory results to retrieve on cold start")
+    MEMORY_PROTECTED_RECENT_TURNS: int = Field(default=3, description="Recent conversation turns shielded from eviction when trimming context")
+    MEMORY_MIN_RELEVANCE: float = Field(default=0.01, description="Minimum cosine-similarity score for a memory hit to be included (0.0-1.0)")
+    MEMORY_MAX_TOKEN_PERCENT: int = Field(default=30, description="Max percentage of context budget that memory results may occupy (0-100)")
+    MEMORY_DEDUP_SIMILARITY: float = Field(default=0.85, description="Similarity threshold for deduplicating near-identical memory hits (0.0-1.0)")
+
+    # --- Generation --- #
+    TEMPERATURE: float = Field(default=0.8, description="Sampling temperature (0.0 = deterministic, higher = more creative)")
+    TOP_P: float = Field(default=0.95, description="Nucleus sampling cutoff. Lower = less random.")
+
+
+# Map of runtime settings key -> RuntimeTunables field name (trivial: just uppercase)
+def runtime_key_to_config(key: str) -> str:
+    """Convert a runtime settings key to its Config field name."""
+    return key.upper()
+
+
+def config_to_runtime_key(field_name: str) -> str:
+    """Convert a Config field name to its runtime settings key."""
+    return field_name.lower()
+
+
+class Config(RuntimeTunables, BaseSettings):
     HISTORY_FILE: str = Field(default=os.path.expanduser("~/.cache/llm-bawt/chat-history"))
-    HISTORY_DURATION: int = Field(default=60 * 30)  # 30 minutes in seconds
     OLLAMA_URL: str = Field(default="http://localhost:11434")
     MODEL_CACHE_DIR: str = Field(default=os.path.expanduser("~/.cache/llm-bawt/models"), description="Directory to cache downloaded GGUF models")
     MODELS_CONFIG_PATH: str = Field(default=str(DEFAULT_MODELS_YAML), description="Path to the models YAML definition file")
@@ -107,13 +154,6 @@ class Config(BaseSettings):
         default=None,
         description="User profile to use. Set via LLM_BAWT_DEFAULT_USER env var.",
     )
-
-    # --- Memory Settings --- #
-    MEMORY_N_RESULTS: int = Field(default=10, description="Number of relevant memories to retrieve during search (Set via LLM_BAWT_MEMORY_N_RESULTS)")
-    MEMORY_PROTECTED_RECENT_TURNS: int = Field(default=3, description="Number of recent conversation turns to always include regardless of token limits (Set via LLM_BAWT_MEMORY_PROTECTED_RECENT_TURNS)")
-    MEMORY_MIN_RELEVANCE: float = Field(default=0.01, description="Minimum relevance score (0.0-1.0) for memories to be included (Set via LLM_BAWT_MEMORY_MIN_RELEVANCE)")
-    MEMORY_MAX_TOKEN_PERCENT: int = Field(default=30, description="Maximum percentage of context window to use for memories (Set via LLM_BAWT_MEMORY_MAX_TOKEN_PERCENT)")
-    MEMORY_DEDUP_SIMILARITY: float = Field(default=0.85, description="Similarity threshold (0.0-1.0) for fuzzy deduplication of memories against history (Set via LLM_BAWT_MEMORY_DEDUP_SIMILARITY)")
 
     # Optional MCP memory server (HTTP JSON-RPC). If set, memory operations use server mode
     # and you will see tool calls like `tools/search_memories` in logs.
@@ -172,6 +212,10 @@ class Config(BaseSettings):
         default=30,
         description="Run history summarization every N minutes",
     )
+    MAINTENANCE_MODEL: str = Field(
+        default="",
+        description="Default model alias for maintenance jobs (empty = job-specific defaults)",
+    )
     PROFILE_MAINTENANCE_MODEL: str = Field(default="", description="Model to use for profile summarization (empty = default)")
 
     # --- Service Settings --- #
@@ -201,22 +245,10 @@ class Config(BaseSettings):
         description="Brave safesearch level: off, moderate, strict"
     )
 
-    # --- History Summarization Settings --- #
-    SUMMARIZATION_SESSION_GAP_SECONDS: int = Field(
-        default=3600,
-        description="Gap in seconds between messages to consider them separate sessions (1 hour default)"
-    )
-    SUMMARIZATION_MIN_MESSAGES: int = Field(
-        default=4,
-        description="Minimum messages in a session before it's eligible for summarization"
-    )
-    SUMMARIZATION_MAX_IN_CONTEXT: int = Field(
-        default=5,
-        description="Maximum number of summaries to include in context window"
-    )
+    # --- Summarization (non-tunable) --- #
     SUMMARIZATION_MODEL: str = Field(
         default="dolphin-qwen-3b",
-        description="Model alias to use for summarization (uses loaded model by default)"
+        description="Model alias to use for history summarization (empty = MAINTENANCE_MODEL/default)"
     )
 
     # --- Tool Calling Settings --- #
@@ -225,11 +257,7 @@ class Config(BaseSettings):
         description="Maximum number of tool calls per conversation turn (0 = unlimited)"
     )
 
-    # --- LLM Generation Settings --- #
-    MAX_TOKENS: int = Field(default=1024*4, description="Default maximum tokens to generate")
-    MAX_CONTEXT_TOKENS: int = Field(default=0, description="Maximum context tokens for input (0 = use LLAMA_CPP_N_CTX - MAX_TOKENS)")
-    TEMPERATURE: float = Field(default=0.8, description="Default generation temperature")
-    TOP_P: float = Field(default=0.95, description="Default nucleus sampling top-p")
+    # --- LLM Hardware Settings --- #
     LLAMA_CPP_N_CTX: int = Field(default=32768, description="Context size for Llama.cpp models (32K for high VRAM)")
     LLAMA_CPP_N_GPU_LAYERS: int = Field(default=-1, description="Number of layers to offload to GPU (-1 for all possible layers)")
     LLAMA_CPP_N_BATCH: int = Field(default=2048, description="Batch size for prompt processing (higher = faster but more VRAM)")
@@ -372,7 +400,7 @@ class Config(BaseSettings):
         if yaml_val is not None:
             return int(yaml_val)
         model_type = model_def.get("type", "")
-        if model_type == "openai":
+        if model_type in ("openai", "grok"):
             return 128000
         return self.LLAMA_CPP_N_CTX or 32768
 
@@ -381,14 +409,14 @@ class Config(BaseSettings):
 
         Resolution order:
         1. Per-model `max_tokens` in models.yaml
-        2. Global MAX_TOKENS config
+        2. Global MAX_OUTPUT_TOKENS config
         3. Hardcoded default: 4096
         """
         model_def = self.defined_models.get("models", {}).get(model_alias or "", {})
         yaml_val = model_def.get("max_tokens")
         if yaml_val is not None:
             return int(yaml_val)
-        return self.MAX_TOKENS or 4096
+        return self.MAX_OUTPUT_TOKENS or 4096
 
     def get_model_n_gpu_layers(self, model_alias: str | None = None) -> int:
         """Get the effective n_gpu_layers for a model.

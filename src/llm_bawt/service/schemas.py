@@ -2,6 +2,7 @@
 
 import time
 import uuid
+from datetime import datetime
 from typing import Any, Literal
 
 from pydantic import BaseModel, Field
@@ -117,6 +118,39 @@ class BotsResponse(BaseModel):
     """Response for /v1/bots endpoint."""
     object: str = "list"
     data: list[BotInfo]
+
+
+class BotProfileResponse(BaseModel):
+    """Response payload for a bot profile."""
+
+    slug: str
+    name: str
+    description: str
+    system_prompt: str
+    requires_memory: bool = True
+    voice_optimized: bool = False
+    uses_tools: bool = False
+    uses_search: bool = False
+    uses_home_assistant: bool = False
+    default_model: str | None = None
+    nextcloud_config: dict[str, Any] | None = None
+    created_at: datetime | None = None
+    updated_at: datetime | None = None
+
+
+class BotProfileUpsertRequest(BaseModel):
+    """Request payload for upserting a bot profile."""
+
+    name: str
+    description: str = ""
+    system_prompt: str
+    requires_memory: bool = True
+    voice_optimized: bool = False
+    uses_tools: bool = False
+    uses_search: bool = False
+    uses_home_assistant: bool = False
+    default_model: str | None = None
+    nextcloud_config: dict[str, Any] | None = None
 
 
 class TaskSubmitRequest(BaseModel):
@@ -345,6 +379,9 @@ class SummarizeResponse(BaseModel):
     success: bool
     sessions_summarized: int
     messages_summarized: int
+    sessions_targeted: int | None = None
+    summaries_replaced: int | None = None
+    summaries_purged: int | None = None
     errors: list[str] = []
 
 
@@ -446,3 +483,41 @@ class NextcloudProvisionResponse(BaseModel):
     room_url: str
     nextcloud_bot_id: int
     nextcloud_bot_name: str
+
+
+# =============================================================================
+# Runtime Settings Schemas
+# =============================================================================
+
+class RuntimeSettingItem(BaseModel):
+    """Runtime setting key/value item."""
+    key: str
+    value: Any
+
+
+class RuntimeSettingsResponse(BaseModel):
+    """List runtime settings for a scope."""
+    scope_type: str
+    scope_id: str
+    settings: list[RuntimeSettingItem]
+
+
+class RuntimeSettingUpsertRequest(BaseModel):
+    """Upsert one runtime setting."""
+    scope_type: Literal["global", "bot"]
+    scope_id: str | None = None
+    key: str
+    value: Any
+
+
+class RuntimeSettingBatchItem(BaseModel):
+    """One runtime setting upsert in a batch request."""
+    scope_type: Literal["global", "bot"]
+    scope_id: str | None = None
+    key: str
+    value: Any
+
+
+class RuntimeSettingBatchUpsertRequest(BaseModel):
+    """Batch upsert runtime settings."""
+    items: list[RuntimeSettingBatchItem]

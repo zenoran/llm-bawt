@@ -602,44 +602,28 @@ class MemoryStorage:
         since_seconds: int | None = None,
         limit: int | None = None,
     ) -> list[dict[str, Any]]:
-        """Get messages for building a context window."""
-        backend = self._get_backend(bot_id)
-        from sqlalchemy import text
+        """Get messages for building a context window.
 
-        params: dict[str, Any] = {}
-        where = ""
-        if since_seconds is not None:
-            cutoff = time.time() - since_seconds
-            where = "WHERE timestamp >= :cutoff"
-            params["cutoff"] = cutoff
-
-        limit_sql = ""
-        if limit is not None:
-            limit_sql = "LIMIT :limit"
-            params["limit"] = limit
-
-        sql = text(
-            f"""
-            SELECT id, role, content, timestamp, session_id
-            FROM {backend._messages_table_name}
-            {where}
-            ORDER BY timestamp ASC
-            {limit_sql}
-            """
-        )
+        Uses the short-term manager's summary-aware retrieval path so older
+        session summaries are available when raw history falls outside the
+        recent time window.
+        """
+        manager = self.get_short_term_manager(bot_id)
 
         try:
-            with backend.engine.connect() as conn:
-                rows = conn.execute(sql, params).fetchall()
+            messages = manager.get_messages(since_minutes=since_seconds)
+            if limit is not None and limit >= 0:
+                messages = messages[-limit:]
+
             return [
                 {
-                    "id": row.id,
-                    "role": row.role,
-                    "content": row.content,
-                    "timestamp": row.timestamp,
-                    "session_id": row.session_id,
+                    "id": msg.db_id,
+                    "role": msg.role,
+                    "content": msg.content,
+                    "timestamp": msg.timestamp,
+                    "session_id": None,
                 }
-                for row in rows
+                for msg in messages
             ]
         except Exception as e:
             logger.error("Failed to get messages: %s", e)

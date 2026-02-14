@@ -35,7 +35,7 @@ class LLMClient(ABC):
         yaml_val = self.model_definition.get("max_tokens")
         if yaml_val is not None:
             return int(yaml_val)
-        return self.config.MAX_TOKENS or 4096
+        return self.config.MAX_OUTPUT_TOKENS or 4096
 
     @property
     def effective_context_window(self) -> int:
@@ -44,7 +44,7 @@ class LLMClient(ABC):
         if yaml_val is not None:
             return int(yaml_val)
         model_type = self.model_definition.get("type", "")
-        if model_type == "openai":
+        if model_type in ("openai", "grok"):
             return 128000
         return self.config.LLAMA_CPP_N_CTX or 32768
 

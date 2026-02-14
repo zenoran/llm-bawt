@@ -8,6 +8,7 @@ from .memory import router as memory_router
 from .models import router as models_router
 from .nextcloud import router as nextcloud_router
 from .profiles import router as profiles_router
+from .settings import router as settings_router
 from .tasks import router as tasks_router
 
 all_routers = [
@@ -18,6 +19,7 @@ all_routers = [
     tasks_router,
     history_router,
     memory_router,
+    settings_router,
     profiles_router,
     llm_router,
 ]

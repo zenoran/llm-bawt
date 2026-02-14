@@ -275,8 +275,15 @@ class RequestPipeline:
     def _stage_context_build(self, ctx: PipelineContext):
         """Stage 2: Build system prompt using PromptBuilder."""
         from .prompt_builder import PromptBuilder, SectionPosition
+        from ..utils.temporal import build_temporal_context
         
         builder = PromptBuilder()
+
+        builder.add_section(
+            "temporal_context",
+            build_temporal_context(self.history_manager.messages if self.history_manager else None),
+            position=SectionPosition.DATETIME,
+        )
         
         # Section 1: User profile context
         if self.profile_manager and ctx.use_memory:
@@ -547,7 +554,7 @@ class RequestPipeline:
         })
     
     def _stage_post_process(self, ctx: PipelineContext):
-        """Stage 7: Post-processing (history save, memory extraction)."""
+        """Stage 7: Post-processing (history save)."""
         if not ctx.response:
             return
 
@@ -563,42 +570,10 @@ class RequestPipeline:
                     "system", f"[Tool Results @ {ts}]\n{ctx.tool_context}"
                 )
 
-        # Trigger memory extraction for all memory-enabled bots
-        if ctx.use_memory and self.memory_client:
-            self._trigger_memory_extraction(ctx)
-
         ctx.record_output(PipelineStage.POST_PROCESS, {
             "saved_to_history": self.history_manager is not None,
-            "extraction_triggered": ctx.use_memory and self.memory_client is not None,
+            "extraction_triggered": False,
         })
-
-    def _trigger_memory_extraction(self, ctx: PipelineContext):
-        """Trigger background memory extraction."""
-        import threading
-        import uuid
-
-        def extract():
-            try:
-                from ..service import ServiceClient
-                from ..service.tasks import create_extraction_task
-
-                client = ServiceClient()
-                if client.is_available():
-                    task = create_extraction_task(
-                        user_message=ctx.prompt,
-                        assistant_message=ctx.response,
-                        bot_id=ctx.bot_id,
-                        user_id=ctx.user_id,
-                        message_ids=[str(uuid.uuid4()), str(uuid.uuid4())],
-                        model=None,  # Use default
-                    )
-                    client.submit_task(task)
-            except Exception as e:
-                logger.debug(f"Memory extraction failed: {e}")
-
-        thread = threading.Thread(target=extract, daemon=True)
-        thread.start()
-        thread.join(timeout=0.5)
     
     def _log_summary(self, ctx: PipelineContext):
         """Log a summary of the pipeline execution."""

@@ -1158,13 +1158,13 @@ class ToolExecutor:
         try:
             if action == "status":
                 text = self.home_client.status()
-                return format_tool_result(tool_call.name, self._compact_home_text(text, max_lines=6))
+                return format_tool_result(tool_call.name, text)
 
             if action == "query":
                 pattern = tool_call.arguments.get("pattern")
                 domain = tool_call.arguments.get("domain")
                 text = self.home_client.query(pattern=pattern, domain=domain)
-                return format_tool_result(tool_call.name, self._compact_home_text(text, max_lines=10))
+                return format_tool_result(tool_call.name, text)
 
             if action == "get":
                 entity = str(tool_call.arguments.get("entity", "")).strip()
@@ -1196,7 +1196,7 @@ class ToolExecutor:
                             f"Call home with action='query' first to find the exact entity ID.{hint}"
                         ),
                     )
-                return format_tool_result(tool_call.name, self._compact_home_text(text, max_lines=8))
+                return format_tool_result(tool_call.name, text)
 
             if action == "set":
                 entity = str(tool_call.arguments.get("entity", "")).strip()
@@ -1241,7 +1241,7 @@ class ToolExecutor:
                             f"Call home with action='query' first to find the exact entity ID.{hint}"
                         ),
                     )
-                return format_tool_result(tool_call.name, self._compact_home_text(text, max_lines=5))
+                return format_tool_result(tool_call.name, text)
 
             if action == "scene":
                 scene_name = str(
@@ -1256,7 +1256,7 @@ class ToolExecutor:
                         error="action='scene' requires 'scene_name'",
                     )
                 text = self.home_client.scene(name=scene_name)
-                return format_tool_result(tool_call.name, self._compact_home_text(text, max_lines=5))
+                return format_tool_result(tool_call.name, text)
 
             return format_tool_result(
                 tool_call.name,

@@ -6,8 +6,6 @@ The service runs on the server and can load models directly.
 
 import logging
 import time
-import threading
-import uuid
 from typing import TYPE_CHECKING
 
 from rich.console import Console
@@ -70,6 +68,29 @@ class ServiceLLMBawt(BaseLLMBawt):
             debug=debug,
             existing_client=existing_client,
         )
+        self._last_history_load_at: float = time.time()
+
+    def _refresh_history_if_stale(self) -> None:
+        """Refresh history from DB only when cache is stale."""
+        ttl = max(
+            0.0,
+            float(
+                self._resolve_setting(
+                    "history_reload_ttl_seconds",
+                    getattr(self.config, "HISTORY_RELOAD_TTL_SECONDS", 0.0),
+                )
+            ),
+        )
+        now = time.time()
+        is_empty = not bool(getattr(self.history_manager, "messages", []))
+        is_stale = ttl == 0.0 or (now - self._last_history_load_at) >= ttl
+        if is_empty or is_stale:
+            self.load_history()
+            self._last_history_load_at = now
+
+    def invalidate_history_cache(self) -> None:
+        """Force a history refresh on the next request."""
+        self._last_history_load_at = 0.0
     
     def _initialize_client(self) -> LLMClient:
         """Initialize client based on model type - supports local models."""
@@ -206,11 +227,9 @@ class ServiceLLMBawt(BaseLLMBawt):
         Returns:
             List of messages ready for LLM query
         """
-        # Reload history from database to ensure we have the latest messages.
-        # The ServiceLLMBawt instance is cached across requests, so in-memory
-        # history may be stale (missing messages from CLI, other sessions, or
-        # messages that were only in DB but not loaded at init time).
-        self.load_history()
+        # Refresh from DB only when stale to reduce per-turn read pressure.
+        # Set HISTORY_RELOAD_TTL_SECONDS=0 to force legacy "reload every request".
+        self._refresh_history_if_stale()
 
         # Add user message to history first
         self.history_manager.add_message("user", prompt)
@@ -276,16 +295,14 @@ class ServiceLLMBawt(BaseLLMBawt):
     
     def finalize_response(
         self,
-        user_prompt: str,
         response: str,
         tool_context: str = "",
     ):
-        """Finalize the response by saving to history and triggering extraction.
+        """Finalize the response by saving to history.
         
         Called by the service API after receiving the response.
         
         Args:
-            user_prompt: The original user prompt
             response: The assistant's response
             tool_context: Optional tool results to save to history
         """
@@ -297,44 +314,6 @@ class ServiceLLMBawt(BaseLLMBawt):
         
         if response:
             self.history_manager.add_message("assistant", response)
-            
-            # Trigger background memory extraction for all memory-enabled bots
-            if self.memory:
-                self._trigger_memory_extraction(user_prompt, response)
-    
-    def _trigger_memory_extraction(self, user_prompt: str, assistant_response: str):
-        """Trigger background memory extraction with service-specific logging."""
-        if not self.memory:
-            slog.debug("Skipping extraction - no memory client")
-            return
-        
-        slog.debug(f"Triggering extraction for {self.bot_id}/{self.user_id}")
-        
-        def extract():
-            try:
-                from ..service import ServiceClient
-                from ..service.tasks import create_extraction_task
-                
-                client = ServiceClient()
-                if client.is_available():
-                    task = create_extraction_task(
-                        user_message=user_prompt,
-                        assistant_message=assistant_response,
-                        bot_id=self.bot_id,
-                        user_id=self.user_id,
-                        message_ids=[str(uuid.uuid4()), str(uuid.uuid4())],
-                        model=self.resolved_model_alias,
-                    )
-                    client.submit_task(task)
-                    slog.debug(f"Extraction task submitted: {task.task_id[:8]}")
-                else:
-                    slog.warning("Extraction skipped - service unavailable")
-            except Exception as e:
-                logger.exception(f"Memory extraction failed: {e}")
-        
-        thread = threading.Thread(target=extract, daemon=True)
-        thread.start()
-        thread.join(timeout=0.5)
     
     def refine_prompt(self, prompt: str, history: list | None = None) -> str:
         """Refine the user's prompt using context.

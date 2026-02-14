@@ -52,6 +52,7 @@ class ToolLoop:
         tools: list | None = None,
         adapter: "ModelAdapter | None" = None,
         history_manager: "HistoryManager | None" = None,
+        generation_kwargs: dict | None = None,
     ):
         """
         Args:
@@ -92,6 +93,7 @@ class ToolLoop:
         self.format_handler = get_format_handler(tool_format)
         self._using_native_tools = False
         self.adapter = adapter
+        self.generation_kwargs = generation_kwargs or {}
     
     def run(
         self,
@@ -426,6 +428,7 @@ class ToolLoop:
                 tools_schema=tools_schema,
                 tool_choice="auto",
                 stop=None,
+                **self.generation_kwargs,
             )
             
             # If we got tool_calls from native mode, return them in a dict
@@ -446,7 +449,7 @@ class ToolLoop:
                 adapter_stops = self.adapter.get_stop_sequences()
                 if adapter_stops:
                     stop_sequences.extend(adapter_stops)
-        return client.query(messages, plaintext_output=True, stream=False, stop=stop_sequences)
+        return client.query(messages, plaintext_output=True, stream=False, stop=stop_sequences, **self.generation_kwargs)
 
 
 def query_with_tools(
@@ -466,6 +469,7 @@ def query_with_tools(
     tools: list | None = None,
     adapter: "ModelAdapter | None" = None,
     history_manager: "HistoryManager | None" = None,
+    generation_kwargs: dict | None = None,
 ) -> tuple[str, str, list[dict]]:
     """Convenience function for tool-enabled queries.
 
@@ -508,6 +512,7 @@ def query_with_tools(
         tools=tools,
         adapter=adapter,
         history_manager=history_manager,
+        generation_kwargs=generation_kwargs,
     )
     response = loop.run(messages, client, stream_final=stream)
     tool_context = loop.get_tool_context_summary()

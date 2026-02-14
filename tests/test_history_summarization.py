@@ -4,6 +4,10 @@ import time
 
 from llm_bawt.memory.summarization import (
     Session,
+    SUMMARIZATION_PROMPT,
+    extract_summary_sections,
+    is_low_signal_session,
+    normalize_structured_summary_text,
     estimate_session_token_savings,
     find_summarizable_sessions,
     prioritize_summarizable_sessions,
@@ -53,6 +57,7 @@ def test_find_summarizable_sessions_filters_by_age_and_size() -> None:
         [eligible, too_small, too_new],
         history_duration_seconds=300,
         min_messages=4,
+        skip_low_signal=False,
     )
 
     assert len(result) == 1
@@ -89,3 +94,82 @@ def test_prioritize_summarizable_sessions_orders_by_estimated_savings() -> None:
 
     prioritized = prioritize_summarizable_sessions([short_session, long_session])
     assert prioritized[0].start_timestamp == long_session.start_timestamp
+
+
+def test_summarization_prompt_includes_intent_and_tone_sections() -> None:
+    prompt = SUMMARIZATION_PROMPT.format(messages="User: hi\nAssistant: hello")
+    assert "Intent:" in prompt
+    assert "Tone:" in prompt
+    assert "Open Loops:" in prompt
+
+
+def test_extract_summary_sections_parses_structured_output() -> None:
+    text = (
+        "Summary: User asked about deploys.\n"
+        "Intent: Fix a broken production pipeline.\n"
+        "Tone: Frustrated but focused.\n"
+        "Open Loops: Confirm rollback policy."
+    )
+    parsed = extract_summary_sections(text)
+    assert parsed["summary"] == "User asked about deploys."
+    assert parsed["intent"] == "Fix a broken production pipeline."
+    assert parsed["tone"] == "Frustrated but focused."
+    assert parsed["open_loops"] == "Confirm rollback policy."
+
+
+def test_normalize_structured_summary_text_fills_missing_sections() -> None:
+    normalized = normalize_structured_summary_text("User asked about DNS propagation.")
+    assert normalized.startswith("Summary: User asked about DNS propagation.")
+    assert "Intent:" in normalized
+    assert "Tone:" in normalized
+    assert "Open Loops:" in normalized
+
+
+def test_is_low_signal_session_flags_greeting_noise() -> None:
+    now = time.time() - 7200
+    session = _session(
+        now,
+        now + 5,
+        [
+            {"id": "n1", "role": "user", "content": "hi", "timestamp": now + 1},
+            {"id": "n2", "role": "assistant", "content": "hey", "timestamp": now + 2},
+            {"id": "n3", "role": "user", "content": "test", "timestamp": now + 3},
+            {"id": "n4", "role": "assistant", "content": "ok", "timestamp": now + 4},
+        ],
+    )
+    assert is_low_signal_session(session) is True
+
+
+def test_is_low_signal_session_allows_substantive_exchange() -> None:
+    now = time.time() - 7200
+    session = _session(
+        now,
+        now + 50,
+        [
+            {
+                "id": "s1",
+                "role": "user",
+                "content": "The deployment is failing after migration and I need help tracing DB auth issues.",
+                "timestamp": now + 1,
+            },
+            {
+                "id": "s2",
+                "role": "assistant",
+                "content": "Share exact error lines and we can isolate whether this is token, permission, or network config.",
+                "timestamp": now + 2,
+            },
+            {
+                "id": "s3",
+                "role": "user",
+                "content": "Error says role cannot read table, but token refresh also failed right before it.",
+                "timestamp": now + 3,
+            },
+            {
+                "id": "s4",
+                "role": "assistant",
+                "content": "Got it. Check migration grants first, then rotate token and retry webhook callback validation.",
+                "timestamp": now + 4,
+            },
+        ],
+    )
+    assert is_low_signal_session(session) is False

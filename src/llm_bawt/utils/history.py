@@ -3,7 +3,7 @@ import json
 import time
 import logging
 import uuid
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Callable, Any
 
 from ..clients.base import LLMClient
 from ..models.message import Message
@@ -46,12 +46,14 @@ class HistoryManager:
         config: Config,
         db_backend: "ShortTermMemoryManager | None" = None,
         bot_id: str = "nova",
+        settings_getter: Callable[[str, Any], Any] | None = None,
     ):
         self.client = client
         self.config = config
         self.bot_id = bot_id
         self.messages = []
         self._db_backend = db_backend
+        self._settings_getter = settings_getter
         
         # Use per-bot history files for local mode
         if config.HISTORY_FILE:
@@ -69,6 +71,15 @@ class HistoryManager:
             logger.debug(f"HistoryManager using PostgreSQL short-term backend for bot: {bot_id}")
         else:
             logger.debug(f"HistoryManager using text file backend for bot: {bot_id} ({self.history_file})")
+
+    def _setting(self, key: str, fallback: Any) -> Any:
+        """Resolve setting through optional runtime resolver."""
+        if self._settings_getter is None:
+            return fallback
+        try:
+            return self._settings_getter(key, fallback)
+        except Exception:
+            return fallback
 
     def load_history(self, since_minutes: int | None = None):
         self.messages = []
@@ -122,6 +133,63 @@ class HistoryManager:
         except Exception as e:
             self.client.console.print(f"[bold red]Error saving history:[/bold red] {e}")
 
+    def _compact_summary_content(self, content: str) -> str:
+        """Reduce summary verbosity for prompt context while preserving key continuity."""
+        text = (content or "").strip()
+        if not text:
+            return text
+
+        # Pass through active-session summaries unchanged.
+        if text.startswith("[ACTIVE SESSION SUMMARY]"):
+            return text
+
+        compact_enabled = bool(
+            self._setting("summarization_compact_context", getattr(self.config, "SUMMARIZATION_COMPACT_CONTEXT", True))
+        )
+        if not compact_enabled:
+            return text
+
+        lines = [line.rstrip() for line in text.splitlines() if line.strip()]
+        if not lines:
+            return text
+
+        prefix_lines: list[str] = []
+        section_summary = ""
+        section_open_loops = ""
+
+        for line in lines:
+            lowered = line.lower()
+            if lowered.startswith("[historical summary]"):
+                prefix_lines.append(line)
+                continue
+            if lowered.startswith("summary:"):
+                section_summary = line
+                continue
+            if lowered.startswith("open loops:"):
+                section_open_loops = line
+                continue
+            # Keep non-section metadata prefix lines (legacy lines like "On YYYY-MM-DD...")
+            if ":" not in line and not line.startswith("["):
+                prefix_lines.append(line)
+
+        compact_lines: list[str] = []
+        compact_lines.extend(prefix_lines[:2])
+        if section_summary:
+            compact_lines.append(section_summary)
+        if section_open_loops:
+            compact_lines.append(section_open_loops)
+
+        # Legacy fallback: keep as-is if we couldn't identify structured sections.
+        if not compact_lines:
+            return text
+
+        compact = "\n".join(compact_lines).strip()
+        # Guardrail against oversized summary rows.
+        max_chars = 420
+        if len(compact) > max_chars:
+            compact = compact[: max_chars - 3].rstrip() + "..."
+        return compact
+
     def get_context_messages(self, max_tokens: int = 0):
         """Get messages to be used as context for the LLM.
 
@@ -140,20 +208,24 @@ class HistoryManager:
                         0 = no limit (backward-compatible default).
         """
         import time
-        from datetime import datetime
-        
-        cutoff = time.time() - self.config.HISTORY_DURATION
+        history_duration = int(self._setting("history_duration_seconds", self.config.HISTORY_DURATION_SECONDS))
+        cutoff = time.time() - history_duration
         system_messages = []
         summary_messages = []
         recent_messages = []
+        older_messages = []
         
         for msg in self.messages:
             if msg.role == "system":
                 system_messages.append(msg)
             elif msg.role == "summary":
-                # Add time context to summaries
-                time_ago = self._format_time_ago(msg.timestamp)
-                enhanced_content = f"[Previous conversation {time_ago}]\n{msg.content}"
+                if msg.content.startswith("[ACTIVE SESSION SUMMARY]"):
+                    enhanced_content = msg.content
+                else:
+                    # Add time context to historical summaries
+                    time_ago = self._format_time_ago(msg.timestamp)
+                    compact_summary = self._compact_summary_content(msg.content)
+                    enhanced_content = f"[Previous conversation {time_ago}]\n{compact_summary}"
                 summary_messages.append(Message(
                     role="summary",
                     content=enhanced_content,
@@ -162,6 +234,17 @@ class HistoryManager:
             elif msg.timestamp >= cutoff:
                 # Recent messages
                 recent_messages.append(msg)
+            else:
+                older_messages.append(msg)
+
+        # Bridge continuity gaps around the cutoff to avoid abrupt jumps into summaries.
+        bridge_count = max(
+            0,
+            int(self._setting("history_bridge_messages", getattr(self.config, "HISTORY_BRIDGE_MESSAGES", 4))),
+        )
+        if bridge_count > 0 and older_messages:
+            bridge_messages = older_messages[-bridge_count:]
+            recent_messages = bridge_messages + recent_messages
         
         if not system_messages:
             system_messages.append(Message(role="system", content=self.config.SYSTEM_MESSAGE))
@@ -171,7 +254,12 @@ class HistoryManager:
             return system_messages + summary_messages + recent_messages
 
         # ── Token-budget enforcement ──────────────────────────────
-        protected_turns = getattr(self.config, 'MEMORY_PROTECTED_RECENT_TURNS', 3)
+        protected_turns = int(
+            self._setting(
+                "memory_protected_recent_turns",
+                getattr(self.config, "MEMORY_PROTECTED_RECENT_TURNS", 3),
+            )
+        )
         # Protect the last N user+assistant pairs (= 2*N messages from the end)
         n_protected = min(protected_turns * 2, len(recent_messages))
         protected = recent_messages[-n_protected:] if n_protected > 0 else []
@@ -185,8 +273,20 @@ class HistoryManager:
 
         # Fill from summaries (oldest context → newest)
         included_summaries: list[Message] = []
-        max_summaries = getattr(self.config, 'SUMMARIZATION_MAX_IN_CONTEXT', 5)
-        for s in summary_messages[-max_summaries:]:
+        active_summaries = [s for s in summary_messages if s.content.startswith("[ACTIVE SESSION SUMMARY]")]
+        historical_summaries = [s for s in summary_messages if not s.content.startswith("[ACTIVE SESSION SUMMARY]")]
+        max_summaries = int(
+            self._setting(
+                "summarization_max_in_context",
+                getattr(self.config, "SUMMARIZATION_MAX_IN_CONTEXT", 5),
+            )
+        )
+        for s in historical_summaries[-max_summaries:]:
+            cost = estimate_messages_tokens([s])
+            if used + cost <= budget:
+                included_summaries.append(s)
+                used += cost
+        for s in active_summaries[-1:]:
             cost = estimate_messages_tokens([s])
             if used + cost <= budget:
                 included_summaries.append(s)
@@ -225,8 +325,6 @@ class HistoryManager:
     def _format_time_ago(self, timestamp: float) -> str:
         """Format a timestamp as a human-readable relative time."""
         import time
-        from datetime import datetime
-        
         now = time.time()
         diff = now - timestamp
         

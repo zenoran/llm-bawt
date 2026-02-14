@@ -30,6 +30,7 @@ Usage:
     llm-memory --msg-forget-id <ID>              # Soft-delete specific message
     llm-memory --msg-restore                     # Restore soft-deleted messages
     llm-memory --msg-summarize                   # Summarize old sessions
+    llm-memory --msg-rebuild-summaries 10       # Rebuild last 10 session summaries
     llm-memory --msg-summarize-preview           # Preview summarization
     llm-memory --msg-summaries                   # List existing summaries
     llm-memory --msg-delete-summary <ID>         # Delete a summary
@@ -943,6 +944,101 @@ def handle_msg_summarize(bot_id: str, skip_confirm: bool):
         console.print("[yellow]No sessions were summarized.[/yellow]")
 
 
+def handle_msg_rebuild_summaries(
+    bot_id: str,
+    sessions: int,
+    skip_confirm: bool,
+    start_ts: float | None = None,
+    end_ts: float | None = None,
+    purge_existing: bool = False,
+):
+    """Rebuild summaries for the most recent eligible sessions."""
+    target_label = "all eligible sessions" if sessions == 0 else f"last {sessions} eligible session(s)"
+    console.print(f"[bold]Rebuild target:[/bold] {target_label}")
+    if start_ts is not None or end_ts is not None:
+        console.print(f"[bold]Date filter:[/bold] start_ts={start_ts} end_ts={end_ts}")
+    if purge_existing:
+        console.print("[bold yellow]Mode:[/bold yellow] purge existing historical summaries in range before rebuild")
+    console.print()
+
+    if not skip_confirm:
+        confirm = console.input(
+            "[bold yellow]Recalculate and replace existing summaries for these sessions? (y/N):[/bold yellow] "
+        ).strip().lower()
+        if confirm not in ("y", "yes"):
+            console.print("[dim]Cancelled[/dim]")
+            return
+
+    with console.status("[bold green]Rebuilding summaries..."):
+        rebuild_timeout = max(LONG_TIMEOUT, float(sessions) * 180.0) if sessions > 0 else max(LONG_TIMEOUT, 3600.0)
+        params = {
+            "bot_id": bot_id,
+            "sessions": sessions,
+            "use_heuristic": False,
+            "purge_existing": purge_existing,
+        }
+        if start_ts is not None:
+            params["start_ts"] = start_ts
+        if end_ts is not None:
+            params["end_ts"] = end_ts
+        result = api_post(
+            "/v1/history/summarize/rebuild",
+            params=params,
+            timeout=rebuild_timeout,
+        )
+
+    if not result:
+        console.print("[red]Rebuild failed.[/red]")
+        return
+
+    sessions_done = result.get("sessions_summarized", 0)
+    messages_done = result.get("messages_summarized", 0)
+    targeted = result.get("sessions_targeted", sessions_done)
+    replaced = result.get("summaries_replaced", 0)
+    purged = result.get("summaries_purged", 0)
+    errors = result.get("errors", [])
+
+    console.print(
+        f"[green]Rebuilt {sessions_done}/{targeted} sessions ({messages_done} messages), "
+        f"replaced {replaced} summary row(s), purged {purged} pre-existing summary row(s).[/green]"
+    )
+
+    if errors:
+        console.print(f"\n[yellow]LLM rebuild failed for {len(errors)} session(s):[/yellow]")
+        for err in errors[:3]:
+            console.print(f"  [red]- {err}[/red]")
+        if len(errors) > 3:
+            console.print(f"  [dim]... and {len(errors) - 3} more[/dim]")
+
+        if not skip_confirm:
+            fallback = console.input(
+                "[bold yellow]Retry with heuristic fallback? (y/N):[/bold yellow] "
+            ).strip().lower()
+            if fallback in ("y", "yes"):
+                with console.status("[bold green]Rebuilding with heuristic fallback..."):
+                    params2 = {
+                        "bot_id": bot_id,
+                        "sessions": sessions,
+                        "use_heuristic": True,
+                        "purge_existing": purge_existing,
+                    }
+                    if start_ts is not None:
+                        params2["start_ts"] = start_ts
+                    if end_ts is not None:
+                        params2["end_ts"] = end_ts
+                    result2 = api_post(
+                        "/v1/history/summarize/rebuild",
+                        params=params2,
+                        timeout=LONG_TIMEOUT,
+                    )
+                if result2:
+                    console.print(
+                        f"[green]Fallback rebuilt {result2.get('sessions_summarized', 0)} sessions, "
+                        f"replaced {result2.get('summaries_replaced', 0)} summary row(s), "
+                        f"purged {result2.get('summaries_purged', 0)} pre-existing summary row(s).[/green]"
+                    )
+
+
 def handle_msg_summaries(bot_id: str):
     """List existing message summaries."""
     data = api_get("/v1/history/summaries", {"bot_id": bot_id})
@@ -962,7 +1058,7 @@ def handle_msg_summaries(bot_id: str):
     table.add_column("Session Time", style="dim", width=30)
     table.add_column("Msgs", justify="right", width=4)
     table.add_column("Method", width=10)
-    table.add_column("Summary", style="white", max_width=50)
+    table.add_column("Summary", style="white", max_width=90, overflow="fold")
 
     for summ in summaries:
         summ_id = summ.get("id", "")[:8] if summ.get("id") else "?"
@@ -972,16 +1068,63 @@ def handle_msg_summaries(bot_id: str):
         msg_count = summ.get("message_count", 0)
         method = summ.get("method", "?")
         content = summ.get("content", "")
-        if len(content) > 50:
-            content = content[:47] + "..."
-        content = content.replace("\n", " ")
+        preview = content.splitlines()
+        preview = "\n".join(preview[:5]).strip() if preview else ""
+        if len(preview) > 500:
+            preview = preview[:497] + "..."
 
         method_style = "green" if method == "llm" else "yellow"
 
-        table.add_row(summ_id, session_time, str(msg_count), f"[{method_style}]{method}[/{method_style}]", content)
+        table.add_row(summ_id, session_time, str(msg_count), f"[{method_style}]{method}[/{method_style}]", preview)
 
     console.print(table)
-    console.print("\n[dim]Use --msg-delete-summary <ID> to remove a summary[/dim]")
+    console.print("\n[dim]Use --msg-summary-get <ID> to view full summary[/dim]")
+    console.print("[dim]Use --msg-delete-summary <ID> to remove a summary[/dim]")
+
+
+def handle_msg_summary_get(bot_id: str, summary_id_prefix: str):
+    """Show full summary content for a summary ID/prefix."""
+    data = api_get("/v1/history/summaries", {"bot_id": bot_id})
+    if not data:
+        console.print(f"[red]Failed to get summaries for bot '{bot_id}'[/red]")
+        return
+
+    summaries = data.get("summaries", [])
+    if not summaries:
+        console.print("[yellow]No summaries found.[/yellow]")
+        return
+
+    needle = (summary_id_prefix or "").strip().lower()
+    matches = [
+        s for s in summaries
+        if str(s.get("id", "")).lower().startswith(needle)
+    ]
+
+    if not matches:
+        console.print(f"[red]No summary found matching prefix '{summary_id_prefix}'[/red]")
+        return
+    if len(matches) > 1:
+        console.print(f"[yellow]Prefix matched {len(matches)} summaries. Be more specific.[/yellow]")
+        for s in matches[:10]:
+            console.print(f"  - {str(s.get('id', ''))[:12]}")
+        return
+
+    summ = matches[0]
+    summ_id = str(summ.get("id", "?"))
+    start = summ.get("session_start_time", "?")
+    end = summ.get("session_end_time", "?")
+    msg_count = summ.get("message_count", 0)
+    method = summ.get("method", "?")
+    content = summ.get("content", "")
+
+    header = (
+        f"ID: {summ_id}\n"
+        f"Session: {start} - {end}\n"
+        f"Messages: {msg_count}\n"
+        f"Method: {method}"
+    )
+    console.print(Panel(header, title="Summary Metadata", border_style="cyan"))
+    console.print(Panel(content or "(empty)", title="Summary Content", border_style="green"))
 
 
 def handle_msg_delete_summary(bot_id: str, summary_id: str, skip_confirm: bool):
@@ -1005,6 +1148,46 @@ def handle_msg_delete_summary(bot_id: str, summary_id: str, skip_confirm: bool):
         console.print(f"[red]{result.get('detail', 'Failed to delete summary')}[/red]")
 
 
+def resolve_bot_selection(bot_arg: str | None) -> str:
+    """Resolve bot id from CLI arg or interactive prompt."""
+    if bot_arg:
+        return bot_arg
+
+    bots_data = api_get("/v1/bots")
+    bots = bots_data.get("data", []) if bots_data else []
+    slugs = [b.get("slug", "").strip() for b in bots if b.get("slug")]
+    slugs = [s for s in slugs if s]
+
+    if not sys.stdin.isatty():
+        console.print("[red]No --bot provided and no interactive terminal available.[/red]")
+        console.print("[dim]Pass --bot <slug> explicitly.[/dim]")
+        sys.exit(1)
+
+    if slugs:
+        console.print("[bold]Select a bot:[/bold]")
+        for idx, slug in enumerate(slugs, 1):
+            name = next((b.get("name", "") for b in bots if b.get("slug") == slug), "")
+            label = f"{slug} ({name})" if name else slug
+            console.print(f"  {idx}. {label}")
+        choice = console.input("[bold yellow]Bot number or slug:[/bold yellow] ").strip()
+        if choice.isdigit():
+            i = int(choice)
+            if 1 <= i <= len(slugs):
+                return slugs[i - 1]
+            console.print("[red]Invalid bot number.[/red]")
+            sys.exit(1)
+        if choice in slugs:
+            return choice
+        console.print(f"[red]Unknown bot '{choice}'.[/red]")
+        sys.exit(1)
+
+    manual = console.input("[bold yellow]Enter bot slug:[/bold yellow] ").strip()
+    if not manual:
+        console.print("[red]Bot is required.[/red]")
+        sys.exit(1)
+    return manual
+
+
 # =============================================================================
 # Main CLI
 # =============================================================================
@@ -1023,7 +1206,7 @@ Examples:
 """,
     )
     parser.add_argument("query", nargs="?", default="", help="Search query for memories")
-    parser.add_argument("--bot", "-b", default="nova", help="Bot ID (default: nova)")
+    parser.add_argument("--bot", "-b", default=None, help="Bot ID (if omitted, prompts interactively)")
     parser.add_argument("--yes", "-y", action="store_true", help="Skip confirmation prompts")
     parser.add_argument("--limit", "-n", type=int, default=10, help="Max results (default: 10)")
 
@@ -1062,9 +1245,19 @@ Examples:
     msg_group.add_argument("--msg-forget-id", metavar="ID", help="Forget a specific message by ID")
     msg_group.add_argument("--msg-restore", action="store_true", help="Restore forgotten messages")
     msg_group.add_argument("--msg-summarize", action="store_true", help="Summarize old message sessions")
+    msg_group.add_argument(
+        "--msg-rebuild-summaries",
+        metavar="N",
+        type=int,
+        help="Rebuild summaries for last N eligible sessions from original history (0 = all eligible)",
+    )
     msg_group.add_argument("--msg-summarize-preview", action="store_true", help="Preview message summarization")
     msg_group.add_argument("--msg-summaries", action="store_true", help="List message summaries")
+    msg_group.add_argument("--msg-summary-get", metavar="ID", help="Show full summary by ID or prefix")
     msg_group.add_argument("--msg-delete-summary", metavar="ID", help="Delete a summary by ID")
+    msg_group.add_argument("--msg-rebuild-start", metavar="UNIX_TS", type=float, help="Optional start timestamp filter for --msg-rebuild-summaries")
+    msg_group.add_argument("--msg-rebuild-end", metavar="UNIX_TS", type=float, help="Optional end timestamp filter for --msg-rebuild-summaries")
+    msg_group.add_argument("--msg-rebuild-purge", action="store_true", help="Delete existing historical summaries in range before rebuild")
 
     args = parser.parse_args()
 
@@ -1080,28 +1273,29 @@ Examples:
         tui_main()
         return
 
-    console.print(f"\n[bold cyan]Memory Tool[/bold cyan] - Bot: [yellow]{args.bot}[/yellow]\n")
+    selected_bot = resolve_bot_selection(args.bot)
+    console.print(f"\n[bold cyan]Memory Tool[/bold cyan] - Bot: [yellow]{selected_bot}[/yellow]\n")
 
     # === General ===
     if args.stats:
-        show_stats(args.bot)
+        show_stats(selected_bot)
         return
 
     # === Memory operations ===
     if args.list_memories:
-        list_memories(args.bot, args.limit)
+        list_memories(selected_bot, args.limit)
         return
 
     if args.delete_memory:
-        handle_delete_memory(args.bot, args.delete_memory, args.yes)
+        handle_delete_memory(selected_bot, args.delete_memory, args.yes)
         return
 
     if args.consolidate or args.consolidate_dry_run:
-        handle_consolidate(args.bot, dry_run=args.consolidate_dry_run)
+        handle_consolidate(selected_bot, dry_run=args.consolidate_dry_run)
         return
 
     if args.regenerate_embeddings:
-        handle_regenerate_embeddings(args.bot)
+        handle_regenerate_embeddings(selected_bot)
         return
 
     # === Entity profiles ===
@@ -1119,47 +1313,65 @@ Examples:
 
     # === Message history operations ===
     if args.msg:
-        handle_show_messages(args.bot, args.limit)
+        handle_show_messages(selected_bot, args.limit)
         return
 
     if args.msg_search:
-        handle_search_messages(args.bot, args.msg_search, args.limit)
+        handle_search_messages(selected_bot, args.msg_search, args.limit)
         return
 
     if args.msg_forget:
-        handle_msg_forget(args.bot, args.msg_forget, args.yes)
+        handle_msg_forget(selected_bot, args.msg_forget, args.yes)
         return
 
     if args.msg_forget_since:
-        handle_msg_forget_since(args.bot, args.msg_forget_since, args.yes)
+        handle_msg_forget_since(selected_bot, args.msg_forget_since, args.yes)
         return
 
     if args.msg_get:
-        handle_msg_get(args.bot, args.msg_get)
+        handle_msg_get(selected_bot, args.msg_get)
         return
 
     if args.msg_forget_id:
-        handle_msg_forget_id(args.bot, args.msg_forget_id, args.yes)
+        handle_msg_forget_id(selected_bot, args.msg_forget_id, args.yes)
         return
 
     if args.msg_restore:
-        handle_msg_restore(args.bot, args.yes)
+        handle_msg_restore(selected_bot, args.yes)
         return
 
     if args.msg_summarize_preview:
-        handle_msg_summarize_preview(args.bot)
+        handle_msg_summarize_preview(selected_bot)
         return
 
     if args.msg_summarize:
-        handle_msg_summarize(args.bot, args.yes)
+        handle_msg_summarize(selected_bot, args.yes)
+        return
+
+    if args.msg_rebuild_summaries is not None:
+        if args.msg_rebuild_summaries < 0:
+            console.print("[red]--msg-rebuild-summaries requires N >= 0[/red]")
+            sys.exit(1)
+        handle_msg_rebuild_summaries(
+            selected_bot,
+            args.msg_rebuild_summaries,
+            args.yes,
+            start_ts=args.msg_rebuild_start,
+            end_ts=args.msg_rebuild_end,
+            purge_existing=bool(args.msg_rebuild_purge),
+        )
         return
 
     if args.msg_summaries:
-        handle_msg_summaries(args.bot)
+        handle_msg_summaries(selected_bot)
+        return
+
+    if args.msg_summary_get:
+        handle_msg_summary_get(selected_bot, args.msg_summary_get)
         return
 
     if args.msg_delete_summary:
-        handle_msg_delete_summary(args.bot, args.msg_delete_summary, args.yes)
+        handle_msg_delete_summary(selected_bot, args.msg_delete_summary, args.yes)
         return
 
     # === Memory search (default action) ===
@@ -1168,7 +1380,7 @@ Examples:
         console.print("\n[yellow]Tip:[/yellow] Use a query to search memories, or --msg to view messages")
         sys.exit(1)
 
-    search_memories(args.bot, args.query, args.method, args.limit, args.min_importance)
+    search_memories(selected_bot, args.query, args.method, args.limit, args.min_importance)
 
 
 if __name__ == "__main__":
