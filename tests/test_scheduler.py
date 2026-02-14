@@ -1,9 +1,9 @@
 """Tests for the background job scheduler."""
 
-import pytest
-from datetime import datetime, timedelta
+from datetime import datetime
 
 from llm_bawt.service.scheduler import (
+    JobScheduler,
     ScheduledJob,
     JobRun,
     JobType,
@@ -123,3 +123,52 @@ class TestTaskFactories:
         assert task.payload["use_heuristic_fallback"] is False
         assert task.payload["max_tokens_per_chunk"] == 2048
         assert task.payload["model"] == "grok-4-fast"
+
+
+class TestJobActivityGates:
+    """Tests for scheduler activity-gating logic."""
+
+    def test_history_job_skips_when_no_new_messages(self):
+        scheduler = JobScheduler(engine=None, task_processor=None)
+        job = ScheduledJob(
+            job_type=JobType.HISTORY_SUMMARIZATION,
+            bot_id="nova",
+            last_run_at=datetime.utcnow(),
+        )
+
+        scheduler._max_timestamp_message_activity = lambda _bot_id: None  # type: ignore[method-assign]
+        should_run, reason = scheduler._has_new_activity_for_job(job)
+
+        assert should_run is False
+        assert reason == "No conversation messages found"
+
+    def test_history_job_runs_when_messages_are_newer_than_last_run(self):
+        scheduler = JobScheduler(engine=None, task_processor=None)
+        last_run = datetime.utcnow()
+        job = ScheduledJob(
+            job_type=JobType.HISTORY_SUMMARIZATION,
+            bot_id="nova",
+            last_run_at=last_run,
+        )
+
+        scheduler._max_timestamp_message_activity = lambda _bot_id: last_run.timestamp() + 1  # type: ignore[method-assign]
+        should_run, reason = scheduler._has_new_activity_for_job(job)
+
+        assert should_run is True
+        assert reason is None
+
+    def test_profile_maintenance_skips_without_profile_changes(self):
+        scheduler = JobScheduler(engine=None, task_processor=None)
+        last_run = datetime.utcnow()
+        job = ScheduledJob(
+            job_type=JobType.PROFILE_MAINTENANCE,
+            bot_id="*",
+            last_run_at=last_run,
+            config_json='{"entity_id":"user","entity_type":"user"}',
+        )
+
+        scheduler._max_profile_updated_at = lambda _entity_id, _entity_type: None  # type: ignore[method-assign]
+        should_run, reason = scheduler._has_new_activity_for_job(job)
+
+        assert should_run is False
+        assert reason == "No profile attribute changes since last run"

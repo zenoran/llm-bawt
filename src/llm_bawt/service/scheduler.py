@@ -3,6 +3,7 @@
 import asyncio
 import json
 import logging
+import re
 from datetime import datetime, timedelta
 from enum import Enum
 from typing import Optional
@@ -193,27 +194,49 @@ class JobScheduler:
         
         run_id = await loop.run_in_executor(None, create_run)
         start_time = datetime.utcnow()
+        status = JobStatus.RUNNING
+        result_json: str | None = None
+        error_message: str | None = None
         
         try:
-            # Create and execute task based on job type
-            task = self._create_task_for_job(job)
-            if task:
-                task_result = await self.task_processor.process_task(task)
-                # TaskResult has .result (dict) and .status
-                from llm_bawt.service.tasks import TaskStatus as TStatus
-                if task_result.status == TStatus.COMPLETED:
-                    result_data = task_result.result or {}
-                    status = JobStatus.SUCCESS if result_data.get("error") is None else JobStatus.FAILED
-                    result_json = json.dumps(result_data)
-                    error_message = result_data.get("error")
-                else:
-                    status = JobStatus.FAILED
-                    result_json = None
-                    error_message = task_result.error
-            else:
+            should_run, skip_reason = await loop.run_in_executor(
+                None,
+                lambda: self._has_new_activity_for_job(job),
+            )
+            if not should_run:
                 status = JobStatus.SKIPPED
-                result_json = None
-                error_message = f"Unknown job type: {job.job_type}"
+                result_json = json.dumps(
+                    {
+                        "skipped": True,
+                        "reason": skip_reason or "No new activity since last run",
+                    }
+                )
+                logger.debug(
+                    "Skipping scheduled job %s for bot %s: %s",
+                    job.job_type,
+                    job.bot_id,
+                    skip_reason or "no new activity",
+                )
+            else:
+                # Create and execute task based on job type
+                task = self._create_task_for_job(job)
+                if task:
+                    task_result = await self.task_processor.process_task(task)
+                    # TaskResult has .result (dict) and .status
+                    from llm_bawt.service.tasks import TaskStatus as TStatus
+                    if task_result.status == TStatus.COMPLETED:
+                        result_data = task_result.result or {}
+                        status = JobStatus.SUCCESS if result_data.get("error") is None else JobStatus.FAILED
+                        result_json = json.dumps(result_data)
+                        error_message = result_data.get("error")
+                    else:
+                        status = JobStatus.FAILED
+                        result_json = None
+                        error_message = task_result.error
+                else:
+                    status = JobStatus.SKIPPED
+                    result_json = None
+                    error_message = f"Unknown job type: {job.job_type}"
         except Exception as e:
             status = JobStatus.FAILED
             result_json = None
@@ -246,6 +269,159 @@ class JobScheduler:
         
         await loop.run_in_executor(None, update_run)
         logger.debug(f"Job {job.job_type} completed with status {status}")
+
+    @staticmethod
+    def _sanitize_identifier(identifier: str) -> str:
+        """Sanitize table identifier to lowercase alnum/underscore."""
+        return re.sub(r"[^a-z0-9_]", "", (identifier or "").lower())
+
+    @staticmethod
+    def _parse_config_json(config_json: str | None) -> dict:
+        """Parse job config JSON safely."""
+        if not config_json:
+            return {}
+        try:
+            return json.loads(config_json)
+        except Exception:
+            return {}
+
+    def _max_timestamp_message_activity(self, bot_id: str) -> float | None:
+        """Return latest non-summary message timestamp for a bot."""
+        table_bot = self._sanitize_identifier(bot_id)
+        if not table_bot:
+            return None
+        table_name = f"{table_bot}_messages"
+        sql = text(
+            f"""
+            SELECT MAX(timestamp) AS latest_ts
+            FROM {table_name}
+            WHERE role != 'summary'
+              AND COALESCE(recalled_history, FALSE) = FALSE
+            """
+        )
+        with self.engine.connect() as conn:
+            row = conn.execute(sql).fetchone()
+            if not row:
+                return None
+            latest_ts = row[0]
+            if latest_ts is None:
+                return None
+            return float(latest_ts)
+
+    def _max_memory_updated_at(self, bot_id: str) -> datetime | None:
+        """Return latest memory update time for a bot."""
+        table_bot = self._sanitize_identifier(bot_id)
+        if not table_bot:
+            return None
+        table_name = f"{table_bot}_memories"
+        sql = text(f"SELECT MAX(updated_at) AS latest_updated_at FROM {table_name}")
+        with self.engine.connect() as conn:
+            row = conn.execute(sql).fetchone()
+            if not row:
+                return None
+            latest = row[0]
+            if isinstance(latest, datetime):
+                return latest
+            return None
+
+    def _max_profile_updated_at(self, entity_id: str, entity_type: str) -> datetime | None:
+        """Return latest profile/attribute update time for an entity."""
+        safe_entity_id = (entity_id or "").strip().lower()
+        safe_entity_type = (entity_type or "user").strip().lower()
+        if not safe_entity_id:
+            return None
+
+        latest: datetime | None = None
+        with self.engine.connect() as conn:
+            attr_row = conn.execute(
+                text(
+                    """
+                    SELECT MAX(updated_at) AS latest_updated_at
+                    FROM entity_profile_attributes
+                    WHERE entity_id = :entity_id
+                      AND entity_type = :entity_type
+                    """
+                ),
+                {"entity_id": safe_entity_id, "entity_type": safe_entity_type},
+            ).fetchone()
+            profile_row = conn.execute(
+                text(
+                    """
+                    SELECT MAX(updated_at) AS latest_updated_at
+                    FROM entity_profiles
+                    WHERE entity_id = :entity_id
+                      AND entity_type = :entity_type
+                    """
+                ),
+                {"entity_id": safe_entity_id, "entity_type": safe_entity_type},
+            ).fetchone()
+
+            candidates = []
+            if attr_row and isinstance(attr_row[0], datetime):
+                candidates.append(attr_row[0])
+            if profile_row and isinstance(profile_row[0], datetime):
+                candidates.append(profile_row[0])
+            if candidates:
+                latest = max(candidates)
+
+        return latest
+
+    @staticmethod
+    def _has_datetime_activity_since(
+        latest_value: datetime | None, last_run_at: datetime | None
+    ) -> bool:
+        """Check if a datetime value indicates new activity since last run."""
+        if latest_value is None:
+            return False
+        if last_run_at is None:
+            return True
+        return latest_value > last_run_at
+
+    def _has_new_activity_for_job(self, job: ScheduledJob) -> tuple[bool, str | None]:
+        """Return whether this job has relevant new activity since last run."""
+        config = self._parse_config_json(job.config_json)
+        last_run_at = job.last_run_at
+
+        try:
+            if job.job_type == JobType.HISTORY_SUMMARIZATION:
+                latest_ts = self._max_timestamp_message_activity(job.bot_id)
+                if latest_ts is None:
+                    return False, "No conversation messages found"
+                if last_run_at is None:
+                    return True, None
+                if latest_ts > last_run_at.timestamp():
+                    return True, None
+                return False, "No new conversation activity since last run"
+
+            if job.job_type == JobType.PROFILE_MAINTENANCE:
+                entity_id = config.get("entity_id", "user")
+                entity_type = config.get("entity_type", "user")
+                latest_profile_update = self._max_profile_updated_at(entity_id, entity_type)
+                if self._has_datetime_activity_since(latest_profile_update, last_run_at):
+                    return True, None
+                return False, "No profile attribute changes since last run"
+
+            if job.job_type == JobType.MEMORY_CONSOLIDATION:
+                latest_memory_update = self._max_memory_updated_at(job.bot_id)
+                if self._has_datetime_activity_since(latest_memory_update, last_run_at):
+                    return True, None
+                return False, "No memory changes since last run"
+
+            if job.job_type == JobType.MEMORY_DECAY:
+                latest_memory_update = self._max_memory_updated_at(job.bot_id)
+                if latest_memory_update is None:
+                    return False, "No memories available for decay"
+                return True, None
+        except Exception as e:
+            logger.debug(
+                "Activity-gate check failed for job %s (%s); falling back to run: %s",
+                job.id,
+                job.job_type,
+                e,
+            )
+            return True, None
+
+        return True, None
     
     def _create_task_for_job(self, job: ScheduledJob):
         """Create a Task from a ScheduledJob."""
@@ -257,7 +433,7 @@ class JobScheduler:
         
         if job.job_type == JobType.PROFILE_MAINTENANCE:
             # For profile maintenance, entity_id comes from config or is the bot's user
-            config = json.loads(job.config_json) if job.config_json else {}
+            config = self._parse_config_json(job.config_json)
             entity_id = config.get("entity_id", "user")  # Default user
             return create_profile_maintenance_task(
                 entity_id=entity_id,
@@ -265,7 +441,7 @@ class JobScheduler:
                 bot_id=job.bot_id,
             )
         elif job.job_type == JobType.MEMORY_CONSOLIDATION:
-            config = json.loads(job.config_json) if job.config_json else {}
+            config = self._parse_config_json(job.config_json)
             entity_id = config.get("entity_id", "system")
             return create_maintenance_task(
                 bot_id=job.bot_id,
@@ -275,7 +451,7 @@ class JobScheduler:
                 run_decay_pruning=False,
             )
         elif job.job_type == JobType.MEMORY_DECAY:
-            config = json.loads(job.config_json) if job.config_json else {}
+            config = self._parse_config_json(job.config_json)
             entity_id = config.get("entity_id", "system")
             return create_maintenance_task(
                 bot_id=job.bot_id,
@@ -285,7 +461,7 @@ class JobScheduler:
                 run_decay_pruning=True,
             )
         elif job.job_type == JobType.HISTORY_SUMMARIZATION:
-            config = json.loads(job.config_json) if job.config_json else {}
+            config = self._parse_config_json(job.config_json)
             return create_history_summarization_task(
                 bot_id=job.bot_id,
                 user_id=config.get("user_id", "system"),
