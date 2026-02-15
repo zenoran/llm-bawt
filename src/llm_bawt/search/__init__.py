@@ -15,7 +15,7 @@ from .brave_client import BraveSearchClient
 
 __all__ = [
     "SearchClient",
-    "SearchResult", 
+    "SearchResult",
     "SearchProvider",
     "get_search_client",
     "get_search_unavailable_reason",

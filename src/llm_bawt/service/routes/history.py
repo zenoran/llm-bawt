@@ -319,8 +319,14 @@ def _build_summary_callable(service, bot_id: str, user_id: str = "system", model
 async def get_history(
     bot_id: str = Query(None, description="Bot ID (uses default if not specified)"),
     limit: int = Query(50, description="Maximum number of messages to return"),
+    before: str | None = Query(
+        None,
+        description="Cursor for older history pages (ISO timestamp, unix timestamp, or message ID)",
+    ),
 ):
     """Get conversation history for a bot."""
+    from datetime import datetime
+
     service = get_service()
     
     effective_bot_id = bot_id or service._default_bot
@@ -331,13 +337,50 @@ async def get_history(
         if not client:
             raise HTTPException(status_code=503, detail="Memory service unavailable")
         
-        # Get messages directly from database (no time filter)
-        messages = client.get_messages(since_seconds=None)  # Get all messages
-        
-        # Apply limit (from most recent)
-        if limit > 0 and len(messages) > limit:
-            messages = messages[-limit:]
-        
+        # Get all messages then paginate in-memory (includes both embedded and MCP server modes).
+        messages = client.get_messages(since_seconds=None)
+
+        # Filter out system messages and normalize chronological ordering.
+        visible_messages = [m for m in messages if m.get("role") != "system"]
+        visible_messages.sort(key=lambda m: (float(m.get("timestamp") or 0.0), str(m.get("id") or "")))
+
+        # Resolve `before` cursor to timestamp cutoff.
+        before_ts: float | None = None
+        if before:
+            raw = before.strip()
+            if raw:
+                # 1) Numeric unix timestamp
+                try:
+                    before_ts = float(raw)
+                except ValueError:
+                    before_ts = None
+
+                # 2) ISO timestamp
+                if before_ts is None:
+                    iso_candidate = raw.replace("Z", "+00:00")
+                    try:
+                        before_ts = datetime.fromisoformat(iso_candidate).timestamp()
+                    except ValueError:
+                        before_ts = None
+
+                # 3) Message ID cursor
+                if before_ts is None:
+                    cursor_msg = next((m for m in visible_messages if str(m.get("id") or "") == raw), None)
+                    if cursor_msg is None:
+                        raise HTTPException(status_code=400, detail="Invalid 'before' cursor")
+                    before_ts = float(cursor_msg.get("timestamp") or 0.0)
+
+        if before_ts is not None:
+            candidate_messages = [m for m in visible_messages if float(m.get("timestamp") or 0.0) < before_ts]
+        else:
+            candidate_messages = visible_messages
+
+        # Take newest `limit` from the candidate set, while returning chronological order.
+        if limit > 0 and len(candidate_messages) > limit:
+            page_messages = candidate_messages[-limit:]
+        else:
+            page_messages = candidate_messages
+
         history_messages = [
             HistoryMessage(
                 id=msg.get("id"),
@@ -345,14 +388,18 @@ async def get_history(
                 content=msg.get("content", ""),
                 timestamp=msg.get("timestamp", 0.0)
             )
-            for msg in messages
-            if msg.get("role") != "system"  # Don't include system messages
+            for msg in page_messages
         ]
+
+        oldest_timestamp = history_messages[0].timestamp if history_messages else None
+        has_more = len(candidate_messages) > len(page_messages)
         
         return HistoryResponse(
             bot_id=effective_bot_id,
             messages=history_messages,
-            total_count=len(history_messages)
+            total_count=len(history_messages),
+            has_more=has_more,
+            oldest_timestamp=oldest_timestamp,
         )
     except Exception as e:
         log.error(f"Failed to get history: {e}")

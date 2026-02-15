@@ -112,6 +112,15 @@ class BotInfo(BaseModel):
     slug: str
     name: str
     description: str | None = None
+    system_prompt: str = ""
+    requires_memory: bool = True
+    voice_optimized: bool = False
+    uses_tools: bool = False
+    uses_search: bool = False
+    uses_home_assistant: bool = False
+    default_model: str | None = None
+    color: str | None = None
+    settings: dict[str, Any] = Field(default_factory=dict)
 
 
 class BotsResponse(BaseModel):
@@ -189,6 +198,105 @@ class ServiceStatusResponse(BaseModel):
     available_models: list[str] = []
 
 
+# =============================================================================
+# Full System Status (mirrors core.status.SystemStatus)
+# =============================================================================
+
+class ServiceInfoSchema(BaseModel):
+    """LLM service status."""
+    available: bool = False
+    healthy: bool = False
+    uptime_seconds: float | None = None
+    current_model: str | None = None
+    tasks_processed: int = 0
+    tasks_pending: int = 0
+
+
+class MemoryInfoSchema(BaseModel):
+    """Database and memory subsystem status."""
+    postgres_connected: bool = False
+    postgres_host: str | None = None
+    postgres_error: str | None = None
+    messages_count: int = 0
+    memories_count: int = 0
+    pgvector_available: bool = False
+    embeddings_available: bool = False
+
+
+class ModelStatusInfoSchema(BaseModel):
+    """Current model configuration details."""
+    alias: str
+    type: str = "unknown"
+    max_tokens: int = 0
+    max_tokens_source: str = "global"
+    context_window: int | None = None
+    context_source: str | None = None
+    gpu_name: str | None = None
+    vram_total_gb: float | None = None
+    vram_free_gb: float | None = None
+    vram_detection_method: str | None = None
+    n_gpu_layers: str | None = None
+    gpu_layers_source: str | None = None
+    native_context_limit: int | None = None
+
+
+class DependencyInfoSchema(BaseModel):
+    """Optional dependency availability."""
+    cuda_version: str | None = None
+    llama_cpp_available: bool = False
+    llama_cpp_gpu: bool | None = None
+    hf_hub_available: bool = False
+    torch_available: bool = False
+    openai_key_set: bool = False
+    search_provider: str | None = None
+    embeddings_available: bool = False
+
+
+class McpInfoSchema(BaseModel):
+    """MCP memory server status."""
+    mode: str = "embedded"
+    status: str = "up"
+    url: str | None = None
+    http_status: int | None = None
+
+
+class BotSummarySchema(BaseModel):
+    """Minimal bot info for the status display."""
+    slug: str
+    name: str
+    is_default: bool = False
+
+
+class ConfigInfoSchema(BaseModel):
+    """System configuration summary."""
+    version: str = SERVICE_VERSION
+    mode: str = "direct"
+    service_url: str | None = None
+    environment: str = "local"
+    bot_name: str = ""
+    bot_slug: str = ""
+    model_alias: str | None = None
+    user_id: str | None = None
+    all_bots: list[BotSummarySchema] = []
+    models_defined: int = 0
+    models_service: int | None = None
+    scheduler_enabled: bool = False
+    scheduler_interval: int = 0
+    ha_mcp_enabled: bool = False
+    ha_mcp_url: str | None = None
+    bind_host: str = "0.0.0.0"
+
+
+class SystemStatusResponse(BaseModel):
+    """Full system status — mirrors ``core.status.SystemStatus``."""
+    config: ConfigInfoSchema
+    service: ServiceInfoSchema
+    mcp: McpInfoSchema
+    model: ModelStatusInfoSchema | None = None
+    memory: MemoryInfoSchema
+    dependencies: DependencyInfoSchema
+
+
 class HealthResponse(BaseModel):
     """Simple health check response."""
     status: str = "ok"
@@ -208,6 +316,8 @@ class HistoryResponse(BaseModel):
     bot_id: str
     messages: list[HistoryMessage]
     total_count: int
+    has_more: bool = False
+    oldest_timestamp: float | None = None
 
 
 class HistorySearchResponse(BaseModel):
@@ -233,8 +343,8 @@ class MemoryItem(BaseModel):
     importance: float = 0.5
     relevance: float | None = None
     tags: list[str] = []
-    created_at: float | None = None
-    last_accessed: float | None = None
+    created_at: float | str | None = None
+    last_accessed: float | str | None = None
     access_count: int = 0
     source_message_ids: list[str] = []
 
@@ -291,6 +401,13 @@ class MemoryDeleteResponse(BaseModel):
     success: bool
     memory_id: str
     message: str
+
+
+class MemoryUpdateRequest(BaseModel):
+    """Request payload for updating a memory."""
+    content: str | None = None
+    importance: float | None = Field(default=None, ge=0.0, le=1.0)
+    tags: list[str] | None = None
 
 
 class MessagePreview(BaseModel):
@@ -422,6 +539,13 @@ class UserProfileAttribute(BaseModel):
     source: str | None = None
     created_at: str | None = None
     updated_at: str | None = None
+
+
+class ProfileAttributeUpdateRequest(BaseModel):
+    """Request payload for updating an existing profile attribute."""
+    value: str | None = None
+    confidence: float | None = Field(default=None, ge=0.0, le=1.0)
+    source: str | None = None
 
 
 class UserProfileSummary(BaseModel):

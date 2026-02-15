@@ -24,6 +24,7 @@ from ..profiles import ProfileManager, EntityType
 from ..runtime_settings import RuntimeSettingsResolver
 from ..memory_server.client import MemoryClient, get_memory_client
 from ..integrations.ha_mcp.client import HomeAssistantMCPClient
+from ..integrations.newsapi.client import NewsAPIClient
 from ..search import get_search_client, SearchClient
 from ..tools import get_tools_prompt, get_tools_list, query_with_tools
 from ..utils.config import Config, has_database_credentials
@@ -88,6 +89,7 @@ class BaseLLMBawt(ABC):
         self.profile_manager: ProfileManager | None = None
         self.search_client: SearchClient | None = None
         self.home_client: HomeAssistantMCPClient | None = None
+        self.news_client: NewsAPIClient | None = None
         self.model_lifecycle: ModelLifecycleManager | None = None
         self.client: LLMClient
         self.bot: Bot
@@ -140,7 +142,10 @@ class BaseLLMBawt(ABC):
 
         # Initialize Home Assistant client
         self._init_home_assistant(config)
-        
+
+        # Initialize NewsAPI client
+        self._init_newsapi()
+
         # Build system prompt
         self._init_system_prompt()
         
@@ -363,6 +368,7 @@ class BaseLLMBawt(ABC):
                         profile_manager=self.profile_manager,
                         search_client=self.search_client if self.bot.uses_tools else None,
                         home_client=self.home_client if self.bot.uses_tools else None,
+                        news_client=self.news_client if self.bot.uses_tools else None,
                         model_lifecycle=self.model_lifecycle if self.bot.uses_tools else None,
                         config=self.config,
                         user_id=self.user_id,
@@ -535,10 +541,12 @@ class BaseLLMBawt(ABC):
 
     def _get_tool_definitions(self) -> list:
         include_search = self.search_client is not None
+        include_news = self.news_client is not None
         include_home = self.home_client is not None
         include_models = self.model_lifecycle is not None
         tools = get_tools_list(
             include_search_tools=include_search,
+            include_news_tools=include_news,
             include_home_tools=include_home,
             include_model_tools=include_models,
         )
@@ -560,6 +568,18 @@ class BaseLLMBawt(ABC):
                 logger.debug("Home Assistant MCP client initialized")
         except Exception as e:
             logger.warning(f"Failed to initialize Home Assistant MCP client: {e}")
+
+    def _init_newsapi(self) -> None:
+        """Initialize NewsAPI client if API key is available."""
+        if not self.bot.uses_tools:
+            return
+        try:
+            client = NewsAPIClient()
+            if client.is_available():
+                self.news_client = client
+                logger.debug("NewsAPI client initialized")
+        except Exception as e:
+            logger.warning(f"Failed to initialize NewsAPI client: {e}")
     
     def _retrieve_cold_start_memories(self, prompt: str) -> str:
         """Retrieve a small set of high-importance memories for cold-start context.

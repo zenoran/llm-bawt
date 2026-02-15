@@ -132,6 +132,7 @@ def edit_bot_yaml(config: Config, bot_slug: str) -> bool:
     editable_fields = {
         "slug": slug,
         "name": bot.name,
+        "color": bot.color,
         "description": bot.description,
         "system_prompt": bot.system_prompt,
         "requires_memory": bot.requires_memory,
@@ -169,6 +170,9 @@ def edit_bot_yaml(config: Config, bot_slug: str) -> bool:
         if not isinstance(parsed.get(key), str):
             console.print(f"[red]Invalid '{key}': expected string.[/red]")
             return False
+    if "color" in parsed and parsed.get("color") is not None and not isinstance(parsed.get("color"), str):
+        console.print("[red]Invalid 'color': expected string or null.[/red]")
+        return False
     required_bool = ("requires_memory", "voice_optimized", "uses_tools", "uses_search", "uses_home_assistant")
     for key in required_bool:
         if key in parsed and not isinstance(parsed.get(key), bool):
@@ -182,6 +186,15 @@ def edit_bot_yaml(config: Config, bot_slug: str) -> bool:
     new_settings = parsed.pop("settings", {}) or {}
     out = parsed.copy()
     out.pop("slug", None)
+
+    # Persist bot UI color as runtime setting (avoids bot_profiles schema migration).
+    edited_color = out.pop("color", bot.color)
+    if edited_color is not None:
+        edited_color = str(edited_color).strip().lower() or None
+    if edited_color:
+        new_settings["ui_color"] = edited_color
+    else:
+        new_settings.pop("ui_color", None)
 
     if out == editable_fields and new_settings == effective_settings:
         console.print("[dim]No changes detected.[/dim]")

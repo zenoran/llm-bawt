@@ -64,7 +64,20 @@ async def list_bots():
     service = get_service()
     bot_manager = BotManager(service.config)
     bots = [
-        BotInfo(slug=bot.slug, name=bot.name, description=bot.description)
+        BotInfo(
+            slug=bot.slug,
+            name=bot.name,
+            description=bot.description,
+            system_prompt=bot.system_prompt,
+            requires_memory=bot.requires_memory,
+            voice_optimized=bot.voice_optimized,
+            uses_tools=bot.uses_tools,
+            uses_search=bot.uses_search,
+            uses_home_assistant=bot.uses_home_assistant,
+            default_model=bot.default_model,
+            color=bot.color,
+            settings=bot.settings,
+        )
         for bot in bot_manager.list_bots()
     ]
     return BotsResponse(data=bots)

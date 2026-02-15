@@ -1,6 +1,5 @@
 import argparse
 import json
-import os
 import subprocess
 import traceback
 import sys  # Import sys for exit codes
@@ -13,7 +12,6 @@ from llm_bawt.core import LLMBawt
 from llm_bawt.model_manager import (
     ModelManager,
     delete_model,
-    is_service_mode_enabled,
     list_models,
     set_model_context_window,
     update_models_interactive,
@@ -71,6 +69,7 @@ def query_via_service(
     """
     from rich.markdown import Markdown
     from rich.align import Align
+    from rich.style import Style
 
     if config is None:
         config = Config()
@@ -85,13 +84,15 @@ def query_via_service(
     bot = bot_manager.get_bot(bot_id) if bot_id else bot_manager.get_default_bot()
     bot_name = bot.name if bot else (bot_id or "Assistant")
 
-    # Determine panel style based on bot
-    panel_styles = {
-        "mira": ("magenta", "magenta"),
-        "nova": ("cyan", "cyan"),
-        "spark": ("yellow", "yellow"),
-    }
-    title_style, border_style = panel_styles.get(bot_id or "", ("green", "green"))
+    # Determine panel style from bot config color with safe fallback.
+    configured_color = (getattr(bot, "color", None) if bot else None) or "green"
+    try:
+        Style.parse(configured_color)
+        panel_color = configured_color
+    except Exception:
+        panel_color = "green"
+
+    title_style, border_style = panel_color, panel_color
 
     def format_panel_title(actual_model: str | None) -> str:
         """Format panel title with actual model used."""
@@ -126,6 +127,12 @@ def query_via_service(
                         # Service warnings (e.g. model fallback)
                         for warning in item["warnings"]:
                             console.print(f"[yellow]{warning}[/yellow]")
+                        if item.get("model"):
+                            actual_model = item["model"]
+                            got_metadata = True
+                    elif isinstance(item, dict) and "tool_call" in item:
+                        tool_name = item.get("tool_call") or "tool"
+                        console.print(f"[dim]· {tool_name}[/dim]")
                         if item.get("model"):
                             actual_model = item["model"]
                             got_metadata = True
@@ -216,10 +223,7 @@ def query_via_service(
 
 def show_status(config: Config, args: argparse.Namespace | None = None):
     """Display overall system status including dependencies, bots, memory, and configuration."""
-    import importlib.util
-    import os
-    import shutil
-    from llm_bawt.utils.config import is_huggingface_available, is_llama_cpp_available, has_database_credentials
+    from llm_bawt.core.status import collect_system_status
 
     def make_table() -> Table:
         table = Table(show_header=False, box=None, padding=(0, 2))
@@ -236,116 +240,77 @@ def show_status(config: Config, args: argparse.Namespace | None = None):
             return f"{minutes}m {secs}s"
         return f"{secs}s"
 
-    # ── Gather data ──────────────────────────────────────────────
-    use_service = is_service_mode_enabled(config)
-    service_url = f"http://{config.SERVICE_HOST}:{config.SERVICE_PORT}"
+    # ── Collect all data via shared module ────────────────────────
+    bot_slug = getattr(args, "bot", None) if args else None
+    explicit_model = getattr(args, "model", None) if args else None
+    user_id = getattr(args, "user", None) if args else None
 
-    service_client = None
-    service_status = None
-    service_available = False
-    try:
-        service_client = get_service_client(config)
-        if service_client and service_client.is_available(force_check=True):
-            service_available = True
-            try:
-                service_status = service_client.get_status(silent=True)
-            except Exception:
-                pass
-    except Exception:
-        pass
+    status = collect_system_status(
+        config,
+        bot_slug=bot_slug,
+        model_alias=explicit_model,
+        user_id=user_id,
+    )
 
-    bot_manager = BotManager(config)
-    default_bot = bot_manager.get_default_bot()
-    defined_models = config.defined_models.get("models", {})
-    openai_api_key = os.getenv("OPENAI_API_KEY")
-
-    # Detect environment: Docker container vs local
-    is_docker = os.path.exists("/.dockerenv") or os.path.exists("/run/.containerenv")
+    s_cfg = status.config
+    s_svc = status.service
+    s_mcp = status.mcp
+    s_model = status.model
+    s_mem = status.memory
+    s_dep = status.dependencies
 
     # ── Header panel ─────────────────────────────────────────────
-    version = service_status.version if (service_status and getattr(service_status, "version", None)) else "0.1.0"
-
-    if use_service:
-        if service_available and service_status and getattr(service_status, "available", False):
+    if s_cfg.mode == "service":
+        if s_svc.available and s_svc.healthy:
             mode_text = "[green]✓ Service Mode[/green]"
-        elif service_available:
+        elif s_svc.available:
             mode_text = "[yellow]⚠ Service Mode[/yellow] [dim](unhealthy)[/dim]"
         else:
             mode_text = "[red]✗ Service Mode[/red] [dim](not reachable)[/dim]"
     else:
         mode_text = "[cyan]Direct Mode[/cyan]"
 
-    env_label = "[dim](docker)[/dim]" if is_docker else "[dim](local)[/dim]"
+    env_label = "[dim](docker)[/dim]" if s_cfg.environment == "docker" else "[dim](local)[/dim]"
 
-    header_parts = [f"[dim]v{version}[/dim]", mode_text]
-    if use_service:
-        header_parts.append(f"[dim]{service_url}[/dim]")
+    header_parts = [f"[dim]v{s_cfg.version}[/dim]", mode_text]
+    if s_cfg.service_url:
+        header_parts.append(f"[dim]{s_cfg.service_url}[/dim]")
     header_parts.append(env_label)
     header_line = "  ".join(header_parts)
     console.print(Panel(header_line, title="[bold magenta]llm-bawt[/bold magenta]", border_style="grey39", padding=(0, 2)))
     console.print()
 
     # ── Config + Service (side-by-side) ─────────────────────────
-    config_table = make_table()
-
-    # Determine effective bot (from args or defaults)
-    if args:
-        if args.bot:
-            target_bot = bot_manager.get_bot(args.bot)
-            if target_bot:
-                bot_display = f"[bold cyan]{target_bot.name}[/bold cyan] ({args.bot})"
-            else:
-                bot_display = f"[red]Unknown: {args.bot}[/red]"
-        elif getattr(args, 'local', False):
-            target_bot = bot_manager.get_default_bot(local_mode=True)
-            bot_display = f"[bold yellow]{target_bot.name}[/bold yellow] ({target_bot.slug})"
-        else:
-            target_bot = default_bot
-            bot_display = f"[bold cyan]{target_bot.name}[/bold cyan] ({target_bot.slug})"
-
-        explicit_model = getattr(args, 'model', None)
-        selection = bot_manager.select_model(
-            explicit_model,
-            bot_slug=target_bot.slug,
-            local_mode=getattr(args, 'local', False),
-        )
-        model_alias = selection.alias
-        user_id = getattr(args, 'user', None) or config.DEFAULT_USER
-    else:
-        bot_display = f"[bold cyan]{default_bot.name}[/bold cyan] ({default_bot.slug})"
-        model_alias = config.DEFAULT_MODEL_ALIAS
-        user_id = config.DEFAULT_USER
-
-    # ── Build combined config + service table ──────────────────
-    # Uses 3 columns: Key | Value | right-side service info
     main_table = Table(show_header=False, box=None, padding=(0, 2))
     main_table.add_column("Key", style="cyan", no_wrap=True)
     main_table.add_column("Val")
     main_table.add_column("Key2", style="cyan", no_wrap=True)
     main_table.add_column("Val2")
 
+    bot_display = f"[bold cyan]{s_cfg.bot_name}[/bold cyan] ({s_cfg.bot_slug})"
+
     # Model display
-    if model_alias:
-        model_def = defined_models.get(model_alias, {})
-        model_type = model_def.get("type", "") if model_def else ""
-        type_suffix = f" [dim]{model_type}[/dim]" if model_type else ""
-        model_display = f"[green]{model_alias}[/green]{type_suffix}"
+    if s_cfg.model_alias and s_model:
+        type_suffix = f" [dim]{s_model.type}[/dim]" if s_model.type else ""
+        model_display = f"[green]{s_cfg.model_alias}[/green]{type_suffix}"
+    elif s_cfg.model_alias:
+        model_display = f"[green]{s_cfg.model_alias}[/green]"
     else:
         model_display = "[dim]not set[/dim]"
 
     # Service status values
-    if service_available and service_status and getattr(service_status, "available", False):
-        uptime_str = _format_uptime(service_status.uptime_seconds) if service_status.uptime_seconds else ""
+    if s_svc.available and s_svc.healthy:
+        uptime_str = _format_uptime(s_svc.uptime_seconds) if s_svc.uptime_seconds else ""
         svc_status = "[green]✓ Up[/green]"
         if uptime_str:
             svc_status += f" [dim]({uptime_str})[/dim]"
-        svc_loaded = f"[green]{service_status.current_model}[/green]" if service_status.current_model else "[dim]none[/dim]"
-        svc_tasks = f"{service_status.tasks_processed} / {service_status.tasks_pending} pending"
-    elif service_available:
+        svc_loaded = f"[green]{s_svc.current_model}[/green]" if s_svc.current_model else "[dim]none[/dim]"
+        svc_tasks = f"{s_svc.tasks_processed} / {s_svc.tasks_pending} pending"
+    elif s_svc.available:
         svc_status = "[yellow]⚠ Unhealthy[/yellow]"
         svc_loaded = ""
         svc_tasks = ""
-    elif use_service:
+    elif s_cfg.mode == "service":
         svc_status = "[red]✗ Not reachable[/red]"
         svc_loaded = ""
         svc_tasks = ""
@@ -354,128 +319,111 @@ def show_status(config: Config, args: argparse.Namespace | None = None):
         svc_loaded = ""
         svc_tasks = ""
 
-    # MCP server check
-    mcp_url = f"http://{config.SERVICE_HOST}:8001"
-    try:
-        import httpx
-        response = httpx.get(f"{mcp_url}/health", timeout=2.0)
-        mcp_status = "[green]✓ Up[/green]" if response.status_code == 200 else "[yellow]⚠ Unhealthy[/yellow]"
-    except Exception:
-        mcp_status = "[red]✗ Down[/red]" if (use_service or service_available) else "[dim]○ Not running[/dim]"
+    # MCP display
+    if s_mcp.mode == "server":
+        mcp_mode = "[green]Server[/green]"
+        if s_mcp.status == "up":
+            mcp_status = "[green]✓ Up[/green]"
+        elif s_mcp.status == "error":
+            mcp_status = f"[yellow]⚠ HTTP {s_mcp.http_status}[/yellow]"
+        else:
+            mcp_status = "[red]✗ Down[/red]"
+        mcp_url_display = str(s_mcp.url)
+    else:
+        mcp_mode = "[cyan]Embedded[/cyan]"
+        mcp_status = "[green]✓ In-process[/green]"
+        mcp_url_display = "[dim]embedded[/dim]"
 
-    # Bots list — slugs only, star the default
-    all_bots = bot_manager.list_bots()
+    # Scheduler / HA / models catalog
+    scheduler_display = "[green]Enabled[/green]" if s_cfg.scheduler_enabled else "[dim]Disabled[/dim]"
+    scheduler_display += f" [dim]({s_cfg.scheduler_interval}s)[/dim]"
+
+    models_catalog = f"{s_cfg.models_defined} defined"
+    if s_cfg.models_service is not None:
+        models_catalog += f" [dim]({s_cfg.models_service} service)[/dim]"
+
+    if s_cfg.ha_mcp_enabled:
+        ha_display = f"[green]Enabled[/green] [dim]({s_cfg.ha_mcp_url})[/dim]"
+    else:
+        ha_display = "[dim]Disabled[/dim]"
+
+    # Bots list
     bot_parts = []
-    for b in all_bots:
-        if b.slug == default_bot.slug:
+    for b in s_cfg.all_bots:
+        if b.is_default:
             bot_parts.append(f"[cyan]{b.slug}*[/cyan]")
         else:
             bot_parts.append(b.slug)
     bots_display = " ".join(bot_parts)
 
-    # Assemble rows: left = config, right = service
     main_table.add_row("Bot", bot_display, "LLM", svc_status)
     main_table.add_row("Model", model_display, "Loaded", svc_loaded)
-    main_table.add_row("User", f"{user_id}" if user_id else "[dim]not set[/dim]", "Tasks", svc_tasks)
-    main_table.add_row("Bots", bots_display, "MCP", mcp_status)
+    main_table.add_row("User", f"{s_cfg.user_id}" if s_cfg.user_id else "[dim]not set[/dim]", "Tasks", svc_tasks)
+    main_table.add_row("Bots", bots_display, "Memory", mcp_mode)
+    main_table.add_row("Models", models_catalog, "MCP", mcp_status)
+    main_table.add_row("Scheduler", scheduler_display, "MCP URL", mcp_url_display)
+    main_table.add_row("HA MCP", ha_display, "Bind Host", f"[dim]{s_cfg.bind_host}[/dim]")
 
     console.print(Panel(main_table, title="[bold]Config[/bold] / [bold]Service[/bold]", border_style="grey39"))
     console.print()
 
     # ── Model Info Panel ─────────────────────────────────────────
-    if model_alias and model_alias in defined_models:
-        from llm_bawt.utils.vram import detect_vram, auto_size_context_window, get_model_file_size
-
+    if s_model:
         model_info_table = make_table()
-        model_def = defined_models[model_alias]
-        model_type = model_def.get("type", "unknown")
+        model_info_table.add_row("Max Tokens", f"{s_model.max_tokens} [dim]({s_model.max_tokens_source})[/dim]")
 
-        # Per-model settings with resolution display
-        effective_max_tokens = model_def.get("max_tokens", config.MAX_OUTPUT_TOKENS)
-        max_tokens_source = "model" if "max_tokens" in model_def else "global"
-        model_info_table.add_row("Max Tokens", f"{effective_max_tokens} [dim]({max_tokens_source})[/dim]")
-
-        if model_type == "gguf":
-            # VRAM detection
-            vram_info = detect_vram()
-            if vram_info:
-                model_info_table.add_row("GPU", f"[green]{vram_info.gpu_name}[/green]")
+        if s_model.type == "gguf":
+            if s_model.gpu_name:
+                model_info_table.add_row("GPU", f"[green]{s_model.gpu_name}[/green]")
                 model_info_table.add_row(
                     "VRAM",
-                    f"{vram_info.total_gb:.1f}GB total, {vram_info.free_gb:.1f}GB free [dim]({vram_info.detection_method})[/dim]"
+                    f"{s_model.vram_total_gb:.1f}GB total, {s_model.vram_free_gb:.1f}GB free [dim]({s_model.vram_detection_method})[/dim]"
                 )
             else:
                 model_info_table.add_row("GPU", "[dim]Not detected[/dim]")
 
-            # Context window auto-sizing
-            sizing = auto_size_context_window(
-                model_definition=model_def,
-                global_n_ctx=config.LLAMA_CPP_N_CTX,
-                global_max_tokens=effective_max_tokens,
-            )
-            ctx_display = f"{sizing.context_window:,} tokens [dim]({sizing.source})[/dim]"
-            model_info_table.add_row("Context", ctx_display)
+            if s_model.context_window:
+                model_info_table.add_row("Context", f"{s_model.context_window:,} tokens [dim]({s_model.context_source})[/dim]")
 
-            # GPU layers
-            n_gpu_layers = model_def.get("n_gpu_layers", config.LLAMA_CPP_N_GPU_LAYERS)
-            gpu_layers_source = "model" if "n_gpu_layers" in model_def else "global"
-            layers_display = "All" if n_gpu_layers == -1 else str(n_gpu_layers)
-            model_info_table.add_row("GPU Layers", f"{layers_display} [dim]({gpu_layers_source})[/dim]")
+            if s_model.n_gpu_layers:
+                layers_display = "All" if s_model.n_gpu_layers == "all" else s_model.n_gpu_layers
+                model_info_table.add_row("GPU Layers", f"{layers_display} [dim]({s_model.gpu_layers_source})[/dim]")
 
-            # Native context limit
-            native_limit = model_def.get("native_context_limit")
-            if native_limit:
-                model_info_table.add_row("Native Limit", f"{int(native_limit):,} tokens")
+            if s_model.native_context_limit:
+                model_info_table.add_row("Native Limit", f"{s_model.native_context_limit:,} tokens")
         else:
-            # OpenAI/Ollama — simpler display
-            ctx_window = model_def.get("context_window")
-            if ctx_window:
-                model_info_table.add_row("Context", f"{int(ctx_window):,} tokens [dim](model)[/dim]")
-            elif model_type == "openai":
-                model_info_table.add_row("Context", "128,000 tokens [dim](default)[/dim]")
+            if s_model.context_window:
+                model_info_table.add_row("Context", f"{s_model.context_window:,} tokens [dim]({s_model.context_source})[/dim]")
 
-        console.print(Panel(model_info_table, title=f"[bold]Model: {model_alias}[/bold] [dim]{model_type}[/dim]", border_style="grey39"))
+        console.print(Panel(model_info_table, title=f"[bold]Model: {s_model.alias}[/bold] [dim]{s_model.type}[/dim]", border_style="grey39"))
         console.print()
 
     # ── Memory + Dependencies (side-by-side) ─────────────────────
     memory_table = make_table()
-    long_term_count = 0
-    messages_count = 0
 
-    if not has_database_credentials(config):
+    if not s_mem.postgres_connected and s_mem.postgres_error is None and s_mem.postgres_host is None:
         memory_table.add_row("Postgres", "[yellow]Not configured[/yellow]")
+    elif s_mem.postgres_connected:
+        pg_host = s_mem.postgres_host or ""
+        if len(pg_host) > 15:
+            pg_host = pg_host[:12] + "..."
+        memory_table.add_row("Postgres", f"[green]✓[/green] {pg_host}")
     else:
-        try:
-            from llm_bawt.memory.postgresql import PostgreSQLMemoryBackend
-            backend = PostgreSQLMemoryBackend(config, bot_id=default_bot.slug)
-            db_stats = backend.stats()
-            long_term_count = db_stats.get('memories', {}).get('total_count', 0)
-            messages_count = db_stats.get('messages', {}).get('total_count', 0)
-            pg_host = config.POSTGRES_HOST
-            if len(pg_host) > 15:
-                pg_host = pg_host[:12] + "..."
-            memory_table.add_row("Postgres", f"[green]✓[/green] {pg_host}")
-        except Exception as e:
-            memory_table.add_row("Postgres", f"[red]✗ Error[/red]")
+        memory_table.add_row("Postgres", "[red]✗ Error[/red]")
 
-    messages_display = f"[green]{messages_count}[/green]" if messages_count else "[dim]0[/dim]"
-    memories_display = f"[green]{long_term_count}[/green]" if long_term_count else "[dim]0[/dim]"
+    messages_display = f"[green]{s_mem.messages_count}[/green]" if s_mem.messages_count else "[dim]0[/dim]"
+    memories_display = f"[green]{s_mem.memories_count}[/green]" if s_mem.memories_count else "[dim]0[/dim]"
     memory_table.add_row("Messages", messages_display)
     memory_table.add_row("Memories", memories_display)
 
-    # pgvector extension
-    if has_database_credentials(config):
-        try:
-            from pgvector.psycopg2 import register_vector
-            memory_table.add_row("pgvector", "[green]✓[/green]")
-        except ImportError:
-            memory_table.add_row("pgvector", "[red]✗ Missing[/red]")
+    if s_mem.pgvector_available:
+        memory_table.add_row("pgvector", "[green]✓[/green]")
+    elif s_mem.postgres_connected or s_mem.postgres_error:
+        memory_table.add_row("pgvector", "[red]✗ Missing[/red]")
     else:
         memory_table.add_row("pgvector", "[dim]○ N/A[/dim]")
 
-    # Embeddings model
-    embed_available = importlib.util.find_spec("sentence_transformers") is not None
-    if embed_available:
+    if s_mem.embeddings_available:
         memory_table.add_row("Embeddings", "[green]✓[/green] [dim]MiniLM[/dim]")
     else:
         memory_table.add_row("Embeddings", "[dim]○ N/A[/dim]")
@@ -484,87 +432,44 @@ def show_status(config: Config, args: argparse.Namespace | None = None):
     deps_table = make_table()
     missing_deps: list[str] = []
 
-    # CUDA
-    nvcc_path = shutil.which("nvcc")
-    if nvcc_path:
-        try:
-            result = subprocess.run(["nvcc", "--version"], capture_output=True, text=True, timeout=5)
-            if result.returncode == 0:
-                import re
-                match = re.search(r"release ([\d.]+)", result.stdout)
-                cuda_ver = match.group(1) if match else "?"
-                deps_table.add_row("CUDA", f"[green]✓[/green] {cuda_ver}")
-            else:
-                deps_table.add_row("CUDA", "[yellow]⚠ error[/yellow]")
-        except Exception:
-            deps_table.add_row("CUDA", "[green]✓[/green]")
+    if s_dep.cuda_version and s_dep.cuda_version not in ("error",):
+        deps_table.add_row("CUDA", f"[green]✓[/green] {s_dep.cuda_version}")
+    elif s_dep.cuda_version == "error":
+        deps_table.add_row("CUDA", "[yellow]⚠ error[/yellow]")
     else:
         deps_table.add_row("CUDA", "[dim]○ N/A[/dim]")
 
-    # llama-cpp-python
-    llama_cpp_available = is_llama_cpp_available()
-    if llama_cpp_available:
+    if s_dep.llama_cpp_available:
         llama_label = "[green]✓[/green]"
-        try:
-            devnull = os.open(os.devnull, os.O_WRONLY)
-            old_stdout_fd = os.dup(1)
-            old_stderr_fd = os.dup(2)
-            try:
-                os.dup2(devnull, 1)
-                os.dup2(devnull, 2)
-                from llama_cpp import llama_supports_gpu_offload
-                has_gpu = llama_supports_gpu_offload()
-            finally:
-                os.dup2(old_stdout_fd, 1)
-                os.dup2(old_stderr_fd, 2)
-                os.close(devnull)
-                os.close(old_stdout_fd)
-                os.close(old_stderr_fd)
-            llama_label += " (GPU)" if has_gpu else " [dim](CPU)[/dim]"
-        except (ImportError, AttributeError, OSError):
-            pass
+        if s_dep.llama_cpp_gpu is True:
+            llama_label += " (GPU)"
+        elif s_dep.llama_cpp_gpu is False:
+            llama_label += " [dim](CPU)[/dim]"
         deps_table.add_row("llama-cpp", llama_label)
     else:
         deps_table.add_row("llama-cpp", "[red]✗ Missing[/red]")
         missing_deps.append("[cyan]make install-extras-llama[/cyan]")
 
-    # huggingface-hub
-    hf_hub_available = importlib.util.find_spec("huggingface_hub") is not None
-    if hf_hub_available:
+    if s_dep.hf_hub_available:
         deps_table.add_row("hf-hub", "[green]✓[/green]")
     else:
         deps_table.add_row("hf-hub", "[red]✗ Missing[/red]")
         missing_deps.append("[cyan]make install-extras-hf[/cyan]")
 
-    # transformers + torch
-    hf_available = is_huggingface_available()
-    if hf_available:
+    if s_dep.torch_available:
         deps_table.add_row("torch", "[green]✓[/green]")
     else:
         deps_table.add_row("torch", "[dim]○ Optional[/dim]")
 
-    # OpenAI API key
-    if openai_api_key:
+    if s_dep.openai_key_set:
         deps_table.add_row("OpenAI", "[green]✓ Key set[/green]")
     else:
         deps_table.add_row("OpenAI", "[dim]○ No key[/dim]")
 
-    # Search provider
-    search_provider = getattr(config, "SEARCH_PROVIDER", None)
-    tavily_key = os.getenv("TAVILY_API_KEY") or getattr(config, "TAVILY_API_KEY", "")
-    brave_key = os.getenv("BRAVE_API_KEY") or getattr(config, "BRAVE_API_KEY", "")
-    if search_provider:
-        deps_table.add_row("Search", f"[green]✓[/green] {search_provider}")
-    elif tavily_key:
-        deps_table.add_row("Search", "[green]✓[/green] tavily")
-    elif brave_key:
-        deps_table.add_row("Search", "[green]✓[/green] brave")
+    if s_dep.search_provider:
+        deps_table.add_row("Search", f"[green]✓[/green] {s_dep.search_provider}")
     else:
-        try:
-            importlib.util.find_spec("ddgs")
-            deps_table.add_row("Search", "[green]✓[/green] duckduckgo")
-        except Exception:
-            deps_table.add_row("Search", "[dim]○ None[/dim]")
+        deps_table.add_row("Search", "[dim]○ None[/dim]")
 
     row2 = Table.grid(expand=True)
     row2.add_column(ratio=1)
@@ -574,6 +479,17 @@ def show_status(config: Config, args: argparse.Namespace | None = None):
         Panel(deps_table, title="[bold]Dependencies[/bold]", border_style="grey39"),
     )
     console.print(row2)
+
+    console.print()
+    console.print(
+        "[dim]Useful:[/dim] "
+        "[cyan]--job-status[/cyan]  "
+        "[cyan]--list-models[/cyan]  "
+        "[cyan]--list-bots[/cyan]  "
+        "[cyan]--list-users[/cyan]  "
+        "[cyan]--user-profile[/cyan]  "
+        "[cyan]--config-list[/cyan]"
+    )
 
     if missing_deps:
         console.print()
@@ -592,6 +508,7 @@ def show_bots(config: Config):
     table = Table(show_header=True, box=None, padding=(0, 2))
     table.add_column("Slug", style="cyan")
     table.add_column("Name", style="bold")
+    table.add_column("Color")
     table.add_column("Description")
     table.add_column("Default Model")
     table.add_column("Memory", justify="center")
@@ -604,6 +521,7 @@ def show_bots(config: Config):
         table.add_row(
             f"{bot.slug}{is_default}",
             bot.name,
+            f"[{bot.color}]{bot.color}[/]" if bot.color else "[dim]default[/dim]",
             bot.description,
             default_model,
             memory_icon

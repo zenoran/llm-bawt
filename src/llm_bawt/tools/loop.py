@@ -20,6 +20,7 @@ if TYPE_CHECKING:
     from ..models.message import Message
     from ..clients import LLMClient
     from ..integrations.ha_mcp.client import HomeAssistantMCPClient
+    from ..integrations.newsapi.client import NewsAPIClient
     from ..memory_server.client import MemoryClient
     from ..profiles import ProfileManager
     from ..search.base import SearchClient
@@ -43,6 +44,7 @@ class ToolLoop:
         profile_manager: "ProfileManager | None" = None,
         search_client: "SearchClient | None" = None,
         home_client: "HomeAssistantMCPClient | None" = None,
+        news_client: "NewsAPIClient | None" = None,
         model_lifecycle: "ModelLifecycleManager | None" = None,
         config: "Config | None" = None,
         user_id: str = "",  # Required - must be passed explicitly
@@ -59,6 +61,8 @@ class ToolLoop:
             memory_client: Client for memory operations.
             profile_manager: Manager for profile operations.
             search_client: Client for web search operations.
+            home_client: Home Assistant MCP client.
+            news_client: NewsAPI client.
             model_lifecycle: Manager for model lifecycle operations.
             config: Application config (used for lazy search setup).
             user_id: Current user ID (required).
@@ -74,6 +78,7 @@ class ToolLoop:
             profile_manager=profile_manager,
             search_client=search_client,
             home_client=home_client,
+            news_client=news_client,
             model_lifecycle=model_lifecycle,
             config=config,
             user_id=user_id,
@@ -459,6 +464,7 @@ def query_with_tools(
     profile_manager: "ProfileManager | None" = None,
     search_client: "SearchClient | None" = None,
     home_client: "HomeAssistantMCPClient | None" = None,
+    news_client: "NewsAPIClient | None" = None,
     model_lifecycle: "ModelLifecycleManager | None" = None,
     config: "Config | None" = None,
     user_id: str = "",  # Required - must be passed explicitly
@@ -480,6 +486,7 @@ def query_with_tools(
         profile_manager: Profile manager for user/bot profile tools.
         search_client: Search client for web search tools.
         home_client: Home Assistant MCP client for smart-home tools.
+        news_client: NewsAPI client for news tools.
         model_lifecycle: Model lifecycle manager for model switching tools.
         config: Application config (used for lazy search setup).
         user_id: Current user ID (required).
@@ -503,6 +510,7 @@ def query_with_tools(
         profile_manager=profile_manager,
         search_client=search_client,
         home_client=home_client,
+        news_client=news_client,
         model_lifecycle=model_lifecycle,
         config=config,
         user_id=user_id,

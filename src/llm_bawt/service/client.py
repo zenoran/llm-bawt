@@ -329,6 +329,14 @@ class ServiceClient:
                             if chunk.get("object") == "service.warning":
                                 yield {"warnings": chunk.get("warnings", []), "model": chunk.get("model")}
                                 continue
+                            # Service tool-call event (subtle UI indicator)
+                            if chunk.get("object") == "service.tool_call":
+                                yield {
+                                    "tool_call": chunk.get("tool"),
+                                    "tool_args": chunk.get("arguments", {}),
+                                    "model": chunk.get("model"),
+                                }
+                                continue
                             # On first chunk, yield metadata with actual model used
                             if first_chunk:
                                 actual_model = chunk.get("model")

@@ -5,9 +5,11 @@ from fastapi import APIRouter, HTTPException
 from ..dependencies import attribute_to_response, get_service
 from ..logging import get_service_logger
 from ..schemas import (
+    ProfileAttributeUpdateRequest,
     ProfileDetail,
     ProfileListResponse,
     UserListResponse,
+    UserProfileAttribute,
     UserProfileDetail,
     UserProfileSummary,
 )
@@ -127,6 +129,41 @@ async def delete_user_attribute(attribute_id: int):
     except Exception as e:
         log.error(f"Failed to delete user attribute: {e}")
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.patch("/v1/profiles/attribute/{attribute_id}", response_model=UserProfileAttribute, tags=["Profiles"])
+async def update_profile_attribute(attribute_id: int, request: ProfileAttributeUpdateRequest):
+    """Update a profile attribute by its ID."""
+    service = get_service()
+
+    try:
+        from ..profiles import ProfileManager
+
+        if request.value is None and request.confidence is None and request.source is None:
+            raise HTTPException(status_code=400, detail="Provide at least one field: value, confidence, or source")
+
+        manager = ProfileManager(service.config)
+        updated = manager.update_attribute_by_id(
+            attribute_id=attribute_id,
+            value=request.value,
+            confidence=request.confidence,
+            source=request.source,
+        )
+        if not updated:
+            raise HTTPException(status_code=404, detail=f"Attribute with ID {attribute_id} not found")
+
+        return attribute_to_response(updated)
+    except HTTPException:
+        raise
+    except Exception as e:
+        log.error(f"Failed to update profile attribute: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.patch("/v1/users/attribute/{attribute_id}", response_model=UserProfileAttribute, tags=["Users"])
+async def update_user_attribute(attribute_id: int, request: ProfileAttributeUpdateRequest):
+    """Alias for updating a user attribute by ID (same behavior as /v1/profiles/attribute/{id})."""
+    return await update_profile_attribute(attribute_id, request)
 
 
 @router.get("/v1/profiles/{entity_id}", response_model=ProfileDetail, tags=["Profiles"])

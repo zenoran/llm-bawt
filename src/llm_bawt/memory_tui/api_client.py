@@ -201,11 +201,14 @@ class MemoryAPIClient:
         bot_id: str | None = None,
         limit: int = 50,
         offset: int = 0,
+        before: str | None = None,
     ) -> dict[str, Any]:
-        """Get recent messages."""
+        """Get messages, optionally paginating older history with a before cursor."""
         params: dict[str, Any] = {"limit": limit, "offset": offset}
         if bot_id:
             params["bot_id"] = bot_id
+        if before:
+            params["before"] = before
         
         response = await self._client.get(
             f"{self.base_url}/v1/history",

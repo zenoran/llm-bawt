@@ -505,6 +505,53 @@ class ProfileManager:
                 logger.debug(f"Deleted attribute by ID {attribute_id}: {desc}")
                 return True
             return False
+
+    def update_attribute_by_id(
+        self,
+        attribute_id: int,
+        value: Any | None = None,
+        confidence: float | None = None,
+        source: str | None = None,
+    ) -> ProfileAttribute | None:
+        """Update a specific attribute by its database ID.
+
+        Returns updated attribute, or None if not found.
+        """
+        with Session(self.engine) as session:
+            statement = select(ProfileAttribute).where(ProfileAttribute.id == attribute_id)
+            attr = session.exec(statement).first()
+            if not attr:
+                return None
+
+            changed = False
+            if value is not None:
+                attr.value = value
+                changed = True
+            if confidence is not None:
+                attr.confidence = confidence
+                changed = True
+            if source is not None:
+                attr.source = source
+                changed = True
+
+            if not changed:
+                return attr
+
+            attr.updated_at = datetime.utcnow()
+            session.add(attr)
+
+            profile_stmt = select(EntityProfile).where(
+                EntityProfile.entity_type == attr.entity_type,
+                EntityProfile.entity_id == attr.entity_id,
+            )
+            profile = session.exec(profile_stmt).first()
+            if profile and profile.summary:
+                profile.summary = None
+                session.add(profile)
+
+            session.commit()
+            session.refresh(attr)
+            return attr
     
     def delete_attributes_by_category(
         self,

@@ -869,6 +869,14 @@ class BackgroundService:
                                                 args = {}
 
                                             log.info(f"🔧 {name}({args})")
+                                            loop.call_soon_threadsafe(
+                                                chunk_queue.put_nowait,
+                                                {
+                                                    "event": "tool_call",
+                                                    "name": name,
+                                                    "arguments": args,
+                                                },
+                                            )
 
                                             tool_call_obj = ToolCall(name=name, arguments=args, raw_text="")
                                             result = executor.execute(tool_call_obj)
@@ -1085,6 +1093,16 @@ class BackgroundService:
                     yield f"data: {json.dumps(data)}\n\n"
                     yield "data: [DONE]\n\n"
                     break
+
+                if isinstance(chunk, dict) and chunk.get("event") == "tool_call":
+                    event_data = {
+                        "object": "service.tool_call",
+                        "model": model_alias,
+                        "tool": chunk.get("name", "unknown"),
+                        "arguments": chunk.get("arguments", {}),
+                    }
+                    yield f"data: {json.dumps(event_data)}\n\n"
+                    continue
                 
                 # Apply emote filter for voice_optimized bots
                 if emote_filter:

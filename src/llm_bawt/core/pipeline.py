@@ -111,6 +111,7 @@ class RequestPipeline:
         profile_manager: Any = None,
         search_client: Any = None,
         home_client: Any = None,
+        news_client: Any = None,
         model_lifecycle: Any = None,
         history_manager: Any = None,
         llm_client: Any = None,
@@ -139,6 +140,7 @@ class RequestPipeline:
         self.profile_manager = profile_manager
         self.search_client = search_client
         self.home_client = home_client
+        self.news_client = news_client
         self.model_lifecycle = model_lifecycle
         self.history_manager = history_manager
         self.llm_client = llm_client
@@ -325,6 +327,7 @@ class RequestPipeline:
             include_models = self.model_lifecycle is not None
             tool_definitions = get_tools_list(
                 include_search_tools=ctx.use_search,
+                include_news_tools=self.news_client is not None,
                 include_home_tools=self.home_client is not None,
                 include_model_tools=include_models,
             )
@@ -513,7 +516,7 @@ class RequestPipeline:
             ctx.response = ""
             return
         
-        if ctx.use_tools and (self.memory_client or self.home_client):
+        if ctx.use_tools and (self.memory_client or self.home_client or self.news_client):
             # Use tool loop
             from ..tools import query_with_tools
             response, tool_context, tool_call_details = query_with_tools(
@@ -523,6 +526,7 @@ class RequestPipeline:
                 profile_manager=self.profile_manager,
                 search_client=self.search_client,
                 home_client=self.home_client,
+                news_client=self.news_client,
                 model_lifecycle=self.model_lifecycle,
                 config=self.config,
                 user_id=ctx.user_id,

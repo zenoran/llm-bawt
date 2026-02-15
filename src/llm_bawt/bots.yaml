@@ -16,6 +16,7 @@ bot_settings_template:
 bots:
   nova:
     name: Nova
+    color: cyan
     description: Full-featured assistant with persistent memory
     requires_memory: true
     uses_tools: true
@@ -46,6 +47,7 @@ bots:
 
   monika:
     name: Monika
+    color: magenta
     description: Emotional support companion with memory
     requires_memory: true
     voice_optimized: true
@@ -93,6 +95,7 @@ bots:
 
   spark:
     name: Spark
+    color: yellow
     description: Lightweight local assistant (no database)
     requires_memory: false
     default_model: null
@@ -113,6 +116,7 @@ bots:
 
   mira:
     name: Mira
+    color: magenta
     description: Conversational companion with natural speech
     requires_memory: true
     voice_optimized: true
@@ -189,6 +193,7 @@ bots:
 
   proto:
     name: Proto
+    color: green
     description: Chatbot with separate memory for testing (tools enabled)
     requires_memory: true
     voice_optimized: true

@@ -52,12 +52,20 @@ class Bot:
     uses_tools: bool = False  # Whether this bot can use tools (memory search, etc.)
     uses_search: bool = False  # Whether this bot can search the web
     uses_home_assistant: bool = False  # Whether this bot can control Home Assistant via MCP
+    color: str | None = None  # Optional Rich color name for CLI panel styling
     nextcloud: dict | None = None  # Nextcloud integration config (bot_id, secret, etc.)
     settings: dict[str, Any] = field(default_factory=dict)  # Effective bot settings (template + overrides)
     
     def __post_init__(self):
         # Ensure slug is lowercase and valid
         self.slug = self.slug.lower().strip()
+        if self.color is not None:
+            normalized_color = str(self.color).strip().lower()
+            # Keep this permissive for standard Rich color-style names.
+            if normalized_color and re.match(r"^[a-z][a-z0-9_-]*$", normalized_color):
+                self.color = normalized_color
+            else:
+                self.color = None
 
 
 @dataclass
@@ -217,7 +225,14 @@ def _load_bots_config() -> None:
         effective_settings = _build_settings(normalized_slug, yaml_source)
         merged_bot_data = dict(payload)
         merged_bot_data["settings"] = effective_settings
+        if "color" not in merged_bot_data and isinstance(yaml_source, dict):
+            merged_bot_data["color"] = yaml_source.get("color")
         _RAW_BOT_DATA[normalized_slug] = merged_bot_data
+        bot_color = payload.get("color")
+        if not bot_color and isinstance(yaml_source, dict):
+            bot_color = yaml_source.get("color")
+        if not bot_color:
+            bot_color = effective_settings.get("ui_color")
         BUILTIN_BOTS[normalized_slug] = Bot(
             slug=normalized_slug,
             name=payload.get("name", normalized_slug.title()),
@@ -229,11 +244,13 @@ def _load_bots_config() -> None:
             uses_tools=payload.get("uses_tools", False),
             uses_search=payload.get("uses_search", False),
             uses_home_assistant=payload.get("uses_home_assistant", False),
+            color=bot_color,
             nextcloud=payload.get("nextcloud"),
             settings=effective_settings,
         )
 
     # 1) DB bot profiles are authoritative for personality fields
+    yaml_bots = merged_data.get("bots", {}) if isinstance(merged_data.get("bots"), dict) else {}
     for slug, profile in db_profiles_by_slug.items():
         _register_bot(
             slug,
@@ -249,6 +266,7 @@ def _load_bots_config() -> None:
                 "uses_home_assistant": profile.uses_home_assistant,
                 "nextcloud": profile.nextcloud_config,
             },
+            yaml_source=yaml_bots.get(slug),
         )
     
     # 2) YAML fallback only for slugs missing in DB

@@ -11,6 +11,7 @@ from ..schemas import (
     MemoryForgetRequest,
     MemoryForgetResponse,
     MemoryItem,
+    MemoryUpdateRequest,
     MemoryRestoreResponse,
     MemorySearchRequest,
     MemorySearchResponse,
@@ -193,6 +194,44 @@ async def delete_memory(
         raise
     except Exception as e:
         log.error(f"Failed to delete memory for bot '{bot_id}': {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.patch("/v1/memory/{memory_id}", response_model=MemoryItem, tags=["Memory"])
+async def update_memory(
+    memory_id: str,
+    request: MemoryUpdateRequest,
+    bot_id: str = Depends(get_effective_bot_id),
+    client=Depends(require_memory_client),
+):
+    """Update an existing memory by ID."""
+    try:
+        if request.content is None and request.importance is None and request.tags is None:
+            raise HTTPException(status_code=400, detail="Provide at least one field: content, importance, or tags")
+
+        updated = client.update_memory(
+            memory_id=memory_id,
+            content=request.content,
+            importance=request.importance,
+            tags=request.tags,
+        )
+        if not updated:
+            raise HTTPException(status_code=404, detail=f"Memory '{memory_id}' not found")
+
+        return MemoryItem(
+            id=str(getattr(updated, "id", "")),
+            content=str(getattr(updated, "content", "")),
+            importance=float(getattr(updated, "importance", 0.5)),
+            relevance=getattr(updated, "relevance", None),
+            tags=list(getattr(updated, "tags", []) or []),
+            created_at=getattr(updated, "created_at", None),
+            last_accessed=getattr(updated, "last_accessed", None),
+            source_message_ids=list(getattr(updated, "source_message_ids", []) or []),
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        log.error(f"Failed to update memory for bot '{bot_id}': {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 

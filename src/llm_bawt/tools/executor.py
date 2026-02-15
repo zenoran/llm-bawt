@@ -3,12 +3,13 @@
 Executes tool calls by routing them to the appropriate backend
 (MCP memory server, profiles, web search, model management, etc.) and returning formatted results.
 
-Consolidated tools (8 total):
+Consolidated tools (9 total):
 - memory: action-based (search/store/delete)
 - history: action-based (search/recent/forget) with date filtering
 - profile: action-based (get/set/delete)
 - self: action-based (get/set/delete) for bot personality development
 - search: type-based (web/news)
+- news: action-based (search/headlines) via NewsAPI
 - home: action-based (status/query/get/set/scene) for Home Assistant
 - model: action-based (list/current/switch)
 - time: current time
@@ -25,6 +26,7 @@ from .definitions import normalize_legacy_tool_call
 
 if TYPE_CHECKING:
     from ..integrations.ha_mcp.client import HomeAssistantMCPClient
+    from ..integrations.newsapi.client import NewsAPIClient
     from ..memory_server.client import MemoryClient
     from ..profiles import ProfileManager
     from ..search.base import SearchClient
@@ -130,6 +132,7 @@ class ToolExecutor:
         profile_manager: "ProfileManager | None" = None,
         search_client: "SearchClient | None" = None,
         home_client: "HomeAssistantMCPClient | None" = None,
+        news_client: "NewsAPIClient | None" = None,
         model_lifecycle: "ModelLifecycleManager | None" = None,
         config: "Config | None" = None,
         user_id: str = "",  # Required - must be passed explicitly
@@ -142,6 +145,8 @@ class ToolExecutor:
             memory_client: Memory client for memory operations.
             profile_manager: Profile manager for user/bot profile operations.
             search_client: Search client for web search operations.
+            home_client: Home Assistant MCP client.
+            news_client: NewsAPI client for news search/headlines.
             model_lifecycle: Model lifecycle manager for model switching.
             user_id: Current user ID for profile operations (required).
             bot_id: Current bot ID for bot personality operations.
@@ -153,6 +158,7 @@ class ToolExecutor:
         self.profile_manager = profile_manager
         self.search_client = search_client
         self.home_client = home_client
+        self.news_client = news_client
         self.model_lifecycle = model_lifecycle
         self.config = config
         self.user_id = user_id
@@ -172,6 +178,7 @@ class ToolExecutor:
             "self": self._execute_self,
             "bot_trait": self._execute_self,  # Legacy name
             "search": self._execute_search,
+            "news": self._execute_news,
             "home": self._execute_home,
             "model": self._execute_model,
             "time": self._execute_time,
@@ -280,13 +287,15 @@ class ToolExecutor:
             return self._memory_search(tool_call)
         elif action == "store":
             return self._memory_store(tool_call)
+        elif action == "update":
+            return self._memory_update(tool_call)
         elif action == "delete":
             return self._memory_delete(tool_call)
         else:
             return format_tool_result(
                 tool_call.name,
                 None,
-                error=f"Invalid action: '{action}'. Use 'search', 'store', or 'delete'."
+                error=f"Invalid action: '{action}'. Use 'search', 'store', 'update', or 'delete'."
             )
 
     def _memory_search(self, tool_call: ToolCall) -> str:
@@ -433,6 +442,56 @@ class ToolExecutor:
 
         except Exception as e:
             logger.error(f"Memory delete failed: {e}")
+            return format_tool_result(tool_call.name, None, error=str(e))
+
+    def _memory_update(self, tool_call: ToolCall) -> str:
+        """Update an existing memory in place."""
+        memory_id = tool_call.arguments.get("memory_id", "")
+        query = tool_call.arguments.get("query", "")
+        content = tool_call.arguments.get("content")
+        importance = tool_call.arguments.get("importance")
+        tags = tool_call.arguments.get("tags")
+
+        if not memory_id and not query:
+            return format_tool_result(
+                tool_call.name,
+                None,
+                error="action='update' requires 'memory_id' or 'query' parameter"
+            )
+
+        if content is None and importance is None and tags is None:
+            return format_tool_result(
+                tool_call.name,
+                None,
+                error="action='update' requires at least one of: content, importance, tags"
+            )
+
+        if isinstance(tags, str):
+            tags = [tags]
+
+        target_id = memory_id
+        try:
+            if not target_id and query:
+                matches = self.memory_client.search(query=query, n_results=1, min_relevance=0.3)
+                if not matches:
+                    return format_tool_result(tool_call.name, f"No memories found matching '{query}'")
+                target_id = matches[0].id
+
+            updated = self.memory_client.update_memory(
+                memory_id=target_id,
+                content=content,
+                importance=float(importance) if importance is not None else None,
+                tags=tags,
+            )
+            if not updated:
+                return format_tool_result(tool_call.name, None, error=f"Memory {target_id} not found")
+
+            return format_tool_result(
+                tool_call.name,
+                f"Updated memory {str(updated.id)[:8]}: {updated.content[:120]}"
+            )
+        except Exception as e:
+            logger.error(f"Memory update failed: {e}")
             return format_tool_result(tool_call.name, None, error=str(e))
 
     def _execute_history(self, tool_call: ToolCall) -> str:
@@ -713,13 +772,15 @@ class ToolExecutor:
             return self._profile_get(tool_call)
         elif action == "set":
             return self._profile_set(tool_call)
+        elif action == "update":
+            return self._profile_update(tool_call)
         elif action == "delete":
             return self._profile_delete(tool_call)
         else:
             return format_tool_result(
                 tool_call.name,
                 None,
-                error=f"Invalid action: '{action}'. Use 'get', 'set', or 'delete'."
+                error=f"Invalid action: '{action}'. Use 'get', 'set', 'update', or 'delete'."
             )
 
     def _profile_get(self, tool_call: ToolCall) -> str:
@@ -850,6 +911,80 @@ class ToolExecutor:
             logger.error(f"Delete user attribute failed: {e}")
             return format_tool_result(tool_call.name, None, error=str(e))
 
+    def _profile_update(self, tool_call: ToolCall) -> str:
+        """Update existing user profile attributes without delete+recreate."""
+        attribute_id = tool_call.arguments.get("attribute_id")
+        category = tool_call.arguments.get("category", "")
+        key = tool_call.arguments.get("key", "")
+        value = tool_call.arguments.get("value")
+        confidence = tool_call.arguments.get("confidence")
+
+        if value is None and confidence is None:
+            return format_tool_result(
+                tool_call.name,
+                None,
+                error="action='update' requires at least one of: value, confidence"
+            )
+
+        try:
+            from ..profiles import EntityType
+
+            # Preferred path: explicit attribute id.
+            if attribute_id is not None and hasattr(self.profile_manager, "update_attribute_by_id"):
+                updated = self.profile_manager.update_attribute_by_id(
+                    attribute_id=int(attribute_id),
+                    value=value,
+                    confidence=float(confidence) if confidence is not None else None,
+                    source="inferred",
+                )
+                if not updated:
+                    return format_tool_result(tool_call.name, None, error=f"Attribute id {attribute_id} not found")
+                return format_tool_result(
+                    tool_call.name,
+                    f"Updated user attribute id {attribute_id}: {updated.category}.{updated.key} = {updated.value}"
+                )
+
+            # Fallback path: update by category+key via upsert semantics.
+            if not category or not key:
+                return format_tool_result(
+                    tool_call.name,
+                    None,
+                    error="action='update' requires 'attribute_id' or ('category' and 'key')"
+                )
+
+            existing = self.profile_manager.get_attribute(
+                entity_type=EntityType.USER,
+                entity_id=self.user_id,
+                category=category.lower(),
+                key=key,
+            )
+            if not existing:
+                return format_tool_result(
+                    tool_call.name,
+                    None,
+                    error=f"Attribute {category}.{key} not found"
+                )
+
+            next_value = existing.value if value is None else value
+            next_confidence = existing.confidence if confidence is None else float(confidence)
+            self.profile_manager.set_attribute(
+                entity_type=EntityType.USER,
+                entity_id=self.user_id,
+                category=category.lower(),
+                key=key,
+                value=next_value,
+                confidence=next_confidence,
+                source="inferred",
+            )
+            return format_tool_result(
+                tool_call.name,
+                f"Updated user attribute: {category}.{key} = {next_value}"
+            )
+
+        except Exception as e:
+            logger.error(f"Update user attribute failed: {e}")
+            return format_tool_result(tool_call.name, None, error=str(e))
+
     def _execute_self(self, tool_call: ToolCall) -> str:
         """Execute self tool - bot personality reflection and development."""
         if not self.profile_manager:
@@ -865,13 +1000,15 @@ class ToolExecutor:
             return self._self_get(tool_call)
         elif action == "set":
             return self._self_set(tool_call)
+        elif action == "update":
+            return self._self_update(tool_call)
         elif action == "delete":
             return self._self_delete(tool_call)
         else:
             return format_tool_result(
                 tool_call.name,
                 None,
-                error=f"Invalid action: '{action}'. Use 'get', 'set', or 'delete'."
+                error=f"Invalid action: '{action}'. Use 'get', 'set', 'update', or 'delete'."
             )
 
     def _self_get(self, tool_call: ToolCall) -> str:
@@ -1078,6 +1215,73 @@ class ToolExecutor:
             logger.exception(f"Self delete failed: {e}")
             return format_tool_result(tool_call.name, None, error="Failed to delete trait. Please try again.")
 
+    def _self_update(self, tool_call: ToolCall) -> str:
+        """Update an existing bot personality trait."""
+        category = tool_call.arguments.get("category", "personality")
+        key = tool_call.arguments.get("key", "").strip()
+        value = tool_call.arguments.get("value")
+
+        if not key:
+            return format_tool_result(
+                tool_call.name,
+                None,
+                error="action='update' requires 'key' parameter"
+            )
+
+        if value is None:
+            return format_tool_result(
+                tool_call.name,
+                None,
+                error="action='update' requires 'value' parameter (cannot be null)"
+            )
+
+        category = category.lower().strip()
+        if category == "communication":
+            category = "communication_style"
+
+        valid_categories = ["personality", "preference", "interest", "communication_style"]
+        if category not in valid_categories:
+            return format_tool_result(
+                tool_call.name,
+                None,
+                error=f"Invalid category. Must be one of: {', '.join(valid_categories)}"
+            )
+
+        try:
+            from ..profiles import EntityType
+
+            existing = self.profile_manager.get_attribute(
+                entity_type=EntityType.BOT,
+                entity_id=self.bot_id,
+                category=category,
+                key=key,
+            )
+            if not existing:
+                return format_tool_result(
+                    tool_call.name,
+                    None,
+                    error=f"Trait {category}.{key} not found"
+                )
+
+            self.profile_manager.set_attribute(
+                entity_type=EntityType.BOT,
+                entity_id=self.bot_id,
+                category=category,
+                key=key,
+                value=value,
+                confidence=1.0,
+                source="self",
+            )
+
+            return format_tool_result(
+                tool_call.name,
+                f"Updated {category} trait: {key} = {value}"
+            )
+
+        except Exception as e:
+            logger.exception(f"Self update failed: {e}")
+            return format_tool_result(tool_call.name, None, error="Failed to update trait. Please try again.")
+
     def _execute_search(self, tool_call: ToolCall) -> str:
         """Execute search tool - web or news search."""
         self._ensure_search_client()
@@ -1135,6 +1339,67 @@ class ToolExecutor:
             self.search_client = get_search_client(self.config)
         except Exception as e:
             logger.warning(f"Failed to initialize search client: {e}")
+
+    def _execute_news(self, tool_call: ToolCall) -> str:
+        """Execute NewsAPI tool - article search or headlines."""
+        if not self.news_client:
+            self._ensure_news_client()
+        if not self.news_client:
+            return format_tool_result(
+                tool_call.name,
+                None,
+                error="NewsAPI not available. Set NEWSAPI_API_KEY in your environment.",
+            )
+
+        action = tool_call.arguments.get("action", "search").lower()
+        query = tool_call.arguments.get("query", "")
+        max_results = tool_call.arguments.get("max_results", 5)
+
+        try:
+            if action == "headlines":
+                country = tool_call.arguments.get("country", "us")
+                category = tool_call.arguments.get("category")
+                result = self.news_client.headlines(
+                    query=query or None,
+                    max_results=max_results,
+                    country=country,
+                    category=category,
+                )
+                logger.info(f"News headlines (country={country}, category={category}) returned")
+            else:
+                if not query:
+                    return format_tool_result(
+                        tool_call.name,
+                        None,
+                        error="Missing required parameter: query (required for action='search')",
+                    )
+                sort_by = tool_call.arguments.get("sort_by", "publishedAt")
+                result = self.news_client.search(
+                    query=query,
+                    max_results=max_results,
+                    sort_by=sort_by,
+                )
+                logger.info(f"News search '{query}' returned")
+
+            return format_tool_result(tool_call.name, result)
+
+        except Exception as e:
+            logger.error(f"News tool failed: {e}")
+            return format_tool_result(tool_call.name, None, error=str(e))
+
+    def _ensure_news_client(self) -> None:
+        """Lazy-init NewsAPI client if API key is available."""
+        if self.news_client:
+            return
+        try:
+            import os
+            api_key = os.environ.get("NEWSAPI_API_KEY", "")
+            if api_key:
+                from ..integrations.newsapi.client import NewsAPIClient
+                self.news_client = NewsAPIClient(api_key=api_key)
+                logger.debug("NewsAPI client initialized")
+        except Exception as e:
+            logger.warning(f"Failed to initialize NewsAPI client: {e}")
 
     def _execute_home(self, tool_call: ToolCall) -> str:
         """Execute Home Assistant tool."""

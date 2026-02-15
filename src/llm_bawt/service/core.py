@@ -275,6 +275,7 @@ class ServiceLLMBawt(BaseLLMBawt):
                 profile_manager=self.profile_manager,
                 search_client=self.search_client,
                 home_client=self.home_client,
+                news_client=self.news_client,
                 model_lifecycle=self.model_lifecycle,
                 config=self.config,
                 user_id=self.user_id,

@@ -1,0 +1,469 @@
+"""Shared system status collection used by both CLI and API."""
+
+from __future__ import annotations
+
+import importlib.util
+import logging
+import os
+import re
+import shutil
+import subprocess
+from dataclasses import dataclass, field
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from llm_bawt.utils.config import Config
+
+logger = logging.getLogger(__name__)
+
+
+@dataclass
+class ServiceInfo:
+    """LLM service status."""
+
+    available: bool = False
+    healthy: bool = False
+    uptime_seconds: float | None = None
+    current_model: str | None = None
+    tasks_processed: int = 0
+    tasks_pending: int = 0
+
+
+@dataclass
+class MemoryInfo:
+    """Database and memory subsystem status."""
+
+    postgres_connected: bool = False
+    postgres_host: str | None = None
+    postgres_error: str | None = None
+    messages_count: int = 0
+    memories_count: int = 0
+    pgvector_available: bool = False
+    embeddings_available: bool = False
+
+
+@dataclass
+class ModelStatusInfo:
+    """Current model configuration details."""
+
+    alias: str
+    type: str = "unknown"
+    max_tokens: int = 0
+    max_tokens_source: str = "global"
+    context_window: int | None = None
+    context_source: str | None = None
+    # GGUF-specific
+    gpu_name: str | None = None
+    vram_total_gb: float | None = None
+    vram_free_gb: float | None = None
+    vram_detection_method: str | None = None
+    n_gpu_layers: str | None = None
+    gpu_layers_source: str | None = None
+    native_context_limit: int | None = None
+
+
+@dataclass
+class DependencyInfo:
+    """Optional dependency availability."""
+
+    cuda_version: str | None = None
+    llama_cpp_available: bool = False
+    llama_cpp_gpu: bool | None = None
+    hf_hub_available: bool = False
+    torch_available: bool = False
+    openai_key_set: bool = False
+    search_provider: str | None = None
+    embeddings_available: bool = False
+
+
+@dataclass
+class McpInfo:
+    """MCP memory server status."""
+
+    mode: str = "embedded"  # "server" | "embedded"
+    status: str = "up"  # "up" | "down" | "error"
+    url: str | None = None
+    http_status: int | None = None
+
+
+@dataclass
+class BotSummary:
+    """Minimal bot info for the status display."""
+
+    slug: str
+    name: str
+    is_default: bool = False
+
+
+@dataclass
+class ConfigInfo:
+    """System configuration summary."""
+
+    version: str = "0.1.0"
+    mode: str = "direct"  # "service" | "direct"
+    service_url: str | None = None
+    environment: str = "local"  # "docker" | "local"
+    bot_name: str = ""
+    bot_slug: str = ""
+    model_alias: str | None = None
+    user_id: str | None = None
+    all_bots: list[BotSummary] = field(default_factory=list)
+    models_defined: int = 0
+    models_service: int | None = None
+    scheduler_enabled: bool = False
+    scheduler_interval: int = 0
+    ha_mcp_enabled: bool = False
+    ha_mcp_url: str | None = None
+    bind_host: str = "0.0.0.0"
+
+
+@dataclass
+class SystemStatus:
+    """Full system status."""
+
+    config: ConfigInfo
+    service: ServiceInfo
+    mcp: McpInfo
+    model: ModelStatusInfo | None
+    memory: MemoryInfo
+    dependencies: DependencyInfo
+
+
+def _collect_service_info(config: Config) -> tuple[ServiceInfo, Any]:
+    """Collect LLM service status. Returns (ServiceInfo, raw_service_status)."""
+    from llm_bawt.model_manager import is_service_mode_enabled
+
+    info = ServiceInfo()
+    raw_status = None
+    use_service = is_service_mode_enabled(config)
+
+    if not use_service:
+        return info, raw_status
+
+    try:
+        from llm_bawt.service import ServiceClient
+
+        host = "127.0.0.1" if config.SERVICE_HOST in {"0.0.0.0", "::"} else config.SERVICE_HOST
+        service_url = f"http://{host}:{config.SERVICE_PORT}"
+        client = ServiceClient(http_url=service_url)
+        if client.is_available(force_check=True):
+            info.available = True
+            try:
+                raw_status = client.get_status(silent=True)
+                if raw_status and getattr(raw_status, "available", False):
+                    info.healthy = True
+                    info.uptime_seconds = raw_status.uptime_seconds
+                    info.current_model = raw_status.current_model
+                    info.tasks_processed = raw_status.tasks_processed
+                    info.tasks_pending = raw_status.tasks_pending
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+    return info, raw_status
+
+
+def _collect_mcp_info(config: Config, default_bot_slug: str) -> McpInfo:
+    """Collect MCP memory server status."""
+    memory_server_url = (config.MEMORY_SERVER_URL or "").strip()
+    if not memory_server_url:
+        return McpInfo(mode="embedded", status="up", url=None)
+
+    mcp_url = memory_server_url.rstrip("/")
+    info = McpInfo(mode="server", url=mcp_url)
+
+    try:
+        import httpx
+
+        probe_payload = {
+            "jsonrpc": "2.0",
+            "method": "tools/call",
+            "params": {
+                "name": "get_messages",
+                "arguments": {
+                    "bot_id": default_bot_slug,
+                    "since_seconds": 60,
+                    "limit": 1,
+                },
+            },
+            "id": "status-probe",
+        }
+        response = httpx.post(
+            f"{mcp_url}/mcp",
+            json=probe_payload,
+            headers={"Accept": "application/json, text/event-stream"},
+            timeout=2.0,
+        )
+        if response.status_code == 200:
+            info.status = "up"
+        else:
+            info.status = "error"
+            info.http_status = response.status_code
+    except Exception:
+        info.status = "down"
+
+    return info
+
+
+def _collect_memory_info(config: Config, default_bot_slug: str) -> MemoryInfo:
+    """Collect database and memory status."""
+    from llm_bawt.utils.config import has_database_credentials
+
+    info = MemoryInfo()
+    info.embeddings_available = importlib.util.find_spec("sentence_transformers") is not None
+
+    if not has_database_credentials(config):
+        return info
+
+    try:
+        from llm_bawt.memory.postgresql import PostgreSQLMemoryBackend
+
+        backend = PostgreSQLMemoryBackend(config, bot_id=default_bot_slug)
+        db_stats = backend.stats()
+        info.postgres_connected = True
+        info.postgres_host = config.POSTGRES_HOST
+        info.memories_count = db_stats.get("memories", {}).get("total_count", 0)
+        info.messages_count = db_stats.get("messages", {}).get("total_count", 0)
+    except Exception as e:
+        info.postgres_error = str(e)
+
+    # pgvector
+    try:
+        from pgvector.psycopg2 import register_vector  # noqa: F401
+
+        info.pgvector_available = True
+    except ImportError:
+        pass
+
+    return info
+
+
+def _collect_model_info(config: Config, model_alias: str) -> ModelStatusInfo | None:
+    """Collect current model details."""
+    defined_models = config.defined_models.get("models", {})
+    if model_alias not in defined_models:
+        return None
+
+    model_def = defined_models[model_alias]
+    model_type = model_def.get("type", "unknown")
+
+    effective_max_tokens = model_def.get("max_tokens", config.MAX_OUTPUT_TOKENS)
+    max_tokens_source = "model" if "max_tokens" in model_def else "global"
+
+    info = ModelStatusInfo(
+        alias=model_alias,
+        type=model_type,
+        max_tokens=effective_max_tokens,
+        max_tokens_source=max_tokens_source,
+    )
+
+    if model_type == "gguf":
+        from llm_bawt.utils.vram import auto_size_context_window, detect_vram
+
+        vram_info = detect_vram()
+        if vram_info:
+            info.gpu_name = vram_info.gpu_name
+            info.vram_total_gb = vram_info.total_gb
+            info.vram_free_gb = vram_info.free_gb
+            info.vram_detection_method = vram_info.detection_method
+
+        sizing = auto_size_context_window(
+            model_definition=model_def,
+            global_n_ctx=config.LLAMA_CPP_N_CTX,
+            global_max_tokens=effective_max_tokens,
+        )
+        info.context_window = sizing.context_window
+        info.context_source = sizing.source
+
+        n_gpu_layers = model_def.get("n_gpu_layers", config.LLAMA_CPP_N_GPU_LAYERS)
+        info.gpu_layers_source = "model" if "n_gpu_layers" in model_def else "global"
+        info.n_gpu_layers = "all" if n_gpu_layers == -1 else str(n_gpu_layers)
+
+        native_limit = model_def.get("native_context_limit")
+        if native_limit:
+            info.native_context_limit = int(native_limit)
+    else:
+        ctx_window = model_def.get("context_window")
+        if ctx_window:
+            info.context_window = int(ctx_window)
+            info.context_source = "model"
+        elif model_type == "openai":
+            info.context_window = 128_000
+            info.context_source = "default"
+
+    return info
+
+
+def _collect_dependencies(config: Config) -> DependencyInfo:
+    """Collect optional dependency availability."""
+    from llm_bawt.utils.config import is_huggingface_available, is_llama_cpp_available
+
+    info = DependencyInfo()
+
+    # CUDA
+    nvcc_path = shutil.which("nvcc")
+    if nvcc_path:
+        try:
+            result = subprocess.run(
+                ["nvcc", "--version"], capture_output=True, text=True, timeout=5
+            )
+            if result.returncode == 0:
+                match = re.search(r"release ([\d.]+)", result.stdout)
+                info.cuda_version = match.group(1) if match else "unknown"
+            else:
+                info.cuda_version = "error"
+        except Exception:
+            info.cuda_version = "unknown"
+
+    # llama-cpp-python
+    info.llama_cpp_available = is_llama_cpp_available()
+    if info.llama_cpp_available:
+        try:
+            devnull = os.open(os.devnull, os.O_WRONLY)
+            old_stdout_fd = os.dup(1)
+            old_stderr_fd = os.dup(2)
+            try:
+                os.dup2(devnull, 1)
+                os.dup2(devnull, 2)
+                from llama_cpp import llama_supports_gpu_offload
+
+                info.llama_cpp_gpu = llama_supports_gpu_offload()
+            finally:
+                os.dup2(old_stdout_fd, 1)
+                os.dup2(old_stderr_fd, 2)
+                os.close(devnull)
+                os.close(old_stdout_fd)
+                os.close(old_stderr_fd)
+        except (ImportError, AttributeError, OSError):
+            pass
+
+    # huggingface-hub
+    info.hf_hub_available = importlib.util.find_spec("huggingface_hub") is not None
+
+    # torch
+    info.torch_available = is_huggingface_available()
+
+    # OpenAI
+    info.openai_key_set = bool(os.getenv("OPENAI_API_KEY"))
+
+    # Search provider
+    search_provider = getattr(config, "SEARCH_PROVIDER", None)
+    tavily_key = os.getenv("TAVILY_API_KEY") or getattr(config, "TAVILY_API_KEY", "")
+    brave_key = os.getenv("BRAVE_API_KEY") or getattr(config, "BRAVE_API_KEY", "")
+    if search_provider:
+        info.search_provider = search_provider
+    elif tavily_key:
+        info.search_provider = "tavily"
+    elif brave_key:
+        info.search_provider = "brave"
+    else:
+        if importlib.util.find_spec("ddgs"):
+            info.search_provider = "duckduckgo"
+
+    # Embeddings
+    info.embeddings_available = importlib.util.find_spec("sentence_transformers") is not None
+
+    return info
+
+
+def collect_system_status(
+    config: Config,
+    bot_slug: str | None = None,
+    model_alias: str | None = None,
+    user_id: str | None = None,
+) -> SystemStatus:
+    """Collect full system status.
+
+    This is the shared entry point used by both the CLI ``show_status()`` and
+    the ``/v1/status`` API endpoint.
+
+    Args:
+        config: Application configuration.
+        bot_slug: Explicit bot slug override (CLI ``-b`` flag).
+        model_alias: Explicit model alias override (CLI ``-m`` flag).
+        user_id: Explicit user override (CLI ``--user`` flag).
+    """
+    from llm_bawt.bots import BotManager
+    from llm_bawt.model_manager import is_service_mode_enabled
+
+    bot_manager = BotManager(config)
+    default_bot = bot_manager.get_default_bot()
+
+    # Resolve effective bot
+    if bot_slug:
+        target_bot = bot_manager.get_bot(bot_slug) or default_bot
+    else:
+        target_bot = default_bot
+
+    # Resolve effective model
+    if model_alias is None:
+        selection = bot_manager.select_model(None, bot_slug=target_bot.slug)
+        model_alias = selection.alias
+
+    # Resolve user
+    effective_user = user_id or config.DEFAULT_USER
+
+    # Service
+    use_service = is_service_mode_enabled(config)
+    effective_host = "127.0.0.1" if config.SERVICE_HOST in {"0.0.0.0", "::"} else config.SERVICE_HOST
+    service_url = f"http://{effective_host}:{config.SERVICE_PORT}" if use_service else None
+
+    service_info, raw_status = _collect_service_info(config)
+
+    # Version
+    version = "0.1.0"
+    if raw_status and getattr(raw_status, "version", None):
+        version = raw_status.version
+
+    # Environment
+    is_docker = os.path.exists("/.dockerenv") or os.path.exists("/run/.containerenv")
+
+    # Bot summaries
+    all_bots = [
+        BotSummary(slug=b.slug, name=b.name, is_default=(b.slug == default_bot.slug))
+        for b in bot_manager.list_bots()
+    ]
+
+    # Model catalog counts
+    defined_models = config.defined_models.get("models", {})
+    models_service = None
+    if raw_status and getattr(raw_status, "available_models", None):
+        models_service = len(raw_status.available_models)
+
+    config_info = ConfigInfo(
+        version=version,
+        mode="service" if use_service else "direct",
+        service_url=service_url,
+        environment="docker" if is_docker else "local",
+        bot_name=target_bot.name,
+        bot_slug=target_bot.slug,
+        model_alias=model_alias,
+        user_id=effective_user,
+        all_bots=all_bots,
+        models_defined=len(defined_models),
+        models_service=models_service,
+        scheduler_enabled=config.SCHEDULER_ENABLED,
+        scheduler_interval=config.SCHEDULER_CHECK_INTERVAL_SECONDS,
+        ha_mcp_enabled=getattr(config, "HA_MCP_ENABLED", False),
+        ha_mcp_url=getattr(config, "HA_MCP_URL", None),
+        bind_host=config.SERVICE_HOST,
+    )
+
+    mcp_info = _collect_mcp_info(config, default_bot.slug)
+
+    model_info = None
+    if model_alias:
+        model_info = _collect_model_info(config, model_alias)
+
+    memory_info = _collect_memory_info(config, default_bot.slug)
+    dep_info = _collect_dependencies(config)
+
+    return SystemStatus(
+        config=config_info,
+        service=service_info,
+        mcp=mcp_info,
+        model=model_info,
+        memory=memory_info,
+        dependencies=dep_info,
+    )

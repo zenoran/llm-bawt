@@ -54,15 +54,15 @@ class Tool:
 # Consolidated Tool Definitions (7 tools total)
 # =============================================================================
 
-# Memory tool - combines search_memories, store_memory, delete_memory
+# Memory tool - combines search_memories, store_memory, update_memory, delete_memory
 MEMORY_TOOL = Tool(
     name="memory",
-    description="Search, store, or delete facts from long-term memory. Use action='search' to find, 'store' to save, 'delete' to remove.",
+    description="Search, store, update, or delete facts from long-term memory. Use action='search' to find, 'store' to save, 'update' to modify existing, 'delete' to remove.",
     parameters=[
         ToolParameter(
             name="action",
             type="string",
-            description="'search', 'store', or 'delete'"
+            description="'search', 'store', 'update', or 'delete'"
         ),
         ToolParameter(
             name="query",
@@ -79,7 +79,7 @@ MEMORY_TOOL = Tool(
         ToolParameter(
             name="memory_id",
             type="string",
-            description="Specific memory ID to delete (for delete)",
+            description="Specific memory ID to update/delete (for update/delete)",
             required=False
         ),
         ToolParameter(
@@ -99,7 +99,7 @@ MEMORY_TOOL = Tool(
         ToolParameter(
             name="tags",
             type="list[string]",
-            description="Categories like ['preference'], ['fact', 'work'] (for store)",
+            description="Categories like ['preference'], ['fact', 'work'] (for store/update)",
             required=False,
             default=["misc"]
         ),
@@ -168,32 +168,38 @@ HISTORY_TOOL = Tool(
     ]
 )
 
-# Profile tool - combines set_user_attribute, get_user_profile, delete_user_attribute
+# Profile tool - combines set/get/update/delete user attributes
 PROFILE_TOOL = Tool(
     name="profile",
-    description="Get, set, or delete user profile attributes. Use action='get' for full profile, 'set' to store, 'delete' to remove.",
+    description="Get, set, update, or delete user profile attributes. Use action='get' for full profile, 'set' to store, 'update' to modify existing, 'delete' to remove.",
     parameters=[
         ToolParameter(
             name="action",
             type="string",
-            description="'get', 'set', or 'delete'"
+            description="'get', 'set', 'update', or 'delete'"
+        ),
+        ToolParameter(
+            name="attribute_id",
+            type="integer",
+            description="Database attribute ID for direct updates (optional for update)",
+            required=False
         ),
         ToolParameter(
             name="category",
             type="string",
-            description="'preference', 'fact', 'interest', or 'communication' (for set/delete)",
+            description="'preference', 'fact', 'interest', or 'communication' (for set/update/delete)",
             required=False
         ),
         ToolParameter(
             name="key",
             type="string",
-            description="Attribute name, e.g., 'occupation' (for set/delete)",
+            description="Attribute name, e.g., 'occupation' (for set/update/delete)",
             required=False
         ),
         ToolParameter(
             name="value",
             type="any",
-            description="Value to store (for set)",
+            description="Value to store (for set/update)",
             required=False
         ),
         ToolParameter(
@@ -215,29 +221,29 @@ PROFILE_TOOL = Tool(
 # Self tool - bot personality development (replaces bot_trait)
 SELF_TOOL = Tool(
     name="self",
-    description="Reflect on and develop your own personality. Use action='get' to see your current traits, 'set' to record new ones, 'delete' to evolve past old ones.",
+    description="Reflect on and develop your own personality. Use action='get' to see your current traits, 'set' to record new ones, 'update' to modify existing traits, 'delete' to evolve past old ones.",
     parameters=[
         ToolParameter(
             name="action",
             type="string",
-            description="'get' (view current traits), 'set' (record trait), or 'delete' (remove trait)"
+            description="'get' (view current traits), 'set' (record trait), 'update' (modify trait), or 'delete' (remove trait)"
         ),
         ToolParameter(
             name="category",
             type="string",
-            description="'personality' (default), 'preference', 'interest', or 'communication_style' (for set/delete)",
+            description="'personality' (default), 'preference', 'interest', or 'communication_style' (for set/update/delete)",
             required=False
         ),
         ToolParameter(
             name="key",
             type="string",
-            description="Trait name, e.g., 'humor_style', 'favorite_topic' (for set/delete)",
+            description="Trait name, e.g., 'humor_style', 'favorite_topic' (for set/update/delete)",
             required=False
         ),
         ToolParameter(
             name="value",
             type="any",
-            description="Trait value (for set)",
+            description="Trait value (for set/update)",
             required=False
         ),
         ToolParameter(
@@ -279,6 +285,52 @@ SEARCH_TOOL = Tool(
             description="For news: 'd' (day), 'w' (week), 'm' (month)",
             required=False,
             default="w"
+        ),
+    ]
+)
+
+# News tool (NewsAPI)
+NEWS_TOOL = Tool(
+    name="news",
+    description="Get news articles and headlines via NewsAPI. Use action='search' to search articles or action='headlines' for top headlines by country/category.",
+    parameters=[
+        ToolParameter(
+            name="action",
+            type="string",
+            description="'search' (search articles by keyword) or 'headlines' (top headlines)",
+        ),
+        ToolParameter(
+            name="query",
+            type="string",
+            description="Search keywords (required for search, optional for headlines)",
+            required=False,
+        ),
+        ToolParameter(
+            name="max_results",
+            type="integer",
+            description="Max results (default 5)",
+            required=False,
+            default=5,
+        ),
+        ToolParameter(
+            name="country",
+            type="string",
+            description="For headlines: 2-letter country code (e.g. 'us', 'gb', 'de'). Default 'us'",
+            required=False,
+            default="us",
+        ),
+        ToolParameter(
+            name="category",
+            type="string",
+            description="For headlines: business, entertainment, general, health, science, sports, technology",
+            required=False,
+        ),
+        ToolParameter(
+            name="sort_by",
+            type="string",
+            description="For search: 'publishedAt' (default), 'relevancy', or 'popularity'",
+            required=False,
+            default="publishedAt",
         ),
     ]
 )
@@ -369,11 +421,12 @@ CORE_TOOLS = [MEMORY_TOOL, HISTORY_TOOL, PROFILE_TOOL, SELF_TOOL, TIME_TOOL]
 
 # Optional tool categories
 SEARCH_TOOLS = [SEARCH_TOOL]
+NEWS_TOOLS = [NEWS_TOOL]
 HOME_TOOLS = [HOME_TOOL]
 MODEL_TOOLS = [MODEL_TOOL]
 
 # All tools combined
-ALL_TOOLS = CORE_TOOLS + SEARCH_TOOLS + HOME_TOOLS + MODEL_TOOLS
+ALL_TOOLS = CORE_TOOLS + SEARCH_TOOLS + NEWS_TOOLS + HOME_TOOLS + MODEL_TOOLS
 
 
 # =============================================================================
@@ -472,6 +525,10 @@ SEARCH_GUIDANCE = '''
 - **search**: For current events, facts you're unsure about, or recent information (type=web or news)
 '''
 
+NEWS_GUIDANCE = '''
+- **news**: For news articles and headlines. Use action='search' with a query, or action='headlines' for top headlines (optionally by country/category)
+'''
+
 # Guidance added when model tools are enabled
 MODEL_GUIDANCE = '''
 - **model**: For listing or switching AI models
@@ -492,6 +549,7 @@ def get_tools_list(
     tools: list[Tool] | None = None,
     include_profile_tools: bool = True,  # Kept for API compatibility (always included in CORE)
     include_search_tools: bool = False,
+    include_news_tools: bool = False,
     include_home_tools: bool = False,
     include_model_tools: bool = False,
 ) -> list[Tool]:
@@ -502,6 +560,8 @@ def get_tools_list(
     resolved = CORE_TOOLS.copy()
     if include_search_tools:
         resolved.extend(SEARCH_TOOLS)
+    if include_news_tools:
+        resolved.extend(NEWS_TOOLS)
     if include_home_tools:
         resolved.extend(HOME_TOOLS)
     if include_model_tools:
@@ -513,6 +573,7 @@ def get_tools_prompt(
     tools: list[Tool] | None = None,
     include_profile_tools: bool = True,
     include_search_tools: bool = False,
+    include_news_tools: bool = False,
     include_home_tools: bool = False,
     include_model_tools: bool = False,
     tool_format: ToolFormat | str = ToolFormat.XML,
@@ -523,6 +584,7 @@ def get_tools_prompt(
         tools: List of tools to include. If None, auto-selects based on flags.
         include_profile_tools: Kept for API compatibility (profile always included).
         include_search_tools: Whether to include web search tools (default False).
+        include_news_tools: Whether to include NewsAPI tools (default False).
         include_home_tools: Whether to include Home Assistant tools (default False).
         include_model_tools: Whether to include model management tools (default False).
         tool_format: Tool format to use for prompt instructions.
@@ -534,6 +596,7 @@ def get_tools_prompt(
         tools=tools,
         include_profile_tools=include_profile_tools,
         include_search_tools=include_search_tools,
+        include_news_tools=include_news_tools,
         include_home_tools=include_home_tools,
         include_model_tools=include_model_tools,
     )
@@ -548,6 +611,9 @@ def get_tools_prompt(
         search_guidance = ""
         if include_search_tools or any(t.name == "search" for t in tools):
             search_guidance = SEARCH_GUIDANCE
+
+        if any(t.name == "news" for t in tools):
+            search_guidance += NEWS_GUIDANCE
 
         # Add model guidance if model tools are included
         if include_model_tools or any(t.name == "model" for t in tools):
