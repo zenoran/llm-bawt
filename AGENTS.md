@@ -26,10 +26,9 @@ llm-bawt normalizes providers (OpenAI, Ollama, GGUF), augments conversations wit
 ```
 src/llm_bawt/
 ├── cli/                    # CLI package
-│   ├── app.py              # Main CLI logic, query handling
-│   ├── parser.py           # Argument parsing
+│   ├── app.py              # Main CLI logic, argument parsing, query handling
+│   ├── config_setup.py     # Interactive .env config walkthrough (llm --setup)
 │   ├── main.py             # Entry point
-│   ├── config_wizard.py    # Interactive config setup
 │   └── commands/           # Subcommands (models, profile, status)
 ├── core/                   # Core orchestration
 │   ├── base.py             # BaseLLMBawt - shared logic for CLI/service
@@ -113,6 +112,23 @@ src/llm_bawt/
     └── vram.py             # VRAMInfo, GPU detection
 ```
 
+### Other Important Files
+
+```
+├── pyproject.toml          # Project config, dependencies, entry points
+├── Dockerfile              # Multi-stage NVIDIA CUDA build
+├── docker-compose.yml      # Production Docker compose
+├── docker-compose.dev.yml  # Dev mode override (mounts ./src)
+├── .env.docker             # Docker environment template
+├── Makefile                # Cross-platform build targets
+├── install.sh              # Installer script (pipx/uv)
+├── server.sh               # MCP + LLM service management
+├── run.sh                  # Docker wrapper script
+├── tests/                  # Test suite (pytest)
+├── docs/                   # Extended documentation
+└── scripts/                # Utility scripts (cleanup_profile, rebuild_profile)
+```
+
 ---
 
 ## Build and Development Commands
@@ -154,6 +170,19 @@ make clean-all              # Deep clean including .venv
 ./server.sh start --dev     # Start MCP + LLM service with auto-reload
 ./server.sh stop            # Stop services
 uv run llm --status         # Run CLI through uv
+```
+
+### CLI Commands
+
+```bash
+llm "question"              # Ask a question
+llm                         # Interactive mode
+llm -m gpt4 "question"     # Specific model alias
+llm -b nova "question"     # Specific bot personality
+llm --setup                 # Interactive .env config walkthrough
+llm --status                # System status
+llm --list-models           # Available models
+llm --list-bots             # Available bots
 ```
 
 ---
@@ -301,6 +330,10 @@ Composable prompt assembly with ordered sections. Each `PromptSection` has a nam
 ### Bot System (`bots.py` + `bots.yaml`)
 
 Bot personalities defined in YAML with slugs, system prompts, and capability flags (`requires_memory`, `uses_tools`, `uses_search`). User overrides via `~/.config/llm-bawt/bots.yaml` are deep-merged with repo defaults.
+
+### Config Pattern (`utils/config.py`)
+
+Uses pydantic-settings `BaseSettings` with `LLM_BAWT_` prefix. All settings declared as `Field()` with descriptions and defaults. Dependency availability checked via `is_huggingface_available()`, `is_llama_cpp_available()` helpers.
 
 ---
 

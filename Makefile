@@ -2,15 +2,11 @@
 # llm-bawt Makefile — cross-platform (Linux / macOS / Windows)
 # ─────────────────────────────────────────────────────────────────
 #
-# Usage:
-#   make help            Show available targets
-#   make install         Install via pipx (production)
-#   make dev             Sync local .venv with all extras (development)
-#   make up              Docker compose up (production)
-#   make docker-dev      Docker compose up (dev mode, live mount)
-#   make server-start    Start MCP + LLM services locally
-#   make test            Run tests
-#   make lint            Lint + format check
+# Workflow:
+#   make install         Editable pipx install — CLI client from local repo
+#   make up / docker-dev Start the service stack in Docker
+#   make dev             Sync local .venv for source development
+#   make test / lint     Run tests and linting (uv-based)
 #
 # ─────────────────────────────────────────────────────────────────
 
@@ -53,8 +49,8 @@ endif
 
 # ── Configurable variables ──────────────────────────────────────
 REPO           ?= git+https://github.com/zenoran/llm-bawt.git
-CUDA_ARCHS     ?= 75;80;86;89;90;120
-WITH_CUDA      ?= true
+CUDA_ARCHS     ?= 75;80;86;89;90;120  # used by dev-llama
+WITH_CUDA      ?= true                # used by dev-llama
 
 # Docker
 COMPOSE_BASE   := docker-compose.yml
@@ -107,72 +103,26 @@ check-pipx: ## Verify pipx is installed
 	@$(call CHECK_CMD,pipx) || (echo "$(RED)pipx not found — install: $(PYTHON) -m pip install --user pipx$(NC)" && exit 1)
 	@echo "$(GREEN)✓ pipx OK$(NC)"
 
-.PHONY: install install-local install-local-all uninstall
 
-install: check-python check-pipx ## [pipx] Production install from GitHub
-	@echo "$(BLUE)Installing llm-bawt via pipx...$(NC)"
+.PHONY: install install-github uninstall
+
+install: check-python check-pipx ## [pipx] Editable install from local repo (recommended)
+	@echo "$(BLUE)Installing llm-bawt via pipx (editable, local repo)...$(NC)"
+	-pipx uninstall llm-bawt 2>$(NULL) || true
+	pipx install --force --editable .
+	@echo "$(GREEN)✓ llm-bawt installed (editable)$(NC)"
+	@echo "  Run: llm --status"
+	@echo "  Source changes in this repo are reflected immediately"
+	@echo "  Service deps (memory, search, etc.) run in Docker — see: make up"
+
+install-github: check-python check-pipx ## [pipx] Non-editable install from GitHub
+	@echo "$(BLUE)Installing llm-bawt via pipx from GitHub...$(NC)"
 	-pipx uninstall llm-bawt 2>$(NULL) || true
 	pipx install --force "$(REPO)"
-	pipx runpip llm-bawt install sentence-transformers
-	@echo "$(GREEN)✓ llm-bawt installed$(NC)"
-	@echo "  Run: llm --status"
+	@echo "$(GREEN)✓ llm-bawt installed (GitHub)$(NC)"
 
-install-local: check-python check-pipx ## [pipx] Editable install from local dir (minimal)
-	@echo "$(BLUE)Installing llm-bawt (editable) from local dir...$(NC)"
-	-pipx uninstall llm-bawt 2>$(NULL) || true
-	pipx install --editable .
-	pipx runpip llm-bawt install sentence-transformers
-	@echo "$(GREEN)✓ llm-bawt installed (editable)$(NC)"
-
-install-local-all: check-python check-pipx ## [pipx] Editable install + ALL optional deps
-	@echo "$(BLUE)Installing llm-bawt (editable) with all extras...$(NC)"
-	-pipx uninstall llm-bawt 2>$(NULL) || true
-	pipx install --editable .
-	pipx runpip llm-bawt install sentence-transformers
-	pipx runpip llm-bawt install transformers torch huggingface-hub accelerate
-	pipx runpip llm-bawt install ddgs tavily-python
-	pipx runpip llm-bawt install fastapi "uvicorn[standard]" httpx
-	pipx runpip llm-bawt install textual textual-dev pyperclip ipython
-	@echo "$(GREEN)✓ llm-bawt installed (editable, all extras)$(NC)"
-	@echo "  Run: make install-extras-llama  to add llama-cpp (CUDA-aware)"
-
-install-extras-llama: check-pipx ## [pipx] Add llama-cpp-python (with CUDA if available)
-ifeq ($(WITH_CUDA),true)
-	@echo "$(BLUE)Installing llama-cpp-python (CUDA)...$(NC)"
-	CMAKE_ARGS="-DGGML_CUDA=on -DCMAKE_CUDA_ARCHITECTURES=$(CUDA_ARCHS)" \
-		pipx runpip llm-bawt install llama-cpp-python --force-reinstall --no-cache-dir
-else
-	@echo "$(BLUE)Installing llama-cpp-python (CPU)...$(NC)"
-	pipx runpip llm-bawt install llama-cpp-python
-endif
-	@echo "$(GREEN)✓ llama-cpp-python installed$(NC)"
-
-install-extras-hf: check-pipx ## [pipx] Add HuggingFace deps
-	@echo "$(BLUE)Installing HuggingFace deps...$(NC)"
-	pipx runpip llm-bawt install transformers torch huggingface-hub accelerate
-	@echo "$(GREEN)✓ HuggingFace deps installed$(NC)"
-
-install-extras-service: check-pipx ## [pipx] Add FastAPI service deps
-	@echo "$(BLUE)Installing service deps...$(NC)"
-	pipx runpip llm-bawt install fastapi "uvicorn[standard]" httpx
-	@echo "$(GREEN)✓ Service deps installed$(NC)"
-
-install-extras-search: check-pipx ## [pipx] Add search deps
-	@echo "$(BLUE)Installing search deps...$(NC)"
-	pipx runpip llm-bawt install ddgs tavily-python
-	@echo "$(GREEN)✓ Search deps installed$(NC)"
-
-install-extras-tui: check-pipx ## [pipx] Add TUI deps (textual, ipython)
-	@echo "$(BLUE)Installing TUI deps...$(NC)"
-	pipx runpip llm-bawt install textual textual-dev pyperclip ipython
-	@echo "$(GREEN)✓ TUI deps installed$(NC)"
-	@echo "  Run: llm-memory-tui  or  llm-memory --tui"
-
-install-extras-vllm: check-pipx ## [pipx] Add vLLM (requires NVIDIA GPU + CUDA)
-	@echo "$(BLUE)Installing vLLM...$(NC)"
-	pipx runpip llm-bawt install vllm
-	@echo "$(GREEN)✓ vLLM installed$(NC)"
-	@echo "$(YELLOW)Note: vLLM requires NVIDIA GPU + CUDA to run$(NC)"
+# To inject extra packages into the pipx client env (rarely needed):
+#   pipx runpip llm-bawt install <package>
 
 uninstall: ## [pipx] Uninstall llm-bawt
 	@echo "$(YELLOW)Uninstalling llm-bawt...$(NC)"

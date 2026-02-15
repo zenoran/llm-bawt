@@ -1183,6 +1183,7 @@ def parse_arguments(config_obj: Config) -> argparse.Namespace:
     )
     parser.add_argument("--config-set", nargs=2, metavar=("KEY", "VALUE"), help="Set a configuration value (e.g., DEFAULT_MODEL_ALIAS) in the .env file.")
     parser.add_argument("--config-list", action="store_true", help="List the current effective configuration settings.")
+    parser.add_argument("--setup", action="store_true", help="Walk through client .env settings interactively (pre-filled with current values).")
     parser.add_argument("--settings-scope", choices=["bot", "global"], default="bot", help="Scope for runtime settings operations (default: bot)")
     parser.add_argument("--settings-list", action="store_true", help="List runtime settings from DB for selected scope")
     parser.add_argument("--settings-set", nargs=2, metavar=("KEY", "VALUE"), help="Set runtime setting in DB for selected scope")
@@ -1242,6 +1243,11 @@ def main():
 
     # Configure logging via centralized LogConfig
     LogConfig.configure(verbose=args.verbose, debug=args.debug)
+
+    # Interactive config setup walkthrough
+    if getattr(args, 'setup', False):
+        from llm_bawt.cli.config_setup import run_config_setup
+        sys.exit(run_config_setup(config_obj, console))
 
     # Handle setting config values, guard missing attribute in stubbed args
     if getattr(args, 'config_set', None):
