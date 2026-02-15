@@ -574,7 +574,8 @@ class BaseLLMBawt(ABC):
         if not self.bot.uses_tools:
             return
         try:
-            client = NewsAPIClient()
+            api_key = getattr(self.config, "NEWSAPI_API_KEY", "")
+            client = NewsAPIClient(api_key=api_key or None)
             if client.is_available():
                 self.news_client = client
                 logger.debug("NewsAPI client initialized")

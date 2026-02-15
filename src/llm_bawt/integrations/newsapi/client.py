@@ -25,7 +25,11 @@ class NewsAPIClient:
         timeout: int = 10,
         language: str = "en",
     ):
-        self._api_key = api_key or os.environ.get("NEWSAPI_API_KEY", "")
+        self._api_key = (
+            api_key
+            or os.environ.get("NEWSAPI_API_KEY", "")
+            or os.environ.get("LLM_BAWT_NEWSAPI_API_KEY", "")
+        )
         self._timeout = timeout
         self._language = language
         self._client: httpx.Client | None = None
@@ -109,10 +113,43 @@ class NewsAPIClient:
             if to_date:
                 params["to"] = to_date
 
-            response = client.get("/everything", params=params)
-            response.raise_for_status()
-            data = response.json()
-            return self._format_articles(data.get("articles", [])[:max_results])
+            page = 1
+            max_pages = 5
+            articles: list[dict[str, Any]] = []
+            seen_keys: set[str] = set()
+            total_results = 0
+
+            while len(articles) < max_results and page <= max_pages:
+                page_params = {**params, "page": page}
+                response = client.get("/everything", params=page_params)
+                response.raise_for_status()
+                data = response.json()
+                if page == 1:
+                    total_results = int(data.get("totalResults", 0) or 0)
+
+                page_articles = data.get("articles", []) or []
+                if not page_articles:
+                    break
+
+                for article in page_articles:
+                    key = str(article.get("url") or article.get("title") or "")
+                    if key and key in seen_keys:
+                        continue
+                    if key:
+                        seen_keys.add(key)
+                    articles.append(article)
+                    if len(articles) >= max_results:
+                        break
+
+                if len(articles) >= max_results:
+                    break
+
+                if page * params["pageSize"] >= total_results:
+                    break
+
+                page += 1
+
+            return self._format_articles(articles[:max_results])
 
         except httpx.HTTPStatusError as e:
             return self._handle_http_error(e, "search")
@@ -156,10 +193,43 @@ class NewsAPIClient:
             if category:
                 params["category"] = category.lower()
 
-            response = client.get("/top-headlines", params=params)
-            response.raise_for_status()
-            data = response.json()
-            return self._format_articles(data.get("articles", [])[:max_results])
+            page = 1
+            max_pages = 5
+            articles: list[dict[str, Any]] = []
+            seen_keys: set[str] = set()
+            total_results = 0
+
+            while len(articles) < max_results and page <= max_pages:
+                page_params = {**params, "page": page}
+                response = client.get("/top-headlines", params=page_params)
+                response.raise_for_status()
+                data = response.json()
+                if page == 1:
+                    total_results = int(data.get("totalResults", 0) or 0)
+
+                page_articles = data.get("articles", []) or []
+                if not page_articles:
+                    break
+
+                for article in page_articles:
+                    key = str(article.get("url") or article.get("title") or "")
+                    if key and key in seen_keys:
+                        continue
+                    if key:
+                        seen_keys.add(key)
+                    articles.append(article)
+                    if len(articles) >= max_results:
+                        break
+
+                if len(articles) >= max_results:
+                    break
+
+                if page * params["pageSize"] >= total_results:
+                    break
+
+                page += 1
+
+            return self._format_articles(articles[:max_results])
 
         except httpx.HTTPStatusError as e:
             return self._handle_http_error(e, "headlines")

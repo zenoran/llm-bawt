@@ -259,7 +259,13 @@ class ServiceLLMBawt(BaseLLMBawt):
             tool_call_details is a list of per-call dicts for debug logging.
         """
         # Use tool loop if bot has tools enabled and at least one tool backend is available
-        if self.bot.uses_tools and (self.memory or self.home_client):
+        if self.bot.uses_tools and (
+            self.memory
+            or self.search_client
+            or self.news_client
+            or self.home_client
+            or self.model_lifecycle
+        ):
             tool_definitions = self._get_tool_definitions()
             if not tool_definitions:
                 response = self.client.query(

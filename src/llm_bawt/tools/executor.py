@@ -1393,7 +1393,11 @@ class ToolExecutor:
             return
         try:
             import os
-            api_key = os.environ.get("NEWSAPI_API_KEY", "")
+            api_key = (
+                (getattr(self.config, "NEWSAPI_API_KEY", "") if self.config else "")
+                or os.environ.get("NEWSAPI_API_KEY", "")
+                or os.environ.get("LLM_BAWT_NEWSAPI_API_KEY", "")
+            )
             if api_key:
                 from ..integrations.newsapi.client import NewsAPIClient
                 self.news_client = NewsAPIClient(api_key=api_key)

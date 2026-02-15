@@ -500,6 +500,8 @@ Output the <tool_call> block IMMEDIATELY when needed, then STOP and wait for <to
 ### Available Tools:
 {tools_list}
 {search_guidance}
+The "Available Tools" list above is authoritative for this turn. If asked to list tools, list exactly those names and do not omit any.
+
 ### Tool Selection:
 - **profile**: For user facts/preferences - check FIRST for "what do you know about me"
 - **memory**: For learned facts and important information
@@ -509,6 +511,8 @@ Output the <tool_call> block IMMEDIATELY when needed, then STOP and wait for <to
 - Only use tools when you NEED information you don't have
 - Call ONE tool at a time, wait for result
 - TRUST tool results exactly - never contradict them
+- If a tool result contains URLs, copy URLs EXACTLY as provided (no rewriting, shortening, or guessing)
+- Do not invent URL slugs, dates, IDs, or domains; if uncertain, include the original tool URL verbatim
 - Before saying "I don't know" about the user: check system prompt "About the User" section, then use memory action=search
 - For date-based history queries: use ISO format dates (e.g., since="{yesterday}", until="{current_date}")
 

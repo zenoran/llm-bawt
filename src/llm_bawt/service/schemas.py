@@ -248,6 +248,7 @@ class DependencyInfoSchema(BaseModel):
     hf_hub_available: bool = False
     torch_available: bool = False
     openai_key_set: bool = False
+    newsapi_key_set: bool = False
     search_provider: str | None = None
     embeddings_available: bool = False
 

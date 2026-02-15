@@ -61,10 +61,13 @@ class NativeOpenAIFormatHandler(ToolFormatHandler):
             "## Tools\n\n"
             "You have access to tools. Use them when needed to answer the user.\n"
             f"Available tool names: {tools_list}\n\n"
+            "The 'Available tool names' list above is authoritative for this turn.\n"
+            "If asked to list tools, list exactly those names and do not omit any.\n\n"
             "Rules:\n"
             "1. Call a tool when you need missing or precise information.\n"
             "2. Do not invent tool results.\n"
             "3. If no tool is needed, respond normally.\n"
+            "4. If tool results contain URLs, copy each URL exactly as provided (no rewriting or guessing).\n"
             f"{home_guidance}"
         )
 

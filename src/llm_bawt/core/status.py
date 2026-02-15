@@ -72,6 +72,7 @@ class DependencyInfo:
     hf_hub_available: bool = False
     torch_available: bool = False
     openai_key_set: bool = False
+    newsapi_key_set: bool = False
     search_provider: str | None = None
     embeddings_available: bool = False
 
@@ -346,6 +347,10 @@ def _collect_dependencies(config: Config) -> DependencyInfo:
 
     # OpenAI
     info.openai_key_set = bool(os.getenv("OPENAI_API_KEY"))
+
+    # NewsAPI
+    newsapi_key = os.getenv("NEWSAPI_API_KEY") or getattr(config, "NEWSAPI_API_KEY", "")
+    info.newsapi_key_set = bool(newsapi_key)
 
     # Search provider
     search_provider = getattr(config, "SEARCH_PROVIDER", None)

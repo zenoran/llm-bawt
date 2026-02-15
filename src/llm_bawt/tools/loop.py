@@ -237,11 +237,9 @@ class ToolLoop:
                     lower = response.lower()
                     if "<tool_call>" in lower or "<function_call>" in lower:
                         from .formats.xml_legacy import LegacyXMLFormatHandler
-
                         return LegacyXMLFormatHandler().sanitize_response(final_text)
                     if "action:" in lower and "action input:" in lower:
                         from .formats.react import ReActFormatHandler
-
                         return ReActFormatHandler().sanitize_response(final_text)
                 return handler.sanitize_response(final_text)
             

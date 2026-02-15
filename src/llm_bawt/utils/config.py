@@ -227,6 +227,10 @@ class Config(RuntimeTunables, BaseSettings):
     XAI_API_KEY: str = Field(default="", description="xAI API key for Grok models (get from x.ai)")
 
     # --- Web Search Settings --- #
+    NEWSAPI_API_KEY: str = Field(
+        default="",
+        description="NewsAPI key for dedicated news tool (newsapi.org)",
+    )
     SEARCH_PROVIDER: Optional[str] = Field(
         default=None,
         description=(

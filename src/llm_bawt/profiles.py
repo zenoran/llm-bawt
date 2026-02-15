@@ -698,6 +698,15 @@ class ProfileManager:
                 # Skip summary entries when mixed with other attributes
                 if attr.key == "summary":
                     continue
+
+                # Do not inject learned tool-list traits for bots; these can become stale
+                # and conflict with the authoritative runtime tool definitions.
+                if (
+                    entity_type == EntityType.BOT
+                    and category == AttributeCategory.PERSONALITY
+                    and attr.key in {"tools", "tool_list", "available_tools"}
+                ):
+                    continue
                     
                 # Format value
                 if isinstance(attr.value, list):

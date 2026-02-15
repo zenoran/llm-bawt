@@ -466,6 +466,13 @@ def show_status(config: Config, args: argparse.Namespace | None = None):
     else:
         deps_table.add_row("OpenAI", "[dim]○ No key[/dim]")
 
+    if s_dep.newsapi_key_set:
+        deps_table.add_row("NewsAPI", "[green]✓ Key set[/green]")
+        deps_table.add_row("News Tool", "[green]✓ Enabled[/green]")
+    else:
+        deps_table.add_row("NewsAPI", "[dim]○ No key[/dim]")
+        deps_table.add_row("News Tool", "[yellow]⚠ Disabled[/yellow] [dim](set LLM_BAWT_NEWSAPI_API_KEY)[/dim]")
+
     if s_dep.search_provider:
         deps_table.add_row("Search", f"[green]✓[/green] {s_dep.search_provider}")
     else:
