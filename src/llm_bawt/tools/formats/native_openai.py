@@ -56,6 +56,8 @@ class NativeOpenAIFormatHandler(ToolFormatHandler):
                 "- For natural names like 'sunroom lights', call home(action='query', pattern='sunroom', domain='light') first.\n"
                 "- Use exact entity IDs returned by query in subsequent home(action='get'/'set') calls.\n"
                 "- If a set/get call reports not found, run query and retry with the suggested exact ID.\n"
+                "- If asked for current home status, call home(action='status') before answering.\n"
+                "- If asked for 'raw output', return the exact tool output verbatim; do not invent or normalize JSON fields.\n"
             )
         return (
             "## Tools\n\n"

@@ -133,7 +133,7 @@ def display_messages_preview(messages: list[dict], max_content_length: int = 80)
     table = Table(show_header=True, header_style="bold", box=None, padding=(0, 1))
     table.add_column("Time", style="dim", width=19)
     table.add_column("Role", width=10)
-    table.add_column("Content", overflow="ellipsis")
+    table.add_column("Content", overflow="fold")
 
     for msg in messages:
         ts = msg.get("timestamp")
@@ -143,9 +143,9 @@ def display_messages_preview(messages: list[dict], max_content_length: int = 80)
         role_style = "cyan" if role == "user" else "green" if role == "assistant" else "yellow"
 
         content = msg.get("content", "")
-        if len(content) > max_content_length:
-            content = content[:max_content_length] + "..."
-        content = content.replace("\n", " ").replace("\r", "")
+        if not isinstance(content, str):
+            import json
+            content = json.dumps(content, indent=2, ensure_ascii=False)
 
         table.add_row(time_str, f"[{role_style}]{role}[/{role_style}]", content)
 
@@ -156,15 +156,17 @@ def display_results(results: list, method: str, show_ids: bool = True):
     """Display memory results in a table."""
     table = Table()
     if show_ids:
-        table.add_column("ID", style="dim", width=8)
+        table.add_column("ID", style="dim")
     table.add_column("Rel", justify="right", style="cyan", width=5)
     table.add_column("Imp", justify="right", style="yellow", width=4)
-    table.add_column("Tags", style="magenta", width=20)
-    table.add_column("Content", style="white", max_width=70)
+    table.add_column("Tags", style="magenta")
+    table.add_column("Content", style="white", overflow="fold")
 
     for r in results:
         content = r.get("content", "")
-        content = content[:100] + "..." if len(content) > 100 else content
+        if not isinstance(content, str):
+            import json
+            content = json.dumps(content, indent=2, ensure_ascii=False)
         relevance = r.get("relevance") or r.get("similarity", 0) or 0
         importance = r.get("importance", 0.5)
         tags = r.get("tags", ["misc"])
@@ -172,7 +174,7 @@ def display_results(results: list, method: str, show_ids: bool = True):
             import json
             tags = json.loads(tags) if tags else ["misc"]
 
-        memory_id = r.get("id", "")[:8] if r.get("id") else "?"
+        memory_id = r.get("id", "?")
 
         row = []
         if show_ids:
@@ -180,7 +182,7 @@ def display_results(results: list, method: str, show_ids: bool = True):
         row.extend([
             f"{relevance:.3f}",
             f"{importance:.2f}",
-            ", ".join(tags[:3]) if tags else "misc",
+            ", ".join(str(tag) for tag in tags) if tags else "misc",
             content,
         ])
         table.add_row(*row)
@@ -255,21 +257,23 @@ def list_memories(bot_id: str, limit: int):
         return
 
     table = Table(title=f"Top {limit} Memories by Importance")
-    table.add_column("ID", style="dim", width=8)
+    table.add_column("ID", style="dim")
     table.add_column("Imp", justify="right", style="cyan", width=4)
-    table.add_column("Tags", style="magenta", width=20)
-    table.add_column("Content", style="white", max_width=60)
+    table.add_column("Tags", style="magenta")
+    table.add_column("Content", style="white", overflow="fold")
     table.add_column("Acc", justify="right", width=3)
 
     for mem in results:
         content = mem.get("content", "")
-        content = content[:100] + "..." if len(content) > 100 else content
+        if not isinstance(content, str):
+            import json
+            content = json.dumps(content, indent=2, ensure_ascii=False)
         tags = mem.get("tags", ["misc"])
-        memory_id = mem.get("id", "")[:8] if mem.get("id") else "?"
+        memory_id = mem.get("id", "?")
         table.add_row(
             memory_id,
             f"{mem.get('importance', 0.5):.2f}",
-            ", ".join(tags[:3]),
+            ", ".join(str(tag) for tag in tags),
             content,
             str(mem.get("access_count", 0)),
         )
@@ -342,13 +346,16 @@ def handle_delete_memory(bot_id: str, memory_id: str, skip_confirm: bool):
         return
 
     full_id = matching.get("id", memory_id)
-    content = matching.get("content", "")[:100]
+    content = matching.get("content", "")
+    if not isinstance(content, str):
+        import json
+        content = json.dumps(content, indent=2, ensure_ascii=False)
     tags = matching.get("tags", [])
 
     console.print("[bold]Memory to delete:[/bold]")
     console.print(f"  ID: [dim]{full_id}[/dim]")
     console.print(f"  Tags: [magenta]{', '.join(tags) if tags else 'none'}[/magenta]")
-    console.print(f"  Content: {content}{'...' if len(matching.get('content', '')) > 100 else ''}")
+    console.print(f"  Content: {content}")
     console.print()
 
     if not skip_confirm:
@@ -418,7 +425,7 @@ def handle_consolidate(bot_id: str, dry_run: bool = False):
     errors = result.get("errors", [])
     if errors:
         console.print(f"\n[yellow]Errors ({len(errors)}):[/yellow]")
-        for err in errors[:5]:
+        for err in errors:
             console.print(f"  - {err}")
 
 
@@ -467,13 +474,14 @@ def handle_list_attrs(entity_id: str):
     table.add_column("ID", style="cyan", justify="right", width=6)
     table.add_column("Category", style="magenta", width=15)
     table.add_column("Key", style="yellow", width=25)
-    table.add_column("Value", style="white", max_width=50)
+    table.add_column("Value", style="white", overflow="fold")
     table.add_column("Conf", justify="right", width=4)
 
     for attr in attributes:
-        value = str(attr.get("value", ""))
-        if len(value) > 50:
-            value = value[:47] + "..."
+        value = attr.get("value", "")
+        if not isinstance(value, str):
+            import json
+            value = json.dumps(value, indent=2, ensure_ascii=False)
         table.add_row(
             str(attr.get("id", "?")),
             attr.get("category", "?"),
@@ -489,8 +497,8 @@ def handle_list_attrs(entity_id: str):
 def handle_list_profiles():
     """List all profiles (both users and bots) with summary information."""
     # Fetch both user and bot profiles
-    user_profiles_data = api_get("/v1/profiles/list/user")
-    bot_profiles_data = api_get("/v1/profiles/list/bot")
+    user_profiles_data = api_get("/v1/profiles", {"entity_type": "user"})
+    bot_profiles_data = api_get("/v1/profiles", {"entity_type": "bot"})
 
     # Collect all profiles
     all_profiles = []
@@ -535,25 +543,21 @@ def handle_list_profiles():
     # Display table
     table = Table(title="All Entity Profiles")
     table.add_column("Type", style="cyan", width=6)
-    table.add_column("ID", style="yellow", width=12)
-    table.add_column("Name", style="white", width=15)
+    table.add_column("ID", style="yellow")
+    table.add_column("Name", style="white")
     table.add_column("Attrs", justify="right", width=6)
-    table.add_column("Categories", style="magenta", max_width=40)
+    table.add_column("Categories", style="magenta", overflow="fold")
 
     for profile in all_profiles:
         # Format categories
         categories = profile.get("categories", [])
         if categories:
-            cat_str = ", ".join(categories[:4])
-            if len(categories) > 4:
-                cat_str += f", +{len(categories) - 4} more"
+            cat_str = ", ".join(str(category) for category in categories)
         else:
             cat_str = "-"
 
         # Format name
         name = profile.get("name", "-")
-        if name and len(name) > 15:
-            name = name[:12] + "..."
 
         table.add_row(
             profile["type"],
@@ -570,7 +574,7 @@ def handle_list_profiles():
 
 def handle_delete_attribute(attribute_id: int, skip_confirm: bool):
     """Delete a user profile attribute by ID."""
-    result = api_delete(f"/v1/users/attribute/{attribute_id}")
+    result = api_delete(f"/v1/profiles/attribute/{attribute_id}")
 
     if not result:
         console.print(f"[red]Failed to delete attribute {attribute_id}[/red]")
@@ -601,25 +605,29 @@ def handle_show_messages(bot_id: str, limit: int):
         console.print(f"[yellow]No messages found for bot '{bot_id}'[/yellow]")
         return
 
-    table = Table(title=f"Message History ({len(messages)} messages)")
-    table.add_column("ID", style="dim", width=8)
-    table.add_column("Time", style="dim", width=19)
-    table.add_column("Role", width=10)
-    table.add_column("Content", style="white", max_width=70)
-
-    for msg in messages:
+    console.print(Panel.fit(f"[bold]Message History[/bold] ({len(messages)} messages)", border_style="cyan"))
+    for index, msg in enumerate(messages, start=1):
         ts = msg.get("timestamp", 0)
         time_str = datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M:%S") if ts else "?"
         role = msg.get("role", "?")
         role_style = "cyan" if role == "user" else "green" if role == "assistant" else "magenta" if role == "summary" else "yellow"
+        msg_id = msg.get("id", "?")
         content = msg.get("content", "")
-        if len(content) > 80:
-            content = content[:77] + "..."
-        content = content.replace("\n", " ")
-        msg_id = msg.get("id", "")[:8] if msg.get("id") else "?"
-        table.add_row(msg_id, time_str, f"[{role_style}]{role}[/{role_style}]", content)
 
-    console.print(table)
+        if not isinstance(content, str):
+            import json
+            content = json.dumps(content, indent=2, ensure_ascii=False)
+
+        console.print(
+            Panel(
+                content,
+                title=f"{index}. [{role_style}]{role}[/{role_style}] • {time_str}",
+                subtitle=f"ID: {msg_id}",
+                border_style=role_style,
+                expand=True,
+            )
+        )
+
     console.print("\n[dim]Use --msg-forget-id <ID> to soft-delete a message[/dim]")
 
 
@@ -636,25 +644,29 @@ def handle_search_messages(bot_id: str, query: str, limit: int):
         console.print(f"[yellow]No messages found matching '{query}'[/yellow]")
         return
 
-    table = Table(title=f"Message Search: '{query}' ({len(messages)} matches)")
-    table.add_column("ID", style="dim", width=8)
-    table.add_column("Time", style="dim", width=19)
-    table.add_column("Role", width=10)
-    table.add_column("Content", style="white", max_width=70)
-
-    for msg in messages:
+    console.print(Panel.fit(f"[bold]Message Search[/bold] '{query}' ({len(messages)} matches)", border_style="cyan"))
+    for index, msg in enumerate(messages, start=1):
         ts = msg.get("timestamp", 0)
         time_str = datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M:%S") if ts else "?"
         role = msg.get("role", "?")
-        role_style = "cyan" if role == "user" else "green" if role == "assistant" else "yellow"
+        role_style = "cyan" if role == "user" else "green" if role == "assistant" else "magenta" if role == "summary" else "yellow"
+        msg_id = msg.get("id", "?")
         content = msg.get("content", "")
-        if len(content) > 80:
-            content = content[:77] + "..."
-        content = content.replace("\n", " ")
-        msg_id = msg.get("id", "")[:8] if msg.get("id") else "?"
-        table.add_row(msg_id, time_str, f"[{role_style}]{role}[/{role_style}]", content)
 
-    console.print(table)
+        if not isinstance(content, str):
+            import json
+            content = json.dumps(content, indent=2, ensure_ascii=False)
+
+        console.print(
+            Panel(
+                content,
+                title=f"{index}. [{role_style}]{role}[/{role_style}] • {time_str}",
+                subtitle=f"ID: {msg_id}",
+                border_style=role_style,
+                expand=True,
+            )
+        )
+
     console.print("\n[dim]Use --msg-forget-id <ID> to soft-delete a message[/dim]")
 
 
@@ -738,7 +750,7 @@ def handle_msg_get(bot_id: str, message_id: str):
     console.print(f"[bold]Role:[/bold] [{role_color}]{role}[/{role_color}]")
     console.print(f"[bold]Timestamp:[/bold] {time_str}")
     if msg.get("session_id"):
-        console.print(f"[bold]Session:[/bold] {msg.get('session_id')[:8]}")
+        console.print(f"[bold]Session:[/bold] {msg.get('session_id')}")
     if msg.get("summary_metadata"):
         meta = msg.get("summary_metadata")
         if isinstance(meta, str):
@@ -814,15 +826,15 @@ def handle_msg_summarize_preview(bot_id: str):
         start = session.get("start_time", "?")
         end = session.get("end_time", "?")
         msg_count = session.get("message_count", 0)
-        first_msg = session.get("first_message", "")[:60]
-        last_msg = session.get("last_message", "")[:60]
+        first_msg = session.get("first_message", "")
+        last_msg = session.get("last_message", "")
 
         total_messages += msg_count
 
         console.print(f"[bold]Session {i}[/bold] ({start} - {end})")
         console.print(f"  Messages: {msg_count}")
-        console.print(f"  First: \"{first_msg}...\"")
-        console.print(f"  Last: \"{last_msg}...\"")
+        console.print(f"  First: \"{first_msg}\"")
+        console.print(f"  Last: \"{last_msg}\"")
         console.print()
 
     console.print(f"[bold]Would summarize {total_messages} messages into {len(sessions)} summaries.[/bold]")
@@ -855,10 +867,8 @@ def handle_msg_summarize(bot_id: str, skip_confirm: bool):
         
         if available_models:
             console.print("[bold]Available models:[/bold]")
-            for model in available_models[:5]:
+            for model in available_models:
                 console.print(f"  - {model}")
-            if len(available_models) > 5:
-                console.print(f"  ... and {len(available_models) - 5} more")
             console.print()
             console.print("[dim]To load a model, run: llm \"hello\" (any query will load the default model)[/dim]")
             console.print()
@@ -921,10 +931,8 @@ def handle_msg_summarize(bot_id: str, skip_confirm: bool):
     # Check if there were LLM failures
     if errors:
         console.print(f"\n[yellow]LLM summarization failed for {len(errors)} session(s):[/yellow]")
-        for err in errors[:3]:  # Show first 3 errors
+        for err in errors:
             console.print(f"  [red]- {err}[/red]")
-        if len(errors) > 3:
-            console.print(f"  [dim]... and {len(errors) - 3} more[/dim]")
         console.print()
         
         if not skip_confirm:
@@ -1005,10 +1013,8 @@ def handle_msg_rebuild_summaries(
 
     if errors:
         console.print(f"\n[yellow]LLM rebuild failed for {len(errors)} session(s):[/yellow]")
-        for err in errors[:3]:
+        for err in errors:
             console.print(f"  [red]- {err}[/red]")
-        if len(errors) > 3:
-            console.print(f"  [dim]... and {len(errors) - 3} more[/dim]")
 
         if not skip_confirm:
             fallback = console.input(
@@ -1053,31 +1059,32 @@ def handle_msg_summaries(bot_id: str):
         console.print("[dim]Use --msg-summarize to create summaries of old sessions.[/dim]")
         return
 
-    table = Table(title=f"Message Summaries ({len(summaries)} total)")
-    table.add_column("ID", style="dim", width=8)
-    table.add_column("Session Time", style="dim", width=30)
-    table.add_column("Msgs", justify="right", width=4)
-    table.add_column("Method", width=10)
-    table.add_column("Summary", style="white", max_width=90, overflow="fold")
+    console.print(Panel.fit(f"[bold]Message Summaries[/bold] ({len(summaries)} total)", border_style="cyan"))
 
-    for summ in summaries:
-        summ_id = summ.get("id", "")[:8] if summ.get("id") else "?"
+    for index, summ in enumerate(summaries, start=1):
+        summ_id = summ.get("id", "?")
         start = summ.get("session_start_time", "?")
         end = summ.get("session_end_time", "?")
-        session_time = f"{start} - {end}"
         msg_count = summ.get("message_count", 0)
         method = summ.get("method", "?")
-        content = summ.get("content", "")
-        preview = content.splitlines()
-        preview = "\n".join(preview[:5]).strip() if preview else ""
-        if len(preview) > 500:
-            preview = preview[:497] + "..."
+        content = summ.get("content", "") or "(empty)"
 
         method_style = "green" if method == "llm" else "yellow"
 
-        table.add_row(summ_id, session_time, str(msg_count), f"[{method_style}]{method}[/{method_style}]", preview)
+        console.print(
+            Panel(
+                str(content),
+                title=(
+                    f"{index}. ID: {summ_id} • "
+                    f"[{method_style}]{method}[/{method_style}] • "
+                    f"{msg_count} messages"
+                ),
+                subtitle=f"Session: {start} - {end}",
+                border_style=method_style,
+                expand=True,
+            )
+        )
 
-    console.print(table)
     console.print("\n[dim]Use --msg-summary-get <ID> to view full summary[/dim]")
     console.print("[dim]Use --msg-delete-summary <ID> to remove a summary[/dim]")
 
@@ -1105,8 +1112,8 @@ def handle_msg_summary_get(bot_id: str, summary_id_prefix: str):
         return
     if len(matches) > 1:
         console.print(f"[yellow]Prefix matched {len(matches)} summaries. Be more specific.[/yellow]")
-        for s in matches[:10]:
-            console.print(f"  - {str(s.get('id', ''))[:12]}")
+        for s in matches:
+            console.print(f"  - {str(s.get('id', ''))}")
         return
 
     summ = matches[0]

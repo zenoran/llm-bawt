@@ -115,6 +115,7 @@ class BotInfo(BaseModel):
     system_prompt: str = ""
     requires_memory: bool = True
     voice_optimized: bool = False
+    default_voice: str | None = None
     uses_tools: bool = False
     uses_search: bool = False
     uses_home_assistant: bool = False
@@ -529,13 +530,13 @@ class DeleteSummaryResponse(BaseModel):
     detail: str | None = None
 
 
-# User Profile Models
+# Profile Attribute Models
 class UserProfileAttribute(BaseModel):
     """A single profile attribute."""
     id: int | None = None
     category: str
     key: str
-    value: str
+    value: Any
     confidence: float = 1.0
     source: str | None = None
     created_at: str | None = None
@@ -544,33 +545,21 @@ class UserProfileAttribute(BaseModel):
 
 class ProfileAttributeUpdateRequest(BaseModel):
     """Request payload for updating an existing profile attribute."""
-    value: str | None = None
+    value: Any | None = None
     confidence: float | None = Field(default=None, ge=0.0, le=1.0)
     source: str | None = None
 
 
-class UserProfileSummary(BaseModel):
-    """Summary of a user profile."""
-    user_id: str
-    display_name: str | None = None
-    description: str | None = None
-    attribute_count: int = 0
-    created_at: str | None = None
+class ProfileAttributeUpsertRequest(BaseModel):
+    """Request payload for creating/updating a profile attribute by identity."""
 
-
-class UserProfileDetail(BaseModel):
-    """Detailed user profile with attributes."""
-    user_id: str
-    display_name: str | None = None
-    description: str | None = None
-    attributes: list[UserProfileAttribute] = []
-    created_at: str | None = None
-
-
-class UserListResponse(BaseModel):
-    """Response for listing users."""
-    users: list[UserProfileSummary]
-    total_count: int
+    entity_type: Literal["user", "bot"]
+    entity_id: str
+    category: str
+    key: str
+    value: Any
+    confidence: float = Field(default=1.0, ge=0.0, le=1.0)
+    source: str = "explicit"
 
 
 # Unified Profile Models

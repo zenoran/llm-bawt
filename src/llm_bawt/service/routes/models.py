@@ -71,6 +71,7 @@ async def list_bots():
             system_prompt=bot.system_prompt,
             requires_memory=bot.requires_memory,
             voice_optimized=bot.voice_optimized,
+            default_voice=bot.default_voice,
             uses_tools=bot.uses_tools,
             uses_search=bot.uses_search,
             uses_home_assistant=bot.uses_home_assistant,

@@ -1,4 +1,4 @@
-"""User and unified profile routes."""
+"""Unified profile routes."""
 
 from fastapi import APIRouter, HTTPException
 
@@ -6,12 +6,10 @@ from ..dependencies import attribute_to_response, get_service
 from ..logging import get_service_logger
 from ..schemas import (
     ProfileAttributeUpdateRequest,
+    ProfileAttributeUpsertRequest,
     ProfileDetail,
     ProfileListResponse,
-    UserListResponse,
     UserProfileAttribute,
-    UserProfileDetail,
-    UserProfileSummary,
 )
 
 router = APIRouter()
@@ -35,99 +33,109 @@ def _get_profile_detail(manager, entity_type_enum, entity_type: str, entity_id: 
     )
 
 
-@router.get("/v1/users", response_model=UserListResponse, tags=["Users"])
-async def list_users():
-    """List all user profiles."""
+def _normalize_entity_type(entity_type: str | None) -> str | None:
+    if entity_type is None:
+        return None
+
+    normalized = entity_type.lower()
+    if normalized not in ("user", "bot"):
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid entity_type '{entity_type}'. Must be 'user' or 'bot'.",
+        )
+    return normalized
+
+
+@router.get("/v1/profiles", response_model=ProfileListResponse, tags=["Profiles"])
+async def list_profiles(entity_type: str | None = None):
+    """List profiles.
+
+    - /v1/profiles: list all user + bot profiles
+    - /v1/profiles?entity_type=user|bot: list by type
+    """
     service = get_service()
 
     try:
-        from ..profiles import EntityType, ProfileManager
+        from ...profiles import EntityType, ProfileManager
 
         manager = ProfileManager(service.config)
-        profiles = manager.list_profiles(EntityType.USER)
+        normalized_entity_type = _normalize_entity_type(entity_type)
 
-        users = []
-        for profile in profiles:
-            attr_count = len(manager.get_all_attributes(EntityType.USER, profile.entity_id))
-            users.append(
-                UserProfileSummary(
-                    user_id=profile.entity_id,
-                    display_name=profile.display_name,
-                    description=profile.description,
-                    attribute_count=attr_count,
-                    created_at=profile.created_at.isoformat() if profile.created_at else None,
-                )
+        result_profiles: list[ProfileDetail] = []
+
+        if normalized_entity_type:
+            target_type = EntityType.USER if normalized_entity_type == "user" else EntityType.BOT
+            typed_profiles = manager.list_profiles(target_type)
+            result_profiles = [
+                _get_profile_detail(manager, target_type, normalized_entity_type, profile.entity_id)
+                for profile in typed_profiles
+            ]
+        else:
+            user_profiles = manager.list_profiles(EntityType.USER)
+            bot_profiles = manager.list_profiles(EntityType.BOT)
+
+            result_profiles.extend(
+                _get_profile_detail(manager, EntityType.USER, "user", profile.entity_id)
+                for profile in user_profiles
+            )
+            result_profiles.extend(
+                _get_profile_detail(manager, EntityType.BOT, "bot", profile.entity_id)
+                for profile in bot_profiles
             )
 
-        return UserListResponse(users=users, total_count=len(users))
-    except Exception as e:
-        log.error(f"Failed to list users: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-@router.get("/v1/users/{user_id}", response_model=UserProfileDetail, tags=["Users"])
-async def get_user_profile(user_id: str):
-    """Get detailed user profile with attributes."""
-    service = get_service()
-
-    try:
-        from ..profiles import EntityType, ProfileManager
-
-        manager = ProfileManager(service.config)
-        profile = manager.get_profile(EntityType.USER, user_id)
-
-        if not profile:
-            raise HTTPException(status_code=404, detail=f"User '{user_id}' not found")
-
-        attributes = manager.get_all_attributes(EntityType.USER, user_id)
-
-        return UserProfileDetail(
-            user_id=user_id,
-            display_name=profile.display_name,
-            description=profile.description,
-            attributes=[attribute_to_response(attr) for attr in attributes],
-            created_at=profile.created_at.isoformat() if profile.created_at else None,
-        )
+        return ProfileListResponse(profiles=result_profiles, total_count=len(result_profiles))
     except HTTPException:
         raise
     except Exception as e:
-        log.error(f"Failed to get user profile: {e}")
+        log.error(f"Failed to list profiles: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@router.delete("/v1/users/attribute/{attribute_id}", tags=["Users"])
-async def delete_user_attribute(attribute_id: int):
-    """Delete a user profile attribute by its ID."""
+@router.get("/v1/profiles/{entity_id}", response_model=ProfileDetail, tags=["Profiles"])
+async def get_profile(entity_id: str):
+    """Get one profile by ID (auto-detect user vs bot)."""
     service = get_service()
 
     try:
-        from ..profiles import ProfileManager
+        from ...profiles import EntityType, ProfileManager
 
         manager = ProfileManager(service.config)
 
-        attr = manager.get_attribute_by_id(attribute_id)
-        if not attr:
-            raise HTTPException(status_code=404, detail=f"Attribute with ID {attribute_id} not found")
+        user_profile = manager.get_profile(EntityType.USER, entity_id)
+        if user_profile:
+            return _get_profile_detail(manager, EntityType.USER, "user", entity_id)
 
-        success = manager.delete_attribute_by_id(attribute_id)
-        if success:
-            return {
-                "success": True,
-                "message": f"Deleted attribute {attr.category}.{attr.key} from {attr.entity_type}/{attr.entity_id}",
-                "deleted": {
-                    "id": attribute_id,
-                    "entity_type": str(attr.entity_type),
-                    "entity_id": attr.entity_id,
-                    "category": attr.category,
-                    "key": attr.key,
-                    "value": attr.value,
-                },
-            }
-        raise HTTPException(status_code=500, detail="Failed to delete attribute")
+        bot_profile = manager.get_profile(EntityType.BOT, entity_id)
+        if bot_profile:
+            return _get_profile_detail(manager, EntityType.BOT, "bot", entity_id)
+
+        raise HTTPException(status_code=404, detail=f"No profile found for entity '{entity_id}'")
     except HTTPException:
         raise
     except Exception as e:
-        log.error(f"Failed to delete user attribute: {e}")
+        log.error(f"Failed to get profile '{entity_id}': {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/v1/profiles/{entity_type}/{entity_id}", response_model=ProfileDetail, tags=["Profiles"])
+async def get_typed_profile(entity_type: str, entity_id: str):
+    """Get one profile by explicit entity type and ID."""
+    service = get_service()
+
+    try:
+        from ...profiles import EntityType, ProfileManager
+
+        normalized_entity_type = _normalize_entity_type(entity_type)
+        if normalized_entity_type is None:
+            raise HTTPException(status_code=400, detail="entity_type is required")
+
+        manager = ProfileManager(service.config)
+        target_type = EntityType.USER if normalized_entity_type == "user" else EntityType.BOT
+        return _get_profile_detail(manager, target_type, normalized_entity_type, entity_id)
+    except HTTPException:
+        raise
+    except Exception as e:
+        log.error(f"Failed to get {entity_type} profile '{entity_id}': {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 
@@ -137,7 +145,7 @@ async def update_profile_attribute(attribute_id: int, request: ProfileAttributeU
     service = get_service()
 
     try:
-        from ..profiles import ProfileManager
+        from ...profiles import ProfileManager
 
         if request.value is None and request.confidence is None and request.source is None:
             raise HTTPException(status_code=400, detail="Provide at least one field: value, confidence, or source")
@@ -160,102 +168,63 @@ async def update_profile_attribute(attribute_id: int, request: ProfileAttributeU
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@router.patch("/v1/users/attribute/{attribute_id}", response_model=UserProfileAttribute, tags=["Users"])
-async def update_user_attribute(attribute_id: int, request: ProfileAttributeUpdateRequest):
-    """Alias for updating a user attribute by ID (same behavior as /v1/profiles/attribute/{id})."""
-    return await update_profile_attribute(attribute_id, request)
-
-
-@router.get("/v1/profiles/{entity_id}", response_model=ProfileDetail, tags=["Profiles"])
-async def get_profile_auto(entity_id: str):
-    """Get profile with attributes - auto-detects entity type (user or bot)."""
-    if entity_id in ("user", "bot"):
-        raise HTTPException(
-            status_code=400,
-            detail=(
-                f"'{entity_id}' is a reserved word. To list all {entity_id} profiles, "
-                f"use GET /v1/profiles/list/{entity_id}"
-            ),
-        )
-
+@router.post("/v1/profiles/attribute", response_model=UserProfileAttribute, tags=["Profiles"])
+async def upsert_profile_attribute(request: ProfileAttributeUpsertRequest):
+    """Create or update a profile attribute by entity identity and key."""
     service = get_service()
 
     try:
-        from ..profiles import EntityType, ProfileManager
+        from ...profiles import EntityType, ProfileManager
 
         manager = ProfileManager(service.config)
-
-        profile = manager.get_profile(EntityType.USER, entity_id)
-        entity_type_str = "user"
-        entity_type_enum = EntityType.USER
-
-        if not profile:
-            profile = manager.get_profile(EntityType.BOT, entity_id)
-            entity_type_str = "bot"
-            entity_type_enum = EntityType.BOT
-
-        if not profile:
-            raise HTTPException(status_code=404, detail=f"No profile found for entity '{entity_id}'")
-
-        return _get_profile_detail(manager, entity_type_enum, entity_type_str, entity_id)
-    except HTTPException:
-        raise
+        entity_type = EntityType.USER if request.entity_type == "user" else EntityType.BOT
+        attr = manager.set_attribute(
+            entity_type=entity_type,
+            entity_id=request.entity_id,
+            category=request.category,
+            key=request.key,
+            value=request.value,
+            confidence=request.confidence,
+            source=request.source,
+        )
+        return attribute_to_response(attr)
     except Exception as e:
-        log.error(f"Failed to get profile for '{entity_id}': {e}")
+        log.error(f"Failed to upsert profile attribute: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@router.get("/v1/profiles/list/{entity_type}", response_model=ProfileListResponse, tags=["Profiles"])
-async def list_profiles(entity_type: str):
-    """List all profiles of a given type (user or bot)."""
+@router.delete("/v1/profiles/attribute/{attribute_id}", tags=["Profiles"])
+async def delete_profile_attribute(attribute_id: int):
+    """Delete a profile attribute by its ID."""
     service = get_service()
 
-    if entity_type not in ("user", "bot"):
-        raise HTTPException(
-            status_code=400,
-            detail=f"Invalid entity_type '{entity_type}'. Must be 'user' or 'bot'.",
-        )
-
     try:
-        from ..profiles import EntityType, ProfileManager
-
-        entity_type_enum = EntityType.USER if entity_type == "user" else EntityType.BOT
+        from ...profiles import ProfileManager
 
         manager = ProfileManager(service.config)
-        profiles = manager.list_profiles(entity_type_enum)
 
-        result_profiles = [
-            _get_profile_detail(manager, entity_type_enum, entity_type, profile.entity_id)
-            for profile in profiles
-        ]
+        attr = manager.get_attribute_by_id(attribute_id)
+        if not attr:
+            raise HTTPException(status_code=404, detail=f"Attribute with ID {attribute_id} not found")
 
-        return ProfileListResponse(profiles=result_profiles, total_count=len(result_profiles))
+        success = manager.delete_attribute_by_id(attribute_id)
+        if success:
+            return {
+                "success": True,
+                "message": f"Deleted attribute {attr.category}.{attr.key} from {attr.entity_type}/{attr.entity_id}",
+                "deleted": {
+                    "id": attribute_id,
+                    "entity_type": str(attr.entity_type),
+                    "entity_id": attr.entity_id,
+                    "category": attr.category,
+                    "key": attr.key,
+                    "value": attr.value,
+                },
+            }
+
+        raise HTTPException(status_code=500, detail="Failed to delete attribute")
     except HTTPException:
         raise
     except Exception as e:
-        log.error(f"Failed to list {entity_type} profiles: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-@router.get("/v1/profiles/{entity_type}/{entity_id}", response_model=ProfileDetail, tags=["Profiles"])
-async def get_profile(entity_type: str, entity_id: str):
-    """Get profile with attributes for any entity type (user or bot)."""
-    service = get_service()
-
-    if entity_type not in ("user", "bot"):
-        raise HTTPException(
-            status_code=400,
-            detail=f"Invalid entity_type '{entity_type}'. Must be 'user' or 'bot'.",
-        )
-
-    try:
-        from ..profiles import EntityType, ProfileManager
-
-        entity_type_enum = EntityType.USER if entity_type == "user" else EntityType.BOT
-        manager = ProfileManager(service.config)
-        return _get_profile_detail(manager, entity_type_enum, entity_type, entity_id)
-    except HTTPException:
-        raise
-    except Exception as e:
-        log.error(f"Failed to get {entity_type} profile: {e}")
+        log.error(f"Failed to delete profile attribute: {e}")
         raise HTTPException(status_code=500, detail=str(e))

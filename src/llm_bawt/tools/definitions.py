@@ -338,12 +338,16 @@ NEWS_TOOL = Tool(
 # Home Assistant tool
 HOME_TOOL = Tool(
     name="home",
-    description="Control Home Assistant devices and scenes. Use action='status', 'query', 'get', 'set', or 'scene'.",
+    description=(
+        "Control Home Assistant devices and scenes. "
+        "Use action='status', 'status_raw', 'query', 'get', 'set', or 'scene'. "
+        "For status/raw requests, return exact tool output; do not synthesize missing JSON fields."
+    ),
     parameters=[
         ToolParameter(
             name="action",
             type="string",
-            description="'status', 'query', 'get', 'set', or 'scene'",
+            description="'status', 'status_raw', 'query', 'get', 'set', or 'scene'",
         ),
         ToolParameter(
             name="pattern",
@@ -511,6 +515,7 @@ The "Available Tools" list above is authoritative for this turn. If asked to lis
 - Only use tools when you NEED information you don't have
 - Call ONE tool at a time, wait for result
 - TRUST tool results exactly - never contradict them
+- If the user asks for a tool's "raw output", call that tool now and return the exact tool output verbatim (do not reformat or paraphrase)
 - If a tool result contains URLs, copy URLs EXACTLY as provided (no rewriting, shortening, or guessing)
 - Do not invent URL slugs, dates, IDs, or domains; if uncertain, include the original tool URL verbatim
 - Before saying "I don't know" about the user: check system prompt "About the User" section, then use memory action=search
@@ -542,6 +547,8 @@ HOME_GUIDANCE = '''
 - **home**: For home status, smart-device lookup, and device/scene control
 - Home control workflow: if user gives a natural name (e.g., "sunroom lights"), call `home` with `action='query'` first, then use the exact entity ID from query in `action='set'` or `action='get'`
 - Never guess entity IDs. If `set/get` reports not found, run `query` and retry with returned IDs.
+- If asked "how is home" / current home status, call `home` with `action='status'` before answering.
+- If asked for raw home output, return the tool output exactly as returned. Do not synthesize JSON keys/values that are not present in tool output.
 '''
 
 

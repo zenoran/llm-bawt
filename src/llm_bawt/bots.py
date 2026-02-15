@@ -48,6 +48,7 @@ class Bot:
     system_prompt: str  # The system message sent to the LLM
     requires_memory: bool = True  # Whether this bot needs database/memory persistence
     voice_optimized: bool = False  # Whether output is optimized for TTS
+    default_voice: str | None = None  # Optional default voice identifier for TTS/voice clients
     default_model: str | None = None  # Default model alias for this bot
     uses_tools: bool = False  # Whether this bot can use tools (memory search, etc.)
     uses_search: bool = False  # Whether this bot can search the web
@@ -240,6 +241,7 @@ def _load_bots_config() -> None:
             system_prompt=payload.get("system_prompt", "You are a helpful assistant."),
             requires_memory=payload.get("requires_memory", True),
             voice_optimized=payload.get("voice_optimized", False),
+            default_voice=payload.get("default_voice") or effective_settings.get("default_voice"),
             default_model=payload.get("default_model"),
             uses_tools=payload.get("uses_tools", False),
             uses_search=payload.get("uses_search", False),

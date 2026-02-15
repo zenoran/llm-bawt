@@ -401,34 +401,82 @@ class MemoryAPIClient:
     # Profile Operations
     # ==================================================================
     
-    async def list_profiles(self, entity_type: str = "user") -> dict[str, Any]:
-        """List profiles of a given type."""
-        response = await self._client.get(
-            f"{self.base_url}/v1/profiles/list/{entity_type}"
-        )
+    async def list_profiles(self, entity_type: str | None = None) -> dict[str, Any]:
+        """List profiles, optionally filtered by entity_type."""
+        params: dict[str, Any] = {}
+        if entity_type:
+            params["entity_type"] = entity_type
+
+        response = await self._client.get(f"{self.base_url}/v1/profiles", params=params)
         response.raise_for_status()
         return response.json()
     
-    async def get_profile(self, entity_id: str) -> dict[str, Any]:
-        """Get profile for any entity (auto-detects type)."""
-        response = await self._client.get(
-            f"{self.base_url}/v1/profiles/{entity_id}"
-        )
+    async def get_profile(self, entity_id: str, entity_type: str | None = None) -> dict[str, Any]:
+        """Get profile by ID, optionally constrained to entity_type."""
+        if entity_type:
+            response = await self._client.get(f"{self.base_url}/v1/profiles/{entity_type}/{entity_id}")
+        else:
+            response = await self._client.get(f"{self.base_url}/v1/profiles/{entity_id}")
         response.raise_for_status()
         return response.json()
     
     async def get_user_profile(self, user_id: str) -> dict[str, Any]:
         """Get user profile."""
-        response = await self._client.get(
-            f"{self.base_url}/v1/users/{user_id}"
-        )
-        response.raise_for_status()
-        return response.json()
+        return await self.get_profile(user_id, entity_type="user")
     
     async def delete_attribute(self, attribute_id: int) -> dict[str, Any]:
         """Delete a profile attribute."""
         response = await self._client.delete(
-            f"{self.base_url}/v1/users/attribute/{attribute_id}"
+            f"{self.base_url}/v1/profiles/attribute/{attribute_id}"
+        )
+        response.raise_for_status()
+        return response.json()
+
+    async def upsert_attribute(
+        self,
+        entity_type: str,
+        entity_id: str,
+        category: str,
+        key: str,
+        value: Any,
+        confidence: float = 1.0,
+        source: str = "explicit",
+    ) -> dict[str, Any]:
+        """Create or update a profile attribute by identity."""
+        response = await self._client.post(
+            f"{self.base_url}/v1/profiles/attribute",
+            json={
+                "entity_type": entity_type,
+                "entity_id": entity_id,
+                "category": category,
+                "key": key,
+                "value": value,
+                "confidence": confidence,
+                "source": source,
+            },
+        )
+        response.raise_for_status()
+        return response.json()
+
+    async def update_attribute(
+        self,
+        attribute_id: int,
+        value: Any | None = None,
+        confidence: float | None = None,
+        source: str | None = None,
+    ) -> dict[str, Any]:
+        """Update an existing profile attribute by ID."""
+        payload: dict[str, Any] = {}
+        if value is not None:
+            payload["value"] = value
+        if confidence is not None:
+            payload["confidence"] = confidence
+        if source is not None:
+            payload["source"] = source
+
+        response = await self._client.patch(
+            f"{self.base_url}/v1/profiles/attribute/{attribute_id}",
+            json=payload,
         )
         response.raise_for_status()
         return response.json()

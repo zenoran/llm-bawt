@@ -32,6 +32,11 @@ class HomeAssistantMCPClient:
     def status(self) -> str:
         return self._call_text_tool("status", {})
 
+    def status_raw(self) -> str:
+        """Return raw MCP payload for status tool (debugging)."""
+        result = self._call_tool(name="status", arguments={})
+        return json.dumps(self._to_serializable(result), indent=2, default=str, ensure_ascii=False)
+
     def query(self, pattern: str | None = None, domain: str | None = None) -> str:
         args: dict[str, Any] = {}
         if pattern:
@@ -132,3 +137,37 @@ class HomeAssistantMCPClient:
         if isinstance(result, str):
             return result.strip()
         return ""
+
+    @classmethod
+    def _to_serializable(cls, value: Any) -> Any:
+        """Convert MCP SDK objects to JSON-serializable structures."""
+        if value is None or isinstance(value, (str, int, float, bool)):
+            return value
+
+        if isinstance(value, dict):
+            return {str(k): cls._to_serializable(v) for k, v in value.items()}
+
+        if isinstance(value, (list, tuple, set)):
+            return [cls._to_serializable(item) for item in value]
+
+        if hasattr(value, "model_dump"):
+            try:
+                dumped = value.model_dump()
+                return cls._to_serializable(dumped)
+            except Exception:
+                pass
+
+        if hasattr(value, "dict"):
+            try:
+                dumped = value.dict()
+                return cls._to_serializable(dumped)
+            except Exception:
+                pass
+
+        if hasattr(value, "__dict__"):
+            try:
+                return cls._to_serializable(vars(value))
+            except Exception:
+                pass
+
+        return str(value)

@@ -1427,6 +1427,21 @@ class ToolExecutor:
         try:
             if action == "status":
                 text = self.home_client.status()
+                battery_match = re.search(r"Battery:\s*([-+]?\d+(?:\.\d+)?)%", text)
+                if battery_match:
+                    try:
+                        battery_pct = float(battery_match.group(1))
+                        if battery_pct < 0 or battery_pct > 100:
+                            text += (
+                                "\n\n[warning] Reported battery percent is outside 0-100. "
+                                "This likely indicates the MCP status formatter is reading a non-percentage source sensor."
+                            )
+                    except ValueError:
+                        pass
+                return format_tool_result(tool_call.name, text)
+
+            if action == "status_raw":
+                text = self.home_client.status_raw()
                 return format_tool_result(tool_call.name, text)
 
             if action == "query":
@@ -1530,7 +1545,7 @@ class ToolExecutor:
             return format_tool_result(
                 tool_call.name,
                 None,
-                error="Invalid action. Use: status, query, get, set, or scene.",
+                error="Invalid action. Use: status, status_raw, query, get, set, or scene.",
             )
 
         except Exception as e:
