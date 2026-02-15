@@ -54,7 +54,7 @@ CLIENT_SETTING_GROUPS: List[SettingGroup] = [
     SettingGroup(
         title="Core",
         settings=[
-            Setting("DEFAULT_MODEL_ALIAS", "Default model alias from models.yaml"),
+            Setting("DEFAULT_MODEL_ALIAS", "Optional default model alias (leave blank for service-selected model)"),
             Setting("DEFAULT_BOT", "Default bot personality (nova, spark, …)"),
             Setting("DEFAULT_USER", "Default user profile name"),
             Setting("USE_SERVICE", "Route queries through the background service by default"),
@@ -213,6 +213,9 @@ def run_config_setup(config: "Config", console: Console) -> int:
             default = _default_value(config, setting)
             prefill = current or default
 
+            if setting.key == "DEFAULT_MODEL_ALIAS" and not config.defined_models.get("models"):
+                console.print("  [dim]No local models.yaml aliases found; leave blank to let service/bot choose.[/dim]")
+
             # Build prompt label
             env_var = _env_var_name(setting, env_prefix)
             display = _display_value(current, setting.secret)
@@ -222,12 +225,13 @@ def run_config_setup(config: "Config", console: Console) -> int:
             )
 
             try:
-                new_value = Prompt.ask(
-                    "  →",
-                    default=prefill,
-                    password=setting.secret,
-                    show_default=not setting.secret,
-                )
+                prompt_kwargs: dict[str, object] = {
+                    "password": setting.secret,
+                    "show_default": bool(prefill) and not setting.secret,
+                }
+                if prefill:
+                    prompt_kwargs["default"] = prefill
+                new_value = Prompt.ask("  →", **prompt_kwargs)
             except KeyboardInterrupt:
                 console.print("\n[yellow]Aborted.[/yellow]")
                 return 1

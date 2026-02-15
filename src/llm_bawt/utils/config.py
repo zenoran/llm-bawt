@@ -306,8 +306,7 @@ class Config(RuntimeTunables, BaseSettings):
     def _load_models_config(self):
         config_path = Path(self.MODELS_CONFIG_PATH)
         if not config_path.is_file():
-            console.print(f"[yellow]Warning:[/yellow] Models configuration file not found at {config_path}")
-            console.print("  Define models in a YAML file (see docs). Using empty model definitions.")
+            logger.debug("Models configuration file not found at %s; using empty model definitions", config_path)
             self.defined_models = {"models": {}}
             return
 

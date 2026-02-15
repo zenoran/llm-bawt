@@ -609,6 +609,79 @@ class ServiceClient:
 
         return None
 
+    def get_history(self, bot_id: str | None = None, limit: int = 50, before: str | None = None) -> dict[str, Any] | None:
+        """Fetch conversation history from the service history endpoint.
+
+        Returns the raw HistoryResponse payload as a dict, or None if unavailable.
+        """
+        if not self.is_available():
+            return None
+
+        params: dict[str, Any] = {"limit": limit}
+        if bot_id:
+            params["bot_id"] = bot_id
+        if before:
+            params["before"] = before
+
+        try:
+            return self._request("GET", "/v1/history", params=params)
+        except Exception as e:
+            logger.warning(f"Get history via service failed: {e}")
+            return None
+
+    def clear_history(self, bot_id: str | None = None) -> dict[str, Any] | None:
+        """Clear conversation history through the service history endpoint.
+
+        Returns the raw HistoryClearResponse payload as a dict, or None if unavailable.
+        """
+        if not self.is_available():
+            return None
+
+        params: dict[str, Any] = {}
+        if bot_id:
+            params["bot_id"] = bot_id
+
+        try:
+            return self._request("DELETE", "/v1/history", params=params)
+        except Exception as e:
+            logger.warning(f"Clear history via service failed: {e}")
+            return None
+
+    def get_all_history(self, bot_id: str | None = None, page_limit: int = 200, max_pages: int = 100) -> list[dict[str, Any]] | None:
+        """Fetch all visible history messages via paginated /v1/history calls.
+
+        Returns messages in chronological order, or None if service unavailable.
+        """
+        if not self.is_available():
+            return None
+
+        all_messages: list[dict[str, Any]] = []
+        before: str | None = None
+        seen_oldest: set[str] = set()
+
+        for _ in range(max_pages):
+            page = self.get_history(bot_id=bot_id, limit=page_limit, before=before)
+            if page is None:
+                return None
+
+            messages = page.get("messages", [])
+            if not messages:
+                break
+            all_messages = messages + all_messages
+
+            if not page.get("has_more", False):
+                break
+
+            oldest = page.get("oldest_timestamp")
+            if oldest is None:
+                break
+            before = str(oldest)
+            if before in seen_oldest:
+                break
+            seen_oldest.add(before)
+
+        return all_messages
+
 
 # Singleton instance for easy access
 _service_client: ServiceClient | None = None

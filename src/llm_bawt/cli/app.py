@@ -1636,40 +1636,90 @@ def run_app(args: argparse.Namespace, config_obj: Config, resolved_alias: str):
     history_only = (args.delete_history or args.print_history is not None) and not args.question and not args.command
     
     if history_only:
-        # Use lightweight history manager without full model initialization
-        from llm_bawt.clients.base import StubClient
-        from llm_bawt.utils.history import HistoryManager
-        from llm_bawt.memory_server.client import get_memory_client
-        
-        stub_client = StubClient(config=config_obj, bot_name=bot.name)
-        
-        # Initialize memory client if database available
-        memory = None
-        if not args.local and has_database_credentials(config_obj):
-            try:
-                memory = get_memory_client(
-                    config=config_obj,
-                    bot_id=bot_id,
-                    user_id=user_id,
-                    server_url=getattr(config_obj, "MEMORY_SERVER_URL", None),
-                )
-            except Exception as e:
-                logger.debug(f"Memory client init failed: {e}")
-        
-        history_manager = HistoryManager(
-            client=stub_client,
-            config=config_obj,
-            db_backend=memory.get_short_term_manager() if memory else None,
-            bot_id=bot_id,
-        )
-        history_manager.load_history()
-        
-        if args.delete_history:
-            history_manager.clear_history()
-            console.print("[green]Chat history cleared.[/green]")
-        
-        if args.print_history is not None:
-            history_manager.print_history(args.print_history)
+        # Prefer service-backed history in service mode so unconfigured local hosts still work.
+        if use_service and not args.local:
+            service_client = get_service_client(config_obj)
+            if service_client and service_client.is_available(force_check=True):
+                from llm_bawt.clients.base import StubClient
+                from llm_bawt.models.message import Message
+                from llm_bawt.utils.history import HistoryManager
+
+                if args.delete_history:
+                    clear_resp = service_client.clear_history(bot_id=bot_id)
+                    if clear_resp and clear_resp.get("success"):
+                        console.print("[green]Chat history cleared.[/green]")
+                    else:
+                        detail = service_client.last_error or "service did not return success"
+                        console.print(f"[yellow]Could not clear history via service: {detail}[/yellow]")
+
+                if args.print_history is not None:
+                    pair_limit = args.print_history
+                    if pair_limit == -1:
+                        messages = service_client.get_all_history(bot_id=bot_id)
+                        history_resp = {"messages": messages or []} if messages is not None else None
+                    else:
+                        message_limit = max(1, pair_limit * 2)
+                        history_resp = service_client.get_history(bot_id=bot_id, limit=message_limit)
+
+                    if history_resp is None:
+                        detail = service_client.last_error or "service unavailable"
+                        console.print(f"[yellow]Could not load history via service: {detail}[/yellow]")
+                    else:
+                        stub_client = StubClient(config=config_obj, bot_name=bot.name)
+                        history_manager = HistoryManager(
+                            client=stub_client,
+                            config=config_obj,
+                            db_backend=None,
+                            bot_id=bot_id,
+                        )
+                        messages = history_resp.get("messages", [])
+                        history_manager.messages = [
+                            Message(
+                                role=str(msg.get("role", "")),
+                                content=str(msg.get("content", "")),
+                                timestamp=float(msg.get("timestamp") or 0.0),
+                                db_id=str(msg.get("id") or ""),
+                            )
+                            for msg in messages
+                        ]
+                        history_manager.print_history(pair_limit)
+            else:
+                console.print("[yellow]Service not available for history operations.[/yellow]")
+        else:
+            # Local fallback: lightweight history manager without full model initialization
+            from llm_bawt.clients.base import StubClient
+            from llm_bawt.utils.history import HistoryManager
+            from llm_bawt.memory_server.client import get_memory_client
+
+            stub_client = StubClient(config=config_obj, bot_name=bot.name)
+
+            # Initialize memory client if database available
+            memory = None
+            if not args.local and has_database_credentials(config_obj):
+                try:
+                    memory = get_memory_client(
+                        config=config_obj,
+                        bot_id=bot_id,
+                        user_id=user_id,
+                        server_url=getattr(config_obj, "MEMORY_SERVER_URL", None),
+                    )
+                except Exception as e:
+                    logging.getLogger(__name__).debug(f"Memory client init failed: {e}")
+
+            history_manager = HistoryManager(
+                client=stub_client,
+                config=config_obj,
+                db_backend=memory.get_short_term_manager() if memory else None,
+                bot_id=bot_id,
+            )
+            history_manager.load_history()
+
+            if args.delete_history:
+                history_manager.clear_history()
+                console.print("[green]Chat history cleared.[/green]")
+
+            if args.print_history is not None:
+                history_manager.print_history(args.print_history)
         
         console.print()
         return
