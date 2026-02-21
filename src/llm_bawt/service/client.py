@@ -676,6 +676,195 @@ class ServiceClient:
             logger.warning(f"Clear history via service failed: {e}")
             return None
 
+    # -----------------------------------------------------------------
+    # Full system status (GET /v1/status)
+    # -----------------------------------------------------------------
+
+    def get_full_status(self) -> dict[str, Any] | None:
+        """Fetch the full system status from the service.
+
+        Returns the raw SystemStatusResponse payload, or None if unavailable.
+        """
+        if not self.is_available():
+            return None
+        try:
+            return self._request("GET", "/v1/status")
+        except Exception as e:
+            logger.warning(f"Get full status via service failed: {e}")
+            return None
+
+    # -----------------------------------------------------------------
+    # Bots (GET /v1/bots)
+    # -----------------------------------------------------------------
+
+    def list_bots(self) -> list[dict[str, Any]] | None:
+        """List bots from the service.
+
+        Returns list of BotInfo dicts, or None if unavailable.
+        """
+        if not self.is_available():
+            return None
+        try:
+            response = self._request("GET", "/v1/bots")
+            if response and "data" in response:
+                return response["data"]
+        except Exception as e:
+            logger.warning(f"List bots via service failed: {e}")
+        return None
+
+    # -----------------------------------------------------------------
+    # Jobs (GET /v1/jobs, GET /v1/jobs/runs)
+    # -----------------------------------------------------------------
+
+    def get_jobs(self, **params) -> dict[str, Any] | None:
+        """Fetch scheduled jobs from the service."""
+        if not self.is_available():
+            return None
+        try:
+            return self._request("GET", "/v1/jobs", params=params or None)
+        except Exception as e:
+            logger.warning(f"Get jobs via service failed: {e}")
+            return None
+
+    def get_job_runs(self, limit: int = 10, **params) -> dict[str, Any] | None:
+        """Fetch recent job runs from the service."""
+        if not self.is_available():
+            return None
+        try:
+            p: dict[str, Any] = {"limit": limit, **params}
+            return self._request("GET", "/v1/jobs/runs", params=p)
+        except Exception as e:
+            logger.warning(f"Get job runs via service failed: {e}")
+            return None
+
+    # -----------------------------------------------------------------
+    # Runtime settings
+    # -----------------------------------------------------------------
+
+    def get_settings(self, scope_type: str = "bot", scope_id: str | None = None) -> dict[str, Any] | None:
+        """Fetch runtime settings for a scope."""
+        if not self.is_available():
+            return None
+        try:
+            params: dict[str, Any] = {"scope_type": scope_type}
+            if scope_id:
+                params["scope_id"] = scope_id
+            return self._request("GET", "/v1/settings", params=params)
+        except Exception as e:
+            logger.warning(f"Get settings via service failed: {e}")
+            return None
+
+    def set_setting(self, scope_type: str, scope_id: str | None, key: str, value: Any) -> dict[str, Any] | None:
+        """Upsert one runtime setting."""
+        if not self.is_available():
+            return None
+        try:
+            return self._request("PUT", "/v1/settings", data={
+                "scope_type": scope_type,
+                "scope_id": scope_id,
+                "key": key,
+                "value": value,
+            })
+        except Exception as e:
+            logger.warning(f"Set setting via service failed: {e}")
+            return None
+
+    def delete_setting(self, scope_type: str, key: str, scope_id: str | None = None) -> dict[str, Any] | None:
+        """Delete one runtime setting."""
+        if not self.is_available():
+            return None
+        try:
+            params: dict[str, Any] = {"scope_type": scope_type, "key": key}
+            if scope_id:
+                params["scope_id"] = scope_id
+            return self._request("DELETE", "/v1/settings", params=params)
+        except Exception as e:
+            logger.warning(f"Delete setting via service failed: {e}")
+            return None
+
+    def batch_set_settings(self, items: list[dict[str, Any]]) -> dict[str, Any] | None:
+        """Batch upsert runtime settings."""
+        if not self.is_available():
+            return None
+        try:
+            return self._request("POST", "/v1/settings/batch", data={"items": items})
+        except Exception as e:
+            logger.warning(f"Batch set settings via service failed: {e}")
+            return None
+
+    # -----------------------------------------------------------------
+    # Bot profiles
+    # -----------------------------------------------------------------
+
+    def get_bot_profile(self, slug: str) -> dict[str, Any] | None:
+        """Fetch a bot profile from the service."""
+        if not self.is_available():
+            return None
+        try:
+            return self._request("GET", f"/v1/bots/{slug}/profile")
+        except Exception as e:
+            logger.debug(f"Get bot profile via service failed: {e}")
+            return None
+
+    def upsert_bot_profile(self, slug: str, data: dict[str, Any]) -> dict[str, Any] | None:
+        """Create or update a bot profile via the service."""
+        if not self.is_available():
+            return None
+        try:
+            return self._request("PUT", f"/v1/bots/{slug}/profile", data=data)
+        except Exception as e:
+            logger.warning(f"Upsert bot profile via service failed: {e}")
+            return None
+
+    # -----------------------------------------------------------------
+    # User/bot profiles
+    # -----------------------------------------------------------------
+
+    def get_profile(self, entity_id: str, entity_type: str | None = None) -> dict[str, Any] | None:
+        """Fetch a profile by entity ID."""
+        if not self.is_available():
+            return None
+        try:
+            if entity_type:
+                return self._request("GET", f"/v1/profiles/{entity_type}/{entity_id}")
+            return self._request("GET", f"/v1/profiles/{entity_id}")
+        except Exception as e:
+            logger.debug(f"Get profile via service failed: {e}")
+            return None
+
+    def list_profiles(self, entity_type: str | None = None) -> dict[str, Any] | None:
+        """List profiles, optionally filtered by type."""
+        if not self.is_available():
+            return None
+        try:
+            params = {"entity_type": entity_type} if entity_type else None
+            return self._request("GET", "/v1/profiles", params=params)
+        except Exception as e:
+            logger.warning(f"List profiles via service failed: {e}")
+            return None
+
+    def upsert_profile_attribute(self, entity_type: str, entity_id: str, category: str, key: str, value: Any, confidence: float = 1.0, source: str = "explicit") -> dict[str, Any] | None:
+        """Create or update a profile attribute."""
+        if not self.is_available():
+            return None
+        try:
+            return self._request("POST", "/v1/profiles/attribute", data={
+                "entity_type": entity_type,
+                "entity_id": entity_id,
+                "category": category,
+                "key": key,
+                "value": value,
+                "confidence": confidence,
+                "source": source,
+            })
+        except Exception as e:
+            logger.warning(f"Upsert profile attribute via service failed: {e}")
+            return None
+
+    # -----------------------------------------------------------------
+    # History (existing methods follow)
+    # -----------------------------------------------------------------
+
     def get_all_history(self, bot_id: str | None = None, page_limit: int = 200, max_pages: int = 100) -> list[dict[str, Any]] | None:
         """Fetch all visible history messages via paginated /v1/history calls.
 

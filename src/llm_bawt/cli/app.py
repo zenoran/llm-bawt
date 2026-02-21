@@ -31,6 +31,13 @@ import yaml
 
 console = Console()
 
+
+def _use_service(config: Config) -> bool:
+    """Return True if the CLI should delegate to the service for DB operations."""
+    from llm_bawt.model_manager import is_service_mode_enabled
+    return is_service_mode_enabled(config)
+
+
 # Cache for service client
 _service_client = None
 
@@ -540,8 +547,133 @@ def show_bots(config: Config):
     console.print()
 
 
+def _render_job_status_from_service(config: Config) -> bool:
+    """Render job status via the service API. Returns True if successful."""
+    client = get_service_client(config)
+    if not client or not client.is_available():
+        return False
+
+    from datetime import datetime
+
+    jobs_resp = client.get_jobs()
+    runs_resp = client.get_job_runs(limit=10)
+    if jobs_resp is None and runs_resp is None:
+        return False
+
+    jobs = (jobs_resp or {}).get("jobs", [])
+    runs = (runs_resp or {}).get("runs", [])
+
+    console.print(Panel.fit("[bold cyan]Scheduled Jobs[/bold cyan]", border_style="cyan"))
+    console.print()
+
+    if not jobs:
+        console.print("[dim]No scheduled jobs found. Start the service to initialize default jobs.[/dim]")
+    else:
+        job_table = Table(show_header=True, box=None, padding=(0, 2))
+        job_table.add_column("Job Type", style="cyan")
+        job_table.add_column("Bot", style="bold")
+        job_table.add_column("Enabled", justify="center")
+        job_table.add_column("Interval")
+        job_table.add_column("Last Run")
+        job_table.add_column("Next Run")
+
+        now = datetime.utcnow()
+        for job in jobs:
+            enabled_icon = "[green]✓[/green]" if job.get("enabled") else "[red]✗[/red]"
+            interval_str = f"{job.get('interval_minutes', 0)}m"
+
+            last_run_str = "[dim]never[/dim]"
+            if job.get("last_run_at"):
+                try:
+                    last_run = datetime.fromisoformat(job["last_run_at"].replace("Z", "+00:00")).replace(tzinfo=None)
+                    ago = now - last_run
+                    if ago.total_seconds() < 3600:
+                        last_run_str = f"{int(ago.total_seconds() // 60)}m ago"
+                    elif ago.total_seconds() < 86400:
+                        last_run_str = f"{int(ago.total_seconds() // 3600)}h ago"
+                    else:
+                        last_run_str = f"{int(ago.total_seconds() // 86400)}d ago"
+                except Exception:
+                    last_run_str = "[dim]?[/dim]"
+
+            next_run_str = "[dim]pending[/dim]"
+            if job.get("next_run_at"):
+                try:
+                    next_run = datetime.fromisoformat(job["next_run_at"].replace("Z", "+00:00")).replace(tzinfo=None)
+                    until = next_run - now
+                    if until.total_seconds() < 0:
+                        next_run_str = "[yellow]overdue[/yellow]"
+                    elif until.total_seconds() < 3600:
+                        next_run_str = f"in {int(until.total_seconds() // 60)}m"
+                    else:
+                        next_run_str = f"in {int(until.total_seconds() // 3600)}h"
+                except Exception:
+                    next_run_str = "[dim]?[/dim]"
+
+            job_table.add_row(
+                job.get("job_type", "?"),
+                job.get("bot_id", "?"),
+                enabled_icon,
+                interval_str,
+                last_run_str,
+                next_run_str,
+            )
+        console.print(job_table)
+
+    console.print()
+    console.print(Panel.fit("[bold cyan]Recent Job Runs[/bold cyan]", border_style="cyan"))
+    console.print()
+
+    if not runs:
+        console.print("[dim]No job runs recorded yet.[/dim]")
+    else:
+        run_table = Table(show_header=True, box=None, padding=(0, 2))
+        run_table.add_column("Started", style="dim")
+        run_table.add_column("Bot", style="bold")
+        run_table.add_column("Status", justify="center")
+        run_table.add_column("Duration")
+        run_table.add_column("Error")
+
+        for run in runs:
+            status_val = run.get("status", "")
+            if status_val == "success":
+                status_str = "[green]✓ success[/green]"
+            elif status_val == "failed":
+                status_str = "[red]✗ failed[/red]"
+            elif status_val == "running":
+                status_str = "[yellow]⟳ running[/yellow]"
+            elif status_val == "skipped":
+                status_str = "[dim]○ skipped[/dim]"
+            else:
+                status_str = "[dim]○ pending[/dim]"
+
+            duration_ms = run.get("duration_ms")
+            duration_str = f"{duration_ms}ms" if duration_ms else "[dim]-[/dim]"
+            error_msg = run.get("error_message") or ""
+            error_str = (error_msg[:40] + "...") if len(error_msg) > 40 else (error_msg or "[dim]-[/dim]")
+            started_str = "[dim]-[/dim]"
+            if run.get("started_at"):
+                try:
+                    started_str = datetime.fromisoformat(run["started_at"].replace("Z", "+00:00")).strftime("%Y-%m-%d %H:%M")
+                except Exception:
+                    pass
+
+            run_table.add_row(started_str, run.get("bot_id", "?"), status_str, duration_str, error_str)
+        console.print(run_table)
+
+    console.print()
+    console.print(f"[dim]Scheduler enabled: {config.SCHEDULER_ENABLED} | Check interval: {config.SCHEDULER_CHECK_INTERVAL_SECONDS}s[/dim]")
+    console.print()
+    return True
+
+
 def show_job_status(config: Config):
     """Display scheduled background jobs and recent run history."""
+    if _use_service(config):
+        if _render_job_status_from_service(config):
+            return
+        console.print("[yellow]Service is configured but not reachable. Falling back to direct DB.[/yellow]")
+
     if not has_database_credentials(config):
         console.print("[yellow]Job scheduler requires database connection.[/yellow]")
         console.print("[dim]Set LLM_BAWT_POSTGRES_PASSWORD in ~/.config/llm-bawt/.env[/dim]")
@@ -559,14 +691,14 @@ def show_job_status(config: Config):
             f"@{config.POSTGRES_HOST}:{config.POSTGRES_PORT}/{config.POSTGRES_DATABASE}"
         )
         engine = create_engine(postgres_url)
-        
+
         # Ensure tables exist
         create_scheduler_tables(engine)
 
         with Session(engine) as session:
             # Get scheduled jobs
             jobs = session.exec(select(ScheduledJob).order_by(ScheduledJob.job_type)).all()
-            
+
             # Get recent runs (last 10)
             runs = session.exec(
                 select(JobRun)
@@ -593,7 +725,7 @@ def show_job_status(config: Config):
             for job in jobs:
                 enabled_icon = "[green]✓[/green]" if job.enabled else "[red]✗[/red]"
                 interval_str = f"{job.interval_minutes}m"
-                
+
                 if job.last_run_at:
                     # Handle both naive and aware datetimes - convert to naive UTC
                     last_run = job.last_run_at.replace(tzinfo=None) if job.last_run_at.tzinfo else job.last_run_at
@@ -630,7 +762,7 @@ def show_job_status(config: Config):
                 )
 
             console.print(job_table)
-        
+
         console.print()
 
         # Display recent runs
@@ -685,6 +817,12 @@ def show_job_status(config: Config):
 
 def trigger_job(config: Config, job_type: str):
     """Trigger a scheduled job to run immediately."""
+    if _use_service(config):
+        # No service endpoint for trigger yet; direct DB access required
+        console.print("[yellow]Job trigger requires direct DB access (not available via service).[/yellow]")
+        console.print("[dim]Run this from the machine hosting the database, or add a trigger endpoint to the service.[/dim]")
+        return
+
     if not has_database_credentials(config):
         console.print("[yellow]Job scheduler requires database connection.[/yellow]")
         console.print("[dim]Set LLM_BAWT_POSTGRES_PASSWORD in ~/.config/llm-bawt/.env[/dim]")
@@ -739,39 +877,79 @@ def trigger_job(config: Config, job_type: str):
 
 def show_user_profile(config: Config, user_id: str):
     """Display user profile."""
+    if _use_service(config):
+        client = get_service_client(config)
+        if client and client.is_available():
+            data = client.get_profile(user_id, entity_type="user")
+            if data:
+                console.print(Panel.fit(f"[bold cyan]User Profile: {user_id}[/bold cyan]", border_style="cyan"))
+                console.print()
+                table = Table(show_header=False, box=None, padding=(0, 2))
+                table.add_column("Field", style="cyan")
+                table.add_column("Value")
+                table.add_row("[bold]Identity[/bold]", "")
+                table.add_row("  Display Name", data.get("display_name") or "[dim]not set[/dim]")
+                table.add_row("  Description", data.get("description") or "[dim]not set[/dim]")
+
+                by_category: dict[str, list] = {}
+                for attr in data.get("attributes", []):
+                    cat = attr.get("category", "other")
+                    by_category.setdefault(cat, []).append(attr)
+
+                category_names = {"preference": "Preferences", "fact": "Facts", "interest": "Interests", "communication": "Communication", "context": "Context"}
+                for category, attrs in sorted(by_category.items()):
+                    table.add_row("", "")
+                    table.add_row(f"[bold]{category_names.get(category, category.title())}[/bold]", "")
+                    for attr in sorted(attrs, key=lambda a: a.get("key", "")):
+                        value_str = str(attr.get("value", ""))
+                        if len(value_str) > 60:
+                            value_str = value_str[:57] + "..."
+                        conf = attr.get("confidence", 1.0)
+                        conf_str = f" [dim]({conf:.0%})[/dim]" if conf < 1.0 else ""
+                        table.add_row(f"  {attr.get('key', '?')}", f"{value_str}{conf_str}")
+
+                console.print(table)
+                console.print()
+                console.print("[dim]Add attributes: llm --user-profile-set category.key=value[/dim]")
+                console.print()
+                return
+            else:
+                console.print(f"[yellow]No profile found for user '{user_id}' on service.[/yellow]")
+                return
+
     if not has_database_credentials(config):
         console.print("[yellow]User profiles require database connection.[/yellow]")
         console.print("[dim]Set LLM_BAWT_POSTGRES_PASSWORD in ~/.config/llm-bawt/.env[/dim]")
         return
-    
+
     try:
         from llm_bawt.profiles import ProfileManager, EntityType
-        
+
         manager = ProfileManager(config)
         profile, _ = manager.get_or_create_profile(EntityType.USER, user_id)
         attributes = manager.get_all_attributes(EntityType.USER, user_id)
     except Exception as e:
         console.print(f"[red]Could not load user profile: {e}[/red]")
         return
-    
+
     console.print(Panel.fit(f"[bold cyan]User Profile: {user_id}[/bold cyan]", border_style="cyan"))
     console.print()
-    
+
     table = Table(show_header=False, box=None, padding=(0, 2))
     table.add_column("Field", style="cyan")
     table.add_column("Value")
-    
+
     table.add_row("[bold]Identity[/bold]", "")
     table.add_row("  Display Name", profile.display_name or "[dim]not set[/dim]")
     table.add_row("  Description", profile.description or "[dim]not set[/dim]")
-    
+
     # Group attributes by category
     by_category = {}
     for attr in attributes:
         if attr.category not in by_category:
             by_category[attr.category] = []
         by_category[attr.category].append(attr)
-    
+
     # Display attributes by category
     category_names = {"preference": "Preferences", "fact": "Facts", "interest": "Interests", "communication": "Communication", "context": "Context"}
     for category, attrs in sorted(by_category.items()):
@@ -781,7 +959,7 @@ def show_user_profile(config: Config, user_id: str):
             value_str = str(attr.value) if not isinstance(attr.value, str) or len(str(attr.value)) < 60 else str(attr.value)[:57] + "..."
             conf_str = f" [dim]({attr.confidence:.0%})[/dim]" if attr.confidence < 1.0 else ""
             table.add_row(f"  {attr.key}", f"{value_str}{conf_str}")
-    
+
     console.print(table)
     console.print()
     console.print("[dim]Add attributes: llm --user-profile-set category.key=value[/dim]")
@@ -790,40 +968,72 @@ def show_user_profile(config: Config, user_id: str):
 
 def show_users(config: Config):
     """Display all user profiles."""
+    if _use_service(config):
+        client = get_service_client(config)
+        if client and client.is_available():
+            data = client.list_profiles(entity_type="user")
+            profiles_list = (data or {}).get("profiles", []) if data else []
+
+            if not profiles_list:
+                console.print("[yellow]No user profiles found.[/yellow]")
+                console.print("[dim]Create one with: llm --user-profile-setup[/dim]")
+                return
+
+            console.print(Panel.fit("[bold cyan]User Profiles[/bold cyan]", border_style="cyan"))
+            console.print()
+            table = Table(show_header=True, box=None, padding=(0, 2))
+            table.add_column("User ID", style="cyan")
+            table.add_column("Display Name")
+            table.add_column("Description")
+
+            for p in profiles_list:
+                desc = p.get("description") or ""
+                table.add_row(
+                    p.get("entity_id", "?"),
+                    p.get("display_name") or "[dim]-[/dim]",
+                    (desc[:50] + "..." if len(desc) > 50 else desc) or "[dim]-[/dim]",
+                )
+
+            console.print(table)
+            console.print()
+            console.print("[dim]Use --user <id> to select a user profile[/dim]")
+            console.print()
+            return
+
     if not has_database_credentials(config):
         console.print("[yellow]User profiles require database connection.[/yellow]")
         console.print("[dim]Set LLM_BAWT_POSTGRES_PASSWORD in ~/.config/llm-bawt/.env[/dim]")
         return
-    
+
     try:
         from llm_bawt.profiles import ProfileManager, EntityType
-        
+
         manager = ProfileManager(config)
         profiles = manager.list_all_profiles(EntityType.USER)
     except Exception as e:
         console.print(f"[red]Could not load users: {e}[/red]")
         return
-    
+
     if not profiles:
         console.print("[yellow]No user profiles found.[/yellow]")
         console.print("[dim]Create one with: llm --user-profile-setup[/dim]")
         return
-    
+
     console.print(Panel.fit("[bold cyan]User Profiles[/bold cyan]", border_style="cyan"))
     console.print()
-    
+
     table = Table(show_header=True, box=None, padding=(0, 2))
     table.add_column("User ID", style="cyan")
     table.add_column("Display Name")
     table.add_column("Description")
-    
+
     for profile in profiles:
         table.add_row(
             profile.entity_id,
             profile.display_name or "[dim]-[/dim]",
             (profile.description[:50] + "..." if profile.description and len(profile.description) > 50 else profile.description) or "[dim]-[/dim]"
         )
-    
+
     console.print(table)
     console.print()
     console.print(f"[dim]Use --user <id> to select a user profile[/dim]")
@@ -851,13 +1061,6 @@ def _parse_runtime_setting_value(raw: str):
 
 def show_runtime_settings(config: Config, scope: str, bot_id: str | None) -> bool:
     """Display runtime settings from DB for global or bot scope."""
-    from llm_bawt.runtime_settings import RuntimeSettingsStore
-
-    store = RuntimeSettingsStore(config)
-    if store.engine is None:
-        console.print("[red]Runtime settings DB unavailable.[/red]")
-        return False
-
     if scope == "global":
         scope_id = "*"
         title = "Runtime Settings (global)"
@@ -865,6 +1068,31 @@ def show_runtime_settings(config: Config, scope: str, bot_id: str | None) -> boo
         target_bot = bot_id or config.DEFAULT_BOT
         scope_id = target_bot
         title = f"Runtime Settings (bot: {target_bot})"
+
+    if _use_service(config):
+        client = get_service_client(config)
+        if client and client.is_available():
+            resp = client.get_settings(scope_type=scope, scope_id=scope_id if scope != "global" else None)
+            if resp is not None:
+                items = resp.get("settings", [])
+                if not items:
+                    console.print("[yellow]No runtime settings found for this scope.[/yellow]")
+                    console.print("[dim]Tip: run `llm --settings-bootstrap` to seed DB settings from current bot/template config.[/dim]")
+                    return True
+                table = Table(title=title)
+                table.add_column("Key", style="cyan")
+                table.add_column("Value")
+                for item in sorted(items, key=lambda i: i.get("key", "")):
+                    table.add_row(item.get("key", "?"), repr(item.get("value")))
+                console.print(table)
+                return True
+
+    from llm_bawt.runtime_settings import RuntimeSettingsStore
+
+    store = RuntimeSettingsStore(config)
+    if store.engine is None:
+        console.print("[red]Runtime settings DB unavailable.[/red]")
+        return False
 
     data = store.get_scope_settings(scope, scope_id)
     if not data:
@@ -883,6 +1111,19 @@ def show_runtime_settings(config: Config, scope: str, bot_id: str | None) -> boo
 
 def set_runtime_setting(config: Config, scope: str, bot_id: str | None, key: str, raw_value: str) -> bool:
     """Set runtime setting in DB."""
+    scope_id = "*" if scope == "global" else (bot_id or config.DEFAULT_BOT)
+    value = _parse_runtime_setting_value(raw_value)
+
+    if _use_service(config):
+        client = get_service_client(config)
+        if client and client.is_available():
+            resp = client.set_setting(scope, scope_id if scope != "global" else None, key, value)
+            if resp and resp.get("success"):
+                console.print(f"[green]Set runtime setting[/green] {scope}:{scope_id} {key}={value!r}")
+                return True
+            console.print("[red]Failed to set runtime setting via service.[/red]")
+            return False
+
     from llm_bawt.runtime_settings import RuntimeSettingsStore
 
     store = RuntimeSettingsStore(config)
@@ -890,8 +1131,6 @@ def set_runtime_setting(config: Config, scope: str, bot_id: str | None, key: str
         console.print("[red]Runtime settings DB unavailable.[/red]")
         return False
 
-    scope_id = "*" if scope == "global" else (bot_id or config.DEFAULT_BOT)
-    value = _parse_runtime_setting_value(raw_value)
     store.set_value(scope, scope_id, key, value)
     console.print(f"[green]Set runtime setting[/green] {scope}:{scope_id} {key}={value!r}")
     return True
@@ -899,6 +1138,21 @@ def set_runtime_setting(config: Config, scope: str, bot_id: str | None, key: str
 
 def delete_runtime_setting(config: Config, scope: str, bot_id: str | None, key: str) -> bool:
     """Delete runtime setting from DB."""
+    scope_id = "*" if scope == "global" else (bot_id or config.DEFAULT_BOT)
+
+    if _use_service(config):
+        client = get_service_client(config)
+        if client and client.is_available():
+            resp = client.delete_setting(scope, key, scope_id=scope_id if scope != "global" else None)
+            if resp and resp.get("success"):
+                if resp.get("deleted"):
+                    console.print(f"[green]Deleted runtime setting[/green] {scope}:{scope_id} {key}")
+                else:
+                    console.print("[yellow]No matching runtime setting found.[/yellow]")
+                return True
+            console.print("[red]Failed to delete runtime setting via service.[/red]")
+            return False
+
     from llm_bawt.runtime_settings import RuntimeSettingsStore
 
     store = RuntimeSettingsStore(config)
@@ -906,7 +1160,6 @@ def delete_runtime_setting(config: Config, scope: str, bot_id: str | None, key: 
         console.print("[red]Runtime settings DB unavailable.[/red]")
         return False
 
-    scope_id = "*" if scope == "global" else (bot_id or config.DEFAULT_BOT)
     deleted = store.delete_value(scope, scope_id, key)
     if not deleted:
         console.print("[yellow]No matching runtime setting found.[/yellow]")
@@ -917,13 +1170,7 @@ def delete_runtime_setting(config: Config, scope: str, bot_id: str | None, key: 
 
 def bootstrap_runtime_settings(config: Config, bot_id: str | None, overwrite: bool = False) -> bool:
     """Seed DB runtime settings from current config/bot effective settings."""
-    from llm_bawt.runtime_settings import RuntimeSettingsStore
     from llm_bawt.bots import BotManager
-
-    store = RuntimeSettingsStore(config)
-    if store.engine is None:
-        console.print("[red]Runtime settings DB unavailable.[/red]")
-        return False
 
     bot_manager = BotManager(config)
     bots = bot_manager.list_bots()
@@ -934,7 +1181,6 @@ def bootstrap_runtime_settings(config: Config, bot_id: str | None, overwrite: bo
             return False
         bots = [target]
 
-    global_existing = store.get_scope_settings("global", "*")
     global_map = {
         "max_context_tokens": config.MAX_CONTEXT_TOKENS,
         "max_output_tokens": config.MAX_OUTPUT_TOKENS,
@@ -959,6 +1205,59 @@ def bootstrap_runtime_settings(config: Config, bot_id: str | None, overwrite: bo
         "temperature": config.TEMPERATURE,
         "top_p": config.TOP_P,
     }
+
+    if _use_service(config):
+        client = get_service_client(config)
+        if client and client.is_available():
+            # Fetch current global settings to check for existing keys
+            existing_resp = client.get_settings(scope_type="global")
+            global_existing_keys = set()
+            if existing_resp:
+                for item in existing_resp.get("settings", []):
+                    global_existing_keys.add(item.get("key"))
+
+            batch_items: list[dict] = []
+            set_count = 0
+            skipped_count = 0
+
+            for key, value in global_map.items():
+                if key in global_existing_keys and not overwrite:
+                    skipped_count += 1
+                    continue
+                batch_items.append({"scope_type": "global", "scope_id": "*", "key": key, "value": value})
+                set_count += 1
+
+            for bot in bots:
+                bot_resp = client.get_settings(scope_type="bot", scope_id=bot.slug)
+                bot_existing_keys = set()
+                if bot_resp:
+                    for item in bot_resp.get("settings", []):
+                        bot_existing_keys.add(item.get("key"))
+                for key, value in (bot.settings or {}).items():
+                    if key in bot_existing_keys and not overwrite:
+                        skipped_count += 1
+                        continue
+                    batch_items.append({"scope_type": "bot", "scope_id": bot.slug, "key": key, "value": value})
+                    set_count += 1
+
+            if batch_items:
+                client.batch_set_settings(batch_items)
+
+            scope_label = f"bot '{bot_id}'" if bot_id else "all bots"
+            console.print(
+                f"[green]Bootstrapped runtime settings[/green] ({scope_label}): "
+                f"set={set_count}, skipped={skipped_count}, overwrite={overwrite}"
+            )
+            return True
+
+    from llm_bawt.runtime_settings import RuntimeSettingsStore
+
+    store = RuntimeSettingsStore(config)
+    if store.engine is None:
+        console.print("[red]Runtime settings DB unavailable.[/red]")
+        return False
+
+    global_existing = store.get_scope_settings("global", "*")
 
     set_count = 0
     skipped_count = 0
@@ -994,13 +1293,6 @@ def migrate_bots_to_db(config: Config) -> bool:
         get_user_bots_yaml_path,
         _deep_merge,
     )
-    from llm_bawt.runtime_settings import BotProfileStore, RuntimeSettingsStore
-
-    profile_store = BotProfileStore(config)
-    settings_store = RuntimeSettingsStore(config)
-    if profile_store.engine is None or settings_store.engine is None:
-        console.print("[red]Migration requires database access.[/red]")
-        return False
 
     def _load_yaml(path: Path) -> dict:
         if not path.exists():
@@ -1019,6 +1311,55 @@ def migrate_bots_to_db(config: Config) -> bool:
     if not isinstance(bots_data, dict) or not bots_data:
         console.print("[yellow]No YAML bots found to migrate.[/yellow]")
         return True
+
+    if _use_service(config):
+        client = get_service_client(config)
+        if client and client.is_available():
+            migrated_profiles = 0
+            settings_items: list[dict] = []
+
+            for slug, bot_data in bots_data.items():
+                if not isinstance(bot_data, dict):
+                    continue
+                normalized_slug = str(slug).strip().lower()
+                if not normalized_slug:
+                    continue
+
+                client.upsert_bot_profile(normalized_slug, {
+                    "name": bot_data.get("name", normalized_slug.title()),
+                    "description": bot_data.get("description", ""),
+                    "system_prompt": bot_data.get("system_prompt", "You are a helpful assistant."),
+                    "requires_memory": bot_data.get("requires_memory", True),
+                    "voice_optimized": bot_data.get("voice_optimized", False),
+                    "uses_tools": bot_data.get("uses_tools", False),
+                    "uses_search": bot_data.get("uses_search", False),
+                    "uses_home_assistant": bot_data.get("uses_home_assistant", False),
+                    "default_model": bot_data.get("default_model"),
+                    "nextcloud_config": bot_data.get("nextcloud"),
+                })
+                migrated_profiles += 1
+
+                bot_settings = bot_data.get("settings", {}) or {}
+                if isinstance(bot_settings, dict):
+                    for key, value in bot_settings.items():
+                        settings_items.append({"scope_type": "bot", "scope_id": normalized_slug, "key": key, "value": value})
+
+            if settings_items:
+                client.batch_set_settings(settings_items)
+
+            console.print(
+                "[green]Bot migration complete.[/green] "
+                f"profiles={migrated_profiles}, bot_settings={len(settings_items)}"
+            )
+            return True
+
+    from llm_bawt.runtime_settings import BotProfileStore, RuntimeSettingsStore
+
+    profile_store = BotProfileStore(config)
+    settings_store = RuntimeSettingsStore(config)
+    if profile_store.engine is None or settings_store.engine is None:
+        console.print("[red]Migration requires database access.[/red]")
+        return False
 
     migrated_profiles = 0
     migrated_settings = 0
@@ -1070,51 +1411,64 @@ def migrate_bots_to_db(config: Config) -> bool:
 
 def run_user_profile_setup(config: Config, user_id: str) -> bool:
     """Run interactive user profile setup wizard."""
-    if not has_database_credentials(config):
+    use_svc = _use_service(config)
+
+    if not use_svc and not has_database_credentials(config):
         console.print("[yellow]User profiles require database connection.[/yellow]")
         console.print("[dim]Set LLM_BAWT_POSTGRES_PASSWORD in ~/.config/llm-bawt/.env[/dim]")
         return False
-    
+
     console.print(Panel.fit("[bold cyan]User Profile Setup[/bold cyan]", border_style="cyan"))
     console.print()
     console.print(f"[dim]Setting up profile for user: {user_id}[/dim]")
     console.print(f"[dim]Press Enter to skip any field.[/dim]")
     console.print()
-    
+
     try:
-        from llm_bawt.profiles import ProfileManager, EntityType, AttributeCategory
-        
-        manager = ProfileManager(config)
-        profile, _ = manager.get_or_create_profile(EntityType.USER, user_id)
-        
-        # Get existing attributes
-        existing_attrs = {attr.key: attr.value for attr in manager.get_all_attributes(EntityType.USER, user_id)}
-        
-        # Prompt for basic info
-        name = Prompt.ask(
-            "What's your name?",
-            default=profile.display_name or existing_attrs.get("name", "")
-        )
-        
-        occupation = Prompt.ask(
-            "What do you do? (occupation)",
-            default=existing_attrs.get("occupation", "")
-        )
-        
+        # Fetch existing profile for defaults
+        existing_name = ""
+        existing_attrs: dict[str, str] = {}
+        if use_svc:
+            client = get_service_client(config)
+            if client and client.is_available():
+                data = client.get_profile(user_id, entity_type="user")
+                if data:
+                    existing_name = data.get("display_name") or ""
+                    for attr in data.get("attributes", []):
+                        existing_attrs[attr.get("key", "")] = attr.get("value", "")
+        else:
+            from llm_bawt.profiles import ProfileManager, EntityType
+            manager = ProfileManager(config)
+            profile, _ = manager.get_or_create_profile(EntityType.USER, user_id)
+            existing_name = profile.display_name or ""
+            existing_attrs = {attr.key: attr.value for attr in manager.get_all_attributes(EntityType.USER, user_id)}
+
+        name = Prompt.ask("What's your name?", default=existing_name or existing_attrs.get("name", ""))
+        occupation = Prompt.ask("What do you do? (occupation)", default=existing_attrs.get("occupation", ""))
         console.print()
-        
-        # Save to new profile system
-        if name:
-            manager.update_profile(EntityType.USER, user_id, display_name=name)
-            manager.set_attribute(EntityType.USER, user_id, AttributeCategory.FACT, "name", name, source="explicit")
-        
-        if occupation:
-            manager.set_attribute(EntityType.USER, user_id, AttributeCategory.FACT, "occupation", occupation, source="explicit")
-        
-        console.print(f"[green]✓ User profile saved for '{user_id}'[/green]")
-        console.print()
-        return True
-            
+
+        if use_svc:
+            client = get_service_client(config)
+            if client and client.is_available():
+                if name:
+                    client.upsert_profile_attribute("user", user_id, "fact", "name", name)
+                if occupation:
+                    client.upsert_profile_attribute("user", user_id, "fact", "occupation", occupation)
+                console.print(f"[green]✓ User profile saved for '{user_id}'[/green]")
+                console.print()
+                return True
+        else:
+            from llm_bawt.profiles import ProfileManager, EntityType, AttributeCategory
+            manager = ProfileManager(config)
+            if name:
+                manager.update_profile(EntityType.USER, user_id, display_name=name)
+                manager.set_attribute(EntityType.USER, user_id, AttributeCategory.FACT, "name", name, source="explicit")
+            if occupation:
+                manager.set_attribute(EntityType.USER, user_id, AttributeCategory.FACT, "occupation", occupation, source="explicit")
+            console.print(f"[green]✓ User profile saved for '{user_id}'[/green]")
+            console.print()
+            return True
+
     except KeyboardInterrupt:
         console.print()
         console.print("[yellow]Setup cancelled.[/yellow]")
@@ -1126,26 +1480,42 @@ def run_user_profile_setup(config: Config, user_id: str) -> bool:
 
 def ensure_user_profile(config: Config, user_id: str) -> bool:
     """Ensure user profile exists, prompting for setup if needed.
-    
+
     Returns True if profile exists or setup succeeded, False if setup was cancelled.
     """
+    if _use_service(config):
+        try:
+            client = get_service_client(config)
+            if client and client.is_available():
+                data = client.get_profile(user_id, entity_type="user")
+                if data and data.get("display_name"):
+                    return True
+                # No profile or no name — run setup
+                console.print()
+                console.print("[yellow]Welcome! Let's set up your user profile.[/yellow]")
+                console.print()
+                return run_user_profile_setup(config, user_id)
+        except Exception as e:
+            logging.getLogger(__name__).warning(f"Could not ensure user profile via service: {e}")
+            return True
+
     if not has_database_credentials(config):
         logging.getLogger(__name__).debug("Database credentials not configured - skipping user profile")
         return True  # Not an error, just no profile
-    
+
     try:
         from llm_bawt.profiles import ProfileManager, EntityType
-        
+
         manager = ProfileManager(config)
         profile, is_new = manager.get_or_create_profile(EntityType.USER, user_id)
-        
+
         # If profile has no name, run setup wizard
         if not profile.display_name:
             console.print()
             console.print(f"[yellow]Welcome! Let's set up your user profile.[/yellow]")
             console.print()
             return run_user_profile_setup(config, user_id)
-        
+
         return True
     except Exception as e:
         logging.getLogger(__name__).warning(f"Could not ensure user profile: {e}")
@@ -1410,36 +1780,43 @@ def main():
     
     elif getattr(args, 'user_profile_set', None):
         ensure_default_user(config_obj, args)
-        if not has_database_credentials(config_obj):
-            console.print("[yellow]User profiles require database connection.[/yellow]")
-            console.print("[dim]Set LLM_BAWT_POSTGRES_PASSWORD in ~/.config/llm-bawt/.env[/dim]")
-            sys.exit(1)
         try:
-            from llm_bawt.profiles import ProfileManager, EntityType, AttributeCategory
-            
             field, value = args.user_profile_set.split("=", 1)
             field = field.strip()
             value = value.strip().strip('"').strip("'")
             user_id = args.user if args.user else config_obj.DEFAULT_USER
-            
-            manager = ProfileManager(config_obj)
-            
+
             # Parse field: category.key or just key
+            valid_categories = {"preference", "fact", "interest", "communication", "context"}
             if "." in field:
                 category_str, key = field.split(".", 1)
-                category_map = {"preference": AttributeCategory.PREFERENCE, "fact": AttributeCategory.FACT, "interest": AttributeCategory.INTEREST, "communication": AttributeCategory.COMMUNICATION, "context": AttributeCategory.CONTEXT}
-                category = category_map.get(category_str.lower())
-                if not category:
+                if category_str.lower() not in valid_categories:
                     console.print(f"[red]Invalid category: {category_str}[/red]")
                     console.print("[dim]Valid categories: preference, fact, interest, communication, context[/dim]")
                     sys.exit(1)
+                category_str = category_str.lower()
             else:
-                # Default to fact category
                 key = field
-                category = AttributeCategory.FACT
-            
+                category_str = "fact"
+
+            if _use_service(config_obj):
+                client = get_service_client(config_obj)
+                if client and client.is_available():
+                    client.upsert_profile_attribute("user", user_id, category_str, key, value)
+                    console.print(f"[green]Set {category_str}.{key} = {value}[/green]")
+                    sys.exit(0)
+
+            if not has_database_credentials(config_obj):
+                console.print("[yellow]User profiles require database connection.[/yellow]")
+                console.print("[dim]Set LLM_BAWT_POSTGRES_PASSWORD in ~/.config/llm-bawt/.env[/dim]")
+                sys.exit(1)
+
+            from llm_bawt.profiles import ProfileManager, EntityType, AttributeCategory
+            category_map = {"preference": AttributeCategory.PREFERENCE, "fact": AttributeCategory.FACT, "interest": AttributeCategory.INTEREST, "communication": AttributeCategory.COMMUNICATION, "context": AttributeCategory.CONTEXT}
+            category = category_map[category_str]
+            manager = ProfileManager(config_obj)
             manager.set_attribute(EntityType.USER, user_id, category, key, value, source="explicit")
-            console.print(f"[green]Set {category}.{key} = {value}[/green]")
+            console.print(f"[green]Set {category_str}.{key} = {value}[/green]")
         except ValueError:
             console.print("[red]Use format: --user-profile-set category.key=value[/red]")
         except Exception as e:

@@ -376,6 +376,117 @@ def _collect_dependencies(config: Config) -> DependencyInfo:
     return info
 
 
+def _status_from_service(config: Config) -> SystemStatus | None:
+    """Try to fetch full system status from the running service.
+
+    Returns a ``SystemStatus`` if the service is reachable, otherwise ``None``.
+    """
+    from llm_bawt.service.client import get_service_client
+
+    client = get_service_client(config)
+    data = client.get_full_status()
+    if data is None:
+        return None
+
+    try:
+        cfg = data.get("config", {})
+        svc = data.get("service", {})
+        mcp = data.get("mcp", {})
+        mdl = data.get("model")
+        mem = data.get("memory", {})
+        dep = data.get("dependencies", {})
+
+        config_info = ConfigInfo(
+            version=cfg.get("version", "0.1.0"),
+            mode=cfg.get("mode", "service"),
+            service_url=cfg.get("service_url"),
+            environment=cfg.get("environment", "local"),
+            bot_name=cfg.get("bot_name", ""),
+            bot_slug=cfg.get("bot_slug", ""),
+            model_alias=cfg.get("model_alias"),
+            user_id=cfg.get("user_id"),
+            all_bots=[
+                BotSummary(slug=b["slug"], name=b["name"], is_default=b.get("is_default", False))
+                for b in cfg.get("all_bots", [])
+            ],
+            models_defined=cfg.get("models_defined", 0),
+            models_service=cfg.get("models_service"),
+            scheduler_enabled=cfg.get("scheduler_enabled", False),
+            scheduler_interval=cfg.get("scheduler_interval", 0),
+            ha_mcp_enabled=cfg.get("ha_mcp_enabled", False),
+            ha_mcp_url=cfg.get("ha_mcp_url"),
+            bind_host=cfg.get("bind_host", "0.0.0.0"),
+        )
+
+        service_info = ServiceInfo(
+            available=svc.get("available", False),
+            healthy=svc.get("healthy", False),
+            uptime_seconds=svc.get("uptime_seconds"),
+            current_model=svc.get("current_model"),
+            tasks_processed=svc.get("tasks_processed", 0),
+            tasks_pending=svc.get("tasks_pending", 0),
+        )
+
+        mcp_info = McpInfo(
+            mode=mcp.get("mode", "embedded"),
+            status=mcp.get("status", "up"),
+            url=mcp.get("url"),
+            http_status=mcp.get("http_status"),
+        )
+
+        model_info = None
+        if mdl:
+            model_info = ModelStatusInfo(
+                alias=mdl["alias"],
+                type=mdl.get("type", "unknown"),
+                max_tokens=mdl.get("max_tokens", 0),
+                max_tokens_source=mdl.get("max_tokens_source", "global"),
+                context_window=mdl.get("context_window"),
+                context_source=mdl.get("context_source"),
+                gpu_name=mdl.get("gpu_name"),
+                vram_total_gb=mdl.get("vram_total_gb"),
+                vram_free_gb=mdl.get("vram_free_gb"),
+                vram_detection_method=mdl.get("vram_detection_method"),
+                n_gpu_layers=mdl.get("n_gpu_layers"),
+                gpu_layers_source=mdl.get("gpu_layers_source"),
+                native_context_limit=mdl.get("native_context_limit"),
+            )
+
+        memory_info = MemoryInfo(
+            postgres_connected=mem.get("postgres_connected", False),
+            postgres_host=mem.get("postgres_host"),
+            postgres_error=mem.get("postgres_error"),
+            messages_count=mem.get("messages_count", 0),
+            memories_count=mem.get("memories_count", 0),
+            pgvector_available=mem.get("pgvector_available", False),
+            embeddings_available=mem.get("embeddings_available", False),
+        )
+
+        dep_info = DependencyInfo(
+            cuda_version=dep.get("cuda_version"),
+            llama_cpp_available=dep.get("llama_cpp_available", False),
+            llama_cpp_gpu=dep.get("llama_cpp_gpu"),
+            hf_hub_available=dep.get("hf_hub_available", False),
+            torch_available=dep.get("torch_available", False),
+            openai_key_set=dep.get("openai_key_set", False),
+            newsapi_key_set=dep.get("newsapi_key_set", False),
+            search_provider=dep.get("search_provider"),
+            embeddings_available=dep.get("embeddings_available", False),
+        )
+
+        return SystemStatus(
+            config=config_info,
+            service=service_info,
+            mcp=mcp_info,
+            model=model_info,
+            memory=memory_info,
+            dependencies=dep_info,
+        )
+    except Exception as e:
+        logger.warning("Failed to parse service status response: %s", e)
+        return None
+
+
 def collect_system_status(
     config: Config,
     bot_slug: str | None = None,
@@ -387,6 +498,10 @@ def collect_system_status(
     This is the shared entry point used by both the CLI ``show_status()`` and
     the ``/v1/status`` API endpoint.
 
+    When the CLI is running in service mode, the status is fetched from the
+    service's ``/v1/status`` endpoint so the CLI never needs direct DB or
+    dependency access.
+
     Args:
         config: Application configuration.
         bot_slug: Explicit bot slug override (CLI ``-b`` flag).
@@ -395,6 +510,16 @@ def collect_system_status(
     """
     from llm_bawt.bots import BotManager
     from llm_bawt.model_manager import is_service_mode_enabled
+
+    use_service = is_service_mode_enabled(config)
+
+    # In service mode, delegate entirely to the service.
+    if use_service:
+        remote = _status_from_service(config)
+        if remote is not None:
+            return remote
+        # Service unreachable — fall through to local collection so we can
+        # at least show something (with the service marked as unavailable).
 
     bot_manager = BotManager(config)
     default_bot = bot_manager.get_default_bot()
@@ -414,7 +539,6 @@ def collect_system_status(
     effective_user = user_id or config.DEFAULT_USER
 
     # Service
-    use_service = is_service_mode_enabled(config)
     effective_host = "127.0.0.1" if config.SERVICE_HOST in {"0.0.0.0", "::"} else config.SERVICE_HOST
     service_url = f"http://{effective_host}:{config.SERVICE_PORT}" if use_service else None
 
