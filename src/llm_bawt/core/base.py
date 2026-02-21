@@ -97,7 +97,8 @@ class BaseLLMBawt(ABC):
         self._db_available: bool = False
         self.adapter: ModelAdapter
         self.settings: RuntimeSettingsResolver | None = None
-        
+        self._client_system_context: str | None = None
+
         if not self.model_definition:
             raise ValueError(f"Could not find model definition for: '{resolved_model_alias}'")
         
@@ -494,6 +495,14 @@ class BaseLLMBawt(ABC):
                     tools_prompt,
                     position=SectionPosition.TOOLS,
                 )
+
+        # Client-supplied system context (e.g. HA device list)
+        if self._client_system_context:
+            builder.add_section(
+                "client_context",
+                f"## Client Context\n{self._client_system_context}",
+                position=SectionPosition.CLIENT_CONTEXT,
+            )
 
         # Cold-start memory priming: inject top memories when history is thin
         if self.memory:

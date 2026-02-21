@@ -1280,6 +1280,19 @@ Examples:
         tui_main()
         return
 
+    # === Entity profiles (no bot selection needed) ===
+    if args.list_profiles:
+        handle_list_profiles()
+        return
+
+    if args.list_attrs:
+        handle_list_attrs(args.list_attrs)
+        return
+
+    if args.delete_attr:
+        handle_delete_attribute(args.delete_attr, args.yes)
+        return
+
     selected_bot = resolve_bot_selection(args.bot)
     console.print(f"\n[bold cyan]Memory Tool[/bold cyan] - Bot: [yellow]{selected_bot}[/yellow]\n")
 
@@ -1303,19 +1316,6 @@ Examples:
 
     if args.regenerate_embeddings:
         handle_regenerate_embeddings(selected_bot)
-        return
-
-    # === Entity profiles ===
-    if args.list_profiles:
-        handle_list_profiles()
-        return
-
-    if args.list_attrs:
-        handle_list_attrs(args.list_attrs)
-        return
-
-    if args.delete_attr:
-        handle_delete_attribute(args.delete_attr, args.yes)
         return
 
     # === Message history operations ===

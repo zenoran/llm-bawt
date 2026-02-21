@@ -72,6 +72,7 @@ KNOWN_TOOLS = {
     "set_user_attribute", "get_user_profile", "delete_user_attribute",
     "set_my_trait",
     "web_search", "news_search",
+    "reddit_search",
     "list_models", "get_current_model", "switch_model",
     "get_current_time",
 }
@@ -107,7 +108,7 @@ ALT_PATTERNS = [
     # Inline markdown code (single backticks): `{"name": "...", "arguments": {...}}`
     re.compile(r'`(\{"name"\s*:\s*"[^"]+"\s*,\s*"arguments"\s*:\s*\{[^}]*\}\s*\})`', re.DOTALL | re.IGNORECASE),
     # Raw JSON tool call without any wrapper (last resort - only if it looks like a tool call)
-    re.compile(r'^(\{"name"\s*:\s*"(?:get_user_profile|search_memories|store_memory|delete_memory|search_history|forget_history|set_user_attribute|delete_user_attribute|web_search|news_search|search|news|home|model|list_models|get_current_model|switch_model|get_current_time)"\s*,\s*"arguments"\s*:\s*\{[^}]*\}\s*\})$', re.DOTALL | re.MULTILINE),
+    re.compile(r'^(\{"name"\s*:\s*"(?:get_user_profile|search_memories|store_memory|delete_memory|search_history|forget_history|set_user_attribute|delete_user_attribute|web_search|news_search|reddit_search|search|news|home|model|list_models|get_current_model|switch_model|get_current_time)"\s*,\s*"arguments"\s*:\s*\{[^}]*\}\s*\})$', re.DOTALL | re.MULTILINE),
 ]
 
 

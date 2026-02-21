@@ -234,14 +234,18 @@ class Config(RuntimeTunables, BaseSettings):
     SEARCH_PROVIDER: Optional[str] = Field(
         default=None,
         description=(
-            "Search provider: 'duckduckgo' (free), 'tavily' (production), or 'brave' "
-            "(privacy-focused). Auto-selects based on available keys."
+            "Search provider: 'duckduckgo' (free), 'tavily' (production), 'brave' "
+            "(privacy-focused), or 'reddit' (official Reddit OAuth API). "
+            "Auto-selects based on available keys."
         ),
     )
     TAVILY_API_KEY: str = Field(default="", description="Tavily API key for production search (get from tavily.com)")
     BRAVE_API_KEY: str = Field(default="", description="Brave Search API key")
+    REDDIT_CLIENT_ID: str = Field(default="", description="Reddit OAuth app client ID for Reddit API search")
+    REDDIT_CLIENT_SECRET: str = Field(default="", description="Reddit OAuth app client secret for Reddit API search")
+    REDDIT_USER_AGENT: str = Field(default="llm-bawt/0.1", description="User-Agent string required by Reddit API")
     SEARCH_MAX_RESULTS: int = Field(default=5, description="Maximum search results to return per query")
-    SEARCH_TIMEOUT: int = Field(default=10, description="Timeout in seconds for search requests (DuckDuckGo/Brave)")
+    SEARCH_TIMEOUT: int = Field(default=10, description="Timeout in seconds for search requests (DuckDuckGo/Brave/Reddit)")
     SEARCH_INCLUDE_ANSWER: bool = Field(default=False, description="Include AI-generated answer from Tavily or Brave (uses more credits)")
     SEARCH_DEPTH: str = Field(default="basic", description="Tavily search depth: 'basic' (1 credit) or 'advanced' (2 credits)")
     BRAVE_SAFESEARCH: str = Field(

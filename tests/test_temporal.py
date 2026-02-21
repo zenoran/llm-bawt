@@ -8,14 +8,9 @@ from llm_bawt.models.message import Message
 from llm_bawt.utils.temporal import build_temporal_context
 
 
-def test_temporal_context_includes_core_fields() -> None:
+def test_temporal_context_includes_datetime() -> None:
     block = build_temporal_context([])
-    assert "## Temporal Context" in block
-    assert "NOW_UTC:" in block
-    assert "NOW_LOCAL:" in block
-    assert "TODAY_LOCAL:" in block
-    assert "YESTERDAY_LOCAL:" in block
-    assert "LAST_CONTACT_AT_LOCAL:" in block
+    assert "Current date/time:" in block
 
 
 def test_temporal_context_uses_previous_turn_for_last_contact() -> None:
@@ -26,4 +21,4 @@ def test_temporal_context_uses_previous_turn_for_last_contact() -> None:
     ]
     block = build_temporal_context(msgs)
     # Should not resolve to "just now" from the current user message.
-    assert "LAST_CONTACT_RELATIVE: 2 minutes ago" in block
+    assert "Last conversation: 2 minutes ago" in block

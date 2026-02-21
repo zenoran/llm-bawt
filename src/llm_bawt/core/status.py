@@ -356,12 +356,16 @@ def _collect_dependencies(config: Config) -> DependencyInfo:
     search_provider = getattr(config, "SEARCH_PROVIDER", None)
     tavily_key = os.getenv("TAVILY_API_KEY") or getattr(config, "TAVILY_API_KEY", "")
     brave_key = os.getenv("BRAVE_API_KEY") or getattr(config, "BRAVE_API_KEY", "")
+    reddit_client_id = os.getenv("REDDIT_CLIENT_ID") or getattr(config, "REDDIT_CLIENT_ID", "")
+    reddit_client_secret = os.getenv("REDDIT_CLIENT_SECRET") or getattr(config, "REDDIT_CLIENT_SECRET", "")
     if search_provider:
         info.search_provider = search_provider
     elif tavily_key:
         info.search_provider = "tavily"
     elif brave_key:
         info.search_provider = "brave"
+    elif reddit_client_id and reddit_client_secret:
+        info.search_provider = "reddit"
     else:
         if importlib.util.find_spec("ddgs"):
             info.search_provider = "duckduckgo"

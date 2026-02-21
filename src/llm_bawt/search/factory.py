@@ -28,7 +28,8 @@ def is_search_available(provider: SearchProvider | str | None = None) -> bool:
         from .ddgs_client import is_ddgs_available
         from .tavily_client import is_tavily_available
         from .brave_client import is_brave_available
-        return is_ddgs_available() or is_tavily_available() or is_brave_available()
+        from .reddit_client import is_reddit_available
+        return is_ddgs_available() or is_tavily_available() or is_brave_available() or is_reddit_available()
     
     if isinstance(provider, str):
         try:
@@ -45,6 +46,9 @@ def is_search_available(provider: SearchProvider | str | None = None) -> bool:
     elif provider == SearchProvider.BRAVE:
         from .brave_client import is_brave_available
         return is_brave_available()
+    elif provider == SearchProvider.REDDIT:
+        from .reddit_client import is_reddit_available
+        return is_reddit_available()
     
     return False
 
@@ -61,7 +65,8 @@ def get_search_client(
     2. Config SEARCH_PROVIDER setting
     3. Tavily (if API key configured)
     4. Brave (if API key configured)
-    5. DuckDuckGo (free fallback)
+    5. Reddit API (if OAuth credentials configured)
+    6. DuckDuckGo (free fallback)
     
     Args:
         config: Application config
@@ -93,12 +98,17 @@ def get_search_client(
         # Auto-select based on availability
         tavily_key = getattr(config, "TAVILY_API_KEY", None)
         brave_key = getattr(config, "BRAVE_API_KEY", None)
+        reddit_client_id = getattr(config, "REDDIT_CLIENT_ID", None)
+        reddit_client_secret = getattr(config, "REDDIT_CLIENT_SECRET", None)
         if tavily_key and is_search_available(SearchProvider.TAVILY):
             provider = SearchProvider.TAVILY
             logger.debug("Auto-selected Tavily (API key configured)")
         elif brave_key and is_search_available(SearchProvider.BRAVE):
             provider = SearchProvider.BRAVE
             logger.debug("Auto-selected Brave (API key configured)")
+        elif reddit_client_id and reddit_client_secret and is_search_available(SearchProvider.REDDIT):
+            provider = SearchProvider.REDDIT
+            logger.debug("Auto-selected Reddit API (credentials configured)")
         elif is_search_available(SearchProvider.DUCKDUCKGO):
             provider = SearchProvider.DUCKDUCKGO
             logger.debug("Auto-selected DuckDuckGo (free fallback)")
@@ -180,6 +190,39 @@ def get_search_client(
             include_summary=include_summary,
             safesearch=safesearch,
         )
+
+    elif provider == SearchProvider.REDDIT:
+        from .reddit_client import RedditSearchClient, is_reddit_available
+
+        if not is_reddit_available():
+            logger.warning("Reddit requested but httpx not installed, falling back to DuckDuckGo")
+            from .ddgs_client import DuckDuckGoClient, is_ddgs_available
+            if is_ddgs_available():
+                timeout = getattr(config, "SEARCH_TIMEOUT", 10)
+                return DuckDuckGoClient(max_results=max_results, timeout=timeout)
+            logger.error("DuckDuckGo fallback also unavailable")
+            return None
+
+        client_id = getattr(config, "REDDIT_CLIENT_ID", None)
+        client_secret = getattr(config, "REDDIT_CLIENT_SECRET", None)
+        user_agent = getattr(config, "REDDIT_USER_AGENT", "llm-bawt/0.1")
+        if not client_id or not client_secret:
+            logger.warning("Reddit requested but credentials are not configured, falling back to DuckDuckGo")
+            from .ddgs_client import DuckDuckGoClient, is_ddgs_available
+            if is_ddgs_available():
+                timeout = getattr(config, "SEARCH_TIMEOUT", 10)
+                return DuckDuckGoClient(max_results=max_results, timeout=timeout)
+            logger.error("DuckDuckGo fallback also unavailable")
+            return None
+
+        timeout = getattr(config, "SEARCH_TIMEOUT", 10)
+        return RedditSearchClient(
+            client_id=client_id,
+            client_secret=client_secret,
+            user_agent=user_agent,
+            max_results=max_results,
+            timeout=timeout,
+        )
     
     elif provider == SearchProvider.DUCKDUCKGO:
         from .ddgs_client import DuckDuckGoClient, is_ddgs_available
@@ -250,6 +293,21 @@ def get_search_unavailable_reason(
                 )
             return "Brave Search is configured but unavailable. Check your API key and network."
 
+        reddit_client_id = getattr(config, "REDDIT_CLIENT_ID", None)
+        reddit_client_secret = getattr(config, "REDDIT_CLIENT_SECRET", None)
+        if reddit_client_id or reddit_client_secret:
+            from .reddit_client import is_reddit_available
+            if not is_reddit_available():
+                return (
+                    "Reddit search requires httpx. This should be installed by default. "
+                    "Try: pip install httpx"
+                )
+            if not reddit_client_id or not reddit_client_secret:
+                return (
+                    "Reddit search requires both REDDIT_CLIENT_ID and REDDIT_CLIENT_SECRET."
+                )
+            return "Reddit search is configured but unavailable. Check credentials and network."
+
         from .ddgs_client import is_ddgs_available
         if not is_ddgs_available():
             return (
@@ -257,7 +315,7 @@ def get_search_unavailable_reason(
                 "Install with: ./install.sh --with-search "
                 "or pipx runpip llm-bawt install ddgs"
             )
-        return "No search provider available. Configure Tavily or Brave or install ddgs."
+        return "No search provider available. Configure Tavily, Brave, or Reddit credentials, or install ddgs."
 
     if resolved_provider == SearchProvider.TAVILY:
         from .tavily_client import is_tavily_available
@@ -295,5 +353,20 @@ def get_search_unavailable_reason(
                 "Try: pip install httpx"
             )
         return "Brave Search is configured but unavailable. Check your API key and network."
+
+    if resolved_provider == SearchProvider.REDDIT:
+        client_id = getattr(config, "REDDIT_CLIENT_ID", None)
+        client_secret = getattr(config, "REDDIT_CLIENT_SECRET", None)
+        if not client_id or not client_secret:
+            return (
+                "Reddit search requires REDDIT_CLIENT_ID and REDDIT_CLIENT_SECRET in your config."
+            )
+        from .reddit_client import is_reddit_available
+        if not is_reddit_available():
+            return (
+                "Reddit search requires httpx. This should be installed by default. "
+                "Try: pip install httpx"
+            )
+        return "Reddit search is configured but unavailable. Check credentials and network."
 
     return "Web search not available."

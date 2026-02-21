@@ -45,8 +45,8 @@ Intent:
 Tone:
 Open Loops:
 
-Target detail level: moderately detailed (about 180-420 words total across all sections).
-Prefer retaining concrete specifics over brevity when trade-offs are needed.
+Target detail level: concise but specific (about 90-180 words total across all sections).
+Keep this materially shorter than the source dialog while preserving concrete facts.
 
 Conversation:
 {messages}
@@ -78,13 +78,25 @@ Return STRICT JSON only (no markdown, no prose):
 }}
 
 Constraints:
-- Keep each session summary moderately detailed (~180-420 words worth of content across fields).
+- Keep each session concise but specific (~90-180 words across fields).
 - "cross_session_links" should mention recurring user goals/patterns if present; otherwise empty string.
 - session_index must match input ordering exactly.
 
 Sessions:
 {sessions_blob}
 """
+
+
+# Hard caps to keep summaries from bloating relative to raw dialog.
+_SUMMARY_MAX_TOTAL_CHARS = 900
+_SUMMARY_MIN_TOTAL_CHARS = 260
+_SUMMARY_SECTION_CAPS = {
+    "summary": 220,
+    "key_details": 360,
+    "intent": 140,
+    "tone": 100,
+    "open_loops": 180,
+}
 
 
 def _extract_json_object(text: str) -> dict[str, Any] | None:
@@ -197,6 +209,60 @@ def normalize_structured_summary_text(text: str) -> str:
             f"Intent: {data['intent']}".rstrip(),
             f"Tone: {data['tone']}".rstrip(),
             f"Open Loops: {data['open_loops']}".rstrip(),
+        ]
+    ).strip()
+
+
+def _truncate_for_limit(text: str, limit: int) -> str:
+    text = " ".join((text or "").strip().split())
+    if len(text) <= limit:
+        return text
+    cutoff = text.rfind(" ", 0, max(limit - 1, 1))
+    if cutoff < max(16, limit // 3):
+        cutoff = max(limit - 1, 1)
+    return text[:cutoff].rstrip(" ,;:-.") + "..."
+
+
+def compress_structured_summary_text(
+    text: str,
+    source_session: "Session | None" = None,
+) -> str:
+    """Enforce concise structured summaries with section and total-size caps."""
+    sections = extract_summary_sections(text)
+    source_chars = 0
+    if source_session is not None:
+        source_chars = sum(len((m.get("content") or "").strip()) for m in source_session.messages)
+
+    dynamic_total_cap = _SUMMARY_MAX_TOTAL_CHARS
+    if source_chars > 0:
+        dynamic_total_cap = min(_SUMMARY_MAX_TOTAL_CHARS, max(_SUMMARY_MIN_TOTAL_CHARS, int(source_chars * 0.55)))
+
+    compact = {
+        key: _truncate_for_limit((sections.get(key) or ""), cap)
+        for key, cap in _SUMMARY_SECTION_CAPS.items()
+    }
+
+    overage = len("\n".join(compact.values())) - dynamic_total_cap
+    if overage > 0:
+        trim_order = ("tone", "summary", "intent", "open_loops", "key_details")
+        for key in trim_order:
+            if overage <= 0:
+                break
+            value = compact.get(key, "")
+            floor = 40 if key != "key_details" else 120
+            if len(value) <= floor:
+                continue
+            new_len = max(floor, len(value) - overage)
+            compact[key] = _truncate_for_limit(value, new_len)
+            overage = len("\n".join(compact.values())) - dynamic_total_cap
+
+    return "\n".join(
+        [
+            f"Summary: {compact['summary']}".rstrip(),
+            f"Key Details: {compact['key_details']}".rstrip(),
+            f"Intent: {compact['intent']}".rstrip(),
+            f"Tone: {compact['tone']}".rstrip(),
+            f"Open Loops: {compact['open_loops']}".rstrip(),
         ]
     ).strip()
 
@@ -985,7 +1051,10 @@ class HistorySummarizer:
         if not summary_text:
             return {"success": False, "error": "Failed to generate summary"}
 
-        normalized_text = normalize_structured_summary_text(summary_text)
+        normalized_text = compress_structured_summary_text(
+            normalize_structured_summary_text(summary_text),
+            source_session=session,
+        )
         if not normalized_text.startswith("[HISTORICAL SUMMARY]"):
             normalized_text = f"[HISTORICAL SUMMARY]\n{normalized_text.strip()}"
         sections = extract_summary_sections(normalized_text)
@@ -1378,7 +1447,10 @@ class HistorySummarizer:
         if not summary_text:
             return {"active_summary_updated": False, "reason": "summary_failed"}
 
-        normalized_text = normalize_structured_summary_text(summary_text)
+        normalized_text = compress_structured_summary_text(
+            normalize_structured_summary_text(summary_text),
+            source_session=session,
+        )
         normalized_text = f"[ACTIVE SESSION SUMMARY]\n{normalized_text.strip()}"
         sections = extract_summary_sections(normalized_text)
         summary_metadata = {

@@ -8,7 +8,7 @@ Consolidated tools (9 total):
 - history: action-based (search/recent/forget) with date filtering
 - profile: action-based (get/set/delete)
 - self: action-based (get/set/delete) for bot personality development
-- search: type-based (web/news)
+- search: type-based (web/news/reddit)
 - news: action-based (search/headlines) via NewsAPI
 - home: action-based (status/query/get/set/scene) for Home Assistant
 - model: action-based (list/current/switch)
@@ -1283,7 +1283,7 @@ class ToolExecutor:
             return format_tool_result(tool_call.name, None, error="Failed to update trait. Please try again.")
 
     def _execute_search(self, tool_call: ToolCall) -> str:
-        """Execute search tool - web or news search."""
+        """Execute search tool - web, news, or reddit search."""
         self._ensure_search_client()
         if not self.search_client:
             error_msg = "Web search not available"
@@ -1319,9 +1319,23 @@ class ToolExecutor:
                     time_range=time_range,
                 )
                 logger.info(f"News search '{query}' returned {len(results)} results")
-            else:
+            elif search_type == "reddit":
+                time_range = tool_call.arguments.get("time_range", "w")
+                results = self.search_client.search_reddit(
+                    query,
+                    max_results=max_results,
+                    time_range=time_range,
+                )
+                logger.info(f"Reddit search '{query}' returned {len(results)} results")
+            elif search_type == "web":
                 results = self.search_client.search(query, max_results=max_results)
                 logger.info(f"Web search '{query}' returned {len(results)} results")
+            else:
+                return format_tool_result(
+                    tool_call.name,
+                    None,
+                    error=f"Invalid search type: '{search_type}'. Use 'web', 'news', or 'reddit'."
+                )
 
             formatted = self.search_client.format_results_for_llm(results)
             return format_tool_result(tool_call.name, formatted)

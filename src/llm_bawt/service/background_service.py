@@ -41,6 +41,53 @@ def _is_tcp_listening(host: str, port: int) -> bool:
         return False
 
 
+def _message_to_dict(msg: Any) -> dict[str, Any]:
+    """Normalize message objects for JSON logging."""
+    if hasattr(msg, "to_dict"):
+        value = msg.to_dict()
+        if isinstance(value, dict):
+            if not value.get("id") and value.get("db_id"):
+                value = dict(value)
+                value["id"] = value.get("db_id")
+            return value
+        return {"value": value}
+    if hasattr(msg, "role"):
+        return {
+            "role": getattr(msg, "role", "unknown"),
+            "content": getattr(msg, "content", ""),
+            "timestamp": getattr(msg, "timestamp", 0),
+            "id": getattr(msg, "db_id", None),
+        }
+    if isinstance(msg, dict):
+        return msg
+    return {"value": str(msg)}
+
+
+def _normalize_tool_call_details(tool_calls: list[dict] | None) -> list[dict]:
+    """Normalize tool-call details into request/response shape."""
+    if not tool_calls:
+        return []
+
+    normalized: list[dict] = []
+    for idx, item in enumerate(tool_calls, start=1):
+        if not isinstance(item, dict):
+            normalized.append({"index": idx, "name": "unknown", "arguments": {}, "result": str(item)})
+            continue
+        name = item.get("tool") or item.get("name") or "unknown"
+        args = item.get("parameters") or item.get("arguments") or {}
+        result = item.get("result") or item.get("response") or ""
+        normalized.append(
+            {
+                "index": idx,
+                "iteration": item.get("iteration", 1),
+                "name": name,
+                "arguments": args if isinstance(args, dict) else {"raw": args},
+                "result": result,
+            }
+        )
+    return normalized
+
+
 def _write_debug_turn_log(
     prepared_messages: list,
     user_prompt: str,
@@ -125,20 +172,13 @@ def _write_debug_turn_log(
         lines.append("JSON FORMAT (for parsing)")
         lines.append("─" * 40)
 
-        def msg_to_dict(msg):
-            if hasattr(msg, 'to_dict'):
-                return msg.to_dict()
-            elif hasattr(msg, 'role'):
-                return {"role": msg.role, "content": msg.content, "timestamp": getattr(msg, 'timestamp', 0)}
-            return dict(msg) if isinstance(msg, dict) else str(msg)
-
         json_data = {
             "timestamp": datetime.now().isoformat(),
             "model": model,
             "bot_id": bot_id,
             "user_id": user_id,
-            "request": [msg_to_dict(msg) for msg in prepared_messages],
-            "tool_calls": tool_calls or [],
+            "request": [_message_to_dict(msg) for msg in prepared_messages],
+            "tool_calls": _normalize_tool_call_details(tool_calls),
             "response": response,
         }
         lines.append(json.dumps(json_data, indent=2, ensure_ascii=False, default=str))
@@ -198,6 +238,7 @@ class BackgroundService:
         self.tasks_processed = 0
         self._task_queue: PriorityQueue = PriorityQueue()
         self._results: dict[str, TaskResult] = {}
+        self._submitted_tasks: dict[str, Task] = {}
         self._result_events: dict[str, asyncio.Event] = {}
         self._shutdown_event = asyncio.Event()
         self._worker_task: asyncio.Task | None = None
@@ -231,6 +272,8 @@ class BackgroundService:
         
         # Memory client cache keyed by bot_id
         self._memory_clients: dict[tuple[str, str], Any] = {}
+        from .turn_logs import TurnLogStore
+        self._turn_log_store = TurnLogStore(config, ttl_hours=168)
 
         # Extraction client (API model like Grok, separate from chat model)
         self._extraction_client: Any | None = None
@@ -369,6 +412,48 @@ class BackgroundService:
             if self._current_generation_cancel is cancel_event:
                 self._current_generation_cancel = None
                 self._generation_done = None
+
+    def _persist_turn_log(
+        self,
+        *,
+        turn_id: str,
+        request_id: str | None,
+        path: str,
+        stream: bool,
+        model: str | None,
+        bot_id: str,
+        user_id: str,
+        status: str,
+        latency_ms: float | None,
+        user_prompt: str,
+        prepared_messages: list,
+        response_text: str,
+        tool_calls: list[dict] | None = None,
+        error_text: str | None = None,
+    ) -> None:
+        """Persist one turn record to short-lived DB storage."""
+        try:
+            request_payload = {
+                "messages": [_message_to_dict(msg) for msg in prepared_messages],
+            }
+            self._turn_log_store.save_turn(
+                turn_id=turn_id,
+                request_id=request_id,
+                path=path,
+                stream=stream,
+                model=model,
+                bot_id=bot_id,
+                user_id=user_id,
+                status=status,
+                latency_ms=latency_ms,
+                user_prompt=user_prompt,
+                request_payload=request_payload,
+                response_text=response_text,
+                tool_calls=_normalize_tool_call_details(tool_calls),
+                error_text=error_text,
+            )
+        except Exception as e:
+            log.debug("Failed to persist turn log: %s", e)
     
     @property
     def uptime_seconds(self) -> float:
@@ -569,6 +654,7 @@ class BackgroundService:
         
         # Start new generation (cancels and waits for any previous one)
         cancel_event, done_event = await self._start_generation()
+        turn_log_id = f"turn-{uuid.uuid4().hex}"
         
         try:
             # Run the blocking query in single-thread executor
@@ -583,12 +669,15 @@ class BackgroundService:
                     cancelled = True
                     return ""
                 
+                # Inject client-supplied system context (e.g. HA device list)
+                llm_bawt._client_system_context = request.client_system_context
+
                 # Prepare messages with history and memory context
                 prepared_messages = llm_bawt.prepare_messages_for_query(user_prompt)
-                
+
                 # Log what we're sending to the LLM (verbose mode)
                 log.llm_context(prepared_messages)
-                
+
                 # Execute the query with prepared messages
                 response, tool_context, tool_call_details = llm_bawt.execute_llm_query(
                     prepared_messages,
@@ -616,6 +705,22 @@ class BackgroundService:
 
                 # Finalize (add to history, trigger memory extraction)
                 llm_bawt.finalize_response(response, tool_context)
+
+                self._persist_turn_log(
+                    turn_id=turn_log_id,
+                    request_id=ctx.request_id,
+                    path=ctx.path,
+                    stream=False,
+                    model=model_alias,
+                    bot_id=bot_id,
+                    user_id=user_id,
+                    status="ok",
+                    latency_ms=(time.time() - llm_start_time) * 1000,
+                    user_prompt=user_prompt,
+                    prepared_messages=prepared_messages,
+                    response_text=response,
+                    tool_calls=tool_call_details,
+                )
 
                 return response
             
@@ -764,6 +869,7 @@ class BackgroundService:
         chunk_queue: asyncio.Queue = asyncio.Queue()
         full_response_holder = [""]  # Use list to allow mutation in nested function
         tool_context_holder = [""]  # Store tool context from native tool calls
+        tool_call_details_holder: list[dict] = []
         timing_holder = [0.0, 0.0]  # [start_time, end_time]
         cancelled_holder = [False]  # Track if we were cancelled
         
@@ -772,6 +878,7 @@ class BackgroundService:
         
         # Start new generation (cancels and waits for any previous one)
         cancel_event, done_event = await self._start_generation()
+        turn_log_id = f"turn-{uuid.uuid4().hex}"
         
         def _stream_to_queue():
             """Run streaming in a thread and push chunks to the async queue."""
@@ -781,6 +888,9 @@ class BackgroundService:
                     cancelled_holder[0] = True
                     return
                 
+                # Inject client-supplied system context (e.g. HA device list)
+                llm_bawt._client_system_context = request.client_system_context
+
                 # Use llm_bawt.prepare_messages_for_query to get full context
                 # (history from DB + memory + system prompt)
                 messages = llm_bawt.prepare_messages_for_query(user_prompt)
@@ -884,6 +994,14 @@ class BackgroundService:
                                                 "tool_call_id": tc.get("id", ""),
                                                 "content": result,
                                             })
+                                            tool_call_details_holder.append(
+                                                {
+                                                    "iteration": iteration + 1,
+                                                    "tool": name,
+                                                    "parameters": args,
+                                                    "result": result,
+                                                }
+                                            )
 
                                         has_executed_tools = True
 
@@ -947,6 +1065,7 @@ class BackgroundService:
                             tool_format=llm_bawt.tool_format,
                             adapter=adapter,
                             history_manager=llm_bawt.history_manager,
+                            tool_call_details=tool_call_details_holder,
                         )
                 else:
                     # Resolve per-bot generation parameters
@@ -989,6 +1108,22 @@ class BackgroundService:
                     log.llm_response(full_response_holder[0], elapsed_ms=elapsed_ms)
                     llm_bawt.finalize_response(full_response_holder[0], tool_context_holder[0])
 
+                    self._persist_turn_log(
+                        turn_id=turn_log_id,
+                        request_id=ctx.request_id,
+                        path=ctx.path,
+                        stream=True,
+                        model=model_alias,
+                        bot_id=bot_id,
+                        user_id=user_id,
+                        status="ok",
+                        latency_ms=elapsed_ms,
+                        user_prompt=user_prompt,
+                        prepared_messages=messages,
+                        response_text=full_response_holder[0],
+                        tool_calls=tool_call_details_holder,
+                    )
+
                     # Write debug turn log if enabled (check config or env var)
                     if self.config.DEBUG_TURN_LOG or os.environ.get("LLM_BAWT_DEBUG_TURN_LOG"):
                         _write_debug_turn_log(
@@ -998,6 +1133,7 @@ class BackgroundService:
                             model=model_alias,
                             bot_id=bot_id,
                             user_id=user_id,
+                            tool_calls=tool_call_details_holder,
                         )
                     
             except Exception as e:
@@ -1732,6 +1868,7 @@ class BackgroundService:
             task=task,
         )
         self._task_queue.put(prioritized)
+        self._submitted_tasks[task.task_id] = task
         self._result_events[task.task_id] = asyncio.Event()
         return task.task_id
     
@@ -1780,6 +1917,7 @@ class BackgroundService:
                     oldest = sorted(self._results.keys())[:100]
                     for key in oldest:
                         self._results.pop(key, None)
+                        self._submitted_tasks.pop(key, None)
                         self._result_events.pop(key, None)
                 
             except Exception as e:
@@ -1802,12 +1940,46 @@ class BackgroundService:
     
     def get_status(self) -> ServiceStatusResponse:
         """Get service status."""
+        from ..core.status import _collect_mcp_info, _collect_memory_info
+        from ..utils.config import has_database_credentials
+
         current = self._model_lifecycle.current_model
+        memory_info = _collect_memory_info(self.config, self._default_bot)
+        mcp_info = _collect_mcp_info(self.config, self._default_bot)
+
+        db_required = has_database_credentials(self.config)
+        db_ok = memory_info.postgres_connected if db_required else True
+        mcp_ok = mcp_info.status == "up"
+        healthy = db_ok and mcp_ok
+
+        checks = {
+            "service": "up",
+            "database": "up" if db_ok else ("disabled" if not db_required else "down"),
+            "mcp": mcp_info.status,
+        }
+
         return ServiceStatusResponse(
+            status="ok" if healthy else "degraded",
+            healthy=healthy,
             uptime_seconds=self.uptime_seconds,
             tasks_processed=self.tasks_processed,
             tasks_pending=self._task_queue.qsize(),
+            worker_running=bool(self._worker_task and not self._worker_task.done()),
             models_loaded=[current] if current else [],
             current_model=current,
+            default_model=self._default_model,
+            default_bot=self._default_bot,
             available_models=self._available_models,
+            checks=checks,
+            database_connected=memory_info.postgres_connected,
+            database_host=memory_info.postgres_host,
+            database_error=memory_info.postgres_error,
+            messages_count=memory_info.messages_count,
+            memories_count=memory_info.memories_count,
+            pgvector_available=memory_info.pgvector_available,
+            embeddings_available=memory_info.embeddings_available,
+            mcp_mode=mcp_info.mode,
+            mcp_status=mcp_info.status,
+            mcp_url=mcp_info.url,
+            mcp_http_status=mcp_info.http_status,
         )

@@ -1690,6 +1690,25 @@ def run_app(args: argparse.Namespace, config_obj: Config, resolved_alias: str):
                             for msg in messages
                         ]
                         history_manager.print_history(pair_limit)
+
+                        message_ids = [str(msg.get("id")) for msg in messages if msg.get("id")]
+                        if message_ids:
+                            tool_events = service_client.get_tool_call_events(
+                                bot_id=bot_id,
+                                message_ids=message_ids,
+                                limit=200,
+                            )
+                            if tool_events and tool_events.get("events"):
+                                console.print("[bold]Tool Activity:[/bold]")
+                                for event in tool_events.get("events", []):
+                                    msg_id = str(event.get("message_id", ""))[:8]
+                                    tools = ", ".join(
+                                        str(tc.get("name", "tool"))
+                                        for tc in (event.get("tool_calls") or [])
+                                        if isinstance(tc, dict)
+                                    )
+                                    if tools:
+                                        console.print(f"[dim]· {msg_id}: {tools}[/dim]")
             else:
                 console.print("[yellow]Service not available for history operations.[/yellow]")
         else:

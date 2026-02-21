@@ -375,7 +375,9 @@ class HistoryManager:
         # Save to PostgreSQL if available, otherwise file
         if self._db_backend:
             try:
-                self._db_backend.add_message(role, content, message.timestamp)
+                persisted_id = self._db_backend.add_message(role, content, message.timestamp)
+                if persisted_id:
+                    message.db_id = str(persisted_id)
             except Exception as e:
                 logger.warning(f"Failed to save to PostgreSQL: {e}")
                 self.save_history()  # Fall back to file

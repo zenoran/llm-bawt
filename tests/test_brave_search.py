@@ -87,6 +87,41 @@ class TestBraveSearchClient:
         assert len(results) == 1
         assert "2 hours ago" in results[0].snippet
 
+    @patch("llm_bawt.search.brave_client.httpx.Client")
+    def test_search_reddit(self, mock_client_class):
+        """Test reddit search uses web endpoint with site filter."""
+        mock_response = Mock()
+        mock_response.json.return_value = {
+            "web": {
+                "results": [
+                    {
+                        "title": "Reddit Thread",
+                        "url": "https://www.reddit.com/r/test/comments/abc123/thread/",
+                        "description": "Interesting discussion",
+                    }
+                ]
+            }
+        }
+        mock_response.raise_for_status = Mock()
+
+        mock_client = Mock()
+        mock_client.get.return_value = mock_response
+        mock_client_class.return_value = mock_client
+
+        client = BraveSearchClient(api_key="test-key")
+        results = client.search_reddit("best mechanical keyboard", time_range="w")
+
+        assert len(results) == 1
+        assert results[0].title == "Reddit Thread"
+        assert results[0].url.startswith("https://www.reddit.com/")
+
+        mock_client.get.assert_called_once()
+        called_path = mock_client.get.call_args.args[0]
+        called_params = mock_client.get.call_args.kwargs["params"]
+        assert called_path == "/web/search"
+        assert called_params["q"].startswith("site:reddit.com")
+        assert called_params["freshness"] == "pw"
+
 
 class TestBraveAvailability:
     """Tests for availability checks."""

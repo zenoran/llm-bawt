@@ -41,30 +41,17 @@ def _get_last_contact_epoch(history_messages: Sequence[Any]) -> float | None:
 def build_temporal_context(history_messages: Sequence[Any] | None = None) -> str:
     """Return a concise temporal context block for prompt grounding."""
     now_local = datetime.now().astimezone()
-    now_utc = datetime.now(timezone.utc)
     tz_name = now_local.tzname() or "local"
 
-    lines = [
-        "## Temporal Context",
-        f"NOW_UTC: {now_utc.isoformat()}",
-        f"NOW_LOCAL: {now_local.isoformat()} ({tz_name})",
-        f"TODAY_LOCAL: {now_local.date().isoformat()}",
-        f"YESTERDAY_LOCAL: {(now_local.date() - timedelta(days=1)).isoformat()}",
-        f"THIS_WEEK_START_LOCAL: {(now_local.date() - timedelta(days=now_local.weekday())).isoformat()}",
-    ]
+    # Human-readable date/time: "Wednesday, February 19, 2026 8:09 PM EST"
+    date_str = now_local.strftime("%A, %B %-d, %Y %-I:%M %p") + f" {tz_name}"
+
+    parts = [f"Current date/time: {date_str}"]
 
     if history_messages:
         last_contact = _get_last_contact_epoch(history_messages)
         if last_contact is not None and last_contact > 0:
-            last_local = datetime.fromtimestamp(last_contact, tz=now_local.tzinfo)
             delta = max(0.0, now_local.timestamp() - last_contact)
-            lines.append(f"LAST_CONTACT_AT_LOCAL: {last_local.isoformat()}")
-            lines.append(f"LAST_CONTACT_RELATIVE: {_relative_time(delta)}")
-        else:
-            lines.append("LAST_CONTACT_AT_LOCAL: unknown")
-            lines.append("LAST_CONTACT_RELATIVE: unknown")
-    else:
-        lines.append("LAST_CONTACT_AT_LOCAL: unknown")
-        lines.append("LAST_CONTACT_RELATIVE: unknown")
+            parts.append(f"Last conversation: {_relative_time(delta)}")
 
-    return "\n".join(lines)
+    return " | ".join(parts)

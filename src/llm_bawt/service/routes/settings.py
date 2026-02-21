@@ -1,12 +1,20 @@
 """Runtime settings routes."""
 
+import json
+
+from sqlalchemy import func
+from sqlmodel import Session, select
+
 from fastapi import APIRouter, HTTPException, Query
 
-from ...runtime_settings import BotProfileStore, RuntimeSettingsStore
+from ...runtime_settings import BotProfileStore, RuntimeSetting, RuntimeSettingsStore
 from ..dependencies import get_service
 from ..schemas import (
+    BotProfileListResponse,
     BotProfileResponse,
     BotProfileUpsertRequest,
+    RuntimeSettingRecord,
+    RuntimeSettingsListResponse,
     RuntimeSettingItem,
     RuntimeSettingBatchUpsertRequest,
     RuntimeSettingsResponse,
@@ -60,6 +68,81 @@ async def list_runtime_settings(
     data = store.get_scope_settings(st, sid)
     items = [RuntimeSettingItem(key=k, value=v) for k, v in sorted(data.items())]
     return RuntimeSettingsResponse(scope_type=st, scope_id=sid, settings=items)
+
+
+@router.get("/v1/settings/all", response_model=RuntimeSettingsListResponse, tags=["System"])
+async def list_all_runtime_settings(
+    scope_type: str | None = Query(None, description="Filter by scope type: global or bot"),
+    scope_id: str | None = Query(None, description="Filter by scope id ('*' for global)"),
+    key: str | None = Query(None, description="Filter by exact key"),
+    key_prefix: str | None = Query(None, description="Filter by key prefix"),
+    limit: int = Query(200, ge=1, le=1000, description="Max rows to return"),
+    offset: int = Query(0, ge=0, description="Pagination offset"),
+):
+    """List runtime settings across all scopes."""
+    service = get_service()
+    store = RuntimeSettingsStore(service.config)
+    if store.engine is None:
+        raise HTTPException(status_code=503, detail="Runtime settings DB unavailable")
+
+    normalized_scope_type = scope_type.strip().lower() if scope_type else None
+    if normalized_scope_type and normalized_scope_type not in {"global", "bot"}:
+        raise HTTPException(status_code=400, detail="scope_type must be 'global' or 'bot'")
+
+    normalized_scope_id = scope_id.strip().lower() if scope_id else None
+    normalized_key = key.strip() if key else None
+    normalized_key_prefix = key_prefix.strip() if key_prefix else None
+
+    conditions: list = []
+    if normalized_scope_type:
+        conditions.append(RuntimeSetting.scope_type == normalized_scope_type)
+    if normalized_scope_id:
+        conditions.append(RuntimeSetting.scope_id == normalized_scope_id)
+    if normalized_key:
+        conditions.append(RuntimeSetting.key == normalized_key)
+    if normalized_key_prefix:
+        conditions.append(RuntimeSetting.key.startswith(normalized_key_prefix))
+
+    statement = select(RuntimeSetting)
+    count_statement = select(func.count()).select_from(RuntimeSetting)
+    if conditions:
+        statement = statement.where(*conditions)
+        count_statement = count_statement.where(*conditions)
+
+    statement = statement.order_by(RuntimeSetting.scope_type, RuntimeSetting.scope_id, RuntimeSetting.key)
+
+    with Session(store.engine) as session:
+        total_count = int(session.exec(count_statement).one() or 0)
+        rows = session.exec(statement.offset(offset).limit(limit)).all()
+
+    items = []
+    for row in rows:
+        try:
+            value = json.loads(row.value_json)
+        except Exception:
+            value = row.value_json
+        items.append(
+            RuntimeSettingRecord(
+                scope_type=row.scope_type,
+                scope_id=row.scope_id,
+                key=row.key,
+                value=value,
+                updated_at=row.updated_at,
+            )
+        )
+
+    return RuntimeSettingsListResponse(
+        settings=items,
+        total_count=total_count,
+        filters={
+            "scope_type": normalized_scope_type,
+            "scope_id": normalized_scope_id,
+            "key": normalized_key,
+            "key_prefix": normalized_key_prefix,
+            "limit": limit,
+            "offset": offset,
+        },
+    )
 
 
 @router.put("/v1/settings", tags=["System"])
@@ -122,6 +205,74 @@ async def batch_upsert_runtime_settings(request: RuntimeSettingBatchUpsertReques
             }
         )
     return {"success": True, "applied_count": len(applied), "applied": applied}
+
+
+@router.get("/v1/bots/profiles", response_model=BotProfileListResponse, tags=["System"])
+async def list_bot_profiles(
+    q: str | None = Query(None, description="Text filter against slug, name, and description"),
+    uses_tools: bool | None = Query(None, description="Filter by uses_tools"),
+    uses_search: bool | None = Query(None, description="Filter by uses_search"),
+    requires_memory: bool | None = Query(None, description="Filter by requires_memory"),
+    voice_optimized: bool | None = Query(None, description="Filter by voice_optimized"),
+    uses_home_assistant: bool | None = Query(None, description="Filter by uses_home_assistant"),
+    default_model: str | None = Query(None, description="Filter by default model alias"),
+    limit: int = Query(200, ge=1, le=1000, description="Max rows to return"),
+    offset: int = Query(0, ge=0, description="Pagination offset"),
+):
+    """List DB-backed bot personality profiles with filters."""
+    service = get_service()
+    store = BotProfileStore(service.config)
+    if store.engine is None:
+        raise HTTPException(status_code=503, detail="Bot profiles DB unavailable")
+
+    query_text = q.strip().lower() if q else None
+    model_filter = default_model.strip() if default_model else None
+    rows = store.list_all()
+
+    filtered = []
+    for row in rows:
+        if query_text:
+            haystack = " ".join(
+                [
+                    (row.slug or ""),
+                    (row.name or ""),
+                    (row.description or ""),
+                ]
+            ).lower()
+            if query_text not in haystack:
+                continue
+        if uses_tools is not None and row.uses_tools != uses_tools:
+            continue
+        if uses_search is not None and row.uses_search != uses_search:
+            continue
+        if requires_memory is not None and row.requires_memory != requires_memory:
+            continue
+        if voice_optimized is not None and row.voice_optimized != voice_optimized:
+            continue
+        if uses_home_assistant is not None and row.uses_home_assistant != uses_home_assistant:
+            continue
+        if model_filter is not None and row.default_model != model_filter:
+            continue
+        filtered.append(row)
+
+    total_count = len(filtered)
+    page = filtered[offset : offset + limit]
+
+    return BotProfileListResponse(
+        profiles=[_to_profile_response(profile) for profile in page],
+        total_count=total_count,
+        filters={
+            "q": query_text,
+            "uses_tools": uses_tools,
+            "uses_search": uses_search,
+            "requires_memory": requires_memory,
+            "voice_optimized": voice_optimized,
+            "uses_home_assistant": uses_home_assistant,
+            "default_model": model_filter,
+            "limit": limit,
+            "offset": offset,
+        },
+    )
 
 
 @router.get("/v1/bots/{slug}/profile", response_model=BotProfileResponse, tags=["System"])

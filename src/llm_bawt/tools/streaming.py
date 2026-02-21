@@ -121,6 +121,7 @@ def stream_with_tools(
     tool_format: ToolFormat | str = ToolFormat.REACT,
     adapter: "ModelAdapter | None" = None,
     history_manager: "HistoryManager | None" = None,
+    tool_call_details: list[dict] | None = None,
 ) -> Iterator[str]:
     """Stream LLM response with tool calling support.
 
@@ -147,6 +148,8 @@ def stream_with_tools(
         tool_format: Tool format to use (determines stop sequences and parsing).
         adapter: Model adapter for model-specific cleaning and stop sequences.
         history_manager: History manager for recall operations.
+        tool_call_details: Optional mutable list to collect per-call tool details
+            for downstream logging/persistence.
 
     Yields:
         Text chunks from the LLM response (cleaned by adapter and handler).
@@ -273,6 +276,15 @@ def stream_with_tools(
         tool_result = executor.execute(tool_call)
         has_executed_tools = True  # Mark that we've executed tools
         log.debug(f"Tool result: {len(tool_result)} chars")
+        if tool_call_details is not None:
+            tool_call_details.append(
+                {
+                    "tool": tc.name,
+                    "parameters": tc.arguments if isinstance(tc.arguments, dict) else {"raw": tc.arguments},
+                    "result": tool_result,
+                    "iteration": iteration,
+                }
+            )
 
         # Format the result for the model
         formatted_result = handler.format_result(

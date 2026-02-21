@@ -193,6 +193,76 @@ class BraveSearchClient(SearchClient):
             logger.error(f"Brave news search failed: {e}")
             return []
 
+    def search_reddit(
+        self,
+        query: str,
+        max_results: int | None = None,
+        time_range: str | None = None,
+    ) -> list[SearchResult]:
+        """Search Reddit content via Brave web search."""
+        if not self._api_key:
+            logger.error("Brave API key not configured")
+            return []
+
+        max_results = max_results or self.max_results
+
+        try:
+            client = self._get_client()
+
+            params = {
+                "q": f"site:reddit.com {query}".strip(),
+                "count": max_results,
+                "safesearch": self._safesearch,
+            }
+
+            if time_range:
+                freshness_map = {
+                    "d": "pd",
+                    "w": "pw",
+                    "m": "pm",
+                    "y": "py",
+                }
+                if time_range in freshness_map:
+                    params["freshness"] = freshness_map[time_range]
+
+            response = client.get("/web/search", params=params)
+            response.raise_for_status()
+            data = response.json()
+
+            results = []
+            web_results = data.get("web", {}).get("results", [])
+            for raw in web_results:
+                snippet = raw.get("description", "")
+                extra = raw.get("extra_snippets", [])
+                if extra:
+                    snippet = f"{snippet}\n{' '.join(extra[:2])}"
+
+                results.append(SearchResult(
+                    title=raw.get("title", ""),
+                    url=raw.get("url", ""),
+                    snippet=snippet,
+                    score=self._normalize_score(raw),
+                    source=self.PROVIDER,
+                    raw=raw,
+                ))
+
+            return results[:max_results]
+
+        except httpx.HTTPStatusError as e:
+            if e.response.status_code == 401:
+                logger.error("Brave API key is invalid")
+            elif e.response.status_code == 429:
+                logger.warning("Brave rate limit exceeded")
+            else:
+                logger.error(f"Brave reddit search HTTP error: {e}")
+            return []
+        except httpx.RequestError as e:
+            logger.error(f"Brave reddit search request failed: {e}")
+            return []
+        except Exception as e:
+            logger.error(f"Brave reddit search failed: {e}")
+            return []
+
     def search_with_summary(
         self,
         query: str,

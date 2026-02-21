@@ -17,6 +17,7 @@ class SearchProvider(str, Enum):
     DUCKDUCKGO = "duckduckgo"
     TAVILY = "tavily"
     BRAVE = "brave"
+    REDDIT = "reddit"
 
 
 @dataclass
@@ -111,6 +112,28 @@ class SearchClient(ABC):
         """
         # Default: just do a regular search with "news" appended
         return self.search(f"{query} news", max_results=max_results)
+
+    def search_reddit(
+        self,
+        query: str,
+        max_results: int | None = None,
+        time_range: str | None = None,
+    ) -> list[SearchResult]:
+        """Search Reddit posts/threads.
+
+        Default implementation uses a site-filtered web query.
+        Providers can override for better freshness/filtering support.
+
+        Args:
+            query: Search query string
+            max_results: Override default max results
+            time_range: Optional freshness filter - 'd', 'w', 'm', 'y'
+
+        Returns:
+            List of SearchResult objects
+        """
+        del time_range  # Not used by the default implementation
+        return self.search(f"site:reddit.com {query}".strip(), max_results=max_results)
     
     def format_results_for_llm(self, results: list[SearchResult]) -> str:
         """Format search results for injection into LLM context.

@@ -1,11 +1,15 @@
 """Unified profile routes."""
 
-from fastapi import APIRouter, HTTPException
+from sqlalchemy import func
+from sqlmodel import Session, select
+
+from fastapi import APIRouter, HTTPException, Query
 
 from ..dependencies import attribute_to_response, get_service
 from ..logging import get_service_logger
 from ..schemas import (
     ProfileAttributeUpdateRequest,
+    ProfileAttributeListResponse,
     ProfileAttributeUpsertRequest,
     ProfileDetail,
     ProfileListResponse,
@@ -88,6 +92,74 @@ async def list_profiles(entity_type: str | None = None):
         raise
     except Exception as e:
         log.error(f"Failed to list profiles: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/v1/profiles/attribute", response_model=ProfileAttributeListResponse, tags=["Profiles"])
+async def list_profile_attributes(
+    entity_type: str | None = Query(None, description="Filter by entity type: user or bot"),
+    entity_id: str | None = Query(None, description="Filter by entity ID"),
+    category: str | None = Query(None, description="Filter by attribute category"),
+    key: str | None = Query(None, description="Filter by attribute key"),
+    source: str | None = Query(None, description="Filter by attribute source"),
+    min_confidence: float | None = Query(None, ge=0.0, le=1.0, description="Minimum confidence"),
+    limit: int = Query(100, ge=1, le=500, description="Max rows to return"),
+    offset: int = Query(0, ge=0, description="Pagination offset"),
+):
+    """List profile attributes with filters and pagination."""
+    service = get_service()
+
+    try:
+        from ...profiles import EntityType, ProfileAttribute, ProfileManager
+
+        manager = ProfileManager(service.config)
+        normalized_entity_type = _normalize_entity_type(entity_type)
+
+        conditions: list = []
+        if normalized_entity_type:
+            target_type = EntityType.USER if normalized_entity_type == "user" else EntityType.BOT
+            conditions.append(ProfileAttribute.entity_type == target_type)
+        if entity_id:
+            conditions.append(ProfileAttribute.entity_id == entity_id.strip().lower())
+        if category:
+            conditions.append(ProfileAttribute.category == category.strip().lower())
+        if key:
+            conditions.append(ProfileAttribute.key == key.strip().lower())
+        if source:
+            conditions.append(ProfileAttribute.source == source.strip().lower())
+        if min_confidence is not None:
+            conditions.append(ProfileAttribute.confidence >= min_confidence)
+
+        statement = select(ProfileAttribute)
+        count_statement = select(func.count()).select_from(ProfileAttribute)
+        if conditions:
+            statement = statement.where(*conditions)
+            count_statement = count_statement.where(*conditions)
+
+        statement = statement.order_by(ProfileAttribute.updated_at.desc())
+
+        with Session(manager.engine) as session:
+            total_count = int(session.exec(count_statement).one() or 0)
+            rows = session.exec(statement.offset(offset).limit(limit)).all()
+
+        return ProfileAttributeListResponse(
+            attributes=[attribute_to_response(attr) for attr in rows],
+            total_count=total_count,
+            filters={
+                "entity_type": normalized_entity_type,
+                "entity_id": entity_id,
+                "category": category,
+                "key": key,
+                "source": source,
+                "min_confidence": min_confidence,
+                "limit": limit,
+                "offset": offset,
+            },
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        log.error(f"Failed to list profile attributes: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 

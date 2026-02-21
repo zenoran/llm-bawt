@@ -56,6 +56,7 @@ class SectionPosition:
     BASE_PROMPT = 2
     MEMORY_CONTEXT = 3
     TOOLS = 4
+    CLIENT_CONTEXT = 5  # System context passed by the calling client
     CUSTOM = 50  # For bot-specific additions
 
 
@@ -134,6 +135,7 @@ class PromptBuilder:
             "base_prompt": SectionPosition.BASE_PROMPT,
             "memory_context": SectionPosition.MEMORY_CONTEXT,
             "tools": SectionPosition.TOOLS,
+            "client_context": SectionPosition.CLIENT_CONTEXT,
         }
         return defaults.get(name, SectionPosition.CUSTOM)
     

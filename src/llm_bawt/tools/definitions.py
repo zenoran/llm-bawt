@@ -8,7 +8,7 @@ Consolidated tools (8 total):
 - history: Search/retrieve/forget messages (action-based, with date filtering)
 - profile: Get/set/delete user attributes (action-based)
 - self: Bot personality reflection and development (action-based)
-- search: Web/news search (type-based)
+- search: Web/news/reddit search (type-based)
 - home: Home Assistant control/status (action-based)
 - model: List/current/switch models (action-based)
 - time: Get current time
@@ -258,7 +258,7 @@ SELF_TOOL = Tool(
 # Search tool - combines web_search, news_search
 SEARCH_TOOL = Tool(
     name="search",
-    description="Search the internet for information. Use type='web' for general search, 'news' for recent news.",
+    description="Search the internet for information. Use type='web' for general search, 'news' for recent news, or 'reddit' for Reddit threads/posts.",
     parameters=[
         ToolParameter(
             name="query",
@@ -268,7 +268,7 @@ SEARCH_TOOL = Tool(
         ToolParameter(
             name="type",
             type="string",
-            description="'web' (default) or 'news'",
+            description="'web' (default), 'news', or 'reddit'",
             required=False,
             default="web"
         ),
@@ -282,7 +282,7 @@ SEARCH_TOOL = Tool(
         ToolParameter(
             name="time_range",
             type="string",
-            description="For news: 'd' (day), 'w' (week), 'm' (month)",
+            description="For news/reddit freshness filters when supported: 'd' (day), 'w' (week), 'm' (month), 'y' (year)",
             required=False,
             default="w"
         ),
@@ -457,6 +457,7 @@ LEGACY_TOOL_MAP = {
     # Search tools
     "web_search": ("search", {"type": "web"}),
     "news_search": ("search", {"type": "news"}),
+    "reddit_search": ("search", {"type": "reddit"}),
     # Model tools
     "list_models": ("model", {"action": "list"}),
     "get_current_model": ("model", {"action": "current"}),
@@ -531,7 +532,7 @@ The "Available Tools" list above is authoritative for this turn. If asked to lis
 
 # Guidance added when search tools are enabled
 SEARCH_GUIDANCE = '''
-- **search**: For current events, facts you're unsure about, or recent information (type=web or news)
+- **search**: For current events, facts you're unsure about, or recent information (type=web, news, or reddit)
 '''
 
 NEWS_GUIDANCE = '''

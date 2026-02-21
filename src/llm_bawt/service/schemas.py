@@ -36,6 +36,7 @@ class ChatCompletionRequest(BaseModel):
     bot_id: str | None = Field(default=None, description="Bot personality to use")
     augment_memory: bool = Field(default=True, description="Whether to augment with memory context")
     extract_memory: bool = Field(default=True, description="Whether to extract memories from response")
+    client_system_context: str | None = Field(default=None, description="System context extracted from client messages (set by routes, not by callers)", exclude=True)
 
 
 class ChatCompletionChoice(BaseModel):
@@ -187,16 +188,165 @@ class TaskStatusResponse(BaseModel):
     processing_time_ms: float | None = None
 
 
+class TaskListItem(BaseModel):
+    """A task entry for task listing."""
+    task_id: str
+    status: str
+    task_type: str | None = None
+    bot_id: str | None = None
+    user_id: str | None = None
+    priority: int | None = None
+    created_at: str | None = None
+    completed_at: str | None = None
+    processing_time_ms: float | None = None
+    error: str | None = None
+
+
+class TaskListResponse(BaseModel):
+    """Response for listing tasks."""
+    tasks: list[TaskListItem]
+    total_count: int
+    filters: dict[str, Any] = Field(default_factory=dict)
+
+
+class ScheduledJobInfo(BaseModel):
+    """A scheduled job with latest run summary."""
+    id: str
+    job_type: str
+    bot_id: str
+    enabled: bool
+    interval_minutes: int
+    last_run_at: datetime | None = None
+    next_run_at: datetime | None = None
+    created_at: datetime | None = None
+    last_status: str | None = None
+    last_duration_ms: int | None = None
+    last_error: str | None = None
+
+
+class ScheduledJobsResponse(BaseModel):
+    """Response for listing scheduled jobs."""
+    jobs: list[ScheduledJobInfo]
+    total_count: int
+    filters: dict[str, Any] = Field(default_factory=dict)
+
+
+class JobRunInfo(BaseModel):
+    """A single scheduler job run record."""
+    id: str
+    job_id: str
+    job_type: str | None = None
+    bot_id: str
+    status: str
+    started_at: datetime
+    finished_at: datetime | None = None
+    duration_ms: int | None = None
+    error_message: str | None = None
+    result: Any | None = None
+
+
+class JobRunsResponse(BaseModel):
+    """Response for listing scheduler job run history."""
+    runs: list[JobRunInfo]
+    total_count: int
+    filters: dict[str, Any] = Field(default_factory=dict)
+
+
+class TurnLogListItem(BaseModel):
+    """Summary row for one persisted turn log."""
+    id: str
+    created_at: datetime
+    request_id: str | None = None
+    path: str
+    stream: bool = False
+    model: str | None = None
+    bot_id: str | None = None
+    user_id: str | None = None
+    status: str
+    latency_ms: float | None = None
+    user_prompt: str | None = None
+    response_preview: str | None = None
+    tool_call_count: int = 0
+    error_text: str | None = None
+
+
+class TurnLogListResponse(BaseModel):
+    """Response for listing persisted turn logs."""
+    turns: list[TurnLogListItem]
+    total_count: int
+    filters: dict[str, Any] = Field(default_factory=dict)
+
+
+class TurnLogDetail(BaseModel):
+    """Detailed persisted turn log."""
+    id: str
+    created_at: datetime
+    request_id: str | None = None
+    path: str
+    stream: bool = False
+    model: str | None = None
+    bot_id: str | None = None
+    user_id: str | None = None
+    status: str
+    latency_ms: float | None = None
+    user_prompt: str | None = None
+    request: Any | None = None
+    response: str | None = None
+    tool_calls: list[dict[str, Any]] = Field(default_factory=list)
+    error_text: str | None = None
+
+
+class ToolCallEvent(BaseModel):
+    """Tool-call event linked to one trigger history message."""
+    turn_id: str
+    created_at: datetime
+    request_id: str | None = None
+    model: str | None = None
+    bot_id: str | None = None
+    user_id: str | None = None
+    message_id: str
+    message_role: str = "user"
+    message_timestamp: float | None = None
+    tool_call_count: int = 0
+    tool_calls: list[dict[str, Any]] = Field(default_factory=list)
+
+
+class ToolCallEventsResponse(BaseModel):
+    """Tool-call events for history annotation in UI/CLI."""
+    events: list[ToolCallEvent]
+    total_count: int
+    filters: dict[str, Any] = Field(default_factory=dict)
+
+
 class ServiceStatusResponse(BaseModel):
     """Service health and status."""
     status: str = "ok"
     version: str = SERVICE_VERSION
+    healthy: bool = True
     uptime_seconds: float
     tasks_processed: int
     tasks_pending: int
+    worker_running: bool = False
     models_loaded: list[str] = []
     current_model: str | None = None
+    default_model: str | None = None
+    default_bot: str | None = None
     available_models: list[str] = []
+    # Health checks
+    checks: dict[str, str] = Field(default_factory=dict)
+    # Database / memory
+    database_connected: bool = False
+    database_host: str | None = None
+    database_error: str | None = None
+    messages_count: int = 0
+    memories_count: int = 0
+    pgvector_available: bool = False
+    embeddings_available: bool = False
+    # MCP memory server
+    mcp_mode: str = "embedded"
+    mcp_status: str = "up"
+    mcp_url: str | None = None
+    mcp_http_status: int | None = None
 
 
 # =============================================================================
@@ -579,6 +729,13 @@ class ProfileListResponse(BaseModel):
     profiles: list[ProfileDetail]
     total_count: int
 
+
+class ProfileAttributeListResponse(BaseModel):
+    """Response for listing profile attributes."""
+    attributes: list[UserProfileAttribute]
+    total_count: int
+    filters: dict[str, Any] = Field(default_factory=dict)
+
 # =============================================================================
 # Nextcloud Admin Schemas
 # =============================================================================
@@ -614,6 +771,29 @@ class RuntimeSettingsResponse(BaseModel):
     scope_type: str
     scope_id: str
     settings: list[RuntimeSettingItem]
+
+
+class RuntimeSettingRecord(BaseModel):
+    """One runtime setting row with scope metadata."""
+    scope_type: str
+    scope_id: str
+    key: str
+    value: Any
+    updated_at: datetime | None = None
+
+
+class RuntimeSettingsListResponse(BaseModel):
+    """List runtime settings across scopes."""
+    settings: list[RuntimeSettingRecord]
+    total_count: int
+    filters: dict[str, Any] = Field(default_factory=dict)
+
+
+class BotProfileListResponse(BaseModel):
+    """Response for listing bot profiles."""
+    profiles: list[BotProfileResponse]
+    total_count: int
+    filters: dict[str, Any] = Field(default_factory=dict)
 
 
 class RuntimeSettingUpsertRequest(BaseModel):

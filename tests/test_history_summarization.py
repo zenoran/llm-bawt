@@ -5,6 +5,7 @@ import time
 from llm_bawt.memory.summarization import (
     Session,
     SUMMARIZATION_PROMPT,
+    compress_structured_summary_text,
     extract_summary_sections,
     is_low_signal_session,
     normalize_structured_summary_text,
@@ -123,6 +124,46 @@ def test_normalize_structured_summary_text_fills_missing_sections() -> None:
     assert "Intent:" in normalized
     assert "Tone:" in normalized
     assert "Open Loops:" in normalized
+
+
+def test_compress_structured_summary_text_caps_overlong_sections() -> None:
+    source_text = (
+        "Summary: " + ("A" * 500) + "\n"
+        "Key Details: " + ("B" * 1200) + "\n"
+        "Intent: " + ("C" * 300) + "\n"
+        "Tone: " + ("D" * 260) + "\n"
+        "Open Loops: " + ("E" * 400)
+    )
+    compact = compress_structured_summary_text(source_text)
+    parsed = extract_summary_sections(compact)
+
+    assert len(parsed["summary"]) <= 223
+    assert len(parsed["key_details"]) <= 363
+    assert len(parsed["intent"]) <= 143
+    assert len(parsed["tone"]) <= 103
+    assert len(parsed["open_loops"]) <= 183
+
+
+def test_compress_structured_summary_text_scales_with_source_session() -> None:
+    now = time.time() - 7200
+    session = _session(
+        now,
+        now + 10,
+        [
+            {"id": "m1", "role": "user", "content": "x" * 300, "timestamp": now + 1},
+            {"id": "m2", "role": "assistant", "content": "y" * 300, "timestamp": now + 2},
+        ],
+    )
+    source_text = (
+        "Summary: " + ("A " * 200) + "\n"
+        "Key Details: " + ("B " * 400) + "\n"
+        "Intent: " + ("C " * 120) + "\n"
+        "Tone: " + ("D " * 120) + "\n"
+        "Open Loops: " + ("E " * 180)
+    )
+    compact = compress_structured_summary_text(source_text, source_session=session)
+    # 55% of 600 chars ~= 330 cap (minimum floor is 260), so this should be aggressively trimmed.
+    assert len(compact) < 420
 
 
 def test_is_low_signal_session_flags_greeting_noise() -> None:

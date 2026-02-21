@@ -4,6 +4,7 @@ Provides a pluggable search client system supporting multiple providers:
 - DuckDuckGo (free, no API key required)
 - Tavily (production-ready, LLM-optimized)
 - Brave (privacy-focused, API key required)
+- Reddit API (OAuth app credentials required)
 
 Search clients follow the same pattern as LLM clients - abstract base
 with provider-specific implementations.
@@ -12,6 +13,7 @@ with provider-specific implementations.
 from .base import SearchClient, SearchResult, SearchProvider
 from .factory import get_search_client, get_search_unavailable_reason, is_search_available
 from .brave_client import BraveSearchClient
+from .reddit_client import RedditSearchClient
 
 __all__ = [
     "SearchClient",
@@ -21,4 +23,5 @@ __all__ = [
     "get_search_unavailable_reason",
     "is_search_available",
     "BraveSearchClient",
+    "RedditSearchClient",
 ]

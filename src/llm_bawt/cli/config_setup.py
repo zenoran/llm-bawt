@@ -90,9 +90,12 @@ CLIENT_SETTING_GROUPS: List[SettingGroup] = [
     SettingGroup(
         title="Web search",
         settings=[
-            Setting("SEARCH_PROVIDER", "Search backend: duckduckgo, tavily, or brave"),
+            Setting("SEARCH_PROVIDER", "Search backend: duckduckgo, tavily, brave, or reddit"),
             Setting("TAVILY_API_KEY", "Tavily API key (optional)", secret=True),
             Setting("BRAVE_API_KEY", "Brave Search API key (optional)", secret=True),
+            Setting("REDDIT_CLIENT_ID", "Reddit OAuth client ID (optional)", secret=True),
+            Setting("REDDIT_CLIENT_SECRET", "Reddit OAuth client secret (optional)", secret=True),
+            Setting("REDDIT_USER_AGENT", "Reddit API user agent (optional)"),
         ],
     ),
     SettingGroup(
@@ -258,7 +261,7 @@ def run_config_setup(config: "Config", console: Console) -> int:
         console.print("[dim]No changes made.[/dim]")
 
     # Quick connectivity checks
-    console.print(f"\n[bold magenta]── Connectivity ──[/bold magenta]")
+    console.print("\n[bold magenta]── Connectivity ──[/bold magenta]")
     _run_connectivity_checks(config, console)
 
     return 0

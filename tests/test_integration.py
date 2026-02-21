@@ -250,6 +250,36 @@ class TestStreamingToolLoop:
             # Second call (after tool) should have None (no stop sequences)
             assert stop_seq_on_calls[1] is None
 
+    def test_streaming_collects_tool_call_details(self):
+        """Tool call details should be collected for turn-log persistence."""
+        details = []
+
+        def mock_stream_fn(messages, stop_sequences=None):
+            if len(messages) == 1:
+                yield "Thought: Need profile\nAction: get_user_profile\nAction Input: {}"
+            else:
+                yield "Final Answer: Done"
+
+        with patch('llm_bawt.tools.streaming.ToolExecutor') as mock_executor_class:
+            mock_executor = Mock()
+            mock_executor.execute.return_value = "name=Nick"
+            mock_executor_class.return_value = mock_executor
+
+            list(stream_with_tools(
+                messages=[MockMessage("user", "profile")],
+                stream_fn=mock_stream_fn,
+                user_id="test",
+                bot_id="proto",
+                tool_format=ToolFormat.REACT,
+                tool_call_details=details,
+            ))
+
+        assert len(details) == 1
+        assert details[0]["tool"] == "get_user_profile"
+        assert details[0]["parameters"] == {}
+        assert details[0]["result"] == "name=Nick"
+        assert details[0]["iteration"] == 1
+
 
 # =============================================================================
 # Response Sanitization

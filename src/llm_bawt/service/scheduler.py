@@ -366,6 +366,28 @@ class JobScheduler:
 
         return latest
 
+    def _has_pending_history_summaries(self, bot_id: str) -> tuple[bool, int]:
+        """Return whether there are currently eligible unsummarized sessions.
+
+        This guards against backlog starvation where no *new* activity happened
+        since the previous check, but old sessions are still eligible and
+        unsummarized.
+        """
+        try:
+            from ..memory.summarization import HistorySummarizer
+
+            summarizer = HistorySummarizer(self.task_processor.config, bot_id=bot_id)
+            eligible_sessions = summarizer.preview_summarizable_sessions()
+            count = len(eligible_sessions)
+            return count > 0, count
+        except Exception as e:
+            logger.debug(
+                "Pending-summary probe failed for bot %s: %s",
+                bot_id,
+                e,
+            )
+            return False, 0
+
     @staticmethod
     def _has_datetime_activity_since(
         latest_value: datetime | None, last_run_at: datetime | None
@@ -384,13 +406,21 @@ class JobScheduler:
 
         try:
             if job.job_type == JobType.HISTORY_SUMMARIZATION:
+                # Primary gate: if there are eligible unsummarized sessions,
+                # run even without fresh message activity since last_run_at.
+                has_pending, pending_count = self._has_pending_history_summaries(job.bot_id)
+                if has_pending:
+                    return True, f"{pending_count} pending unsummarized session(s)"
+
+                # Secondary gate: new raw activity may create soon-to-be-eligible
+                # sessions even when none are currently eligible.
                 latest_ts = self._max_timestamp_message_activity(job.bot_id)
                 if latest_ts is None:
                     return False, "No conversation messages found"
                 if last_run_at is None:
-                    return True, None
+                    return False, "No eligible sessions yet"
                 if latest_ts > last_run_at.timestamp():
-                    return True, None
+                    return True, "New conversation activity detected"
                 return False, "No new conversation activity since last run"
 
             if job.job_type == JobType.PROFILE_MAINTENANCE:

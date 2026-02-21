@@ -629,6 +629,35 @@ class ServiceClient:
             logger.warning(f"Get history via service failed: {e}")
             return None
 
+    def get_tool_call_events(
+        self,
+        bot_id: str | None = None,
+        user_id: str | None = None,
+        message_id: str | None = None,
+        message_ids: list[str] | None = None,
+        since_hours: int = 24,
+        limit: int = 200,
+    ) -> dict[str, Any] | None:
+        """Fetch tool-call events for history annotation."""
+        if not self.is_available():
+            return None
+
+        params: dict[str, Any] = {"since_hours": since_hours, "limit": limit}
+        if bot_id:
+            params["bot_id"] = bot_id
+        if user_id:
+            params["user_id"] = user_id
+        if message_id:
+            params["message_id"] = message_id
+        if message_ids:
+            params["message_ids"] = list(message_ids)
+
+        try:
+            return self._request("GET", "/v1/tool-calls", params=params)
+        except Exception as e:
+            logger.warning(f"Get tool-call events via service failed: {e}")
+            return None
+
     def clear_history(self, bot_id: str | None = None) -> dict[str, Any] | None:
         """Clear conversation history through the service history endpoint.
 

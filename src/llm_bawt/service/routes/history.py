@@ -1,7 +1,5 @@
 """History and summarization routes."""
 
-import json
-
 from fastapi import APIRouter, HTTPException, Query
 
 from ..dependencies import get_service
@@ -68,6 +66,7 @@ def _build_summary_callable(service, bot_id: str, user_id: str = "system", model
         BATCH_SUMMARIZATION_PROMPT,
         SUMMARIZATION_PROMPT,
         _extract_json_object,
+        compress_structured_summary_text,
         format_session_for_summarization,
         is_summary_low_quality,
     )
@@ -138,7 +137,7 @@ def _build_summary_callable(service, bot_id: str, user_id: str = "system", model
             ]
             response = client.query(
                 messages=messages,
-                max_tokens=900,
+                max_tokens=520,
                 temperature=0.3,
                 plaintext_output=True,
                 stream=False,
@@ -149,7 +148,7 @@ def _build_summary_callable(service, bot_id: str, user_id: str = "system", model
             if any(indicator.lower() in response.lower() for indicator in error_indicators):
                 log.error(f"LLM returned error: {response[:100]}...")
                 return None
-            response_text = response.strip()
+            response_text = compress_structured_summary_text(response.strip(), source_session=session)
             if quality_retry_enabled and is_summary_low_quality(response_text, source_session=session):
                 revision_prompt = (
                     "Your previous summary was too vague. Rewrite with concrete specifics from source material only. "
@@ -166,13 +165,13 @@ def _build_summary_callable(service, bot_id: str, user_id: str = "system", model
                         ),
                         Message(role="user", content=revision_prompt),
                     ],
-                    max_tokens=1100,
+                    max_tokens=620,
                     temperature=0.1,
                     plaintext_output=True,
                     stream=False,
                 )
                 if revised and not is_summary_low_quality(revised, source_session=session):
-                    return revised.strip()
+                    return compress_structured_summary_text(revised.strip(), source_session=session)
             return response_text
         except Exception as e:
             log.error(f"LLM summarization failed: {e}")
@@ -218,7 +217,7 @@ def _build_summary_callable(service, bot_id: str, user_id: str = "system", model
             model_max_tokens = int(service.config.get_model_max_tokens(model_alias) or 4096)
             if model_alias and "grok-4-fast" in model_alias and model_max_tokens < 16384:
                 model_max_tokens = 16384
-            requested_output_tokens = max(2048, min(model_max_tokens, 700 * len(sessions)))
+            requested_output_tokens = max(900, min(model_max_tokens, 320 * len(sessions)))
 
             # xAI OpenAI-compatible endpoint is typically most reliable with json_object mode.
             response_format = {"type": "json_object"}
@@ -282,15 +281,18 @@ def _build_summary_callable(service, bot_id: str, user_id: str = "system", model
                 if cross_links:
                     open_loops = f"{open_loops} Cross-session links: {cross_links}".strip()
 
-                mapped[session_index] = "\n".join(
-                    [
-                        f"Summary: {summary}".rstrip(),
-                        f"Key Details: {key_details}".rstrip(),
-                        f"Intent: {intent}".rstrip(),
-                        f"Tone: {tone}".rstrip(),
-                        f"Open Loops: {open_loops}".rstrip(),
-                    ]
-                ).strip()
+                mapped[session_index] = compress_structured_summary_text(
+                    "\n".join(
+                        [
+                            f"Summary: {summary}".rstrip(),
+                            f"Key Details: {key_details}".rstrip(),
+                            f"Intent: {intent}".rstrip(),
+                            f"Tone: {tone}".rstrip(),
+                            f"Open Loops: {open_loops}".rstrip(),
+                        ]
+                    ).strip(),
+                    source_session=sessions[session_index - 1],
+                )
 
             # Drop vague batch items so they get heuristic fallback instead.
             pre_filter_count = len(mapped)
