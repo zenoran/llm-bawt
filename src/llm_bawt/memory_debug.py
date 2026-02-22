@@ -57,6 +57,16 @@ DEFAULT_TIMEOUT = 30.0
 LONG_TIMEOUT = 120.0  # For operations like consolidation
 
 
+def _confirm(prompt: str) -> bool:
+    """Prompt for y/N confirmation. Returns False if stdin is not a TTY (non-interactive)."""
+    try:
+        answer = console.input(prompt).strip().lower()
+        return answer in ("y", "yes")
+    except (EOFError, KeyboardInterrupt):
+        console.print("[dim]Non-interactive stdin — treating as 'N' (cancelled)[/dim]")
+        return False
+
+
 def get_service_url() -> str:
     """Get the service base URL from config."""
     host = config.SERVICE_HOST or "localhost"
@@ -359,8 +369,7 @@ def handle_delete_memory(bot_id: str, memory_id: str, skip_confirm: bool):
     console.print()
 
     if not skip_confirm:
-        confirm = console.input("[bold yellow]Delete this memory? (y/N):[/bold yellow] ").strip().lower()
-        if confirm not in ('y', 'yes'):
+        if not _confirm("[bold yellow]Delete this memory? (y/N):[/bold yellow] "):
             console.print("[dim]Cancelled[/dim]")
             return
 
@@ -682,7 +691,7 @@ def handle_msg_forget(bot_id: str, count: int, skip_confirm: bool):
     console.print(f"[bold]Messages to forget ({len(messages)}):[/bold]\n")
     display_messages_preview(messages)
 
-    if skip_confirm or console.input("\n[bold yellow]Forget these messages? (y/N):[/bold yellow] ").strip().lower() in ('y', 'yes'):
+    if skip_confirm or _confirm("\n[bold yellow]Forget these messages? (y/N):[/bold yellow] "):
         result = api_post("/v1/memory/forget", {"count": count}, {"bot_id": bot_id})
         if result:
             console.print(f"[green]{result.get('message', 'Done')}[/green]")
@@ -703,7 +712,7 @@ def handle_msg_forget_since(bot_id: str, minutes: int, skip_confirm: bool):
     console.print(f"[bold]Messages from last {minutes} minutes to forget ({len(messages)}):[/bold]\n")
     display_messages_preview(messages)
 
-    if skip_confirm or console.input("\n[bold yellow]Forget these messages? (y/N):[/bold yellow] ").strip().lower() in ('y', 'yes'):
+    if skip_confirm or _confirm("\n[bold yellow]Forget these messages? (y/N):[/bold yellow] "):
         result = api_post("/v1/memory/forget", {"minutes": minutes}, {"bot_id": bot_id})
         if result:
             console.print(f"[green]{result.get('message', 'Done')}[/green]")
@@ -763,14 +772,13 @@ def handle_msg_get(bot_id: str, message_id: str):
             console.print(f"[bold]Summary of:[/bold] {meta.get('message_count', '?')} messages")
     
     console.print(f"\n[bold]Content:[/bold]")
-    console.print(Panel(content, border_style="dim"))
+    console.print(Panel(content or "(empty)", border_style="dim"))
 
 
 def handle_msg_forget_id(bot_id: str, message_id: str, skip_confirm: bool):
     """Soft-delete a specific message by ID."""
     if not skip_confirm:
-        confirm = console.input(f"[bold yellow]Forget message {message_id}? (y/N):[/bold yellow] ").strip().lower()
-        if confirm not in ('y', 'yes'):
+        if not _confirm(f"[bold yellow]Forget message {message_id}? (y/N):[/bold yellow] "):
             console.print("[dim]Cancelled[/dim]")
             return
 
@@ -796,7 +804,7 @@ def handle_msg_restore(bot_id: str, skip_confirm: bool):
     console.print(f"[bold]Forgotten messages to restore ({len(messages)}):[/bold]\n")
     display_messages_preview(messages)
 
-    if skip_confirm or console.input("\n[bold yellow]Restore these messages? (y/N):[/bold yellow] ").strip().lower() in ('y', 'yes'):
+    if skip_confirm or _confirm("\n[bold yellow]Restore these messages? (y/N):[/bold yellow] "):
         result = api_post("/v1/memory/restore", params={"bot_id": bot_id})
         if result:
             console.print(f"[green]{result.get('message', 'Done')}[/green]")
@@ -874,8 +882,7 @@ def handle_msg_summarize(bot_id: str, skip_confirm: bool):
             console.print()
         
         if not skip_confirm:
-            proceed = console.input("[bold yellow]Continue with heuristic summarization? (y/N):[/bold yellow] ").strip().lower()
-            if proceed not in ('y', 'yes'):
+            if not _confirm("[bold yellow]Continue with heuristic summarization? (y/N):[/bold yellow] "):
                 console.print("[dim]Cancelled. Load a model first for better summaries.[/dim]")
                 return
     else:
@@ -907,8 +914,7 @@ def handle_msg_summarize(bot_id: str, skip_confirm: bool):
     console.print()
 
     if not skip_confirm:
-        confirm = console.input("[bold yellow]Summarize these sessions? (y/N):[/bold yellow] ").strip().lower()
-        if confirm not in ('y', 'yes'):
+        if not _confirm("[bold yellow]Summarize these sessions? (y/N):[/bold yellow] "):
             console.print("[dim]Cancelled[/dim]")
             return
 
@@ -936,8 +942,7 @@ def handle_msg_summarize(bot_id: str, skip_confirm: bool):
         console.print()
         
         if not skip_confirm:
-            fallback = console.input("[bold yellow]Use heuristic summarization for failed sessions? (y/N):[/bold yellow] ").strip().lower()
-            if fallback in ('y', 'yes'):
+            if _confirm("[bold yellow]Use heuristic summarization for failed sessions? (y/N):[/bold yellow] "):
                 console.print()
                 with console.status("[bold green]Summarizing with heuristic fallback..."):
                     result2 = api_post("/v1/history/summarize", params={"bot_id": bot_id, "use_heuristic": True}, timeout=LONG_TIMEOUT)
@@ -970,10 +975,7 @@ def handle_msg_rebuild_summaries(
     console.print()
 
     if not skip_confirm:
-        confirm = console.input(
-            "[bold yellow]Recalculate and replace existing summaries for these sessions? (y/N):[/bold yellow] "
-        ).strip().lower()
-        if confirm not in ("y", "yes"):
+        if not _confirm("[bold yellow]Recalculate and replace existing summaries for these sessions? (y/N):[/bold yellow] "):
             console.print("[dim]Cancelled[/dim]")
             return
 
@@ -1017,10 +1019,7 @@ def handle_msg_rebuild_summaries(
             console.print(f"  [red]- {err}[/red]")
 
         if not skip_confirm:
-            fallback = console.input(
-                "[bold yellow]Retry with heuristic fallback? (y/N):[/bold yellow] "
-            ).strip().lower()
-            if fallback in ("y", "yes"):
+            if _confirm("[bold yellow]Retry with heuristic fallback? (y/N):[/bold yellow] "):
                 with console.status("[bold green]Rebuilding with heuristic fallback..."):
                     params2 = {
                         "bot_id": bot_id,
@@ -1137,8 +1136,7 @@ def handle_msg_summary_get(bot_id: str, summary_id_prefix: str):
 def handle_msg_delete_summary(bot_id: str, summary_id: str, skip_confirm: bool):
     """Delete a summary and restore the original messages."""
     if not skip_confirm:
-        confirm = console.input(f"[bold yellow]Delete summary {summary_id} and restore original messages? (y/N):[/bold yellow] ").strip().lower()
-        if confirm not in ('y', 'yes'):
+        if not _confirm(f"[bold yellow]Delete summary {summary_id} and restore original messages? (y/N):[/bold yellow] "):
             console.print("[dim]Cancelled[/dim]")
             return
 

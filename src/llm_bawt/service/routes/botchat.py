@@ -30,30 +30,20 @@ _HA_CONFLICTING_LINES = frozenset(
 
 
 def _sanitize_client_context(text: str) -> str:
-    """Strip HA boilerplate and device CSV from client context.
+    """Strip HA boilerplate from client context.
 
-    With HA native MCP tools, the device list is unnecessary — the LLM
-    uses GetLiveContext and tools like HassTurnOn with friendly names.
-    The HA prompt instructions also conflict with our tool-calling system.
+    The HA prompt instructions conflict with our tool-calling system,
+    so we remove those lines. The device CSV list is kept intact so
+    the LLM can identify devices by entity ID and friendly name.
     """
     lines = text.splitlines()
     cleaned = []
-    in_csv_block = False
 
     for line in lines:
         stripped = line.strip().lower()
 
         # Skip known conflicting HA instructions
         if stripped in _HA_CONFLICTING_LINES:
-            continue
-
-        # Skip the entire CSV device list block
-        if "entity_id,name,state" in stripped or "```csv" in stripped:
-            in_csv_block = True
-            continue
-        if in_csv_block:
-            if stripped.startswith("```") or stripped == "":
-                in_csv_block = False
             continue
 
         # Skip HA prompt boilerplate that conflicts with our tool system

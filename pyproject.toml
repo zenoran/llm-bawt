@@ -97,3 +97,9 @@ build-backend = "setuptools.build_meta"
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.pytest.ini_options]
+markers = [
+    "service: requires the llm-bawt service running at :8642",
+    "llm_call: makes real LLM API calls (slow, uses API credits)",
+]
