@@ -192,15 +192,12 @@ def _load_bots_config() -> None:
     db_profiles_by_slug: dict[str, Any] = {}
     db_bot_settings: dict[str, dict[str, Any]] = {}
 
-    # Load profiles from DB first (if available).
-    # In service mode the CLI should NOT connect to the DB directly — the
-    # service owns all DB access.  We skip this block entirely when
-    # USE_SERVICE is enabled and fall back to YAML-only bot definitions.
+    # Load profiles from DB if credentials are available.
+    # Both the service process and direct-mode CLI load from DB here.
     try:
         config = Config()
-        from llm_bawt.model_manager import is_service_mode_enabled
 
-        if not is_service_mode_enabled(config) and has_database_credentials(config):
+        if has_database_credentials(config):
             from llm_bawt.runtime_settings import BotProfileStore, RuntimeSettingsStore
 
             profile_store = BotProfileStore(config)

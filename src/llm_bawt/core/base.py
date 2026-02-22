@@ -23,7 +23,7 @@ from ..clients import LLMClient
 from ..profiles import ProfileManager, EntityType
 from ..runtime_settings import RuntimeSettingsResolver
 from ..memory_server.client import MemoryClient, get_memory_client
-from ..integrations.ha_mcp.client import HomeAssistantMCPClient
+from ..integrations.ha_mcp.client import HomeAssistantMCPClient, HomeAssistantNativeClient
 from ..integrations.newsapi.client import NewsAPIClient
 from ..search import get_search_client, SearchClient
 from ..tools import get_tools_prompt, get_tools_list, query_with_tools
@@ -89,6 +89,7 @@ class BaseLLMBawt(ABC):
         self.profile_manager: ProfileManager | None = None
         self.search_client: SearchClient | None = None
         self.home_client: HomeAssistantMCPClient | None = None
+        self.ha_native_client: HomeAssistantNativeClient | None = None
         self.news_client: NewsAPIClient | None = None
         self.model_lifecycle: ModelLifecycleManager | None = None
         self.client: LLMClient
@@ -98,6 +99,7 @@ class BaseLLMBawt(ABC):
         self.adapter: ModelAdapter
         self.settings: RuntimeSettingsResolver | None = None
         self._client_system_context: str | None = None
+        self._ha_mode: bool = False
 
         if not self.model_definition:
             raise ValueError(f"Could not find model definition for: '{resolved_model_alias}'")
@@ -346,7 +348,7 @@ class BaseLLMBawt(ABC):
                 if self.bot.uses_tools and self.config.VERBOSE:
                     logger.info(f"Tool calling disabled for model {self.resolved_model_alias} (tool_format=none)")
             else:
-                use_tools = (self.bot.uses_tools and (self.memory is not None or self.home_client is not None)) or (
+                use_tools = (self.bot.uses_tools and (self.memory is not None or self.home_client is not None or self.ha_native_client is not None)) or (
                     self.memory and not self.bot.uses_tools
                 )
             # Resolve per-bot generation parameters once for this query
@@ -369,6 +371,7 @@ class BaseLLMBawt(ABC):
                         profile_manager=self.profile_manager,
                         search_client=self.search_client if self.bot.uses_tools else None,
                         home_client=self.home_client if self.bot.uses_tools else None,
+                        ha_native_client=self.ha_native_client if self.bot.uses_tools else None,
                         news_client=self.news_client if self.bot.uses_tools else None,
                         model_lifecycle=self.model_lifecycle if self.bot.uses_tools else None,
                         config=self.config,
@@ -505,7 +508,8 @@ class BaseLLMBawt(ABC):
             )
 
         # Cold-start memory priming: inject top memories when history is thin
-        if self.memory:
+        # Skip for HA-mode — device commands don't need semantic memories
+        if self.memory and not self._ha_mode:
             history_count = len(self.history_manager.messages)
             if history_count <= 3:
                 cold_start_context = self._retrieve_cold_start_memories(prompt)
@@ -542,10 +546,33 @@ class BaseLLMBawt(ABC):
         history = self.history_manager.get_context_messages(
             max_tokens=max_context_tokens
         )
-        for msg in history:
-            if msg.role in ("user", "assistant", "summary"):
-                messages.append(msg)
-        
+
+        if self._ha_mode:
+            # HA-mode: drop summaries, keep only last 6 user/assistant/tool-result msgs.
+            # Device commands are stateless — long history causes hallucinated tool calls.
+            ha_msgs = []
+            for msg in history:
+                if msg.role in ("user", "assistant"):
+                    ha_msgs.append(msg)
+                elif msg.role == "system" and msg.content and (
+                    msg.content.startswith("[Tool Results]")
+                    or msg.content.startswith("[Tools used:")
+                ):
+                    ha_msgs.append(msg)
+                # Skip 'summary' role entirely
+            messages.extend(ha_msgs[-6:])
+        else:
+            for msg in history:
+                if msg.role in ("user", "assistant", "summary"):
+                    messages.append(msg)
+                elif msg.role == "system" and msg.content and (
+                    msg.content.startswith("[Tool Results]")
+                    or msg.content.startswith("[Tools used:")
+                ):
+                    # Include tool-result system messages so the LLM sees
+                    # evidence that past device actions required real tool calls.
+                    messages.append(msg)
+
         return messages
 
     def _get_tool_definitions(self) -> list:
@@ -553,11 +580,19 @@ class BaseLLMBawt(ABC):
         include_news = self.news_client is not None
         include_home = self.home_client is not None
         include_models = self.model_lifecycle is not None
+
+        # Convert HA native tools if available
+        ha_native_tools = None
+        if self.ha_native_client and self.ha_native_client.initialized:
+            from ..tools.definitions import ha_tools_to_tool_definitions
+            ha_native_tools = ha_tools_to_tool_definitions(self.ha_native_client.tools)
+
         tools = get_tools_list(
             include_search_tools=include_search,
             include_news_tools=include_news,
             include_home_tools=include_home,
             include_model_tools=include_models,
+            ha_native_tools=ha_native_tools,
         )
         if self.memory is None:
             disallowed = {"memory", "history", "profile", "self"}
@@ -565,18 +600,40 @@ class BaseLLMBawt(ABC):
         return tools
 
     def _init_home_assistant(self, config: Config):
-        """Initialize Home Assistant MCP client if enabled."""
-        if not getattr(config, "HA_MCP_ENABLED", False):
-            return
+        """Initialize Home Assistant integration.
+
+        Priority: HA native MCP > legacy custom MCP server.
+        """
         if not self.bot.uses_tools:
+            return
+
+        # Try native MCP first (direct connection to HA's /api/mcp)
+        native_url = getattr(config, "HA_NATIVE_MCP_URL", "") or ""
+        native_token = getattr(config, "HA_NATIVE_MCP_TOKEN", "") or ""
+        if native_url and native_token:
+            try:
+                client = HomeAssistantNativeClient(config)
+                if client.available:
+                    tools = client.discover_tools()
+                    if tools:
+                        self.ha_native_client = client
+                        logger.info(f"HA native MCP initialized with {len(tools)} tools")
+                        return
+                    else:
+                        logger.warning("HA native MCP connected but no tools discovered")
+            except Exception as e:
+                logger.warning(f"Failed to initialize HA native MCP: {e}")
+
+        # Fallback to legacy custom MCP server
+        if not getattr(config, "HA_MCP_ENABLED", False):
             return
         try:
             client = HomeAssistantMCPClient(config)
             if client.available:
                 self.home_client = client
-                logger.debug("Home Assistant MCP client initialized")
+                logger.debug("Legacy Home Assistant MCP client initialized")
         except Exception as e:
-            logger.warning(f"Failed to initialize Home Assistant MCP client: {e}")
+            logger.warning(f"Failed to initialize legacy HA MCP client: {e}")
 
     def _init_newsapi(self) -> None:
         """Initialize NewsAPI client if API key is available."""

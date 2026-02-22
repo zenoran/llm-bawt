@@ -84,12 +84,29 @@ src/llm_bawt/
 │   └── extraction.py       # Extraction service
 ├── service/                # Background FastAPI service
 │   ├── server.py           # FastAPI server
-│   ├── api.py              # API routes
+│   ├── api.py              # API route registration
 │   ├── core.py             # ServiceLLMBawt
 │   ├── client.py           # ServiceClient
 │   ├── logging.py          # Request/response logging
 │   ├── scheduler.py        # JobScheduler
-│   └── tasks.py            # Async task processing
+│   ├── tasks.py            # Async task processing
+│   ├── turn_logs.py        # TurnLog model + TurnLogStore (persistent turn logging)
+│   ├── tool_call_events.py # Tool-call correlation helpers
+│   └── routes/             # FastAPI route modules (mounted in api.py)
+│       ├── __init__.py     # Route registration
+│       ├── chat.py         # /v1/chat/completions
+│       ├── botchat.py      # /v1/botchat (bot-to-bot messaging)
+│       ├── health.py       # /health
+│       ├── history.py      # /v1/history/*
+│       ├── jobs.py         # /v1/jobs/*
+│       ├── llm.py          # /v1/llm/* (model queries)
+│       ├── memory.py       # /v1/memory/*
+│       ├── models.py       # /v1/models, /v1/bots
+│       ├── nextcloud.py    # /nextcloud/* (Nextcloud Talk integration)
+│       ├── profiles.py     # /v1/profiles/*
+│       ├── settings.py     # /v1/settings/*
+│       ├── tasks.py        # /v1/tasks/*
+│       └── turn_logs.py    # /v1/turn-logs, /v1/tool-calls
 ├── integrations/           # External service integrations
 │   └── nextcloud/          # Nextcloud Talk bot routing
 ├── models/

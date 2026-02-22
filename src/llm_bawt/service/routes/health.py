@@ -28,8 +28,28 @@ async def get_system_status():
     from llm_bawt.core.status import collect_system_status
 
     service = get_service()
-    status = collect_system_status(service.config)
-    return SystemStatusResponse(**dataclasses.asdict(status))
+    # Collect local status (local_only=True avoids recursive self-call)
+    status = collect_system_status(service.config, local_only=True)
+    status_dict = dataclasses.asdict(status)
+
+    # Override service info with real running-service data.
+    # When collect_system_status runs local_only=True the ServiceInfo is empty
+    # (available=False) because it deliberately skips the network check.
+    # We are *inside* the service right now, so we can populate it directly.
+    svc = service.get_status()
+    status_dict["service"] = {
+        "available": True,
+        "healthy": svc.healthy,
+        "uptime_seconds": svc.uptime_seconds,
+        "current_model": svc.current_model,
+        "tasks_processed": svc.tasks_processed,
+        "tasks_pending": svc.tasks_pending,
+    }
+
+    # local_only=True also sets mode="direct"; correct it to "service".
+    status_dict["config"]["mode"] = "service"
+
+    return SystemStatusResponse(**status_dict)
 
 
 # -------------------------------------------------------------------------

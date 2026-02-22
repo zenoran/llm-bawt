@@ -12,10 +12,12 @@ from .nextcloud import router as nextcloud_router
 from .profiles import router as profiles_router
 from .settings import router as settings_router
 from .tasks import router as tasks_router
+from .ha_weather import router as ha_weather_router
 from .turn_logs import router as turn_logs_router
 
 all_routers = [
     health_router,
+    ha_weather_router,
     nextcloud_router,
     models_router,
     botchat_router,

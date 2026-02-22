@@ -264,6 +264,7 @@ class ServiceLLMBawt(BaseLLMBawt):
             or self.search_client
             or self.news_client
             or self.home_client
+            or self.ha_native_client
             or self.model_lifecycle
         ):
             tool_definitions = self._get_tool_definitions()
@@ -281,6 +282,7 @@ class ServiceLLMBawt(BaseLLMBawt):
                 profile_manager=self.profile_manager,
                 search_client=self.search_client,
                 home_client=self.home_client,
+                ha_native_client=self.ha_native_client,
                 news_client=self.news_client,
                 model_lifecycle=self.model_lifecycle,
                 config=self.config,
@@ -291,6 +293,7 @@ class ServiceLLMBawt(BaseLLMBawt):
                 tools=tool_definitions,
                 adapter=self.adapter,
                 history_manager=self.history_manager,
+                ha_mode=self._ha_mode,
             )
         
         response = self.client.query(

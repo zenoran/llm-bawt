@@ -136,7 +136,9 @@ async def get_tool_call_events(
     user_id: str | None = Query(None, description="Filter by user ID"),
     message_id: str | None = Query(None, description="Single message ID to match"),
     message_ids: list[str] | None = Query(None, description="Message IDs (repeat param or CSV)"),
-    since_hours: int = Query(168, ge=1, le=168, description="Only include turns from recent N hours"),
+    after: float | None = Query(None, description="Only include turns created after this unix timestamp"),
+    before: float | None = Query(None, description="Only include turns created before this unix timestamp"),
+    since_hours: int = Query(168, ge=1, le=168, description="Only include turns from recent N hours (ignored if after/before set)"),
     limit: int = Query(200, ge=1, le=1000, description="Max tool-call events to return"),
 ):
     """List tool-call events keyed by trigger message ID for history annotation."""
@@ -146,10 +148,14 @@ async def get_tool_call_events(
         raise HTTPException(status_code=503, detail="Turn logs DB unavailable")
 
     target_ids = parse_message_filters(message_id, message_ids)
+
     rows, _ = store.list_turns(
         bot_id=bot_id,
         user_id=user_id,
         has_tools=True,
+        trigger_message_ids=target_ids or None,
+        after=after,
+        before=before,
         since_hours=since_hours,
         limit=min(limit, 1000),
         offset=0,
@@ -161,14 +167,17 @@ async def get_tool_call_events(
         if not isinstance(parsed_tools, list) or not parsed_tools:
             continue
 
-        parsed_request = _parse_json(row.request_json)
-        trigger = extract_trigger_message(parsed_request)
-        if trigger is None:
-            continue
-
-        trigger_id, trigger_role, trigger_timestamp = trigger
-        if not message_id_matches(trigger_id, target_ids):
-            continue
+        trigger_id = row.trigger_message_id
+        trigger_role = "user"
+        trigger_timestamp: float | None = None
+        if not trigger_id:
+            parsed_request = _parse_json(row.request_json)
+            trigger = extract_trigger_message(parsed_request)
+            if trigger is None:
+                continue
+            trigger_id, trigger_role, trigger_timestamp = trigger
+            if target_ids and not message_id_matches(trigger_id, target_ids):
+                continue
 
         events.append(
             ToolCallEvent(
@@ -195,9 +204,8 @@ async def get_tool_call_events(
         filters={
             "bot_id": bot_id,
             "user_id": user_id,
-            "message_id": message_id,
-            "message_ids": sorted(target_ids),
-            "since_hours": since_hours,
+            "after": after,
+            "before": before,
             "limit": limit,
         },
     )

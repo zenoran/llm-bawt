@@ -8,12 +8,27 @@ import time
 from datetime import datetime, timedelta
 from urllib.parse import quote_plus
 
-from sqlalchemy import Column, DateTime, Text
+from sqlalchemy import Column, DateTime, Text, text as sa_text
 from sqlmodel import Field, SQLModel, Session, create_engine, delete, select
 
 from ..utils.config import Config, has_database_credentials
 
 logger = logging.getLogger(__name__)
+
+
+def _extract_trigger_id(request_payload: dict) -> str | None:
+    """Extract the last user message ID from a request payload."""
+    messages = request_payload.get("messages")
+    if not isinstance(messages, list):
+        return None
+    for message in reversed(messages):
+        if not isinstance(message, dict) or str(message.get("role") or "") != "user":
+            continue
+        for key in ("id", "db_id", "message_id"):
+            value = message.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+    return None
 
 
 class TurnLog(SQLModel, table=True):
@@ -39,6 +54,7 @@ class TurnLog(SQLModel, table=True):
     response_text: str | None = Field(default=None, sa_column=Column(Text, nullable=True))
     tool_calls_json: str | None = Field(default=None, sa_column=Column(Text, nullable=True))
     error_text: str | None = Field(default=None, sa_column=Column(Text, nullable=True))
+    trigger_message_id: str | None = Field(default=None, index=True)
 
 
 class TurnLogStore:
@@ -61,6 +77,7 @@ class TurnLogStore:
             url = f"postgresql+psycopg2://{user}:{encoded_password}@{host}:{port}/{database}"
             self.engine = create_engine(url, echo=False)
             self._ensure_tables_exist()
+            self._backfill_trigger_message_ids()
         except Exception as e:
             self.engine = None
             logger.warning("Turn logs DB unavailable: %s", e)
@@ -69,6 +86,52 @@ class TurnLogStore:
         if self.engine is None:
             return
         SQLModel.metadata.create_all(self.engine, tables=[TurnLog.__table__])
+        # Add columns that may not exist on older tables.
+        with self.engine.connect() as conn:
+            try:
+                conn.execute(sa_text(
+                    "ALTER TABLE turn_logs ADD COLUMN IF NOT EXISTS"
+                    " trigger_message_id VARCHAR"
+                ))
+                conn.execute(sa_text(
+                    "CREATE INDEX IF NOT EXISTS ix_turn_logs_trigger_message_id"
+                    " ON turn_logs (trigger_message_id)"
+                ))
+                conn.commit()
+            except Exception:
+                pass
+
+    def _backfill_trigger_message_ids(self) -> None:
+        """One-time backfill: populate trigger_message_id for existing rows."""
+        if self.engine is None:
+            return
+        try:
+            with Session(self.engine) as session:
+                rows = session.exec(
+                    select(TurnLog)
+                    .where(TurnLog.trigger_message_id.is_(None))
+                    .where(TurnLog.request_json.is_not(None))
+                    .limit(5000)
+                ).all()
+                if not rows:
+                    return
+                updated = 0
+                for row in rows:
+                    try:
+                        payload = json.loads(row.request_json) if row.request_json else None
+                    except Exception:
+                        continue
+                    if payload:
+                        tid = _extract_trigger_id(payload)
+                        if tid:
+                            row.trigger_message_id = tid
+                            session.add(row)
+                            updated += 1
+                if updated:
+                    session.commit()
+                    logger.info("Backfilled trigger_message_id for %d turn logs", updated)
+        except Exception as e:
+            logger.debug("trigger_message_id backfill skipped: %s", e)
 
     def _cleanup_expired_if_due(self, force: bool = False) -> None:
         if self.engine is None:
@@ -103,12 +166,17 @@ class TurnLogStore:
         response_text: str | None,
         tool_calls: list[dict] | None,
         error_text: str | None = None,
+        trigger_message_id: str | None = None,
     ) -> None:
         """Persist one turn entry and enforce short TTL cleanup."""
         if self.engine is None:
             return
 
         self._cleanup_expired_if_due()
+
+        # Auto-extract trigger message ID from request if not provided.
+        if trigger_message_id is None and request_payload:
+            trigger_message_id = _extract_trigger_id(request_payload)
 
         row = TurnLog(
             id=turn_id,
@@ -125,6 +193,7 @@ class TurnLogStore:
             response_text=response_text,
             tool_calls_json=json.dumps(tool_calls or [], ensure_ascii=False, default=str),
             error_text=error_text,
+            trigger_message_id=trigger_message_id,
         )
 
         with Session(self.engine) as session:
@@ -149,6 +218,9 @@ class TurnLogStore:
         status: str | None = None,
         stream: bool | None = None,
         has_tools: bool | None = None,
+        trigger_message_ids: set[str] | None = None,
+        after: float | None = None,
+        before: float | None = None,
         since_hours: int = 24,
         limit: int = 100,
         offset: int = 0,
@@ -158,8 +230,15 @@ class TurnLogStore:
             return [], 0
         self._cleanup_expired_if_due()
 
-        since_cutoff = datetime.utcnow() - timedelta(hours=max(1, int(since_hours)))
-        conditions: list = [TurnLog.created_at >= since_cutoff]
+        conditions: list = []
+        if after is not None:
+            conditions.append(TurnLog.created_at >= datetime.utcfromtimestamp(after))
+        elif before is None:
+            # Only apply since_hours if no explicit time range given.
+            since_cutoff = datetime.utcnow() - timedelta(hours=max(1, int(since_hours)))
+            conditions.append(TurnLog.created_at >= since_cutoff)
+        if before is not None:
+            conditions.append(TurnLog.created_at <= datetime.utcfromtimestamp(before))
         if bot_id:
             conditions.append(TurnLog.bot_id == bot_id.strip().lower())
         if user_id:
@@ -177,6 +256,8 @@ class TurnLogStore:
             conditions.append(TurnLog.tool_calls_json != "[]")
         elif has_tools is False:
             conditions.append((TurnLog.tool_calls_json.is_(None)) | (TurnLog.tool_calls_json == "[]"))
+        if trigger_message_ids:
+            conditions.append(TurnLog.trigger_message_id.in_(trigger_message_ids))
 
         statement = select(TurnLog).where(*conditions).order_by(TurnLog.created_at.desc())
         count_statement = select(TurnLog).where(*conditions)

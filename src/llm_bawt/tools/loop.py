@@ -19,7 +19,7 @@ from .parser import ToolCall, format_tool_result
 if TYPE_CHECKING:
     from ..models.message import Message
     from ..clients import LLMClient
-    from ..integrations.ha_mcp.client import HomeAssistantMCPClient
+    from ..integrations.ha_mcp.client import HomeAssistantMCPClient, HomeAssistantNativeClient
     from ..integrations.newsapi.client import NewsAPIClient
     from ..memory_server.client import MemoryClient
     from ..profiles import ProfileManager
@@ -44,6 +44,7 @@ class ToolLoop:
         profile_manager: "ProfileManager | None" = None,
         search_client: "SearchClient | None" = None,
         home_client: "HomeAssistantMCPClient | None" = None,
+        ha_native_client: "HomeAssistantNativeClient | None" = None,
         news_client: "NewsAPIClient | None" = None,
         model_lifecycle: "ModelLifecycleManager | None" = None,
         config: "Config | None" = None,
@@ -55,6 +56,7 @@ class ToolLoop:
         adapter: "ModelAdapter | None" = None,
         history_manager: "HistoryManager | None" = None,
         generation_kwargs: dict | None = None,
+        ha_mode: bool = False,
     ):
         """
         Args:
@@ -62,6 +64,7 @@ class ToolLoop:
             profile_manager: Manager for profile operations.
             search_client: Client for web search operations.
             home_client: Home Assistant MCP client.
+            ha_native_client: Home Assistant native MCP client.
             news_client: NewsAPI client.
             model_lifecycle: Manager for model lifecycle operations.
             config: Application config (used for lazy search setup).
@@ -70,6 +73,7 @@ class ToolLoop:
             max_iterations: Maximum tool call iterations per turn (None = use config default).
             adapter: Model adapter for model-specific stop sequences and output cleaning.
             history_manager: History manager for recall operations.
+            ha_mode: If True, force tool_choice="required" on first iteration.
         """
         if not user_id:
             raise ValueError("user_id is required for ToolLoop")
@@ -78,6 +82,7 @@ class ToolLoop:
             profile_manager=profile_manager,
             search_client=search_client,
             home_client=home_client,
+            ha_native_client=ha_native_client,
             news_client=news_client,
             model_lifecycle=model_lifecycle,
             config=config,
@@ -91,6 +96,9 @@ class ToolLoop:
             self.max_iterations = config_max if config_max > 0 else 100
         else:
             self.max_iterations = max_iterations
+        # HA-mode: cap iterations — device commands need at most a few tool calls
+        if ha_mode and self.max_iterations > 3:
+            self.max_iterations = 3
         self.tool_context: list[dict] = []  # Track tool interactions for history
         self.tool_call_details: list[dict] = []  # Per-call detail for debug logging
         self.tool_format = tool_format
@@ -99,6 +107,7 @@ class ToolLoop:
         self._using_native_tools = False
         self.adapter = adapter
         self.generation_kwargs = generation_kwargs or {}
+        self.ha_mode = ha_mode
     
     def run(
         self,
@@ -462,6 +471,7 @@ def query_with_tools(
     profile_manager: "ProfileManager | None" = None,
     search_client: "SearchClient | None" = None,
     home_client: "HomeAssistantMCPClient | None" = None,
+    ha_native_client: "HomeAssistantNativeClient | None" = None,
     news_client: "NewsAPIClient | None" = None,
     model_lifecycle: "ModelLifecycleManager | None" = None,
     config: "Config | None" = None,
@@ -474,6 +484,7 @@ def query_with_tools(
     adapter: "ModelAdapter | None" = None,
     history_manager: "HistoryManager | None" = None,
     generation_kwargs: dict | None = None,
+    ha_mode: bool = False,
 ) -> tuple[str, str, list[dict]]:
     """Convenience function for tool-enabled queries.
 
@@ -484,6 +495,7 @@ def query_with_tools(
         profile_manager: Profile manager for user/bot profile tools.
         search_client: Search client for web search tools.
         home_client: Home Assistant MCP client for smart-home tools.
+        ha_native_client: Home Assistant native MCP client.
         news_client: NewsAPI client for news tools.
         model_lifecycle: Model lifecycle manager for model switching tools.
         config: Application config (used for lazy search setup).
@@ -495,6 +507,7 @@ def query_with_tools(
         tools: Tool definitions to include in schema/formatting.
         adapter: Model adapter for model-specific stop sequences.
         history_manager: History manager for recall operations.
+        ha_mode: If True, force tool_choice="required" on first iteration.
 
     Returns:
         Tuple of (final_response, tool_context_summary, tool_call_details).
@@ -508,6 +521,7 @@ def query_with_tools(
         profile_manager=profile_manager,
         search_client=search_client,
         home_client=home_client,
+        ha_native_client=ha_native_client,
         news_client=news_client,
         model_lifecycle=model_lifecycle,
         config=config,
@@ -519,6 +533,7 @@ def query_with_tools(
         adapter=adapter,
         history_manager=history_manager,
         generation_kwargs=generation_kwargs,
+        ha_mode=ha_mode,
     )
     response = loop.run(messages, client, stream_final=stream)
     tool_context = loop.get_tool_context_summary()

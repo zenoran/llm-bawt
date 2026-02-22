@@ -1,5 +1,5 @@
 """Home Assistant MCP integration."""
 
-from .client import HomeAssistantMCPClient
+from .client import HomeAssistantMCPClient, HomeAssistantNativeClient, HAToolDefinition
 
-__all__ = ["HomeAssistantMCPClient"]
+__all__ = ["HomeAssistantMCPClient", "HomeAssistantNativeClient", "HAToolDefinition"]

@@ -25,7 +25,7 @@ from .parser import ToolCall, format_tool_result
 from .definitions import normalize_legacy_tool_call
 
 if TYPE_CHECKING:
-    from ..integrations.ha_mcp.client import HomeAssistantMCPClient
+    from ..integrations.ha_mcp.client import HomeAssistantMCPClient, HomeAssistantNativeClient
     from ..integrations.newsapi.client import NewsAPIClient
     from ..memory_server.client import MemoryClient
     from ..profiles import ProfileManager
@@ -132,6 +132,7 @@ class ToolExecutor:
         profile_manager: "ProfileManager | None" = None,
         search_client: "SearchClient | None" = None,
         home_client: "HomeAssistantMCPClient | None" = None,
+        ha_native_client: "HomeAssistantNativeClient | None" = None,
         news_client: "NewsAPIClient | None" = None,
         model_lifecycle: "ModelLifecycleManager | None" = None,
         config: "Config | None" = None,
@@ -146,6 +147,7 @@ class ToolExecutor:
             profile_manager: Profile manager for user/bot profile operations.
             search_client: Search client for web search operations.
             home_client: Home Assistant MCP client.
+            ha_native_client: Home Assistant native MCP client.
             news_client: NewsAPI client for news search/headlines.
             model_lifecycle: Model lifecycle manager for model switching.
             user_id: Current user ID for profile operations (required).
@@ -158,6 +160,7 @@ class ToolExecutor:
         self.profile_manager = profile_manager
         self.search_client = search_client
         self.home_client = home_client
+        self.ha_native_client = ha_native_client
         self.news_client = news_client
         self.model_lifecycle = model_lifecycle
         self.config = config
@@ -249,6 +252,10 @@ class ToolExecutor:
 
         result: str
         try:
+            # Check if this is an HA native tool call
+            if self.ha_native_client and self.ha_native_client.is_ha_tool(normalized_call.name):
+                return self._execute_ha_native_tool(normalized_call)
+
             handler = self._handlers.get(normalized_call.name)
             if handler:
                 result = handler(normalized_call)
@@ -1505,11 +1512,12 @@ class ToolExecutor:
                         None,
                         error="action='set' requires 'entity' and 'state'",
                     )
-                if state not in {"on", "off", "toggle"}:
+                valid_states = {"on", "off", "toggle", "open", "close", "stop", "lock", "unlock"}
+                if state not in valid_states:
                     return format_tool_result(
                         tool_call.name,
                         None,
-                        error="state must be one of: on, off, toggle",
+                        error=f"state must be one of: {', '.join(sorted(valid_states))}",
                     )
 
                 brightness_raw = tool_call.arguments.get("brightness")
@@ -1580,6 +1588,26 @@ class ToolExecutor:
                 self.home_client = client
         except Exception as e:
             logger.warning(f"Failed to initialize Home Assistant MCP client: {e}")
+
+    def _execute_ha_native_tool(self, tool_call: ToolCall) -> str:
+        """Execute an HA native MCP tool call (passthrough to HA)."""
+        if not self.ha_native_client:
+            return format_tool_result(tool_call.name, "HA native MCP client not available")
+
+        tool_name = tool_call.name
+        arguments = tool_call.arguments or {}
+
+        # Strip None values — HA doesn't want them
+        clean_args = {k: v for k, v in arguments.items() if v is not None}
+
+        logger.info(f"HA native tool call: {tool_name}({clean_args})")
+        try:
+            result = self.ha_native_client.call_tool(tool_name, clean_args)
+            logger.debug(f"HA native tool result: {result[:200] if result else '(empty)'}")
+            return format_tool_result(tool_name, result or "Done")
+        except Exception as e:
+            logger.error(f"HA native tool call failed: {tool_name}: {e}")
+            return format_tool_result(tool_name, f"Error: {e}")
 
     @staticmethod
     def _home_needs_resolution(text: str) -> bool:

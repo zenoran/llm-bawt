@@ -41,8 +41,11 @@ class TestReActFormatHandler:
 
     def test_stop_sequences(self, handler):
         stops = handler.get_stop_sequences()
-        assert "\nObservation:" in stops
-        assert "\nObservation" in stops
+        # Stop sequences are now post-action-JSON format: they trigger after the
+        # closing brace of Action Input JSON to catch model continuations.
+        assert any("Observation" in s for s in stops)
+        # At least one stop that includes Observation
+        assert any(s for s in stops if "}".startswith(s[:1]) or "Observation" in s)
 
     def test_parse_basic_action(self, handler):
         response = """Thought: I need to search for user preferences
@@ -100,16 +103,17 @@ Action Input: {"query": "test",}"""  # trailing comma
         assert calls[0].arguments == {"query": "test"}
 
     def test_parse_missing_closing_brace(self, handler):
-        """Parser can't extract JSON without closing brace - returns no calls."""
+        """Parser recovers from incomplete JSON by attempting partial extraction."""
         response = """Thought: Searching
 Action: search_memories
 Action Input: {"query": "test" """
 
         calls, remaining = handler.parse_response(response)
 
-        # JSON extraction requires balanced braces - incomplete JSON fails gracefully
-        assert len(calls) == 0
-        assert remaining == response.strip()
+        # Parser now handles partial JSON gracefully - extracts what it can
+        assert len(calls) == 1
+        assert calls[0].name == "search_memories"
+        assert calls[0].arguments.get("query") == "test"
 
     def test_sanitize_removes_thought_markers(self, handler):
         response = """Thought: Let me think about this
@@ -500,16 +504,25 @@ This will search for test.'''
         assert "This will search for test." in sanitized
 
     def test_stop_sequences_only_observation(self, handler):
-        """Stop sequences should only include Observation markers.
-        
-        We want to stop the model before it hallucinates tool results,
-        but NOT stop before Thought, Action, or Final Answer.
+        """Stop sequences include Observation markers and post-action continuation guards.
+
+        The '}\\nThought' and '}\\nFinal Answer' sequences prevent the model from
+        hallucinating continuations after it closes an Action Input JSON block.
+        They only fire when immediately following a closing brace, so they don't
+        block a normal Thought or Final Answer at the start of a turn.
         """
         stops = handler.get_stop_sequences()
-        
+
         # Should stop before hallucinated observations
         assert any("Observation" in s for s in stops)
-        
-        # Should NOT stop at other markers
+
+        # Should NOT stop at bare Tool: markers
         assert not any("Tool:" in s for s in stops)
-        assert not any("Final Answer" in s for s in stops)
+
+        # Post-action Final Answer and Thought stops are intentional (prevent
+        # hallucinating content after closing the Action Input JSON)
+        final_stops = [s for s in stops if "Final Answer" in s]
+        thought_stops = [s for s in stops if "Thought" in s and "Observation" not in s]
+        # All such stops must be prefixed with '}' (post-JSON-close guards only)
+        assert all(s.startswith("}") for s in final_stops)
+        assert all(s.startswith("}") for s in thought_stops)

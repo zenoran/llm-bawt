@@ -37,6 +37,7 @@ class ChatCompletionRequest(BaseModel):
     augment_memory: bool = Field(default=True, description="Whether to augment with memory context")
     extract_memory: bool = Field(default=True, description="Whether to extract memories from response")
     client_system_context: str | None = Field(default=None, description="System context extracted from client messages (set by routes, not by callers)", exclude=True)
+    ha_mode: bool = Field(default=False, description="HA-mode: cap history, force tool_choice=required on first call (set by routes)", exclude=True)
 
 
 class ChatCompletionChoice(BaseModel):
@@ -436,6 +437,8 @@ class ConfigInfoSchema(BaseModel):
     scheduler_interval: int = 0
     ha_mcp_enabled: bool = False
     ha_mcp_url: str | None = None
+    ha_native_mcp_url: str | None = None
+    ha_native_mcp_tools: int = 0
     bind_host: str = "0.0.0.0"
 
 

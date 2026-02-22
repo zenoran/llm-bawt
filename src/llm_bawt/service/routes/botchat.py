@@ -17,12 +17,72 @@ router = APIRouter()
 log = get_service_logger(__name__)
 
 
+_HA_CONFLICTING_LINES = frozenset(
+    {
+        # HA's default assistant prompt tells the LLM to describe actions instead
+        # of executing them, which fights the tool-calling system.
+        "do not execute service without user's confirmation.",
+        "use execute_services function only for requested action, not for current states.",
+        # Redundant state restatement instruction — Nova handles this via tools.
+        "do not restate or appreciate what user says, rather make a quick inquiry.",
+    }
+)
+
+
+def _sanitize_client_context(text: str) -> str:
+    """Strip HA boilerplate and device CSV from client context.
+
+    With HA native MCP tools, the device list is unnecessary — the LLM
+    uses GetLiveContext and tools like HassTurnOn with friendly names.
+    The HA prompt instructions also conflict with our tool-calling system.
+    """
+    lines = text.splitlines()
+    cleaned = []
+    in_csv_block = False
+
+    for line in lines:
+        stripped = line.strip().lower()
+
+        # Skip known conflicting HA instructions
+        if stripped in _HA_CONFLICTING_LINES:
+            continue
+
+        # Skip the entire CSV device list block
+        if "entity_id,name,state" in stripped or "```csv" in stripped:
+            in_csv_block = True
+            continue
+        if in_csv_block:
+            if stripped.startswith("```") or stripped == "":
+                in_csv_block = False
+            continue
+
+        # Skip HA prompt boilerplate that conflicts with our tool system
+        if any(phrase in stripped for phrase in (
+            "i want you to act as smart home manager",
+            "i will provide information of smart home",
+            "available devices:",
+            "the current state of devices",
+            "use execute_services function",
+        )):
+            continue
+
+        cleaned.append(line)
+
+    result = "\n".join(cleaned).strip()
+    # Remove excessive blank lines
+    while "\n\n\n" in result:
+        result = result.replace("\n\n\n", "\n\n")
+    return result
+
+
 def _extract_client_system_context(request: ChatCompletionRequest) -> None:
     """Extract system messages from the request and set them as client context.
 
     Pulls out all role='system' messages, concatenates their content into
     ``request.client_system_context``, and removes them from the message list
     so only user/assistant messages remain.
+
+    HA-specific boilerplate that conflicts with tool-calling is stripped.
     """
     system_parts: list[str] = []
     non_system: list = []
@@ -34,7 +94,9 @@ def _extract_client_system_context(request: ChatCompletionRequest) -> None:
             non_system.append(msg)
 
     if system_parts:
-        request.client_system_context = "\n\n".join(system_parts)
+        combined = "\n\n".join(system_parts)
+        request.client_system_context = _sanitize_client_context(combined)
+        request.ha_mode = True
         request.messages = non_system
 
 

@@ -155,7 +155,7 @@ class TestJobActivityGates:
         should_run, reason = scheduler._has_new_activity_for_job(job)
 
         assert should_run is True
-        assert reason is None
+        assert reason == "New conversation activity detected"
 
     def test_profile_maintenance_skips_without_profile_changes(self):
         scheduler = JobScheduler(engine=None, task_processor=None)

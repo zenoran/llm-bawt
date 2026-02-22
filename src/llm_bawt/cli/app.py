@@ -311,48 +311,28 @@ def show_status(config: Config, args: argparse.Namespace | None = None):
         svc_status = "[green]✓ Up[/green]"
         if uptime_str:
             svc_status += f" [dim]({uptime_str})[/dim]"
-        svc_loaded = f"[green]{s_svc.current_model}[/green]" if s_svc.current_model else "[dim]none[/dim]"
+        svc_loaded = f"[green]{s_svc.current_model}[/green]" if s_svc.current_model else "[dim]not loaded[/dim]"
         svc_tasks = f"{s_svc.tasks_processed} / {s_svc.tasks_pending} pending"
     elif s_svc.available:
         svc_status = "[yellow]⚠ Unhealthy[/yellow]"
-        svc_loaded = ""
-        svc_tasks = ""
+        svc_loaded = "[dim]—[/dim]"
+        svc_tasks = "[dim]—[/dim]"
     elif s_cfg.mode == "service":
         svc_status = "[red]✗ Not reachable[/red]"
-        svc_loaded = ""
-        svc_tasks = ""
+        svc_loaded = "[dim]—[/dim]"
+        svc_tasks = "[dim]—[/dim]"
     else:
         svc_status = "[dim]○ Not running[/dim]"
-        svc_loaded = ""
-        svc_tasks = ""
+        svc_loaded = "[dim]—[/dim]"
+        svc_tasks = "[dim]—[/dim]"
 
-    # MCP display
-    if s_mcp.mode == "server":
-        mcp_mode = "[green]Server[/green]"
-        if s_mcp.status == "up":
-            mcp_status = "[green]✓ Up[/green]"
-        elif s_mcp.status == "error":
-            mcp_status = f"[yellow]⚠ HTTP {s_mcp.http_status}[/yellow]"
-        else:
-            mcp_status = "[red]✗ Down[/red]"
-        mcp_url_display = str(s_mcp.url)
-    else:
-        mcp_mode = "[cyan]Embedded[/cyan]"
-        mcp_status = "[green]✓ In-process[/green]"
-        mcp_url_display = "[dim]embedded[/dim]"
-
-    # Scheduler / HA / models catalog
+    # Scheduler / models catalog
     scheduler_display = "[green]Enabled[/green]" if s_cfg.scheduler_enabled else "[dim]Disabled[/dim]"
     scheduler_display += f" [dim]({s_cfg.scheduler_interval}s)[/dim]"
 
     models_catalog = f"{s_cfg.models_defined} defined"
     if s_cfg.models_service is not None:
         models_catalog += f" [dim]({s_cfg.models_service} service)[/dim]"
-
-    if s_cfg.ha_mcp_enabled:
-        ha_display = f"[green]Enabled[/green] [dim]({s_cfg.ha_mcp_url})[/dim]"
-    else:
-        ha_display = "[dim]Disabled[/dim]"
 
     # Bots list
     bot_parts = []
@@ -363,15 +343,54 @@ def show_status(config: Config, args: argparse.Namespace | None = None):
             bot_parts.append(b.slug)
     bots_display = " ".join(bot_parts)
 
+    # ── Config / Service (side-by-side) ──────────────────────────
+    # Left: config settings | Right: service runtime info
+    # Rows are balanced — no blank right-side cells.
     main_table.add_row("Bot", bot_display, "LLM", svc_status)
     main_table.add_row("Model", model_display, "Loaded", svc_loaded)
     main_table.add_row("User", f"{s_cfg.user_id}" if s_cfg.user_id else "[dim]not set[/dim]", "Tasks", svc_tasks)
-    main_table.add_row("Bots", bots_display, "Memory", mcp_mode)
-    main_table.add_row("Models", models_catalog, "MCP", mcp_status)
-    main_table.add_row("Scheduler", scheduler_display, "MCP URL", mcp_url_display)
-    main_table.add_row("HA MCP", ha_display, "Bind Host", f"[dim]{s_cfg.bind_host}[/dim]")
+    main_table.add_row("Bots", bots_display, "Bind", f"[dim]{s_cfg.bind_host}[/dim]")
+    main_table.add_row("Models", models_catalog, "Scheduler", scheduler_display)
 
     console.print(Panel(main_table, title="[bold]Config[/bold] / [bold]Service[/bold]", border_style="grey39"))
+    console.print()
+
+    # ── MCP + HA (side-by-side) ───────────────────────────────────
+    mcp_table = make_table()
+    if s_mcp.mode == "server":
+        mcp_table.add_row("Mode", "[green]Server[/green]")
+        if s_mcp.status == "up":
+            mcp_table.add_row("Status", "[green]✓ Up[/green]")
+        elif s_mcp.status == "error":
+            mcp_table.add_row("Status", f"[yellow]⚠ HTTP {s_mcp.http_status}[/yellow]")
+        else:
+            mcp_table.add_row("Status", "[red]✗ Down[/red]")
+        mcp_table.add_row("URL", str(s_mcp.url))
+    else:
+        mcp_table.add_row("Mode", "[cyan]Embedded[/cyan]")
+        mcp_table.add_row("Status", "[green]✓ In-process[/green]")
+        mcp_table.add_row("URL", "[dim]embedded[/dim]")
+
+    ha_table = make_table()
+    if s_cfg.ha_native_mcp_url:
+        ha_table.add_row("HA MCP", "[green]✓ Native MCP[/green]")
+        ha_table.add_row("URL", f"[dim]{s_cfg.ha_native_mcp_url}[/dim]")
+        tools_val = f"[green]{s_cfg.ha_native_mcp_tools}[/green]" if s_cfg.ha_native_mcp_tools else "[dim]0[/dim]"
+        ha_table.add_row("Tools", tools_val)
+    elif s_cfg.ha_mcp_enabled:
+        ha_table.add_row("HA MCP", f"[green]✓ Enabled[/green]")
+        ha_table.add_row("URL", f"[dim]{s_cfg.ha_mcp_url}[/dim]")
+    else:
+        ha_table.add_row("HA MCP", "[dim]Disabled[/dim]")
+
+    row_mcp_ha = Table.grid(expand=True)
+    row_mcp_ha.add_column(ratio=1)
+    row_mcp_ha.add_column(ratio=1)
+    row_mcp_ha.add_row(
+        Panel(mcp_table, title="[bold]MCP Memory Server[/bold]", border_style="grey39"),
+        Panel(ha_table, title="[bold]HA Integration[/bold]", border_style="grey39"),
+    )
+    console.print(row_mcp_ha)
     console.print()
 
     # ── Model Info Panel ─────────────────────────────────────────

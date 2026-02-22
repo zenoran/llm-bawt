@@ -370,7 +370,7 @@ HOME_TOOL = Tool(
         ToolParameter(
             name="state",
             type="string",
-            description="Required for action='set': on, off, or toggle",
+            description="Required for action='set'. Lights/switches: on, off, toggle. Covers/blinds: open, close, stop. Locks: lock, unlock.",
             required=False,
         ),
         ToolParameter(
@@ -552,10 +552,86 @@ HOME_GUIDANCE = '''
 - If asked for raw home output, return the tool output exactly as returned. Do not synthesize JSON keys/values that are not present in tool output.
 '''
 
+HA_NATIVE_GUIDANCE = '''
+- **Home Assistant tools** (HassTurnOn, HassTurnOff, HassLightSet, etc.): Control smart home devices directly
+- These tools use **friendly names** (e.g., name="kitchen lights"), NOT entity IDs
+- Use name, area, and/or floor parameters to identify devices
+- For device state queries, use **GetLiveContext** tool
+- HassTurnOn: Turn on lights, switches, scripts. For covers/blinds, this OPENS them.
+- HassTurnOff: Turn off lights, switches. For covers/blinds, this CLOSES them.
+- HassLightSet: Set brightness (0-100), color, or color temperature for lights
+- HassSetPosition: Set cover/blind position (0-100)
+- Execute tool calls immediately when user gives a command — do not describe what you plan to do.
+'''
+
 
 # =============================================================================
 # Tool Selection Functions
 # =============================================================================
+
+def ha_tools_to_tool_definitions(ha_tools: list) -> list[Tool]:
+    """Convert HAToolDefinition objects to Tool dataclass instances.
+
+    Takes the tool definitions discovered from HA's native MCP server and
+    converts them into the same Tool format used by all other llm-bawt tools.
+    This allows them to be included in tool lists and schema generation.
+
+    Args:
+        ha_tools: List of HAToolDefinition from HomeAssistantNativeClient.
+
+    Returns:
+        List of Tool dataclass instances.
+    """
+    tools = []
+    for ha_tool in ha_tools:
+        params = []
+        schema = ha_tool.input_schema or {}
+        properties = schema.get("properties", {})
+        required_names = set(schema.get("required", []))
+
+        for prop_name, prop_def in properties.items():
+            # Map JSON schema types to our ToolParameter types
+            prop_type = prop_def.get("type", "string")
+            if prop_type == "array":
+                items = prop_def.get("items", {})
+                item_type = items.get("type", "string")
+                prop_type = f"array[{item_type}]"
+            elif prop_type == "number":
+                prop_type = "number"
+
+            description = prop_def.get("description", "")
+            # Add enum values to description if present
+            if "enum" in prop_def:
+                enum_str = ", ".join(str(v) for v in prop_def["enum"])
+                description = f"{description} (one of: {enum_str})".strip()
+            elif "items" in prop_def and "enum" in prop_def.get("items", {}):
+                enum_str = ", ".join(str(v) for v in prop_def["items"]["enum"])
+                description = f"{description} (values: {enum_str})".strip()
+
+            # Add min/max to description if present
+            if "minimum" in prop_def or "maximum" in prop_def:
+                range_parts = []
+                if "minimum" in prop_def:
+                    range_parts.append(f"min={prop_def['minimum']}")
+                if "maximum" in prop_def:
+                    range_parts.append(f"max={prop_def['maximum']}")
+                description = f"{description} ({', '.join(range_parts)})".strip()
+
+            params.append(ToolParameter(
+                name=prop_name,
+                type=prop_type,
+                description=description or f"Parameter '{prop_name}'",
+                required=prop_name in required_names,
+            ))
+
+        tools.append(Tool(
+            name=ha_tool.name,
+            description=ha_tool.description or f"Home Assistant tool: {ha_tool.name}",
+            parameters=params,
+        ))
+
+    return tools
+
 
 def get_tools_list(
     tools: list[Tool] | None = None,
@@ -564,8 +640,14 @@ def get_tools_list(
     include_news_tools: bool = False,
     include_home_tools: bool = False,
     include_model_tools: bool = False,
+    ha_native_tools: list[Tool] | None = None,
 ) -> list[Tool]:
-    """Return the tool list based on selection flags."""
+    """Return the tool list based on selection flags.
+
+    Args:
+        ha_native_tools: Pre-converted HA native MCP tool definitions.
+            When provided, these replace HOME_TOOLS entirely.
+    """
     if tools is not None:
         return tools
 
@@ -574,7 +656,11 @@ def get_tools_list(
         resolved.extend(SEARCH_TOOLS)
     if include_news_tools:
         resolved.extend(NEWS_TOOLS)
-    if include_home_tools:
+    if ha_native_tools:
+        # Native HA tools replace the legacy home tool
+        resolved.extend(ha_native_tools)
+    elif include_home_tools:
+        # Fallback to legacy home tool
         resolved.extend(HOME_TOOLS)
     if include_model_tools:
         resolved.extend(MODEL_TOOLS)
@@ -589,6 +675,7 @@ def get_tools_prompt(
     include_home_tools: bool = False,
     include_model_tools: bool = False,
     tool_format: ToolFormat | str = ToolFormat.XML,
+    ha_native_tools: list[Tool] | None = None,
 ) -> str:
     """Generate the tools instruction prompt.
 
@@ -600,6 +687,7 @@ def get_tools_prompt(
         include_home_tools: Whether to include Home Assistant tools (default False).
         include_model_tools: Whether to include model management tools (default False).
         tool_format: Tool format to use for prompt instructions.
+        ha_native_tools: Pre-converted HA native MCP tool definitions.
 
     Returns:
         Formatted prompt string to inject into system message.
@@ -611,6 +699,7 @@ def get_tools_prompt(
         include_news_tools=include_news_tools,
         include_home_tools=include_home_tools,
         include_model_tools=include_model_tools,
+        ha_native_tools=ha_native_tools,
     )
 
     # Legacy XML format stays inline for backward compatibility.
@@ -631,7 +720,9 @@ def get_tools_prompt(
         if include_model_tools or any(t.name == "model" for t in tools):
             search_guidance += MODEL_GUIDANCE
 
-        if include_home_tools or any(t.name == "home" for t in tools):
+        if ha_native_tools:
+            search_guidance += HA_NATIVE_GUIDANCE
+        elif include_home_tools or any(t.name == "home" for t in tools):
             search_guidance += HOME_GUIDANCE
 
         return get_tool_calling_instructions(

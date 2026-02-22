@@ -177,6 +177,18 @@ class Config(RuntimeTunables, BaseSettings):
         default="",
         description="Optional bearer token for Home Assistant MCP (Set via LLM_BAWT_HA_MCP_AUTH_TOKEN)",
     )
+    HA_NATIVE_MCP_URL: str = Field(
+        default="",
+        description="Home Assistant native MCP endpoint URL, e.g. http://hass.home:8123/api/mcp (Set via LLM_BAWT_HA_NATIVE_MCP_URL)",
+    )
+    HA_NATIVE_MCP_TOKEN: str = Field(
+        default="",
+        description="Home Assistant long-lived access token for native MCP auth (Set via LLM_BAWT_HA_NATIVE_MCP_TOKEN)",
+    )
+    HA_MCP_TOOL_EXCLUDE: str = Field(
+        default="GetDateTime,HassCancelAllTimers,HassBroadcast",
+        description="Comma-separated list of HA MCP tool names to exclude (Set via LLM_BAWT_HA_MCP_TOOL_EXCLUDE)",
+    )
 
     # --- PostgreSQL Memory Backend Settings --- #
     POSTGRES_HOST: str = Field(default="localhost", description="PostgreSQL server hostname (Set via LLM_BAWT_POSTGRES_HOST)")

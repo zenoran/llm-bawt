@@ -115,6 +115,8 @@ class ConfigInfo:
     scheduler_interval: int = 0
     ha_mcp_enabled: bool = False
     ha_mcp_url: str | None = None
+    ha_native_mcp_url: str | None = None
+    ha_native_mcp_tools: int = 0
     bind_host: str = "0.0.0.0"
 
 
@@ -130,13 +132,13 @@ class SystemStatus:
     dependencies: DependencyInfo
 
 
-def _collect_service_info(config: Config) -> tuple[ServiceInfo, Any]:
+def _collect_service_info(config: Config, local_only: bool = False) -> tuple[ServiceInfo, Any]:
     """Collect LLM service status. Returns (ServiceInfo, raw_service_status)."""
     from llm_bawt.model_manager import is_service_mode_enabled
 
     info = ServiceInfo()
     raw_status = None
-    use_service = is_service_mode_enabled(config)
+    use_service = is_service_mode_enabled(config) and not local_only
 
     if not use_service:
         return info, raw_status
@@ -302,20 +304,74 @@ def _collect_dependencies(config: Config) -> DependencyInfo:
 
     info = DependencyInfo()
 
-    # CUDA
-    nvcc_path = shutil.which("nvcc")
-    if nvcc_path:
+    # CUDA — try multiple detection strategies so we work both with and
+    # without the CUDA toolkit (nvcc) in the PATH (common in runtime-only
+    # Docker images).
+    def _detect_cuda() -> str | None:
+        # 1. PyTorch reports CUDA version when compiled with GPU support
         try:
-            result = subprocess.run(
-                ["nvcc", "--version"], capture_output=True, text=True, timeout=5
-            )
-            if result.returncode == 0:
-                match = re.search(r"release ([\d.]+)", result.stdout)
-                info.cuda_version = match.group(1) if match else "unknown"
-            else:
-                info.cuda_version = "error"
+            import torch  # type: ignore[import]
+            cuda_ver = torch.version.cuda  # type: ignore[attr-defined]
+            if cuda_ver:
+                return cuda_ver
         except Exception:
-            info.cuda_version = "unknown"
+            pass
+
+        # 2. CUDA_VERSION env var (set by NVIDIA base images)
+        cuda_env = os.environ.get("CUDA_VERSION") or os.environ.get("CUDA_VERSION_TAG")
+        if cuda_env:
+            return cuda_env.split("-")[0]  # strip suffixes like "12.4.0-rc"
+
+        # 3. nvcc (full toolkit installed)
+        nvcc_path = shutil.which("nvcc")
+        if nvcc_path:
+            try:
+                result = subprocess.run(
+                    ["nvcc", "--version"], capture_output=True, text=True, timeout=5
+                )
+                if result.returncode == 0:
+                    match = re.search(r"release ([\d.]+)", result.stdout)
+                    if match:
+                        return match.group(1)
+            except Exception:
+                pass
+
+        # 4. nvidia-smi (driver installed, no toolkit)
+        smi_path = shutil.which("nvidia-smi")
+        if smi_path:
+            try:
+                result = subprocess.run(
+                    ["nvidia-smi", "--query-gpu=driver_version", "--format=csv,noheader"],
+                    capture_output=True, text=True, timeout=5,
+                )
+                if result.returncode == 0 and result.stdout.strip():
+                    return f"driver {result.stdout.strip().splitlines()[0]}"
+            except Exception:
+                pass
+
+        # 5. /usr/local/cuda/version.txt or version.json
+        for path in ("/usr/local/cuda/version.txt", "/usr/local/cuda-12/version.txt"):
+            try:
+                with open(path) as fh:
+                    line = fh.readline().strip()
+                    match = re.search(r"([\d]+\.[\d.]+)", line)
+                    if match:
+                        return match.group(1)
+            except OSError:
+                pass
+        try:
+            import json as _json
+            with open("/usr/local/cuda/version.json") as fh:
+                data = _json.load(fh)
+                ver = data.get("cuda", {}).get("version")
+                if ver:
+                    return ver
+        except Exception:
+            pass
+
+        return None
+
+    info.cuda_version = _detect_cuda()
 
     # llama-cpp-python
     info.llama_cpp_available = is_llama_cpp_available()
@@ -415,6 +471,8 @@ def _status_from_service(config: Config) -> SystemStatus | None:
             scheduler_interval=cfg.get("scheduler_interval", 0),
             ha_mcp_enabled=cfg.get("ha_mcp_enabled", False),
             ha_mcp_url=cfg.get("ha_mcp_url"),
+            ha_native_mcp_url=cfg.get("ha_native_mcp_url"),
+            ha_native_mcp_tools=cfg.get("ha_native_mcp_tools", 0),
             bind_host=cfg.get("bind_host", "0.0.0.0"),
         )
 
@@ -492,6 +550,8 @@ def collect_system_status(
     bot_slug: str | None = None,
     model_alias: str | None = None,
     user_id: str | None = None,
+    *,
+    local_only: bool = False,
 ) -> SystemStatus:
     """Collect full system status.
 
@@ -511,7 +571,7 @@ def collect_system_status(
     from llm_bawt.bots import BotManager
     from llm_bawt.model_manager import is_service_mode_enabled
 
-    use_service = is_service_mode_enabled(config)
+    use_service = is_service_mode_enabled(config) and not local_only
 
     # In service mode, delegate entirely to the service.
     if use_service:
@@ -542,7 +602,7 @@ def collect_system_status(
     effective_host = "127.0.0.1" if config.SERVICE_HOST in {"0.0.0.0", "::"} else config.SERVICE_HOST
     service_url = f"http://{effective_host}:{config.SERVICE_PORT}" if use_service else None
 
-    service_info, raw_status = _collect_service_info(config)
+    service_info, raw_status = _collect_service_info(config, local_only=local_only)
 
     # Version
     version = "0.1.0"
@@ -580,6 +640,7 @@ def collect_system_status(
         scheduler_interval=config.SCHEDULER_CHECK_INTERVAL_SECONDS,
         ha_mcp_enabled=getattr(config, "HA_MCP_ENABLED", False),
         ha_mcp_url=getattr(config, "HA_MCP_URL", None),
+        ha_native_mcp_url=getattr(config, "HA_NATIVE_MCP_URL", None) or None,
         bind_host=config.SERVICE_HOST,
     )
 

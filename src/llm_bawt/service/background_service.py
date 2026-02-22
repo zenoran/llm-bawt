@@ -607,16 +607,20 @@ class BackgroundService:
         4. Stores messages and extracts memories for future use
         """
         # Create request context for logging
+        if request.client_system_context is not None:
+            req_path = f"/v1/botchat/{request.bot_id}/{request.user}/chat/completions"
+        else:
+            req_path = "/v1/chat/completions"
         ctx = RequestContext(
             request_id=generate_request_id(),
             method="POST",
-            path="/v1/chat/completions",
+            path=req_path,
             model=request.model,
             bot_id=request.bot_id,
             user_id=request.user,
             stream=False,
         )
-        
+
         # Log incoming request (verbose mode will show the full payload)
         log.api_request(ctx, request.model_dump(exclude_none=True))
         
@@ -671,6 +675,7 @@ class BackgroundService:
                 
                 # Inject client-supplied system context (e.g. HA device list)
                 llm_bawt._client_system_context = request.client_system_context
+                llm_bawt._ha_mode = request.ha_mode
 
                 # Prepare messages with history and memory context
                 prepared_messages = llm_bawt.prepare_messages_for_query(user_prompt)
@@ -792,16 +797,20 @@ class BackgroundService:
         """
         import json
         # Create request context for logging
+        if request.client_system_context is not None:
+            req_path = f"/v1/botchat/{request.bot_id}/{request.user}/chat/completions"
+        else:
+            req_path = "/v1/chat/completions"
         ctx = RequestContext(
             request_id=generate_request_id(),
             method="POST",
-            path="/v1/chat/completions",
+            path=req_path,
             model=request.model,
             bot_id=request.bot_id,
             user_id=request.user,
             stream=True,
         )
-        
+
         # Log incoming request (verbose mode will show the full payload)
         log.api_request(ctx, request.model_dump(exclude_none=True))
         
@@ -890,6 +899,7 @@ class BackgroundService:
                 
                 # Inject client-supplied system context (e.g. HA device list)
                 llm_bawt._client_system_context = request.client_system_context
+                llm_bawt._ha_mode = request.ha_mode
 
                 # Use llm_bawt.prepare_messages_for_query to get full context
                 # (history from DB + memory + system prompt)
@@ -902,7 +912,7 @@ class BackgroundService:
                 timing_holder[0] = time.time()
                 
                 # Choose streaming method based on whether bot uses tools
-                if llm_bawt.bot.uses_tools and llm_bawt.memory:
+                if llm_bawt.bot.uses_tools and (llm_bawt.memory or llm_bawt.home_client or llm_bawt.ha_native_client):
                     # Check if client supports native streaming with tools (OpenAI)
                     use_native_streaming = (
                         llm_bawt.client.supports_native_tools()
@@ -925,10 +935,17 @@ class BackgroundService:
                         handler = get_format_handler(llm_bawt.tool_format)
                         tools_schema = handler.get_tools_schema(tool_definitions)
 
+                        # Log tool names for debugging
+                        tool_names = [t.get("function", {}).get("name", "?") for t in tools_schema]
+                        ha_tools = [n for n in tool_names if n.startswith("Hass") or n in ("GetLiveContext",)]
+                        log.info(f"📋 {len(tools_schema)} tools in schema ({len(ha_tools)} HA: {', '.join(ha_tools[:5])}{'...' if len(ha_tools) > 5 else ''})")
+
                         executor = ToolExecutor(
                             memory_client=llm_bawt.memory,
                             profile_manager=llm_bawt.profile_manager,
                             search_client=llm_bawt.search_client,
+                            home_client=llm_bawt.home_client,
+                            ha_native_client=llm_bawt.ha_native_client,
                             model_lifecycle=llm_bawt.model_lifecycle,
                             config=llm_bawt.config,
                             user_id=llm_bawt.user_id,
@@ -941,7 +958,7 @@ class BackgroundService:
                             from ..tools.parser import ToolCall
 
                             current_msgs = list(messages)
-                            max_iterations = 5
+                            max_iterations = 3 if llm_bawt._ha_mode else 5
                             has_executed_tools = False
 
                             for iteration in range(max_iterations):
@@ -1058,6 +1075,8 @@ class BackgroundService:
                             memory_client=llm_bawt.memory,
                             profile_manager=llm_bawt.profile_manager,
                             search_client=llm_bawt.search_client,
+                            home_client=llm_bawt.home_client,
+                            ha_native_client=llm_bawt.ha_native_client,
                             model_lifecycle=llm_bawt.model_lifecycle,
                             config=llm_bawt.config,
                             user_id=llm_bawt.user_id,

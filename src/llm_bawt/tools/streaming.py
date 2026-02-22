@@ -16,6 +16,7 @@ if TYPE_CHECKING:
     from ..memory_server.client import MemoryClient
     from ..profiles import ProfileManager
     from ..search.base import SearchClient
+    from ..integrations.ha_mcp.client import HomeAssistantMCPClient, HomeAssistantNativeClient
     from ..core.model_lifecycle import ModelLifecycleManager
     from ..utils.config import Config
     from ..utils.history import HistoryManager
@@ -113,6 +114,8 @@ def stream_with_tools(
     memory_client: "MemoryClient | None" = None,
     profile_manager: "ProfileManager | None" = None,
     search_client: "SearchClient | None" = None,
+    home_client: "HomeAssistantMCPClient | None" = None,
+    ha_native_client: "HomeAssistantNativeClient | None" = None,
     model_lifecycle: "ModelLifecycleManager | None" = None,
     config: "Config | None" = None,
     user_id: str = "",
@@ -184,6 +187,8 @@ def stream_with_tools(
         memory_client=memory_client,
         profile_manager=profile_manager,
         search_client=search_client,
+        home_client=home_client,
+        ha_native_client=ha_native_client,
         model_lifecycle=model_lifecycle,
         config=config,
         user_id=user_id,

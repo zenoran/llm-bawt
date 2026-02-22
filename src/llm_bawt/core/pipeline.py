@@ -111,6 +111,7 @@ class RequestPipeline:
         profile_manager: Any = None,
         search_client: Any = None,
         home_client: Any = None,
+        ha_native_client: Any = None,
         news_client: Any = None,
         model_lifecycle: Any = None,
         history_manager: Any = None,
@@ -140,6 +141,7 @@ class RequestPipeline:
         self.profile_manager = profile_manager
         self.search_client = search_client
         self.home_client = home_client
+        self.ha_native_client = ha_native_client
         self.news_client = news_client
         self.model_lifecycle = model_lifecycle
         self.history_manager = history_manager
@@ -251,7 +253,7 @@ class RequestPipeline:
         else:
             ctx.use_tools = (
                 getattr(self.bot, "uses_tools", False)
-                and (self.memory_client is not None or self.home_client is not None)
+                and (self.memory_client is not None or self.home_client is not None or self.ha_native_client is not None)
             )
         
         if "use_search" in self._decision_overrides:
@@ -325,11 +327,19 @@ class RequestPipeline:
         if ctx.use_tools:
             from ..tools import get_tools_prompt, get_tools_list
             include_models = self.model_lifecycle is not None
+
+            # Convert HA native tools if available
+            ha_native_tool_defs = None
+            if self.ha_native_client and self.ha_native_client.initialized:
+                from ..tools.definitions import ha_tools_to_tool_definitions
+                ha_native_tool_defs = ha_tools_to_tool_definitions(self.ha_native_client.tools)
+
             tool_definitions = get_tools_list(
                 include_search_tools=ctx.use_search,
                 include_news_tools=self.news_client is not None,
                 include_home_tools=self.home_client is not None,
                 include_model_tools=include_models,
+                ha_native_tools=ha_native_tool_defs,
             )
             if self.memory_client is None:
                 disallowed = {"memory", "history", "profile", "self"}
@@ -342,6 +352,7 @@ class RequestPipeline:
             tools_prompt = get_tools_prompt(
                 tools=tool_definitions,
                 tool_format=tool_format,
+                ha_native_tools=ha_native_tool_defs,
             )
             builder.add_section(
                 "tools",
@@ -516,7 +527,7 @@ class RequestPipeline:
             ctx.response = ""
             return
         
-        if ctx.use_tools and (self.memory_client or self.home_client or self.news_client):
+        if ctx.use_tools and (self.memory_client or self.home_client or self.ha_native_client or self.news_client):
             # Use tool loop
             from ..tools import query_with_tools
             response, tool_context, tool_call_details = query_with_tools(
@@ -526,6 +537,7 @@ class RequestPipeline:
                 profile_manager=self.profile_manager,
                 search_client=self.search_client,
                 home_client=self.home_client,
+                ha_native_client=self.ha_native_client,
                 news_client=self.news_client,
                 model_lifecycle=self.model_lifecycle,
                 config=self.config,

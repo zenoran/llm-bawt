@@ -11,7 +11,7 @@ log = get_service_logger(__name__)
 @router.post("/webhook/nextcloud", tags=["Webhooks"])
 async def nextcloud_talk_webhook(request: Request):
     """Handle incoming Nextcloud Talk webhooks."""
-    from ..integrations.nextcloud.webhook import handle_nextcloud_webhook
+    from llm_bawt.integrations.nextcloud.webhook import handle_nextcloud_webhook
     return await handle_nextcloud_webhook(request)
 
 # -------------------------------------------------------------------------
@@ -21,8 +21,8 @@ async def nextcloud_talk_webhook(request: Request):
 @router.post("/admin/nextcloud-talk/provision", response_model=NextcloudProvisionResponse, tags=["Admin"])
 async def provision_nextcloud_talk(request: NextcloudProvisionRequest):
     """Provision a Nextcloud Talk room and bot for an llm_bawt bot."""
-    from ..integrations.nextcloud.provisioner import get_provisioner_client
-    from ..integrations.nextcloud.manager import get_nextcloud_manager
+    from llm_bawt.integrations.nextcloud.provisioner import get_provisioner_client
+    from llm_bawt.integrations.nextcloud.manager import get_nextcloud_manager
 
     manager = get_nextcloud_manager()
 
@@ -72,7 +72,7 @@ async def provision_nextcloud_talk(request: NextcloudProvisionRequest):
 @router.post("/admin/nextcloud-talk/reload", tags=["Admin"])
 async def reload_nextcloud_bots():
     """Force reload Nextcloud bot configuration from disk."""
-    from ..integrations.nextcloud.manager import get_nextcloud_manager
+    from llm_bawt.integrations.nextcloud.manager import get_nextcloud_manager
     manager = get_nextcloud_manager()
     manager.reload()
     bots = manager.list_bots()

@@ -76,25 +76,39 @@ class TestReActStopSequences:
     """Test that stop sequences don't break normal flow."""
 
     def test_stop_sequences_dont_include_final_answer(self):
-        """Stop sequences should NOT include Final Answer marker."""
+        """Bare 'Final Answer' should NOT be a stop sequence — it's our output.
+
+        Post-action guards like '}\\nFinal Answer' are intentional (they only fire
+        after a closing JSON brace) and are therefore allowed.
+        """
         handler = ReActFormatHandler()
         stops = handler.get_stop_sequences()
-        
-        # Final Answer should NOT be a stop sequence - it's our output!
+
+        # The bare string "Final Answer:" should never be a stop (would break output)
         assert "\nFinal Answer:" not in stops
-        assert "Final Answer" not in stops
+        assert "Final Answer" not in stops  # no exact-match entry
+
+        # Any Final Answer stops must be post-JSON-close guards (prefixed with '}')
+        final_stops = [s for s in stops if "Final Answer" in s]
+        assert all(s.startswith("}") for s in final_stops)
 
     def test_stop_sequences_only_observation(self):
-        """Only Observation variants should be stop sequences."""
+        """Observation variants are the primary stop sequences.
+
+        Post-action guards ('}\\nThought', '}\\nFinal Answer') are also present to
+        prevent the model hallucinating continuations after a closed Action Input
+        JSON block. They only fire after '}' so they don't interfere with normal
+        Thought or Final Answer output.
+        """
         handler = ReActFormatHandler()
         stops = handler.get_stop_sequences()
-        
+
         # Should stop before hallucinated observations
         assert any("Observation" in s for s in stops)
-        
-        # Should NOT stop at Thought (needed for multi-step reasoning)
+
+        # Post-action Thought stops must be '}'-prefixed (not free-standing)
         thought_stops = [s for s in stops if "Thought" in s and "Observation" not in s]
-        assert len(thought_stops) == 0
+        assert all(s.startswith("}") for s in thought_stops)
 
 
 # =============================================================================

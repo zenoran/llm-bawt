@@ -50,14 +50,36 @@ class NativeOpenAIFormatHandler(ToolFormatHandler):
                 tool_names.append(name)
         tools_list = ", ".join(tool_names) if tool_names else "(none)"
         home_guidance = ""
-        if "home" in tool_names:
+        # Check if HA native tools are present (they start with "Hass" or "Get")
+        ha_native_names = [n for n in tool_names if n.startswith("Hass") or n in ("GetLiveContext", "GetDateTime")]
+        if ha_native_names:
+            home_guidance = (
+                "\nCRITICAL — Home Assistant device control:\n"
+                "- You MUST call a Hass* tool for ANY smart home action (turn on/off, dim, open/close, set temperature, etc.).\n"
+                "- NEVER say you performed a device action unless you ACTUALLY called a tool and received a result.\n"
+                "- If the user asks to control a device, your FIRST response must be a tool call — not text.\n"
+                "- After calling a tool, report the actual result: success/failure, which entities were affected, and any errors.\n"
+                "- For multiple devices, call the tool once per device (e.g., two HassTurnOff calls for two lights).\n"
+                "- Tools use friendly device NAMES (e.g., name='kitchen lights'), NOT entity IDs.\n"
+                "- Use name, area, and/or floor parameters to target devices.\n"
+                "- HassTurnOn opens covers/blinds. HassTurnOff closes them.\n"
+                "- HassLightSet sets brightness (0-100), color, or color temperature.\n"
+                "- HassSetPosition sets cover/blind position (0-100).\n"
+                "- For device state queries, use GetLiveContext.\n"
+                "- Execute tool calls immediately — do not describe what you plan to do.\n"
+            )
+        elif "home" in tool_names:
             home_guidance = (
                 "Home tool guidance:\n"
                 "- For natural names like 'sunroom lights', call home(action='query', pattern='sunroom', domain='light') first.\n"
                 "- Use exact entity IDs returned by query in subsequent home(action='get'/'set') calls.\n"
+                "- Covers/blinds use state='close' or state='open' (NOT 'off'/'on') with action='set'.\n"
+                "- Lights and switches use state='on', 'off', or 'toggle'.\n"
+                "- Locks use state='lock' or state='unlock'.\n"
                 "- If a set/get call reports not found, run query and retry with the suggested exact ID.\n"
                 "- If asked for current home status, call home(action='status') before answering.\n"
                 "- If asked for 'raw output', return the exact tool output verbatim; do not invent or normalize JSON fields.\n"
+                "- Execute tool calls immediately when the user confirms — do not describe what you're about to do without calling the tool.\n"
             )
         return (
             "## Tools\n\n"
@@ -67,9 +89,10 @@ class NativeOpenAIFormatHandler(ToolFormatHandler):
             "If asked to list tools, list exactly those names and do not omit any.\n\n"
             "Rules:\n"
             "1. Call a tool when you need missing or precise information.\n"
-            "2. Do not invent tool results.\n"
-            "3. If no tool is needed, respond normally.\n"
-            "4. If tool results contain URLs, copy each URL exactly as provided (no rewriting or guessing).\n"
+            "2. ALWAYS call a tool to perform real-world actions (device control, searches). NEVER say you did something without actually calling the tool.\n"
+            "3. Do not invent tool results. Report what the tool actually returned.\n"
+            "4. If no tool is needed, respond normally.\n"
+            "5. If tool results contain URLs, copy each URL exactly as provided (no rewriting or guessing).\n"
             f"{home_guidance}"
         )
 
