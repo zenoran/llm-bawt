@@ -25,12 +25,6 @@ from llm_bawt.utils.config import Config, RuntimeTunables
 console = Console()
 
 
-def _use_service(config: Config) -> bool:
-    """Return True if the CLI should delegate to the service for DB operations."""
-    from llm_bawt.model_manager import is_service_mode_enabled
-    return is_service_mode_enabled(config)
-
-
 def _get_service_client(config: Config):
     """Build a service client for the bot editor."""
     from llm_bawt.service.client import get_service_client
@@ -126,26 +120,16 @@ def edit_bot_yaml(config: Config, bot_slug: str) -> bool:
         return False
 
     template = get_bot_settings_template()
-    via_service = _use_service(config)
-    db_bot_settings: dict[str, Any] = {}
 
-    if via_service:
-        client = _get_service_client(config)
-        if client and client.is_available():
-            resp = client.get_settings(scope_type="bot", scope_id=slug)
-            if resp:
-                db_bot_settings = {item["key"]: item["value"] for item in resp.get("settings", [])}
-        else:
-            console.print("[red]Service is configured but not reachable.[/red]")
-            return False
-    else:
-        from llm_bawt.runtime_settings import BotProfileStore, RuntimeSettingsStore
-        store = RuntimeSettingsStore(config)
-        profile_store = BotProfileStore(config)
-        if profile_store.engine is None:
-            console.print("[red]Bot profiles DB unavailable.[/red]")
-            return False
-        db_bot_settings = store.get_scope_settings("bot", slug) if store.engine else {}
+    client = _get_service_client(config)
+    if not client or not client.is_available():
+        console.print("[red]Service not available. Start with: llm-service[/red]")
+        return False
+
+    resp = client.get_settings(scope_type="bot", scope_id=slug)
+    db_bot_settings: dict[str, Any] = {}
+    if resp:
+        db_bot_settings = {item["key"]: item["value"] for item in resp.get("settings", [])}
 
     # Build settings: template < YAML < DB (DB wins)
     effective_settings = {**template, **(raw.get("settings") or {}), **db_bot_settings}
@@ -241,53 +225,26 @@ def edit_bot_yaml(config: Config, bot_slug: str) -> bool:
         "nextcloud_config": out.get("nextcloud", raw.get("nextcloud")),
     }
 
-    if via_service:
-        client = _get_service_client(config)
-        if client and client.is_available():
-            client.upsert_bot_profile(slug, profile_payload)
-            console.print(f"[green]Personality saved:[/green] {slug} -> service")
+    client = _get_service_client(config)
+    if client and client.is_available():
+        client.upsert_bot_profile(slug, profile_payload)
+        console.print(f"[green]Personality saved:[/green] {slug} -> service")
 
-            settings_changed = 0
-            for key, value in new_settings.items():
-                old_val = db_bot_settings.get(key)
-                template_val = template.get(key)
-                if old_val != value or (old_val is None and value != template_val):
-                    client.set_setting("bot", slug, key, value)
-                    settings_changed += 1
-            for key in db_bot_settings:
-                if key not in new_settings:
-                    client.delete_setting("bot", key, scope_id=slug)
-                    settings_changed += 1
-            if settings_changed:
-                console.print(f"[green]Settings saved:[/green] {settings_changed} key(s) -> service (bot/{slug})")
-            else:
-                console.print("[dim]Settings unchanged.[/dim]")
-    else:
-        from llm_bawt.runtime_settings import BotProfileStore, RuntimeSettingsStore
-        profile_store = BotProfileStore(config)
-        store = RuntimeSettingsStore(config)
-
-        profile_store.upsert({"slug": slug, **profile_payload})
-        console.print(f"[green]Personality saved:[/green] {slug} -> bot_profiles")
-
-        if store.engine and isinstance(new_settings, dict):
-            settings_changed = 0
-            for key, value in new_settings.items():
-                old_val = db_bot_settings.get(key)
-                template_val = template.get(key)
-                if old_val != value or (old_val is None and value != template_val):
-                    store.set_value("bot", slug, key, value)
-                    settings_changed += 1
-            for key in db_bot_settings:
-                if key not in new_settings:
-                    store.delete_value("bot", slug, key)
-                    settings_changed += 1
-            if settings_changed:
-                console.print(f"[green]Settings saved:[/green] {settings_changed} key(s) -> DB (bot/{slug})")
-            else:
-                console.print("[dim]Settings unchanged.[/dim]")
-        elif new_settings and not store.engine:
-            console.print("[yellow]Warning: DB unavailable — settings not saved. Use --settings-set or configure database.[/yellow]")
+        settings_changed = 0
+        for key, value in new_settings.items():
+            old_val = db_bot_settings.get(key)
+            template_val = template.get(key)
+            if old_val != value or (old_val is None and value != template_val):
+                client.set_setting("bot", slug, key, value)
+                settings_changed += 1
+        for key in db_bot_settings:
+            if key not in new_settings:
+                client.delete_setting("bot", key, scope_id=slug)
+                settings_changed += 1
+        if settings_changed:
+            console.print(f"[green]Settings saved:[/green] {settings_changed} key(s) -> service (bot/{slug})")
+        else:
+            console.print("[dim]Settings unchanged.[/dim]")
 
     from llm_bawt.bots import invalidate_bots_cache
 
@@ -299,26 +256,17 @@ def edit_bot_yaml(config: Config, bot_slug: str) -> bool:
 
 def edit_global_settings(config: Config) -> bool:
     """Edit global runtime settings in DB (scope=global/*)."""
-    via_service = _use_service(config)
     defaults = _runtime_defaults()
     current_db: dict[str, Any] = {}
 
-    if via_service:
-        client = _get_service_client(config)
-        if client and client.is_available():
-            resp = client.get_settings(scope_type="global")
-            if resp:
-                current_db = {item["key"]: item["value"] for item in resp.get("settings", [])}
-        else:
-            console.print("[red]Service is configured but not reachable.[/red]")
-            return False
-    else:
-        from llm_bawt.runtime_settings import RuntimeSettingsStore
-        store = RuntimeSettingsStore(config)
-        if store.engine is None:
-            console.print("[red]Runtime settings DB unavailable.[/red]")
-            return False
-        current_db = store.get_scope_settings("global", "*")
+    client = _get_service_client(config)
+    if not client or not client.is_available():
+        console.print("[red]Service not available. Start with: llm-service[/red]")
+        return False
+
+    resp = client.get_settings(scope_type="global")
+    if resp:
+        current_db = {item["key"]: item["value"] for item in resp.get("settings", [])}
 
     effective = {**defaults, **current_db}
 
@@ -352,43 +300,23 @@ def edit_global_settings(config: Config) -> bool:
 
     changed = 0
 
-    if via_service:
-        client = _get_service_client(config)
-        if client and client.is_available():
-            for key, value in new_settings.items():
-                old_val = current_db.get(key)
-                default_val = defaults.get(key)
-                if old_val == value:
-                    continue
-                if old_val is None and value == default_val:
-                    continue
-                client.set_setting("global", None, key, value)
-                changed += 1
-            for key in current_db:
-                if key not in new_settings:
-                    client.delete_setting("global", key)
-                    changed += 1
-    else:
-        from llm_bawt.runtime_settings import RuntimeSettingsStore
-        store = RuntimeSettingsStore(config)
+    for key, value in new_settings.items():
+        old_val = current_db.get(key)
+        default_val = defaults.get(key)
+        if old_val == value:
+            continue
+        if old_val is None and value == default_val:
+            continue
+        client.set_setting("global", None, key, value)
+        changed += 1
 
-        for key, value in new_settings.items():
-            old_val = current_db.get(key)
-            default_val = defaults.get(key)
-            if old_val == value:
-                continue
-            if old_val is None and value == default_val:
-                continue
-            store.set_value("global", "*", key, value)
+    for key in current_db:
+        if key not in new_settings:
+            client.delete_setting("global", key)
             changed += 1
 
-        for key in current_db:
-            if key not in new_settings:
-                store.delete_value("global", "*", key)
-                changed += 1
-
     if changed:
-        console.print(f"[green]Global settings saved:[/green] {changed} key(s) -> {'service' if via_service else 'DB'} (global/*)")
+        console.print(f"[green]Global settings saved:[/green] {changed} key(s) -> service (global/*)")
     else:
         console.print("[dim]Global settings unchanged.[/dim]")
 

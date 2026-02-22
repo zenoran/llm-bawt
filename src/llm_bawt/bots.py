@@ -13,8 +13,6 @@ from typing import Any
 
 import yaml
 
-from llm_bawt.utils.config import Config, has_database_credentials
-
 logger = logging.getLogger(__name__)
 
 # Path to the repo bots.yaml file (in the same directory as this module)
@@ -159,138 +157,89 @@ def _extract_bot_settings_template(merged_data: dict[str, Any]) -> dict[str, Any
 
 
 def _load_bots_config() -> None:
-    """Load bot definitions DB-first with YAML fallback for missing slugs."""
+    """Load bot definitions from YAML (repo + user config).
+
+    Note: DB bot_profiles are only loaded by the service process at startup.
+    The CLI gets full bot info from the service API when needed.
+    """
     global BUILTIN_BOTS, _DEFAULTS, _SYSTEM_PROMPTS, _RAW_BOT_DATA, _BOT_SETTINGS_TEMPLATE
     global _LAST_REPO_MTIME, _LAST_USER_MTIME
-    
+
     repo_path = get_repo_bots_yaml_path()
     user_path = get_user_bots_yaml_path()
-    
+
     # Track mtimes for hot reload
     _LAST_REPO_MTIME = repo_path.stat().st_mtime if repo_path.exists() else 0
     _LAST_USER_MTIME = user_path.stat().st_mtime if user_path.exists() else 0
-    
+
     # Load repo config (defaults)
     repo_data = _load_yaml_file(repo_path) or {}
-    
+
     # Load user config (overrides)
     user_data = _load_yaml_file(user_path) or {}
-    
+
     # Merge: user overrides repo
     merged_data = _deep_merge(repo_data, user_data)
-    
+
     if not merged_data:
         logger.warning("No bot configuration found in repo or user config")
         return
-    
+
     # Clear existing data
     BUILTIN_BOTS.clear()
     _RAW_BOT_DATA.clear()
     _BOT_SETTINGS_TEMPLATE = _extract_bot_settings_template(merged_data)
 
-    runtime_store = None
-    db_profiles_by_slug: dict[str, Any] = {}
-    db_bot_settings: dict[str, dict[str, Any]] = {}
-
-    # Load profiles from DB if credentials are available.
-    # Both the service process and direct-mode CLI load from DB here.
-    try:
-        config = Config()
-
-        if has_database_credentials(config):
-            from llm_bawt.runtime_settings import BotProfileStore, RuntimeSettingsStore
-
-            profile_store = BotProfileStore(config)
-            runtime_store = RuntimeSettingsStore(config)
-            if profile_store.engine is not None:
-                db_profiles = profile_store.list_all()
-                db_profiles_by_slug = {p.slug: p for p in db_profiles}
-
-            if runtime_store.engine is not None:
-                for slug in db_profiles_by_slug:
-                    db_bot_settings[slug] = runtime_store.get_scope_settings("bot", slug)
-    except Exception as e:
-        logger.warning("Failed loading bot profiles from DB: %s", e)
-
-    def _build_settings(slug: str, yaml_bot_data: dict[str, Any] | None = None) -> dict[str, Any]:
+    def _build_settings(yaml_bot_data: dict[str, Any] | None = None) -> dict[str, Any]:
         yaml_settings = {}
         if isinstance(yaml_bot_data, dict):
             yaml_settings = yaml_bot_data.get("settings", {}) or {}
-        return _deep_merge(
-            _deep_merge(_BOT_SETTINGS_TEMPLATE, yaml_settings),
-            db_bot_settings.get(slug, {}),
-        )
+        return _deep_merge(_BOT_SETTINGS_TEMPLATE, yaml_settings)
 
-    def _register_bot(slug: str, payload: dict[str, Any], yaml_source: dict[str, Any] | None = None) -> None:
+    def _register_bot(slug: str, bot_data: dict[str, Any]) -> None:
         normalized_slug = (slug or "").strip().lower()
         if not normalized_slug:
             return
-        effective_settings = _build_settings(normalized_slug, yaml_source)
-        merged_bot_data = dict(payload)
+        effective_settings = _build_settings(bot_data)
+        merged_bot_data = dict(bot_data)
         merged_bot_data["settings"] = effective_settings
-        if "color" not in merged_bot_data and isinstance(yaml_source, dict):
-            merged_bot_data["color"] = yaml_source.get("color")
         _RAW_BOT_DATA[normalized_slug] = merged_bot_data
-        bot_color = payload.get("color")
-        if not bot_color and isinstance(yaml_source, dict):
-            bot_color = yaml_source.get("color")
-        if not bot_color:
-            bot_color = effective_settings.get("ui_color")
+        bot_color = bot_data.get("color") or effective_settings.get("ui_color")
         BUILTIN_BOTS[normalized_slug] = Bot(
             slug=normalized_slug,
-            name=payload.get("name", normalized_slug.title()),
-            description=payload.get("description", ""),
-            system_prompt=payload.get("system_prompt", "You are a helpful assistant."),
-            requires_memory=payload.get("requires_memory", True),
-            voice_optimized=payload.get("voice_optimized", False),
-            default_voice=payload.get("default_voice") or effective_settings.get("default_voice"),
-            default_model=payload.get("default_model"),
-            uses_tools=payload.get("uses_tools", False),
-            uses_search=payload.get("uses_search", False),
-            uses_home_assistant=payload.get("uses_home_assistant", False),
+            name=bot_data.get("name", normalized_slug.title()),
+            description=bot_data.get("description", ""),
+            system_prompt=bot_data.get("system_prompt", "You are a helpful assistant."),
+            requires_memory=bot_data.get("requires_memory", True),
+            voice_optimized=bot_data.get("voice_optimized", False),
+            default_voice=bot_data.get("default_voice") or effective_settings.get("default_voice"),
+            default_model=bot_data.get("default_model"),
+            uses_tools=bot_data.get("uses_tools", False),
+            uses_search=bot_data.get("uses_search", False),
+            uses_home_assistant=bot_data.get("uses_home_assistant", False),
             color=bot_color,
-            nextcloud=payload.get("nextcloud"),
+            nextcloud=bot_data.get("nextcloud"),
             settings=effective_settings,
         )
 
-    # 1) DB bot profiles are authoritative for personality fields
-    yaml_bots = merged_data.get("bots", {}) if isinstance(merged_data.get("bots"), dict) else {}
-    for slug, profile in db_profiles_by_slug.items():
-        _register_bot(
-            slug,
-            {
-                "name": profile.name,
-                "description": profile.description,
-                "system_prompt": profile.system_prompt,
-                "requires_memory": profile.requires_memory,
-                "voice_optimized": profile.voice_optimized,
-                "default_model": profile.default_model,
-                "uses_tools": profile.uses_tools,
-                "uses_search": profile.uses_search,
-                "uses_home_assistant": profile.uses_home_assistant,
-                "nextcloud": profile.nextcloud_config,
-            },
-            yaml_source=yaml_bots.get(slug),
-        )
-    
-    # 2) YAML fallback only for slugs missing in DB
+    # Load bots from YAML only (DB profiles are service-only)
     for slug, bot_data in merged_data.get("bots", {}).items():
         normalized_slug = (slug or "").strip().lower()
-        if not normalized_slug or normalized_slug in BUILTIN_BOTS:
+        if not normalized_slug:
             continue
-        _register_bot(normalized_slug, bot_data, yaml_source=bot_data)
-    
+        _register_bot(normalized_slug, bot_data)
+
     # Load defaults (merged)
     if "defaults" in merged_data:
         _DEFAULTS.update(merged_data["defaults"])
-    
+
     # Load system prompts (merged)
     if "system_prompts" in merged_data:
         _SYSTEM_PROMPTS.update(merged_data["system_prompts"])
-    
+
     logger.debug(
-        f"Loaded {len(BUILTIN_BOTS)} bots from config "
-        f"(repo: {repo_path.exists()}, user: {user_path.exists()}, db_profiles: {len(db_profiles_by_slug)})"
+        f"Loaded {len(BUILTIN_BOTS)} bots from YAML "
+        f"(repo: {repo_path.exists()}, user: {user_path.exists()})"
     )
 
 

@@ -13,7 +13,7 @@ from rich.console import Console
 from ..clients import LLMClient, GrokClient
 from ..clients.openai_client import OpenAIClient
 from ..core.base import BaseLLMBawt
-from ..utils.config import Config, is_llama_cpp_available
+from ..utils.config import Config, is_llama_cpp_available, has_database_credentials
 from ..utils.history import Message
 from ..tools import query_with_tools
 from .logging import get_service_logger
@@ -69,6 +69,47 @@ class ServiceLLMBawt(BaseLLMBawt):
             existing_client=existing_client,
         )
         self._last_history_load_at: float = time.time()
+
+    def _init_memory(self, config: Config):
+        """Initialize memory client and profile manager for service-side operation."""
+        if self.local_mode:
+            logger.debug("Local mode enabled - using filesystem for history")
+            return
+
+        if not has_database_credentials(config):
+            logger.debug("Database credentials not configured")
+            return
+
+        if not self.bot.requires_memory:
+            logger.debug(f"Bot '{self.bot.name}' has requires_memory=false")
+            self._db_available = True  # DB available but not needed
+            return
+
+        try:
+            from ..memory_server.client import get_memory_client
+            from ..profiles import ProfileManager
+
+            self.memory = get_memory_client(
+                config=config,
+                bot_id=self.bot_id,
+                user_id=self.user_id,
+                server_url=getattr(config, "MEMORY_SERVER_URL", None),
+            )
+            self._db_available = True
+            logger.debug(f"Memory client initialized for bot: {self.bot_id}")
+
+            # Initialize profile manager
+            self.profile_manager = ProfileManager(config)
+
+        except Exception as e:
+            # Log without full traceback for connection errors
+            error_str = str(e)
+            if "could not translate host name" in error_str or "Connection refused" in error_str:
+                logger.error(f"Failed to initialize memory: {e}")
+            else:
+                logger.exception(f"Failed to initialize memory: {e}")
+            if self.verbose:
+                console.print(f"[yellow]Warning:[/yellow] Memory client failed: {e}")
 
     def _refresh_history_if_stale(self) -> None:
         """Refresh history from DB only when cache is stale."""

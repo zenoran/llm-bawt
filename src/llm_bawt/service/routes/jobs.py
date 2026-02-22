@@ -25,6 +25,43 @@ def _get_scheduler_engine():
     return manager.engine
 
 
+@router.post("/v1/jobs/{job_type}/trigger", tags=["Jobs"])
+async def trigger_job(job_type: str):
+    """Trigger a scheduled job to run immediately.
+
+    Sets the job's next_run_at to the past so the scheduler picks it up
+    on its next check interval.
+    """
+    from datetime import datetime, timedelta
+
+    engine = _get_scheduler_engine()
+
+    valid_types = {jt.value for jt in JobType}
+    normalized_job_type = job_type.strip().lower()
+    if normalized_job_type not in valid_types:
+        raise HTTPException(status_code=400, detail=f"Invalid job_type '{job_type}'")
+
+    job_type_enum = JobType(normalized_job_type)
+
+    with Session(engine) as session:
+        job = session.exec(
+            select(ScheduledJob).where(ScheduledJob.job_type == job_type_enum)
+        ).first()
+
+        if not job:
+            raise HTTPException(
+                status_code=404,
+                detail=f"No scheduled job found for type: {job_type}"
+            )
+
+        # Set next_run_at to past to trigger immediate run
+        job.next_run_at = datetime.utcnow() - timedelta(minutes=1)
+        session.add(job)
+        session.commit()
+
+    return {"success": True, "job_type": normalized_job_type}
+
+
 @router.get("/v1/jobs", response_model=ScheduledJobsResponse, tags=["Jobs"])
 async def list_scheduled_jobs(
     job_type: str | None = Query(None, description="Filter by job type"),

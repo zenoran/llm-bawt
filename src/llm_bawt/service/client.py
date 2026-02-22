@@ -862,6 +862,27 @@ class ServiceClient:
             return None
 
     # -----------------------------------------------------------------
+    # Jobs - trigger
+    # -----------------------------------------------------------------
+
+    def trigger_job(self, job_type: str) -> dict[str, Any] | None:
+        """Trigger a scheduled job to run immediately.
+
+        Args:
+            job_type: The job type to trigger (e.g., "profile_maintenance")
+
+        Returns:
+            Response dict with success status, or None if service unavailable
+        """
+        if not self.is_available():
+            return None
+        try:
+            return self._request("POST", f"/v1/jobs/{job_type}/trigger")
+        except Exception as e:
+            logger.warning(f"Trigger job via service failed: {e}")
+            return None
+
+    # -----------------------------------------------------------------
     # History (existing methods follow)
     # -----------------------------------------------------------------
 

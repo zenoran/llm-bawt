@@ -20,14 +20,13 @@ from rich.console import Console
 
 from ..bots import Bot, BotManager
 from ..clients import LLMClient
-from ..profiles import ProfileManager, EntityType
 from ..runtime_settings import RuntimeSettingsResolver
-from ..memory_server.client import MemoryClient, get_memory_client
+from ..memory_server.client import MemoryClient
 from ..integrations.ha_mcp.client import HomeAssistantMCPClient, HomeAssistantNativeClient
 from ..integrations.newsapi.client import NewsAPIClient
 from ..search import get_search_client, SearchClient
 from ..tools import get_tools_prompt, get_tools_list, query_with_tools
-from ..utils.config import Config, has_database_credentials
+from ..utils.config import Config
 from ..utils.paths import resolve_log_dir
 from ..utils.history import HistoryManager, Message
 from ..utils.temporal import build_temporal_context
@@ -178,42 +177,13 @@ class BaseLLMBawt(ABC):
             logger.info(f"Using bot: {self.bot.name} ({self.bot_id})")
     
     def _init_memory(self, config: Config):
-        """Initialize memory client if database is available."""
-        if self.local_mode:
-            logger.debug("Local mode enabled - using filesystem for history")
-            return
-        
-        if not has_database_credentials(config):
-            logger.debug("Database credentials not configured")
-            return
-        
-        if not self.bot.requires_memory:
-            logger.debug(f"Bot '{self.bot.name}' has requires_memory=false")
-            self._db_available = True  # DB available but not needed
-            return
-        
-        try:
-            self.memory = get_memory_client(
-                config=config,
-                bot_id=self.bot_id,
-                user_id=self.user_id,
-                server_url=getattr(config, "MEMORY_SERVER_URL", None),
-            )
-            self._db_available = True
-            logger.debug(f"Memory client initialized for bot: {self.bot_id}")
-            
-            # Initialize profile manager
-            self.profile_manager = ProfileManager(config)
-            
-        except Exception as e:
-            # Log without full traceback for connection errors (avoid 10-page stack traces)
-            error_str = str(e)
-            if "could not translate host name" in error_str or "Connection refused" in error_str:
-                logger.error(f"Failed to initialize memory: {e}")
-            else:
-                logger.exception(f"Failed to initialize memory: {e}")
-            if self.verbose:
-                console.print(f"[yellow]Warning:[/yellow] Memory client failed: {e}")
+        """Initialize memory client - base class is a no-op.
+
+        Service-side subclass (ServiceLLMBawt) overrides this to set up
+        database connections. CLI never initializes memory directly.
+        """
+        self._db_available = False
+        logger.debug("BaseLLMBawt._init_memory() is a no-op; memory is service-managed")
     
     def _init_search(self, config: Config):
         """Initialize search client if bot uses search."""
