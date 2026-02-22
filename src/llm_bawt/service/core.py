@@ -102,6 +102,7 @@ class ServiceLLMBawt(BaseLLMBawt):
             self.profile_manager = ProfileManager(config)
 
         except Exception as e:
+            self.profile_manager = None
             # Log without full traceback for connection errors
             error_str = str(e)
             if "could not translate host name" in error_str or "Connection refused" in error_str:

@@ -697,10 +697,14 @@ def trigger_job(config: Config, job_type: str):
         console.print("[yellow]Service not available. Start with: llm-service[/yellow]")
         return
 
-    valid_types = ["profile_maintenance", "memory_consolidation", "memory_decay"]
+    try:
+        from llm_bawt.service.scheduler import JobType
+        valid_types = {jt.value for jt in JobType}
+    except ImportError:
+        valid_types = {"profile_maintenance", "memory_consolidation", "memory_decay", "history_summarization"}
     if job_type not in valid_types:
         console.print(f"[red]Unknown job type: {job_type}[/red]")
-        console.print(f"[dim]Valid types: {', '.join(valid_types)}[/dim]")
+        console.print(f"[dim]Valid types: {', '.join(sorted(valid_types))}[/dim]")
         return
 
     result = client.trigger_job(job_type)
@@ -1556,23 +1560,30 @@ def run_app(args: argparse.Namespace, config_obj: Config, resolved_alias: str):
     # Use config default if --user not specified
     user_id = args.user if args.user else config_obj.DEFAULT_USER
     
-    # Determine service mode: --local flag disables, otherwise check config
-    use_service = not args.local and (getattr(args, 'service', False) or config_obj.USE_SERVICE)
+    # Determine service mode: --local flag disables, otherwise check config/flags
+    service_explicitly_set = not args.local and (getattr(args, 'service', False) or config_obj.USE_SERVICE)
+    use_tools = getattr(bot, 'uses_tools', False)
+    use_service = service_explicitly_set
 
     # Auto-enable service mode when bot uses tools and not in local mode
-    use_tools = getattr(bot, 'uses_tools', False)
     if use_tools and not use_service and not args.local:
         use_service = True
         if config_obj.VERBOSE:
             console.print(f"[dim]Bot '{bot.name}' uses tools; enabling service mode[/dim]")
 
-    # Hard gate: if service mode required, service must be available
+    # Check service availability; fallback rules differ based on how service mode was activated
     if use_service:
         service_client = get_service_client(config_obj)
         if not service_client or not service_client.is_available(force_check=True):
-            console.print("[bold red]Service not available. Start with: llm-service[/bold red]")
-            console.print("[dim]Or use --local for direct API calls without memory/tools.[/dim]")
-            sys.exit(1)
+            # Service mode was explicitly configured (env var / --service flag) or tools require it
+            if service_explicitly_set or use_tools:
+                console.print("[bold red]Service not available.[/bold red] Start with: [yellow]llm-service[/yellow]")
+                console.print("[dim]Or use --local for direct API calls without memory/tools.[/dim]")
+                sys.exit(1)
+            # Service mode was auto-detected but not explicitly required — fall back to direct OpenAI
+            use_service = False
+            if config_obj.VERBOSE:
+                console.print("[dim]Service unavailable; falling back to direct API mode (no memory/tools).[/dim]")
 
     llm_bawt = None
     
@@ -1586,6 +1597,10 @@ def run_app(args: argparse.Namespace, config_obj: Config, resolved_alias: str):
             sys.exit(1)
 
         service_client = get_service_client(config_obj)
+        if not service_client or not service_client.is_available():
+            console.print("[bold red]Service not available.[/bold red] Start with: [yellow]llm-service[/yellow]")
+            sys.exit(1)
+
         from llm_bawt.clients.base import StubClient
         from llm_bawt.models.message import Message
         from llm_bawt.utils.history import HistoryManager

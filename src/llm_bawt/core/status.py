@@ -212,14 +212,36 @@ def _collect_mcp_info(config: Config, default_bot_slug: str) -> McpInfo:
 def _collect_memory_info(config: Config, default_bot_slug: str) -> MemoryInfo:
     """Collect database and memory status (service-side only).
 
-    When called from CLI (local_only=True), memory info comes from service status API.
-    This function should only be called server-side or when we know DB is available.
+    Only called from the service process (BackgroundService.get_status() and
+    collect_system_status()). CLI gets memory info via _status_from_service().
     """
+    from llm_bawt.utils.config import has_database_credentials
+
     info = MemoryInfo()
     info.embeddings_available = importlib.util.find_spec("sentence_transformers") is not None
 
-    # Note: Direct DB access is only done server-side. CLI gets memory info from
-    # the /v1/status API endpoint (see _status_from_service above).
+    if not has_database_credentials(config):
+        return info
+
+    try:
+        from llm_bawt.memory.postgresql import PostgreSQLMemoryBackend
+
+        backend = PostgreSQLMemoryBackend(config, bot_id=default_bot_slug)
+        db_stats = backend.stats()
+        info.postgres_connected = True
+        info.postgres_host = config.POSTGRES_HOST
+        info.memories_count = db_stats.get("memories", {}).get("total_count", 0)
+        info.messages_count = db_stats.get("messages", {}).get("total_count", 0)
+    except Exception as e:
+        info.postgres_error = str(e)
+
+    try:
+        from pgvector.psycopg2 import register_vector  # noqa: F401
+
+        info.pgvector_available = True
+    except ImportError:
+        pass
+
     return info
 
 
