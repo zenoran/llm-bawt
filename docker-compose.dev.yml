@@ -14,8 +14,8 @@ services:
     
     volumes:
       # Mount source code for live development
-      - ./src:/app/src
-      - ./server.sh:/app/server.sh
+      # - ./src:/app/src  # disabled: Docker Desktop VirtioFS bug corrupts src view
+      # - ./server.sh:/app/server.sh  # disabled: Docker Desktop VirtioFS bug shows server.sh as directory
       # Config, logs, models (mirrors base compose)
       - ${HOME}/.config/llm-bawt:/root/.config/llm-bawt
       - ./.logs:/app/.logs

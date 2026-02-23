@@ -375,7 +375,7 @@ class ToolExecutor:
 
             return format_tool_result(
                 tool_call.name,
-                f"Memory stored successfully with ID: {result.id[:8]}"
+                f"Memory stored successfully with ID: {result.id}"
             )
 
         except Exception as e:
@@ -417,13 +417,11 @@ class ToolExecutor:
                         success = self.memory_client.delete_memory(mid)
                         if success:
                             deleted_count += 1
-                            content = memory.content[:50] if memory.content else ""
-                            deleted_contents.append(f"- {content}...")
+                            content = memory.content if memory.content else ""
+                            deleted_contents.append(f"- {content}")
 
                 if deleted_count > 0:
-                    result = f"Deleted {deleted_count} memories matching '{query}':\n" + "\n".join(deleted_contents[:5])
-                    if deleted_count > 5:
-                        result += f"\n... and {deleted_count - 5} more"
+                    result = f"Deleted {deleted_count} memories matching '{query}':\n" + "\n".join(deleted_contents)
                     return format_tool_result(tool_call.name, result)
                 else:
                     return format_tool_result(
@@ -495,7 +493,7 @@ class ToolExecutor:
 
             return format_tool_result(
                 tool_call.name,
-                f"Updated memory {str(updated.id)[:8]}: {updated.content[:120]}"
+                f"Updated memory {updated.id}: {updated.content}"
             )
         except Exception as e:
             logger.error(f"Memory update failed: {e}")
@@ -571,8 +569,7 @@ class ToolExecutor:
             # Format results for the model
             lines = [f"Found {len(results)} messages matching '{query}':"]
             for i, msg in enumerate(results, 1):
-                content = msg.content[:200] + "..." if len(msg.content) > 200 else msg.content
-                content = content.replace("\n", " ")
+                content = msg.content
                 lines.append(f"{i}. [{msg.role}] {content}")
 
             return format_tool_result(tool_call.name, "\n".join(lines))
@@ -628,8 +625,6 @@ class ToolExecutor:
             for i, msg in enumerate(results, 1):
                 role = msg.get("role", "unknown")
                 content = msg.get("content", "")
-                content = content[:200] + "..." if len(content) > 200 else content
-                content = content.replace("\n", " ")
                 lines.append(f"{i}. [{role}] {content}")
 
             return format_tool_result(tool_call.name, "\n".join(lines))
@@ -711,7 +706,7 @@ class ToolExecutor:
             for i, msg in enumerate(raw_messages, 1):
                 from datetime import datetime
                 ts = datetime.fromtimestamp(msg.timestamp).strftime("%Y-%m-%d %H:%M")
-                content = msg.content[:500] + "..." if len(msg.content) > 500 else msg.content
+                content = msg.content
                 lines.append(f"{i}. [{msg.role} @ {ts}] {content}")
 
             # Mark these messages as recalled in the database
@@ -885,9 +880,7 @@ class ToolExecutor:
                 )
 
                 if count > 0:
-                    result = f"Deleted {count} attribute(s) matching '{query}':\n" + "\n".join(f"- {d}" for d in deleted[:5])
-                    if count > 5:
-                        result += f"\n... and {count - 5} more"
+                    result = f"Deleted {count} attribute(s) matching '{query}':\n" + "\n".join(f"- {d}" for d in deleted)
                     return format_tool_result(tool_call.name, result)
                 else:
                     return format_tool_result(
@@ -1188,9 +1181,7 @@ class ToolExecutor:
                 )
 
                 if count > 0:
-                    result = f"You've evolved past {count} trait(s) matching '{query}':\n" + "\n".join(f"- {d}" for d in deleted[:5])
-                    if count > 5:
-                        result += f"\n... and {count - 5} more"
+                    result = f"You've evolved past {count} trait(s) matching '{query}':\n" + "\n".join(f"- {d}" for d in deleted)
                     return format_tool_result(tool_call.name, result)
                 else:
                     return format_tool_result(
@@ -1603,7 +1594,8 @@ class ToolExecutor:
         logger.info(f"HA native tool call: {tool_name}({clean_args})")
         try:
             result = self.ha_native_client.call_tool(tool_name, clean_args)
-            logger.debug(f"HA native tool result: {result[:200] if result else '(empty)'}")
+            result_len = len(result) if isinstance(result, str) else 0
+            logger.debug(f"HA native tool result length: {result_len} chars")
             return format_tool_result(tool_name, result or "Done")
         except Exception as e:
             logger.error(f"HA native tool call failed: {tool_name}: {e}")
@@ -1764,7 +1756,7 @@ class ToolExecutor:
 
     @staticmethod
     def _compact_home_text(text: str, max_lines: int = 8, max_chars_per_line: int = 180) -> str:
-        """Trim Home Assistant MCP output to avoid prompt bloat."""
+        """Normalize Home Assistant MCP output without truncating content."""
         if not text:
             return ""
 
@@ -1773,14 +1765,7 @@ class ToolExecutor:
             line = raw.strip()
             if not line:
                 continue
-            if len(line) > max_chars_per_line:
-                line = line[: max_chars_per_line - 3] + "..."
             lines.append(line)
-
-        if len(lines) > max_lines:
-            remaining = len(lines) - max_lines
-            lines = lines[:max_lines]
-            lines.append(f"... (+{remaining} more lines)")
 
         return "\n".join(lines)
 

@@ -327,7 +327,7 @@ def format_memories_for_result(memories: list[dict]) -> str:
     for i, mem in enumerate(memories, 1):
         content = mem.get("content", "")
         relevance = mem.get("relevance", 0)
-        memory_id = mem.get("id", "")[:8] if mem.get("id") else ""
+        memory_id = mem.get("id", "") if mem.get("id") else ""
         lines.append(f"{i}. [id:{memory_id}] (relevance: {relevance:.2f}) {content}")
     
     return "\n".join(lines)

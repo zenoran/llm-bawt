@@ -26,7 +26,7 @@ services:
       # Mount logs directory
       - ./.logs:/app/.logs
       # Mount bots.yaml for live updates (nextcloud provisioning, etc.)
-      - ./src/llm_bawt/bots.yaml:/app/src/llm_bawt/bots.yaml:ro
+      # - ./src/llm_bawt/bots.yaml:/app/src/llm_bawt/bots.yaml:ro  # disabled: Docker Desktop VirtioFS bug
       # Optional: mount local models
       - ${MODELS_PATH:-./models}:/app/models
       # Share host's GGUF model cache to avoid re-downloads
