@@ -324,6 +324,166 @@ class RuntimeSettingsStore:
             return True
 
 
+class ModelDefinition(SQLModel, table=True):
+    """DB-backed model definition — mirrors models.yaml but DB takes priority."""
+
+    __tablename__ = "model_definitions"
+
+    id: int | None = Field(default=None, primary_key=True)
+    alias: str = Field(sa_column=Column(String(128), nullable=False, index=True, unique=True))
+    type: str = Field(sa_column=Column(String(64), nullable=False))
+    model_id: str | None = Field(default=None, sa_column=Column(String(512), nullable=True))
+    repo_id: str | None = Field(default=None, sa_column=Column(String(512), nullable=True))
+    filename: str | None = Field(default=None, sa_column=Column(String(512), nullable=True))
+    description: str | None = Field(default=None, sa_column=Column(Text, nullable=True))
+    extra: dict[str, Any] | None = Field(
+        default=None,
+        sa_column=Column(JSONB, nullable=True),
+        description="Optional fields: chat_format, context_window, max_tokens, n_gpu_layers, tool_support, tool_format",
+    )
+    created_at: datetime = Field(
+        default_factory=datetime.utcnow,
+        sa_column=Column(DateTime(timezone=True), nullable=False),
+    )
+    updated_at: datetime = Field(
+        default_factory=datetime.utcnow,
+        sa_column=Column(DateTime(timezone=True), nullable=False),
+    )
+
+    def to_model_dict(self) -> dict[str, Any]:
+        """Convert to the dict format used by config.defined_models['models'][alias]."""
+        d: dict[str, Any] = {"type": self.type}
+        if self.model_id is not None:
+            d["model_id"] = self.model_id
+        if self.repo_id is not None:
+            d["repo_id"] = self.repo_id
+        if self.filename is not None:
+            d["filename"] = self.filename
+        if self.description is not None:
+            d["description"] = self.description
+        if self.extra:
+            d.update(self.extra)
+        return d
+
+
+class ModelDefinitionStore:
+    """DB access for model definitions. DB always takes priority over models.yaml."""
+
+    def __init__(self, config: Config):
+        self.config = config
+        self.engine = None
+        if not has_database_credentials(config):
+            return
+
+        try:
+            host = getattr(config, "POSTGRES_HOST", "localhost")
+            port = int(getattr(config, "POSTGRES_PORT", 5432))
+            user = getattr(config, "POSTGRES_USER", "llm_bawt")
+            password = getattr(config, "POSTGRES_PASSWORD", "")
+            database = getattr(config, "POSTGRES_DATABASE", "llm_bawt")
+            encoded_password = quote_plus(password)
+            connection_url = f"postgresql+psycopg2://{user}:{encoded_password}@{host}:{port}/{database}"
+            self.engine = create_engine(connection_url, echo=False)
+            self._ensure_tables_exist()
+        except Exception as e:
+            self.engine = None
+            logger.warning("Model definitions DB unavailable: %s", e)
+
+    def _ensure_tables_exist(self) -> None:
+        if self.engine is None:
+            return
+        SQLModel.metadata.create_all(self.engine, tables=[ModelDefinition.__table__])
+
+    def count(self) -> int:
+        if self.engine is None:
+            return 0
+        with Session(self.engine) as session:
+            return session.exec(select(ModelDefinition)).all().__len__()
+
+    def list_all(self) -> list[ModelDefinition]:
+        if self.engine is None:
+            return []
+        with Session(self.engine) as session:
+            return list(session.exec(select(ModelDefinition).order_by(ModelDefinition.alias)).all())
+
+    def to_config_dict(self) -> dict[str, dict[str, Any]]:
+        """Return all DB models as {alias: definition_dict} for merging into config."""
+        return {row.alias: row.to_model_dict() for row in self.list_all()}
+
+    def get(self, alias: str) -> ModelDefinition | None:
+        if self.engine is None:
+            return None
+        with Session(self.engine) as session:
+            return session.exec(
+                select(ModelDefinition).where(ModelDefinition.alias == alias)
+            ).first()
+
+    def upsert(self, alias: str, model_data: dict[str, Any]) -> ModelDefinition:
+        if self.engine is None:
+            raise RuntimeError("Model definitions DB unavailable")
+
+        known_fields = {"type", "model_id", "repo_id", "filename", "description"}
+        extra = {k: v for k, v in model_data.items() if k not in known_fields}
+        now = datetime.utcnow()
+
+        with Session(self.engine) as session:
+            row = session.exec(
+                select(ModelDefinition).where(ModelDefinition.alias == alias)
+            ).first()
+            if row is None:
+                row = ModelDefinition(
+                    alias=alias,
+                    type=str(model_data.get("type", "openai")),
+                    model_id=model_data.get("model_id"),
+                    repo_id=model_data.get("repo_id"),
+                    filename=model_data.get("filename"),
+                    description=model_data.get("description"),
+                    extra=extra or None,
+                    created_at=now,
+                    updated_at=now,
+                )
+            else:
+                row.type = str(model_data.get("type", row.type))
+                row.model_id = model_data.get("model_id", row.model_id)
+                row.repo_id = model_data.get("repo_id", row.repo_id)
+                row.filename = model_data.get("filename", row.filename)
+                row.description = model_data.get("description", row.description)
+                row.extra = extra or None
+                row.updated_at = now
+
+            session.add(row)
+            session.commit()
+            session.refresh(row)
+            return row
+
+    def delete(self, alias: str) -> bool:
+        if self.engine is None:
+            raise RuntimeError("Model definitions DB unavailable")
+        with Session(self.engine) as session:
+            row = session.exec(
+                select(ModelDefinition).where(ModelDefinition.alias == alias)
+            ).first()
+            if not row:
+                return False
+            session.delete(row)
+            session.commit()
+            return True
+
+    def seed_from_yaml(self, models_dict: dict[str, Any]) -> int:
+        """Seed DB from models.yaml format {alias: definition}. Skips existing aliases."""
+        if self.engine is None:
+            raise RuntimeError("Model definitions DB unavailable")
+        seeded = 0
+        for alias, model_data in models_dict.items():
+            if not isinstance(model_data, dict):
+                continue
+            if self.get(alias) is not None:
+                continue
+            self.upsert(alias, model_data)
+            seeded += 1
+        return seeded
+
+
 class RuntimeSettingsResolver:
     """Resolve runtime settings with layered precedence and short-lived cache."""
 

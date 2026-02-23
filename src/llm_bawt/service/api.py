@@ -34,6 +34,20 @@ async def lifespan(app):
     # This ensures memory retrieval happens via MCP tools and can be logged clearly.
     _ensure_memory_mcp_server(config)
 
+    # Load model definitions from DB and merge into config.
+    # DB always takes priority; YAML is seeded to DB on first run if DB is empty.
+    from ..runtime_settings import ModelDefinitionStore
+    model_store = ModelDefinitionStore(config)
+    if model_store.engine is not None:
+        yaml_models = config.defined_models.get("models", {})
+        if yaml_models and model_store.count() == 0:
+            seeded = model_store.seed_from_yaml(yaml_models)
+            log.info("Seeded %d model definitions from YAML to DB", seeded)
+        db_models = model_store.to_config_dict()
+        if db_models:
+            config.merge_db_models(db_models)
+            log.debug("Loaded %d model definitions from DB", len(db_models))
+
     service = BackgroundService(config)
     set_service(service)
     service.start_worker()

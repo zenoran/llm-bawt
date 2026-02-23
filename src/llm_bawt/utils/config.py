@@ -350,6 +350,14 @@ class Config(RuntimeTunables, BaseSettings):
             console.print(f"[bold red]Error loading models config {config_path}:[/bold red] {e}")
             self.defined_models = {"models": {}}
 
+    def merge_db_models(self, db_models: dict[str, Any]) -> None:
+        """Overlay DB model definitions on top of YAML. DB always wins per alias."""
+        if not db_models:
+            return
+        models = dict(self.defined_models.get("models", {}))
+        models.update(db_models)
+        self.defined_models = {"models": models}
+
     def _check_ollama_availability(self, force_check: bool = False) -> None:
         if not force_check and self.ollama_checked:
             return
