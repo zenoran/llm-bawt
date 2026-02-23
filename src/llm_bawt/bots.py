@@ -77,7 +77,8 @@ class ModelSelection:
 
 # Global bot registry - populated from YAML on module load
 BUILTIN_BOTS: dict[str, Bot] = {}
-_DEFAULTS: dict[str, str] = {"standard": "nova", "local": "spark"}
+_DEFAULTS_BASE: dict[str, str] = {"standard": "nova", "local": "spark"}
+_DEFAULTS: dict[str, str] = _DEFAULTS_BASE.copy()
 _SYSTEM_PROMPTS: dict[str, str] = {}
 _RAW_BOT_DATA: dict[str, dict] = {}  # Raw effective bot data for integrations
 _BOT_SETTINGS_TEMPLATE: dict[str, Any] = {}
@@ -156,11 +157,53 @@ def _extract_bot_settings_template(merged_data: dict[str, Any]) -> dict[str, Any
     return {}
 
 
+def _load_db_bot_overrides() -> dict[str, dict[str, Any]]:
+    """Load DB-backed bot profile overrides keyed by slug.
+
+    These values take priority over YAML bot fields when building the active
+    in-memory bot registry.
+    """
+    try:
+        from llm_bawt.runtime_settings import BotProfileStore
+        from llm_bawt.utils.config import Config, has_database_credentials
+
+        config = Config()
+        if not has_database_credentials(config):
+            return {}
+
+        store = BotProfileStore(config)
+        if store.engine is None:
+            return {}
+
+        rows = store.list_all()
+        overrides: dict[str, dict[str, Any]] = {}
+        for row in rows:
+            slug = (row.slug or "").strip().lower()
+            if not slug:
+                continue
+            overrides[slug] = {
+                "name": row.name,
+                "description": row.description,
+                "system_prompt": row.system_prompt,
+                "requires_memory": row.requires_memory,
+                "voice_optimized": row.voice_optimized,
+                "uses_tools": row.uses_tools,
+                "uses_search": row.uses_search,
+                "uses_home_assistant": row.uses_home_assistant,
+                "default_model": row.default_model,
+                "nextcloud": row.nextcloud_config,
+            }
+        return overrides
+    except Exception as e:
+        logger.warning(f"Could not load DB bot profile overrides: {e}")
+        return {}
+
+
 def _load_bots_config() -> None:
     """Load bot definitions from YAML (repo + user config).
 
-    Note: DB bot_profiles are only loaded by the service process at startup.
-    The CLI gets full bot info from the service API when needed.
+    When available, DB-backed bot_profiles are loaded as overrides with higher
+    precedence than YAML bot fields.
     """
     global BUILTIN_BOTS, _DEFAULTS, _SYSTEM_PROMPTS, _RAW_BOT_DATA, _BOT_SETTINGS_TEMPLATE
     global _LAST_REPO_MTIME, _LAST_USER_MTIME
@@ -188,7 +231,26 @@ def _load_bots_config() -> None:
     # Clear existing data
     BUILTIN_BOTS.clear()
     _RAW_BOT_DATA.clear()
+    _SYSTEM_PROMPTS.clear()
+    _DEFAULTS.clear()
+    _DEFAULTS.update(_DEFAULTS_BASE)
     _BOT_SETTINGS_TEMPLATE = _extract_bot_settings_template(merged_data)
+
+    merged_bots = merged_data.get("bots", {}) if isinstance(merged_data.get("bots"), dict) else {}
+    effective_bots: dict[str, dict[str, Any]] = {}
+    for slug, bot_data in merged_bots.items():
+        normalized_slug = (slug or "").strip().lower()
+        if not normalized_slug or not isinstance(bot_data, dict):
+            continue
+        effective_bots[normalized_slug] = dict(bot_data)
+
+    # DB-backed bot_profiles take precedence over YAML.
+    db_overrides = _load_db_bot_overrides()
+    for slug, db_payload in db_overrides.items():
+        base = effective_bots.get(slug, {})
+        merged_payload = dict(base)
+        merged_payload.update(db_payload)
+        effective_bots[slug] = merged_payload
 
     def _build_settings(yaml_bot_data: dict[str, Any] | None = None) -> dict[str, Any]:
         yaml_settings = {}
@@ -222,12 +284,8 @@ def _load_bots_config() -> None:
             settings=effective_settings,
         )
 
-    # Load bots from YAML only (DB profiles are service-only)
-    for slug, bot_data in merged_data.get("bots", {}).items():
-        normalized_slug = (slug or "").strip().lower()
-        if not normalized_slug:
-            continue
-        _register_bot(normalized_slug, bot_data)
+    for slug, bot_data in effective_bots.items():
+        _register_bot(slug, bot_data)
 
     # Load defaults (merged)
     if "defaults" in merged_data:
@@ -238,8 +296,8 @@ def _load_bots_config() -> None:
         _SYSTEM_PROMPTS.update(merged_data["system_prompts"])
 
     logger.debug(
-        f"Loaded {len(BUILTIN_BOTS)} bots from YAML "
-        f"(repo: {repo_path.exists()}, user: {user_path.exists()})"
+        f"Loaded {len(BUILTIN_BOTS)} bots "
+        f"(repo: {repo_path.exists()}, user: {user_path.exists()}, db_overrides: {len(db_overrides)})"
     )
 
 
@@ -273,6 +331,8 @@ def save_user_bot_config(slug: str, section: str, data: dict) -> None:
 
     if section != "nextcloud":
         raise ValueError(f"Unsupported bot config section: {section}")
+
+    from llm_bawt.utils.config import Config, has_database_credentials
 
     config = Config()
     if not has_database_credentials(config):
@@ -327,6 +387,8 @@ def remove_user_bot_section(slug: str, section: str) -> bool:
 
     if section != "nextcloud":
         return False
+
+    from llm_bawt.utils.config import Config, has_database_credentials
 
     config = Config()
     if not has_database_credentials(config):

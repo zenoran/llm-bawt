@@ -54,6 +54,39 @@ def _to_profile_response(profile) -> BotProfileResponse:
     )
 
 
+def _reload_bot_registry() -> None:
+    """Reload in-memory bot registry from YAML + DB overrides."""
+    from ...bots import invalidate_bots_cache, _check_reload
+
+    invalidate_bots_cache()
+    _check_reload()
+
+
+def _invalidate_bot_instance_cache(service, bot_id: str) -> int:
+    """Drop cached ServiceLLMBawt instances for a bot so prompt changes apply."""
+    invalidate = getattr(service, "invalidate_bot_instances", None)
+    if callable(invalidate):
+        return int(invalidate(bot_id))
+
+    normalized = (bot_id or "").strip().lower()
+    if not normalized:
+        return 0
+    keys_to_remove = [key for key in service._llm_bawt_cache if key[1] == normalized]
+    for key in keys_to_remove:
+        del service._llm_bawt_cache[key]
+    return len(keys_to_remove)
+
+
+def _invalidate_all_instance_cache(service) -> int:
+    """Drop all cached ServiceLLMBawt instances."""
+    invalidate = getattr(service, "invalidate_all_instances", None)
+    if callable(invalidate):
+        return int(invalidate())
+    cleared = len(service._llm_bawt_cache)
+    service._llm_bawt_cache.clear()
+    return cleared
+
+
 @router.get("/v1/settings", response_model=RuntimeSettingsResponse, tags=["System"])
 async def list_runtime_settings(
     scope_type: str = Query("bot", description="global or bot"),
@@ -312,17 +345,18 @@ async def upsert_bot_profile(slug: str, request: BotProfileUpsertRequest):
             "nextcloud_config": request.nextcloud_config,
         }
     )
+    _reload_bot_registry()
+    _invalidate_bot_instance_cache(service, profile.slug)
     return _to_profile_response(profile)
 
 
 @router.post("/v1/admin/reload-bots", tags=["Admin"])
 async def reload_bots():
     """Force reload bot registry from DB + YAML."""
-    from ...bots import invalidate_bots_cache, _check_reload
-
-    invalidate_bots_cache()
-    _check_reload()
-    return {"status": "reloaded"}
+    service = get_service()
+    _reload_bot_registry()
+    cleared_instances = _invalidate_all_instance_cache(service)
+    return {"status": "reloaded", "cleared_instances": cleared_instances}
 
 
 @router.delete("/v1/bots/{slug}/profile", tags=["System"])
@@ -337,4 +371,8 @@ async def delete_bot_profile(slug: str):
     if not deleted:
         raise HTTPException(status_code=404, detail="Bot profile not found")
 
-    return {"success": True, "slug": slug.strip().lower()}
+    normalized_slug = slug.strip().lower()
+    _reload_bot_registry()
+    _invalidate_bot_instance_cache(service, normalized_slug)
+
+    return {"success": True, "slug": normalized_slug}

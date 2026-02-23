@@ -309,6 +309,33 @@ class BackgroundService:
             del self._llm_bawt_cache[key]
         
         log.debug(f"Cleared {len(keys_to_remove)} cached instances for model '{model_alias}'")
+
+    def invalidate_bot_instances(self, bot_id: str) -> int:
+        """Invalidate cached ServiceLLMBawt instances for a bot across models/users."""
+        normalized_bot_id = (bot_id or "").strip().lower()
+        if not normalized_bot_id:
+            return 0
+        keys_to_remove = [
+            key for key in self._llm_bawt_cache
+            if key[1] == normalized_bot_id
+        ]
+        for key in keys_to_remove:
+            del self._llm_bawt_cache[key]
+        if keys_to_remove:
+            log.debug(
+                "Cleared %s cached instances for bot '%s'",
+                len(keys_to_remove),
+                normalized_bot_id,
+            )
+        return len(keys_to_remove)
+
+    def invalidate_all_instances(self) -> int:
+        """Invalidate all cached ServiceLLMBawt instances."""
+        cleared = len(self._llm_bawt_cache)
+        self._llm_bawt_cache.clear()
+        if cleared:
+            log.debug("Cleared all cached instances (%s)", cleared)
+        return cleared
     
     def _load_available_models(self):
         """Load list of available models from config."""
