@@ -84,6 +84,9 @@ llm-nextcloud = "llm_bawt.integrations.nextcloud.cli:nextcloud_cli"
 [project.entry-points."llm_bawt.memory"]
 postgresql = "llm_bawt.memory.postgresql:PostgreSQLMemoryBackend"
 
+[project.entry-points."llm_bawt.agent_backends"]
+openclaw = "llm_bawt.agent_backends.openclaw:OpenClawBackend"
+
 [tool.setuptools]
 package-dir = {"" = "src"}
 include-package-data = true

@@ -6,7 +6,7 @@ pipeline components, see the other modules in this package.
 
 import logging
 
-from ..clients import LLMClient, GrokClient
+from ..clients import LLMClient, GrokClient, AgentBackendClient
 from ..clients.openai_client import OpenAIClient
 from .base import BaseLLMBawt
 from ..utils.config import Config
@@ -66,9 +66,30 @@ class LLMBawt(BaseLLMBawt):
         model_type = self.model_definition.get("type")
         model_id = self.model_definition.get("model_id")
         
+        if model_type == "openclaw":
+            backend_config = {
+                "transport": "gateway_api",
+                "gateway_url": self.model_definition.get("gateway_url"),
+                "token": self.model_definition.get("token"),
+                "token_env": self.model_definition.get("token_env"),
+                "agent_id": self.model_definition.get("agent_id", "main"),
+                "session_key": self.model_definition.get("session_key"),
+                "message_channel": self.model_definition.get("message_channel"),
+                "account_id": self.model_definition.get("account_id"),
+                "model": self.model_definition.get("model_id"),
+                "timeout_seconds": self.model_definition.get("timeout_seconds", 120),
+                "tool_history_limit": self.model_definition.get("tool_history_limit", 8),
+            }
+            return AgentBackendClient(
+                backend_name="openclaw",
+                config=self.config,
+                bot_config=backend_config,
+                model_definition=self.model_definition,
+            )
+
         if model_type not in ("openai", "grok"):
             raise ValueError(
-                f"Only 'openai' and 'grok' model types are supported in CLI mode. "
+                f"Only 'openai', 'grok', and 'openclaw' model types are supported in CLI mode. "
                 f"Got '{model_type}'. Use --service flag for local models."
             )
         

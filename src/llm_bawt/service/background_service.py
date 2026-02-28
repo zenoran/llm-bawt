@@ -342,9 +342,36 @@ class BackgroundService:
         models = self.config.defined_models.get("models", {})
         self._available_models = list(models.keys())
         log.debug(f"Loaded {len(self._available_models)} models from config")
-        
-        # Set default model from bot/config selection or use first available
+
+        # Inject virtual model definitions for agent-backend bots.
+        # Each backend name (e.g. "openclaw") becomes a model alias with
+        # type: "agent_backend" so the entire pipeline flows normally.
         bot_manager = BotManager(self.config)
+        for bot in bot_manager.list_bots():
+            backend_name = getattr(bot, "agent_backend", None)
+            if not backend_name:
+                continue
+            backend_config = getattr(bot, "agent_backend_config", {}) or {}
+            if backend_name not in models:
+                virtual_def = {
+                    "type": "agent_backend",
+                    "backend": backend_name,
+                    "bot_config": backend_config,
+                    "tool_support": "none",
+                }
+                models[backend_name] = virtual_def
+                if backend_name not in self._available_models:
+                    self._available_models.append(backend_name)
+                log.info(
+                    "Registered virtual model '%s' for agent backend (bot=%s)",
+                    backend_name,
+                    bot.slug,
+                )
+            # Ensure the bot's default_model points at its backend
+            if not bot.default_model:
+                bot.default_model = backend_name
+
+        # Set default model from bot/config selection or use first available
         selection = bot_manager.select_model(None, bot_slug=self._default_bot)
         self._default_model = selection.alias
         if not self._default_model and self._available_models:
@@ -656,6 +683,7 @@ class BackgroundService:
         local_mode = not request.augment_memory
 
         # Resolve model using shared bot/config logic
+        # Agent-backend bots resolve to their virtual model (e.g. "openclaw")
         try:
             model_alias, model_warnings = self._resolve_request_model(request.model, bot_id, local_mode)
         except Exception as e:
@@ -716,6 +744,21 @@ class BackgroundService:
                     plaintext_output=True,
                     stream=False,
                 )
+
+                # For agent backend clients, extract tool call details
+                # from the structured result stashed by the backend.
+                from ..clients.agent_backend_client import AgentBackendClient
+                if isinstance(llm_bawt.client, AgentBackendClient):
+                    for tc in llm_bawt.client.get_tool_calls():
+                        result_payload = tc.get("result")
+                        if result_payload is None:
+                            result_payload = "Result not exposed by OpenClaw API (see assistant response)."
+                        tool_call_details.append({
+                            "iteration": 1,
+                            "tool": tc.get("display_name") or tc.get("name", "unknown"),
+                            "parameters": tc.get("arguments", {}),
+                            "result": result_payload,
+                        })
 
                 # Write debug turn log if enabled (check config or env var)
                 if self.config.DEBUG_TURN_LOG or os.environ.get("LLM_BAWT_DEBUG_TURN_LOG"):
@@ -846,6 +889,7 @@ class BackgroundService:
         local_mode = not request.augment_memory
 
         # Resolve model using shared bot/config logic
+        # Agent-backend bots resolve to their virtual model (e.g. "openclaw")
         try:
             model_alias, model_warnings = self._resolve_request_model(request.model, bot_id, local_mode)
         except Exception as e:
@@ -1137,6 +1181,40 @@ class BackgroundService:
                 
                 timing_holder[1] = time.time()
                 
+                # Emit tool call SSE events for agent backend clients.
+                # The backend stashes tool call metadata in last_result after
+                # query() completes — push them to the chunk queue so the
+                # SSE consumer can broadcast them to the frontend.
+                from ..clients.agent_backend_client import AgentBackendClient
+                if isinstance(llm_bawt.client, AgentBackendClient):
+                    for tc in llm_bawt.client.get_tool_calls():
+                        result_payload = tc.get("result")
+                        if result_payload is None:
+                            result_payload = "Result not exposed by OpenClaw API (see assistant response)."
+                        loop.call_soon_threadsafe(
+                            chunk_queue.put_nowait,
+                            {
+                                "event": "tool_call",
+                                "name": tc.get("display_name") or tc.get("name", "unknown"),
+                                "arguments": tc.get("arguments", {}),
+                                "result": result_payload,
+                            },
+                        )
+                        loop.call_soon_threadsafe(
+                            chunk_queue.put_nowait,
+                            {
+                                "event": "tool_result",
+                                "name": tc.get("display_name") or tc.get("name", "unknown"),
+                                "result": result_payload,
+                            },
+                        )
+                        tool_call_details_holder.append({
+                            "iteration": 1,
+                            "tool": tc.get("display_name") or tc.get("name", "unknown"),
+                            "parameters": tc.get("arguments", {}),
+                            "result": result_payload,
+                        })
+                
                 # Finalize: add response to history and trigger memory extraction
                 # Only if we weren't cancelled
                 if full_response_holder[0] and not cancel_event.is_set():
@@ -1277,11 +1355,24 @@ class BackgroundService:
                     break
 
                 if isinstance(chunk, dict) and chunk.get("event") == "tool_call":
+                    has_result = chunk.get("result") is not None
                     event_data = {
                         "object": "service.tool_call",
                         "model": model_alias,
                         "tool": chunk.get("name", "unknown"),
                         "arguments": chunk.get("arguments", {}),
+                        "result": chunk.get("result"),
+                        "status": "completed" if has_result else "pending",
+                    }
+                    yield f"data: {json.dumps(event_data)}\n\n"
+                    continue
+
+                if isinstance(chunk, dict) and chunk.get("event") == "tool_result":
+                    event_data = {
+                        "object": "service.tool_result",
+                        "model": model_alias,
+                        "tool": chunk.get("name", "unknown"),
+                        "result": chunk.get("result"),
                     }
                     yield f"data: {json.dumps(event_data)}\n\n"
                     continue

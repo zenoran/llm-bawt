@@ -15,6 +15,8 @@ services:
               capabilities: [gpu]
     container_name: llm-bawt-app
     ipc: host  # Required for vLLM multiprocess engine shared memory
+    security_opt:
+      - apparmor:unconfined  # AppArmor not available on this kernel; nvidia-ctk owns daemon.json
     env_file:
       - ./.env
     ports:

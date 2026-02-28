@@ -9,6 +9,7 @@ RUN apt-get update && apt-get install -y \
     python3-venv \
     python3-dev \
     curl \
+    openssh-client \
     build-essential \
     cmake \
     ninja-build \
@@ -81,6 +82,7 @@ RUN apt-get update && apt-get install -y \
     libpq5 \
     libgomp1 \
     curl \
+    openssh-client \
     tzdata \
     && rm -rf /var/lib/apt/lists/*
 

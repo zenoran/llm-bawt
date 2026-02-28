@@ -64,7 +64,10 @@ class BotProfile(SQLModel, table=True):
     uses_search: bool = Field(default=False)
     uses_home_assistant: bool = Field(default=False)
     default_model: str | None = Field(default=None, sa_column=Column(String(255), nullable=True))
+    color: str | None = Field(default=None, sa_column=Column(String(64), nullable=True))
     nextcloud_config: dict[str, Any] | None = Field(default=None, sa_column=Column(JSONB, nullable=True))
+    agent_backend: str | None = Field(default=None, sa_column=Column(String(128), nullable=True))
+    agent_backend_config: dict[str, Any] | None = Field(default=None, sa_column=Column(JSONB, nullable=True))
     created_at: datetime = Field(
         default_factory=datetime.utcnow,
         sa_column=Column(DateTime(timezone=True), nullable=False),
@@ -102,6 +105,27 @@ class BotProfileStore:
         if self.engine is None:
             return
         SQLModel.metadata.create_all(self.engine, tables=[BotProfile.__table__])
+        # Add columns that may be missing on older schemas
+        self._migrate_add_columns()
+
+    def _migrate_add_columns(self) -> None:
+        """Add columns introduced after initial schema creation."""
+        if self.engine is None:
+            return
+        from sqlalchemy import text
+
+        migrations = [
+            "ALTER TABLE bot_profiles ADD COLUMN IF NOT EXISTS color VARCHAR(64)",
+            "ALTER TABLE bot_profiles ADD COLUMN IF NOT EXISTS agent_backend VARCHAR(128)",
+            "ALTER TABLE bot_profiles ADD COLUMN IF NOT EXISTS agent_backend_config JSONB",
+        ]
+        try:
+            with self.engine.connect() as conn:
+                for stmt in migrations:
+                    conn.execute(text(stmt))
+                conn.commit()
+        except Exception as e:
+            logger.debug("Column migration skipped: %s", e)
 
     def get(self, slug: str) -> BotProfile | None:
         if self.engine is None:
@@ -148,7 +172,10 @@ class BotProfileStore:
                     uses_search=bool(payload.get("uses_search", False)),
                     uses_home_assistant=bool(payload.get("uses_home_assistant", False)),
                     default_model=payload.get("default_model"),
+                    color=payload.get("color"),
                     nextcloud_config=payload.get("nextcloud_config"),
+                    agent_backend=payload.get("agent_backend"),
+                    agent_backend_config=payload.get("agent_backend_config"),
                     created_at=now,
                     updated_at=now,
                 )
@@ -162,7 +189,10 @@ class BotProfileStore:
                 row.uses_search = bool(payload.get("uses_search", row.uses_search))
                 row.uses_home_assistant = bool(payload.get("uses_home_assistant", row.uses_home_assistant))
                 row.default_model = payload.get("default_model", row.default_model)
+                row.color = payload.get("color", row.color)
                 row.nextcloud_config = payload.get("nextcloud_config", row.nextcloud_config)
+                row.agent_backend = payload.get("agent_backend", row.agent_backend)
+                row.agent_backend_config = payload.get("agent_backend_config", row.agent_backend_config)
                 row.updated_at = now
 
             session.add(row)

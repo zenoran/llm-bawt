@@ -18,6 +18,7 @@ from llm_bawt.model_manager import (
 )
 from llm_bawt.gguf_handler import handle_add_gguf
 from llm_bawt.cli.vllm_handler import handle_add_vllm
+from llm_bawt.cli.openclaw_handler import handle_add_openclaw
 from llm_bawt.bots import BotManager
 from llm_bawt.utils.streaming import render_streaming_response, render_complete_response
 from llm_bawt.shared.logging import LogConfig
@@ -132,7 +133,12 @@ def query_via_service(
                             got_metadata = True
                     elif isinstance(item, dict) and "tool_call" in item:
                         tool_name = item.get("tool_call") or "tool"
-                        console.print(f"[dim]· {tool_name}[/dim]")
+                        tool_args = item.get("tool_args", {})
+                        if tool_args:
+                            params = json.dumps(tool_args, ensure_ascii=False)
+                            console.print(f"[dim]· {tool_name}({params})[/dim]")
+                        else:
+                            console.print(f"[dim]· {tool_name}[/dim]")
                         if item.get("model"):
                             actual_model = item["model"]
                             got_metadata = True
@@ -1144,7 +1150,7 @@ def parse_arguments(config_obj: Config) -> argparse.Namespace:
     parser.add_argument("-m","--model",type=str,default=None,help=f"Model alias defined in {config_obj.MODELS_CONFIG_PATH}. Supports partial matching. (Default: bot's default or {config_obj.DEFAULT_MODEL_ALIAS or 'None'})")
     parser.add_argument("--list-models",action="store_true",help="List available model aliases defined in the configuration file and exit.")
     parser.add_argument("--add-gguf",type=str,metavar="REPO_ID",help="(Deprecated: use --add-model gguf) Add a GGUF model from a Hugging Face repo ID.")
-    parser.add_argument("--add-model",type=str,choices=['ollama', 'openai', 'gguf', 'vllm'],metavar="TYPE",help="Add models: 'ollama' (refresh from server), 'openai' (query API), 'gguf' (add from HuggingFace repo), 'vllm' (add vLLM model from HuggingFace)")
+    parser.add_argument("--add-model",type=str,choices=['ollama', 'openai', 'gguf', 'vllm', 'openclaw'],metavar="TYPE",help="Add models: 'ollama' (refresh from server), 'openai' (query API), 'gguf' (add from HuggingFace repo), 'vllm' (add vLLM model from HuggingFace), 'openclaw' (bind OpenClaw session/channel)")
     parser.add_argument("--delete-model",type=str,metavar="ALIAS",help="Delete the specified model alias from the configuration file after confirmation.")
     parser.add_argument(
         "--set-context-window",
@@ -1440,6 +1446,8 @@ def main():
                     success = False
             elif args.add_model == 'vllm':
                 success = handle_add_vllm(config_obj)
+            elif args.add_model == 'openclaw':
+                success = handle_add_openclaw(config_obj)
             if success:
                 console.print(f"[green]Model add for '{args.add_model}' completed.[/green]")
             else:
@@ -1508,12 +1516,19 @@ def main():
         # In service mode, pass the model alias directly - let the service validate it
         resolved_alias = effective_model
     else:
-        # Local mode: validate model is available locally
-        model_manager = ModelManager(config_obj)
-        resolved_alias = model_manager.resolve_model_alias(effective_model)
-        if not resolved_alias:
-            sys.exit(1)
-            return
+        # Check if bot uses an agent backend (skip model validation entirely)
+        _pre_bot = BotManager(config_obj).get_bot(
+            getattr(args, "bot", None) or config_obj.DEFAULT_BOT or "nova"
+        )
+        if _pre_bot and _pre_bot.agent_backend:
+            resolved_alias = None  # No LLM model needed
+        else:
+            # Local mode: validate model is available locally
+            model_manager = ModelManager(config_obj)
+            resolved_alias = model_manager.resolve_model_alias(effective_model)
+            if not resolved_alias:
+                sys.exit(1)
+                return
     
     try:
         run_app(args, config_obj, resolved_alias)
@@ -1524,6 +1539,51 @@ def main():
         sys.exit(1)
     else:
         sys.exit(0)
+
+def _query_agent_backend(prompt: str, bot, plaintext_output: bool):
+    """Dispatch a query to an external agent backend (e.g. OpenClaw via SSH).
+
+    Called when a bot has ``agent_backend`` set and the service is not in use.
+    """
+    import asyncio
+    from llm_bawt.agent_backends import get_backend
+    from rich.style import Style
+
+    backend = get_backend(bot.agent_backend)
+    if not backend:
+        console.print(f"[bold red]Agent backend '{bot.agent_backend}' not found.[/bold red]")
+        return
+
+    try:
+        response = asyncio.run(backend.chat(prompt, bot.agent_backend_config))
+    except Exception as e:
+        console.print(f"[bold red]Agent backend error:[/bold red] {e}")
+        return
+
+    if not response:
+        console.print("[yellow]Agent returned empty response.[/yellow]")
+        return
+
+    if plaintext_output:
+        print(response)
+    else:
+        from rich.markdown import Markdown
+        from rich.panel import Panel
+
+        bot_color = getattr(bot, "color", None) or "green"
+        try:
+            Style.parse(bot_color)
+        except Exception:
+            bot_color = "green"
+
+        title = f"[bold {bot_color}]{bot.name}[/bold {bot_color}] [dim][{bot.agent_backend}][/dim]"
+        render_complete_response(
+            response=response,
+            console=console,
+            panel_title=title,
+            panel_border_style=bot_color,
+        )
+
 
 def run_app(args: argparse.Namespace, config_obj: Config, resolved_alias: str):
     # Determine which bot to use
@@ -1565,6 +1625,14 @@ def run_app(args: argparse.Namespace, config_obj: Config, resolved_alias: str):
     use_tools = getattr(bot, 'uses_tools', False)
     use_service = service_explicitly_set
 
+    # Agent backend bots still go through service for history/memory logging.
+    # Only if service is unavailable will they fall back to direct dispatch.
+    has_agent_backend = bool(getattr(bot, 'agent_backend', None))
+    if has_agent_backend and not use_service and not args.local:
+        use_service = True
+        if config_obj.VERBOSE:
+            console.print(f"[dim]Bot '{bot.name}' uses agent backend; enabling service mode[/dim]")
+
     # Auto-enable service mode when bot uses tools and not in local mode
     if use_tools and not use_service and not args.local:
         use_service = True
@@ -1575,15 +1643,21 @@ def run_app(args: argparse.Namespace, config_obj: Config, resolved_alias: str):
     if use_service:
         service_client = get_service_client(config_obj)
         if not service_client or not service_client.is_available(force_check=True):
+            # Agent backend bots can fall back to direct dispatch
+            if has_agent_backend:
+                use_service = False
+                if config_obj.VERBOSE:
+                    console.print("[dim]Service unavailable; agent backend will run direct (no history/memory).[/dim]")
             # Service mode was explicitly configured (env var / --service flag) or tools require it
-            if service_explicitly_set or use_tools:
+            elif service_explicitly_set or use_tools:
                 console.print("[bold red]Service not available.[/bold red] Start with: [yellow]llm-service[/yellow]")
                 console.print("[dim]Or use --local for direct API calls without memory/tools.[/dim]")
                 sys.exit(1)
             # Service mode was auto-detected but not explicitly required — fall back to direct OpenAI
-            use_service = False
-            if config_obj.VERBOSE:
-                console.print("[dim]Service unavailable; falling back to direct API mode (no memory/tools).[/dim]")
+            else:
+                use_service = False
+                if config_obj.VERBOSE:
+                    console.print("[dim]Service unavailable; falling back to direct API mode (no memory/tools).[/dim]")
 
     llm_bawt = None
     
@@ -1668,7 +1742,8 @@ def run_app(args: argparse.Namespace, config_obj: Config, resolved_alias: str):
         return
     
     # For query operations, we need full LLMBawt when not using service
-    if not use_service:
+    # Agent backend bots skip LLMBawt entirely — they dispatch to external agents
+    if not use_service and not bot.agent_backend:
         try:
             llm_bawt = LLMBawt(
                 resolved_model_alias=resolved_alias,
@@ -1714,8 +1789,11 @@ def run_app(args: argparse.Namespace, config_obj: Config, resolved_alias: str):
     # use_tools was already set above and factored into use_service decision
     
     def do_query(prompt: str):
-        """Execute query via service or local client."""
+        """Execute query via service, agent backend, or local client."""
         nonlocal llm_bawt
+        if bot.agent_backend and not use_service:
+            _query_agent_backend(prompt, bot, plaintext_flag)
+            return
         if use_service:
             if query_via_service(
                 prompt,

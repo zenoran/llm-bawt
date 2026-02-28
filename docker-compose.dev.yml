@@ -14,8 +14,8 @@ services:
     
     volumes:
       # Mount source code for live development
-      # - ./src:/app/src  # disabled: Docker Desktop VirtioFS bug corrupts src view
-      # - ./server.sh:/app/server.sh  # disabled: Docker Desktop VirtioFS bug shows server.sh as directory
+      - ./src:/app/src
+      - ./server.sh:/app/server.sh
       # Config, logs, models (mirrors base compose)
       - ${HOME}/.config/llm-bawt:/root/.config/llm-bawt
       - ./.logs:/app/.logs
@@ -24,5 +24,5 @@ services:
       - ${LLM_BAWT_MODEL_CACHE_DIR:-${HOME}/.cache/llm-bawt/models}:/root/.cache/llm-bawt/models
       - ${HF_HOME:-${HOME}/.cache/huggingface}:/root/.cache/huggingface
 
-    # Restart on failure for auto-reload
-    restart: on-failure
+    # Restart on reboot and on failure
+    restart: unless-stopped

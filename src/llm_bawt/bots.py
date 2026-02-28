@@ -53,6 +53,8 @@ class Bot:
     uses_home_assistant: bool = False  # Whether this bot can control Home Assistant via MCP
     color: str | None = None  # Optional Rich color name for CLI panel styling
     nextcloud: dict | None = None  # Nextcloud integration config (bot_id, secret, etc.)
+    agent_backend: str | None = None  # External agent backend slug (e.g. "openclaw")
+    agent_backend_config: dict[str, Any] = field(default_factory=dict)  # Backend-specific config
     settings: dict[str, Any] = field(default_factory=dict)  # Effective bot settings (template + overrides)
     
     def __post_init__(self):
@@ -168,6 +170,7 @@ def _load_db_bot_overrides() -> dict[str, dict[str, Any]]:
         from llm_bawt.utils.config import Config, has_database_credentials
 
         config = Config()
+
         if not has_database_credentials(config):
             return {}
 
@@ -181,7 +184,9 @@ def _load_db_bot_overrides() -> dict[str, dict[str, Any]]:
             slug = (row.slug or "").strip().lower()
             if not slug:
                 continue
-            overrides[slug] = {
+            # Only include non-None fields so DB acts as a sparse override
+            # and doesn't clobber YAML values with NULL.
+            entry: dict[str, Any] = {
                 "name": row.name,
                 "description": row.description,
                 "system_prompt": row.system_prompt,
@@ -190,9 +195,18 @@ def _load_db_bot_overrides() -> dict[str, dict[str, Any]]:
                 "uses_tools": row.uses_tools,
                 "uses_search": row.uses_search,
                 "uses_home_assistant": row.uses_home_assistant,
-                "default_model": row.default_model,
-                "nextcloud": row.nextcloud_config,
             }
+            if row.default_model is not None:
+                entry["default_model"] = row.default_model
+            if row.color is not None:
+                entry["color"] = row.color
+            if row.nextcloud_config is not None:
+                entry["nextcloud"] = row.nextcloud_config
+            if row.agent_backend is not None:
+                entry["agent_backend"] = row.agent_backend
+            if row.agent_backend_config is not None:
+                entry["agent_backend_config"] = row.agent_backend_config
+            overrides[slug] = entry
         return overrides
     except Exception as e:
         logger.warning(f"Could not load DB bot profile overrides: {e}")
@@ -281,6 +295,8 @@ def _load_bots_config() -> None:
             uses_home_assistant=bot_data.get("uses_home_assistant", False),
             color=bot_color,
             nextcloud=bot_data.get("nextcloud"),
+            agent_backend=bot_data.get("agent_backend"),
+            agent_backend_config=bot_data.get("agent_backend_config") or {},
             settings=effective_settings,
         )
 

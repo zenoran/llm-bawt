@@ -169,6 +169,11 @@ Two-service architecture for background operation:
 ./start.sh shell            # Shell into container
 ```
 
+## Integration Runbooks
+
+- OpenClaw integration: [docs/OPENCLAW_INTEGRATION.md](docs/OPENCLAW_INTEGRATION.md)
+- Nextcloud integration: [docs/NEXTCLOUD_INTEGRATION.md](docs/NEXTCLOUD_INTEGRATION.md)
+
 ## Development
 
 ### Setup

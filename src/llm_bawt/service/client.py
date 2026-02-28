@@ -609,6 +609,23 @@ class ServiceClient:
 
         return None
 
+    def reload_models(self) -> dict[str, Any] | None:
+        """Trigger a service-side model catalog reload.
+
+        Returns raw JSON response when successful, otherwise None.
+        """
+        if not self.is_available():
+            return None
+
+        try:
+            response = self._request("POST", "/v1/models/reload")
+            if isinstance(response, dict):
+                return response
+        except Exception as e:
+            logger.warning(f"Reload models via service failed: {e}")
+
+        return None
+
     def get_history(self, bot_id: str | None = None, limit: int = 50, before: str | None = None) -> dict[str, Any] | None:
         """Fetch conversation history from the service history endpoint.
 

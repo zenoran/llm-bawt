@@ -32,10 +32,12 @@ from llm_bawt.utils.config import (
     PROVIDER_GGUF,
     PROVIDER_GROK,
     PROVIDER_HF,
+    PROVIDER_OPENCLAW,
     PROVIDER_OLLAMA,
     PROVIDER_OPENAI,
     PROVIDER_UNKNOWN,
 )
+from .runtime_settings import ModelDefinitionStore
 from .utils.config import Config
 
 
@@ -87,6 +89,28 @@ class ModelManager:
         self.config_path = _PathWrapper(raw_path)
         self.models_data: Dict[str, Any] = {}
         self.load_config()
+        self._merge_db_models()
+
+    def _merge_db_models(self) -> None:
+        """Overlay DB model definitions so CLI view matches service catalog.
+
+        DB remains source-of-truth when available; YAML entries remain for
+        file-backed portability and are shown unless overridden by DB aliases.
+        """
+        try:
+            store = ModelDefinitionStore(self.config)
+            if store.engine is None:
+                return
+            db_models = store.to_config_dict()
+            if not db_models:
+                return
+            models = dict(self.models_data.get("models", {}))
+            models.update(db_models)
+            self.models_data["models"] = models
+            # Keep config resolver in sync for availability markers.
+            self.config.merge_db_models(db_models)
+        except Exception:
+            return
 
     def load_config(self) -> bool:
         if not self.config_path.is_file():
@@ -145,6 +169,11 @@ class ModelManager:
         defined_models = self.models_data.get("models", {})
         available_aliases = set(self.config.get_model_options())
         local_aliases = set(defined_models.keys())
+        local_openclaw_aliases = sorted(
+            alias
+            for alias, info in defined_models.items()
+            if isinstance(info, dict) and info.get("type") == PROVIDER_OPENCLAW
+        )
         
         # Only check service availability if service mode is enabled
         # This prevents "service not reachable" errors when user isn't using service mode
@@ -199,11 +228,68 @@ class ModelManager:
                 console.print(Rule("[bold cyan]Service Models[/bold cyan]"))
             if service_available:
                 if service_models:
+                    def infer_provider(model_id: str) -> str:
+                        local_info = defined_models.get(model_id, {}) if isinstance(defined_models, dict) else {}
+                        local_type = str(local_info.get("type") or "").strip().lower()
+                        if local_type:
+                            return local_type
+                        lowered = model_id.lower()
+                        if lowered == "openclaw":
+                            return "openclaw"
+                        if lowered.startswith("grok"):
+                            return "grok"
+                        if lowered.startswith("gpt") or lowered.startswith(("o1", "o3", "o4")):
+                            return "openai"
+                        return "other"
+
+                    grouped: dict[str, list[str]] = defaultdict(list)
                     for model_id in sorted(service_models):
-                        overlap_note = " [dim](also local config)[/dim]" if model_id in local_aliases else ""
-                        console.print(f"  [bold][bright_blue]{model_id}[/bright_blue][/bold]{overlap_note}")
+                        grouped[infer_provider(model_id)].append(model_id)
+
+                    provider_order = [
+                        "openai",
+                        "grok",
+                        "openclaw",
+                        "ollama",
+                        "vllm",
+                        "gguf",
+                        "huggingface",
+                        "agent_backend",
+                        "other",
+                    ]
+                    present = [p for p in provider_order if grouped.get(p)]
+                    present.extend(sorted([p for p in grouped.keys() if p not in present]))
+
+                    for provider in present:
+                        title = f"[bold magenta]{provider.upper()}[/bold magenta]"
+                        if hasattr(console, 'rule'):
+                            console.rule(title)
+                        else:
+                            console.print(Rule(title))
+                        for model_id in grouped.get(provider, []):
+                            notes: list[str] = []
+                            if model_id in local_aliases:
+                                notes.append("also local config")
+                            if model_id == "openclaw" and local_openclaw_aliases:
+                                notes.append("virtual backend alias")
+                            suffix = f" [dim]({'; '.join(notes)})[/dim]" if notes else ""
+                            console.print(f"  [bold][bright_blue]{model_id}[/bright_blue][/bold]{suffix}")
+                        console.print()
                 else:
                     console.print("  [yellow]No models reported by service.[/yellow]")
+                if local_openclaw_aliases and "openclaw" in service_models:
+                    aliases = ", ".join(local_openclaw_aliases)
+                    console.print(
+                        "  [dim]Local OpenClaw session aliases: "
+                        f"{aliases}[/dim]"
+                    )
+                    missing_in_service = [a for a in local_openclaw_aliases if a not in service_models]
+                    if missing_in_service:
+                        missing_str = ", ".join(missing_in_service)
+                        console.print(
+                            "  [yellow]Service catalog is missing local OpenClaw alias(es): "
+                            f"{missing_str}. Restart llm-service/app to refresh.[/yellow]"
+                        )
                 if service_url:
                     console.print(f"  [dim]Source: {service_url}[/dim]")
             else:
@@ -211,6 +297,58 @@ class ModelManager:
                 if service_url:
                     console.print(f"  [dim]Expected at: {service_url}[/dim]")
             console.print()
+
+        # Explain OpenClaw alias semantics to reduce confusion between
+        # local session aliases and service virtual backend alias.
+        show_openclaw_guide = bool(local_openclaw_aliases) or ("openclaw" in service_models)
+        if show_openclaw_guide:
+            if hasattr(console, 'rule'):
+                console.rule("[bold yellow]OpenClaw Alias Guide[/bold yellow]")
+            else:
+                console.print(Rule("[bold yellow]OpenClaw Alias Guide[/bold yellow]"))
+
+            for alias in local_openclaw_aliases:
+                info = defined_models.get(alias, {}) if isinstance(defined_models, dict) else {}
+                session_key = str(info.get("session_key") or "(none)")
+                if alias == "main":
+                    console.print(
+                        f"  [bold][bright_blue]{alias}[/bright_blue][/bold] = local alias → session [cyan]{session_key}[/cyan] [dim](name is generic; still a normal alias)[/dim]"
+                    )
+                else:
+                    console.print(
+                        f"  [bold][bright_blue]{alias}[/bright_blue][/bold] = local alias → session [cyan]{session_key}[/cyan]"
+                    )
+
+            if "openclaw" in service_models:
+                console.print(
+                    "  [bold][bright_blue]openclaw[/bright_blue][/bold] = service virtual backend alias [dim](generic bridge for bot agent_backend=openclaw)[/dim]"
+                )
+
+            # Show which bot currently routes through the virtual alias.
+            try:
+                from llm_bawt.runtime_settings import BotProfileStore
+
+                bot_store = BotProfileStore(self.config)
+                if bot_store.engine is not None:
+                    backend_bots = [
+                        row.slug
+                        for row in bot_store.list_all()
+                        if (row.agent_backend or "").strip().lower() == "openclaw"
+                    ]
+                    if backend_bots:
+                        console.print(
+                            "  [dim]Bots using virtual backend alias: "
+                            f"{', '.join(sorted(backend_bots))}[/dim]"
+                        )
+            except Exception:
+                pass
+
+            if local_openclaw_aliases:
+                console.print(
+                    "  [dim]Tip: use -m <local-alias> to target a specific OpenClaw session.[/dim]"
+                )
+            console.print()
+
         if hasattr(console, 'rule'):
             console.rule(style="#777777")
         else:
@@ -446,6 +584,22 @@ class ModelManager:
                     parts.append(f"ID: {formatted_id_str}")
                 if processed_desc: # Use potentially prefix-removed description
                     parts.append(processed_desc)
+
+        elif model_type == PROVIDER_OPENCLAW:
+            session_key = model_info.get("session_key")
+            gateway_url = model_info.get("gateway_url")
+            token_env = model_info.get("token_env")
+            model_id = model_info.get("model_id")
+            if model_id:
+                parts.append(f"Model: [bright_blue]{model_id}[/bright_blue]")
+            if session_key:
+                parts.append(f"Session: [bright_blue]{session_key}[/bright_blue]")
+            if gateway_url:
+                parts.append(f"Gateway: {gateway_url}")
+            if token_env:
+                parts.append(f"Token env: {token_env}")
+            if model_info.get("description"):
+                parts.append(str(model_info.get("description")))
 
         return ", ".join(parts) or "No details"
 

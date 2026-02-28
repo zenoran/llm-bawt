@@ -268,5 +268,7 @@ def _stream_rich_live(
         if live_display:
             _update_live(add_cursor=False)
             live_display.stop()
+        if overflow_buffer.strip():
+            console.print(Align(Markdown(overflow_buffer.strip()), align="left", pad=False))
     
     return total_response

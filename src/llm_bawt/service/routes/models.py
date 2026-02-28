@@ -58,6 +58,37 @@ async def switch_model(request: ModelSwitchRequest):
         new_model=request.model,
     )
 
+
+@router.post("/v1/models/reload", tags=["Models"])
+async def reload_models_catalog():
+    """Reload model catalog from DB/YAML and refresh service model availability."""
+    service = get_service()
+    config = service.config
+
+    # Reset from YAML first so aliases removed from DB don't linger in-memory.
+    config._load_models_config()
+
+    from ...runtime_settings import ModelDefinitionStore
+
+    db_count = 0
+    store = ModelDefinitionStore(config)
+    if store.engine is not None:
+        db_models = store.to_config_dict()
+        db_count = len(db_models)
+        if db_models:
+            config.merge_db_models(db_models)
+
+    service._load_available_models()
+    cleared = service.invalidate_all_instances()
+
+    return {
+        "ok": True,
+        "models": list(service._available_models),
+        "default_model": service._default_model,
+        "db_models_loaded": db_count,
+        "cleared_instances": cleared,
+    }
+
 @router.get("/v1/bots", response_model=BotsResponse, tags=["System"])
 async def list_bots():
     """List available bots configured on the service."""
