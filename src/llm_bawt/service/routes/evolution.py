@@ -642,7 +642,7 @@ async def get_bot_personality_drift(
 @router.get("/suggestions")
 async def list_improvement_suggestions(
     bot_id: str | None = Query(None),
-    priority: str | None = Query(None, regex="^(critical|high|medium|low)$"),
+    priority: str | None = Query(None, pattern="^(critical|high|medium|low)$"),
     category: str | None = Query(None),
     limit: int = Query(20, ge=1, le=100)
 ):

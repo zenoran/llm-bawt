@@ -298,9 +298,11 @@ def show_status(config: Config, args: argparse.Namespace | None = None):
     # Model display
     if s_cfg.model_alias and s_model:
         type_suffix = f" [dim]{s_model.type}[/dim]" if s_model.type else ""
-        model_display = f"[green]{s_cfg.model_alias}[/green]{type_suffix}"
+        source_suffix = f" [dim]({s_cfg.model_source})[/dim]" if s_cfg.model_source else ""
+        model_display = f"[green]{s_cfg.model_alias}[/green]{type_suffix}{source_suffix}"
     elif s_cfg.model_alias:
-        model_display = f"[green]{s_cfg.model_alias}[/green]"
+        source_suffix = f" [dim]({s_cfg.model_source})[/dim]" if s_cfg.model_source else ""
+        model_display = f"[green]{s_cfg.model_alias}[/green]{source_suffix}"
     else:
         model_display = "[dim]not set[/dim]"
 
@@ -311,18 +313,22 @@ def show_status(config: Config, args: argparse.Namespace | None = None):
         if uptime_str:
             svc_status += f" [dim]({uptime_str})[/dim]"
         svc_loaded = f"[green]{s_svc.current_model}[/green]" if s_svc.current_model else "[dim]not loaded[/dim]"
+        svc_default = f"[cyan]{s_svc.default_model}[/cyan]" if s_svc.default_model else "[dim]not set[/dim]"
         svc_tasks = f"{s_svc.tasks_processed} / {s_svc.tasks_pending} pending"
     elif s_svc.available:
         svc_status = "[yellow]⚠ Unhealthy[/yellow]"
         svc_loaded = "[dim]—[/dim]"
+        svc_default = "[dim]—[/dim]"
         svc_tasks = "[dim]—[/dim]"
     elif s_cfg.mode == "service":
         svc_status = "[red]✗ Not reachable[/red]"
         svc_loaded = "[dim]—[/dim]"
+        svc_default = "[dim]—[/dim]"
         svc_tasks = "[dim]—[/dim]"
     else:
         svc_status = "[dim]○ Not running[/dim]"
         svc_loaded = "[dim]—[/dim]"
+        svc_default = "[dim]—[/dim]"
         svc_tasks = "[dim]—[/dim]"
 
     # Scheduler / models catalog
@@ -346,7 +352,8 @@ def show_status(config: Config, args: argparse.Namespace | None = None):
     # Left: config settings | Right: service runtime info
     # Rows are balanced — no blank right-side cells.
     main_table.add_row("Bot", bot_display, "LLM", svc_status)
-    main_table.add_row("Model", model_display, "Loaded", svc_loaded)
+    main_table.add_row("Model", model_display, "Default", svc_default)
+    main_table.add_row("Source", f"[dim]{s_cfg.model_source or 'unknown'}[/dim]", "Loaded", svc_loaded)
     main_table.add_row("User", f"{s_cfg.user_id}" if s_cfg.user_id else "[dim]not set[/dim]", "Tasks", svc_tasks)
     main_table.add_row("Bots", bots_display, "Bind", f"[dim]{s_cfg.bind_host}[/dim]")
     main_table.add_row("Models", models_catalog, "Scheduler", scheduler_display)

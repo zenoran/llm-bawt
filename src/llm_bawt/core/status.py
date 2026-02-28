@@ -25,6 +25,8 @@ class ServiceInfo:
     healthy: bool = False
     uptime_seconds: float | None = None
     current_model: str | None = None
+    default_model: str | None = None
+    default_bot: str | None = None
     tasks_processed: int = 0
     tasks_pending: int = 0
 
@@ -107,6 +109,7 @@ class ConfigInfo:
     bot_name: str = ""
     bot_slug: str = ""
     model_alias: str | None = None
+    model_source: str | None = None
     user_id: str | None = None
     all_bots: list[BotSummary] = field(default_factory=list)
     models_defined: int = 0
@@ -455,6 +458,22 @@ def _status_from_service(config: Config) -> SystemStatus | None:
         mem = data.get("memory", {})
         dep = data.get("dependencies", {})
 
+        model_source = cfg.get("model_source")
+        if not model_source:
+            try:
+                from llm_bawt.bots import BotManager
+
+                cfg_bot_slug = cfg.get("bot_slug")
+                cfg_model_alias = cfg.get("model_alias")
+                if cfg_bot_slug and cfg_model_alias:
+                    inferred = BotManager(config).select_model(None, bot_slug=cfg_bot_slug)
+                    if inferred.alias == cfg_model_alias:
+                        model_source = inferred.source
+                    else:
+                        model_source = "service_runtime"
+            except Exception:
+                model_source = None
+
         config_info = ConfigInfo(
             version=cfg.get("version", "0.1.0"),
             mode=cfg.get("mode", "service"),
@@ -463,6 +482,7 @@ def _status_from_service(config: Config) -> SystemStatus | None:
             bot_name=cfg.get("bot_name", ""),
             bot_slug=cfg.get("bot_slug", ""),
             model_alias=cfg.get("model_alias"),
+            model_source=model_source,
             user_id=cfg.get("user_id"),
             all_bots=[
                 BotSummary(slug=b["slug"], name=b["name"], is_default=b.get("is_default", False))
@@ -479,11 +499,16 @@ def _status_from_service(config: Config) -> SystemStatus | None:
             bind_host=cfg.get("bind_host", "0.0.0.0"),
         )
 
+        service_default_model = svc.get("default_model") or cfg.get("model_alias")
+        service_default_bot = svc.get("default_bot") or cfg.get("bot_slug")
+
         service_info = ServiceInfo(
             available=svc.get("available", False),
             healthy=svc.get("healthy", False),
             uptime_seconds=svc.get("uptime_seconds"),
             current_model=svc.get("current_model"),
+            default_model=service_default_model,
+            default_bot=service_default_bot,
             tasks_processed=svc.get("tasks_processed", 0),
             tasks_pending=svc.get("tasks_pending", 0),
         )
@@ -596,7 +621,10 @@ def collect_system_status(
     # Resolve effective model
     if model_alias is None:
         selection = bot_manager.select_model(None, bot_slug=target_bot.slug)
-        model_alias = selection.alias
+    else:
+        selection = bot_manager.select_model(model_alias, bot_slug=target_bot.slug)
+
+    model_alias = selection.alias
 
     # Resolve user
     effective_user = user_id or config.DEFAULT_USER
@@ -635,6 +663,7 @@ def collect_system_status(
         bot_name=target_bot.name,
         bot_slug=target_bot.slug,
         model_alias=model_alias,
+        model_source=selection.source,
         user_id=effective_user,
         all_bots=all_bots,
         models_defined=len(defined_models),

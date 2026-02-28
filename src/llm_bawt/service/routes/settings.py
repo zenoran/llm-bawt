@@ -77,6 +77,32 @@ def _invalidate_bot_instance_cache(service, bot_id: str) -> int:
     return len(keys_to_remove)
 
 
+def _clear_session_model_overrides(service, bot_id: str | None = None, user_id: str | None = None) -> int:
+    """Clear sticky per-session model overrides so bot/default model changes take effect."""
+    clear_overrides = getattr(service, "clear_session_model_overrides", None)
+    if callable(clear_overrides):
+        return int(clear_overrides(bot_id=bot_id, user_id=user_id))
+
+    # Backward-compatible fallback for older service objects.
+    if not hasattr(service, "_session_model_overrides"):
+        return 0
+
+    normalized_bot = (bot_id or "").strip().lower() if bot_id is not None else None
+    normalized_user = (user_id or "").strip() if user_id is not None else None
+    keys_to_remove = []
+    for key in service._session_model_overrides:
+        key_bot, key_user = key
+        if normalized_bot is not None and key_bot != normalized_bot:
+            continue
+        if normalized_user is not None and key_user != normalized_user:
+            continue
+        keys_to_remove.append(key)
+
+    for key in keys_to_remove:
+        del service._session_model_overrides[key]
+    return len(keys_to_remove)
+
+
 def _invalidate_all_instance_cache(service) -> int:
     """Drop all cached ServiceLLMBawt instances."""
     invalidate = getattr(service, "invalidate_all_instances", None)
@@ -347,6 +373,7 @@ async def upsert_bot_profile(slug: str, request: BotProfileUpsertRequest):
     )
     _reload_bot_registry()
     _invalidate_bot_instance_cache(service, profile.slug)
+    _clear_session_model_overrides(service, bot_id=profile.slug)
     return _to_profile_response(profile)
 
 
@@ -356,7 +383,12 @@ async def reload_bots():
     service = get_service()
     _reload_bot_registry()
     cleared_instances = _invalidate_all_instance_cache(service)
-    return {"status": "reloaded", "cleared_instances": cleared_instances}
+    cleared_session_overrides = _clear_session_model_overrides(service)
+    return {
+        "status": "reloaded",
+        "cleared_instances": cleared_instances,
+        "cleared_session_model_overrides": cleared_session_overrides,
+    }
 
 
 @router.delete("/v1/bots/{slug}/profile", tags=["System"])
@@ -374,5 +406,6 @@ async def delete_bot_profile(slug: str):
     normalized_slug = slug.strip().lower()
     _reload_bot_registry()
     _invalidate_bot_instance_cache(service, normalized_slug)
+    _clear_session_model_overrides(service, bot_id=normalized_slug)
 
     return {"success": True, "slug": normalized_slug}

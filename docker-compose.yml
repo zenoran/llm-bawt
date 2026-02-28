@@ -38,3 +38,12 @@ services:
     restart: unless-stopped
     stdin_open: true
     tty: true
+
+  crawl4ai:
+    image: unclecode/crawl4ai:latest
+    container_name: llm-bawt-crawl4ai
+    ports:
+      - "${CRAWL4AI_PORT:-11235}:11235"
+    environment:
+      - CRAWL4AI_API_TOKEN=${CRAWL4AI_API_TOKEN:-}
+    restart: unless-stopped

@@ -42,6 +42,8 @@ async def get_system_status():
         "healthy": svc.healthy,
         "uptime_seconds": svc.uptime_seconds,
         "current_model": svc.current_model,
+        "default_model": svc.default_model,
+        "default_bot": svc.default_bot,
         "tasks_processed": svc.tasks_processed,
         "tasks_pending": svc.tasks_pending,
     }

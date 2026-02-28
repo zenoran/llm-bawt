@@ -123,3 +123,34 @@ def test_background_service_invalidates_all_instances() -> None:
 
     assert removed == 2
     assert service._llm_bawt_cache == {}
+
+
+def test_background_service_clears_session_model_overrides_for_bot() -> None:
+    """Clearing model overrides by bot should only remove matching bot sessions."""
+    service = BackgroundService.__new__(BackgroundService)
+    service._session_model_overrides = {
+        ("nova", "u1"): "grok-4-fast",
+        ("nova", "u2"): "grok-4-fast",
+        ("spark", "u1"): "gpt-4.1",
+    }
+
+    removed = service.clear_session_model_overrides(bot_id="nova")
+
+    assert removed == 2
+    assert ("spark", "u1") in service._session_model_overrides
+    assert ("nova", "u1") not in service._session_model_overrides
+    assert ("nova", "u2") not in service._session_model_overrides
+
+
+def test_background_service_clears_all_session_model_overrides() -> None:
+    """Clearing with no scope should remove every session override."""
+    service = BackgroundService.__new__(BackgroundService)
+    service._session_model_overrides = {
+        ("nova", "u1"): "grok-4-fast",
+        ("spark", "u1"): "gpt-4.1",
+    }
+
+    removed = service.clear_session_model_overrides()
+
+    assert removed == 2
+    assert service._session_model_overrides == {}

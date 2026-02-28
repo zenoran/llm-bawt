@@ -360,6 +360,8 @@ class ServiceInfoSchema(BaseModel):
     healthy: bool = False
     uptime_seconds: float | None = None
     current_model: str | None = None
+    default_model: str | None = None
+    default_bot: str | None = None
     tasks_processed: int = 0
     tasks_pending: int = 0
 
@@ -429,6 +431,7 @@ class ConfigInfoSchema(BaseModel):
     bot_name: str = ""
     bot_slug: str = ""
     model_alias: str | None = None
+    model_source: str | None = None
     user_id: str | None = None
     all_bots: list[BotSummarySchema] = []
     models_defined: int = 0

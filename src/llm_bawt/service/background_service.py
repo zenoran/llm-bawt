@@ -336,6 +336,37 @@ class BackgroundService:
         if cleared:
             log.debug("Cleared all cached instances (%s)", cleared)
         return cleared
+
+    def clear_session_model_overrides(self, bot_id: str | None = None, user_id: str | None = None) -> int:
+        """Clear session model overrides, optionally scoped by bot and/or user."""
+        if not self._session_model_overrides:
+            return 0
+
+        normalized_bot = (bot_id or "").strip().lower() if bot_id is not None else None
+        normalized_user = (user_id or "").strip() if user_id is not None else None
+
+        keys_to_remove: list[tuple[str, str]] = []
+        for key in self._session_model_overrides:
+            key_bot, key_user = key
+            if normalized_bot is not None and key_bot != normalized_bot:
+                continue
+            if normalized_user is not None and key_user != normalized_user:
+                continue
+            keys_to_remove.append(key)
+
+        for key in keys_to_remove:
+            del self._session_model_overrides[key]
+
+        if keys_to_remove:
+            scope = []
+            if normalized_bot is not None:
+                scope.append(f"bot={normalized_bot}")
+            if normalized_user is not None:
+                scope.append(f"user={normalized_user}")
+            detail = " ".join(scope) if scope else "all sessions"
+            log.info("Cleared %s session model override(s) for %s", len(keys_to_remove), detail)
+
+        return len(keys_to_remove)
     
     def _load_available_models(self):
         """Load list of available models from config."""

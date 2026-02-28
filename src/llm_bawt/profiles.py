@@ -14,6 +14,7 @@ from enum import Enum
 from typing import Any
 from urllib.parse import quote_plus
 
+from pydantic import ConfigDict
 from sqlalchemy import Column, JSON, text
 from sqlmodel import Field, Session, SQLModel, create_engine, select
 
@@ -57,8 +58,7 @@ class ProfileAttribute(SQLModel, table=True):
     created_at: datetime = Field(default_factory=datetime.utcnow)
     updated_at: datetime = Field(default_factory=datetime.utcnow)
     
-    class Config:
-        use_enum_values = True
+    model_config = ConfigDict(use_enum_values=True)
 
 
 class EntityProfile(SQLModel, table=True):
@@ -84,8 +84,7 @@ class EntityProfile(SQLModel, table=True):
     created_at: datetime = Field(default_factory=datetime.utcnow)
     updated_at: datetime = Field(default_factory=datetime.utcnow)
     
-    class Config:
-        use_enum_values = True
+    model_config = ConfigDict(use_enum_values=True)
 
 
 # Predefined attribute categories
