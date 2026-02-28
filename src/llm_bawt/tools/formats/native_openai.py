@@ -4,6 +4,7 @@ import json
 from typing import Any
 
 from .base import ToolCallRequest, ToolFormatHandler
+from ...shared.output_sanitizer import strip_tool_protocol_leakage
 
 
 def _json_type(param_type: str) -> tuple[str, dict | None]:
@@ -192,7 +193,9 @@ class NativeOpenAIFormatHandler(ToolFormatHandler):
         return message
 
     def sanitize_response(self, response: str) -> str:
-        return response or ""
+        if not response:
+            return ""
+        return strip_tool_protocol_leakage(response)
 
     def _normalize_result(self, result: Any) -> str:
         result_str = str(result)

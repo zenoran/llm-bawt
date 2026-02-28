@@ -62,6 +62,7 @@ class TurnLogStore:
 
     _last_cleanup_at: float = 0.0
     _cleanup_interval_seconds: float = 300.0
+    _backfill_done: bool = False
 
     def __init__(self, config: Config, ttl_hours: int = 168):
         self.config = config
@@ -103,8 +104,9 @@ class TurnLogStore:
 
     def _backfill_trigger_message_ids(self) -> None:
         """One-time backfill: populate trigger_message_id for existing rows."""
-        if self.engine is None:
+        if self.engine is None or TurnLogStore._backfill_done:
             return
+        TurnLogStore._backfill_done = True
         try:
             with Session(self.engine) as session:
                 rows = session.exec(

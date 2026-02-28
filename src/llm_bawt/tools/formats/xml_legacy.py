@@ -4,6 +4,7 @@ import re
 from typing import Any
 
 from .base import ToolCallRequest, ToolFormatHandler
+from ...shared.output_sanitizer import strip_tool_protocol_leakage
 
 
 class LegacyXMLFormatHandler(ToolFormatHandler):
@@ -44,4 +45,4 @@ class LegacyXMLFormatHandler(ToolFormatHandler):
             return ""
         cleaned = re.sub(r"<tool_call>.*?</tool_call>", "", response, flags=re.DOTALL | re.IGNORECASE)
         cleaned = re.sub(r"<function_call>.*?</function_call>", "", cleaned, flags=re.DOTALL | re.IGNORECASE)
-        return cleaned.strip()
+        return strip_tool_protocol_leakage(cleaned)

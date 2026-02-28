@@ -127,7 +127,7 @@ def setup_service_logging(verbose: bool = False, debug: bool = False) -> None:
 
     # Configure root logger for the service
     log_prefix = os.getenv("LLM_BAWT_LOG_PREFIX", "").strip()
-    log_time_format = "[%I:%M %p]"
+    log_time_format = "[%I:%M:%S %p]"
     log_dir = os.getenv("LLM_BAWT_LOG_DIR", ".logs")
 
     class _PrefixFilter(logging.Filter):

@@ -6,6 +6,7 @@ import re
 from typing import Any
 
 from .base import ToolCallRequest, ToolFormatHandler
+from ...shared.output_sanitizer import strip_tool_protocol_leakage
 
 logger = logging.getLogger(__name__)
 
@@ -515,7 +516,7 @@ class ReActFormatHandler(ToolFormatHandler):
         # Note: Model-specific markers (e.g., [HUMAN], [INST], BBCode) are handled
         # by the ModelAdapter.clean_output(), not the format handler.
         
-        return cleaned.strip()
+        return strip_tool_protocol_leakage(cleaned)
 
     def _normalize_result(self, result: Any) -> str:
         if isinstance(result, (dict, list)):

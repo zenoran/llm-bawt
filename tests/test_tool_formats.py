@@ -243,6 +243,17 @@ class TestNativeOpenAIFormatHandler:
         response = "Any response text"
         assert handler.sanitize_response(response) == response
 
+    def test_sanitize_removes_leaked_tool_protocol(self, handler):
+        response = (
+            "to=functions.self commentary blah\n"
+            '{"tool_uses":[{"recipient_name":"functions.self","parameters":{"action":"update"}}]}\n'
+            "Final response"
+        )
+        sanitized = handler.sanitize_response(response)
+        assert "to=functions" not in sanitized
+        assert '"tool_uses"' not in sanitized
+        assert "Final response" in sanitized
+
     def test_get_tools_schema(self, handler):
         # Create mock tool objects
         class MockParam:
@@ -343,15 +354,20 @@ class TestRegressionDebugTurnCase:
         assert "<tool_call>" not in sanitized
         assert "</tool_call>" not in sanitized
 
-    def test_native_handler_passthrough(self):
-        """Native handler doesn't have text markers to sanitize."""
+    def test_native_handler_removes_leaked_tool_protocol(self):
+        """Native handler strips leaked internal routing/protocol fragments."""
         handler = NativeOpenAIFormatHandler()
 
-        # Native format receives structured data, not text
-        response = "Just a regular text response"
+        response = (
+            "to=multi_tool_use.parallel commentary ...\n"
+            '{"tool_uses":[{"recipient_name":"functions.exec","parameters":{"command":"echo hi"}}]}\n'
+            "Just a regular text response"
+        )
         sanitized = handler.sanitize_response(response)
 
-        assert sanitized == response
+        assert "to=multi_tool_use" not in sanitized
+        assert '"tool_uses"' not in sanitized
+        assert "Just a regular text response" in sanitized
 
 
 class TestEdgeCases:

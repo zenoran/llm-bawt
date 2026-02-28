@@ -11,6 +11,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 import shlex
 import time
 from urllib import request as urlrequest
@@ -19,6 +20,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from .base import AgentBackend
+from ..shared.output_sanitizer import strip_tool_protocol_leakage
 
 logger = logging.getLogger(__name__)
 
@@ -70,6 +72,38 @@ def _friendly_tool_name(name: str, arguments: dict[str, Any]) -> str:
             first_word = first_word.rsplit("/", 1)[-1]
             return first_word
     return name
+
+
+def _clean_tool_call_leakage(text: str) -> str:
+    """Strip raw tool-call protocol text that OpenClaw sometimes leaks.
+
+    When the gateway returns an intermediate step, the content contains the
+    model's internal reasoning plus raw JSON like::
+
+        to=multi_tool_use.parallel 派奖中commentary...
+        {"tool_uses":[{"recipient_name":"functions.exec",...}]}
+
+    This strips the protocol noise, leaving only the readable portion
+    (if any).
+    """
+    lower = text.lower()
+    if (
+        "tool_uses" not in lower
+        and "to=multi_tool_use." not in lower
+        and "to=functions." not in lower
+    ):
+        return text
+
+    cleaned = strip_tool_protocol_leakage(text)
+
+    if cleaned:
+        logger.debug("Cleaned tool-call leakage from response (%d -> %d chars)", len(text), len(cleaned))
+        return cleaned
+
+    # If stripping left nothing readable, return a placeholder so the
+    # response isn't empty (which would raise an error downstream).
+    logger.warning("OpenClaw response was entirely tool-call protocol; returning placeholder")
+    return "(OpenClaw is executing tools — response pending)"
 
 
 def _extract_tool_calls(data: dict) -> list[OpenClawToolCall]:
@@ -468,6 +502,13 @@ class OpenClawBackend(AgentBackend):
             response_text = str(message.get("content") or "")
             if not response_text:
                 raise RuntimeError("OpenClaw API returned empty message content")
+
+            # Guard: OpenClaw gateway sometimes returns an intermediate
+            # tool-call step instead of the final response.  The content
+            # contains the model's chain-of-thought plus raw tool-call
+            # JSON (e.g. multi_tool_use.parallel / {"tool_uses": ...}).
+            # Strip the protocol noise so only readable text is saved.
+            response_text = _clean_tool_call_leakage(response_text)
 
             usage = data.get("usage", {}) or {}
             upstream_model = str(data.get("model") or config.get("model") or "")
