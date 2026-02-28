@@ -90,6 +90,7 @@ class BaseLLMBawt(ABC):
         self.home_client: HomeAssistantMCPClient | None = None
         self.ha_native_client: HomeAssistantNativeClient | None = None
         self.news_client: NewsAPIClient | None = None
+        self.web_fetch_client: "WebFetchClient | None" = None
         self.model_lifecycle: ModelLifecycleManager | None = None
         self.client: LLMClient
         self.bot: Bot
@@ -147,6 +148,9 @@ class BaseLLMBawt(ABC):
 
         # Initialize NewsAPI client
         self._init_newsapi()
+
+        # Initialize web fetch client (Crawl4AI)
+        self._init_web_fetch()
 
         # Build system prompt
         self._init_system_prompt()
@@ -343,6 +347,7 @@ class BaseLLMBawt(ABC):
                         home_client=self.home_client if self.bot.uses_tools else None,
                         ha_native_client=self.ha_native_client if self.bot.uses_tools else None,
                         news_client=self.news_client if self.bot.uses_tools else None,
+                        web_fetch_client=self.web_fetch_client if self.bot.uses_tools else None,
                         model_lifecycle=self.model_lifecycle if self.bot.uses_tools else None,
                         config=self.config,
                         user_id=self.user_id,
@@ -548,6 +553,7 @@ class BaseLLMBawt(ABC):
     def _get_tool_definitions(self) -> list:
         include_search = self.search_client is not None
         include_news = self.news_client is not None
+        include_web_fetch = self.web_fetch_client is not None
         include_home = self.home_client is not None
         include_models = self.model_lifecycle is not None
 
@@ -560,6 +566,7 @@ class BaseLLMBawt(ABC):
         tools = get_tools_list(
             include_search_tools=include_search,
             include_news_tools=include_news,
+            include_web_fetch_tools=include_web_fetch,
             include_home_tools=include_home,
             include_model_tools=include_models,
             ha_native_tools=ha_native_tools,
@@ -617,7 +624,22 @@ class BaseLLMBawt(ABC):
                 logger.debug("NewsAPI client initialized")
         except Exception as e:
             logger.warning(f"Failed to initialize NewsAPI client: {e}")
-    
+
+    def _init_web_fetch(self) -> None:
+        """Initialize web fetch client if Crawl4AI service is available."""
+        if not self.bot.uses_tools:
+            return
+        try:
+            from ..integrations.web_fetch.client import WebFetchClient
+            client = WebFetchClient()
+            if client.is_available():
+                self.web_fetch_client = client
+                logger.debug("Web fetch client initialized (Crawl4AI)")
+            else:
+                logger.debug("Crawl4AI service not reachable, web_fetch tool disabled")
+        except Exception as e:
+            logger.warning(f"Failed to initialize web fetch client: {e}")
+
     def _retrieve_cold_start_memories(self, prompt: str) -> str:
         """Retrieve a small set of high-importance memories for cold-start context.
 

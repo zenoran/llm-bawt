@@ -3,13 +3,14 @@
 Executes tool calls by routing them to the appropriate backend
 (MCP memory server, profiles, web search, model management, etc.) and returning formatted results.
 
-Consolidated tools (9 total):
+Consolidated tools (10 total):
 - memory: action-based (search/store/delete)
 - history: action-based (search/recent/forget) with date filtering
 - profile: action-based (get/set/delete)
 - self: action-based (get/set/delete) for bot personality development
 - search: type-based (web/news/reddit)
 - news: action-based (search/headlines) via NewsAPI
+- web_fetch: fetch and read web page content via Crawl4AI
 - home: action-based (status/query/get/set/scene) for Home Assistant
 - model: action-based (list/current/switch)
 - time: current time
@@ -27,6 +28,7 @@ from .definitions import normalize_legacy_tool_call
 if TYPE_CHECKING:
     from ..integrations.ha_mcp.client import HomeAssistantMCPClient, HomeAssistantNativeClient
     from ..integrations.newsapi.client import NewsAPIClient
+    from ..integrations.web_fetch.client import WebFetchClient
     from ..memory_server.client import MemoryClient
     from ..profiles import ProfileManager
     from ..search.base import SearchClient
@@ -134,6 +136,7 @@ class ToolExecutor:
         home_client: "HomeAssistantMCPClient | None" = None,
         ha_native_client: "HomeAssistantNativeClient | None" = None,
         news_client: "NewsAPIClient | None" = None,
+        web_fetch_client: "WebFetchClient | None" = None,
         model_lifecycle: "ModelLifecycleManager | None" = None,
         config: "Config | None" = None,
         user_id: str = "",  # Required - must be passed explicitly
@@ -149,6 +152,7 @@ class ToolExecutor:
             home_client: Home Assistant MCP client.
             ha_native_client: Home Assistant native MCP client.
             news_client: NewsAPI client for news search/headlines.
+            web_fetch_client: Web fetch client for reading web page content.
             model_lifecycle: Model lifecycle manager for model switching.
             user_id: Current user ID for profile operations (required).
             bot_id: Current bot ID for bot personality operations.
@@ -162,6 +166,7 @@ class ToolExecutor:
         self.home_client = home_client
         self.ha_native_client = ha_native_client
         self.news_client = news_client
+        self.web_fetch_client = web_fetch_client
         self.model_lifecycle = model_lifecycle
         self.config = config
         self.user_id = user_id
@@ -182,6 +187,7 @@ class ToolExecutor:
             "bot_trait": self._execute_self,  # Legacy name
             "search": self._execute_search,
             "news": self._execute_news,
+            "web_fetch": self._execute_web_fetch,
             "home": self._execute_home,
             "model": self._execute_model,
             "time": self._execute_time,
@@ -1416,6 +1422,48 @@ class ToolExecutor:
                 logger.debug("NewsAPI client initialized")
         except Exception as e:
             logger.warning(f"Failed to initialize NewsAPI client: {e}")
+
+    def _execute_web_fetch(self, tool_call: ToolCall) -> str:
+        """Execute web fetch tool - retrieve web page content."""
+        if not self.web_fetch_client:
+            self._ensure_web_fetch_client()
+        if not self.web_fetch_client:
+            return format_tool_result(
+                tool_call.name,
+                None,
+                error="Web fetch service not available. Is the crawl4ai container running?",
+            )
+
+        url = tool_call.arguments.get("url", "")
+        if not url:
+            return format_tool_result(
+                tool_call.name,
+                None,
+                error="Missing required parameter: url",
+            )
+
+        try:
+            result = self.web_fetch_client.fetch(url)
+            logger.info(f"Web fetch '{url}' returned {len(result)} chars")
+            return format_tool_result(tool_call.name, result)
+        except Exception as e:
+            logger.error(f"Web fetch tool failed: {e}")
+            return format_tool_result(tool_call.name, None, error=str(e))
+
+    def _ensure_web_fetch_client(self) -> None:
+        """Lazy-init web fetch client if service is available."""
+        if self.web_fetch_client:
+            return
+        try:
+            from ..integrations.web_fetch.client import WebFetchClient
+            client = WebFetchClient()
+            if client.is_available():
+                self.web_fetch_client = client
+                logger.debug("Web fetch client initialized")
+            else:
+                logger.warning("Crawl4AI service not reachable")
+        except Exception as e:
+            logger.warning(f"Failed to initialize web fetch client: {e}")
 
     def _execute_home(self, tool_call: ToolCall) -> str:
         """Execute Home Assistant tool."""

@@ -3,12 +3,13 @@
 Defines the available tools that bots can use, with their descriptions
 and parameters in a format suitable for prompt injection.
 
-Consolidated tools (8 total):
+Consolidated tools (9 total):
 - memory: Search/store/delete facts (action-based)
 - history: Search/retrieve/forget messages (action-based, with date filtering)
 - profile: Get/set/delete user attributes (action-based)
 - self: Bot personality reflection and development (action-based)
 - search: Web/news/reddit search (type-based)
+- web_fetch: Fetch and read web page content
 - home: Home Assistant control/status (action-based)
 - model: List/current/switch models (action-based)
 - time: Get current time
@@ -408,6 +409,19 @@ MODEL_TOOL = Tool(
     ]
 )
 
+# Web fetch tool - retrieve web page content
+WEB_FETCH_TOOL = Tool(
+    name="web_fetch",
+    description="Fetch a web page and read its content as text. Use this to read articles, documentation, blog posts, or any URL the user references.",
+    parameters=[
+        ToolParameter(
+            name="url",
+            type="string",
+            description="The full URL to fetch (must start with http:// or https://)",
+        ),
+    ],
+)
+
 # Time tool - simple utility
 TIME_TOOL = Tool(
     name="time",
@@ -426,11 +440,12 @@ CORE_TOOLS = [MEMORY_TOOL, HISTORY_TOOL, PROFILE_TOOL, SELF_TOOL, TIME_TOOL]
 # Optional tool categories
 SEARCH_TOOLS = [SEARCH_TOOL]
 NEWS_TOOLS = [NEWS_TOOL]
+WEB_FETCH_TOOLS = [WEB_FETCH_TOOL]
 HOME_TOOLS = [HOME_TOOL]
 MODEL_TOOLS = [MODEL_TOOL]
 
 # All tools combined
-ALL_TOOLS = CORE_TOOLS + SEARCH_TOOLS + NEWS_TOOLS + HOME_TOOLS + MODEL_TOOLS
+ALL_TOOLS = CORE_TOOLS + SEARCH_TOOLS + NEWS_TOOLS + WEB_FETCH_TOOLS + HOME_TOOLS + MODEL_TOOLS
 
 
 # =============================================================================
@@ -539,6 +554,10 @@ NEWS_GUIDANCE = '''
 - **news**: For news articles and headlines. Use action='search' with a query, or action='headlines' for top headlines (optionally by country/category)
 '''
 
+WEB_FETCH_GUIDANCE = '''
+- **web_fetch**: For reading the content of a specific URL. Use when the user shares a link or you need to read an article, documentation page, or blog post.
+'''
+
 # Guidance added when model tools are enabled
 MODEL_GUIDANCE = '''
 - **model**: For listing or switching AI models
@@ -638,6 +657,7 @@ def get_tools_list(
     include_profile_tools: bool = True,  # Kept for API compatibility (always included in CORE)
     include_search_tools: bool = False,
     include_news_tools: bool = False,
+    include_web_fetch_tools: bool = False,
     include_home_tools: bool = False,
     include_model_tools: bool = False,
     ha_native_tools: list[Tool] | None = None,
@@ -656,6 +676,8 @@ def get_tools_list(
         resolved.extend(SEARCH_TOOLS)
     if include_news_tools:
         resolved.extend(NEWS_TOOLS)
+    if include_web_fetch_tools:
+        resolved.extend(WEB_FETCH_TOOLS)
     if ha_native_tools:
         # Native HA tools replace the legacy home tool
         resolved.extend(ha_native_tools)
@@ -672,6 +694,7 @@ def get_tools_prompt(
     include_profile_tools: bool = True,
     include_search_tools: bool = False,
     include_news_tools: bool = False,
+    include_web_fetch_tools: bool = False,
     include_home_tools: bool = False,
     include_model_tools: bool = False,
     tool_format: ToolFormat | str = ToolFormat.XML,
@@ -684,6 +707,7 @@ def get_tools_prompt(
         include_profile_tools: Kept for API compatibility (profile always included).
         include_search_tools: Whether to include web search tools (default False).
         include_news_tools: Whether to include NewsAPI tools (default False).
+        include_web_fetch_tools: Whether to include web fetch tools (default False).
         include_home_tools: Whether to include Home Assistant tools (default False).
         include_model_tools: Whether to include model management tools (default False).
         tool_format: Tool format to use for prompt instructions.
@@ -697,6 +721,7 @@ def get_tools_prompt(
         include_profile_tools=include_profile_tools,
         include_search_tools=include_search_tools,
         include_news_tools=include_news_tools,
+        include_web_fetch_tools=include_web_fetch_tools,
         include_home_tools=include_home_tools,
         include_model_tools=include_model_tools,
         ha_native_tools=ha_native_tools,
@@ -715,6 +740,9 @@ def get_tools_prompt(
 
         if any(t.name == "news" for t in tools):
             search_guidance += NEWS_GUIDANCE
+
+        if include_web_fetch_tools or any(t.name == "web_fetch" for t in tools):
+            search_guidance += WEB_FETCH_GUIDANCE
 
         # Add model guidance if model tools are included
         if include_model_tools or any(t.name == "model" for t in tools):

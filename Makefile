@@ -177,7 +177,10 @@ dev-tui-debug: ## [uv] Run memory TUI with textual console
 
 .PHONY: run up docker-dev down restart rebuild logs docker-status docker-shell docker-exec
 
-run: down docker-dev logs ## Stop, rebuild dev containers, and tail logs
+run: ## Stop app, rebuild dev, tail logs (sidecars untouched)
+	docker compose -f $(COMPOSE_BASE) -f $(COMPOSE_DEV) down --remove-orphans --timeout 5 app
+	docker compose -f $(COMPOSE_BASE) -f $(COMPOSE_DEV) up -d app
+	docker compose logs -f --tail=50 app
 
 up: ## Docker compose up (production)
 	@echo "Starting containers (production mode)..."

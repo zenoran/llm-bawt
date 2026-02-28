@@ -200,6 +200,40 @@ class TurnLogStore:
             session.add(row)
             session.commit()
 
+    def update_turn(
+        self,
+        *,
+        turn_id: str,
+        status: str | None = None,
+        latency_ms: float | None = None,
+        response_text: str | None = None,
+        request_payload: dict | None = None,
+        tool_calls: list[dict] | None = None,
+        error_text: str | None = None,
+    ) -> None:
+        """Update an existing turn log row with new data."""
+        if self.engine is None:
+            return
+        with Session(self.engine) as session:
+            row = session.get(TurnLog, turn_id)
+            if row is None:
+                logger.debug("update_turn: no row with id=%s", turn_id)
+                return
+            if status is not None:
+                row.status = status
+            if latency_ms is not None:
+                row.latency_ms = latency_ms
+            if response_text is not None:
+                row.response_text = response_text
+            if request_payload is not None:
+                row.request_json = json.dumps(request_payload, ensure_ascii=False, default=str)
+            if tool_calls is not None:
+                row.tool_calls_json = json.dumps(tool_calls, ensure_ascii=False, default=str)
+            if error_text is not None:
+                row.error_text = error_text
+            session.add(row)
+            session.commit()
+
     def get_turn(self, turn_id: str) -> TurnLog | None:
         """Get one turn by id."""
         if self.engine is None:

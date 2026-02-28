@@ -344,6 +344,7 @@ class ServiceLLMBawt(BaseLLMBawt):
             self.memory
             or self.search_client
             or self.news_client
+            or self.web_fetch_client
             or self.home_client
             or self.ha_native_client
             or self.model_lifecycle
@@ -365,6 +366,7 @@ class ServiceLLMBawt(BaseLLMBawt):
                 home_client=self.home_client,
                 ha_native_client=self.ha_native_client,
                 news_client=self.news_client,
+                web_fetch_client=self.web_fetch_client,
                 model_lifecycle=self.model_lifecycle,
                 config=self.config,
                 user_id=self.user_id,

@@ -539,7 +539,37 @@ class BackgroundService:
             )
         except Exception as e:
             log.debug("Failed to persist turn log: %s", e)
-    
+
+    def _update_turn_log(
+        self,
+        *,
+        turn_id: str,
+        status: str | None = None,
+        latency_ms: float | None = None,
+        response_text: str | None = None,
+        prepared_messages: list | None = None,
+        tool_calls: list[dict] | None = None,
+        error_text: str | None = None,
+    ) -> None:
+        """Update an existing turn log row with new data."""
+        try:
+            request_payload = None
+            if prepared_messages is not None:
+                request_payload = {
+                    "messages": [_message_to_dict(msg) for msg in prepared_messages],
+                }
+            self._turn_log_store.update_turn(
+                turn_id=turn_id,
+                status=status,
+                latency_ms=latency_ms,
+                response_text=response_text,
+                request_payload=request_payload,
+                tool_calls=_normalize_tool_call_details(tool_calls) if tool_calls is not None else None,
+                error_text=error_text,
+            )
+        except Exception as e:
+            log.debug("Failed to update turn log: %s", e)
+
     @property
     def uptime_seconds(self) -> float:
         return time.time() - self.start_time
@@ -745,20 +775,37 @@ class BackgroundService:
         # Start new generation (cancels and waits for any previous one)
         cancel_event, done_event = await self._start_generation()
         turn_log_id = f"turn-{uuid.uuid4().hex}"
-        
+
+        # Persist turn log immediately so the user's prompt is recorded
+        # even if the backend times out or errors before responding.
+        self._persist_turn_log(
+            turn_id=turn_log_id,
+            request_id=ctx.request_id,
+            path=ctx.path,
+            stream=False,
+            model=model_alias,
+            bot_id=bot_id,
+            user_id=user_id,
+            status="pending",
+            latency_ms=None,
+            user_prompt=user_prompt,
+            prepared_messages=[],
+            response_text="",
+        )
+
         try:
             # Run the blocking query in single-thread executor
             loop = asyncio.get_event_loop()
             llm_start_time = time.time()
             cancelled = False
-            
+
             def _do_query():
                 nonlocal cancelled
                 # Check if already cancelled before starting
                 if cancel_event.is_set():
                     cancelled = True
                     return ""
-                
+
                 # Inject client-supplied system context (e.g. HA device list)
                 llm_bawt._client_system_context = request.client_system_context
                 llm_bawt._ha_mode = request.ha_mode
@@ -812,17 +859,10 @@ class BackgroundService:
                 # Finalize (add to history, trigger memory extraction)
                 llm_bawt.finalize_response(response, tool_context)
 
-                self._persist_turn_log(
+                self._update_turn_log(
                     turn_id=turn_log_id,
-                    request_id=ctx.request_id,
-                    path=ctx.path,
-                    stream=False,
-                    model=model_alias,
-                    bot_id=bot_id,
-                    user_id=user_id,
                     status="ok",
                     latency_ms=(time.time() - llm_start_time) * 1000,
-                    user_prompt=user_prompt,
                     prepared_messages=prepared_messages,
                     response_text=response,
                     tool_calls=tool_call_details,
@@ -830,9 +870,19 @@ class BackgroundService:
 
                 return response
             
-            response_text = await loop.run_in_executor(self._llm_executor, _do_query)
+            try:
+                response_text = await loop.run_in_executor(self._llm_executor, _do_query)
+            except Exception as e:
+                elapsed_ms = (time.time() - llm_start_time) * 1000
+                self._update_turn_log(
+                    turn_id=turn_log_id,
+                    status="error",
+                    latency_ms=elapsed_ms,
+                    error_text=str(e),
+                )
+                raise
             llm_elapsed_ms = (time.time() - llm_start_time) * 1000
-            
+
             # If cancelled, return empty response (the new request will handle it)
             if cancelled:
                 return ChatCompletionResponse(
@@ -990,7 +1040,24 @@ class BackgroundService:
         # Start new generation (cancels and waits for any previous one)
         cancel_event, done_event = await self._start_generation()
         turn_log_id = f"turn-{uuid.uuid4().hex}"
-        
+
+        # Persist turn log immediately so the user's prompt is recorded
+        # even if the backend times out or errors before responding.
+        self._persist_turn_log(
+            turn_id=turn_log_id,
+            request_id=ctx.request_id,
+            path=ctx.path,
+            stream=True,
+            model=model_alias,
+            bot_id=bot_id,
+            user_id=user_id,
+            status="streaming",
+            latency_ms=None,
+            user_prompt=user_prompt,
+            prepared_messages=[],
+            response_text="",
+        )
+
         def _stream_to_queue():
             """Run streaming in a thread and push chunks to the async queue."""
             try:
@@ -1006,10 +1073,16 @@ class BackgroundService:
                 # Use llm_bawt.prepare_messages_for_query to get full context
                 # (history from DB + memory + system prompt)
                 messages = llm_bawt.prepare_messages_for_query(user_prompt)
-                
+
+                # Backfill prepared messages into the turn log
+                self._update_turn_log(
+                    turn_id=turn_log_id,
+                    prepared_messages=messages,
+                )
+
                 # Log what we're sending to the LLM (verbose mode)
                 log.llm_context(messages)
-                
+
                 # Track when first token arrives
                 timing_holder[0] = time.time()
                 
@@ -1263,18 +1336,10 @@ class BackgroundService:
                     log.llm_response(full_response_holder[0], elapsed_ms=elapsed_ms)
                     llm_bawt.finalize_response(full_response_holder[0], tool_context_holder[0])
 
-                    self._persist_turn_log(
+                    self._update_turn_log(
                         turn_id=turn_log_id,
-                        request_id=ctx.request_id,
-                        path=ctx.path,
-                        stream=True,
-                        model=model_alias,
-                        bot_id=bot_id,
-                        user_id=user_id,
                         status="ok",
                         latency_ms=elapsed_ms,
-                        user_prompt=user_prompt,
-                        prepared_messages=messages,
                         response_text=full_response_holder[0],
                         tool_calls=tool_call_details_holder,
                     )
@@ -1294,6 +1359,14 @@ class BackgroundService:
             except Exception as e:
                 if not cancel_event.is_set():
                     loop.call_soon_threadsafe(chunk_queue.put_nowait, e)
+                elapsed_ms = (time.time() - timing_holder[0]) * 1000 if timing_holder[0] else None
+                self._update_turn_log(
+                    turn_id=turn_log_id,
+                    status="error",
+                    latency_ms=elapsed_ms,
+                    response_text=full_response_holder[0] or None,
+                    error_text=str(e),
+                )
             finally:
                 loop.call_soon_threadsafe(chunk_queue.put_nowait, None)  # Sentinel
         

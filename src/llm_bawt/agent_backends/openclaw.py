@@ -112,13 +112,13 @@ class OpenClawBackend(AgentBackend):
             gateway_url: OpenClaw gateway base URL (default: from ``host``)
             token: OpenClaw gateway bearer token
             model: model id (default: "gpt-5.3-codex")
-            timeout_seconds: HTTP timeout (default: 120)
+            timeout_seconds: HTTP timeout (default: 300)
 
         Legacy SSH mode:
             host: SSH host IP or hostname (required)
             user: SSH username (required)
             agent_id: OpenClaw agent id (default: "main")
-            timeout_seconds: Max wait for agent response (default: 120)
+            timeout_seconds: Max wait for agent response (default: 300)
             session_id: Optional persistent session id
             thinking: Optional thinking level (off|minimal|low|medium|high)
     """
@@ -188,7 +188,7 @@ class OpenClawBackend(AgentBackend):
     ) -> dict:
         base_url = self._resolve_gateway_base_url(config)
         token = self._resolve_gateway_token(config)
-        timeout = int(config.get("timeout_seconds", 120))
+        timeout = int(config.get("timeout_seconds", 300))
         model = self._resolve_gateway_model(config)
         extra_headers = self._resolve_gateway_headers(config)
 
@@ -269,7 +269,7 @@ class OpenClawBackend(AgentBackend):
         if not base_url or not token or not session_key:
             return []
 
-        timeout = int(config.get("timeout_seconds", 120))
+        timeout = int(config.get("timeout_seconds", 300))
         url = f"{base_url}/tools/invoke"
         payload = {
             "tool": "sessions_history",
@@ -381,7 +381,7 @@ class OpenClawBackend(AgentBackend):
                 "(set via bot DB profile, e.g. host: 10.0.0.97, user: vex)"
             )
         agent_id = config.get("agent_id", "main")
-        timeout = int(config.get("timeout_seconds", 120))
+        timeout = int(config.get("timeout_seconds", 300))
         session_id = config.get("session_id")
         thinking = config.get("thinking")
 

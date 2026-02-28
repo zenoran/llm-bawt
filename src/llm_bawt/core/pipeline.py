@@ -113,6 +113,7 @@ class RequestPipeline:
         home_client: Any = None,
         ha_native_client: Any = None,
         news_client: Any = None,
+        web_fetch_client: Any = None,
         model_lifecycle: Any = None,
         history_manager: Any = None,
         llm_client: Any = None,
@@ -128,6 +129,7 @@ class RequestPipeline:
             memory_client: Optional memory client for retrieval/storage
             profile_manager: Optional profile manager for user/bot attributes
             search_client: Optional search client for web search tools
+            web_fetch_client: Optional web fetch client for reading web pages
             model_lifecycle: Optional model lifecycle manager for model switching
             history_manager: History manager for conversation history
             llm_client: LLM client for query execution
@@ -143,6 +145,7 @@ class RequestPipeline:
         self.home_client = home_client
         self.ha_native_client = ha_native_client
         self.news_client = news_client
+        self.web_fetch_client = web_fetch_client
         self.model_lifecycle = model_lifecycle
         self.history_manager = history_manager
         self.llm_client = llm_client
@@ -337,6 +340,7 @@ class RequestPipeline:
             tool_definitions = get_tools_list(
                 include_search_tools=ctx.use_search,
                 include_news_tools=self.news_client is not None,
+                include_web_fetch_tools=self.web_fetch_client is not None,
                 include_home_tools=self.home_client is not None,
                 include_model_tools=include_models,
                 ha_native_tools=ha_native_tool_defs,
@@ -527,7 +531,7 @@ class RequestPipeline:
             ctx.response = ""
             return
         
-        if ctx.use_tools and (self.memory_client or self.home_client or self.ha_native_client or self.news_client):
+        if ctx.use_tools and (self.memory_client or self.home_client or self.ha_native_client or self.news_client or self.web_fetch_client):
             # Use tool loop
             from ..tools import query_with_tools
             response, tool_context, tool_call_details = query_with_tools(
@@ -539,6 +543,7 @@ class RequestPipeline:
                 home_client=self.home_client,
                 ha_native_client=self.ha_native_client,
                 news_client=self.news_client,
+                web_fetch_client=self.web_fetch_client,
                 model_lifecycle=self.model_lifecycle,
                 config=self.config,
                 user_id=ctx.user_id,

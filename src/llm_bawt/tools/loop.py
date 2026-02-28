@@ -21,6 +21,7 @@ if TYPE_CHECKING:
     from ..clients import LLMClient
     from ..integrations.ha_mcp.client import HomeAssistantMCPClient, HomeAssistantNativeClient
     from ..integrations.newsapi.client import NewsAPIClient
+    from ..integrations.web_fetch.client import WebFetchClient
     from ..memory_server.client import MemoryClient
     from ..profiles import ProfileManager
     from ..search.base import SearchClient
@@ -46,6 +47,7 @@ class ToolLoop:
         home_client: "HomeAssistantMCPClient | None" = None,
         ha_native_client: "HomeAssistantNativeClient | None" = None,
         news_client: "NewsAPIClient | None" = None,
+        web_fetch_client: "WebFetchClient | None" = None,
         model_lifecycle: "ModelLifecycleManager | None" = None,
         config: "Config | None" = None,
         user_id: str = "",  # Required - must be passed explicitly
@@ -66,6 +68,7 @@ class ToolLoop:
             home_client: Home Assistant MCP client.
             ha_native_client: Home Assistant native MCP client.
             news_client: NewsAPI client.
+            web_fetch_client: Web fetch client for reading web pages.
             model_lifecycle: Manager for model lifecycle operations.
             config: Application config (used for lazy search setup).
             user_id: Current user ID (required).
@@ -84,6 +87,7 @@ class ToolLoop:
             home_client=home_client,
             ha_native_client=ha_native_client,
             news_client=news_client,
+            web_fetch_client=web_fetch_client,
             model_lifecycle=model_lifecycle,
             config=config,
             user_id=user_id,
@@ -473,6 +477,7 @@ def query_with_tools(
     home_client: "HomeAssistantMCPClient | None" = None,
     ha_native_client: "HomeAssistantNativeClient | None" = None,
     news_client: "NewsAPIClient | None" = None,
+    web_fetch_client: "WebFetchClient | None" = None,
     model_lifecycle: "ModelLifecycleManager | None" = None,
     config: "Config | None" = None,
     user_id: str = "",  # Required - must be passed explicitly
@@ -497,6 +502,7 @@ def query_with_tools(
         home_client: Home Assistant MCP client for smart-home tools.
         ha_native_client: Home Assistant native MCP client.
         news_client: NewsAPI client for news tools.
+        web_fetch_client: Web fetch client for reading web pages.
         model_lifecycle: Model lifecycle manager for model switching tools.
         config: Application config (used for lazy search setup).
         user_id: Current user ID (required).
@@ -523,6 +529,7 @@ def query_with_tools(
         home_client=home_client,
         ha_native_client=ha_native_client,
         news_client=news_client,
+        web_fetch_client=web_fetch_client,
         model_lifecycle=model_lifecycle,
         config=config,
         user_id=user_id,
