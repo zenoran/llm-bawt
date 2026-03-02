@@ -91,9 +91,14 @@ class ProfileMaintenanceService:
             # Build the final summary string from LLM output
             summary_lines = []
             
+            logger.debug(f"Consolidated keys for {entity_id}: {list(consolidated.keys())}")
+            
             # Handle "name" / "identity" field - extract name for display_name
             name_value = None
             identity_text = consolidated.get("identity", "")
+            # Coerce non-string values (lists, dicts) to string
+            if identity_text and not isinstance(identity_text, str):
+                identity_text = ", ".join(str(v) for v in identity_text) if isinstance(identity_text, list) else str(identity_text)
             if identity_text and isinstance(identity_text, str):
                 # Try to extract name from identity (e.g., "Nick is a software developer")
                 import re
@@ -124,12 +129,26 @@ class ProfileMaintenanceService:
             
             for cat_key in category_order:
                 value = consolidated.get(cat_key, "")
+                # Coerce non-string values (lists, dicts) to string
+                if value and not isinstance(value, str):
+                    if isinstance(value, list):
+                        value = ", ".join(str(v) for v in value)
+                    else:
+                        value = str(value)
                 if value and isinstance(value, str) and value.strip() and value.lower() != "null":
                     label = category_labels.get(cat_key, cat_key.title())
                     summary_lines.append(f"{label}: {value.strip()}")
             
             # Build final summary
             final_summary = "\n".join(summary_lines) if summary_lines else None
+            
+            if not final_summary:
+                logger.warning(
+                    f"Profile maintenance for {entity_id} produced no summary. "
+                    f"Consolidated types: {
+                        {k: type(v).__name__ for k, v in consolidated.items()}
+                    }"
+                )
             
             # Save summary to profile (attributes are KEPT for future consolidation runs)
             if final_summary:

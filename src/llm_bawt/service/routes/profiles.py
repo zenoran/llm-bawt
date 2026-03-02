@@ -13,6 +13,7 @@ from ..schemas import (
     ProfileAttributeUpsertRequest,
     ProfileDetail,
     ProfileListResponse,
+    ProfileUpdateRequest,
     UserProfileAttribute,
 )
 
@@ -29,9 +30,11 @@ def _get_profile_detail(manager, entity_type_enum, entity_type: str, entity_id: 
     return ProfileDetail(
         entity_type=entity_type,
         entity_id=entity_id,
+        email=profile.email,
         display_name=profile.display_name,
         description=profile.description,
         summary=profile.summary,
+        summary_updated_at=profile.summary_updated_at.isoformat() if profile.summary_updated_at else None,
         attributes=[attribute_to_response(attr) for attr in attributes],
         created_at=profile.created_at.isoformat() if profile.created_at else None,
     )
@@ -163,6 +166,30 @@ async def list_profile_attributes(
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@router.get("/v1/profiles/lookup", tags=["Profiles"])
+async def lookup_profile_by_email(email: str = Query(..., description="Email address to look up")):
+    """Look up a user profile by email address. Returns entity_id mapping."""
+    service = get_service()
+
+    try:
+        from ...profiles import ProfileManager
+
+        manager = ProfileManager(service.config)
+        profile = manager.get_profile_by_email(email)
+        if not profile:
+            return {"found": False, "email": email, "entity_id": None}
+
+        return {
+            "found": True,
+            "email": email,
+            "entity_id": profile.entity_id,
+            "display_name": profile.display_name,
+        }
+    except Exception as e:
+        log.error(f"Failed to look up profile by email '{email}': {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @router.get("/v1/profiles/{entity_id}", response_model=ProfileDetail, tags=["Profiles"])
 async def get_profile(entity_id: str):
     """Get one profile by ID (auto-detect user vs bot)."""
@@ -237,6 +264,52 @@ async def update_profile_attribute(attribute_id: int, request: ProfileAttributeU
         raise
     except Exception as e:
         log.error(f"Failed to update profile attribute: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.patch("/v1/profiles/{entity_type}/{entity_id}", response_model=ProfileDetail, tags=["Profiles"])
+async def update_typed_profile(entity_type: str, entity_id: str, request: ProfileUpdateRequest):
+    """Update core profile fields by explicit entity type and ID."""
+    service = get_service()
+
+    try:
+        from ...profiles import EntityType, ProfileManager
+
+        normalized_entity_type = _normalize_entity_type(entity_type)
+        if normalized_entity_type is None:
+            raise HTTPException(status_code=400, detail="entity_type is required")
+
+        target_type = EntityType.USER if normalized_entity_type == "user" else EntityType.BOT
+        manager = ProfileManager(service.config)
+
+        profile = manager.update_profile(
+            target_type,
+            entity_id,
+            display_name=request.display_name,
+            description=request.description,
+            summary=request.summary,
+            email=request.email,
+        )
+
+        if not profile:
+            manager.get_or_create_profile(target_type, entity_id)
+            profile = manager.update_profile(
+                target_type,
+                entity_id,
+                display_name=request.display_name,
+                description=request.description,
+                summary=request.summary,
+                email=request.email,
+            )
+
+        if not profile:
+            raise HTTPException(status_code=500, detail="Failed to update profile")
+
+        return _get_profile_detail(manager, target_type, normalized_entity_type, entity_id)
+    except HTTPException:
+        raise
+    except Exception as e:
+        log.error(f"Failed to update {entity_type} profile '{entity_id}': {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 

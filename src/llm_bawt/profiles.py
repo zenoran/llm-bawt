@@ -72,13 +72,15 @@ class EntityProfile(SQLModel, table=True):
     id: int | None = Field(default=None, primary_key=True)
     entity_type: EntityType = Field(index=True)
     entity_id: str = Field(max_length=100, index=True)  # user_id or bot_id
-    
+    email: str | None = Field(default=None, max_length=255, index=True)  # optional email for user lookup
+
     # Basic identity
     display_name: str | None = Field(default=None, max_length=100)
     description: str | None = Field(default=None, max_length=500)
     
     # Pre-computed summary for system prompt injection (set by maintenance job)
     summary: str | None = Field(default=None)
+    summary_updated_at: datetime | None = Field(default=None)  # stamped each time summary is regenerated
     
     # Timestamps
     created_at: datetime = Field(default_factory=datetime.utcnow)
@@ -118,11 +120,26 @@ class ProfileManager:
         logger.debug(f"ProfileManager connected to {host}:{port}/{database}")
     
     def _ensure_tables_exist(self) -> None:
-        """Create tables if they don't exist."""
+        """Create tables if they don't exist, and run incremental column migrations."""
         SQLModel.metadata.create_all(self.engine)
-        
-        # Create composite index for efficient lookups
+
         with self.engine.connect() as conn:
+            # ---- column migrations (idempotent) ----
+            conn.execute(text("""
+                ALTER TABLE entity_profiles
+                ADD COLUMN IF NOT EXISTS email VARCHAR(255)
+            """))
+            conn.execute(text("""
+                ALTER TABLE entity_profiles
+                ADD COLUMN IF NOT EXISTS summary_updated_at TIMESTAMP
+            """))
+            conn.execute(text("""
+                CREATE INDEX IF NOT EXISTS idx_entity_profiles_email
+                ON entity_profiles (email)
+                WHERE email IS NOT NULL
+            """))
+
+            # ---- structural indexes ----
             conn.execute(text("""
                 CREATE INDEX IF NOT EXISTS idx_entity_profile_attr_entity 
                 ON entity_profile_attributes (entity_type, entity_id, category)
@@ -132,7 +149,7 @@ class ProfileManager:
                 ON entity_profiles (entity_type, entity_id)
             """))
             conn.commit()
-        
+
         logger.debug("Ensured profile tables exist")
     
     # =========================================================================
@@ -155,21 +172,36 @@ class ProfileManager:
             return list(session.exec(statement).all())
     
     def get_profile(
-        self, 
-        entity_type: EntityType, 
+        self,
+        entity_type: EntityType,
         entity_id: str
     ) -> EntityProfile | None:
         """Get a profile by type and ID without creating it.
-        
+
         Returns:
             Profile if found, None otherwise
         """
         entity_id = entity_id.lower().strip()
-        
+
         with Session(self.engine) as session:
             statement = select(EntityProfile).where(
                 EntityProfile.entity_type == entity_type,
                 EntityProfile.entity_id == entity_id
+            )
+            return session.exec(statement).first()
+
+    def get_profile_by_email(self, email: str) -> EntityProfile | None:
+        """Look up a user profile by email address.
+
+        Returns:
+            Profile if found, None otherwise
+        """
+        email = email.lower().strip()
+
+        with Session(self.engine) as session:
+            statement = select(EntityProfile).where(
+                EntityProfile.entity_type == EntityType.USER,
+                EntityProfile.email == email
             )
             return session.exec(statement).first()
     
@@ -214,32 +246,36 @@ class ProfileManager:
         display_name: str | None = None,
         description: str | None = None,
         summary: str | None = None,
+        email: str | None = None,
     ) -> EntityProfile | None:
         """Update basic profile info."""
         entity_id = entity_id.lower().strip()
-        
+
         with Session(self.engine) as session:
             statement = select(EntityProfile).where(
                 EntityProfile.entity_type == entity_type,
                 EntityProfile.entity_id == entity_id
             )
             profile = session.exec(statement).first()
-            
+
             if not profile:
                 return None
-            
+
             if display_name is not None:
                 profile.display_name = display_name
             if description is not None:
                 profile.description = description
             if summary is not None:
                 profile.summary = summary
+                profile.summary_updated_at = datetime.utcnow()
+            if email is not None:
+                profile.email = email.lower().strip() if email else None
             profile.updated_at = datetime.utcnow()
-            
+
             session.add(profile)
             session.commit()
             session.refresh(profile)
-            
+
             return profile
     
     def set_display_name(

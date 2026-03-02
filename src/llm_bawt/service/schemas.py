@@ -723,11 +723,21 @@ class ProfileDetail(BaseModel):
     """Generic profile detail with attributes for any entity type (user or bot)."""
     entity_type: str  # "user" or "bot"
     entity_id: str
+    email: str | None = None
     display_name: str | None = None
     description: str | None = None
     summary: str | None = None
+    summary_updated_at: str | None = None
     attributes: list[UserProfileAttribute] = []
     created_at: str | None = None
+
+
+class ProfileUpdateRequest(BaseModel):
+    """Request payload for updating core profile fields."""
+    display_name: str | None = None
+    description: str | None = None
+    summary: str | None = None
+    email: str | None = None
 
 
 class ProfileListResponse(BaseModel):

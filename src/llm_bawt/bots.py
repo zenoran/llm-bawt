@@ -524,10 +524,17 @@ class BotManager:
         """Resolve the effective model alias for a request.
 
         Priority:
+        0) Agent-backend bots ALWAYS use their default_model (bound to backend)
         1) Explicit request model (unless it matches a bot slug and isn't a model alias)
         2) Bot default_model
         3) Config DEFAULT_MODEL_ALIAS
         """
+        # Agent-backend bots are bound to their backend — the client-provided
+        # model must be ignored so requests always route through the backend.
+        bot = self.get_bot(bot_slug) if bot_slug else None
+        if bot and bot.agent_backend and bot.default_model:
+            return ModelSelection(alias=bot.default_model, source="bot_default")
+
         model_alias = requested_model.strip() if requested_model else None
         if model_alias == "":
             model_alias = None
@@ -542,7 +549,6 @@ class BotManager:
         if model_alias:
             return ModelSelection(alias=model_alias, source="explicit")
 
-        bot = self.get_bot(bot_slug) if bot_slug else None
         if not bot:
             bot = self.get_default_bot(local_mode=local_mode)
 

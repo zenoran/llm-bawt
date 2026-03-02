@@ -1460,13 +1460,17 @@ class BackgroundService:
 
                 if isinstance(chunk, dict) and chunk.get("event") == "tool_call":
                     has_result = chunk.get("result") is not None
+                    error = chunk.get("error")
+                    # Treat errors as completed results so the frontend never
+                    # gets stuck showing "Pending result..." forever.
+                    result = chunk.get("result") if has_result else (f"Error: {error}" if error else None)
                     event_data = {
                         "object": "service.tool_call",
                         "model": model_alias,
                         "tool": chunk.get("name", "unknown"),
                         "arguments": chunk.get("arguments", {}),
-                        "result": chunk.get("result"),
-                        "status": "completed" if has_result else "pending",
+                        "result": result,
+                        "status": "completed" if (has_result or error) else "pending",
                     }
                     yield f"data: {json.dumps(event_data)}\n\n"
                     continue

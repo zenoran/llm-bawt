@@ -399,37 +399,6 @@ def show_status(config: Config, args: argparse.Namespace | None = None):
     console.print(row_mcp_ha)
     console.print()
 
-    # ── Model Info Panel ─────────────────────────────────────────
-    if s_model:
-        model_info_table = make_table()
-        model_info_table.add_row("Max Tokens", f"{s_model.max_tokens} [dim]({s_model.max_tokens_source})[/dim]")
-
-        if s_model.type == "gguf":
-            if s_model.gpu_name:
-                model_info_table.add_row("GPU", f"[green]{s_model.gpu_name}[/green]")
-                model_info_table.add_row(
-                    "VRAM",
-                    f"{s_model.vram_total_gb:.1f}GB total, {s_model.vram_free_gb:.1f}GB free [dim]({s_model.vram_detection_method})[/dim]"
-                )
-            else:
-                model_info_table.add_row("GPU", "[dim]Not detected[/dim]")
-
-            if s_model.context_window:
-                model_info_table.add_row("Context", f"{s_model.context_window:,} tokens [dim]({s_model.context_source})[/dim]")
-
-            if s_model.n_gpu_layers:
-                layers_display = "All" if s_model.n_gpu_layers == "all" else s_model.n_gpu_layers
-                model_info_table.add_row("GPU Layers", f"{layers_display} [dim]({s_model.gpu_layers_source})[/dim]")
-
-            if s_model.native_context_limit:
-                model_info_table.add_row("Native Limit", f"{s_model.native_context_limit:,} tokens")
-        else:
-            if s_model.context_window:
-                model_info_table.add_row("Context", f"{s_model.context_window:,} tokens [dim]({s_model.context_source})[/dim]")
-
-        console.print(Panel(model_info_table, title=f"[bold]Model: {s_model.alias}[/bold] [dim]{s_model.type}[/dim]", border_style="grey39"))
-        console.print()
-
     # ── Memory + Dependencies (side-by-side) ─────────────────────
     memory_table = make_table()
 
