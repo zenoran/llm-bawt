@@ -4,6 +4,8 @@ These prompts are used to distill important facts from conversations
 and handle memory updates/conflicts.
 """
 
+from ...prompt_registry import get_prompt_resolver
+
 # Canonical tags for categorization (extensible)
 MEMORY_TAGS = [
   "preference",      # User preferences and likes/dislikes
@@ -164,7 +166,10 @@ Output only valid JSON:"""
 
 def get_fact_extraction_prompt(conversation: str) -> str:
   """Get the fact extraction prompt with the conversation filled in."""
-  return FACT_EXTRACTION_PROMPT_TEMPLATE.format(conversation=conversation)
+  return get_prompt_resolver().render(
+    key="memory.extraction.fact",
+    variables={"conversation": conversation},
+  )
 
 
 MEMORY_UPDATE_PROMPT_TEMPLATE = """You are a memory management assistant. Your task is to compare newly extracted facts against existing memories and determine the appropriate action for each new fact.
@@ -239,9 +244,12 @@ Output only valid JSON:"""
 
 def get_memory_update_prompt(existing_memories: str, new_facts: str) -> str:
     """Get the memory update prompt with memories and facts filled in."""
-    return MEMORY_UPDATE_PROMPT_TEMPLATE.format(
-        existing_memories=existing_memories,
-        new_facts=new_facts,
+    return get_prompt_resolver().render(
+        key="memory.extraction.update",
+        variables={
+            "existing_memories": existing_memories,
+            "new_facts": new_facts,
+        },
     )
 
 
@@ -300,10 +308,13 @@ def get_summary_extraction_prompt(
     summary_text: str, start_date: str, end_date: str
 ) -> str:
     """Get the summary extraction prompt with the summary filled in."""
-    return SUMMARY_EXTRACTION_PROMPT_TEMPLATE.format(
-        summary_text=summary_text,
-        start_date=start_date,
-        end_date=end_date,
+    return get_prompt_resolver().render(
+        key="memory.extraction.summary",
+        variables={
+            "summary_text": summary_text,
+            "start_date": start_date,
+            "end_date": end_date,
+        },
     )
 
 
@@ -404,3 +415,11 @@ Return a JSON object with these EXACT keys:
   "context": "Currently working on an LLM chatbot with Nextcloud integration."
 }}
 ```'''
+
+
+def get_profile_consolidation_prompt(attributes: str) -> str:
+    """Get the profile consolidation prompt with attributes filled in."""
+    return get_prompt_resolver().render(
+        key="profile.consolidation",
+        variables={"attributes": attributes},
+    )

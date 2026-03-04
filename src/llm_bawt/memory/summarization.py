@@ -45,8 +45,11 @@ Intent:
 Tone:
 Open Loops:
 
-Target detail level: concise but specific (about 90-180 words total across all sections).
-Keep this materially shorter than the source dialog while preserving concrete facts.
+7. Start directly with concrete facts. Avoid boilerplate lead-ins like "The conversation begins with", "The conversation revolves around", or "The conversation is about".
+8. Prefer dense wording over scene-setting. If a short noun phrase is clearer than a full sentence, use it.
+
+Target detail level: concise but concrete (about 120-220 words total across all sections).
+Keep this materially shorter than the source dialog while preserving concrete facts. Do not pad with filler.
 
 Conversation:
 {messages}
@@ -81,22 +84,12 @@ Constraints:
 - Keep each session concise but specific (~90-180 words across fields).
 - "cross_session_links" should mention recurring user goals/patterns if present; otherwise empty string.
 - session_index must match input ordering exactly.
+- Start directly with concrete facts. Avoid lead-ins like "The conversation begins with" or "The conversation revolves around".
+- Prefer compact, information-dense wording over narrative filler.
 
 Sessions:
 {sessions_blob}
 """
-
-
-# Hard caps to keep summaries from bloating relative to raw dialog.
-_SUMMARY_MAX_TOTAL_CHARS = 900
-_SUMMARY_MIN_TOTAL_CHARS = 260
-_SUMMARY_SECTION_CAPS = {
-    "summary": 220,
-    "key_details": 360,
-    "intent": 140,
-    "tone": 100,
-    "open_loops": 180,
-}
 
 
 def _extract_json_object(text: str) -> dict[str, Any] | None:
@@ -175,6 +168,8 @@ def extract_summary_sections(text: str) -> dict[str, str]:
             if current_key:
                 buffers[current_key].append("")
             continue
+        if line.lower() in {"[historical summary]", "[active session summary]"}:
+            continue
         normalized = line.lower()
         matched = False
         for prefix, key in key_map.items():
@@ -202,69 +197,75 @@ def extract_summary_sections(text: str) -> dict[str, str]:
 def normalize_structured_summary_text(text: str) -> str:
     """Normalize summary text into consistent sectioned format."""
     data = extract_summary_sections(text)
-    return "\n".join(
-        [
-            f"Summary: {data['summary']}".rstrip(),
-            f"Key Details: {data['key_details']}".rstrip(),
-            f"Intent: {data['intent']}".rstrip(),
-            f"Tone: {data['tone']}".rstrip(),
-            f"Open Loops: {data['open_loops']}".rstrip(),
-        ]
-    ).strip()
-
-
-def _truncate_for_limit(text: str, limit: int) -> str:
-    text = " ".join((text or "").strip().split())
-    if len(text) <= limit:
-        return text
-    cutoff = text.rfind(" ", 0, max(limit - 1, 1))
-    if cutoff < max(16, limit // 3):
-        cutoff = max(limit - 1, 1)
-    return text[:cutoff].rstrip(" ,;:-.") + "..."
-
+    return _render_structured_summary_text(data)
 
 def compress_structured_summary_text(
     text: str,
     source_session: "Session | None" = None,
 ) -> str:
-    """Enforce concise structured summaries with section and total-size caps."""
+    """Normalize summary sections without truncating stored content."""
+    _ = source_session  # Signature retained for compatibility with existing callers.
     sections = extract_summary_sections(text)
-    source_chars = 0
-    if source_session is not None:
-        source_chars = sum(len((m.get("content") or "").strip()) for m in source_session.messages)
+    return _render_structured_summary_text(sections)
 
-    dynamic_total_cap = _SUMMARY_MAX_TOTAL_CHARS
-    if source_chars > 0:
-        dynamic_total_cap = min(_SUMMARY_MAX_TOTAL_CHARS, max(_SUMMARY_MIN_TOTAL_CHARS, int(source_chars * 0.55)))
 
-    compact = {
-        key: _truncate_for_limit((sections.get(key) or ""), cap)
-        for key, cap in _SUMMARY_SECTION_CAPS.items()
-    }
+def _clean_summary_section_value(section: str, value: str) -> str:
+    """Reduce boilerplate in structured summaries without dropping facts."""
+    cleaned = " ".join((value or "").strip().split())
+    if not cleaned:
+        return ""
 
-    overage = len("\n".join(compact.values())) - dynamic_total_cap
-    if overage > 0:
-        trim_order = ("tone", "summary", "intent", "open_loops", "key_details")
-        for key in trim_order:
-            if overage <= 0:
+    if section == "summary":
+        boilerplate_prefixes = (
+            "the conversation begins with ",
+            "the conversation starts with ",
+            "the conversation revolves around ",
+            "the conversation is about ",
+            "the conversation is ",
+            "this conversation begins with ",
+            "this conversation starts with ",
+            "this conversation is about ",
+            "this conversation is ",
+            "the exchange begins with ",
+            "the exchange starts with ",
+            "the session begins with ",
+            "the session starts with ",
+        )
+        lowered = cleaned.lower()
+        stripped_boilerplate = False
+        for prefix in boilerplate_prefixes:
+            if lowered.startswith(prefix):
+                cleaned = cleaned[len(prefix):].lstrip()
+                stripped_boilerplate = True
                 break
-            value = compact.get(key, "")
-            floor = 40 if key != "key_details" else 120
-            if len(value) <= floor:
-                continue
-            new_len = max(floor, len(value) - overage)
-            compact[key] = _truncate_for_limit(value, new_len)
-            overage = len("\n".join(compact.values())) - dynamic_total_cap
 
-    return "\n".join(
-        [
-            f"Summary: {compact['summary']}".rstrip(),
-            f"Key Details: {compact['key_details']}".rstrip(),
-            f"Intent: {compact['intent']}".rstrip(),
-            f"Tone: {compact['tone']}".rstrip(),
-            f"Open Loops: {compact['open_loops']}".rstrip(),
-        ]
-    ).strip()
+        # If stripping left a leading article, keep it terse and natural.
+        cleaned = re.sub(r"^(?:that|which)\s+", "", cleaned, flags=re.IGNORECASE)
+        if stripped_boilerplate and cleaned[:1].islower():
+            cleaned = cleaned[:1].upper() + cleaned[1:]
+
+    return cleaned
+
+
+def _render_structured_summary_text(
+    sections: dict[str, str],
+    *,
+    include_empty: bool = False,
+) -> str:
+    """Render structured summary sections in a compact, stable format."""
+    labels = (
+        ("summary", "Summary"),
+        ("key_details", "Key Details"),
+        ("intent", "Intent"),
+        ("tone", "Tone"),
+        ("open_loops", "Open Loops"),
+    )
+    lines: list[str] = []
+    for key, label in labels:
+        value = _clean_summary_section_value(key, sections.get(key) or "")
+        if key == "summary" or include_empty or value:
+            lines.append(f"{label}: {value}".rstrip())
+    return "\n".join(lines).strip()
 
 
 def is_summary_low_quality(text: str, source_session: "Session | None" = None) -> bool:
@@ -640,6 +641,7 @@ def summarize_session_with_llm(
     session: Session,
     service_url: str = "http://127.0.0.1:8642",
     timeout: float = 120.0,  # Increased from 30s - small models need more time
+    config: Any | None = None,
 ) -> str | None:
     """Summarize a session using the LLM service.
 
@@ -654,7 +656,12 @@ def summarize_session_with_llm(
         Summary text if successful, None on failure
     """
     conversation_text = format_session_for_summarization(session)
-    prompt = SUMMARIZATION_PROMPT.format(messages=conversation_text)
+    from ..prompt_registry import PromptResolver
+
+    prompt = PromptResolver(config).render(
+        key="history.summarization.single",
+        variables={"messages": conversation_text},
+    )
     
     # Log the prompt size for debugging
     logger.debug(f"Summarization prompt: {len(prompt)} chars for {session.message_count} messages")
@@ -1041,7 +1048,7 @@ class HistorySummarizer:
                 summary_text = self._summarize_fn(session)
             else:
                 # Use HTTP endpoint (for CLI usage)
-                summary_text = summarize_session_with_llm(session, self.service_url)
+                summary_text = summarize_session_with_llm(session, self.service_url, config=self.config)
             method = method_override or "llm"
 
         if not summary_text and use_heuristic_fallback:
@@ -1437,7 +1444,7 @@ class HistorySummarizer:
         if self._summarize_fn:
             summary_text = self._summarize_fn(session)
         else:
-            summary_text = summarize_session_with_llm(session, self.service_url)
+            summary_text = summarize_session_with_llm(session, self.service_url, config=self.config)
         method = "llm"
 
         if not summary_text and use_heuristic_fallback:

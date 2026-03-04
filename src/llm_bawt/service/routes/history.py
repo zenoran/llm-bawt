@@ -63,14 +63,13 @@ def _invalidate_bot_history_cache(service, bot_id: str) -> None:
 def _build_summary_callable(service, bot_id: str, user_id: str = "system", model: str | None = None):
     """Create a summarization callable using the service's model resolution path."""
     from ...memory.summarization import (
-        BATCH_SUMMARIZATION_PROMPT,
-        SUMMARIZATION_PROMPT,
         _extract_json_object,
         compress_structured_summary_text,
         format_session_for_summarization,
         is_summary_low_quality,
     )
     from ...models.message import Message
+    from ...prompt_registry import PromptResolver
 
     requested_model = (
         model
@@ -107,12 +106,17 @@ def _build_summary_callable(service, bot_id: str, user_id: str = "system", model
         log.error(f"Failed to resolve/load model for history summarization route: {e}")
         client = None
 
+    prompt_resolver = PromptResolver(service.config)
+
     def summarize_with_loaded_client(session) -> str | None:
         if not client:
             return None
 
         conversation_text = format_session_for_summarization(session)
-        prompt = SUMMARIZATION_PROMPT.format(messages=conversation_text)
+        prompt = prompt_resolver.render(
+            key="history.summarization.single",
+            variables={"messages": conversation_text},
+        )
         estimated_tokens = len(prompt) // 4
         log.debug(
             "Per-session summarization: %s messages, ~%s estimated prompt tokens",
@@ -198,7 +202,10 @@ def _build_summary_callable(service, bot_id: str, user_id: str = "system", model
                 )
 
             sessions_blob = "\n\n".join(session_lines)
-            prompt = BATCH_SUMMARIZATION_PROMPT.format(sessions_blob=sessions_blob)
+            prompt = prompt_resolver.render(
+                key="history.summarization.batch",
+                variables={"sessions_blob": sessions_blob},
+            )
             estimated_tokens = len(prompt) // 4
             log.info(
                 "Batch summarization: %s sessions, ~%s estimated prompt tokens (limit %s)",

@@ -15,12 +15,30 @@ _cache_ts: float = 0.0
 _CACHE_TTL = 900  # 15 minutes
 
 
-def _ha_base_url(config: Any) -> str | None:
-    """Derive HA base URL from native MCP URL."""
-    url = config.HA_NATIVE_MCP_URL
-    if url and "/api/mcp" in url:
-        return url.rsplit("/api/mcp", 1)[0]
-    return None
+def _ha_credentials(config: Any) -> tuple[str | None, str | None]:
+    """Derive HA base URL and token from available config.
+
+    Tries HA_NATIVE_MCP_URL first (strips /api/mcp suffix), then falls back
+    to HA_MCP_URL (strips /api/mcp if present, otherwise uses as-is).
+    """
+    # Try native MCP config first
+    native_url = getattr(config, "HA_NATIVE_MCP_URL", "") or ""
+    native_token = getattr(config, "HA_NATIVE_MCP_TOKEN", "") or ""
+    if native_url:
+        base = native_url.rsplit("/api/mcp", 1)[0] if "/api/mcp" in native_url else native_url.rstrip("/")
+        if native_token:
+            return base, native_token
+
+    # Fall back to legacy MCP config
+    mcp_url = getattr(config, "HA_MCP_URL", "") or ""
+    mcp_token = getattr(config, "HA_MCP_AUTH_TOKEN", "") or ""
+    if mcp_url:
+        base = mcp_url.rsplit("/api/mcp", 1)[0] if "/api/mcp" in mcp_url else mcp_url.rstrip("/")
+        token = mcp_token or native_token
+        if token:
+            return base, token
+
+    return None, None
 
 
 @router.get("/v1/ha/weather", tags=["Home Assistant"])
@@ -34,8 +52,7 @@ async def get_ha_weather(entity_id: str = Query(default="weather.home")):
         return _cache[cache_key]
 
     service = get_service()
-    base_url = _ha_base_url(service.config)
-    token = service.config.HA_NATIVE_MCP_TOKEN
+    base_url, token = _ha_credentials(service.config)
 
     if not base_url or not token:
         return {"error": "Home Assistant not configured"}

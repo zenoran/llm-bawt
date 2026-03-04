@@ -9,7 +9,7 @@ from typing import Optional
 from llm_bawt.profiles import ProfileManager, EntityType, AttributeCategory
 from llm_bawt.clients.base import LLMClient
 from llm_bawt.models.message import Message
-from llm_bawt.memory.extraction.prompts import PROFILE_CONSOLIDATION_PROMPT
+from llm_bawt.memory.extraction.prompts import get_profile_consolidation_prompt
 
 logger = logging.getLogger(__name__)
 
@@ -63,7 +63,7 @@ class ProfileMaintenanceService:
         for attr in attributes:
             attr_lines.append(f"{attr.category}: {attr.key} = {attr.value}")
         
-        prompt = PROFILE_CONSOLIDATION_PROMPT.format(attributes="\n".join(attr_lines))
+        prompt = get_profile_consolidation_prompt("\n".join(attr_lines))
         
         try:
             # Call LLM

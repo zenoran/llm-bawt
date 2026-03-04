@@ -1960,10 +1960,10 @@ class BackgroundService:
         """Process proactive history summarization and extraction for a bot."""
         from ..memory.summarization import (
             HistorySummarizer,
-            SUMMARIZATION_PROMPT,
             format_session_for_summarization,
         )
         from ..models.message import Message
+        from ..prompt_registry import PromptResolver
 
         bot_id = task.bot_id or self._default_bot
         requested_model = (
@@ -2013,12 +2013,17 @@ class BackgroundService:
                 log.error(f"Failed to resolve/load model for history summarization: {e}")
                 client = None
 
+        prompt_resolver = PromptResolver(self.config)
+
         def summarize_with_loaded_client(session) -> str | None:
             if not client:
                 return None
 
             conversation_text = format_session_for_summarization(session)
-            prompt = SUMMARIZATION_PROMPT.format(messages=conversation_text)
+            prompt = prompt_resolver.render(
+                key="history.summarization.single",
+                variables={"messages": conversation_text},
+            )
 
             # Conservative budget to reduce context overflows on smaller models.
             if len(prompt) // 4 > 6000:

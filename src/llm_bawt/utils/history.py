@@ -153,20 +153,20 @@ class HistoryManager:
         if not lines:
             return text
 
+        from ..memory.summarization import compress_structured_summary_text, extract_summary_sections
+
         prefix_lines: list[str] = []
-        section_summary = ""
-        section_open_loops = ""
+        sections = extract_summary_sections(compress_structured_summary_text(text))
+        section_summary = (sections.get("summary") or "").strip()
+        section_key_details = (sections.get("key_details") or "").strip()
+        section_intent = (sections.get("intent") or "").strip()
+        section_open_loops = (sections.get("open_loops") or "").strip()
 
         for line in lines:
             lowered = line.lower()
             if lowered.startswith("[historical summary]"):
-                prefix_lines.append(line)
                 continue
-            if lowered.startswith("summary:"):
-                section_summary = line
-                continue
-            if lowered.startswith("open loops:"):
-                section_open_loops = line
+            if lowered.startswith("summary:") or lowered.startswith("key details:") or lowered.startswith("intent:") or lowered.startswith("tone:") or lowered.startswith("open loops:"):
                 continue
             # Keep non-section metadata prefix lines (legacy lines like "On YYYY-MM-DD...")
             if ":" not in line and not line.startswith("["):
@@ -176,19 +176,18 @@ class HistoryManager:
         compact_lines.extend(prefix_lines[:2])
         if section_summary:
             compact_lines.append(section_summary)
+        if section_key_details:
+            compact_lines.append(f"Details: {section_key_details}")
+        elif section_intent:
+            compact_lines.append(f"Intent: {section_intent}")
         if section_open_loops:
-            compact_lines.append(section_open_loops)
+            compact_lines.append(f"Open: {section_open_loops}")
 
         # Legacy fallback: keep as-is if we couldn't identify structured sections.
         if not compact_lines:
             return text
 
-        compact = "\n".join(compact_lines).strip()
-        # Guardrail against oversized summary rows.
-        max_chars = 420
-        if len(compact) > max_chars:
-            compact = compact[: max_chars - 3].rstrip() + "..."
-        return compact
+        return "\n".join(compact_lines).strip()
 
     def get_context_messages(self, max_tokens: int = 0):
         """Get messages to be used as context for the LLM.

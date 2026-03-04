@@ -12,8 +12,6 @@ from datetime import datetime
 from typing import Any, Optional, Protocol, TYPE_CHECKING
 
 from .prompts import (
-    FACT_EXTRACTION_PROMPT,
-    MEMORY_UPDATE_PROMPT,
     MEMORY_TAGS,
     get_fact_extraction_prompt,
     get_memory_update_prompt,

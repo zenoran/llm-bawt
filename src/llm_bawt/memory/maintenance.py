@@ -24,7 +24,30 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from typing import Any
 
+from ..prompt_registry import get_prompt_resolver
+
 logger = logging.getLogger(__name__)
+
+
+INTENT_PROMPT_WITH_CONTEXT = """Given this conversation excerpt and the fact that was extracted from it, determine WHY the user shared this information.
+
+Conversation:
+{conversation}
+
+Extracted fact: {fact}
+
+What was the user's intent in sharing this? Describe it in a brief phrase (3-6 words) that captures their underlying motivation or goal. Be specific to this situation rather than generic.
+
+Respond with ONLY the intent phrase, nothing else."""
+
+
+INTENT_PROMPT_CONTENT_ONLY = """Given this extracted memory/fact about a user, determine WHY they likely shared this information originally.
+
+Memory: {fact}
+
+What was the user's probable intent in sharing this? Describe it in a brief phrase (3-6 words) that captures their underlying motivation or goal. Be specific to this situation rather than generic.
+
+Respond with ONLY the intent phrase, nothing else."""
 
 
 @dataclass
@@ -445,27 +468,6 @@ def backfill_intent_with_llm(
     skipped = 0
     errors = []
     
-    # Prompt for intent inference with conversation context
-    INTENT_PROMPT_WITH_CONTEXT = """Given this conversation excerpt and the fact that was extracted from it, determine WHY the user shared this information.
-
-Conversation:
-{conversation}
-
-Extracted fact: {fact}
-
-What was the user's intent in sharing this? Describe it in a brief phrase (3-6 words) that captures their underlying motivation or goal. Be specific to this situation rather than generic.
-
-Respond with ONLY the intent phrase, nothing else."""
-
-    # Prompt for intent inference without conversation (fallback)
-    INTENT_PROMPT_CONTENT_ONLY = """Given this extracted memory/fact about a user, determine WHY they likely shared this information originally.
-
-Memory: {fact}
-
-What was the user's probable intent in sharing this? Describe it in a brief phrase (3-6 words) that captures their underlying motivation or goal. Be specific to this situation rather than generic.
-
-Respond with ONLY the intent phrase, nothing else."""
-
     messages_table = backend._memories_table_name.replace("_memories", "_messages")
     
     with backend.engine.connect() as conn:
@@ -526,13 +528,19 @@ Respond with ONLY the intent phrase, nothing else."""
                         f"{msg.role.capitalize()}: {msg.content}"
                         for msg in messages
                     ])
-                    prompt = INTENT_PROMPT_WITH_CONTEXT.format(
-                        conversation=conversation[:2000],
-                        fact=row.content,
+                    prompt = get_prompt_resolver().render(
+                        key="memory.maintenance.intent_with_context",
+                        variables={
+                            "conversation": conversation[:2000],
+                            "fact": row.content,
+                        },
                     )
                 else:
                     # Fallback to content-only inference
-                    prompt = INTENT_PROMPT_CONTENT_ONLY.format(fact=row.content)
+                    prompt = get_prompt_resolver().render(
+                        key="memory.maintenance.intent_content_only",
+                        variables={"fact": row.content},
+                    )
                 
                 # Query LLM for intent
                 from ..models.message import Message

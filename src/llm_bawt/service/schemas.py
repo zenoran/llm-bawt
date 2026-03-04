@@ -831,3 +831,92 @@ class RuntimeSettingBatchItem(BaseModel):
 class RuntimeSettingBatchUpsertRequest(BaseModel):
     """Batch upsert runtime settings."""
     items: list[RuntimeSettingBatchItem]
+
+
+class PromptTemplateResponse(BaseModel):
+    """Resolved or exact prompt template payload."""
+
+    key: str
+    title: str
+    category: str
+    format: str = "plain_text"
+    body: str
+    scope_type: str
+    scope_id: str
+    source: str
+    required_vars: list[str] = Field(default_factory=list)
+    placeholders: list[str] = Field(default_factory=list)
+    metadata: dict[str, Any] = Field(default_factory=dict)
+    updated_at: datetime | None = None
+
+
+class PromptTemplateListResponse(BaseModel):
+    """Response for listing prompt templates."""
+
+    prompts: list[PromptTemplateResponse]
+    total_count: int
+    filters: dict[str, Any] = Field(default_factory=dict)
+
+
+class PromptTemplateUpsertRequest(BaseModel):
+    """Create or update one prompt template."""
+
+    body: str
+    title: str | None = None
+    category: str | None = None
+    format: str = "plain_text"
+    scope_type: Literal["global", "bot"] = "global"
+    scope_id: str | None = None
+    required_vars: list[str] = Field(default_factory=list)
+    metadata: dict[str, Any] = Field(default_factory=dict)
+    updated_by: str | None = None
+    change_note: str | None = None
+
+
+class PromptTemplateValidateRequest(BaseModel):
+    """Validate a candidate prompt body."""
+
+    body: str | None = None
+    required_vars: list[str] | None = None
+    variables: dict[str, Any] = Field(default_factory=dict)
+
+
+class PromptTemplateValidateResponse(BaseModel):
+    """Validation result for a prompt template."""
+
+    valid: bool
+    required_vars: list[str] = Field(default_factory=list)
+    placeholders: list[str] = Field(default_factory=list)
+    missing_required: list[str] = Field(default_factory=list)
+    unknown_placeholders: list[str] = Field(default_factory=list)
+    rendered_preview: str | None = None
+    errors: list[str] = Field(default_factory=list)
+
+
+class PromptTemplateVersionResponse(BaseModel):
+    """One stored prompt template version."""
+
+    version: int
+    body: str
+    change_note: str | None = None
+    created_by: str | None = None
+    created_at: datetime
+
+
+class PromptTemplateVersionsResponse(BaseModel):
+    """Version history for a prompt key/scope."""
+
+    key: str
+    scope_type: str
+    scope_id: str
+    versions: list[PromptTemplateVersionResponse]
+    total_count: int
+
+
+class PromptTemplateSeedResponse(BaseModel):
+    """Result of seeding built-in prompt templates into the DB."""
+
+    created: int
+    skipped: int
+    total: int
+    seeded_keys: list[str] = Field(default_factory=list)

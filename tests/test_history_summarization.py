@@ -121,12 +121,12 @@ def test_extract_summary_sections_parses_structured_output() -> None:
 def test_normalize_structured_summary_text_fills_missing_sections() -> None:
     normalized = normalize_structured_summary_text("User asked about DNS propagation.")
     assert normalized.startswith("Summary: User asked about DNS propagation.")
-    assert "Intent:" in normalized
-    assert "Tone:" in normalized
-    assert "Open Loops:" in normalized
+    assert "Intent:" not in normalized
+    assert "Tone:" not in normalized
+    assert "Open Loops:" not in normalized
 
 
-def test_compress_structured_summary_text_caps_overlong_sections() -> None:
+def test_compress_structured_summary_text_preserves_overlong_sections() -> None:
     source_text = (
         "Summary: " + ("A" * 500) + "\n"
         "Key Details: " + ("B" * 1200) + "\n"
@@ -137,14 +137,14 @@ def test_compress_structured_summary_text_caps_overlong_sections() -> None:
     compact = compress_structured_summary_text(source_text)
     parsed = extract_summary_sections(compact)
 
-    assert len(parsed["summary"]) <= 223
-    assert len(parsed["key_details"]) <= 363
-    assert len(parsed["intent"]) <= 143
-    assert len(parsed["tone"]) <= 103
-    assert len(parsed["open_loops"]) <= 183
+    assert parsed["summary"] == "A" * 500
+    assert parsed["key_details"] == "B" * 1200
+    assert parsed["intent"] == "C" * 300
+    assert parsed["tone"] == "D" * 260
+    assert parsed["open_loops"] == "E" * 400
 
 
-def test_compress_structured_summary_text_scales_with_source_session() -> None:
+def test_compress_structured_summary_text_ignores_source_session_for_storage() -> None:
     now = time.time() - 7200
     session = _session(
         now,
@@ -162,8 +162,18 @@ def test_compress_structured_summary_text_scales_with_source_session() -> None:
         "Open Loops: " + ("E " * 180)
     )
     compact = compress_structured_summary_text(source_text, source_session=session)
-    # 55% of 600 chars ~= 330 cap (minimum floor is 260), so this should be aggressively trimmed.
-    assert len(compact) < 420
+    parsed = extract_summary_sections(compact)
+    assert parsed["summary"].startswith("A A A")
+    assert "..." not in compact
+
+
+def test_compress_structured_summary_text_strips_summary_boilerplate() -> None:
+    compact = compress_structured_summary_text(
+        "Summary: The conversation begins with a debugging pass over flaky deploys.\n"
+        "Open Loops: Confirm rollback threshold."
+    )
+    parsed = extract_summary_sections(compact)
+    assert parsed["summary"] == "A debugging pass over flaky deploys."
 
 
 def test_is_low_signal_session_flags_greeting_noise() -> None:
