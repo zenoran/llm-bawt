@@ -57,6 +57,7 @@ async def list_turn_logs(
     for row in rows:
         tool_calls = _parse_json(row.tool_calls_json) or []
         response_text = row.response_text or ""
+        response_preview = response_text[:300] if response_text else None
         items.append(
             TurnLogListItem(
                 id=row.id,
@@ -70,7 +71,9 @@ async def list_turn_logs(
                 status=row.status,
                 latency_ms=row.latency_ms,
                 user_prompt=row.user_prompt,
-                response_preview=response_text[:300] if response_text else None,
+                response_preview=response_preview,
+                response_chars=len(response_text),
+                response_preview_truncated=bool(response_text and len(response_text) > len(response_preview or "")),
                 tool_call_count=len(tool_calls) if isinstance(tool_calls, list) else 0,
                 error_text=row.error_text,
             )

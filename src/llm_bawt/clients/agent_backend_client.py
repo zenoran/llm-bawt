@@ -33,7 +33,7 @@ class AgentBackendClient(LLMClient):
     query completes.
     """
 
-    SUPPORTS_STREAMING = False
+    SUPPORTS_STREAMING = True
 
     def __init__(
         self,
@@ -103,8 +103,25 @@ class AgentBackendClient(LLMClient):
     def get_styling(self) -> tuple[str | None, str]:
         return self.bot_name, "cyan"
 
-    def stream_raw(self, messages: List[Message], **kwargs: Any) -> Iterator[str]:
-        """Agent backends don't natively stream; yield the full response."""
+    def stream_raw(self, messages: List[Message], **kwargs: Any) -> Iterator[str | dict[str, Any]]:
+        """Stream from backend when supported; fallback to one-shot query."""
+        prompt = ""
+        for msg in reversed(messages):
+            if msg.role == "user":
+                prompt = msg.content or ""
+                break
+
+        if not prompt:
+            logger.warning("AgentBackendClient.stream_raw() called with no user message")
+            return
+
+        if hasattr(self._backend, "stream_raw"):
+            for item in self._backend.stream_raw(prompt, self._bot_config):
+                yield item
+            if hasattr(self._backend, "get_last_stream_result"):
+                self.last_result = self._backend.get_last_stream_result()
+            return
+
         response = self.query(messages, plaintext_output=True, **kwargs)
         if response:
             yield response

@@ -267,6 +267,8 @@ class TurnLogListItem(BaseModel):
     latency_ms: float | None = None
     user_prompt: str | None = None
     response_preview: str | None = None
+    response_chars: int = 0
+    response_preview_truncated: bool = False
     tool_call_count: int = 0
     error_text: str | None = None
 

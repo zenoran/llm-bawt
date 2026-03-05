@@ -12,8 +12,10 @@ from typing import Any, AsyncIterator
 from urllib.parse import urlparse
 
 from ..bots import BotManager, StreamingEmoteFilter, get_bot, strip_emotes
+from ..clients.agent_backend_client import AgentBackendClient
 from ..utils.config import Config
 from ..utils.paths import resolve_log_dir
+from .chat_stream_worker import consume_stream_chunks, put_queue_item_threadsafe
 from .logging import RequestContext, generate_request_id, get_service_logger
 from .schemas import (
     ChatCompletionChoice,
@@ -570,6 +572,92 @@ class BackgroundService:
         except Exception as e:
             log.debug("Failed to update turn log: %s", e)
 
+    def _extract_agent_backend_tool_calls(
+        self,
+        *,
+        llm_bawt: Any,
+    ) -> list[dict]:
+        """Extract normalized tool-call details from agent backend clients."""
+        if not isinstance(getattr(llm_bawt, "client", None), AgentBackendClient):
+            return []
+
+        extracted: list[dict] = []
+        for tc in llm_bawt.client.get_tool_calls():
+            result_payload = tc.get("result")
+            if result_payload is None:
+                result_payload = "Result not exposed by OpenClaw API (see assistant response)."
+            extracted.append(
+                {
+                    "iteration": 1,
+                    "tool": tc.get("display_name") or tc.get("name", "unknown"),
+                    "parameters": tc.get("arguments", {}),
+                    "result": result_payload,
+                }
+            )
+        return extracted
+
+    def _finalize_turn(
+        self,
+        *,
+        llm_bawt,
+        turn_id: str,
+        response_text: str,
+        tool_context: str,
+        tool_call_details: list[dict],
+        prepared_messages: list,
+        user_prompt: str,
+        model: str,
+        bot_id: str,
+        user_id: str,
+        elapsed_ms: float,
+        stream: bool,
+    ) -> None:
+        """Finalize a turn in one place for both non-streaming and streaming paths."""
+        if not response_text:
+            return
+
+        # Safety-net output cleaning in case adapter-level cleanup did not run upstream.
+        adapter = getattr(llm_bawt, "adapter", None)
+        if adapter:
+            cleaned = adapter.clean_output(response_text)
+            if cleaned != response_text:
+                log.info(
+                    "Adapter '%s' cleaned response: %s -> %s chars",
+                    adapter.name,
+                    len(response_text),
+                    len(cleaned),
+                )
+                response_text = cleaned
+
+        extracted_tool_calls = self._extract_agent_backend_tool_calls(llm_bawt=llm_bawt)
+        if extracted_tool_calls:
+            tool_call_details.extend(extracted_tool_calls)
+
+        llm_bawt.finalize_response(response_text, tool_context)
+
+        self._update_turn_log(
+            turn_id=turn_id,
+            status="ok",
+            latency_ms=elapsed_ms,
+            prepared_messages=prepared_messages,
+            response_text=response_text,
+            tool_calls=tool_call_details,
+        )
+
+        if stream:
+            log.llm_response(response_text, elapsed_ms=elapsed_ms)
+
+        if self.config.DEBUG_TURN_LOG or os.environ.get("LLM_BAWT_DEBUG_TURN_LOG"):
+            _write_debug_turn_log(
+                prepared_messages=prepared_messages,
+                user_prompt=user_prompt,
+                response=response_text,
+                model=model,
+                bot_id=bot_id,
+                user_id=user_id,
+                tool_calls=tool_call_details,
+            )
+
     @property
     def uptime_seconds(self) -> float:
         return time.time() - self.start_time
@@ -823,49 +911,25 @@ class BackgroundService:
                     stream=False,
                 )
 
-                # For agent backend clients, extract tool call details
-                # from the structured result stashed by the backend.
-                from ..clients.agent_backend_client import AgentBackendClient
-                if isinstance(llm_bawt.client, AgentBackendClient):
-                    for tc in llm_bawt.client.get_tool_calls():
-                        result_payload = tc.get("result")
-                        if result_payload is None:
-                            result_payload = "Result not exposed by OpenClaw API (see assistant response)."
-                        tool_call_details.append({
-                            "iteration": 1,
-                            "tool": tc.get("display_name") or tc.get("name", "unknown"),
-                            "parameters": tc.get("arguments", {}),
-                            "result": result_payload,
-                        })
-
-                # Write debug turn log if enabled (check config or env var)
-                if self.config.DEBUG_TURN_LOG or os.environ.get("LLM_BAWT_DEBUG_TURN_LOG"):
-                    _write_debug_turn_log(
-                        prepared_messages=prepared_messages,
-                        user_prompt=user_prompt,
-                        response=response,
-                        model=model_alias,
-                        bot_id=bot_id,
-                        user_id=user_id,
-                        tool_calls=tool_call_details,
-                    )
-
                 # Check if cancelled during generation
                 if cancel_event.is_set():
                     log.info("Generation cancelled - newer request received")
                     cancelled = True
                     return ""
 
-                # Finalize (add to history, trigger memory extraction)
-                llm_bawt.finalize_response(response, tool_context)
-
-                self._update_turn_log(
+                self._finalize_turn(
+                    llm_bawt=llm_bawt,
                     turn_id=turn_log_id,
-                    status="ok",
-                    latency_ms=(time.time() - llm_start_time) * 1000,
-                    prepared_messages=prepared_messages,
                     response_text=response,
-                    tool_calls=tool_call_details,
+                    tool_context=tool_context,
+                    tool_call_details=tool_call_details,
+                    prepared_messages=prepared_messages,
+                    user_prompt=user_prompt,
+                    model=model_alias,
+                    bot_id=bot_id,
+                    user_id=user_id,
+                    elapsed_ms=(time.time() - llm_start_time) * 1000,
+                    stream=False,
                 )
 
                 return response
@@ -1171,8 +1235,9 @@ class BackgroundService:
                                                 args = {}
 
                                             log.info(f"🔧 {name}({args})")
-                                            loop.call_soon_threadsafe(
-                                                chunk_queue.put_nowait,
+                                            put_queue_item_threadsafe(
+                                                loop,
+                                                chunk_queue,
                                                 {
                                                     "event": "tool_call",
                                                     "name": name,
@@ -1272,93 +1337,21 @@ class BackgroundService:
                     )
                 
                 # Stream chunks to queue
-                for chunk in stream_iter:
-                    # Check for cancellation - new request came in
-                    if cancel_event.is_set():
-                        log.info("Generation cancelled - newer request received")
-                        cancelled_holder[0] = True
-                        return
-                    
-                    full_response_holder[0] += chunk
-                    # Put chunk in queue - use call_soon_threadsafe with captured loop
-                    loop.call_soon_threadsafe(chunk_queue.put_nowait, chunk)
-                
+                cancelled_holder[0] = consume_stream_chunks(
+                    stream_iter,
+                    cancel_event=cancel_event,
+                    loop=loop,
+                    chunk_queue=chunk_queue,
+                    full_response_holder=full_response_holder,
+                )
+                if cancelled_holder[0]:
+                    log.info("Generation cancelled - newer request received")
+
                 timing_holder[1] = time.time()
-                
-                # Emit tool call SSE events for agent backend clients.
-                # The backend stashes tool call metadata in last_result after
-                # query() completes — push them to the chunk queue so the
-                # SSE consumer can broadcast them to the frontend.
-                from ..clients.agent_backend_client import AgentBackendClient
-                if isinstance(llm_bawt.client, AgentBackendClient):
-                    for tc in llm_bawt.client.get_tool_calls():
-                        result_payload = tc.get("result")
-                        if result_payload is None:
-                            result_payload = "Result not exposed by OpenClaw API (see assistant response)."
-                        loop.call_soon_threadsafe(
-                            chunk_queue.put_nowait,
-                            {
-                                "event": "tool_call",
-                                "name": tc.get("display_name") or tc.get("name", "unknown"),
-                                "arguments": tc.get("arguments", {}),
-                                "result": result_payload,
-                            },
-                        )
-                        loop.call_soon_threadsafe(
-                            chunk_queue.put_nowait,
-                            {
-                                "event": "tool_result",
-                                "name": tc.get("display_name") or tc.get("name", "unknown"),
-                                "result": result_payload,
-                            },
-                        )
-                        tool_call_details_holder.append({
-                            "iteration": 1,
-                            "tool": tc.get("display_name") or tc.get("name", "unknown"),
-                            "parameters": tc.get("arguments", {}),
-                            "result": result_payload,
-                        })
-                
-                # Finalize: add response to history and trigger memory extraction
-                # Only if we weren't cancelled
-                if full_response_holder[0] and not cancel_event.is_set():
-                    # Calculate elapsed time and log with tokens/sec
-                    elapsed_ms = (timing_holder[1] - timing_holder[0]) * 1000
-                    # Apply adapter output cleaning as safety net
-                    adapter = getattr(llm_bawt, 'adapter', None)
-                    if adapter:
-                        cleaned = adapter.clean_output(full_response_holder[0])
-                        if cleaned != full_response_holder[0]:
-                            log.info(f"Adapter '{adapter.name}' cleaned response: "
-                                     f"{len(full_response_holder[0])} -> {len(cleaned)} chars")
-                            full_response_holder[0] = cleaned
-                    
-                    log.llm_response(full_response_holder[0], elapsed_ms=elapsed_ms)
-                    llm_bawt.finalize_response(full_response_holder[0], tool_context_holder[0])
-
-                    self._update_turn_log(
-                        turn_id=turn_log_id,
-                        status="ok",
-                        latency_ms=elapsed_ms,
-                        response_text=full_response_holder[0],
-                        tool_calls=tool_call_details_holder,
-                    )
-
-                    # Write debug turn log if enabled (check config or env var)
-                    if self.config.DEBUG_TURN_LOG or os.environ.get("LLM_BAWT_DEBUG_TURN_LOG"):
-                        _write_debug_turn_log(
-                            prepared_messages=messages,
-                            user_prompt=user_prompt,
-                            response=full_response_holder[0],
-                            model=model_alias,
-                            bot_id=bot_id,
-                            user_id=user_id,
-                            tool_calls=tool_call_details_holder,
-                        )
                     
             except Exception as e:
                 if not cancel_event.is_set():
-                    loop.call_soon_threadsafe(chunk_queue.put_nowait, e)
+                    put_queue_item_threadsafe(loop, chunk_queue, e)
                 elapsed_ms = (time.time() - timing_holder[0]) * 1000 if timing_holder[0] else None
                 self._update_turn_log(
                     turn_id=turn_log_id,
@@ -1368,7 +1361,26 @@ class BackgroundService:
                     error_text=str(e),
                 )
             finally:
-                loop.call_soon_threadsafe(chunk_queue.put_nowait, None)  # Sentinel
+                if full_response_holder[0]:
+                    end_time = timing_holder[1] or time.time()
+                    start_time = timing_holder[0] or end_time
+                    elapsed_ms = (end_time - start_time) * 1000
+                    self._finalize_turn(
+                        llm_bawt=llm_bawt,
+                        turn_id=turn_log_id,
+                        response_text=full_response_holder[0],
+                        tool_context=tool_context_holder[0],
+                        tool_call_details=tool_call_details_holder,
+                        prepared_messages=messages if "messages" in locals() else [],
+                        user_prompt=user_prompt,
+                        model=model_alias,
+                        bot_id=bot_id,
+                        user_id=user_id,
+                        elapsed_ms=elapsed_ms,
+                        stream=True,
+                    )
+
+                put_queue_item_threadsafe(loop, chunk_queue, None)  # Sentinel
         
         try:
             # Check if this bot needs emote filtering for TTS

@@ -135,9 +135,9 @@ uninstall: ## [pipx] Uninstall llm-bawt
 
 .PHONY: dev dev-llama dev-run
 
-dev: check-uv ## [uv] Sync .venv with all extras (mcp, service, search, memory, hf, tui)
+dev: check-uv ## [uv] Sync .venv with all extras (dev, mcp, service, search, memory, hf, tui)
 	@echo "$(BLUE)Syncing .venv with all extras...$(NC)"
-	uv sync --inexact --extra mcp --extra service --extra search --extra memory --extra huggingface
+	uv sync --inexact --extra dev --extra mcp --extra service --extra search --extra memory --extra huggingface
 	@echo "$(GREEN)✓ .venv synced$(NC)"
 	@echo "  Run: uv run llm --status"
 	@echo "  Run: uv run llm-memory-tui  (TUI interface)"

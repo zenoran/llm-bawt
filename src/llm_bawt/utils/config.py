@@ -239,6 +239,28 @@ class Config(RuntimeTunables, BaseSettings):
     # --- xAI (Grok) Settings --- #
     XAI_API_KEY: str = Field(default="", description="xAI API key for Grok models (get from x.ai)")
 
+    # --- OpenClaw Gateway Settings --- #
+    OPENCLAW_GATEWAY_URL: str = Field(
+        default="http://127.0.0.1:18789",
+        description="OpenClaw gateway base URL",
+    )
+    OPENCLAW_GATEWAY_TOKEN: str = Field(
+        default="",
+        description="Bearer token for OpenClaw gateway",
+    )
+    OPENCLAW_AGENT_ID: str = Field(
+        default="main",
+        description="OpenClaw agent namespace",
+    )
+    OPENCLAW_STREAM_ENABLED: bool = Field(
+        default=True,
+        description="Enable SSE streaming for OpenClaw responses",
+    )
+    OPENCLAW_USE_SSH_FALLBACK: bool = Field(
+        default=False,
+        description="Allow SSH transport as emergency fallback",
+    )
+
     # --- Web Search Settings --- #
     NEWSAPI_API_KEY: str = Field(
         default="",

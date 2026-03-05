@@ -8,19 +8,20 @@ legacy fallback transport.
 from __future__ import annotations
 
 import asyncio
+import codecs
 import json
 import logging
 import os
-import re
 import shlex
 import time
 from urllib import request as urlrequest
 from urllib import error as urlerror
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Iterator
 
 from .base import AgentBackend
 from ..shared.output_sanitizer import strip_tool_protocol_leakage
+from ..utils.config import Config
 
 logger = logging.getLogger(__name__)
 
@@ -159,11 +160,36 @@ class OpenClawBackend(AgentBackend):
 
     name = "openclaw"
 
+    def __init__(self) -> None:
+        self._config = Config()
+        self._last_stream_result: OpenClawResult | None = None
+
+    def _bool_from_any(self, value: Any, default: bool) -> bool:
+        if isinstance(value, bool):
+            return value
+        if value is None:
+            return default
+        raw = str(value).strip().lower()
+        if raw in {"1", "true", "yes", "on"}:
+            return True
+        if raw in {"0", "false", "no", "off"}:
+            return False
+        return default
+
+    def _resolve_ssh_fallback_enabled(self, config: dict) -> bool:
+        if "use_ssh_fallback" in config:
+            return self._bool_from_any(config.get("use_ssh_fallback"), default=False)
+        if "OPENCLAW_USE_SSH_FALLBACK" in os.environ:
+            return self._bool_from_any(os.getenv("OPENCLAW_USE_SSH_FALLBACK"), default=False)
+        return bool(self._config.OPENCLAW_USE_SSH_FALLBACK)
+
     def _resolve_transport(self, config: dict) -> str:
         transport = str(config.get("transport") or "gateway_api").strip().lower()
         if transport in ("api", "gateway", "gateway_api", "openai_api"):
             return "gateway_api"
         if transport in ("ssh", "legacy_ssh"):
+            return "ssh"
+        if self._resolve_ssh_fallback_enabled(config):
             return "ssh"
         return "gateway_api"
 
@@ -175,7 +201,10 @@ class OpenClawBackend(AgentBackend):
         if host:
             port = int(config.get("gateway_port", 18789))
             return f"http://{host}:{port}"
-        return ""
+        env_url = os.getenv("OPENCLAW_GATEWAY_URL", "").strip() or os.getenv("LLM_BAWT_OPENCLAW_GATEWAY_URL", "").strip()
+        if env_url:
+            return env_url.rstrip("/")
+        return str(self._config.OPENCLAW_GATEWAY_URL or "").strip().rstrip("/")
 
     def _resolve_gateway_token(self, config: dict) -> str:
         token_env_name = str(config.get("token_env") or "").strip()
@@ -184,6 +213,7 @@ class OpenClawBackend(AgentBackend):
             str(config.get("token") or "").strip()
             or str(config.get("gateway_token") or "").strip()
             or env_token
+            or str(self._config.OPENCLAW_GATEWAY_TOKEN or "").strip()
             or os.getenv("OPENCLAW_GATEWAY_TOKEN", "").strip()
             or os.getenv("LLM_BAWT_OPENCLAW_GATEWAY_TOKEN", "").strip()
         )
@@ -192,8 +222,24 @@ class OpenClawBackend(AgentBackend):
         explicit_model = str(config.get("model") or config.get("model_id") or "").strip()
         if explicit_model:
             return explicit_model
-        agent_id = str(config.get("agent_id") or "main").strip() or "main"
+        agent_id = self._resolve_agent_id(config)
         return f"openclaw:{agent_id}"
+
+    def _resolve_agent_id(self, config: dict) -> str:
+        explicit = str(config.get("agent_id") or "").strip()
+        if explicit:
+            return explicit
+        env_value = os.getenv("OPENCLAW_AGENT_ID", "").strip() or os.getenv("LLM_BAWT_OPENCLAW_AGENT_ID", "").strip()
+        if env_value:
+            return env_value
+        return str(self._config.OPENCLAW_AGENT_ID or "main").strip() or "main"
+
+    def _resolve_stream_enabled(self, config: dict) -> bool:
+        if "stream_enabled" in config:
+            return self._bool_from_any(config.get("stream_enabled"), default=True)
+        if "OPENCLAW_STREAM_ENABLED" in os.environ:
+            return self._bool_from_any(os.getenv("OPENCLAW_STREAM_ENABLED"), default=True)
+        return bool(self._config.OPENCLAW_STREAM_ENABLED)
 
     def _resolve_gateway_headers(self, config: dict) -> dict[str, str]:
         headers: dict[str, str] = {}
@@ -201,7 +247,7 @@ class OpenClawBackend(AgentBackend):
         if session_key:
             headers["x-openclaw-session-key"] = session_key
 
-        agent_id = str(config.get("agent_id") or "").strip()
+        agent_id = self._resolve_agent_id(config)
         if agent_id:
             headers["x-openclaw-agent-id"] = agent_id
 
@@ -215,15 +261,18 @@ class OpenClawBackend(AgentBackend):
 
         return headers
 
-    async def _run_gateway_api(
+    def _request_gateway_responses(
         self,
         prompt: str,
         config: dict,
-    ) -> dict:
+        *,
+        stream: bool,
+    ) -> dict | Any:
         base_url = self._resolve_gateway_base_url(config)
         token = self._resolve_gateway_token(config)
         timeout = int(config.get("timeout_seconds", 300))
         model = self._resolve_gateway_model(config)
+        agent_id = self._resolve_agent_id(config)
         extra_headers = self._resolve_gateway_headers(config)
 
         if not base_url:
@@ -237,12 +286,16 @@ class OpenClawBackend(AgentBackend):
                 "(or env OPENCLAW_GATEWAY_TOKEN / LLM_BAWT_OPENCLAW_GATEWAY_TOKEN)."
             )
 
-        url = f"{base_url}/v1/chat/completions"
+        url = f"{base_url}/v1/responses"
         payload: dict[str, Any] = {
             "model": model,
-            "messages": [{"role": "user", "content": prompt}],
-            "stream": False,
+            "input": [{"role": "user", "content": [{"type": "input_text", "text": prompt}]}],
+            "stream": stream,
         }
+
+        if agent_id:
+            payload["metadata"] = {"agent_id": agent_id}
+
         user = str(config.get("user") or "").strip()
         if user:
             payload["user"] = user
@@ -260,31 +313,311 @@ class OpenClawBackend(AgentBackend):
             headers=req_headers,
         )
 
-        logger.debug("OpenClaw API: POST %s (model=%s)", url, model)
+        logger.info("OpenClaw request start: agent_id=%s stream=%s timeout=%ds", agent_id, stream, timeout)
 
-        def _do_request() -> dict:
-            try:
-                with urlrequest.urlopen(req, timeout=timeout) as resp:
-                    raw = resp.read().decode("utf-8", errors="replace")
-            except urlerror.HTTPError as e:
-                body = ""
+        try:
+            resp = urlrequest.urlopen(req, timeout=timeout)
+            if stream:
+                # For SSE streaming, extend the per-read socket timeout.
+                # OpenClaw may go silent for minutes during tool execution;
+                # the initial connection timeout (above) is for the HTTP
+                # round-trip, but once connected we need patience.
+                stream_read_timeout = max(timeout * 3, 300)
                 try:
-                    body = e.read().decode("utf-8", errors="replace")
-                except Exception:
-                    pass
-                raise RuntimeError(
-                    f"OpenClaw API HTTP {e.code}: {body[:400]}"
-                )
-            except urlerror.URLError as e:
-                raise RuntimeError(f"OpenClaw API unavailable: {e}")
-
+                    resp.fp.raw._sock.settimeout(stream_read_timeout)
+                    logger.debug(
+                        "SSE stream connected, per-read timeout extended to %ds",
+                        stream_read_timeout,
+                    )
+                except (AttributeError, OSError) as sock_err:
+                    logger.debug("Could not extend SSE socket timeout: %s", sock_err)
+            return resp
+        except urlerror.HTTPError as e:
+            body = ""
             try:
-                parsed = json.loads(raw)
+                body = e.read().decode("utf-8", errors="replace")
+            except Exception:
+                pass
+            raise RuntimeError(f"OpenClaw API HTTP {e.code}: {body[:400]}")
+        except urlerror.URLError as e:
+            raise RuntimeError(f"OpenClaw API unavailable: {e}")
+
+    async def _run_gateway_response_json(
+        self,
+        prompt: str,
+        config: dict,
+    ) -> dict:
+        def _do_request() -> dict:
+            with self._request_gateway_responses(prompt, config, stream=False) as resp:
+                raw = resp.read().decode("utf-8", errors="replace")
+            try:
+                return json.loads(raw)
             except json.JSONDecodeError as e:
                 raise RuntimeError(f"OpenClaw API returned invalid JSON: {e}")
-            return parsed
 
         return await asyncio.to_thread(_do_request)
+
+    def _iter_sse_events(self, byte_chunks: Iterator[bytes]) -> Iterator[tuple[str, str]]:
+        """Parse SSE events from byte chunks (supports partial lines)."""
+        decoder = codecs.getincrementaldecoder("utf-8")()
+        buffer = ""
+        event_name = "message"
+        data_parts: list[str] = []
+
+        def _flush_event() -> tuple[str, str] | None:
+            nonlocal event_name, data_parts
+            if not data_parts:
+                event_name = "message"
+                return None
+            payload = "\n".join(data_parts)
+            out = (event_name, payload)
+            event_name = "message"
+            data_parts = []
+            return out
+
+        for chunk in byte_chunks:
+            if not chunk:
+                continue
+            buffer += decoder.decode(chunk)
+            while "\n" in buffer:
+                line, buffer = buffer.split("\n", 1)
+                line = line.rstrip("\r")
+                if not line:
+                    flushed = _flush_event()
+                    if flushed is not None:
+                        yield flushed
+                    continue
+                if line.startswith(":"):
+                    continue
+                if line.startswith("event:"):
+                    event_name = line[6:].strip() or "message"
+                    continue
+                if line.startswith("data:"):
+                    data_parts.append(line[5:].lstrip())
+
+        buffer += decoder.decode(b"", final=True)
+        if buffer.strip():
+            # Treat trailing fragment as final data line.
+            if buffer.startswith("data:"):
+                data_parts.append(buffer[5:].lstrip())
+        flushed = _flush_event()
+        if flushed is not None:
+            yield flushed
+
+    def _extract_response_text(self, data: dict[str, Any]) -> str:
+        output_text = data.get("output_text")
+        if isinstance(output_text, str) and output_text.strip():
+            return output_text
+
+        texts: list[str] = []
+        for item in data.get("output", []) or []:
+            if not isinstance(item, dict):
+                continue
+            for content in item.get("content", []) or []:
+                if not isinstance(content, dict):
+                    continue
+                ctype = str(content.get("type") or "").lower()
+                if ctype in {"output_text", "text"}:
+                    text_value = content.get("text") or content.get("value")
+                    if isinstance(text_value, str) and text_value:
+                        texts.append(text_value)
+        return "".join(texts)
+
+    def _extract_tool_call_from_item(self, item: dict[str, Any]) -> OpenClawToolCall | None:
+        item_type = str(item.get("type") or item.get("item_type") or "").lower()
+        if item_type not in {"function_call", "tool_call"}:
+            return None
+
+        name = str(item.get("name") or item.get("tool_name") or "unknown")
+        raw_args = item.get("arguments") or item.get("input") or {}
+        if isinstance(raw_args, str):
+            try:
+                parsed = json.loads(raw_args)
+                args = parsed if isinstance(parsed, dict) else {"raw": raw_args}
+            except Exception:
+                args = {"raw": raw_args}
+        elif isinstance(raw_args, dict):
+            args = raw_args
+        else:
+            args = {"raw": raw_args}
+
+        return OpenClawToolCall(name=name, arguments=args)
+
+    def _extract_tool_result_from_item(self, item: dict[str, Any]) -> tuple[str, Any] | None:
+        item_type = str(item.get("type") or item.get("item_type") or "").lower()
+        if item_type not in {"function_call_output", "tool_result", "tool_call_result"}:
+            return None
+        call_id = str(item.get("call_id") or item.get("tool_call_id") or item.get("id") or "").strip()
+        result = item.get("output")
+        if result is None:
+            result = item.get("result")
+        return call_id, result
+
+    def stream_raw(self, prompt: str, config: dict) -> Iterator[str | dict[str, Any]]:
+        """Stream OpenClaw response deltas and tool events via SSE."""
+        if not self._resolve_stream_enabled(config):
+            # Fall back to single full text chunk in non-stream mode.
+            data = asyncio.run(self._run_gateway_response_json(prompt, config))
+            text = self._clean_and_validate_non_stream_text(data)
+            self._last_stream_result = OpenClawResult(
+                text=text,
+                model=str(data.get("model") or self._resolve_gateway_model(config)),
+                provider="openclaw-gateway",
+                raw=data,
+            )
+            if text:
+                yield text
+            return
+
+        request_started = time.time()
+        first_delta_at: float | None = None
+        tool_calls: list[OpenClawToolCall] = []
+        tool_calls_by_id: dict[str, OpenClawToolCall] = {}
+        text_parts: list[str] = []
+        response_id = ""
+        upstream_model = self._resolve_gateway_model(config)
+        termination_reason = "completed"
+
+        try:
+            with self._request_gateway_responses(prompt, config, stream=True) as resp:
+                def _iter_chunks() -> Iterator[bytes]:
+                    while True:
+                        chunk = resp.read(4096)
+                        if not chunk:
+                            break
+                        yield chunk
+
+                for event_name, raw_data in self._iter_sse_events(_iter_chunks()):
+                    if raw_data == "[DONE]":
+                        termination_reason = "completed"
+                        break
+                    try:
+                        payload = json.loads(raw_data)
+                    except json.JSONDecodeError:
+                        logger.debug("OpenClaw SSE non-JSON payload for event=%s", event_name)
+                        continue
+
+                    event_type = str(payload.get("type") or event_name or "message")
+                    if event_type == "response.created":
+                        response_id = str(payload.get("response", {}).get("id") or payload.get("id") or "")
+                        upstream_model = str(payload.get("response", {}).get("model") or upstream_model)
+                        logger.info(
+                            "OpenClaw stream created: response_id=%s agent_id=%s",
+                            response_id or "?",
+                            self._resolve_agent_id(config),
+                        )
+                        continue
+
+                    if event_type == "response.output_text.delta":
+                        delta = str(payload.get("delta") or "")
+                        if delta:
+                            if first_delta_at is None:
+                                first_delta_at = time.time()
+                                logger.info(
+                                    "OpenClaw first-token latency: %.1fms response_id=%s",
+                                    (first_delta_at - request_started) * 1000,
+                                    response_id or "?",
+                                )
+                            text_parts.append(delta)
+                            yield delta
+                        continue
+
+                    if event_type == "response.output_item.added":
+                        item = payload.get("item", {})
+                        if isinstance(item, dict):
+                            tool_call = self._extract_tool_call_from_item(item)
+                            if tool_call:
+                                call_id = str(item.get("call_id") or item.get("id") or "").strip()
+                                if call_id:
+                                    tool_calls_by_id[call_id] = tool_call
+                                tool_calls.append(tool_call)
+                                logger.info("OpenClaw tool event: %s", tool_call.display_name)
+                                yield {
+                                    "event": "tool_call",
+                                    "name": tool_call.display_name,
+                                    "arguments": tool_call.arguments,
+                                }
+                                continue
+
+                            tool_result = self._extract_tool_result_from_item(item)
+                            if tool_result:
+                                call_id, result_payload = tool_result
+                                if call_id and call_id in tool_calls_by_id:
+                                    tool_calls_by_id[call_id].result = result_payload
+                                    tool_name = tool_calls_by_id[call_id].display_name
+                                else:
+                                    tool_name = str(item.get("name") or "unknown")
+                                yield {
+                                    "event": "tool_result",
+                                    "name": tool_name,
+                                    "result": result_payload,
+                                }
+                        continue
+
+                    if event_type == "response.completed":
+                        response = payload.get("response", {})
+                        if isinstance(response, dict):
+                            upstream_model = str(response.get("model") or upstream_model)
+                        termination_reason = "completed"
+                        break
+        except Exception as exc:
+            termination_reason = "error"
+            # If we got a response_id but no text (tool work timeout), try
+            # a synchronous non-stream fetch as last resort — OpenClaw may
+            # have finished by the time we retry.
+            if not text_parts and response_id:
+                logger.warning(
+                    "SSE stream failed with no text (response_id=%s); "
+                    "attempting non-stream recovery...",
+                    response_id,
+                )
+                try:
+                    data = asyncio.run(
+                        self._run_gateway_response_json(prompt, config)
+                    )
+                    recovered_text = self._extract_response_text(data)
+                    if recovered_text:
+                        recovered_text = _clean_tool_call_leakage(recovered_text)
+                        text_parts.append(recovered_text)
+                        termination_reason = "recovered"
+                        logger.info(
+                            "Recovery succeeded: %d chars from non-stream fallback",
+                            len(recovered_text),
+                        )
+                        # Yield the recovered text so it flows to the consumer
+                        yield recovered_text
+                except Exception as recovery_err:
+                    logger.warning(
+                        "Non-stream recovery also failed: %s", recovery_err
+                    )
+            if termination_reason != "recovered":
+                raise exc
+        finally:
+            end_time = time.time()
+            logger.info(
+                "OpenClaw stream termination: reason=%s total_latency_ms=%.1f response_id=%s",
+                termination_reason,
+                (end_time - request_started) * 1000,
+                response_id or "?",
+            )
+            full_text = "".join(text_parts)
+            self._last_stream_result = OpenClawResult(
+                text=full_text,
+                model=upstream_model,
+                provider="openclaw-gateway",
+                duration_ms=int((end_time - request_started) * 1000),
+                tool_calls=tool_calls,
+                raw={"response_id": response_id, "termination_reason": termination_reason},
+            )
+
+    def _clean_and_validate_non_stream_text(self, data: dict[str, Any]) -> str:
+        response_text = self._extract_response_text(data)
+        if not response_text:
+            raise RuntimeError("OpenClaw API returned empty message content")
+        return _clean_tool_call_leakage(response_text)
+
+    def get_last_stream_result(self) -> OpenClawResult | None:
+        return self._last_stream_result
 
     async def _fetch_session_tool_calls_gateway(
         self,
@@ -493,46 +826,21 @@ class OpenClawBackend(AgentBackend):
         if transport == "ssh":
             data = await self._run_ssh(prompt, config)
         else:
-            data = await self._run_gateway_api(prompt, config)
+            data = await self._run_gateway_response_json(prompt, config)
 
-        # OpenClaw gateway API (OpenAI-compatible)
-        if "choices" in data:
-            choices = data.get("choices") or []
-            message = choices[0].get("message", {}) if choices else {}
-            response_text = str(message.get("content") or "")
-            if not response_text:
-                raise RuntimeError("OpenClaw API returned empty message content")
-
-            # Guard: OpenClaw gateway sometimes returns an intermediate
-            # tool-call step instead of the final response.  The content
-            # contains the model's chain-of-thought plus raw tool-call
-            # JSON (e.g. multi_tool_use.parallel / {"tool_uses": ...}).
-            # Strip the protocol noise so only readable text is saved.
-            response_text = _clean_tool_call_leakage(response_text)
-
+        # OpenClaw gateway responses API
+        if "output" in data or "output_text" in data:
+            response_text = self._clean_and_validate_non_stream_text(data)
             usage = data.get("usage", {}) or {}
-            upstream_model = str(data.get("model") or config.get("model") or "")
+            upstream_model = str(data.get("model") or self._resolve_gateway_model(config))
 
             tool_calls: list[OpenClawToolCall] = []
-            for tc in message.get("tool_calls", []) or []:
-                if not isinstance(tc, dict):
+            for item in data.get("output", []) or []:
+                if not isinstance(item, dict):
                     continue
-                func = tc.get("function", {})
-                name = str(func.get("name") or "unknown")
-                raw_args = func.get("arguments")
-                args: dict[str, Any]
-                if isinstance(raw_args, str):
-                    try:
-                        args = json.loads(raw_args)
-                        if not isinstance(args, dict):
-                            args = {"raw": raw_args}
-                    except Exception:
-                        args = {"raw": raw_args}
-                elif isinstance(raw_args, dict):
-                    args = raw_args
-                else:
-                    args = {}
-                tool_calls.append(OpenClawToolCall(name=name, arguments=args))
+                tool_call = self._extract_tool_call_from_item(item)
+                if tool_call:
+                    tool_calls.append(tool_call)
 
             result = OpenClawResult(
                 text=response_text,
@@ -559,7 +867,7 @@ class OpenClawBackend(AgentBackend):
                 "OpenClaw API response: %d chars, model=%s, tools=%d",
                 len(response_text),
                 result.model or "?",
-                len(tool_calls),
+                len(result.tool_calls),
             )
             return result
 
