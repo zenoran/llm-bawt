@@ -9,7 +9,7 @@ import logging
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, ClassVar
 
 import yaml
 
@@ -59,13 +59,24 @@ class Bot:
     agent_backend_config: dict[str, Any] = field(default_factory=dict)  # Backend-specific config
     settings: dict[str, Any] = field(default_factory=dict)  # Effective bot settings (template + overrides)
     
+    # Map common color names to valid Rich color names
+    _COLOR_ALIASES: ClassVar[dict[str, str]] = {
+        "orange": "orange3",
+        "purple": "purple4",
+        "pink": "hot_pink",
+        "brown": "rgb(150,75,0)",
+        "gray": "grey50",
+        "grey": "grey50",
+    }
+
     def __post_init__(self):
         # Ensure slug is lowercase and valid
         self.slug = self.slug.lower().strip()
         if self.color is not None:
             normalized_color = str(self.color).strip().lower()
+            normalized_color = self._COLOR_ALIASES.get(normalized_color, normalized_color)
             # Keep this permissive for standard Rich color-style names.
-            if normalized_color and re.match(r"^[a-z][a-z0-9_-]*$", normalized_color):
+            if normalized_color and re.match(r"^[a-z][a-z0-9_#()-]*$", normalized_color):
                 self.color = normalized_color
             else:
                 self.color = None
