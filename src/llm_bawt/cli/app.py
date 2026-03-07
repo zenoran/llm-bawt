@@ -505,14 +505,26 @@ def show_status(config: Config, args: argparse.Namespace | None = None):
 
 
 def show_bots(config: Config):
-    """Display available bots."""
-    bot_manager = BotManager(config)
-    bots = bot_manager.list_bots()
-    default_bot = bot_manager.get_default_bot()
-    
+    """Display available bots. Uses service API when available, falls back to local YAML."""
+    # Try service first
+    client = get_service_client(config)
+    if client and client.is_available():
+        service_bots = client.list_bots()
+        if service_bots is not None:
+            _show_bots_from_service(config, service_bots)
+            return
+
+    # Fallback to local BotManager (YAML + DB)
+    _show_bots_from_local(config)
+
+
+def _show_bots_from_service(config: Config, bots_data: list[dict]):
+    """Render bot list from service API response."""
+    default_slug = config.DEFAULT_BOT or "nova"
+
     console.print(Panel.fit("[bold cyan]Available Bots[/bold cyan]", border_style="cyan"))
     console.print()
-    
+
     table = Table(show_header=True, box=None, padding=(0, 2))
     table.add_column("Slug", style="cyan")
     table.add_column("Name", style="bold")
@@ -520,7 +532,46 @@ def show_bots(config: Config):
     table.add_column("Description")
     table.add_column("Default Model")
     table.add_column("Memory", justify="center")
-    
+
+    for bot in sorted(bots_data, key=lambda b: b.get("slug", "")):
+        slug = bot.get("slug", "")
+        is_default = " ⭐" if slug == default_slug else ""
+        requires_memory = bot.get("requires_memory", False)
+        memory_icon = "[green]✓[/green]" if requires_memory else "[dim]✗[/dim]"
+        default_model = bot.get("default_model") or f"[dim]{config.DEFAULT_MODEL_ALIAS or 'global'}[/dim]"
+        color = bot.get("color")
+        table.add_row(
+            f"{slug}{is_default}",
+            bot.get("name", slug),
+            f"[{color}]{color}[/]" if color else "[dim]default[/dim]",
+            bot.get("description", ""),
+            default_model,
+            memory_icon,
+        )
+
+    console.print(table)
+    console.print()
+    console.print(f"[dim]⭐ = default bot | ✓ = requires database | Use -b/--bot <slug> to select[/dim]")
+    console.print()
+
+
+def _show_bots_from_local(config: Config):
+    """Render bot list from local BotManager (YAML + DB)."""
+    bot_manager = BotManager(config)
+    bots = bot_manager.list_bots()
+    default_bot = bot_manager.get_default_bot()
+
+    console.print(Panel.fit("[bold cyan]Available Bots[/bold cyan]", border_style="cyan"))
+    console.print()
+
+    table = Table(show_header=True, box=None, padding=(0, 2))
+    table.add_column("Slug", style="cyan")
+    table.add_column("Name", style="bold")
+    table.add_column("Color")
+    table.add_column("Description")
+    table.add_column("Default Model")
+    table.add_column("Memory", justify="center")
+
     for bot in bots:
         is_default = " ⭐" if bot.slug == default_bot.slug else ""
         memory_icon = "[green]✓[/green]" if bot.requires_memory else "[dim]✗[/dim]"
@@ -534,7 +585,7 @@ def show_bots(config: Config):
             default_model,
             memory_icon
         )
-    
+
     console.print(table)
     console.print()
     console.print(f"[dim]⭐ = default bot | ✓ = requires database | Use -b/--bot <slug> to select[/dim]")
@@ -1460,13 +1511,19 @@ def main():
     if args.bot:
         target_bot = bot_manager.get_bot(args.bot)
         if not target_bot:
-            console.print(f"[bold red]Unknown bot: {args.bot}[/bold red]. Use --list-bots to see available bots.")
-            sys.exit(1)
+            if use_service:
+                # Service mode: don't validate bot locally, let the service resolve it.
+                # Create a minimal placeholder so the rest of the CLI flow has something.
+                from llm_bawt.bots import Bot
+                target_bot = Bot(slug=args.bot.lower().strip(), name=args.bot, description="", system_prompt="")
+            else:
+                console.print(f"[bold red]Unknown bot: {args.bot}[/bold red]. Use --list-bots to see available bots.")
+                sys.exit(1)
     elif args.local:
         target_bot = bot_manager.get_default_bot(local_mode=True)
     else:
         target_bot = bot_manager.get_bot(config_obj.DEFAULT_BOT) or bot_manager.get_default_bot()
-    
+
     # Determine effective model alias (without validation for service mode)
     selection = bot_manager.select_model(args.model, bot_slug=target_bot.slug, local_mode=args.local)
     effective_model = selection.alias
@@ -1567,6 +1624,9 @@ def run_app(args: argparse.Namespace, config_obj: Config, resolved_alias: str):
     # Determine which bot to use
     bot_manager = BotManager(config_obj)
     
+    # Determine if service is likely in play (for bot validation)
+    service_mode = not args.local and (getattr(args, 'service', False) or config_obj.USE_SERVICE)
+
     # Handle --local with explicit --bot (conflicting intent warning)
     if args.local and args.bot:
         bot = bot_manager.get_bot(args.bot)
@@ -1581,8 +1641,13 @@ def run_app(args: argparse.Namespace, config_obj: Config, resolved_alias: str):
         # Explicit bot selection
         bot = bot_manager.get_bot(args.bot)
         if not bot:
-            console.print(f"[bold red]Unknown bot: {args.bot}[/bold red]. Use --list-bots to see available bots.")
-            sys.exit(1)
+            if service_mode:
+                # Service mode: let the service resolve the bot
+                from llm_bawt.bots import Bot
+                bot = Bot(slug=args.bot.lower().strip(), name=args.bot, description="", system_prompt="")
+            else:
+                console.print(f"[bold red]Unknown bot: {args.bot}[/bold red]. Use --list-bots to see available bots.")
+                sys.exit(1)
         bot_id = bot.slug
     elif args.local:
         # Local mode defaults to Spark
