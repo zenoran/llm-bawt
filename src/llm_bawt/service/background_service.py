@@ -374,28 +374,34 @@ class BackgroundService:
         return len(keys_to_remove)
     
     def _load_available_models(self):
-        """Load list of available models from config."""
+        """Load list of available models from config.
+
+        Builds the canonical model catalog for the service:
+        1. All models from models.yaml / DB
+        2. Virtual model aliases for agent-backend bots
+        3. A mapping from bot slug → backend model for agent-backend bots
+           (stored separately — does NOT mutate bot objects)
+        """
         models = self.config.defined_models.get("models", {})
         self._available_models = list(models.keys())
-        log.debug(f"Loaded {len(self._available_models)} models from config")
 
-        # Inject virtual model definitions for agent-backend bots.
-        # Each backend name (e.g. "openclaw") becomes a model alias with
-        # type: "agent_backend" so the entire pipeline flows normally.
+        # Agent-backend bot → virtual model mapping (no bot mutation)
+        self._agent_backend_models: dict[str, str] = {}
+
         bot_manager = BotManager(self.config)
         for bot in bot_manager.list_bots():
             backend_name = getattr(bot, "agent_backend", None)
             if not backend_name:
                 continue
             backend_config = getattr(bot, "agent_backend_config", {}) or {}
+            # Register the virtual model definition if not already a real model
             if backend_name not in models:
-                virtual_def = {
+                models[backend_name] = {
                     "type": "agent_backend",
                     "backend": backend_name,
                     "bot_config": backend_config,
                     "tool_support": "none",
                 }
-                models[backend_name] = virtual_def
                 if backend_name not in self._available_models:
                     self._available_models.append(backend_name)
                 log.info(
@@ -403,15 +409,28 @@ class BackgroundService:
                     backend_name,
                     bot.slug,
                 )
-            # Ensure the bot's default_model points at its backend
-            if not bot.default_model:
-                bot.default_model = backend_name
+            # Track the mapping without mutating the bot object
+            self._agent_backend_models[bot.slug] = backend_name
 
-        # Set default model from bot/config selection or use first available
-        selection = bot_manager.select_model(None, bot_slug=self._default_bot)
-        self._default_model = selection.alias
+        # Resolve default model: bot default → config default → first available
+        default_bot = bot_manager.get_bot(self._default_bot) or bot_manager.get_default_bot()
+        if default_bot:
+            if default_bot.slug in self._agent_backend_models:
+                self._default_model = self._agent_backend_models[default_bot.slug]
+            elif default_bot.default_model and default_bot.default_model in self._available_models:
+                self._default_model = default_bot.default_model
+        if not self._default_model:
+            config_default = getattr(self.config, "DEFAULT_MODEL_ALIAS", None)
+            if config_default and config_default in self._available_models:
+                self._default_model = config_default
         if not self._default_model and self._available_models:
             self._default_model = self._available_models[0]
+
+        log.debug(
+            "Loaded %d models (default=%s, agent_backends=%s)",
+            len(self._available_models), self._default_model,
+            list(self._agent_backend_models.values()),
+        )
 
     def _resolve_request_model(
         self,
@@ -419,34 +438,61 @@ class BackgroundService:
         bot_id: str,
         local_mode: bool,
     ) -> tuple[str, list[str]]:
-        """Resolve the model alias for a request using shared bot/config logic.
+        """Resolve the model alias for a request.
+
+        This is the single authoritative resolution point. The CLI in service
+        mode sends only the user's explicit --model (or None).
+
+        Priority:
+        1. Agent-backend bots are locked to their backend model
+        2. Explicit requested model (if available on service)
+        3. Bot's default_model (from bots.yaml / DB)
+        4. Service default model
+        5. First available model (with warning)
 
         Returns:
             Tuple of (resolved_model_alias, list_of_warnings)
         """
         warnings: list[str] = []
         bot_manager = BotManager(self.config)
-        selection = bot_manager.select_model(requested_model, bot_slug=bot_id, local_mode=local_mode)
-        model_alias = selection.alias
+        bot = bot_manager.get_bot(bot_id) or bot_manager.get_default_bot()
 
-        if model_alias and model_alias in self._available_models:
-            return model_alias, warnings
+        # 1. Agent-backend bots are locked to their backend model
+        backend_model = self._agent_backend_models.get(bot.slug if bot else bot_id)
+        if backend_model and backend_model in self._available_models:
+            if requested_model and requested_model != backend_model:
+                warnings.append(
+                    f"Bot '{bot_id}' uses agent backend; ignoring requested model '{requested_model}'"
+                )
+            return backend_model, warnings
 
-        # If explicit model is invalid, warn and fall back
-        if model_alias and model_alias not in self._available_models:
-            fallback = bot_manager.select_model(None, bot_slug=bot_id, local_mode=local_mode)
-            if fallback.alias and fallback.alias in self._available_models:
-                msg = f"Model '{model_alias}' not available on service, using '{fallback.alias}'"
-                log.warning(msg)
-                warnings.append(msg)
-                return fallback.alias, warnings
+        # 2. Explicit requested model
+        model = requested_model.strip() if requested_model else None
+        if model:
+            if model in self._available_models:
+                return model, warnings
+            # Requested model not available — fall through with warning
+            warnings.append(f"Model '{model}' not available on service")
 
+        # 3. Bot's default_model
+        if bot and bot.default_model and bot.default_model in self._available_models:
+            if warnings:
+                warnings[-1] += f", using bot default '{bot.default_model}'"
+            return bot.default_model, warnings
+
+        # 4. Service default model
+        if self._default_model and self._default_model in self._available_models:
+            if warnings:
+                warnings[-1] += f", using service default '{self._default_model}'"
+            return self._default_model, warnings
+
+        # 5. First available
         if self._available_models:
-            fallback_model = self._available_models[0]
-            msg = f"Model '{model_alias}' not available on service, using '{fallback_model}'"
+            fallback = self._available_models[0]
+            msg = f"No preferred model available, using '{fallback}'"
             log.warning(msg)
             warnings.append(msg)
-            return fallback_model, warnings
+            return fallback, warnings
 
         raise ValueError("No models available on service.")
     
@@ -1981,12 +2027,13 @@ class BackgroundService:
             return None, None
 
         try:
-            model_alias, model_def = self._resolve_request_model(
+            model_alias, _ = self._resolve_request_model(
                 extraction_model,
                 bot_id="nova",
                 local_mode=False,
             )
-            model_type = model_def.get("type")
+            models = self.config.defined_models.get("models", {})
+            model_type = models.get(model_alias, {}).get("type")
 
             if model_type not in ("openai", "grok"):
                 log.warning(

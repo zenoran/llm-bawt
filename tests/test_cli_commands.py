@@ -470,7 +470,8 @@ class TestLLMSettings:
 
 class TestLLMErrors:
     def test_invalid_bot_fails(self):
-        r = run(f"{LLM} -b nonexistent_bot_xyz -m {MODEL} 'hello'", timeout=15)
+        """In local mode, unknown bot slugs should fail with a clear error."""
+        r = run(f"{LLM} --local -b nonexistent_bot_xyz 'hello'", timeout=15)
         o = assert_err(r, "invalid bot")
         assert no_traceback(o)
         assert any(kw in o.lower() for kw in ["unknown", "invalid", "not found", "list-bots"])

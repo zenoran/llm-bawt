@@ -1524,41 +1524,39 @@ def main():
     else:
         target_bot = bot_manager.get_bot(config_obj.DEFAULT_BOT) or bot_manager.get_default_bot()
 
-    # Determine effective model alias (without validation for service mode)
-    selection = bot_manager.select_model(args.model, bot_slug=target_bot.slug, local_mode=args.local)
-    effective_model = selection.alias
-
-    # Auto-switch to service when using non-OpenAI models and service is available
-    defined_models = config_obj.defined_models.get("models", {})
-    model_def = defined_models.get(effective_model, {}) if effective_model else {}
-    effective_model_type = model_def.get("type")
-    if not use_service and not args.local and effective_model_type and effective_model_type != "openai":
-        service_client = get_service_client(config_obj)
-        if service_client and service_client.is_available(force_check=True):
-            use_service = True
-            if config_obj.VERBOSE:
-                console.print(f"[dim]Detected {effective_model_type} model; using service mode[/dim]")
-        else:
-            console.print(
-                "[bold red]Service not available for local model. Start the service or pass --service when it is running.[/bold red]"
-            )
-            sys.exit(1)
-    
-    # For history-only or service mode, skip local model validation
+    # For history-only operations, skip model resolution entirely
     if history_only:
         resolved_alias = None
     elif use_service:
-        # In service mode, pass the model alias directly - let the service validate it
-        resolved_alias = effective_model
+        # Service mode: the service is authoritative for model resolution.
+        # Only pass the user's explicit --model (or None to let service decide).
+        resolved_alias = args.model or None
     else:
-        # Check if bot uses an agent backend (skip model validation entirely)
-        _pre_bot = BotManager(config_obj).get_bot(
-            getattr(args, "bot", None) or config_obj.DEFAULT_BOT or "nova"
-        )
-        if _pre_bot and _pre_bot.agent_backend:
-            resolved_alias = None  # No LLM model needed
+        # Local mode: resolve model fully using bot defaults and config
+        selection = bot_manager.select_model(args.model, bot_slug=target_bot.slug, local_mode=args.local)
+        effective_model = selection.alias
+
+        # Auto-switch to service for non-OpenAI model types
+        defined_models = config_obj.defined_models.get("models", {})
+        model_def = defined_models.get(effective_model, {}) if effective_model else {}
+        effective_model_type = model_def.get("type")
+        if effective_model_type and effective_model_type != "openai":
+            service_client = get_service_client(config_obj)
+            if service_client and service_client.is_available(force_check=True):
+                use_service = True
+                if config_obj.VERBOSE:
+                    console.print(f"[dim]Detected {effective_model_type} model; using service mode[/dim]")
+                # In service mode, pass only the explicit user override
+                resolved_alias = args.model or None
+            else:
+                console.print(
+                    "[bold red]Service not available for local model. Start the service or pass --service when it is running.[/bold red]"
+                )
+                sys.exit(1)
+        elif target_bot.agent_backend:
+            resolved_alias = None  # Agent backend, no LLM model needed
         else:
-            # Local mode: validate model is available locally
+            # Validate model is available locally
             model_manager = ModelManager(config_obj)
             resolved_alias = model_manager.resolve_model_alias(effective_model)
             if not resolved_alias:
