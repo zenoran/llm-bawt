@@ -21,7 +21,7 @@ import logging
 import uuid
 from collections import defaultdict
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from ..prompt_registry import get_prompt_resolver
@@ -238,7 +238,7 @@ class MemoryMaintenance:
             """)
             rows = conn.execute(sql).fetchall()
 
-            now = datetime.utcnow()
+            now = datetime.now(timezone.utc)
             to_archive: list[str] = []
             for row in rows:
                 age_days = (now - row.created_at).total_seconds() / 86400.0

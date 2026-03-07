@@ -9,7 +9,7 @@ from __future__ import annotations
 import json
 import logging
 import time
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import TYPE_CHECKING
 from typing import Any
 from urllib.parse import quote_plus
@@ -43,7 +43,7 @@ class RuntimeSetting(SQLModel, table=True):
     key: str = Field(sa_column=Column(String(128), nullable=False, index=True))
     value_json: str = Field(sa_column=Column(Text, nullable=False))
     updated_at: datetime = Field(
-        default_factory=datetime.utcnow,
+        default_factory=lambda: datetime.now(timezone.utc),
         sa_column=Column(DateTime(timezone=True), nullable=False),
     )
 
@@ -71,11 +71,11 @@ class BotProfile(SQLModel, table=True):
     agent_backend: str | None = Field(default=None, sa_column=Column(String(128), nullable=True))
     agent_backend_config: dict[str, Any] | None = Field(default=None, sa_column=Column(JSONB, nullable=True))
     created_at: datetime = Field(
-        default_factory=datetime.utcnow,
+        default_factory=lambda: datetime.now(timezone.utc),
         sa_column=Column(DateTime(timezone=True), nullable=False),
     )
     updated_at: datetime = Field(
-        default_factory=datetime.utcnow,
+        default_factory=lambda: datetime.now(timezone.utc),
         sa_column=Column(DateTime(timezone=True), nullable=False),
     )
 
@@ -161,7 +161,7 @@ class BotProfileStore:
         if not slug:
             raise ValueError("Bot profile slug is required")
 
-        now = datetime.utcnow()
+        now = datetime.now(timezone.utc)
         with Session(self.engine) as session:
             row = session.exec(select(BotProfile).where(BotProfile.slug == slug)).first()
             if row is None:
@@ -334,7 +334,7 @@ class RuntimeSettingsStore:
             ).first()
             if row:
                 row.value_json = value_json
-                row.updated_at = datetime.utcnow()
+                row.updated_at = datetime.now(timezone.utc)
             else:
                 row = RuntimeSetting(
                     scope_type=scope_type,
@@ -382,11 +382,11 @@ class ModelDefinition(SQLModel, table=True):
         description="Optional fields: chat_format, context_window, max_tokens, n_gpu_layers, tool_support, tool_format",
     )
     created_at: datetime = Field(
-        default_factory=datetime.utcnow,
+        default_factory=lambda: datetime.now(timezone.utc),
         sa_column=Column(DateTime(timezone=True), nullable=False),
     )
     updated_at: datetime = Field(
-        default_factory=datetime.utcnow,
+        default_factory=lambda: datetime.now(timezone.utc),
         sa_column=Column(DateTime(timezone=True), nullable=False),
     )
 
@@ -464,7 +464,7 @@ class ModelDefinitionStore:
 
         known_fields = {"type", "model_id", "repo_id", "filename", "description"}
         extra = {k: v for k, v in model_data.items() if k not in known_fields}
-        now = datetime.utcnow()
+        now = datetime.now(timezone.utc)
 
         with Session(self.engine) as session:
             row = session.exec(

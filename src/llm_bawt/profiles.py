@@ -9,7 +9,7 @@ Uses SQLModel ORM with PostgreSQL for storage.
 """
 
 import logging
-from datetime import datetime
+from datetime import datetime, timezone
 from enum import Enum
 from typing import Any
 from urllib.parse import quote_plus
@@ -55,8 +55,8 @@ class ProfileAttribute(SQLModel, table=True):
     source_message_id: str | None = Field(default=None, max_length=100)  # Message that led to this
     
     # Timestamps
-    created_at: datetime = Field(default_factory=datetime.utcnow)
-    updated_at: datetime = Field(default_factory=datetime.utcnow)
+    created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+    updated_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
     
     model_config = ConfigDict(use_enum_values=True)
 
@@ -83,8 +83,8 @@ class EntityProfile(SQLModel, table=True):
     summary_updated_at: datetime | None = Field(default=None)  # stamped each time summary is regenerated
     
     # Timestamps
-    created_at: datetime = Field(default_factory=datetime.utcnow)
-    updated_at: datetime = Field(default_factory=datetime.utcnow)
+    created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+    updated_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
     
     model_config = ConfigDict(use_enum_values=True)
 
@@ -267,10 +267,10 @@ class ProfileManager:
                 profile.description = description
             if summary is not None:
                 profile.summary = summary
-                profile.summary_updated_at = datetime.utcnow()
+                profile.summary_updated_at = datetime.now(timezone.utc)
             if email is not None:
                 profile.email = email.lower().strip() if email else None
-            profile.updated_at = datetime.utcnow()
+            profile.updated_at = datetime.now(timezone.utc)
 
             session.add(profile)
             session.commit()
@@ -348,7 +348,7 @@ class ProfileManager:
                 attr.confidence = confidence
                 attr.source = source
                 attr.source_message_id = source_message_id
-                attr.updated_at = datetime.utcnow()
+                attr.updated_at = datetime.now(timezone.utc)
             else:
                 # Create new
                 attr = ProfileAttribute(
@@ -572,7 +572,7 @@ class ProfileManager:
             if not changed:
                 return attr
 
-            attr.updated_at = datetime.utcnow()
+            attr.updated_at = datetime.now(timezone.utc)
             session.add(attr)
 
             profile_stmt = select(EntityProfile).where(

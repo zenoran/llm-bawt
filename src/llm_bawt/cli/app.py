@@ -630,7 +630,7 @@ def _render_job_status_from_service(config: Config) -> bool:
     if not client or not client.is_available():
         return False
 
-    from datetime import datetime
+    from datetime import datetime, timezone
 
     jobs_resp = client.get_jobs()
     runs_resp = client.get_job_runs(limit=10)
@@ -654,7 +654,7 @@ def _render_job_status_from_service(config: Config) -> bool:
         job_table.add_column("Last Run")
         job_table.add_column("Next Run")
 
-        now = datetime.utcnow()
+        now = datetime.now(timezone.utc)
         for job in jobs:
             enabled_icon = "[green]✓[/green]" if job.get("enabled") else "[red]✗[/red]"
             interval_str = f"{job.get('interval_minutes', 0)}m"

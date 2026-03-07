@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import logging
 import time
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from urllib.parse import quote_plus
 
 from sqlalchemy import Column, DateTime, Text, text as sa_text
@@ -38,7 +38,7 @@ class TurnLog(SQLModel, table=True):
 
     id: str = Field(primary_key=True)
     created_at: datetime = Field(
-        default_factory=datetime.utcnow,
+        default_factory=lambda: datetime.now(timezone.utc),
         sa_column=Column(DateTime(timezone=True), nullable=False, index=True),
     )
     request_id: str | None = Field(default=None, index=True)
@@ -142,7 +142,7 @@ class TurnLogStore:
         if not force and (now - self.__class__._last_cleanup_at) < self.__class__._cleanup_interval_seconds:
             return
 
-        cutoff = datetime.utcnow() - timedelta(hours=self.ttl_hours)
+        cutoff = datetime.now(timezone.utc) - timedelta(hours=self.ttl_hours)
         try:
             with Session(self.engine) as session:
                 session.exec(delete(TurnLog).where(TurnLog.created_at < cutoff))
@@ -268,13 +268,13 @@ class TurnLogStore:
 
         conditions: list = []
         if after is not None:
-            conditions.append(TurnLog.created_at >= datetime.utcfromtimestamp(after))
+            conditions.append(TurnLog.created_at >= datetime.fromtimestamp(after, tz=timezone.utc))
         elif before is None:
             # Only apply since_hours if no explicit time range given.
-            since_cutoff = datetime.utcnow() - timedelta(hours=max(1, int(since_hours)))
+            since_cutoff = datetime.now(timezone.utc) - timedelta(hours=max(1, int(since_hours)))
             conditions.append(TurnLog.created_at >= since_cutoff)
         if before is not None:
-            conditions.append(TurnLog.created_at <= datetime.utcfromtimestamp(before))
+            conditions.append(TurnLog.created_at <= datetime.fromtimestamp(before, tz=timezone.utc))
         if bot_id:
             conditions.append(TurnLog.bot_id == bot_id.strip().lower())
         if user_id:

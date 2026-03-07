@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import logging
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timezone
 from string import Formatter
 from typing import Any, Callable
 from urllib.parse import quote_plus
@@ -38,11 +38,11 @@ class PromptTemplate(SQLModel, table=True):
     metadata_json: str | None = Field(default=None, sa_column=Column(Text, nullable=True))
     updated_by: str | None = Field(default=None, sa_column=Column(String(255), nullable=True))
     created_at: datetime = Field(
-        default_factory=datetime.utcnow,
+        default_factory=lambda: datetime.now(timezone.utc),
         sa_column=Column(DateTime(timezone=True), nullable=False),
     )
     updated_at: datetime = Field(
-        default_factory=datetime.utcnow,
+        default_factory=lambda: datetime.now(timezone.utc),
         sa_column=Column(DateTime(timezone=True), nullable=False),
     )
 
@@ -61,7 +61,7 @@ class PromptTemplateVersion(SQLModel, table=True):
     change_note: str | None = Field(default=None, sa_column=Column(Text, nullable=True))
     created_by: str | None = Field(default=None, sa_column=Column(String(255), nullable=True))
     created_at: datetime = Field(
-        default_factory=datetime.utcnow,
+        default_factory=lambda: datetime.now(timezone.utc),
         sa_column=Column(DateTime(timezone=True), nullable=False),
     )
 
@@ -338,7 +338,7 @@ class PromptTemplateStore:
             )
             existing_keys = {str(key) for key in session.exec(statement).all()}
 
-            now = datetime.utcnow()
+            now = datetime.now(timezone.utc)
             created = 0
             skipped = 0
             seeded_keys: list[str] = []
@@ -450,7 +450,7 @@ class PromptTemplateStore:
         normalized_type, normalized_id = _normalize_scope(scope_type, scope_id)
         required_vars = [str(item) for item in (required_vars or []) if str(item).strip()]
         metadata = metadata or {}
-        now = datetime.utcnow()
+        now = datetime.now(timezone.utc)
         with Session(self.engine) as session:
             row = session.exec(
                 select(PromptTemplate).where(

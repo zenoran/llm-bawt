@@ -9,7 +9,7 @@ from __future__ import annotations
 import json
 import time
 from collections import defaultdict
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from fastapi import APIRouter, HTTPException, Query
@@ -514,7 +514,7 @@ async def get_evolution_dashboard(
             triggering_metrics=s.get("triggering_metrics"),
             suggested_prompt_adjustments=s.get("suggested_prompt_adjustments"),
             suggested_config_changes=s.get("suggested_config_changes"),
-            created_at=datetime.utcnow().isoformat()
+            created_at=datetime.now(timezone.utc).isoformat()
         )
         for s in suggestions[:10]  # Top 10
     ]
@@ -522,7 +522,7 @@ async def get_evolution_dashboard(
     agg = analysis.get("aggregated", {})
     
     return EvolutionDashboardSummary(
-        generated_at=datetime.utcnow().isoformat(),
+        generated_at=datetime.now(timezone.utc).isoformat(),
         period_hours=period_hours,
         total_turns=analysis.get("total_turns", 0),
         total_bots=len(set(k.split(":")[0] for k in pair_metrics.keys())),

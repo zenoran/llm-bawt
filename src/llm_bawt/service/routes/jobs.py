@@ -32,7 +32,7 @@ async def trigger_job(job_type: str):
     Sets the job's next_run_at to the past so the scheduler picks it up
     on its next check interval.
     """
-    from datetime import datetime, timedelta
+    from datetime import datetime, timedelta, timezone
 
     engine = _get_scheduler_engine()
 
@@ -55,7 +55,7 @@ async def trigger_job(job_type: str):
             )
 
         # Set next_run_at to past to trigger immediate run
-        job.next_run_at = datetime.utcnow() - timedelta(minutes=1)
+        job.next_run_at = datetime.now(timezone.utc) - timedelta(minutes=1)
         session.add(job)
         session.commit()
 

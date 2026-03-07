@@ -15,7 +15,11 @@ import logging
 import re
 import time
 import uuid
-from datetime import datetime
+from datetime import datetime, timezone
+
+
+def _utcnow() -> datetime:
+    return datetime.now(timezone.utc)
 from typing import Any, TYPE_CHECKING
 from urllib.parse import quote_plus
 
@@ -72,7 +76,7 @@ def get_message_table_pg(bot_id: str) -> Table:
         Column("summarized", Boolean, default=False),  # Whether this message is included in a summary
         Column("recalled_history", Boolean, default=False),  # Whether this message was re-inserted via recall tool
         Column("summary_metadata", JSON, nullable=True),  # For role='summary' rows only
-        Column("created_at", DateTime, default=datetime.utcnow),
+        Column("created_at", DateTime, default=_utcnow),
         extend_existing=True
     )
 
@@ -104,8 +108,8 @@ def get_forgotten_table_pg(bot_id: str) -> Table:
         Column("timestamp", Float, nullable=False),
         Column("session_id", String(36), nullable=True),
         Column("processed", Boolean, default=False),
-        Column("created_at", DateTime, default=datetime.utcnow),
-        Column("forgotten_at", DateTime, default=datetime.utcnow),  # When it was forgotten
+        Column("created_at", DateTime, default=_utcnow),
+        Column("forgotten_at", DateTime, default=_utcnow),  # When it was forgotten
         extend_existing=True
     )
     
@@ -135,8 +139,8 @@ def get_memory_table_pg(bot_id: str) -> Table:
             Column("emotional_charge", Float, nullable=True),
             Column("recurrence_keywords", JSON, nullable=True),
             Column("meaning_updated_at", DateTime, nullable=True),
-        Column("created_at", DateTime, default=datetime.utcnow),
-        Column("updated_at", DateTime, default=datetime.utcnow, onupdate=datetime.utcnow),
+        Column("created_at", DateTime, default=_utcnow),
+        Column("updated_at", DateTime, default=_utcnow, onupdate=_utcnow),
         # embedding column added via raw SQL for pgvector
         extend_existing=True
     )
@@ -423,7 +427,7 @@ class PostgreSQLMemoryBackend(MemoryBackend):
                         timestamp=timestamp,
                         session_id=session_id,
                         processed=False,
-                        created_at=datetime.utcnow(),
+                        created_at=datetime.now(timezone.utc),
                     )
                     session.execute(stmt)
                 
@@ -549,7 +553,7 @@ class PostgreSQLMemoryBackend(MemoryBackend):
             except Exception as e:
                 logger.debug(f"Could not generate meaning embedding: {e}")
         if meaning_embedding:
-            meaning_updated_at = meaning_updated_at or datetime.utcnow()
+            meaning_updated_at = meaning_updated_at or datetime.now(timezone.utc)
         
         with self.engine.connect() as conn:
             try:
@@ -1878,7 +1882,7 @@ class PostgreSQLShortTermManager:
         Returns the message ID.
         """
         message_id = str(uuid.uuid4())
-        ts = timestamp or datetime.utcnow().timestamp()
+        ts = timestamp or datetime.now(timezone.utc).timestamp()
         
         self._backend.add_message(
             message_id=message_id,

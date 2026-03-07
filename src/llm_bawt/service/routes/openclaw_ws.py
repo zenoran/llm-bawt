@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
-from datetime import datetime
+from datetime import datetime, timezone
 
 from fastapi import APIRouter, HTTPException, Query
 from fastapi.responses import StreamingResponse
@@ -37,7 +37,7 @@ async def openclaw_ws_bridge(
             {
                 "session_key": session_key,
                 "connected": True,
-                "ts": datetime.utcnow().isoformat() + "Z",
+                "ts": datetime.now(timezone.utc).isoformat(),
             },
         )
 

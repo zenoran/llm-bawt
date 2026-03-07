@@ -6,7 +6,7 @@ import os
 import threading
 import time
 import uuid
-from datetime import datetime
+from datetime import datetime, timezone
 from queue import PriorityQueue
 from typing import Any, AsyncIterator
 from urllib.parse import urlparse
@@ -2250,7 +2250,7 @@ class BackgroundService:
                         )
                         WHERE id = :sid AND role = 'summary'
                     """),
-                    {"ts": datetime.utcnow().isoformat(), "sid": summary_id},
+                    {"ts": datetime.now(timezone.utc).isoformat(), "sid": summary_id},
                 )
                 conn.commit()
         except Exception as e:

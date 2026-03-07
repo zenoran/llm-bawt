@@ -14,7 +14,7 @@ import logging
 import time
 import uuid
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any, TYPE_CHECKING
 
 from llm_bawt.memory.postgresql import PostgreSQLMemoryBackend
@@ -158,7 +158,7 @@ class MemoryStorage:
             tags=tags,
             importance=importance,
             source_message_ids=source_message_ids or [],
-            created_at=datetime.utcnow(),
+            created_at=datetime.now(timezone.utc),
         )
 
     async def search_memories(

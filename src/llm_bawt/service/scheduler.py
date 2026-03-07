@@ -4,7 +4,7 @@ import asyncio
 import json
 import logging
 import re
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from enum import Enum
 from typing import Optional
 from uuid import uuid4
@@ -44,7 +44,7 @@ class ScheduledJob(SQLModel, table=True):
     interval_minutes: int = Field(default=60)
     last_run_at: Optional[datetime] = Field(default=None, sa_column=Column(DateTime(timezone=True)))
     next_run_at: Optional[datetime] = Field(default=None, sa_column=Column(DateTime(timezone=True)))
-    created_at: datetime = Field(default_factory=datetime.utcnow, sa_column=Column(DateTime(timezone=True)))
+    created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc), sa_column=Column(DateTime(timezone=True)))
     config_json: Optional[str] = Field(default=None, sa_column=Column(Text), description="Job-specific config as JSON")
 
 
@@ -56,7 +56,7 @@ class JobRun(SQLModel, table=True):
     job_id: str = Field(index=True, foreign_key="scheduled_jobs.id")
     bot_id: str = Field(index=True)
     status: JobStatus = Field(default=JobStatus.PENDING)
-    started_at: datetime = Field(default_factory=datetime.utcnow, sa_column=Column(DateTime(timezone=True)))
+    started_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc), sa_column=Column(DateTime(timezone=True)))
     finished_at: Optional[datetime] = Field(default=None, sa_column=Column(DateTime(timezone=True)))
     duration_ms: Optional[int] = Field(default=None)
     result_json: Optional[str] = Field(default=None, sa_column=Column(Text), description="Success result as JSON")
@@ -161,7 +161,7 @@ class JobScheduler:
         
         def get_due_jobs():
             with Session(self.engine) as session:
-                now = datetime.utcnow()
+                now = datetime.now(timezone.utc)
                 statement = select(ScheduledJob).where(
                     ScheduledJob.enabled.is_(True),
                     (ScheduledJob.next_run_at.is_(None)) | (ScheduledJob.next_run_at <= now)
@@ -193,7 +193,7 @@ class JobScheduler:
                 return run.id
         
         run_id = await loop.run_in_executor(None, create_run)
-        start_time = datetime.utcnow()
+        start_time = datetime.now(timezone.utc)
         status = JobStatus.RUNNING
         result_json: str | None = None
         error_message: str | None = None
@@ -244,7 +244,7 @@ class JobScheduler:
             logger.exception(f"Job {job.id} failed")
         
         # Update job run record
-        finish_time = datetime.utcnow()
+        finish_time = datetime.now(timezone.utc)
         duration_ms = int((finish_time - start_time).total_seconds() * 1000)
         
         def update_run():

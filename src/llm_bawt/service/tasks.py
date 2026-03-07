@@ -3,7 +3,7 @@ Task definitions for the background service.
 """
 
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timezone
 from enum import Enum
 from typing import Any
 import uuid
@@ -35,7 +35,7 @@ class Task:
     task_type: TaskType
     payload: dict[str, Any]
     task_id: str = field(default_factory=lambda: str(uuid.uuid4()))
-    created_at: datetime = field(default_factory=datetime.utcnow)
+    created_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
     bot_id: str = "nova"
     user_id: str = ""  # Required - caller must set this
     priority: int = 0  # Higher = more urgent
@@ -80,7 +80,7 @@ class TaskResult:
     result: Any = None
     error: str | None = None
     processing_time_ms: float = 0.0
-    completed_at: datetime = field(default_factory=datetime.utcnow)
+    completed_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
     
     def to_dict(self) -> dict:
         return {
