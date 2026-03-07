@@ -146,8 +146,8 @@ class TestLLMInfo:
         assert "Service Models" in o
         assert no_traceback(o)
 
-    def test_config_list(self):
-        o = assert_ok(run(f"{LLM} --config-list"), "--config-list")
+    def test_list_config(self):
+        o = assert_ok(run(f"{LLM} --list-config"), "--list-config")
         assert "USE_SERVICE" in o
         assert "DEFAULT_BOT" in o
         assert "POSTGRES_HOST" in o

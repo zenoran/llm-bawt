@@ -511,7 +511,7 @@ def show_status(config: Config, args: argparse.Namespace | None = None):
         "[cyan]--list-bots[/cyan]  "
         "[cyan]--list-users[/cyan]  "
         "[cyan]--user-profile[/cyan]  "
-        "[cyan]--config-list[/cyan]"
+        "[cyan]--list-config[/cyan]"
     )
 
     if missing_deps:
@@ -1204,7 +1204,7 @@ def parse_arguments(config_obj: Config) -> argparse.Namespace:
         help="Set per-model context window in models.yaml. Creates missing aliases (e.g., grok-* from --list-models).",
     )
     parser.add_argument("--config-set", nargs=2, metavar=("KEY", "VALUE"), help="Set a configuration value (e.g., DEFAULT_MODEL_ALIAS) in the .env file.")
-    parser.add_argument("--config-list", action="store_true", help="List the current effective configuration settings.")
+    parser.add_argument("--list-config", action="store_true", help="List the current effective configuration settings.")
     parser.add_argument("--setup", action="store_true", help="Walk through client .env settings interactively (pre-filled with current values).")
     parser.add_argument("--settings-scope", choices=["bot", "global"], default="bot", help="Scope for runtime settings operations (default: bot)")
     parser.add_argument("--settings-list", action="store_true", help="List runtime settings from DB for selected scope")
@@ -1292,7 +1292,7 @@ def main():
         success = set_model_context_window(alias, context_window, config_obj)
         sys.exit(0 if success else 1)
     # Handle listing config values
-    elif getattr(args, 'config_list', False):
+    elif getattr(args, 'list_config', False):
         env_file_path = config_obj.model_config.get('env_file', 'unknown')
         console.print(f"[bold magenta]Current Configuration Settings[/bold magenta]")
         console.print(f"[dim]Config file: {env_file_path}[/dim]\n")

@@ -69,7 +69,7 @@ def parse_arguments(config_obj: "Config") -> argparse.Namespace:
         help="Set a configuration value (e.g., DEFAULT_MODEL_ALIAS) in the .env file."
     )
     parser.add_argument(
-        "--config-list",
+        "--list-config",
         action="store_true",
         help="List the current effective configuration settings."
     )
