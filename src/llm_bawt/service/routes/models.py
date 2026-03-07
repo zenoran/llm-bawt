@@ -7,6 +7,12 @@ from ..dependencies import get_service
 from ..schemas import (
     BotInfo,
     BotsResponse,
+    ModelDefinitionDeleteResponse,
+    ModelDefinitionListResponse,
+    ModelDefinitionResponse,
+    ModelDefinitionSeedRequest,
+    ModelDefinitionSeedResponse,
+    ModelDefinitionUpsertRequest,
     ModelDetail,
     ModelInfo,
     ModelsResponse,
@@ -89,6 +95,118 @@ async def reload_models_catalog():
         "cleared_instances": cleared,
     }
 
+# =============================================================================
+# Model Definition CRUD (DB-backed)
+# =============================================================================
+
+def _get_model_store():
+    """Get a ModelDefinitionStore instance."""
+    from ...runtime_settings import ModelDefinitionStore
+    service = get_service()
+    store = ModelDefinitionStore(service.config)
+    if store.engine is None:
+        raise HTTPException(status_code=503, detail="Model definitions database unavailable")
+    return store
+
+
+def _row_to_response(row) -> ModelDefinitionResponse:
+    return ModelDefinitionResponse(
+        alias=row.alias,
+        type=row.type,
+        model_id=row.model_id,
+        repo_id=row.repo_id,
+        filename=row.filename,
+        description=row.description,
+        extra=row.extra,
+        created_at=row.created_at,
+        updated_at=row.updated_at,
+    )
+
+
+@router.get("/v1/models/definitions", response_model=ModelDefinitionListResponse, tags=["Models"])
+async def list_model_definitions():
+    """List all DB-backed model definitions."""
+    store = _get_model_store()
+    rows = store.list_all()
+    return ModelDefinitionListResponse(
+        models=[_row_to_response(r) for r in rows],
+        total_count=len(rows),
+    )
+
+
+@router.get("/v1/models/definitions/{alias}", response_model=ModelDefinitionResponse, tags=["Models"])
+async def get_model_definition(alias: str):
+    """Get a single model definition by alias."""
+    store = _get_model_store()
+    row = store.get(alias)
+    if not row:
+        raise HTTPException(status_code=404, detail=f"Model alias '{alias}' not found")
+    return _row_to_response(row)
+
+
+@router.put("/v1/models/definitions/{alias}", response_model=ModelDefinitionResponse, tags=["Models"])
+async def upsert_model_definition(alias: str, request: ModelDefinitionUpsertRequest):
+    """Create or update a model definition. Triggers model catalog reload."""
+    store = _get_model_store()
+    model_data: dict = {"type": request.type}
+    if request.model_id is not None:
+        model_data["model_id"] = request.model_id
+    if request.repo_id is not None:
+        model_data["repo_id"] = request.repo_id
+    if request.filename is not None:
+        model_data["filename"] = request.filename
+    if request.description is not None:
+        model_data["description"] = request.description
+    if request.extra:
+        model_data.update(request.extra)
+
+    row = store.upsert(alias, model_data)
+    # Reload catalog so the new model is immediately available
+    await reload_models_catalog()
+    return _row_to_response(row)
+
+
+@router.delete("/v1/models/definitions/{alias}", response_model=ModelDefinitionDeleteResponse, tags=["Models"])
+async def delete_model_definition(alias: str):
+    """Delete a model definition by alias. Triggers model catalog reload."""
+    store = _get_model_store()
+    deleted = store.delete(alias)
+    if not deleted:
+        raise HTTPException(status_code=404, detail=f"Model alias '{alias}' not found")
+    await reload_models_catalog()
+    return ModelDefinitionDeleteResponse(
+        success=True,
+        alias=alias,
+        message=f"Model '{alias}' deleted",
+    )
+
+
+@router.post("/v1/models/definitions/seed", response_model=ModelDefinitionSeedResponse, tags=["Models"])
+async def seed_model_definitions(request: ModelDefinitionSeedRequest | None = None):
+    """Seed DB model definitions from the current YAML config."""
+    service = get_service()
+    yaml_models = service.config.defined_models.get("models", {})
+    if not yaml_models:
+        return ModelDefinitionSeedResponse(seeded=0, total_yaml=0, message="No models in YAML config")
+
+    store = _get_model_store()
+    if request and request.overwrite:
+        seeded = 0
+        for alias, model_data in yaml_models.items():
+            if isinstance(model_data, dict):
+                store.upsert(alias, model_data)
+                seeded += 1
+    else:
+        seeded = store.seed_from_yaml(yaml_models)
+
+    await reload_models_catalog()
+    return ModelDefinitionSeedResponse(
+        seeded=seeded,
+        total_yaml=len(yaml_models),
+        message=f"Seeded {seeded} model(s) from YAML",
+    )
+
+
 @router.get("/v1/bots", response_model=BotsResponse, tags=["System"])
 async def list_bots():
     """List available bots configured on the service."""
@@ -102,6 +220,8 @@ async def list_bots():
             system_prompt=bot.system_prompt,
             requires_memory=bot.requires_memory,
             voice_optimized=bot.voice_optimized,
+            tts_mode=bot.tts_mode,
+            include_summaries=bot.include_summaries,
             default_voice=bot.default_voice,
             uses_tools=bot.uses_tools,
             uses_search=bot.uses_search,

@@ -277,6 +277,9 @@ class BackgroundService:
         from .turn_logs import TurnLogStore
         self._turn_log_store = TurnLogStore(config, ttl_hours=168)
 
+        # OpenClaw WS session bridge (set by api.py lifespan if enabled)
+        self._session_bridge: Any | None = None
+
         # Extraction client (API model like Grok, separate from chat model)
         self._extraction_client: Any | None = None
         self._extraction_client_model: str | None = None
@@ -897,6 +900,8 @@ class BackgroundService:
                 # Inject client-supplied system context (e.g. HA device list)
                 llm_bawt._client_system_context = request.client_system_context
                 llm_bawt._ha_mode = request.ha_mode
+                llm_bawt._include_summaries = request.include_summaries
+                llm_bawt._tts_mode = request.tts_mode
 
                 # Prepare messages with history and memory context
                 prepared_messages = llm_bawt.prepare_messages_for_query(user_prompt)
@@ -1000,6 +1005,233 @@ class BackgroundService:
         
         return response
 
+    def _is_openclaw_bot(self, model_alias: str) -> bool:
+        """Check if this model alias maps to an openclaw agent backend."""
+        model_def = self.config.defined_models.get("models", {}).get(model_alias, {})
+        if model_def.get("type") == "agent_backend" and model_def.get("backend") == "openclaw":
+            return True
+        if model_def.get("type") == "openclaw":
+            return True
+        return model_alias == "openclaw"
+
+    def _get_openclaw_session_key(self, model_alias: str) -> str:
+        """Get the normalized session_key for an OpenClaw model.
+
+        Checks the model definition first (type=openclaw has session_key directly,
+        type=agent_backend has it in bot_config), then falls back to config.
+        """
+        from openclaw_bridge.ingest import EventIngestPipeline
+
+        model_def = self.config.defined_models.get("models", {}).get(model_alias, {})
+        sk = (
+            model_def.get("session_key")
+            or (model_def.get("bot_config") or {}).get("session_key")
+            or self.config.OPENCLAW_WS_SESSIONS.split(",")[0].strip()
+            or "main"
+        )
+        return EventIngestPipeline._normalize_session_key(sk)
+
+    async def _stream_via_bridge(
+        self,
+        *,
+        user_prompt: str,
+        session_key: str,
+        response_id: str,
+        created: int,
+        model_alias: str,
+        bot_id: str,
+        user_id: str,
+        ctx: Any,
+        turn_log_id: str,
+        llm_bawt: Any,
+    ) -> AsyncIterator[str]:
+        """Stream an OpenClaw response via the WS SessionBridge."""
+        import json
+
+        bridge = self._session_bridge
+        start_time = time.time()
+
+        self._persist_turn_log(
+            turn_id=turn_log_id,
+            request_id=ctx.request_id,
+            path=ctx.path,
+            stream=True,
+            model=model_alias,
+            bot_id=bot_id,
+            user_id=user_id,
+            status="streaming",
+            latency_ms=None,
+            user_prompt=user_prompt,
+            prepared_messages=[],
+            response_text="",
+        )
+
+        try:
+            # Persist user message to bot history so it appears in /v1/history
+            llm_bawt.history_manager.add_message("user", user_prompt)
+
+            # Send user message and subscribe to events
+            redis_sub = getattr(self, '_redis_subscriber', None)
+            if redis_sub:
+                # Redis mode: send via Gateway HTTP, subscribe via Redis
+                gateway = getattr(self, '_gateway_http', None)
+                if not gateway:
+                    from openclaw_bridge.gateway_http import GatewayHttpClient
+                    gateway = GatewayHttpClient(
+                        self.config.OPENCLAW_GATEWAY_URL,
+                        self.config.OPENCLAW_GATEWAY_TOKEN,
+                    )
+                    self._gateway_http = gateway
+                run_id = await gateway.send_user_message(session_key, user_prompt)
+                log.info("OpenClaw gateway HTTP: sent message, run_id=%s", run_id)
+                event_source = redis_sub.subscribe(session_key, run_id=run_id)
+            else:
+                # In-process mode: send via WS bridge, subscribe via fanout
+                run_id = await bridge.send_user_message(session_key, user_prompt)
+                bridge._api_run_ids.add(run_id)
+                log.info("OpenClaw bridge: sent message, run_id=%s", run_id)
+                event_source = bridge._fanout.subscribe(session_key)
+
+            full_text_parts: list[str] = []
+            tool_call_details: list[dict] = []
+
+            async for event in event_source:
+                from openclaw_bridge.events import OpenClawEventKind
+
+                if event.kind == OpenClawEventKind.ASSISTANT_DELTA:
+                    delta = event.text or ""
+                    if delta:
+                        full_text_parts.append(delta)
+                        data = {
+                            "id": response_id,
+                            "object": "chat.completion.chunk",
+                            "created": created,
+                            "model": model_alias,
+                            "choices": [{"index": 0, "delta": {"content": delta}, "finish_reason": None}],
+                        }
+                        yield f"data: {json.dumps(data)}\n\n"
+
+                elif event.kind == OpenClawEventKind.TOOL_START:
+                    tool_data = {
+                        "object": "service.tool_call",
+                        "name": event.tool_name or "unknown",
+                        "arguments": event.tool_arguments or {},
+                    }
+                    yield f"data: {json.dumps(tool_data)}\n\n"
+                    tool_call_details.append({
+                        "iteration": 1,
+                        "tool": event.tool_name or "unknown",
+                        "parameters": event.tool_arguments or {},
+                        "result": "",
+                    })
+
+                elif event.kind == OpenClawEventKind.TOOL_END:
+                    tool_result_data = {
+                        "object": "service.tool_result",
+                        "name": event.tool_name or "unknown",
+                        "result": event.tool_result,
+                    }
+                    yield f"data: {json.dumps(tool_result_data)}\n\n"
+                    if tool_call_details:
+                        tool_call_details[-1]["result"] = str(event.tool_result or "")
+
+                elif event.kind == OpenClawEventKind.RUN_COMPLETED:
+                    if event.run_id == run_id or not run_id:
+                        break
+
+                elif event.kind == OpenClawEventKind.ERROR:
+                    warning_data = {
+                        "object": "service.warning",
+                        "model": model_alias,
+                        "warnings": [f"openclaw_error: {event.text}"],
+                    }
+                    yield f"data: {json.dumps(warning_data)}\n\n"
+                    break
+
+            # Final chunk
+            data = {
+                "id": response_id,
+                "object": "chat.completion.chunk",
+                "created": created,
+                "model": model_alias,
+                "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+            }
+            yield f"data: {json.dumps(data)}\n\n"
+            yield "data: [DONE]\n\n"
+
+            # Fetch tool calls from chat history (gateway doesn't stream them)
+            try:
+                if redis_sub and gateway:
+                    history_msgs = await gateway.get_chat_history(session_key, limit=20)
+                elif bridge:
+                    history_msgs = await bridge._ws_client.get_chat_history(session_key, limit=20)
+                else:
+                    history_msgs = []
+                for msg in reversed(history_msgs):
+                    if not isinstance(msg, dict):
+                        continue
+                    # Look for tool_calls in the most recent assistant message
+                    if msg.get("role") == "assistant":
+                        for tc in msg.get("tool_calls") or []:
+                            fn = tc.get("function") or {}
+                            tool_call_details.append({
+                                "iteration": 1,
+                                "tool": fn.get("name") or tc.get("name") or "unknown",
+                                "parameters": fn.get("arguments") or {},
+                                "result": "",
+                            })
+                        break
+                    # Also capture tool results
+                    if msg.get("role") == "tool":
+                        # Will be matched to tool_call above
+                        pass
+            except Exception as e:
+                log.debug("Could not fetch tool calls from chat.history: %s", e)
+
+            # Finalize turn
+            full_text = "".join(full_text_parts)
+            elapsed_ms = (time.time() - start_time) * 1000
+            if full_text:
+                self._finalize_turn(
+                    llm_bawt=llm_bawt,
+                    turn_id=turn_log_id,
+                    response_text=full_text,
+                    tool_context="",
+                    tool_call_details=tool_call_details,
+                    prepared_messages=[],
+                    user_prompt=user_prompt,
+                    model=model_alias,
+                    bot_id=bot_id,
+                    user_id=user_id,
+                    elapsed_ms=elapsed_ms,
+                    stream=True,
+                )
+
+        except Exception as e:
+            log.error("OpenClaw bridge stream failed: %s", e)
+            elapsed_ms = (time.time() - start_time) * 1000
+            self._update_turn_log(
+                turn_id=turn_log_id,
+                status="error",
+                latency_ms=elapsed_ms,
+                error_text=str(e),
+            )
+            warning_data = {
+                "object": "service.warning",
+                "model": model_alias,
+                "warnings": [f"bridge_error: {e}"],
+            }
+            yield f"data: {json.dumps(warning_data)}\n\n"
+            data = {
+                "id": response_id,
+                "object": "chat.completion.chunk",
+                "created": created,
+                "model": model_alias,
+                "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+            }
+            yield f"data: {json.dumps(data)}\n\n"
+            yield "data: [DONE]\n\n"
+
     async def chat_completion_stream(
         self,
         request: ChatCompletionRequest,
@@ -1090,7 +1322,31 @@ class BackgroundService:
             yield f"data: {json.dumps(data)}\n\n"
             yield "data: [DONE]\n\n"
             return
-        
+
+        # --- OpenClaw WS Bridge Mode ---
+        # When OPENCLAW_MODE=ws_bridge and this bot uses an openclaw agent backend,
+        # route through the SessionBridge instead of the normal HTTP stream path.
+        _use_bridge = (
+            (self._session_bridge is not None or getattr(self, '_redis_subscriber', None) is not None)
+            and self.config.OPENCLAW_MODE == "ws_bridge"
+            and self._is_openclaw_bot(model_alias)
+        )
+        if _use_bridge:
+            async for chunk in self._stream_via_bridge(
+                user_prompt=user_prompt,
+                session_key=self._get_openclaw_session_key(model_alias),
+                response_id=response_id,
+                created=created,
+                model_alias=model_alias,
+                bot_id=bot_id,
+                user_id=user_id,
+                ctx=ctx,
+                turn_log_id=f"turn-{uuid.uuid4().hex}",
+                llm_bawt=llm_bawt,
+            ):
+                yield chunk
+            return
+
         chunk_queue: asyncio.Queue = asyncio.Queue()
         full_response_holder = [""]  # Use list to allow mutation in nested function
         tool_context_holder = [""]  # Store tool context from native tool calls
@@ -1133,6 +1389,8 @@ class BackgroundService:
                 # Inject client-supplied system context (e.g. HA device list)
                 llm_bawt._client_system_context = request.client_system_context
                 llm_bawt._ha_mode = request.ha_mode
+                llm_bawt._include_summaries = request.include_summaries
+                llm_bawt._tts_mode = request.tts_mode
 
                 # Use llm_bawt.prepare_messages_for_query to get full context
                 # (history from DB + memory + system prompt)

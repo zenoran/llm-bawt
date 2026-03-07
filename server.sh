@@ -39,10 +39,11 @@ start_memory_server() {
 
   echo "[mcp] Starting on ${MEMORY_HOST}:${MEMORY_PORT}..."
 
+  # --quiet suppresses uv's progress/build output
   # In dev mode, use --no-sync to avoid rebuilding
-  UV_FLAGS=""
+  UV_FLAGS="--quiet"
   if [[ "$DEV_MODE" == true ]]; then
-    UV_FLAGS="--no-sync"
+    UV_FLAGS="--quiet --no-sync"
   fi
 
   if [[ "$LOG_MODE" == "stdout" ]]; then
@@ -69,10 +70,10 @@ start_llm_service() {
 
   # Set up dev mode flags early (needed for health check and service start)
   RELOAD_FLAG=""
-  UV_FLAGS=""
+  UV_FLAGS="--quiet"
   if [[ "$DEV_MODE" == true ]]; then
     RELOAD_FLAG="--reload"
-    UV_FLAGS="--no-sync"
+    UV_FLAGS="--quiet --no-sync"
   fi
 
   # Wait for MCP server to be ready before starting llm-service

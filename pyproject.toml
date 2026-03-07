@@ -24,6 +24,10 @@ dependencies = [
     "textual-dev>=1.5.0",
     "pyperclip>=1.8.0",
     "ipython>=8.0.0",
+    # OpenClaw WS bridge
+    "websockets>=13.0",
+    # Redis (for OpenClaw bridge fanout)
+    "redis[hiredis]>=5.0.0",
 ]
 
 [project.optional-dependencies]
@@ -81,6 +85,7 @@ llm-memory = "llm_bawt.memory_debug:main"
 llm-memory-tui = "llm_bawt.memory_tui:main"
 llm-mcp-server = "llm_bawt.memory_server:run_server"
 llm-nextcloud = "llm_bawt.integrations.nextcloud.cli:nextcloud_cli"
+openclaw-bridge = "openclaw_bridge.__main__:main"
 
 [project.entry-points."llm_bawt.memory"]
 postgresql = "llm_bawt.memory.postgresql:PostgreSQLMemoryBackend"

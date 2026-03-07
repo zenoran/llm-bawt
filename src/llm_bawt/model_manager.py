@@ -446,6 +446,16 @@ class ModelManager:
     def _fetch_api_models(self, provider_type: str) -> Tuple[bool, List[Dict[str, Any]]]:
         if provider_type == PROVIDER_OPENAI:
             return fetch_openai_api_models()
+        if provider_type == PROVIDER_GROK:
+            api_key = (
+                getattr(self.config, 'XAI_API_KEY', '')
+                or os.getenv('XAI_API_KEY', '')
+                or os.getenv('LLM_BAWT_XAI_API_KEY', '')
+            )
+            if not api_key:
+                console.print("[bold red]Error:[/bold red] XAI_API_KEY not set. Set LLM_BAWT_XAI_API_KEY in .env or XAI_API_KEY env var.")
+                return False, []
+            return fetch_grok_api_models(api_key)
         if provider_type == PROVIDER_OLLAMA:
             ollama_url = getattr(self.config, 'OLLAMA_URL', None)
             if not ollama_url:
@@ -466,7 +476,7 @@ class ModelManager:
                 ts = self._format_model_timestamp_str(provider_type, m, tz)
                 if not ts:
                     continue
-                label = 'Created' if provider_type == PROVIDER_OPENAI else 'Modified'
+                label = 'Created' if provider_type in (PROVIDER_OPENAI, PROVIDER_GROK) else 'Modified'
                 expected = f"{mid} ({label}: {ts})"
                 if ts not in entry.get('description', '') or mid not in entry.get('description', ''):
                     entry['description'] = expected
@@ -511,7 +521,7 @@ class ModelManager:
             alias = self._generate_alias(provider_type, m, existing)
             existing.add(alias)
             ts = self._format_model_timestamp_str(provider_type, m, tz)
-            label = 'Created' if provider_type == PROVIDER_OPENAI else 'Modified'
+            label = 'Created' if provider_type in (PROVIDER_OPENAI, PROVIDER_GROK) else 'Modified'
             desc = f"{m['id']} ({label}: {ts})"
             entry = {'type': provider_type, 'model_id': m['id'], 'description': desc}
             self.models_data['models'][alias] = entry
@@ -529,7 +539,7 @@ class ModelManager:
         return alias
 
     def _format_model_timestamp_str(self, provider_type: str, model_info: Dict[str, Any], tz: Any) -> Optional[str]:
-        dt = model_info.get('created') if provider_type == PROVIDER_OPENAI else model_info.get('modified_at')
+        dt = model_info.get('created') if provider_type in (PROVIDER_OPENAI, PROVIDER_GROK) else model_info.get('modified_at')
         if not dt:
             return None
         if dt.tzinfo is None:
@@ -746,6 +756,28 @@ def fetch_openai_api_models() -> Tuple[bool, List[Dict[str, Any]]]:
         return True, details
     except Exception as e:
         console.print(f"[bold red]OpenAI fetch error:[/bold red] {e}")
+        return False, []
+
+
+def fetch_grok_api_models(api_key: str) -> Tuple[bool, List[Dict[str, Any]]]:
+    """Fetches model list from xAI API (Grok models)."""
+    from openai import OpenAI
+    details = []
+    start = time.time()
+    try:
+        client = OpenAI(api_key=api_key, base_url="https://api.x.ai/v1")
+        resp = client.models.list()
+        for m in resp.data:
+            # Skip image/video generation models — not usable as chat models
+            if 'imagine' in m.id or 'video' in m.id:
+                continue
+            ts = getattr(m, 'created', None)
+            dt = datetime.fromtimestamp(ts, tz=timezone.utc) if ts else None
+            details.append({'id': m.id, 'created': dt})
+        console.print(f"⏱️ xAI query took {(time.time()-start)*1000:.0f}ms, found {len(details)} models")
+        return True, details
+    except Exception as e:
+        console.print(f"[bold red]xAI API error:[/bold red] {e}")
         return False, []
 
 

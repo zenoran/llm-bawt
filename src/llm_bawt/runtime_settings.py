@@ -60,6 +60,8 @@ class BotProfile(SQLModel, table=True):
     system_prompt: str = Field(sa_column=Column(Text, nullable=False))
     requires_memory: bool = Field(default=True)
     voice_optimized: bool = Field(default=False)
+    tts_mode: bool = Field(default=False)
+    include_summaries: bool = Field(default=True)
     uses_tools: bool = Field(default=False)
     uses_search: bool = Field(default=False)
     uses_home_assistant: bool = Field(default=False)
@@ -118,6 +120,8 @@ class BotProfileStore:
             "ALTER TABLE bot_profiles ADD COLUMN IF NOT EXISTS color VARCHAR(64)",
             "ALTER TABLE bot_profiles ADD COLUMN IF NOT EXISTS agent_backend VARCHAR(128)",
             "ALTER TABLE bot_profiles ADD COLUMN IF NOT EXISTS agent_backend_config JSONB",
+            "ALTER TABLE bot_profiles ADD COLUMN IF NOT EXISTS tts_mode BOOLEAN DEFAULT FALSE",
+            "ALTER TABLE bot_profiles ADD COLUMN IF NOT EXISTS include_summaries BOOLEAN DEFAULT TRUE",
         ]
         try:
             with self.engine.connect() as conn:
@@ -168,6 +172,8 @@ class BotProfileStore:
                     system_prompt=str(payload.get("system_prompt") or "You are a helpful assistant."),
                     requires_memory=bool(payload.get("requires_memory", True)),
                     voice_optimized=bool(payload.get("voice_optimized", False)),
+                    tts_mode=bool(payload.get("tts_mode", False)),
+                    include_summaries=bool(payload.get("include_summaries", True)),
                     uses_tools=bool(payload.get("uses_tools", False)),
                     uses_search=bool(payload.get("uses_search", False)),
                     uses_home_assistant=bool(payload.get("uses_home_assistant", False)),
@@ -185,6 +191,8 @@ class BotProfileStore:
                 row.system_prompt = str(payload.get("system_prompt", row.system_prompt) or row.system_prompt)
                 row.requires_memory = bool(payload.get("requires_memory", row.requires_memory))
                 row.voice_optimized = bool(payload.get("voice_optimized", row.voice_optimized))
+                row.tts_mode = bool(payload.get("tts_mode", row.tts_mode))
+                row.include_summaries = bool(payload.get("include_summaries", row.include_summaries))
                 row.uses_tools = bool(payload.get("uses_tools", row.uses_tools))
                 row.uses_search = bool(payload.get("uses_search", row.uses_search))
                 row.uses_home_assistant = bool(payload.get("uses_home_assistant", row.uses_home_assistant))
@@ -233,6 +241,8 @@ class BotProfileStore:
                 "system_prompt": bot_data.get("system_prompt", "You are a helpful assistant."),
                 "requires_memory": bot_data.get("requires_memory", True),
                 "voice_optimized": bot_data.get("voice_optimized", False),
+                "tts_mode": bot_data.get("tts_mode", False),
+                "include_summaries": bot_data.get("include_summaries", True),
                 "uses_tools": bot_data.get("uses_tools", False),
                 "uses_search": bot_data.get("uses_search", False),
                 "uses_home_assistant": bot_data.get("uses_home_assistant", False),

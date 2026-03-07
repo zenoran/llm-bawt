@@ -39,6 +39,56 @@ services:
     stdin_open: true
     tty: true
 
+  redis:
+    image: redis:7-alpine
+    container_name: llm-bawt-redis
+    command: ["redis-server", "--maxmemory", "128mb", "--maxmemory-policy", "allkeys-lru"]
+    ports:
+      - "${REDIS_PORT:-6379}:6379"
+    volumes:
+      - redis-data:/data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+    profiles:
+      - bridge
+
+  openclaw-bridge:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        WITH_CUDA: "false"
+    container_name: llm-bawt-openclaw-bridge
+    command: ["python", "-m", "openclaw_bridge"]
+    env_file:
+      - ./.env
+    environment:
+      - OPENCLAW_BRIDGE_LOG_LEVEL=${OPENCLAW_BRIDGE_LOG_LEVEL:-INFO}
+      - OPENCLAW_SESSION_TO_BOT=${OPENCLAW_SESSION_TO_BOT:-}
+      - REDIS_URL=redis://redis:6379/0
+      - INFLUXDB_URL=${INFLUXDB_URL:-}
+      - INFLUXDB_TOKEN=${INFLUXDB_TOKEN:-}
+      - INFLUXDB_ORG=${INFLUXDB_ORG:-homeassistant}
+      - INFLUXDB_BUCKET=${INFLUXDB_BUCKET:-llm-bawt}
+    volumes:
+      - ./.logs:/app/.logs
+    depends_on:
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8680/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    profiles:
+      - bridge
+
   crawl4ai:
     image: unclecode/crawl4ai:latest
     container_name: llm-bawt-crawl4ai
@@ -47,3 +97,6 @@ services:
     environment:
       - CRAWL4AI_API_TOKEN=${CRAWL4AI_API_TOKEN:-}
     restart: unless-stopped
+
+volumes:
+  redis-data:

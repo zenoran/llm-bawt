@@ -100,6 +100,8 @@ class BaseLLMBawt(ABC):
         self.settings: RuntimeSettingsResolver | None = None
         self._client_system_context: str | None = None
         self._ha_mode: bool = False
+        self._include_summaries: bool = True
+        self._tts_mode: bool = False
 
         if not self.model_definition:
             raise ValueError(f"Could not find model definition for: '{resolved_model_alias}'")
@@ -495,6 +497,18 @@ class BaseLLMBawt(ABC):
                         position=SectionPosition.MEMORY_CONTEXT,
                     )
         
+        # TTS output instructions (when tts_mode is enabled)
+        if self._tts_mode:
+            from ..prompt_registry import get_prompt_resolver
+            resolved = get_prompt_resolver(self.config).resolve("chat.tts_output_instructions")
+            tts_body = resolved.body if resolved else None
+            if tts_body:
+                builder.add_section(
+                    "tts_output",
+                    tts_body,
+                    position=SectionPosition.CUSTOM,
+                )
+
         # Build final system message
         system_content = builder.build()
         if system_content:
@@ -538,6 +552,8 @@ class BaseLLMBawt(ABC):
             messages.extend(ha_msgs[-6:])
         else:
             for msg in history:
+                if msg.role == "summary" and not self._include_summaries:
+                    continue
                 if msg.role in ("user", "assistant", "summary"):
                     messages.append(msg)
                 elif msg.role == "system" and msg.content and (

@@ -18,6 +18,8 @@ async def chat_completions(request: ChatCompletionRequest):
     - `bot_id`: Bot personality to use (default: nova)
     - `augment_memory`: Whether to include memory context (default: true)
     - `extract_memory`: Whether to extract memories from response (default: true)
+    - `include_summaries`: Whether to inject conversation summary records into context (default: true)
+    - `tts_mode`: Whether to append TTS output formatting instructions to the system prompt (default: false)
     """
     from fastapi.responses import StreamingResponse
     

@@ -9,6 +9,7 @@ from .jobs import router as jobs_router
 from .llm import router as llm_router
 from .memory import router as memory_router
 from .models import router as models_router
+from .openclaw_ws import router as openclaw_ws_router
 from .nextcloud import router as nextcloud_router
 from .prompts import router as prompts_router
 from .profiles import router as profiles_router
@@ -22,6 +23,7 @@ all_routers = [
     ha_weather_router,
     nextcloud_router,
     models_router,
+    openclaw_ws_router,
     botchat_router,
     chat_router,
     tasks_router,

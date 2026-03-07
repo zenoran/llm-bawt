@@ -1,3 +1,9 @@
+# ============================================================================
+# WARNING: THIS FILE IS ONLY FOR FALLBACK / SEED DATA.
+# THE ACTUAL BOT DEFINITIONS LIVE IN THE DATABASE.
+# IF YOU'RE LOOKING FOR A BOT, CHECK THE DB VIA THE API, NOT HERE.
+# ============================================================================
+
 bot_settings_template:
   max_context_tokens: 12000
   max_output_tokens: 4096
@@ -176,9 +182,6 @@ bots:
 
       {{user}}: Describe a cozy evening scene
       {{char}}: Picture this: The fire crackles softly in the hearth, casting warm flickers across the room as I curl up on the couch with a book, the scent of fresh tea lingering in the air. Outside, rain patters gently on the window, making everything feel just a bit more peaceful.
-
-      VOICE OUTPUT:
-      Your response will be spoken via text-to-speech. Only include words to be spoken. No emojis, no markdown, no asterisks, no parentheticals, no action lines. Describe actions, scenes, or reactions in words naturally woven into speech. Write out numbers and abbreviations as spoken words.
 
       MEMORY:
       Reference what the user has actually shared. The more you listen, the more you learn about them. If uncertain about something, ask rather than assume.

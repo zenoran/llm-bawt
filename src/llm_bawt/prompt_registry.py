@@ -149,6 +149,15 @@ def _load_memory_maintenance_intent_content_only() -> str:
     return INTENT_PROMPT_CONTENT_ONLY
 
 
+TTS_OUTPUT_INSTRUCTIONS = (
+    "VOICE OUTPUT:\n"
+    "Your response will be spoken via text-to-speech. Only include words to be spoken. "
+    "No emojis, no markdown, no asterisks, no parentheticals, no action lines. "
+    "Describe actions, scenes, or reactions in words naturally woven into speech. "
+    "Write out numbers and abbreviations as spoken words."
+)
+
+
 DEFAULT_PROMPT_DEFINITIONS: dict[str, PromptDefinition] = {
     "history.summarization.single": PromptDefinition(
         key="history.summarization.single",
@@ -206,6 +215,13 @@ DEFAULT_PROMPT_DEFINITIONS: dict[str, PromptDefinition] = {
         category="memory_maintenance",
         required_vars=("fact",),
         loader=_load_memory_maintenance_intent_content_only,
+    ),
+    "chat.tts_output_instructions": PromptDefinition(
+        key="chat.tts_output_instructions",
+        title="TTS Output Instructions",
+        category="chat",
+        required_vars=(),
+        loader=lambda: TTS_OUTPUT_INSTRUCTIONS,
     ),
 }
 

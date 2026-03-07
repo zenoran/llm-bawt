@@ -36,6 +36,8 @@ class ChatCompletionRequest(BaseModel):
     bot_id: str | None = Field(default=None, description="Bot personality to use")
     augment_memory: bool = Field(default=True, description="Whether to augment with memory context")
     extract_memory: bool = Field(default=True, description="Whether to extract memories from response")
+    include_summaries: bool = Field(default=True, description="Whether to inject conversation summary records into context")
+    tts_mode: bool = Field(default=False, description="Whether to append TTS output formatting instructions to the system prompt")
     client_system_context: str | None = Field(default=None, description="System context extracted from client messages (set by routes, not by callers)", exclude=True)
     ha_mode: bool = Field(default=False, description="HA-mode: cap history, force tool_choice=required on first call (set by routes)", exclude=True)
 
@@ -109,6 +111,61 @@ class ModelDetail(BaseModel):
     current: bool = False
 
 
+# =============================================================================
+# Model Definition CRUD Schemas
+# =============================================================================
+
+class ModelDefinitionResponse(BaseModel):
+    """Response payload for a single model definition."""
+    alias: str
+    type: str
+    model_id: str | None = None
+    repo_id: str | None = None
+    filename: str | None = None
+    description: str | None = None
+    extra: dict[str, Any] | None = None
+    created_at: datetime | None = None
+    updated_at: datetime | None = None
+
+
+class ModelDefinitionListResponse(BaseModel):
+    """Response for listing model definitions."""
+    models: list[ModelDefinitionResponse]
+    total_count: int
+
+
+class ModelDefinitionUpsertRequest(BaseModel):
+    """Request to create or update a model definition."""
+    type: str = Field(..., description="Model type: openai, ollama, gguf, huggingface, grok, openclaw")
+    model_id: str | None = Field(default=None, description="Model ID (for openai/ollama/grok/openclaw)")
+    repo_id: str | None = Field(default=None, description="HuggingFace repo ID (for gguf/huggingface)")
+    filename: str | None = Field(default=None, description="GGUF filename")
+    description: str | None = None
+    extra: dict[str, Any] | None = Field(
+        default=None,
+        description="Optional fields: chat_format, context_window, max_tokens, n_gpu_layers, tool_support, tool_format",
+    )
+
+
+class ModelDefinitionDeleteResponse(BaseModel):
+    """Response from deleting a model definition."""
+    success: bool
+    alias: str
+    message: str
+
+
+class ModelDefinitionSeedRequest(BaseModel):
+    """Request to seed DB models from current YAML config."""
+    overwrite: bool = Field(default=False, description="If true, overwrite existing DB entries with YAML values")
+
+
+class ModelDefinitionSeedResponse(BaseModel):
+    """Response from seeding model definitions."""
+    seeded: int
+    total_yaml: int
+    message: str
+
+
 class BotInfo(BaseModel):
     """Bot information for /v1/bots endpoint."""
     slug: str
@@ -117,6 +174,8 @@ class BotInfo(BaseModel):
     system_prompt: str = ""
     requires_memory: bool = True
     voice_optimized: bool = False
+    tts_mode: bool = False
+    include_summaries: bool = True
     default_voice: str | None = None
     uses_tools: bool = False
     uses_search: bool = False
@@ -141,6 +200,8 @@ class BotProfileResponse(BaseModel):
     system_prompt: str
     requires_memory: bool = True
     voice_optimized: bool = False
+    tts_mode: bool = False
+    include_summaries: bool = True
     uses_tools: bool = False
     uses_search: bool = False
     uses_home_assistant: bool = False
@@ -158,6 +219,8 @@ class BotProfileUpsertRequest(BaseModel):
     system_prompt: str
     requires_memory: bool = True
     voice_optimized: bool = False
+    tts_mode: bool = False
+    include_summaries: bool = True
     uses_tools: bool = False
     uses_search: bool = False
     uses_home_assistant: bool = False

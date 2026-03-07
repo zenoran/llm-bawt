@@ -261,6 +261,32 @@ class Config(RuntimeTunables, BaseSettings):
         description="Allow SSH transport as emergency fallback",
     )
 
+    # --- OpenClaw WebSocket Bridge Settings --- #
+    OPENCLAW_WS_ENABLED: bool = Field(
+        default=False,
+        description="Enable WebSocket session bridge (Phase 1: shadow mode)",
+    )
+    OPENCLAW_MODE: str = Field(
+        default="http",
+        description="'ws_bridge' | 'http'. WS bridge for session-subscribed mode, HTTP for per-request mode.",
+    )
+    OPENCLAW_WS_URL: str = Field(
+        default="",
+        description="OpenClaw gateway WebSocket URL (e.g. ws://127.0.0.1:18789/v1/ws). Empty = bridge disabled.",
+    )
+    OPENCLAW_WS_SESSIONS: str = Field(
+        default="main",
+        description="Comma-separated session keys to subscribe to",
+    )
+    OPENCLAW_WS_RECONNECT_MAX_DELAY: int = Field(
+        default=60,
+        description="Max reconnect delay in seconds",
+    )
+    REDIS_URL: str = Field(
+        default="",
+        description="Redis URL for OpenClaw bridge event fanout (e.g. redis://localhost:6379/0). Empty = use in-process fanout.",
+    )
+
     # --- Web Search Settings --- #
     NEWSAPI_API_KEY: str = Field(
         default="",

@@ -222,8 +222,6 @@ def _build_summary_callable(service, bot_id: str, user_id: str = "system", model
                 return None
 
             model_max_tokens = int(service.config.get_model_max_tokens(model_alias) or 4096)
-            if model_alias and "grok-4-fast" in model_alias and model_max_tokens < 16384:
-                model_max_tokens = 16384
             requested_output_tokens = max(900, min(model_max_tokens, 320 * len(sessions)))
 
             # xAI OpenAI-compatible endpoint is typically most reliable with json_object mode.

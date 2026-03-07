@@ -1126,7 +1126,7 @@ def parse_arguments(config_obj: Config) -> argparse.Namespace:
     parser.add_argument("-m","--model",type=str,default=None,help=f"Model alias defined in {config_obj.MODELS_CONFIG_PATH}. Supports partial matching. (Default: bot's default or {config_obj.DEFAULT_MODEL_ALIAS or 'None'})")
     parser.add_argument("--list-models",action="store_true",help="List available model aliases defined in the configuration file and exit.")
     parser.add_argument("--add-gguf",type=str,metavar="REPO_ID",help="(Deprecated: use --add-model gguf) Add a GGUF model from a Hugging Face repo ID.")
-    parser.add_argument("--add-model",type=str,choices=['ollama', 'openai', 'gguf', 'vllm', 'openclaw'],metavar="TYPE",help="Add models: 'ollama' (refresh from server), 'openai' (query API), 'gguf' (add from HuggingFace repo), 'vllm' (add vLLM model from HuggingFace), 'openclaw' (bind OpenClaw session/channel)")
+    parser.add_argument("--add-model",type=str,choices=['ollama', 'openai', 'grok', 'gguf', 'vllm', 'openclaw'],metavar="TYPE",help="Add models: 'ollama' (refresh from server), 'openai' (query API), 'grok' (query xAI API), 'gguf' (add from HuggingFace repo), 'vllm' (add vLLM model from HuggingFace), 'openclaw' (bind OpenClaw session/channel)")
     parser.add_argument("--delete-model",type=str,metavar="ALIAS",help="Delete the specified model alias from the configuration file after confirmation.")
     parser.add_argument(
         "--set-context-window",
@@ -1410,6 +1410,8 @@ def main():
         try:
             if args.add_model == 'openai':
                 success = update_models_interactive(config_obj, provider='openai')
+            elif args.add_model == 'grok':
+                success = update_models_interactive(config_obj, provider='grok')
             elif args.add_model == 'ollama':
                 success = update_models_interactive(config_obj, provider='ollama')
             elif args.add_model == 'gguf':

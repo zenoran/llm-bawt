@@ -143,6 +143,8 @@ def edit_bot_yaml(config: Config, bot_slug: str) -> bool:
         "system_prompt": bot.system_prompt,
         "requires_memory": bot.requires_memory,
         "voice_optimized": bot.voice_optimized,
+        "tts_mode": bot.tts_mode,
+        "include_summaries": bot.include_summaries,
         "uses_tools": bot.uses_tools,
         "uses_search": bot.uses_search,
         "uses_home_assistant": bot.uses_home_assistant,
