@@ -25,7 +25,6 @@ from typing import Any, Dict, List, Optional, Tuple
 import pytz
 import yaml
 from rich.console import Console
-from rich.panel import Panel
 from rich.prompt import Confirm, Prompt
 from rich.rule import Rule
 
@@ -170,11 +169,7 @@ class ModelManager:
         defined_models = self.models_data.get("models", {})
         available_aliases = set(self.config.get_model_options())
 
-        console.print(Panel.fit(
-            "[bold green]Local Models[/bold green]",
-            subtitle=f"[dim]{self.config_path}[/dim]",
-            border_style="green",
-        ))
+        console.print(f"[bold green]Local Models[/bold green]  [dim]{self.config_path}[/dim]")
         console.print()
 
         if not defined_models:
