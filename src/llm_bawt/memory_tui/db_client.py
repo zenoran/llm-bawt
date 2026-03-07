@@ -48,7 +48,9 @@ class MemoryDBClient:
                 poolclass=NullPool,
                 future=True,
             )
-            
+            from ..utils.db import set_utc_on_connect
+            set_utc_on_connect(self.engine)
+
             # Test connection
             with self.engine.connect() as conn:
                 conn.execute(text("SELECT 1"))

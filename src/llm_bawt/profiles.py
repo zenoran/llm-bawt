@@ -116,6 +116,8 @@ class ProfileManager:
         connection_url = f"postgresql+psycopg2://{user}:{encoded_password}@{host}:{port}/{database}"
         
         self.engine = create_engine(connection_url, echo=False)
+        from .utils.db import set_utc_on_connect
+        set_utc_on_connect(self.engine)
         self._ensure_tables_exist()
         logger.debug(f"ProfileManager connected to {host}:{port}/{database}")
     
@@ -876,7 +878,9 @@ def migrate_from_old_user_profiles(config: Any) -> int:
     
     from sqlalchemy import create_engine, text
     engine = create_engine(connection_url, echo=False)
-    
+    from .utils.db import set_utc_on_connect
+    set_utc_on_connect(engine)
+
     manager = ProfileManager(config)
     migrated = 0
     

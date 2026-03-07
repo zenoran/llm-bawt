@@ -207,7 +207,9 @@ class PostgreSQLMemoryBackend(MemoryBackend):
             pool_size=5,
             max_overflow=10,
         )
-        
+        from ..utils.db import set_utc_on_connect
+        set_utc_on_connect(self.engine)
+
         self._ensure_tables_exist()
         logger.debug(f"Connected to PostgreSQL at {host}:{port}/{database} (bot: {bot_id})")
     
