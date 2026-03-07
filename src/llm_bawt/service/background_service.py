@@ -1772,7 +1772,7 @@ class BackgroundService:
                     event_data = {
                         "object": "service.tool_call",
                         "model": model_alias,
-                        "tool": chunk.get("name", "unknown"),
+                        "name": chunk.get("name", "unknown"),
                         "arguments": chunk.get("arguments", {}),
                         "result": result,
                         "status": "completed" if (has_result or error) else "pending",
@@ -1784,7 +1784,7 @@ class BackgroundService:
                     event_data = {
                         "object": "service.tool_result",
                         "model": model_alias,
-                        "tool": chunk.get("name", "unknown"),
+                        "name": chunk.get("name", "unknown"),
                         "result": chunk.get("result"),
                     }
                     yield f"data: {json.dumps(event_data)}\n\n"

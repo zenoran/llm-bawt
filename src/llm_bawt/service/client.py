@@ -332,8 +332,15 @@ class ServiceClient:
                             # Service tool-call event (subtle UI indicator)
                             if chunk.get("object") == "service.tool_call":
                                 yield {
-                                    "tool_call": chunk.get("tool"),
+                                    "tool_call": chunk.get("name") or chunk.get("tool") or "tool",
                                     "tool_args": chunk.get("arguments", {}),
+                                    "model": chunk.get("model"),
+                                }
+                                continue
+                            if chunk.get("object") == "service.tool_result":
+                                yield {
+                                    "tool_result": chunk.get("name") or chunk.get("tool") or "tool",
+                                    "result_text": chunk.get("result"),
                                     "model": chunk.get("model"),
                                 }
                                 continue
