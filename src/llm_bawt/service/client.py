@@ -309,7 +309,7 @@ class ServiceClient:
         req = urllib.request.Request(url, data=body, headers=headers, method="POST")
 
         try:
-            with urllib.request.urlopen(req, timeout=60.0) as resp:
+            with urllib.request.urlopen(req, timeout=600.0) as resp:
                 first_chunk = True
                 # Use readline() instead of iterating the response directly.
                 # `for line in resp` uses BufferedIOBase iteration which reads

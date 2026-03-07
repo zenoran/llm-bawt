@@ -121,6 +121,10 @@ class RedisSubscriber:
         stream_key = f"{RUN_STREAM_PREFIX}{request_id}"
         last_id = "0"  # read from beginning (stream is created fresh per run)
         deadline = asyncio.get_event_loop().time() + timeout_s
+        logger.info(
+            "subscribe_run started: request_id=%s timeout_s=%.0f stream=%s",
+            request_id, timeout_s, stream_key,
+        )
 
         while True:
             remaining = deadline - asyncio.get_event_loop().time()
