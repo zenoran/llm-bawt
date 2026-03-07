@@ -200,9 +200,8 @@ class OpenClawBackend(AgentBackend):
                                     result = event.tool_result or "(completed)"
                                     tool_calls[-1].result = result
                                     result_queue.put({
-                                        "event": "tool_call",
+                                        "event": "tool_result",
                                         "name": tool_calls[-1].display_name,
-                                        "arguments": tool_calls[-1].arguments,
                                         "result": result,
                                     })
 
