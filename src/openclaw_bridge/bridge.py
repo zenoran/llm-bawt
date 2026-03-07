@@ -1,11 +1,12 @@
 from __future__ import annotations
 import asyncio
+import json
 import logging
 
 from .events import OpenClawEventKind
 from .ingest import EventIngestPipeline
 from .metrics import get_metrics
-from .publisher import RedisPublisher
+from .publisher import COMMANDS_STREAM, RedisPublisher
 from .store import EventStore
 from .ws_client import OpenClawWsClient
 
@@ -29,14 +30,22 @@ class SessionBridge:
         self._run_buffers: dict[str, list[str]] = {}  # run_id -> text deltas
         self._run_tool_calls: dict[str, list[dict]] = {}  # run_id -> tool calls
         self._session_to_bot: dict[str, str] = session_to_bot or {}
+        self._command_task: asyncio.Task | None = None
 
     async def start(self) -> None:
-        """Start the bridge: connect WS and begin consuming events."""
+        """Start the bridge: connect WS, begin consuming events, and listen for commands."""
         self._ws_client.on_event(self._on_raw_event)
         await self._ws_client.connect()
+        self._command_task = asyncio.create_task(self._command_listener())
         logger.info("SessionBridge started (sessions=%s)", list(self._ws_client.subscribed_sessions))
 
     async def stop(self) -> None:
+        if self._command_task:
+            self._command_task.cancel()
+            try:
+                await self._command_task
+            except (asyncio.CancelledError, Exception):
+                pass
         await self._ws_client.disconnect()
         self._publisher.close()
         logger.info("SessionBridge stopped")
@@ -51,6 +60,112 @@ class SessionBridge:
             pass
         finally:
             await self.stop()
+
+    async def _command_listener(self) -> None:
+        """Read send commands from Redis and dispatch them via WS."""
+        import redis.asyncio as aioredis
+
+        redis_url = self._publisher._redis.connection_pool.connection_kwargs.get("db", 0)
+        # Reuse the same Redis URL by extracting from the sync publisher
+        # We need an async client for blocking reads
+        try:
+            # Build URL from the sync publisher's connection
+            conn_kwargs = self._publisher._redis.connection_pool.connection_kwargs
+            host = conn_kwargs.get("host", "localhost")
+            port = conn_kwargs.get("port", 6379)
+            db = conn_kwargs.get("db", 0)
+            async_redis = aioredis.Redis(host=host, port=port, db=db, decode_responses=True)
+            await async_redis.ping()
+        except Exception as e:
+            logger.error("Command listener: cannot connect to Redis: %s", e)
+            return
+
+        # Create consumer group
+        try:
+            await async_redis.xgroup_create(
+                COMMANDS_STREAM, "bridge", id="0", mkstream=True
+            )
+        except Exception:
+            pass  # group already exists
+
+        logger.info("Command listener started on %s", COMMANDS_STREAM)
+
+        while True:
+            try:
+                results = await async_redis.xreadgroup(
+                    "bridge", "worker-0",
+                    {COMMANDS_STREAM: ">"},
+                    count=1,
+                    block=5000,
+                )
+                if not results:
+                    continue
+
+                for _stream, messages in results:
+                    for msg_id, fields in messages:
+                        action = fields.get("action", "")
+                        if action == "chat.send":
+                            asyncio.create_task(
+                                self._handle_send_command(fields, msg_id, async_redis)
+                            )
+                        else:
+                            logger.warning("Unknown command action: %s", action)
+                            await async_redis.xack(COMMANDS_STREAM, "bridge", msg_id)
+
+            except asyncio.CancelledError:
+                await async_redis.aclose()
+                raise
+            except Exception:
+                logger.exception("Command listener error")
+                await asyncio.sleep(2)
+
+    async def _handle_send_command(
+        self, fields: dict, msg_id: str, async_redis
+    ) -> None:
+        """Handle a chat.send command: send via WS, stream events back via Redis."""
+        request_id = fields.get("request_id", "")
+        session_key = fields.get("session_key", "main")
+        message = fields.get("message", "")
+
+        if not request_id or not message:
+            logger.warning("Invalid send command: missing request_id or message")
+            await async_redis.xack(COMMANDS_STREAM, "bridge", msg_id)
+            return
+
+        logger.info(
+            "Handling send command: request_id=%s session=%s msg=%.60s...",
+            request_id, session_key, message,
+        )
+
+        try:
+            async for raw_event in self._ws_client.send_and_stream(
+                session_key, message, timeout=600,
+            ):
+                # Parse through ingest pipeline to get structured event
+                event = self._ingest.parse(raw_event, session_key)
+                if event is not None:
+                    self._publisher.publish_run_event(request_id, event)
+
+            self._publisher.publish_run_done(request_id)
+            get_metrics().incr("openclaw.commands_completed")
+            logger.info("Send command completed: request_id=%s", request_id)
+
+        except Exception as e:
+            logger.exception("Send command failed: request_id=%s", request_id)
+            # Publish error event
+            from .events import OpenClawEvent, OpenClawEventKind
+            err_event = OpenClawEvent(
+                event_id=f"err_{request_id}",
+                session_key=session_key,
+                run_id=None,
+                kind=OpenClawEventKind.ERROR,
+                origin="bridge",
+                text=str(e),
+            )
+            self._publisher.publish_run_event(request_id, err_event)
+            self._publisher.publish_run_done(request_id)
+        finally:
+            await async_redis.xack(COMMANDS_STREAM, "bridge", msg_id)
 
     async def _on_raw_event(self, raw: dict) -> None:
         """Process a raw WS message: parse -> store -> update run state -> publish to Redis."""
@@ -106,9 +221,12 @@ class SessionBridge:
                 self._publisher.publish_history(bot_id, "assistant", event.text)
 
         elif event.kind == OpenClawEventKind.USER_MESSAGE:
-            bot_id = self._resolve_bot_id(event.session_key)
-            if bot_id and event.text:
-                self._publisher.publish_history(bot_id, "user", event.text)
+            if event.text and self._ingest.should_drop_content(event.text):
+                logger.debug("Dropping user message matching content filter: %.80s…", event.text)
+            else:
+                bot_id = self._resolve_bot_id(event.session_key)
+                if bot_id and event.text:
+                    self._publisher.publish_history(bot_id, "user", event.text)
 
         elif event.kind == OpenClawEventKind.RUN_COMPLETED and event.run_id:
             full_text = "".join(self._run_buffers.pop(event.run_id, []))

@@ -467,29 +467,58 @@ async def clear_history(
 ):
     """Clear conversation history for a bot."""
     service = get_service()
-    
+
     effective_bot_id = bot_id or service._default_bot
-    
+
     try:
-        model_alias = list(service._available_models)[0] if service._available_models else None
-        if not model_alias:
-            raise HTTPException(status_code=500, detail="No models available")
-        
-        llm_bawt = service._get_llm_bawt(model_alias, effective_bot_id, service.config.DEFAULT_USER)
-        llm_bawt.history_manager.clear_history()
-        
-        # Also remove from cache to force fresh state
-        cache_key = (model_alias, effective_bot_id, service.config.DEFAULT_USER)
-        if cache_key in service._llm_bawt_cache:
-            del service._llm_bawt_cache[cache_key]
-        
+        # Try the fast path: clear directly via DB backend (no model loading needed)
+        cleared = _clear_history_direct(service.config, effective_bot_id)
+
+        if not cleared:
+            # Fallback: use the full LLMBawt instance
+            model_alias = list(service._available_models)[0] if service._available_models else None
+            if not model_alias:
+                raise HTTPException(status_code=500, detail="No models available")
+            llm_bawt = service._get_llm_bawt(model_alias, effective_bot_id, service.config.DEFAULT_USER)
+            llm_bawt.history_manager.clear_history()
+
+        # Evict any cached LLMBawt instances for this bot
+        stale_keys = [k for k in service._llm_bawt_cache if k[1] == effective_bot_id]
+        for k in stale_keys:
+            del service._llm_bawt_cache[k]
+
         return HistoryClearResponse(
             success=True,
             message=f"History cleared for bot '{effective_bot_id}'"
         )
+    except HTTPException:
+        raise
     except Exception as e:
         log.error(f"Failed to clear history: {e}")
         raise HTTPException(status_code=500, detail=str(e))
+
+
+def _clear_history_direct(config, bot_id: str) -> bool:
+    """Clear history directly via PostgreSQL without loading a model.
+
+    Returns True if cleared successfully, False if DB is unavailable.
+    """
+    try:
+        from llm_bawt.memory.postgresql import PostgreSQLMemoryBackend
+        backend = PostgreSQLMemoryBackend(config, bot_id=bot_id)
+        # Clear messages table
+        from sqlalchemy.orm import Session as SASession
+        from sqlalchemy import delete as sa_delete
+        with SASession(backend.engine) as session:
+            session.execute(sa_delete(backend.messages_table))
+            session.commit()
+        # Clear memories table
+        backend.clear()
+        log.info("History cleared directly for bot '%s'", bot_id)
+        return True
+    except Exception as e:
+        log.warning("Direct history clear failed for '%s': %s", bot_id, e)
+        return False
 
 @router.get("/v1/history/summarize/preview", response_model=SummarizePreviewResponse, tags=["History"])
 async def preview_summarizable_sessions(

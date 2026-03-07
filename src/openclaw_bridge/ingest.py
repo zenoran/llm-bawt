@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import json
 import logging
+import re
+from dataclasses import dataclass, field
 from typing import Any
 
 from .events import OpenClawEvent, OpenClawEventKind, synthesize_event_id
@@ -9,15 +11,60 @@ from .events import OpenClawEvent, OpenClawEventKind, synthesize_event_id
 logger = logging.getLogger(__name__)
 
 
+@dataclass
+class IngestFilterConfig:
+    """Configurable filters applied at the ingest boundary.
+
+    - drop_msg_types: top-level ``type`` values to silently discard (e.g. ping, pong).
+    - drop_event_names: gateway event names to discard (e.g. health, tick).
+    - drop_content_patterns: regex patterns matched against user-message text;
+      if *any* pattern matches the full text, the message is dropped.
+    """
+    drop_msg_types: set[str] = field(default_factory=lambda: {"ping", "pong", "heartbeat"})
+    drop_event_names: set[str] = field(default_factory=lambda: {"health", "tick", "heartbeat", "presence", "shutdown"})
+    drop_content_patterns: list[re.Pattern[str]] = field(default_factory=list)
+
+    @classmethod
+    def from_env(cls, *, drop_patterns_csv: str = "", drop_events_csv: str = "", drop_msg_types_csv: str = "") -> IngestFilterConfig:
+        """Build from comma-separated env-var strings.
+
+        Values are *merged* with the built-in defaults, not replacing them.
+        """
+        cfg = cls()
+        if drop_msg_types_csv:
+            for t in drop_msg_types_csv.split(","):
+                t = t.strip()
+                if t:
+                    cfg.drop_msg_types.add(t)
+        if drop_events_csv:
+            for e in drop_events_csv.split(","):
+                e = e.strip()
+                if e:
+                    cfg.drop_event_names.add(e)
+        if drop_patterns_csv:
+            for pat in drop_patterns_csv.split(","):
+                pat = pat.strip()
+                if pat:
+                    try:
+                        cfg.drop_content_patterns.append(re.compile(pat, re.DOTALL))
+                    except re.error as exc:
+                        logger.warning("Invalid ingest drop pattern %r: %s", pat, exc)
+        return cfg
+
+    def should_drop_content(self, text: str) -> bool:
+        return any(p.search(text) for p in self.drop_content_patterns)
+
+
 class EventIngestPipeline:
-    def __init__(self) -> None:
+    def __init__(self, filter_config: IngestFilterConfig | None = None) -> None:
         self._stream_seq = 0
+        self._filter = filter_config or IngestFilterConfig()
 
     def parse(self, raw: dict, session_key: str) -> OpenClawEvent | None:
         msg_type = str(raw.get("type", ""))
 
         # Ignore infra noise
-        if msg_type in ("ping", "pong", "heartbeat"):
+        if msg_type in self._filter.drop_msg_types:
             return None
 
         if msg_type == "event":
@@ -113,7 +160,7 @@ class EventIngestPipeline:
                             kind=OpenClawEventKind.TOOL_END,
                             origin="system",
                             tool_name=tool_name,
-                            tool_result=data.get("result") or data.get("output"),
+                            tool_result=data.get("result") or data.get("output") or data.get("meta"),
                             raw=raw,
                         )
 
@@ -158,8 +205,8 @@ class EventIngestPipeline:
                     # provides ASSISTANT_DELTA events with the same content.
                     return None
 
-            # Ignore unrelated system events for now (health/tick/heartbeat/presence etc)
-            if event_name in {"health", "tick", "heartbeat", "presence", "shutdown"}:
+            # Ignore unrelated system events
+            if event_name in self._filter.drop_event_names:
                 return None
 
             # Unknown gateway event -> keep as system note for observability
@@ -175,6 +222,10 @@ class EventIngestPipeline:
 
         # Some gateways emit non-event frames like chat.sent
         if msg_type == "chat.sent":
+            text = self._extract_message_text(raw.get("message", {})) or str(raw.get("content") or raw.get("text") or "")
+            if text and self._filter.should_drop_content(text):
+                logger.debug("Dropping chat.sent matching content filter: %.80s…", text)
+                return None
             event_id = raw.get("event_id") or synthesize_event_id(session_key, "chat.sent", raw, self._next_seq())
             return OpenClawEvent(
                 event_id=event_id,
@@ -182,6 +233,7 @@ class EventIngestPipeline:
                 run_id=raw.get("run_id"),
                 kind=OpenClawEventKind.USER_MESSAGE,
                 origin="user",
+                text=text or None,
                 raw=raw,
             )
 
@@ -200,6 +252,13 @@ class EventIngestPipeline:
             text=str(raw),
             raw=raw,
         )
+
+    @property
+    def filter_config(self) -> IngestFilterConfig:
+        return self._filter
+
+    def should_drop_content(self, text: str) -> bool:
+        return self._filter.should_drop_content(text)
 
     @staticmethod
     def _normalize_session_key(sk: str) -> str:

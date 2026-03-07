@@ -309,7 +309,6 @@ def handle_add_openclaw(config: Config) -> bool:
             table.add_row(str(idx), str(item.get("id", "")), str(item.get("label", "")))
         console.print(table)
 
-    use_existing = False
     if sessions:
         table = Table(title="Recent sessions", show_header=True)
         table.add_column("#", style="cyan", width=4)
@@ -324,16 +323,47 @@ def handle_add_openclaw(config: Config) -> bool:
                 str(item.get("model", "")),
             )
         console.print(table)
-        use_existing = Confirm.ask("Subscribe to an existing session?", default=True)
+
+    # Session selection: pick from list, enter custom key, or create new
+    session_mode_choices = []
+    if sessions:
+        session_mode_choices.append("list")
+    session_mode_choices.extend(["custom", "new"])
+    default_mode = "list" if sessions else "custom"
+
+    if len(session_mode_choices) == 1:
+        session_mode = session_mode_choices[0]
+    else:
+        labels = []
+        if "list" in session_mode_choices:
+            labels.append("[bold]list[/bold] (pick from above)")
+        labels.append("[bold]custom[/bold] (enter session key)")
+        labels.append("[bold]new[/bold] (create agent:id:slug)")
+        console.print("Session mode: " + ", ".join(labels))
+        session_mode = Prompt.ask(
+            "Mode",
+            choices=session_mode_choices,
+            default=default_mode,
+        ).strip()
 
     selected_session_key = ""
     agent_id = "main"
 
-    if use_existing and sessions:
+    if session_mode == "list" and sessions:
         choices = [str(i) for i in range(1, len(sessions) + 1)]
         selected = Prompt.ask("Pick session #", choices=choices, default="1")
         row = sessions[int(selected) - 1]
         selected_session_key = str(row.get("key", "")).strip()
+        parts = selected_session_key.split(":")
+        if len(parts) >= 2 and parts[0] == "agent":
+            agent_id = parts[1]
+    elif session_mode == "custom":
+        selected_session_key = Prompt.ask(
+            "Session key (e.g. agent:codebitch:main)",
+        ).strip()
+        if not selected_session_key:
+            console.print("[red]Session key is required.[/red]")
+            return False
         parts = selected_session_key.split(":")
         if len(parts) >= 2 and parts[0] == "agent":
             agent_id = parts[1]
@@ -391,18 +421,30 @@ def handle_add_openclaw(config: Config) -> bool:
         console.print("[yellow]Cancelled.[/yellow]")
         return False
 
-    models[alias] = model_entry
-    if not manager.save_config(added=0 if existing else 1, updated=1 if existing else 0):
-        return False
-
-    # Keep DB model definitions in sync when DB is enabled (service uses DB precedence)
+    # Save to DB if available (authoritative store), fall back to yaml
+    db_saved = False
     try:
         store = ModelDefinitionStore(config)
         if store.engine is not None:
             store.upsert(alias, model_entry)
-            console.print("[dim]Synced to model_definitions DB.[/dim]")
+            db_saved = True
+            console.print("[dim]Saved to model_definitions DB.[/dim]")
     except Exception as e:
-        console.print(f"[yellow]Warning:[/yellow] Could not sync model to DB: {e}")
+        console.print(f"[yellow]Warning:[/yellow] Could not save model to DB: {e}")
+
+    models[alias] = model_entry
+    if not db_saved:
+        if not manager.save_config(added=0 if existing else 1, updated=1 if existing else 0):
+            return False
+    else:
+        # Silent yaml sync as fallback only
+        try:
+            manager.config_path.parent.mkdir(parents=True, exist_ok=True)
+            import yaml
+            with open(manager.config_path, 'w', encoding='utf-8') as f:
+                yaml.dump(manager.models_data, f, sort_keys=False, indent=2, default_flow_style=False, allow_unicode=True)
+        except Exception:
+            pass  # DB is authoritative, yaml failure is non-fatal
 
     # Best effort: refresh running service model catalog so --list-models and
     # /v1/models include this alias immediately without manual restart.
@@ -417,4 +459,42 @@ def handle_add_openclaw(config: Config) -> bool:
 
     console.print(f"[green]Added OpenClaw model alias '{alias}'.[/green]")
     console.print(f"[dim]Session key: {selected_session_key}[/dim]")
+
+    # --- Optionally create a bot profile bound to this model ---
+    if Confirm.ask("Create a bot for this model?", default=True):
+        default_bot_slug = _slugify(agent_id) if agent_id != "main" else _slugify(selected_session_key)
+        bot_slug = Prompt.ask("Bot slug", default=default_bot_slug).strip().lower()
+        if not bot_slug:
+            console.print("[yellow]Skipped bot creation (no slug).[/yellow]")
+            return True
+
+        bot_name = Prompt.ask("Bot display name", default=bot_slug.replace("-", " ").title()).strip()
+        bot_system_prompt = Prompt.ask(
+            "System prompt (leave blank for none)",
+            default="",
+        ).strip()
+
+        bot_payload = {
+            "name": bot_name,
+            "description": f"OpenClaw agent ({selected_session_key})",
+            "system_prompt": bot_system_prompt,
+            "requires_memory": True,
+            "default_model": alias,
+            "agent_backend": "openclaw",
+            "agent_backend_config": {"session_key": selected_session_key},
+        }
+
+        try:
+            service_client = get_service_client(config)
+            if service_client and service_client.is_available(force_check=True):
+                result = service_client.upsert_bot_profile(bot_slug, bot_payload)
+                if result:
+                    console.print(f"[green]Created bot '{bot_slug}' -> model '{alias}'[/green]")
+                else:
+                    console.print("[yellow]Service did not confirm bot creation.[/yellow]")
+            else:
+                console.print("[yellow]Service not available — bot not created. Create manually via API.[/yellow]")
+        except Exception as e:
+            console.print(f"[yellow]Warning:[/yellow] Could not create bot: {e}")
+
     return True

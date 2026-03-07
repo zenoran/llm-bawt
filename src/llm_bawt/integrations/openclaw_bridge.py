@@ -163,6 +163,9 @@ class SessionBridge:
                             if isinstance(item, dict) and item.get("text"):
                                 parts.append(item["text"])
                         content = "".join(parts)
+                    if content and self._ingest.should_drop_content(content):
+                        logger.debug("Dropping polled user message matching content filter: %.80s…", content)
+                        break
                     bot_id = self._resolve_bot_id(session_key)
                     if content and self._history_sink and bot_id:
                         self._history_sink(bot_id, "user", content)

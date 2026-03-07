@@ -5,7 +5,7 @@ import logging
 import random
 import uuid
 from dataclasses import dataclass, field
-from typing import Awaitable, Callable
+from typing import AsyncIterator, Awaitable, Callable
 
 try:
     import websockets
@@ -35,6 +35,7 @@ class OpenClawWsClient:
         self._closing = False
         self._stream_seq = 0
         self._pending_requests: dict[str, asyncio.Future] = {}
+        self._run_queues: dict[str, asyncio.Queue[dict | None]] = {}
 
     async def connect(self) -> None:
         if not self._config.url:
@@ -63,6 +64,7 @@ class OpenClawWsClient:
                 raise RuntimeError("gateway connect challenge missing nonce")
 
             req_id = uuid.uuid4().hex
+            caps = ["tool-events"]
             connect_req = {
                 "type": "req",
                 "id": req_id,
@@ -77,6 +79,7 @@ class OpenClawWsClient:
                         "mode": "cli",
                     },
                     "role": "operator",
+                    "caps": caps,
                     "scopes": ["operator.read", "operator.write", "operator.admin", "chat.read", "chat.write", "session.read", "session.write"],
                     "auth": {"token": self._config.token} if self._config.token else {},
                 },
@@ -90,7 +93,7 @@ class OpenClawWsClient:
                 raise RuntimeError(f"gateway connect failed: {err}")
 
             self._connected = True
-            logger.info("OpenClaw WS connected to %s", self._config.url)
+            logger.info("OpenClaw WS connected to %s (caps=%s)", self._config.url, ",".join(caps))
             from .metrics import get_metrics
             get_metrics().incr("openclaw.ws_connects")
             self._receive_task = asyncio.create_task(self._receive_loop())
@@ -121,6 +124,16 @@ class OpenClawWsClient:
                     if fut and not fut.done():
                         fut.set_result(data)
                     continue
+
+                # Route to per-run listeners if this is an event with a runId
+                if data.get("type") == "event":
+                    payload = data.get("payload") or {}
+                    run_id = payload.get("runId") or payload.get("run_id")
+                    if run_id and run_id in self._run_queues:
+                        try:
+                            self._run_queues[run_id].put_nowait(data)
+                        except asyncio.QueueFull:
+                            logger.warning("Run queue full for %s, dropping event", run_id)
 
                 if self._event_callback:
                     try:
@@ -218,6 +231,56 @@ class OpenClawWsClient:
         payload = res.get("payload") or {}
         run_id = str(payload.get("runId") or payload.get("run_id") or params["idempotencyKey"])
         return run_id
+
+    async def send_and_stream(
+        self,
+        session_key: str,
+        text: str,
+        *,
+        timeout: float = 600,
+    ) -> AsyncIterator[dict]:
+        """Send a message via chat.send and yield raw WS events for the resulting run.
+
+        Events are yielded until a lifecycle end/error event is received,
+        or until timeout. The caller gets the full stream of agent events
+        (assistant deltas, tool events, lifecycle, errors) for this run.
+        """
+        run_id = await self.send_user_message(session_key, text)
+        queue: asyncio.Queue[dict | None] = asyncio.Queue(maxsize=2000)
+        self._run_queues[run_id] = queue
+
+        try:
+            deadline = asyncio.get_event_loop().time() + timeout
+            while True:
+                remaining = deadline - asyncio.get_event_loop().time()
+                if remaining <= 0:
+                    logger.warning("send_and_stream timeout for run %s", run_id)
+                    return
+
+                try:
+                    raw = await asyncio.wait_for(queue.get(), timeout=min(remaining, 5.0))
+                except asyncio.TimeoutError:
+                    if not self._connected:
+                        logger.warning("WS disconnected during send_and_stream for run %s", run_id)
+                        return
+                    continue
+
+                if raw is None:
+                    return
+
+                yield raw
+
+                # Check if this is a lifecycle end/error -> run done
+                payload = raw.get("payload") or {}
+                if raw.get("type") == "event" and raw.get("event") == "agent":
+                    stream = payload.get("stream")
+                    data = payload.get("data") or {}
+                    if stream == "lifecycle" and data.get("phase") in ("end", "error"):
+                        return
+                    if stream == "error":
+                        return
+        finally:
+            self._run_queues.pop(run_id, None)
 
     async def get_chat_history(self, session_key: str, *, limit: int = 50) -> list[dict]:
         """Fetch chat history for a session via the gateway."""

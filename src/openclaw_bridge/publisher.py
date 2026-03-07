@@ -25,9 +25,13 @@ logger = logging.getLogger(__name__)
 # Stream names
 EVENTS_STREAM_PREFIX = "openclaw:events:"
 HISTORY_STREAM = "openclaw:history"
+COMMANDS_STREAM = "openclaw:commands"
+RUN_STREAM_PREFIX = "openclaw:run:"
 
 # Keep last 10k events per session stream (auto-trimmed)
 STREAM_MAXLEN = 10_000
+# Run response streams are shorter-lived
+RUN_STREAM_MAXLEN = 5_000
 
 
 class RedisPublisher:
@@ -85,6 +89,38 @@ class RedisPublisher:
             logger.exception("Failed to publish history command")
             get_metrics().incr("openclaw.redis_publish_errors", stream="history")
             return None
+
+    def publish_run_event(self, request_id: str, event: OpenClawEvent) -> str | None:
+        """Publish an event to a per-run response stream for the requesting client."""
+        if not self._connected:
+            return None
+        stream_key = f"{RUN_STREAM_PREFIX}{request_id}"
+        try:
+            data = event.to_dict()
+            fields = {"payload": json.dumps(data, ensure_ascii=False, default=str)}
+            stream_id = self._redis.xadd(
+                stream_key,
+                fields,
+                maxlen=RUN_STREAM_MAXLEN,
+                approximate=True,
+            )
+            get_metrics().incr("openclaw.redis_publish", stream="run")
+            return stream_id
+        except Exception:
+            logger.exception("Failed to publish run event to %s", stream_key)
+            return None
+
+    def publish_run_done(self, request_id: str) -> None:
+        """Signal that a run is complete by writing a sentinel entry."""
+        if not self._connected:
+            return
+        stream_key = f"{RUN_STREAM_PREFIX}{request_id}"
+        try:
+            self._redis.xadd(stream_key, {"done": "1"}, maxlen=RUN_STREAM_MAXLEN, approximate=True)
+            # Expire the run stream after 5 minutes (cleanup)
+            self._redis.expire(stream_key, 300)
+        except Exception:
+            logger.exception("Failed to publish run done to %s", stream_key)
 
     def close(self) -> None:
         try:

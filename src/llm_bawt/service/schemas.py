@@ -207,6 +207,8 @@ class BotProfileResponse(BaseModel):
     uses_home_assistant: bool = False
     default_model: str | None = None
     nextcloud_config: dict[str, Any] | None = None
+    agent_backend: str | None = None
+    agent_backend_config: dict[str, Any] | None = None
     created_at: datetime | None = None
     updated_at: datetime | None = None
 
@@ -226,6 +228,8 @@ class BotProfileUpsertRequest(BaseModel):
     uses_home_assistant: bool = False
     default_model: str | None = None
     nextcloud_config: dict[str, Any] | None = None
+    agent_backend: str | None = None
+    agent_backend_config: dict[str, Any] | None = None
 
 
 class TaskSubmitRequest(BaseModel):

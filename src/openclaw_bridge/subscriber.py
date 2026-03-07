@@ -14,7 +14,7 @@ from typing import AsyncIterator
 import redis.asyncio as aioredis
 
 from .events import OpenClawEvent
-from .publisher import EVENTS_STREAM_PREFIX, HISTORY_STREAM
+from .publisher import COMMANDS_STREAM, EVENTS_STREAM_PREFIX, HISTORY_STREAM, RUN_STREAM_PREFIX
 
 logger = logging.getLogger(__name__)
 
@@ -87,6 +87,79 @@ class RedisSubscriber:
                         from .events import OpenClawEventKind
                         if event.kind in (OpenClawEventKind.RUN_COMPLETED, OpenClawEventKind.ERROR):
                             return
+
+    async def send_command(
+        self,
+        session_key: str,
+        message: str,
+        request_id: str,
+    ) -> None:
+        """Publish a chat.send command to the bridge's command stream."""
+        await self._redis.xadd(
+            COMMANDS_STREAM,
+            {
+                "action": "chat.send",
+                "session_key": session_key,
+                "message": message,
+                "request_id": request_id,
+            },
+            maxlen=1000,
+            approximate=True,
+        )
+        logger.debug("Sent command: request_id=%s session=%s", request_id, session_key)
+
+    async def subscribe_run(
+        self,
+        request_id: str,
+        *,
+        timeout_s: float = 600,
+    ) -> AsyncIterator[OpenClawEvent]:
+        """Subscribe to the per-run response stream published by the bridge.
+
+        Yields events until the bridge signals 'done' or timeout.
+        """
+        stream_key = f"{RUN_STREAM_PREFIX}{request_id}"
+        last_id = "0"  # read from beginning (stream is created fresh per run)
+        deadline = asyncio.get_event_loop().time() + timeout_s
+
+        while True:
+            remaining = deadline - asyncio.get_event_loop().time()
+            if remaining <= 0:
+                logger.warning("subscribe_run timeout for request_id=%s", request_id)
+                return
+
+            block_ms = min(int(remaining * 1000), 2000)
+            try:
+                results = await self._redis.xread(
+                    {stream_key: last_id},
+                    count=100,
+                    block=block_ms,
+                )
+            except Exception:
+                logger.exception("Redis XREAD error on %s", stream_key)
+                await asyncio.sleep(1)
+                continue
+
+            if not results:
+                continue
+
+            for _stream_name, messages in results:
+                for msg_id, fields in messages:
+                    last_id = msg_id
+
+                    # Check for done sentinel
+                    if fields.get("done"):
+                        return
+
+                    payload_str = fields.get("payload", "{}")
+                    try:
+                        data = json.loads(payload_str)
+                        event = OpenClawEvent.from_dict(data)
+                    except Exception:
+                        logger.debug("Failed to parse run event: %s", payload_str[:200])
+                        continue
+
+                    yield event
 
     async def drain_history(
         self,

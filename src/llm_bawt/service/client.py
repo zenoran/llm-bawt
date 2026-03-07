@@ -833,6 +833,17 @@ class ServiceClient:
             logger.warning(f"Upsert bot profile via service failed: {e}")
             return None
 
+    def delete_bot_profile(self, slug: str) -> bool:
+        """Delete a bot profile via the service. Returns True on success."""
+        if not self.is_available():
+            return False
+        try:
+            self._request("DELETE", f"/v1/bots/{slug}/profile")
+            return True
+        except Exception as e:
+            logger.warning(f"Delete bot profile via service failed: {e}")
+            return False
+
     # -----------------------------------------------------------------
     # User/bot profiles
     # -----------------------------------------------------------------

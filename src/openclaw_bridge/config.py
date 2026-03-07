@@ -8,9 +8,10 @@ from dataclasses import dataclass, field
 
 @dataclass
 class BridgeConfig:
-    # OpenClaw Gateway WebSocket
-    ws_url: str = ""
-    ws_token: str = ""
+    # OpenClaw Gateway
+    gateway_url: str = ""  # HTTP base URL (e.g. http://10.0.0.97:18789)
+    ws_url: str = ""       # WS URL (e.g. ws://10.0.0.97:18789/v1/ws)
+    ws_token: str = ""     # Bearer token for both HTTP and WS auth
     session_keys: list[str] = field(default_factory=lambda: ["main"])
     reconnect_max_delay: int = 60
 
@@ -29,6 +30,11 @@ class BridgeConfig:
 
     # Health check
     health_port: int = 8680
+
+    # Ingest filters (comma-separated; merged with built-in defaults)
+    ingest_drop_patterns: str = ""   # regex patterns to drop from user message content
+    ingest_drop_events: str = ""     # additional gateway event names to drop
+    ingest_drop_msg_types: str = ""  # additional top-level msg types to drop
 
     # Logging
     log_level: str = "INFO"
@@ -50,6 +56,9 @@ class BridgeConfig:
             redis_url=os.environ.get("REDIS_URL", "redis://localhost:6379/0"),
             session_to_bot_json=os.environ.get("OPENCLAW_SESSION_TO_BOT", ""),
             health_port=int(os.environ.get("OPENCLAW_BRIDGE_HEALTH_PORT", "8680")),
+            ingest_drop_patterns=os.environ.get("OPENCLAW_INGEST_DROP_PATTERNS", ""),
+            ingest_drop_events=os.environ.get("OPENCLAW_INGEST_DROP_EVENTS", ""),
+            ingest_drop_msg_types=os.environ.get("OPENCLAW_INGEST_DROP_MSG_TYPES", ""),
             log_level=os.environ.get("OPENCLAW_BRIDGE_LOG_LEVEL", "INFO"),
         )
 

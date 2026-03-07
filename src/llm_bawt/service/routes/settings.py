@@ -51,6 +51,8 @@ def _to_profile_response(profile) -> BotProfileResponse:
         uses_home_assistant=profile.uses_home_assistant,
         default_model=profile.default_model,
         nextcloud_config=profile.nextcloud_config,
+        agent_backend=profile.agent_backend,
+        agent_backend_config=profile.agent_backend_config,
         created_at=profile.created_at,
         updated_at=profile.updated_at,
     )
@@ -373,6 +375,8 @@ async def upsert_bot_profile(slug: str, request: BotProfileUpsertRequest):
             "uses_home_assistant": request.uses_home_assistant,
             "default_model": request.default_model,
             "nextcloud_config": request.nextcloud_config,
+            "agent_backend": request.agent_backend,
+            "agent_backend_config": request.agent_backend_config,
         }
     )
     _reload_bot_registry()

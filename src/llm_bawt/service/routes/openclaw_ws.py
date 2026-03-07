@@ -23,48 +23,27 @@ def _sse(event: str, data: dict) -> str:
 @router.get("/v1/ws", tags=["OpenClaw Bridge"])
 async def openclaw_ws_bridge(
     session_key: str = Query("main", description="Session key to stream"),
-    since_id: int | None = Query(None, description="Replay events after this DB id before tailing live"),
 ):
-    """Expose OpenClaw bridge events as SSE.
-
-    Supports both Redis subscriber mode (external bridge) and
-    in-process fanout mode (legacy).
-    """
+    """Expose OpenClaw bridge events as SSE via Redis subscriber."""
     service = get_service()
 
-    # Check for Redis subscriber first (external bridge mode)
     redis_sub = getattr(service, "_redis_subscriber", None)
-
-    # Fall back to in-process bridge
-    bridge = getattr(service, "_session_bridge", None)
-    fanout = getattr(bridge, "_fanout", None) if bridge else None
-    store = getattr(bridge, "_store", None) if bridge else None
-
-    if redis_sub is None and (fanout is None or store is None):
-        raise HTTPException(status_code=503, detail="OpenClaw bridge not enabled")
+    if redis_sub is None:
+        raise HTTPException(status_code=503, detail="OpenClaw bridge not enabled (no Redis subscriber)")
 
     async def event_stream():
-        # Initial hello
-        cursor = store.get_session_cursor(session_key) if store else None
-        connected = bool(getattr(bridge, "connected", False)) if bridge else True
         yield _sse(
             "hello",
             {
                 "session_key": session_key,
-                "connected": connected,
-                "cursor": cursor,
+                "connected": True,
                 "ts": datetime.utcnow().isoformat() + "Z",
             },
         )
 
         last_ping = asyncio.get_running_loop().time()
         try:
-            if redis_sub:
-                source = redis_sub.subscribe(session_key)
-            else:
-                source = fanout.subscribe(session_key, since_event_id=since_id)
-
-            async for evt in source:
+            async for evt in redis_sub.subscribe(session_key):
                 payload = {
                     "id": evt.db_id,
                     "event_id": evt.event_id,

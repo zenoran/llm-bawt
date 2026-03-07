@@ -35,6 +35,9 @@ services:
       - ${LLM_BAWT_MODEL_CACHE_DIR:-${HOME}/.cache/llm-bawt/models}:/root/.cache/llm-bawt/models
       # Mount HuggingFace cache for GGUF models
       - ${HF_HOME:-${HOME}/.cache/huggingface}:/root/.cache/huggingface
+    depends_on:
+      redis:
+        condition: service_healthy
     restart: unless-stopped
     stdin_open: true
     tty: true
@@ -53,20 +56,16 @@ services:
       interval: 10s
       timeout: 3s
       retries: 3
-    profiles:
-      - bridge
 
   openclaw-bridge:
-    build:
-      context: .
-      dockerfile: Dockerfile
-      args:
-        WITH_CUDA: "false"
+    image: llm-bawt-app
     container_name: llm-bawt-openclaw-bridge
     command: ["python", "-m", "openclaw_bridge"]
     env_file:
       - ./.env
     environment:
+      - OPENCLAW_WS_URL=${OPENCLAW_WS_URL:-}
+      - OPENCLAW_GATEWAY_TOKEN=${OPENCLAW_GATEWAY_TOKEN:-}
       - OPENCLAW_BRIDGE_LOG_LEVEL=${OPENCLAW_BRIDGE_LOG_LEVEL:-INFO}
       - OPENCLAW_SESSION_TO_BOT=${OPENCLAW_SESSION_TO_BOT:-}
       - REDIS_URL=redis://redis:6379/0
@@ -86,8 +85,6 @@ services:
       timeout: 5s
       retries: 3
       start_period: 10s
-    profiles:
-      - bridge
 
   crawl4ai:
     image: unclecode/crawl4ai:latest

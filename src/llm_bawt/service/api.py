@@ -73,7 +73,6 @@ async def lifespan(app):
         log.info(f"📅 Scheduler started (interval={config.SCHEDULER_CHECK_INTERVAL_SECONDS}s)")
 
     # Start OpenClaw integration (Redis subscriber or in-process bridge)
-    session_bridge = None
     redis_subscriber = None
     history_drain_task = None
     if config.OPENCLAW_WS_ENABLED and config.OPENCLAW_WS_URL:
@@ -113,13 +112,21 @@ async def lifespan(app):
             if session_to_bot:
                 log.info("OpenClaw session->bot mapping: %s", session_to_bot)
 
-            if config.REDIS_URL:
-                # Redis mode: bridge runs separately, we just subscribe
+            if not config.REDIS_URL:
+                log.error(
+                    "OpenClaw WS is enabled but REDIS_URL is not set. "
+                    "The bridge requires Redis for command/event transport."
+                )
+            else:
                 from openclaw_bridge.subscriber import RedisSubscriber
+                from ..agent_backends.openclaw import set_openclaw_subscriber
 
                 redis_subscriber = RedisSubscriber(config.REDIS_URL)
                 await redis_subscriber.connect()
                 service._redis_subscriber = redis_subscriber
+
+                # Make subscriber available to OpenClawBackend instances
+                set_openclaw_subscriber(redis_subscriber)
 
                 # Start history drain background task
                 def _history_sink(bot_id: str, role: str, content: str) -> None:
@@ -138,59 +145,8 @@ async def lifespan(app):
                     config.REDIS_URL,
                     list(session_to_bot.keys()),
                 )
-            else:
-                # In-process mode: run bridge + fanout locally (legacy)
-                from ..integrations.openclaw_bridge import SessionBridge
-                from ..integrations.openclaw_fanout import FanoutHub
-                from openclaw_bridge.store import EventStore, create_openclaw_tables
-                from openclaw_bridge.ws_client import OpenClawWsClient, OpenClawWsConfig
-
-                from sqlalchemy import create_engine
-                pg_url = (
-                    f"postgresql://{config.POSTGRES_USER}:{config.POSTGRES_PASSWORD}"
-                    f"@{config.POSTGRES_HOST}:{config.POSTGRES_PORT}/{config.POSTGRES_DATABASE}"
-                )
-                bridge_engine = create_engine(pg_url)
-                create_openclaw_tables(bridge_engine)
-
-                ws_config = OpenClawWsConfig(
-                    url=config.OPENCLAW_WS_URL,
-                    token=config.OPENCLAW_GATEWAY_TOKEN,
-                    session_keys=[s.strip() for s in config.OPENCLAW_WS_SESSIONS.split(",") if s.strip()],
-                    reconnect_max_delay=config.OPENCLAW_WS_RECONNECT_MAX_DELAY,
-                )
-
-                ws_client = OpenClawWsClient(ws_config)
-                ingest = EventIngestPipeline()
-                store = EventStore(bridge_engine)
-                fanout = FanoutHub(store)
-
-                for sk in session_to_bot:
-                    if sk not in ws_config.session_keys:
-                        ws_config.session_keys.append(sk)
-                        ws_client._subscribed_sessions.add(sk)
-
-                def _history_sink(bot_id: str, role: str, content: str) -> None:
-                    client = service.get_memory_client(bot_id)
-                    if client:
-                        client.add_message(role=role, content=content)
-
-                session_bridge = SessionBridge(
-                    ws_client, ingest, store, fanout,
-                    history_sink=_history_sink,
-                    session_to_bot=session_to_bot,
-                )
-
-                await session_bridge.start()
-                service._session_bridge = session_bridge
-                log.info(
-                    "OpenClaw WS bridge started in-process (mode=%s, sessions=%s)",
-                    config.OPENCLAW_MODE,
-                    ws_config.session_keys,
-                )
         except Exception:
             log.exception("Failed to start OpenClaw integration")
-            session_bridge = None
             redis_subscriber = None
 
     # Log startup with rich formatting
@@ -218,9 +174,9 @@ async def lifespan(app):
             except (asyncio.CancelledError, Exception):
                 pass
         if redis_subscriber:
+            from ..agent_backends.openclaw import set_openclaw_subscriber
+            set_openclaw_subscriber(None)
             await redis_subscriber.close()
-        if session_bridge:
-            await session_bridge.stop()
         if scheduler:
             await scheduler.stop()
         await service.shutdown()

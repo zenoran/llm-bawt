@@ -239,53 +239,37 @@ class Config(RuntimeTunables, BaseSettings):
     # --- xAI (Grok) Settings --- #
     XAI_API_KEY: str = Field(default="", description="xAI API key for Grok models (get from x.ai)")
 
-    # --- OpenClaw Gateway Settings --- #
-    OPENCLAW_GATEWAY_URL: str = Field(
-        default="http://127.0.0.1:18789",
-        description="OpenClaw gateway base URL",
-    )
+    # --- OpenClaw Settings --- #
     OPENCLAW_GATEWAY_TOKEN: str = Field(
         default="",
-        description="Bearer token for OpenClaw gateway",
+        description="Bearer token for OpenClaw gateway (used by bridge)",
     )
-    OPENCLAW_AGENT_ID: str = Field(
-        default="main",
-        description="OpenClaw agent namespace",
-    )
-    OPENCLAW_STREAM_ENABLED: bool = Field(
-        default=True,
-        description="Enable SSE streaming for OpenClaw responses",
-    )
-    OPENCLAW_USE_SSH_FALLBACK: bool = Field(
-        default=False,
-        description="Allow SSH transport as emergency fallback",
-    )
-
-    # --- OpenClaw WebSocket Bridge Settings --- #
     OPENCLAW_WS_ENABLED: bool = Field(
         default=False,
-        description="Enable WebSocket session bridge (Phase 1: shadow mode)",
-    )
-    OPENCLAW_MODE: str = Field(
-        default="http",
-        description="'ws_bridge' | 'http'. WS bridge for session-subscribed mode, HTTP for per-request mode.",
+        description="Enable OpenClaw integration via bridge",
     )
     OPENCLAW_WS_URL: str = Field(
         default="",
-        description="OpenClaw gateway WebSocket URL (e.g. ws://127.0.0.1:18789/v1/ws). Empty = bridge disabled.",
+        description="OpenClaw gateway WebSocket URL (e.g. ws://10.0.0.97:18789/v1/ws). Empty = bridge disabled.",
     )
     OPENCLAW_WS_SESSIONS: str = Field(
         default="main",
         description="Comma-separated session keys to subscribe to",
     )
-    OPENCLAW_WS_RECONNECT_MAX_DELAY: int = Field(
-        default=60,
-        description="Max reconnect delay in seconds",
-    )
     REDIS_URL: str = Field(
         default="",
-        description="Redis URL for OpenClaw bridge event fanout (e.g. redis://localhost:6379/0). Empty = use in-process fanout.",
+        description="Redis URL for bridge command/event transport (e.g. redis://redis:6379/0)",
     )
+    # Deprecated: kept for env file compat, silently ignored
+    OPENCLAW_GATEWAY_URL: str = Field(default="", exclude=True)
+    OPENCLAW_AGENT_ID: str = Field(default="main", exclude=True)
+    OPENCLAW_STREAM_ENABLED: bool = Field(default=True, exclude=True)
+    OPENCLAW_USE_SSH_FALLBACK: bool = Field(default=False, exclude=True)
+    OPENCLAW_MODE: str = Field(default="ws_bridge", exclude=True)
+    OPENCLAW_WS_RECONNECT_MAX_DELAY: int = Field(default=60, exclude=True)
+    OPENCLAW_INGEST_DROP_PATTERNS: str = Field(default="", exclude=True)
+    OPENCLAW_INGEST_DROP_EVENTS: str = Field(default="", exclude=True)
+    OPENCLAW_INGEST_DROP_MSG_TYPES: str = Field(default="", exclude=True)
 
     # --- Web Search Settings --- #
     NEWSAPI_API_KEY: str = Field(

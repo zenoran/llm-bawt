@@ -635,6 +635,16 @@ class BackgroundService:
         extracted_tool_calls = self._extract_agent_backend_tool_calls(llm_bawt=llm_bawt)
         if extracted_tool_calls:
             tool_call_details.extend(extracted_tool_calls)
+            # For agent backends (e.g. OpenClaw), tools execute remotely so
+            # tool_context is empty.  Synthesize it from the extracted calls
+            # so that tool usage is persisted alongside the response.
+            if not tool_context:
+                parts = []
+                for tc in extracted_tool_calls:
+                    name = tc.get("tool") or tc.get("name", "unknown")
+                    result = tc.get("result", "")
+                    parts.append(f"[{name}]\n{result}")
+                tool_context = "\n\n".join(parts)
 
         llm_bawt.finalize_response(response_text, tool_context)
 
@@ -1323,29 +1333,8 @@ class BackgroundService:
             yield "data: [DONE]\n\n"
             return
 
-        # --- OpenClaw WS Bridge Mode ---
-        # When OPENCLAW_MODE=ws_bridge and this bot uses an openclaw agent backend,
-        # route through the SessionBridge instead of the normal HTTP stream path.
-        _use_bridge = (
-            (self._session_bridge is not None or getattr(self, '_redis_subscriber', None) is not None)
-            and self.config.OPENCLAW_MODE == "ws_bridge"
-            and self._is_openclaw_bot(model_alias)
-        )
-        if _use_bridge:
-            async for chunk in self._stream_via_bridge(
-                user_prompt=user_prompt,
-                session_key=self._get_openclaw_session_key(model_alias),
-                response_id=response_id,
-                created=created,
-                model_alias=model_alias,
-                bot_id=bot_id,
-                user_id=user_id,
-                ctx=ctx,
-                turn_log_id=f"turn-{uuid.uuid4().hex}",
-                llm_bawt=llm_bawt,
-            ):
-                yield chunk
-            return
+        # OpenClaw bots now flow through the normal AgentBackendClient.stream_raw()
+        # pipeline, which routes via Redis -> Bridge -> WS automatically.
 
         chunk_queue: asyncio.Queue = asyncio.Queue()
         full_response_holder = [""]  # Use list to allow mutation in nested function

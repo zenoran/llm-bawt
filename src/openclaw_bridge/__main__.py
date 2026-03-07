@@ -11,7 +11,7 @@ import sys
 
 from .bridge import SessionBridge
 from .config import BridgeConfig
-from .ingest import EventIngestPipeline
+from .ingest import EventIngestPipeline, IngestFilterConfig
 from .metrics import get_metrics
 from .publisher import RedisPublisher
 from .store import EventStore, create_openclaw_tables
@@ -88,10 +88,17 @@ def main() -> None:
     )
     ws_client = OpenClawWsClient(ws_config)
 
+    # Ingest filters
+    ingest_filter = IngestFilterConfig.from_env(
+        drop_patterns_csv=config.ingest_drop_patterns,
+        drop_events_csv=config.ingest_drop_events,
+        drop_msg_types_csv=config.ingest_drop_msg_types,
+    )
+
     # Assemble bridge
     bridge = SessionBridge(
         ws_client=ws_client,
-        ingest=EventIngestPipeline(),
+        ingest=EventIngestPipeline(filter_config=ingest_filter),
         store=EventStore(engine),
         publisher=publisher,
         session_to_bot=config.session_to_bot,

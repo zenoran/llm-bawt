@@ -395,6 +395,19 @@ class ModelManager:
             console.print("[info]Deletion cancelled.[/info]")
             return True
         del models[alias]
+
+        # Delete from DB (authoritative store)
+        db_deleted = False
+        try:
+            store = ModelDefinitionStore(self.config)
+            if store.engine is not None:
+                db_deleted = store.delete(alias)
+                if db_deleted:
+                    console.print(f"[dim]Removed '{alias}' from model_definitions DB.[/dim]")
+        except Exception as e:
+            console.print(f"[yellow]Warning:[/yellow] Could not delete from DB: {e}")
+
+        # Also remove from yaml
         return self.save_config(deleted=1)
 
     def update_models(self, provider_type: Optional[str] = None):
@@ -790,6 +803,39 @@ def list_models(config: Config):
         manager.config = config
     manager.list_available_models()
 
+def _delete_openclaw_bot(alias: str, config: Config) -> None:
+    """Offer to delete bot profiles that reference this openclaw model alias."""
+    from llm_bawt.service.client import ServiceClient
+    service_url = getattr(config, 'SERVICE_URL', None)
+    if not service_url and hasattr(config, 'SERVICE_HOST') and hasattr(config, 'SERVICE_PORT'):
+        host = config.SERVICE_HOST or "localhost"
+        service_url = f"http://{host}:{config.SERVICE_PORT}"
+    client = ServiceClient(http_url=service_url)
+    if not client.is_available():
+        console.print("[yellow]Service not running — cannot check for associated bot profiles.[/yellow]")
+        return
+
+    bots = client.list_bots() or []
+    matching = [b for b in bots if b.get("default_model") == alias]
+    if not matching:
+        return
+
+    for bot in matching:
+        slug = bot.get("slug", "")
+        name = bot.get("name", slug)
+        if Confirm.ask(f"Delete bot profile '[cyan]{name}[/cyan]' (slug: {slug})?", default=True):
+            if Confirm.ask(f"  Also clear message history for '{slug}'?", default=True):
+                result = client.clear_history(bot_id=slug)
+                if result:
+                    console.print(f"[green]History cleared for '{slug}'.[/green]")
+                else:
+                    console.print(f"[yellow]Could not clear history for '{slug}'.[/yellow]")
+            if client.delete_bot_profile(slug):
+                console.print(f"[green]Bot profile '{slug}' deleted.[/green]")
+            else:
+                console.print(f"[red]Failed to delete bot profile '{slug}'.[/red]")
+
+
 def delete_model(alias: str, config: Config) -> bool:
     manager = ModelManager(config)
     # Get model info before deletion from config
@@ -801,6 +847,10 @@ def delete_model(alias: str, config: Config) -> bool:
         # Avoid probing Ollama during unrelated operations.
         # Ollama connectivity/model checks happen only when explicitly refreshing Ollama models.
         
+        # If the model is an OpenClaw model, offer to delete the associated bot profile
+        if model_info and model_info.get('type') == 'openclaw':
+            _delete_openclaw_bot(alias, config)
+
         # If the model is a GGUF model, check if we should delete the model files as well
         if model_info and model_info.get('type') == PROVIDER_GGUF:
             repo_id = model_info.get('repo_id')
