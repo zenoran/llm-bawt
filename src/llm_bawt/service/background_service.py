@@ -1262,6 +1262,12 @@ class BackgroundService:
                     elapsed_ms=elapsed_ms,
                     stream=True,
                 )
+            else:
+                self._update_turn_log(
+                    turn_id=turn_log_id,
+                    status="timeout",
+                    latency_ms=elapsed_ms,
+                )
 
         except Exception as e:
             log.error("OpenClaw bridge stream failed: %s", e)
@@ -1654,10 +1660,10 @@ class BackgroundService:
                     error_text=str(e),
                 )
             finally:
+                end_time = timing_holder[1] or time.time()
+                start_time = timing_holder[0] or end_time
+                elapsed_ms = (end_time - start_time) * 1000
                 if full_response_holder[0]:
-                    end_time = timing_holder[1] or time.time()
-                    start_time = timing_holder[0] or end_time
-                    elapsed_ms = (end_time - start_time) * 1000
                     self._finalize_turn(
                         llm_bawt=llm_bawt,
                         turn_id=turn_log_id,
@@ -1671,6 +1677,14 @@ class BackgroundService:
                         user_id=user_id,
                         elapsed_ms=elapsed_ms,
                         stream=True,
+                    )
+                else:
+                    # No response received — mark as timeout so turn doesn't
+                    # stay stuck at status='streaming' forever.
+                    self._update_turn_log(
+                        turn_id=turn_log_id,
+                        status="timeout",
+                        latency_ms=elapsed_ms,
                     )
 
                 put_queue_item_threadsafe(loop, chunk_queue, None)  # Sentinel
