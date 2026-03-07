@@ -217,43 +217,25 @@ def _load_db_bot_overrides() -> dict[str, dict[str, Any]]:
         return {}
 
 
-def _load_bots_config() -> None:
-    """Load bot definitions from YAML (repo + user config).
-
-    When available, DB-backed bot_profiles are loaded as overrides with higher
-    precedence than YAML bot fields.
-    """
-    global BUILTIN_BOTS, _DEFAULTS, _SYSTEM_PROMPTS, _RAW_BOT_DATA, _BOT_SETTINGS_TEMPLATE
-    global _LAST_REPO_MTIME, _LAST_USER_MTIME
-
+def _load_merged_yaml() -> tuple[dict, Path, Path]:
+    """Load and merge repo + user bots YAML. Returns (merged_data, repo_path, user_path)."""
     repo_path = get_repo_bots_yaml_path()
     user_path = get_user_bots_yaml_path()
-
-    # Track mtimes for hot reload
-    _LAST_REPO_MTIME = repo_path.stat().st_mtime if repo_path.exists() else 0
-    _LAST_USER_MTIME = user_path.stat().st_mtime if user_path.exists() else 0
-
-    # Load repo config (defaults)
     repo_data = _load_yaml_file(repo_path) or {}
-
-    # Load user config (overrides)
     user_data = _load_yaml_file(user_path) or {}
+    return _deep_merge(repo_data, user_data), repo_path, user_path
 
-    # Merge: user overrides repo
-    merged_data = _deep_merge(repo_data, user_data)
 
-    if not merged_data:
-        logger.warning("No bot configuration found in repo or user config")
-        return
+def _build_bots_from_data(
+    merged_data: dict,
+    *,
+    skip_db: bool = False,
+) -> tuple[dict[str, Bot], dict[str, dict], dict[str, str], dict[str, str]]:
+    """Build bot objects from merged YAML data, optionally overlaying DB profiles.
 
-    # Clear existing data
-    BUILTIN_BOTS.clear()
-    _RAW_BOT_DATA.clear()
-    _SYSTEM_PROMPTS.clear()
-    _DEFAULTS.clear()
-    _DEFAULTS.update(_DEFAULTS_BASE)
-    _BOT_SETTINGS_TEMPLATE = _extract_bot_settings_template(merged_data)
-
+    Returns (bots, raw_data, system_prompts, defaults).
+    """
+    settings_template = _extract_bot_settings_template(merged_data)
     merged_bots = merged_data.get("bots", {}) if isinstance(merged_data.get("bots"), dict) else {}
     effective_bots: dict[str, dict[str, Any]] = {}
     for slug, bot_data in merged_bots.items():
@@ -262,32 +244,34 @@ def _load_bots_config() -> None:
             continue
         effective_bots[normalized_slug] = dict(bot_data)
 
-    # DB-backed bot_profiles take precedence over YAML.
-    db_overrides = _load_db_bot_overrides()
-    for slug, db_payload in db_overrides.items():
-        base = effective_bots.get(slug, {})
-        merged_payload = dict(base)
-        merged_payload.update(db_payload)
-        effective_bots[slug] = merged_payload
+    db_count = 0
+    if not skip_db:
+        db_overrides = _load_db_bot_overrides()
+        db_count = len(db_overrides)
+        for slug, db_payload in db_overrides.items():
+            base = effective_bots.get(slug, {})
+            merged_payload = dict(base)
+            merged_payload.update(db_payload)
+            effective_bots[slug] = merged_payload
+
+    bots: dict[str, Bot] = {}
+    raw_data: dict[str, dict] = {}
 
     def _build_settings(yaml_bot_data: dict[str, Any] | None = None) -> dict[str, Any]:
         yaml_settings = {}
         if isinstance(yaml_bot_data, dict):
             yaml_settings = yaml_bot_data.get("settings", {}) or {}
-        return _deep_merge(_BOT_SETTINGS_TEMPLATE, yaml_settings)
+        return _deep_merge(settings_template, yaml_settings)
 
-    def _register_bot(slug: str, bot_data: dict[str, Any]) -> None:
-        normalized_slug = (slug or "").strip().lower()
-        if not normalized_slug:
-            return
+    for slug, bot_data in effective_bots.items():
         effective_settings = _build_settings(bot_data)
         merged_bot_data = dict(bot_data)
         merged_bot_data["settings"] = effective_settings
-        _RAW_BOT_DATA[normalized_slug] = merged_bot_data
+        raw_data[slug] = merged_bot_data
         bot_color = bot_data.get("color") or effective_settings.get("ui_color")
-        BUILTIN_BOTS[normalized_slug] = Bot(
-            slug=normalized_slug,
-            name=bot_data.get("name", normalized_slug.title()),
+        bots[slug] = Bot(
+            slug=slug,
+            name=bot_data.get("name", slug.title()),
             description=bot_data.get("description", ""),
             system_prompt=bot_data.get("system_prompt", "You are a helpful assistant."),
             requires_memory=bot_data.get("requires_memory", True),
@@ -306,20 +290,63 @@ def _load_bots_config() -> None:
             settings=effective_settings,
         )
 
-    for slug, bot_data in effective_bots.items():
-        _register_bot(slug, bot_data)
-
-    # Load defaults (merged)
+    defaults = dict(_DEFAULTS_BASE)
     if "defaults" in merged_data:
-        _DEFAULTS.update(merged_data["defaults"])
+        defaults.update(merged_data["defaults"])
 
-    # Load system prompts (merged)
+    system_prompts: dict[str, str] = {}
     if "system_prompts" in merged_data:
-        _SYSTEM_PROMPTS.update(merged_data["system_prompts"])
+        system_prompts.update(merged_data["system_prompts"])
 
     logger.debug(
-        f"Loaded {len(BUILTIN_BOTS)} bots "
-        f"(repo: {repo_path.exists()}, user: {user_path.exists()}, db_overrides: {len(db_overrides)})"
+        "Built %d bots (skip_db=%s, db_overrides=%d)", len(bots), skip_db, db_count,
+    )
+    return bots, raw_data, system_prompts, defaults
+
+
+def _load_yaml_only_bots() -> dict[str, Bot]:
+    """Load bots from YAML only — no database access."""
+    merged_data, _, _ = _load_merged_yaml()
+    if not merged_data:
+        return {}
+    bots, _, _, _ = _build_bots_from_data(merged_data, skip_db=True)
+    return bots
+
+
+def _load_bots_config() -> None:
+    """Load bot definitions from YAML (repo + user config).
+
+    When available, DB-backed bot_profiles are loaded as overrides with higher
+    precedence than YAML bot fields.
+    """
+    global BUILTIN_BOTS, _DEFAULTS, _SYSTEM_PROMPTS, _RAW_BOT_DATA, _BOT_SETTINGS_TEMPLATE
+    global _LAST_REPO_MTIME, _LAST_USER_MTIME
+
+    merged_data, repo_path, user_path = _load_merged_yaml()
+
+    _LAST_REPO_MTIME = repo_path.stat().st_mtime if repo_path.exists() else 0
+    _LAST_USER_MTIME = user_path.stat().st_mtime if user_path.exists() else 0
+
+    if not merged_data:
+        logger.warning("No bot configuration found in repo or user config")
+        return
+
+    _BOT_SETTINGS_TEMPLATE = _extract_bot_settings_template(merged_data)
+
+    bots, raw_data, system_prompts, defaults = _build_bots_from_data(merged_data)
+
+    BUILTIN_BOTS.clear()
+    BUILTIN_BOTS.update(bots)
+    _RAW_BOT_DATA.clear()
+    _RAW_BOT_DATA.update(raw_data)
+    _SYSTEM_PROMPTS.clear()
+    _SYSTEM_PROMPTS.update(system_prompts)
+    _DEFAULTS.clear()
+    _DEFAULTS.update(defaults)
+
+    logger.debug(
+        "Loaded %d bots (repo: %s, user: %s)",
+        len(BUILTIN_BOTS), repo_path.exists(), user_path.exists(),
     )
 
 
@@ -464,14 +491,20 @@ _load_bots_config()
 
 class BotManager:
     """Manages bot loading and retrieval."""
-    
-    def __init__(self, config: Any = None):
+
+    def __init__(self, config: Any = None, local_only: bool = False):
         self.config = config
-        logger.debug(f"BotManager initialized with {len(BUILTIN_BOTS)} bots")
-    
+        self.local_only = local_only
+        self._local_bots: dict[str, Bot] | None = None
+        if local_only:
+            self._local_bots = _load_yaml_only_bots()
+        logger.debug(f"BotManager initialized with {len(self._bots)} bots (local_only={local_only})")
+
     @property
     def _bots(self) -> dict[str, Bot]:
         """Get bots from global registry, checking for reload."""
+        if self._local_bots is not None:
+            return self._local_bots
         _check_reload()
         return BUILTIN_BOTS
     

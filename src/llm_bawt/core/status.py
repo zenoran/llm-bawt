@@ -609,7 +609,7 @@ def collect_system_status(
         # Service unreachable — fall through to local collection so we can
         # at least show something (with the service marked as unavailable).
 
-    bot_manager = BotManager(config)
+    bot_manager = BotManager(config, local_only=local_only)
     default_bot = bot_manager.get_default_bot()
 
     # Resolve effective bot

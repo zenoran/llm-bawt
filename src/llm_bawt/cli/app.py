@@ -264,11 +264,13 @@ def show_status(config: Config, args: argparse.Namespace | None = None):
     explicit_model = getattr(args, "model", None) if args else None
     user_id = getattr(args, "user", None) if args else None
 
+    is_local = getattr(args, "local", False) if args else False
     status = collect_system_status(
         config,
         bot_slug=bot_slug,
         model_alias=explicit_model,
         user_id=user_id,
+        local_only=is_local,
     )
 
     s_cfg = status.config
@@ -520,7 +522,7 @@ def show_status(config: Config, args: argparse.Namespace | None = None):
 def show_bots(config: Config, service_mode: bool = False):
     """Display available bots.
 
-    In service mode, queries the running service. Otherwise uses local YAML + DB.
+    In service mode, queries the running service. Otherwise uses local YAML only.
     """
     if service_mode:
         client = get_service_client(config)
@@ -572,8 +574,8 @@ def _show_bots_from_service(config: Config, bots_data: list[dict]):
 
 
 def _show_bots_from_local(config: Config):
-    """Render bot list from local BotManager (YAML + DB)."""
-    bot_manager = BotManager(config)
+    """Render bot list from local BotManager (YAML only, no DB)."""
+    bot_manager = BotManager(config, local_only=True)
     bots = bot_manager.list_bots()
     default_bot = bot_manager.get_default_bot()
 
@@ -1517,7 +1519,7 @@ def main():
     use_service = _is_service_mode(args, config_obj)
     
     # Determine which bot will be used (needed to get bot's default model)
-    bot_manager = BotManager(config_obj)
+    bot_manager = BotManager(config_obj, local_only=getattr(args, 'local', False))
     if args.bot:
         target_bot = bot_manager.get_bot(args.bot)
         if not target_bot:
@@ -1630,7 +1632,7 @@ def _query_agent_backend(prompt: str, bot, plaintext_output: bool):
 
 def run_app(args: argparse.Namespace, config_obj: Config, resolved_alias: str):
     # Determine which bot to use
-    bot_manager = BotManager(config_obj)
+    bot_manager = BotManager(config_obj, local_only=getattr(args, 'local', False))
     
     # Determine if service is likely in play (for bot validation)
     service_mode = not args.local and (getattr(args, 'service', False) or config_obj.USE_SERVICE)
