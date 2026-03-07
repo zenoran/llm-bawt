@@ -67,7 +67,7 @@ services:
       - OPENCLAW_WS_URL=${OPENCLAW_WS_URL:-}
       - OPENCLAW_GATEWAY_TOKEN=${OPENCLAW_GATEWAY_TOKEN:-}
       - OPENCLAW_BRIDGE_LOG_LEVEL=${OPENCLAW_BRIDGE_LOG_LEVEL:-INFO}
-      - OPENCLAW_SESSION_TO_BOT=${OPENCLAW_SESSION_TO_BOT:-}
+      - LLM_BAWT_API_URL=http://app:8642
       - REDIS_URL=redis://redis:6379/0
       - INFLUXDB_URL=${INFLUXDB_URL:-}
       - INFLUXDB_TOKEN=${INFLUXDB_TOKEN:-}
@@ -78,6 +78,8 @@ services:
     depends_on:
       redis:
         condition: service_healthy
+      app:
+        condition: service_started
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8680/health"]

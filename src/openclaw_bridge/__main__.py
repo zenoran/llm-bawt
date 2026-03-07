@@ -95,13 +95,16 @@ def main() -> None:
         drop_msg_types_csv=config.ingest_drop_msg_types,
     )
 
+    # Fetch session->bot mapping from main app API
+    session_to_bot = config.fetch_session_to_bot()
+
     # Assemble bridge
     bridge = SessionBridge(
         ws_client=ws_client,
         ingest=EventIngestPipeline(filter_config=ingest_filter),
         store=EventStore(engine),
         publisher=publisher,
-        session_to_bot=config.session_to_bot,
+        session_to_bot=session_to_bot,
     )
 
     # Metrics
@@ -111,7 +114,7 @@ def main() -> None:
     logger.info(
         "Starting OpenClaw bridge (sessions=%s, bot_map=%s)",
         config.session_keys,
-        config.session_to_bot,
+        session_to_bot,
     )
 
     loop = asyncio.new_event_loop()

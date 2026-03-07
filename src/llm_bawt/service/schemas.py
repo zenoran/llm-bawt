@@ -185,6 +185,8 @@ class BotInfo(BaseModel):
     uses_home_assistant: bool = False
     default_model: str | None = None
     color: str | None = None
+    agent_backend: str | None = None
+    agent_backend_config: dict[str, Any] = Field(default_factory=dict)
     settings: dict[str, Any] = Field(default_factory=dict)
 
 

@@ -25,8 +25,8 @@ class BridgeConfig:
     # Redis (for event fanout)
     redis_url: str = "redis://localhost:6379/0"
 
-    # Session -> bot_id mapping (JSON string from env, e.g. '{"main": "vex"}')
-    session_to_bot_json: str = ""
+    # Main app API URL (for fetching bot config at startup)
+    app_api_url: str = ""  # e.g. http://app:8642
 
     # Health check
     health_port: int = 8680
@@ -54,7 +54,7 @@ class BridgeConfig:
             postgres_port=int(os.environ.get("POSTGRES_PORT", "5432")),
             postgres_database=os.environ.get("POSTGRES_DATABASE", "llm_bawt"),
             redis_url=os.environ.get("REDIS_URL", "redis://localhost:6379/0"),
-            session_to_bot_json=os.environ.get("OPENCLAW_SESSION_TO_BOT", ""),
+            app_api_url=os.environ.get("LLM_BAWT_API_URL", ""),
             health_port=int(os.environ.get("OPENCLAW_BRIDGE_HEALTH_PORT", "8680")),
             ingest_drop_patterns=os.environ.get("OPENCLAW_INGEST_DROP_PATTERNS", ""),
             ingest_drop_events=os.environ.get("OPENCLAW_INGEST_DROP_EVENTS", ""),
@@ -69,12 +69,32 @@ class BridgeConfig:
             f"@{self.postgres_host}:{self.postgres_port}/{self.postgres_database}"
         )
 
-    @property
-    def session_to_bot(self) -> dict[str, str]:
-        if not self.session_to_bot_json:
+    def fetch_session_to_bot(self) -> dict[str, str]:
+        """Fetch session_key -> bot_id mapping from the main app's /v1/bots API."""
+        if not self.app_api_url:
             return {}
         import json
+        import logging
+        import urllib.request
+        logger = logging.getLogger(__name__)
+        url = f"{self.app_api_url.rstrip('/')}/v1/bots"
         try:
-            return json.loads(self.session_to_bot_json)
-        except (json.JSONDecodeError, TypeError):
+            with urllib.request.urlopen(url, timeout=10) as resp:
+                data = json.loads(resp.read())
+            mapping: dict[str, str] = {}
+            for bot in data.get("data", []):
+                if bot.get("agent_backend") != "openclaw":
+                    continue
+                bc = bot.get("agent_backend_config") or {}
+                sk = bc.get("session_key", "")
+                if sk:
+                    # Normalize "agent:main:main" -> "main"
+                    if sk.startswith("agent:"):
+                        parts = sk.split(":")
+                        if len(parts) >= 2:
+                            sk = parts[1]
+                    mapping[sk] = bot["slug"]
+            return mapping
+        except Exception as e:
+            logger.warning("Failed to fetch bot mapping from %s: %s", url, e)
             return {}

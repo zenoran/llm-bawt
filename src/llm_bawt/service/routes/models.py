@@ -234,6 +234,8 @@ async def list_bots():
             uses_home_assistant=bot.uses_home_assistant,
             default_model=bot.default_model,
             color=bot.color,
+            agent_backend=bot.agent_backend,
+            agent_backend_config=bot.agent_backend_config or {},
             settings=bot.settings,
         )
         for bot in bot_manager.list_bots()
