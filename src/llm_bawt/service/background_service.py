@@ -280,9 +280,9 @@ class BackgroundService:
         # OpenClaw WS session bridge (set by api.py lifespan if enabled)
         self._session_bridge: Any | None = None
 
-        # Extraction client (API model like Grok, separate from chat model)
-        self._extraction_client: Any | None = None
-        self._extraction_client_model: str | None = None
+        # Background client for summarization/extraction (isolated from chat model lifecycle)
+        self._bg_client: Any | None = None
+        self._bg_client_model: str | None = None
         
         # Session model overrides: when user switches model via tool, 
         # remember it for the rest of the session. Keyed by (bot_id, user_id).
@@ -1965,32 +1965,10 @@ class BackgroundService:
         # Get or create profile manager
         profile_manager = ProfileManager(self.config)
         
-        # Get LLM client - try cached first
-        llm_client = None
-        if model_to_use and model_to_use in self._client_cache:
-            llm_client = self._client_cache[model_to_use]
-        else:
-            # Check LLMBawt cache
-            for (cached_model, _, _), llm_bawt in self._llm_bawt_cache.items():
-                if not model_to_use or cached_model == model_to_use:
-                    llm_client = llm_bawt.client
-                    break
-        
-        # If no cached client, load the default model
+        # Use isolated background client — never interferes with main chat model
+        llm_client, _ = self._get_background_client(model_override=model_to_use)
         if not llm_client:
-            log.info(f"⏳ Loading model for profile maintenance: {model_to_use}")
-            try:
-                # Create an LLMBawt instance which will load the model
-                llm_bawt = self._get_llm_bawt(
-                    model_alias=model_to_use,
-                    bot_id=task.bot_id or self._default_bot,
-                    user_id=entity_id,
-                    local_mode=False,
-                )
-                llm_client = llm_bawt.client
-            except Exception as e:
-                log.error(f"Failed to load model for profile maintenance: {e}")
-                return {"error": f"Failed to load model: {e}"}
+            return {"error": f"Failed to create background client for profile maintenance"}
         
         service = ProfileMaintenanceService(profile_manager, llm_client)
         
@@ -2008,55 +1986,71 @@ class BackgroundService:
             "error": result.error,
         }
 
-    def _get_extraction_client(self) -> tuple[Any | None, str | None]:
-        """Get or create the extraction client for memory extraction.
+    def _get_background_client(self, model_override: str | None = None) -> tuple[Any | None, str | None]:
+        """Get or create an API client for background tasks (summarization, extraction).
 
-        Uses ``EXTRACTION_MODEL`` from config.  Only API-based models
-        (``openai`` or ``grok`` type) are supported to avoid VRAM conflicts
-        with the local chat model.
+        This client is completely isolated from the main chat model lifecycle —
+        it never triggers model switches or unloads the active chat model.
+
+        Only API-based models (openai/grok) are supported.
 
         Returns:
             ``(client, model_alias)`` or ``(None, None)`` if unavailable.
         """
-        if self._extraction_client is not None:
-            return self._extraction_client, self._extraction_client_model
+        preferred = (
+            model_override
+            or getattr(self.config, "EXTRACTION_MODEL", None)
+            or getattr(self.config, "MAINTENANCE_MODEL", None)
+            or getattr(self.config, "SUMMARIZATION_MODEL", None)
+        )
 
-        extraction_model = getattr(self.config, "EXTRACTION_MODEL", None)
-        if not extraction_model:
-            log.debug("No EXTRACTION_MODEL configured — memory extraction will use heuristics")
-            return None, None
+        # Reuse cached client if same model
+        if self._bg_client is not None and (not preferred or preferred == self._bg_client_model):
+            return self._bg_client, self._bg_client_model
 
+        # Resolve alias
         try:
             model_alias, _ = self._resolve_request_model(
-                extraction_model,
-                bot_id="nova",
-                local_mode=False,
+                preferred, bot_id="nova", local_mode=False,
             )
-            models = self.config.defined_models.get("models", {})
-            model_type = models.get(model_alias, {}).get("type")
+        except Exception as e:
+            log.error(f"Failed to resolve background model '{preferred}': {e}")
+            return None, None
 
-            if model_type not in ("openai", "grok"):
+        models = self.config.defined_models.get("models", {})
+        model_def = models.get(model_alias, {})
+        model_type = model_def.get("type")
+
+        if model_type not in ("openai", "grok"):
+            if preferred:
                 log.warning(
-                    f"EXTRACTION_MODEL '{extraction_model}' is type '{model_type}'. "
-                    f"Only 'openai' and 'grok' types are supported for extraction. "
-                    f"Falling back to heuristics."
+                    "Background model '%s' is type '%s' (only openai/grok supported). "
+                    "Falling back to heuristics.", preferred, model_type,
                 )
-                return None, None
+            return None, None
 
-            llm_bawt = self._get_llm_bawt(
-                model_alias=model_alias,
-                bot_id="nova",
-                user_id="system",
-            )
-            client = llm_bawt.client
+        # Create a standalone client — no model lifecycle involvement
+        try:
+            from ..clients.openai_client import OpenAIClient
+            from ..clients.grok_client import GrokClient
 
-            self._extraction_client = client
-            self._extraction_client_model = model_alias
-            log.info(f"Initialized extraction client: {model_alias} ({model_type})")
+            model_id = model_def.get("model_id", model_alias)
+            if model_type == "grok":
+                client = GrokClient(
+                    model=model_id, config=self.config, model_definition=model_def,
+                )
+            else:
+                client = OpenAIClient(
+                    model=model_id, config=self.config, model_definition=model_def,
+                )
+
+            self._bg_client = client
+            self._bg_client_model = model_alias
+            log.info("Background client ready: %s (%s)", model_alias, model_type)
             return client, model_alias
 
         except Exception as e:
-            log.error(f"Failed to initialize extraction client for '{extraction_model}': {e}")
+            log.error("Failed to create background client for '%s': %s", model_alias, e)
             return None, None
 
     async def _extract_from_summaries(
@@ -2080,7 +2074,7 @@ class BackgroundService:
         """
         from ..memory.extraction.service import MemoryExtractionService, MemoryAction
 
-        extraction_client, extraction_model = self._get_extraction_client()
+        extraction_client, extraction_model = self._get_background_client()
         use_llm = extraction_client is not None
 
         if not use_llm:
@@ -2280,44 +2274,8 @@ class BackgroundService:
         use_heuristic_fallback = bool(task.payload.get("use_heuristic_fallback", True))
         max_tokens_per_chunk = int(task.payload.get("max_tokens_per_chunk", 4000))
 
-        model_alias = None
-        client = None
-
-        if requested_model:
-            try:
-                model_alias, _ = self._resolve_request_model(
-                    requested_model,
-                    bot_id,
-                    local_mode=False,
-                )
-                llm_bawt = self._get_llm_bawt(
-                    model_alias=model_alias,
-                    bot_id=bot_id,
-                    user_id=task.user_id or "system",
-                )
-                client = llm_bawt.client
-            except Exception as e:
-                log.error(f"Failed to resolve/load model for history summarization: {e}")
-                client = None
-        elif self._client_cache:
-            model_alias = next(iter(self._client_cache.keys()))
-            client = self._client_cache[model_alias]
-        else:
-            try:
-                model_alias, _ = self._resolve_request_model(
-                    None,
-                    bot_id,
-                    local_mode=False,
-                )
-                llm_bawt = self._get_llm_bawt(
-                    model_alias=model_alias,
-                    bot_id=bot_id,
-                    user_id=task.user_id or "system",
-                )
-                client = llm_bawt.client
-            except Exception as e:
-                log.error(f"Failed to resolve/load model for history summarization: {e}")
-                client = None
+        # Use isolated background client — never interferes with main chat model
+        client, model_alias = self._get_background_client(model_override=requested_model)
 
         prompt_resolver = PromptResolver(self.config)
 

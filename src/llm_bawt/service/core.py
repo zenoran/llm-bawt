@@ -274,7 +274,7 @@ class ServiceLLMBawt(BaseLLMBawt):
                 "message_channel": self.model_definition.get("message_channel"),
                 "account_id": self.model_definition.get("account_id"),
                 "model": self.model_definition.get("model_id"),
-                "timeout_seconds": self.model_definition.get("timeout_seconds", 120),
+                "timeout_seconds": self.model_definition.get("timeout_seconds", 600),
                 "tool_history_limit": self.model_definition.get("tool_history_limit", 8),
             }
             client = AgentBackendClient(
