@@ -79,11 +79,14 @@ def main() -> None:
         logger.error("Cannot connect to Redis at %s", config.redis_url)
         sys.exit(1)
 
-    # WS client
+    # Fetch session->bot mapping from main app API (source of truth for session keys)
+    session_to_bot = config.fetch_session_to_bot()
+
+    # WS client — session keys come from the bot mapping
     ws_config = OpenClawWsConfig(
         url=config.ws_url,
         token=config.ws_token,
-        session_keys=config.session_keys,
+        session_keys=list(session_to_bot.keys()),
         reconnect_max_delay=config.reconnect_max_delay,
     )
     ws_client = OpenClawWsClient(ws_config)
@@ -94,9 +97,6 @@ def main() -> None:
         drop_events_csv=config.ingest_drop_events,
         drop_msg_types_csv=config.ingest_drop_msg_types,
     )
-
-    # Fetch session->bot mapping from main app API
-    session_to_bot = config.fetch_session_to_bot()
 
     # Assemble bridge
     bridge = SessionBridge(
@@ -113,7 +113,7 @@ def main() -> None:
 
     logger.info(
         "Starting OpenClaw bridge (sessions=%s, bot_map=%s)",
-        config.session_keys,
+        list(session_to_bot.keys()),
         session_to_bot,
     )
 

@@ -195,14 +195,7 @@ def edit_bot_yaml(config: Config, bot_slug: str) -> bool:
     out = parsed.copy()
     out.pop("slug", None)
 
-    # Persist bot UI color as runtime setting (avoids bot_profiles schema migration).
-    edited_color = out.pop("color", bot.color)
-    if edited_color is not None:
-        edited_color = str(edited_color).strip().lower() or None
-    if edited_color:
-        new_settings["ui_color"] = edited_color
-    else:
-        new_settings.pop("ui_color", None)
+    edited_color = out.pop("color", None)
 
     if out == editable_fields and new_settings == effective_settings:
         console.print("[dim]No changes detected.[/dim]")
@@ -224,6 +217,8 @@ def edit_bot_yaml(config: Config, bot_slug: str) -> bool:
         "uses_search": out.get("uses_search", bot.uses_search),
         "uses_home_assistant": out.get("uses_home_assistant", bot.uses_home_assistant),
         "default_model": out.get("default_model", bot.default_model),
+        "color": edited_color,
+        "default_voice": out.get("default_voice"),
         "nextcloud_config": out.get("nextcloud", raw.get("nextcloud")),
     }
 

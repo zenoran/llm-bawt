@@ -67,6 +67,7 @@ class BotProfile(SQLModel, table=True):
     uses_home_assistant: bool = Field(default=False)
     default_model: str | None = Field(default=None, sa_column=Column(String(255), nullable=True))
     color: str | None = Field(default=None, sa_column=Column(String(64), nullable=True))
+    default_voice: str | None = Field(default=None, sa_column=Column(String(128), nullable=True))
     nextcloud_config: dict[str, Any] | None = Field(default=None, sa_column=Column(JSONB, nullable=True))
     agent_backend: str | None = Field(default=None, sa_column=Column(String(128), nullable=True))
     agent_backend_config: dict[str, Any] | None = Field(default=None, sa_column=Column(JSONB, nullable=True))
@@ -124,6 +125,7 @@ class BotProfileStore:
             "ALTER TABLE bot_profiles ADD COLUMN IF NOT EXISTS agent_backend_config JSONB",
             "ALTER TABLE bot_profiles ADD COLUMN IF NOT EXISTS tts_mode BOOLEAN DEFAULT FALSE",
             "ALTER TABLE bot_profiles ADD COLUMN IF NOT EXISTS include_summaries BOOLEAN DEFAULT TRUE",
+            "ALTER TABLE bot_profiles ADD COLUMN IF NOT EXISTS default_voice VARCHAR(128)",
         ]
         try:
             with self.engine.connect() as conn:
@@ -181,6 +183,7 @@ class BotProfileStore:
                     uses_home_assistant=bool(payload.get("uses_home_assistant", False)),
                     default_model=payload.get("default_model"),
                     color=payload.get("color"),
+                    default_voice=payload.get("default_voice"),
                     nextcloud_config=payload.get("nextcloud_config"),
                     agent_backend=payload.get("agent_backend"),
                     agent_backend_config=payload.get("agent_backend_config"),
@@ -198,11 +201,19 @@ class BotProfileStore:
                 row.uses_tools = bool(payload.get("uses_tools", row.uses_tools))
                 row.uses_search = bool(payload.get("uses_search", row.uses_search))
                 row.uses_home_assistant = bool(payload.get("uses_home_assistant", row.uses_home_assistant))
-                row.default_model = payload.get("default_model", row.default_model)
-                row.color = payload.get("color", row.color)
-                row.nextcloud_config = payload.get("nextcloud_config", row.nextcloud_config)
-                row.agent_backend = payload.get("agent_backend", row.agent_backend)
-                row.agent_backend_config = payload.get("agent_backend_config", row.agent_backend_config)
+                if payload.get("default_model") is not None:
+                    row.default_model = payload["default_model"]
+                if payload.get("color") is not None:
+                    row.color = payload["color"]
+                if payload.get("default_voice") is not None:
+                    row.default_voice = payload["default_voice"]
+                if payload.get("nextcloud_config") is not None:
+                    row.nextcloud_config = payload["nextcloud_config"]
+                # Only overwrite agent_backend fields if explicitly provided (not None)
+                if payload.get("agent_backend") is not None:
+                    row.agent_backend = payload["agent_backend"]
+                if payload.get("agent_backend_config") is not None:
+                    row.agent_backend_config = payload["agent_backend_config"]
                 row.updated_at = now
 
             session.add(row)

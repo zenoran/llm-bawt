@@ -110,6 +110,18 @@ class RedisPublisher:
             logger.exception("Failed to publish run event to %s", stream_key)
             return None
 
+    def publish_rpc_result(self, request_id: str, result: dict) -> None:
+        """Publish an RPC call result to a short-lived response stream."""
+        if not self._connected:
+            return
+        stream_key = f"openclaw:rpc:{request_id}"
+        try:
+            fields = {"payload": json.dumps(result, ensure_ascii=False, default=str)}
+            self._redis.xadd(stream_key, fields, maxlen=10)
+            self._redis.expire(stream_key, 60)
+        except Exception:
+            logger.exception("Failed to publish RPC result to %s", stream_key)
+
     def publish_run_done(self, request_id: str) -> None:
         """Signal that a run is complete by writing a sentinel entry."""
         if not self._connected:

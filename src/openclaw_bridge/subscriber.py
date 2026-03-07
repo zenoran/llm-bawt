@@ -108,6 +108,46 @@ class RedisSubscriber:
         )
         logger.debug("Sent command: request_id=%s session=%s", request_id, session_key)
 
+    async def send_rpc(
+        self,
+        method: str,
+        params: dict,
+        request_id: str,
+        *,
+        timeout_s: float = 15,
+    ) -> dict:
+        """Send an RPC command to the bridge and wait for the result."""
+        import json as _json
+
+        await self._redis.xadd(
+            COMMANDS_STREAM,
+            {
+                "action": "rpc.call",
+                "method": method,
+                "params": _json.dumps(params, ensure_ascii=False),
+                "request_id": request_id,
+            },
+            maxlen=1000,
+            approximate=True,
+        )
+
+        # Wait for result on openclaw:rpc:{request_id}
+        stream_key = f"openclaw:rpc:{request_id}"
+        deadline = asyncio.get_event_loop().time() + timeout_s
+        while asyncio.get_event_loop().time() < deadline:
+            remaining_ms = int((deadline - asyncio.get_event_loop().time()) * 1000)
+            if remaining_ms <= 0:
+                break
+            results = await self._redis.xread(
+                {stream_key: "0-0"}, count=1, block=min(remaining_ms, 2000),
+            )
+            if results:
+                for _stream, messages in results:
+                    for _msg_id, fields in messages:
+                        payload_raw = fields.get("payload", "{}")
+                        return _json.loads(payload_raw)
+        raise TimeoutError(f"RPC {method} timed out after {timeout_s}s")
+
     async def subscribe_run(
         self,
         request_id: str,

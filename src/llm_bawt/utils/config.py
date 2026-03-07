@@ -252,10 +252,6 @@ class Config(RuntimeTunables, BaseSettings):
         default="",
         description="OpenClaw gateway WebSocket URL (e.g. ws://10.0.0.97:18789/v1/ws). Empty = bridge disabled.",
     )
-    OPENCLAW_WS_SESSIONS: str = Field(
-        default="main",
-        description="Comma-separated session keys to subscribe to",
-    )
     REDIS_URL: str = Field(
         default="",
         description="Redis URL for bridge command/event transport (e.g. redis://redis:6379/0)",

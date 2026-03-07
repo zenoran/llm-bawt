@@ -19,7 +19,7 @@ logger = logging.getLogger(__name__)
 class OpenClawWsConfig:
     url: str = ""
     token: str = ""
-    session_keys: list[str] = field(default_factory=lambda: ["main"])
+    session_keys: list[str] = field(default_factory=list)
     reconnect_max_delay: int = 60
 
 
@@ -28,7 +28,7 @@ class OpenClawWsClient:
         self._config = config
         self._ws = None
         self._connected = False
-        self._subscribed_sessions: set[str] = set(config.session_keys or ["main"])
+        self._subscribed_sessions: set[str] = set(config.session_keys)
         self._event_callback: Callable[[dict], Awaitable[None]] | None = None
         self._reconnect_task: asyncio.Task | None = None
         self._receive_task: asyncio.Task | None = None

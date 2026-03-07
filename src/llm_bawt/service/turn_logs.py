@@ -231,6 +231,12 @@ class TurnLogStore:
                 row.response_text = response_text
             if request_payload is not None:
                 row.request_json = json.dumps(request_payload, ensure_ascii=False, default=str)
+                # Backfill trigger_message_id if it wasn't set on initial persist
+                # (common when prepared_messages were empty at creation time).
+                if not row.trigger_message_id:
+                    tid = _extract_trigger_id(request_payload)
+                    if tid:
+                        row.trigger_message_id = tid
             if tool_calls is not None:
                 row.tool_calls_json = json.dumps(tool_calls, ensure_ascii=False, default=str)
             if error_text is not None:

@@ -12,7 +12,6 @@ class BridgeConfig:
     gateway_url: str = ""  # HTTP base URL (e.g. http://10.0.0.97:18789)
     ws_url: str = ""       # WS URL (e.g. ws://10.0.0.97:18789/v1/ws)
     ws_token: str = ""     # Bearer token for both HTTP and WS auth
-    session_keys: list[str] = field(default_factory=lambda: ["main"])
     reconnect_max_delay: int = 60
 
     # PostgreSQL (for event store)
@@ -41,12 +40,9 @@ class BridgeConfig:
 
     @classmethod
     def from_env(cls) -> BridgeConfig:
-        sessions_str = os.environ.get("OPENCLAW_WS_SESSIONS", "main")
-        session_keys = [s.strip() for s in sessions_str.split(",") if s.strip()]
         return cls(
             ws_url=os.environ.get("OPENCLAW_WS_URL", ""),
             ws_token=os.environ.get("OPENCLAW_GATEWAY_TOKEN", ""),
-            session_keys=session_keys,
             reconnect_max_delay=int(os.environ.get("OPENCLAW_WS_RECONNECT_MAX_DELAY", "60")),
             postgres_user=os.environ.get("POSTGRES_USER", "llm_bawt"),
             postgres_password=os.environ.get("POSTGRES_PASSWORD", ""),
@@ -93,11 +89,6 @@ class BridgeConfig:
                     bc = bot.get("agent_backend_config") or {}
                     sk = bc.get("session_key", "")
                     if sk:
-                        # Normalize "agent:main:main" -> "main"
-                        if sk.startswith("agent:"):
-                            parts = sk.split(":")
-                            if len(parts) >= 2:
-                                sk = parts[1]
                         mapping[sk] = bot["slug"]
                 return mapping
             except Exception as e:

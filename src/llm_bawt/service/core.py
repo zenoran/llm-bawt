@@ -70,6 +70,16 @@ class ServiceLLMBawt(BaseLLMBawt):
         )
         self._last_history_load_at: float = time.time()
 
+    def _init_bot(self, config: Config):
+        """Initialize bot, then patch AgentBackendClient with bot-specific config."""
+        super()._init_bot(config)
+        # The virtual model 'openclaw' is registered once with the first bot's
+        # config.  Now that self.bot is loaded, override the client's bot_config
+        # so each bot uses its own session_key / settings.
+        from ..clients.agent_backend_client import AgentBackendClient
+        if isinstance(self.client, AgentBackendClient) and self.bot.agent_backend_config:
+            self.client._bot_config = self.bot.agent_backend_config
+
     def _init_memory(self, config: Config):
         """Initialize memory client and profile manager for service-side operation."""
         if self.local_mode:

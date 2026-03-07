@@ -74,7 +74,7 @@ class EventIngestPipeline:
 
             # Gateway session/run fields are usually inside payload
             sk = str(payload.get("sessionKey") or payload.get("session_key") or raw.get("session_key") or session_key)
-            sk = self._normalize_session_key(sk)
+            # Use raw session key from gateway — no normalization
             run_id = payload.get("runId") or payload.get("run_id") or raw.get("run_id")
             seq = payload.get("seq") if isinstance(payload.get("seq"), int) else raw.get("seq")
 
@@ -229,7 +229,7 @@ class EventIngestPipeline:
             event_id = raw.get("event_id") or synthesize_event_id(session_key, "chat.sent", raw, self._next_seq())
             return OpenClawEvent(
                 event_id=event_id,
-                session_key=self._normalize_session_key(str(raw.get("session_key") or session_key)),
+                session_key=str(raw.get("session_key") or session_key),
                 run_id=raw.get("run_id"),
                 kind=OpenClawEventKind.USER_MESSAGE,
                 origin="user",
@@ -245,7 +245,7 @@ class EventIngestPipeline:
         event_id = raw.get("event_id") or synthesize_event_id(session_key, msg_type, raw, self._next_seq())
         return OpenClawEvent(
             event_id=event_id,
-            session_key=self._normalize_session_key(session_key),
+            session_key=session_key,
             run_id=raw.get("run_id"),
             kind=OpenClawEventKind.SYSTEM_NOTE,
             origin="system",
@@ -259,15 +259,6 @@ class EventIngestPipeline:
 
     def should_drop_content(self, text: str) -> bool:
         return self._filter.should_drop_content(text)
-
-    @staticmethod
-    def _normalize_session_key(sk: str) -> str:
-        """Normalize gateway session keys like 'agent:main:main' -> 'main'."""
-        if sk.startswith("agent:"):
-            parts = sk.split(":")
-            if len(parts) >= 2:
-                return parts[1]
-        return sk
 
     @staticmethod
     def _extract_message_text(message: dict[str, Any]) -> str:

@@ -1069,16 +1069,12 @@ class BackgroundService:
         return model_alias == "openclaw"
 
     def _get_openclaw_session_key(self, model_alias: str) -> str:
-        """Get the normalized session_key for an OpenClaw model from its bot_config."""
-        from openclaw_bridge.ingest import EventIngestPipeline
-
+        """Get the session_key for an OpenClaw model from its bot_config."""
         model_def = self.config.defined_models.get("models", {}).get(model_alias, {})
-        sk = (
+        return (
             (model_def.get("bot_config") or {}).get("session_key")
-            or self.config.OPENCLAW_WS_SESSIONS.split(",")[0].strip()
-            or "main"
+            or "agent:main:main"
         )
-        return EventIngestPipeline._normalize_session_key(sk)
 
     async def _stream_via_bridge(
         self,

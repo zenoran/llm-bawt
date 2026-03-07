@@ -179,11 +179,6 @@ class SessionBridge:
             return None
         bot_id = self._session_to_bot.get(session_key)
         if not bot_id:
-            # Try normalized form in case raw gateway key slipped through
-            from .openclaw_ingest import EventIngestPipeline
-            normalized = EventIngestPipeline._normalize_session_key(session_key)
-            bot_id = self._session_to_bot.get(normalized)
-        if not bot_id:
             logger.debug("No bot mapped for session_key=%s", session_key)
         return bot_id
 

@@ -108,6 +108,10 @@ class SessionBridge:
                             asyncio.create_task(
                                 self._handle_send_command(fields, msg_id, async_redis)
                             )
+                        elif action == "rpc.call":
+                            asyncio.create_task(
+                                self._handle_rpc_command(fields, msg_id, async_redis)
+                            )
                         else:
                             logger.warning("Unknown command action: %s", action)
                             await async_redis.xack(COMMANDS_STREAM, "bridge", msg_id)
@@ -164,6 +168,38 @@ class SessionBridge:
             )
             self._publisher.publish_run_event(request_id, err_event)
             self._publisher.publish_run_done(request_id)
+        finally:
+            await async_redis.xack(COMMANDS_STREAM, "bridge", msg_id)
+
+    async def _handle_rpc_command(
+        self, fields: dict, msg_id: str, async_redis
+    ) -> None:
+        """Handle an rpc.call command: call WS RPC, publish result via Redis."""
+        import json as _json
+
+        request_id = fields.get("request_id", "")
+        method = fields.get("method", "")
+        params_raw = fields.get("params", "{}")
+
+        try:
+            params = _json.loads(params_raw) if isinstance(params_raw, str) else params_raw
+        except (_json.JSONDecodeError, TypeError):
+            params = {}
+
+        if not request_id or not method:
+            logger.warning("Invalid rpc.call command: missing request_id or method")
+            await async_redis.xack(COMMANDS_STREAM, "bridge", msg_id)
+            return
+
+        logger.info("Handling RPC command: method=%s request_id=%s", method, request_id)
+
+        try:
+            res = await self._ws_client._request(method, params)
+            payload = res.get("payload", {})
+            self._publisher.publish_rpc_result(request_id, {"ok": True, "payload": payload})
+        except Exception as e:
+            logger.warning("RPC command failed: method=%s error=%s", method, e)
+            self._publisher.publish_rpc_result(request_id, {"ok": False, "error": str(e)})
         finally:
             await async_redis.xack(COMMANDS_STREAM, "bridge", msg_id)
 
@@ -248,11 +284,7 @@ class SessionBridge:
     def _resolve_bot_id(self, session_key: str) -> str | None:
         if not self._session_to_bot:
             return None
-        bot_id = self._session_to_bot.get(session_key)
-        if not bot_id:
-            normalized = EventIngestPipeline._normalize_session_key(session_key)
-            bot_id = self._session_to_bot.get(normalized)
-        return bot_id
+        return self._session_to_bot.get(session_key)
 
     @property
     def connected(self) -> bool:

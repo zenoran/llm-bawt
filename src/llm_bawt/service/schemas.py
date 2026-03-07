@@ -211,6 +211,8 @@ class BotProfileResponse(BaseModel):
     uses_search: bool = False
     uses_home_assistant: bool = False
     default_model: str | None = None
+    color: str | None = None
+    default_voice: str | None = None
     nextcloud_config: dict[str, Any] | None = None
     agent_backend: str | None = None
     agent_backend_config: dict[str, Any] | None = None
@@ -232,6 +234,8 @@ class BotProfileUpsertRequest(BaseModel):
     uses_search: bool = False
     uses_home_assistant: bool = False
     default_model: str | None = None
+    color: str | None = None
+    default_voice: str | None = None
     nextcloud_config: dict[str, Any] | None = None
     agent_backend: str | None = None
     agent_backend_config: dict[str, Any] | None = None

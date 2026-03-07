@@ -77,8 +77,6 @@ async def lifespan(app):
     history_drain_task = None
     if config.OPENCLAW_WS_ENABLED and config.OPENCLAW_WS_URL:
         try:
-            from openclaw_bridge.ingest import EventIngestPipeline
-
             # Build session_key -> bot_id mapping from openclaw bots
             from ..bots import BotManager
             session_to_bot: dict[str, str] = {}
@@ -90,8 +88,7 @@ async def lifespan(app):
                 bc = bot.agent_backend_config or {}
                 sk = bc.get("session_key")
                 if sk:
-                    normalized = EventIngestPipeline._normalize_session_key(sk)
-                    session_to_bot[normalized] = bot.slug
+                    session_to_bot[sk] = bot.slug
 
             if session_to_bot:
                 log.info("OpenClaw session->bot mapping: %s", session_to_bot)
