@@ -658,6 +658,20 @@ def list_models(config: Config, service_mode: bool | None = None):
         manager.list_available_models()
 
 
+def _infer_type(alias: str) -> str:
+    """Best-effort type inference from a model alias when the service doesn't report type."""
+    low = alias.lower()
+    if low.startswith("grok"):
+        return "grok"
+    if low.startswith(("gpt", "o1", "o3", "o4")):
+        return "openai"
+    if low.startswith("openclaw"):
+        return "openclaw"
+    if low == "openclaw":
+        return "agent_backend"
+    return "other"
+
+
 def _list_models_from_service(config: Config):
     """Display model catalog from the running service."""
     from llm_bawt.service.client import get_service_client
@@ -675,16 +689,13 @@ def _list_models_from_service(config: Config):
         console.print("[yellow]No models reported by service.[/yellow]")
         return
 
-    console.print(Panel.fit(
-        "[bold cyan]Service Models[/bold cyan]",
-        subtitle=f"[dim]{client.http_url}[/dim]",
-        border_style="cyan",
-    ))
+    service_url = client.http_url or ""
+    console.print(f"[bold cyan]Service Models[/bold cyan]  [dim]{service_url}[/dim]")
     console.print()
 
     grouped: dict[str, list[dict]] = defaultdict(list)
     for model in service_models:
-        mtype = (model.get("type") or "other").lower()
+        mtype = (model.get("type") or _infer_type(model["id"])).lower()
         grouped[mtype].append(model)
 
     provider_order = [
