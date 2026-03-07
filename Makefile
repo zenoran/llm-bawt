@@ -140,7 +140,6 @@ dev: check-uv ## [uv] Sync .venv with all extras (dev, mcp, service, search, mem
 	uv sync --inexact --extra dev --extra mcp --extra service --extra search --extra memory --extra huggingface
 	@echo "$(GREEN)✓ .venv synced$(NC)"
 	@echo "  Run: uv run llm --status"
-	@echo "  Run: uv run llm-memory-tui  (TUI interface)"
 
 dev-llama: check-uv ## [uv] Add llama-cpp-python to .venv (CUDA-aware)
 ifeq ($(WITH_CUDA),true)
@@ -162,14 +161,6 @@ dev-vllm: check-uv ## [uv] Add vLLM to .venv (requires NVIDIA GPU + CUDA)
 dev-run: ## [uv] Run llm from .venv (e.g. make dev-run ARGS="--status")
 	uv run llm $(ARGS)
 
-dev-tui: ## [uv] Run memory TUI from .venv
-	uv run llm-memory-tui
-
-dev-tui-debug: ## [uv] Run memory TUI with textual console
-	@echo "$(BLUE)Starting TUI with debug console...$(NC)"
-	@echo "$(YELLOW)In another terminal, run: textual console$(NC)"
-	@sleep 2
-	textual run --dev src/llm_bawt/memory_tui/app.py
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # DOCKER (works identically on Linux / macOS / Windows)
