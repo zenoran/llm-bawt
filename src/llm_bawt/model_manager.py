@@ -83,13 +83,15 @@ class _PathWrapper:
 class ModelManager:
     """Manages models defined in the configuration file."""
 
-    def __init__(self, config: Config):
+    def __init__(self, config: Config, local_only: bool = False):
         self.config = config
+        self.local_only = local_only
         raw_path = Path(self.config.MODELS_CONFIG_PATH)
         self.config_path = _PathWrapper(raw_path)
         self.models_data: Dict[str, Any] = {}
         self.load_config()
-        self._merge_db_models()
+        if not local_only:
+            self._merge_db_models()
 
     def _merge_db_models(self) -> None:
         """Overlay DB model definitions so CLI view matches service catalog.
@@ -168,8 +170,7 @@ class ModelManager:
         defined_models = self.models_data.get("models", {})
         available_aliases = set(self.config.get_model_options())
 
-        source = str(self.config_path) if self.config_path.is_file() else "database"
-        console.print(f"[bold green]Local Models[/bold green]  [dim]{source}[/dim]")
+        console.print(f"[bold green]Local Models[/bold green]  [dim]{self.config_path}[/dim]")
         console.print()
 
         if not defined_models:
@@ -637,7 +638,7 @@ def list_models(config: Config, service_mode: bool | None = None):
     """CLI wrapper: list models.
 
     In service mode, queries the running service for its authoritative model
-    catalog. In local mode, displays models from models.yaml / DB.
+    catalog. In local mode, displays only models from models.yaml on disk.
     """
     if service_mode is None:
         service_mode = is_service_mode_enabled(config)
@@ -646,10 +647,11 @@ def list_models(config: Config, service_mode: bool | None = None):
         _list_models_from_service(config)
     else:
         try:
-            manager = ModelManager(config)
+            manager = ModelManager(config, local_only=True)
         except Exception:
             manager = ModelManager.__new__(ModelManager)
             manager.config = config
+            manager.local_only = True
         manager.list_available_models()
 
 
