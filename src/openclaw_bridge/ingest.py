@@ -160,7 +160,7 @@ class EventIngestPipeline:
                             kind=OpenClawEventKind.TOOL_END,
                             origin="system",
                             tool_name=tool_name,
-                            tool_result=data.get("result") or data.get("output"),
+                            tool_result=data.get("result") or data.get("output") or data.get("meta"),
                             raw=raw,
                         )
 

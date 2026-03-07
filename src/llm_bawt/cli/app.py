@@ -156,16 +156,7 @@ def query_via_service(
                             actual_model = item["model"]
                             got_metadata = True
                     elif isinstance(item, dict) and "tool_result" in item:
-                        tool_name = item.get("tool_result") or "tool"
-                        result_text = item.get("result_text")
-                        if result_text:
-                            # Truncate long results for display
-                            display = str(result_text)[:200]
-                            if len(str(result_text)) > 200:
-                                display += "…"
-                            console.print(f"[dim]  ✓ {tool_name}: {display}[/dim]")
-                        else:
-                            console.print(f"[dim]  ✓ {tool_name}[/dim]")
+                        # Silently consume — tool_call already notified the user
                         if item.get("model"):
                             actual_model = item["model"]
                             got_metadata = True
