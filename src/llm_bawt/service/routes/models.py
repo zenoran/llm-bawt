@@ -26,10 +26,16 @@ router = APIRouter()
 async def list_models():
     """List available models (OpenAI-compatible)."""
     service = get_service()
-    models = [
-        ModelInfo(id=alias)
-        for alias in service._available_models
-    ]
+    defined = service.config.defined_models.get("models", {})
+    models = []
+    for alias in service._available_models:
+        info = defined.get(alias, {})
+        models.append(ModelInfo(
+            id=alias,
+            type=info.get("type"),
+            model_id=info.get("model_id"),
+            description=info.get("description"),
+        ))
     return ModelsResponse(data=models)
 
 @router.get("/v1/models/current", tags=["Models"])

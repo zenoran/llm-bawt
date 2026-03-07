@@ -81,6 +81,9 @@ class ModelInfo(BaseModel):
     object: str = "model"
     created: int = Field(default_factory=lambda: int(time.time()))
     owned_by: str = "llm-bawt"
+    type: str | None = None
+    model_id: str | None = None
+    description: str | None = None
 
 
 class ModelsResponse(BaseModel):

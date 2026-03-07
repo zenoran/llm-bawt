@@ -590,12 +590,12 @@ class ServiceClient:
 
         return None
 
-    def list_models(self) -> list[str] | None:
-        """
-        List available models from the service.
+    def list_models(self) -> list[dict[str, Any]] | None:
+        """List available models from the service.
 
         Returns:
-            List of model IDs, or None if service unavailable
+            List of model dicts (id, type, model_id, description),
+            or None if service unavailable.
         """
         if not self.is_available():
             return None
@@ -603,7 +603,7 @@ class ServiceClient:
         try:
             response = self._request("GET", "/v1/models")
             if response and "data" in response:
-                return [m.get("id") for m in response["data"] if m.get("id")]
+                return [m for m in response["data"] if m.get("id")]
         except Exception as e:
             logger.warning(f"List models via service failed: {e}")
 

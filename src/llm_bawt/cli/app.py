@@ -54,6 +54,19 @@ def get_service_client(config: Config | None = None):
     return _service_client if _service_client else None
 
 
+def _is_service_mode(args: argparse.Namespace, config: Config) -> bool:
+    """Determine if the CLI should operate in service mode.
+
+    Returns False when --local is set. Otherwise True if --service flag
+    or USE_SERVICE config is enabled.
+    """
+    if getattr(args, "local", False):
+        return False
+    if getattr(args, "service", False):
+        return True
+    return bool(config.USE_SERVICE)
+
+
 def query_via_service(
     prompt: str,
     model: str | None,
@@ -504,17 +517,20 @@ def show_status(config: Config, args: argparse.Namespace | None = None):
         console.print(f"  [dim]Install missing:[/dim] {', '.join(missing_deps)}")
 
 
-def show_bots(config: Config):
-    """Display available bots. Uses service API when available, falls back to local YAML."""
-    # Try service first
-    client = get_service_client(config)
-    if client and client.is_available():
-        service_bots = client.list_bots()
-        if service_bots is not None:
-            _show_bots_from_service(config, service_bots)
-            return
+def show_bots(config: Config, service_mode: bool = False):
+    """Display available bots.
 
-    # Fallback to local BotManager (YAML + DB)
+    In service mode, queries the running service. Otherwise uses local YAML + DB.
+    """
+    if service_mode:
+        client = get_service_client(config)
+        if client and client.is_available():
+            service_bots = client.list_bots()
+            if service_bots is not None:
+                _show_bots_from_service(config, service_bots)
+                return
+        console.print("[yellow]Service not reachable — showing local bots.[/yellow]")
+
     _show_bots_from_local(config)
 
 
@@ -522,7 +538,7 @@ def _show_bots_from_service(config: Config, bots_data: list[dict]):
     """Render bot list from service API response."""
     default_slug = config.DEFAULT_BOT or "nova"
 
-    console.print(Panel.fit("[bold cyan]Available Bots[/bold cyan]", border_style="cyan"))
+    console.print(Panel.fit("[bold cyan]Available Bots[/bold cyan] [dim](service)[/dim]", border_style="cyan"))
     console.print()
 
     table = Table(show_header=True, box=None, padding=(0, 2))
@@ -561,7 +577,7 @@ def _show_bots_from_local(config: Config):
     bots = bot_manager.list_bots()
     default_bot = bot_manager.get_default_bot()
 
-    console.print(Panel.fit("[bold cyan]Available Bots[/bold cyan]", border_style="cyan"))
+    console.print(Panel.fit("[bold cyan]Available Bots[/bold cyan] [dim](local)[/dim]", border_style="cyan"))
     console.print()
 
     table = Table(show_header=True, box=None, padding=(0, 2))
@@ -1386,7 +1402,7 @@ def main():
         sys.exit(0)
 
     elif getattr(args, 'list_bots', False):
-        show_bots(config_obj)
+        show_bots(config_obj, service_mode=_is_service_mode(args, config_obj))
         sys.exit(0)
 
     elif getattr(args, 'list_users', False):
@@ -1440,7 +1456,7 @@ def main():
         sys.exit(0)
 
     elif args.list_models:
-        list_models(config_obj)
+        list_models(config_obj, service_mode=_is_service_mode(args, config_obj))
         sys.exit(0)
         return
     if args.delete_model:
@@ -1498,13 +1514,7 @@ def main():
     history_only = (args.delete_history or args.print_history is not None) and not args.question and not args.command
     
     # Check if using service mode (don't validate model locally - let service handle it)
-    use_service = False
-    if args.local:
-        use_service = False
-    elif getattr(args, 'service', False):
-        use_service = True
-    elif config_obj.USE_SERVICE:
-        use_service = True
+    use_service = _is_service_mode(args, config_obj)
     
     # Determine which bot will be used (needed to get bot's default model)
     bot_manager = BotManager(config_obj)
