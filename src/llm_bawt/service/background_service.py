@@ -1066,22 +1066,15 @@ class BackgroundService:
         model_def = self.config.defined_models.get("models", {}).get(model_alias, {})
         if model_def.get("type") == "agent_backend" and model_def.get("backend") == "openclaw":
             return True
-        if model_def.get("type") == "openclaw":
-            return True
         return model_alias == "openclaw"
 
     def _get_openclaw_session_key(self, model_alias: str) -> str:
-        """Get the normalized session_key for an OpenClaw model.
-
-        Checks the model definition first (type=openclaw has session_key directly,
-        type=agent_backend has it in bot_config), then falls back to config.
-        """
+        """Get the normalized session_key for an OpenClaw model from its bot_config."""
         from openclaw_bridge.ingest import EventIngestPipeline
 
         model_def = self.config.defined_models.get("models", {}).get(model_alias, {})
         sk = (
-            model_def.get("session_key")
-            or (model_def.get("bot_config") or {}).get("session_key")
+            (model_def.get("bot_config") or {}).get("session_key")
             or self.config.OPENCLAW_WS_SESSIONS.split(",")[0].strip()
             or "main"
         )

@@ -20,8 +20,8 @@ PROVIDER_GGUF = "gguf"
 PROVIDER_HF = "huggingface"
 PROVIDER_VLLM = "vllm"
 PROVIDER_GROK = "grok"
-PROVIDER_OPENCLAW = "openclaw"
-PROVIDER_UNKNOWN = "Unknown" 
+PROVIDER_AGENT_BACKEND = "agent_backend"
+PROVIDER_UNKNOWN = "Unknown"
 
 logger = logging.getLogger(__name__)
 console = Console()
@@ -440,7 +440,7 @@ class Config(RuntimeTunables, BaseSettings):
             elif model_type == PROVIDER_VLLM:
                 if is_vllm_available():
                     available_options.append(alias)
-            elif model_type == PROVIDER_OPENCLAW:
+            elif model_type == PROVIDER_AGENT_BACKEND:
                 available_options.append(alias)
 
         return sorted(list(set(available_options))) # Return sorted list of unique aliases
@@ -462,7 +462,7 @@ class Config(RuntimeTunables, BaseSettings):
         if yaml_val is not None:
             return int(yaml_val)
         model_type = model_def.get("type", "")
-        if model_type in ("openai", "grok", "openclaw"):
+        if model_type in ("openai", "grok", "agent_backend"):
             return 128000
         return self.LLAMA_CPP_N_CTX or 32768
 
@@ -524,7 +524,7 @@ class Config(RuntimeTunables, BaseSettings):
             return "native"  # Grok supports native tool calling
         if model_type == PROVIDER_VLLM:
             return "native"  # tools passed via chat template, parsed from output
-        if model_type == PROVIDER_OPENCLAW:
+        if model_type == PROVIDER_AGENT_BACKEND:
             return "none"
         if model_type in (PROVIDER_GGUF, PROVIDER_OLLAMA, PROVIDER_HF):
             return "react"

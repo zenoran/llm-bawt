@@ -32,7 +32,7 @@ from llm_bawt.utils.config import (
     PROVIDER_GGUF,
     PROVIDER_GROK,
     PROVIDER_HF,
-    PROVIDER_OPENCLAW,
+    PROVIDER_AGENT_BACKEND,
     PROVIDER_OLLAMA,
     PROVIDER_OPENAI,
     PROVIDER_UNKNOWN,
@@ -448,21 +448,14 @@ class ModelManager:
                 if processed_desc: # Use potentially prefix-removed description
                     parts.append(processed_desc)
 
-        elif model_type == PROVIDER_OPENCLAW:
-            session_key = model_info.get("session_key")
-            gateway_url = model_info.get("gateway_url")
-            token_env = model_info.get("token_env")
-            model_id = model_info.get("model_id")
-            if model_id:
-                parts.append(f"Model: [bright_blue]{model_id}[/bright_blue]")
+        elif model_type == PROVIDER_AGENT_BACKEND:
+            backend = model_info.get("backend", "")
+            bot_config = model_info.get("bot_config", {})
+            session_key = bot_config.get("session_key")
+            if backend:
+                parts.append(f"Backend: [bright_blue]{backend}[/bright_blue]")
             if session_key:
                 parts.append(f"Session: [bright_blue]{session_key}[/bright_blue]")
-            if gateway_url:
-                parts.append(f"Gateway: {gateway_url}")
-            if token_env:
-                parts.append(f"Token env: {token_env}")
-            if model_info.get("description"):
-                parts.append(str(model_info.get("description")))
 
         return ", ".join(parts) or "No details"
 
@@ -715,39 +708,6 @@ def _list_models_from_service(config: Config):
             console.print(f"  [bold]{alias}[/bold]  {detail}")
         console.print()
 
-def _delete_openclaw_bot(alias: str, config: Config) -> None:
-    """Offer to delete bot profiles that reference this openclaw model alias."""
-    from llm_bawt.service.client import ServiceClient
-    service_url = getattr(config, 'SERVICE_URL', None)
-    if not service_url and hasattr(config, 'SERVICE_HOST') and hasattr(config, 'SERVICE_PORT'):
-        host = config.SERVICE_HOST or "localhost"
-        service_url = f"http://{host}:{config.SERVICE_PORT}"
-    client = ServiceClient(http_url=service_url)
-    if not client.is_available():
-        console.print("[yellow]Service not running — cannot check for associated bot profiles.[/yellow]")
-        return
-
-    bots = client.list_bots() or []
-    matching = [b for b in bots if b.get("default_model") == alias]
-    if not matching:
-        return
-
-    for bot in matching:
-        slug = bot.get("slug", "")
-        name = bot.get("name", slug)
-        if Confirm.ask(f"Delete bot profile '[cyan]{name}[/cyan]' (slug: {slug})?", default=True):
-            if Confirm.ask(f"  Also clear message history for '{slug}'?", default=True):
-                result = client.clear_history(bot_id=slug)
-                if result:
-                    console.print(f"[green]History cleared for '{slug}'.[/green]")
-                else:
-                    console.print(f"[yellow]Could not clear history for '{slug}'.[/yellow]")
-            if client.delete_bot_profile(slug):
-                console.print(f"[green]Bot profile '{slug}' deleted.[/green]")
-            else:
-                console.print(f"[red]Failed to delete bot profile '{slug}'.[/red]")
-
-
 def delete_model(alias: str, config: Config) -> bool:
     manager = ModelManager(config)
     # Get model info before deletion from config
@@ -759,10 +719,6 @@ def delete_model(alias: str, config: Config) -> bool:
         # Avoid probing Ollama during unrelated operations.
         # Ollama connectivity/model checks happen only when explicitly refreshing Ollama models.
         
-        # If the model is an OpenClaw model, offer to delete the associated bot profile
-        if model_info and model_info.get('type') == 'openclaw':
-            _delete_openclaw_bot(alias, config)
-
         # If the model is a GGUF model, check if we should delete the model files as well
         if model_info and model_info.get('type') == PROVIDER_GGUF:
             repo_id = model_info.get('repo_id')

@@ -79,25 +79,10 @@ async def lifespan(app):
         try:
             from openclaw_bridge.ingest import EventIngestPipeline
 
-            # Build session_key -> bot_id mapping from all openclaw bots/models
+            # Build session_key -> bot_id mapping from openclaw bots
             from ..bots import BotManager
             session_to_bot: dict[str, str] = {}
             bot_mgr = BotManager(config)
-            models = config.defined_models.get("models", {})
-
-            for alias, mdef in models.items():
-                if not isinstance(mdef, dict):
-                    continue
-                sk = mdef.get("session_key")
-                if not sk:
-                    continue
-                mtype = mdef.get("type", "")
-                if mtype in ("openclaw", "agent_backend"):
-                    normalized = EventIngestPipeline._normalize_session_key(sk)
-                    for bot in bot_mgr.list_bots():
-                        if bot.default_model == alias or (bot.agent_backend == "openclaw" and bot.default_model in (alias, "openclaw")):
-                            session_to_bot[normalized] = bot.slug
-                            break
 
             for bot in bot_mgr.list_bots():
                 if bot.agent_backend != "openclaw":
@@ -106,8 +91,7 @@ async def lifespan(app):
                 sk = bc.get("session_key")
                 if sk:
                     normalized = EventIngestPipeline._normalize_session_key(sk)
-                    if normalized not in session_to_bot:
-                        session_to_bot[normalized] = bot.slug
+                    session_to_bot[normalized] = bot.slug
 
             if session_to_bot:
                 log.info("OpenClaw session->bot mapping: %s", session_to_bot)

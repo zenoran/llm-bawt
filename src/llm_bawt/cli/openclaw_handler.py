@@ -1,4 +1,4 @@
-"""Handler for adding OpenClaw session/channel-backed models."""
+"""Handler for adding OpenClaw bot profiles."""
 
 from __future__ import annotations
 
@@ -16,8 +16,6 @@ from rich.console import Console
 from rich.prompt import Confirm, Prompt
 from rich.table import Table
 
-from ..model_manager import ModelManager
-from ..runtime_settings import ModelDefinitionStore
 from ..service.client import get_service_client
 from ..utils.config import Config
 
@@ -215,8 +213,8 @@ def _check_gateway_health(base_url: str, token: str) -> bool:
 
 
 def handle_add_openclaw(config: Config) -> bool:
-    """Interactive wizard for creating OpenClaw-backed model aliases."""
-    console.print("\n[bold magenta]Add OpenClaw model[/bold magenta]")
+    """Interactive wizard for creating OpenClaw bot profiles."""
+    console.print("\n[bold magenta]Add OpenClaw Bot[/bold magenta]")
     console.print(
         "[dim]Session key controls memory/context continuity; channel is transport metadata.[/dim]"
     )
@@ -380,121 +378,55 @@ def handle_add_openclaw(config: Config) -> bool:
         ).strip()
         selected_session_key = f"agent:{agent_id}:{session_slug}"
 
-    manager = ModelManager(config)
-    existing_models = manager.models_data.setdefault("models", {})
-    existing_session_aliases = sorted(
-        a
-        for a, info in existing_models.items()
-        if isinstance(info, dict)
-        and info.get("type") == "openclaw"
-        and str(info.get("session_key") or "").strip() == selected_session_key
-    )
-
-    default_alias = existing_session_aliases[0] if existing_session_aliases else f"openclaw-{_slugify(selected_session_key)}"
-    if existing_session_aliases:
-        console.print(
-            "[dim]Existing alias(es) for this session: "
-            f"{', '.join(existing_session_aliases)}[/dim]"
-        )
-    alias = Prompt.ask("Model alias", default=default_alias).strip()
-    if not alias:
-        console.print("[red]Alias is required.[/red]")
+    # --- Create bot profile ---
+    default_bot_slug = _slugify(agent_id) if agent_id != "main" else _slugify(selected_session_key)
+    bot_slug = Prompt.ask("Bot slug", default=default_bot_slug).strip().lower()
+    if not bot_slug:
+        console.print("[red]Bot slug is required.[/red]")
         return False
 
-    upstream_model = Prompt.ask("Upstream OpenClaw model id", default=f"openclaw:{agent_id}").strip()
+    bot_name = Prompt.ask("Bot display name", default=bot_slug.replace("-", " ").title()).strip()
+    bot_system_prompt = Prompt.ask(
+        "System prompt (leave blank for none)",
+        default="",
+    ).strip()
 
-    description = f"OpenClaw session {selected_session_key} via {gateway_url}"
-    model_entry: dict[str, Any] = {
-        "type": "openclaw",
-        "model_id": upstream_model,
-        "gateway_url": gateway_url,
-        "token_env": token_env,
-        "agent_id": agent_id,
-        "session_key": selected_session_key,
-        "tool_support": "none",
-        "description": description,
+    bot_payload = {
+        "name": bot_name,
+        "description": f"OpenClaw agent ({selected_session_key})",
+        "system_prompt": bot_system_prompt,
+        "requires_memory": True,
+        "agent_backend": "openclaw",
+        "agent_backend_config": {
+            "session_key": selected_session_key,
+            "timeout_seconds": 600,
+        },
     }
 
-    models = manager.models_data.setdefault("models", {})
-    existing = alias in models
-    if existing and not Confirm.ask(f"Alias '{alias}' exists. Overwrite?", default=False):
-        console.print("[yellow]Cancelled.[/yellow]")
-        return False
-
-    # Save to DB if available (authoritative store), fall back to yaml
-    db_saved = False
-    try:
-        store = ModelDefinitionStore(config)
-        if store.engine is not None:
-            store.upsert(alias, model_entry)
-            db_saved = True
-            console.print("[dim]Saved to model_definitions DB.[/dim]")
-    except Exception as e:
-        console.print(f"[yellow]Warning:[/yellow] Could not save model to DB: {e}")
-
-    models[alias] = model_entry
-    if not db_saved:
-        if not manager.save_config(added=0 if existing else 1, updated=1 if existing else 0):
-            return False
-    else:
-        # Silent yaml sync as fallback only
-        try:
-            manager.config_path.parent.mkdir(parents=True, exist_ok=True)
-            import yaml
-            with open(manager.config_path, 'w', encoding='utf-8') as f:
-                yaml.dump(manager.models_data, f, sort_keys=False, indent=2, default_flow_style=False, allow_unicode=True)
-        except Exception:
-            pass  # DB is authoritative, yaml failure is non-fatal
-
-    # Best effort: refresh running service model catalog so --list-models and
-    # /v1/models include this alias immediately without manual restart.
     try:
         service_client = get_service_client(config)
         if service_client and service_client.is_available(force_check=True):
-            reloaded = service_client.reload_models()
-            if isinstance(reloaded, dict) and reloaded.get("ok"):
-                console.print("[dim]Refreshed service model catalog.[/dim]")
-    except Exception:
-        pass
+            result = service_client.upsert_bot_profile(bot_slug, bot_payload)
+            if result:
+                console.print(f"[green]Created OpenClaw bot '{bot_slug}'[/green]")
+                console.print(f"[dim]Session key: {selected_session_key}[/dim]")
+                console.print(f"[dim]Usage: llm -b {bot_slug} \"your message\"[/dim]")
 
-    console.print(f"[green]Added OpenClaw model alias '{alias}'.[/green]")
-    console.print(f"[dim]Session key: {selected_session_key}[/dim]")
-
-    # --- Optionally create a bot profile bound to this model ---
-    if Confirm.ask("Create a bot for this model?", default=True):
-        default_bot_slug = _slugify(agent_id) if agent_id != "main" else _slugify(selected_session_key)
-        bot_slug = Prompt.ask("Bot slug", default=default_bot_slug).strip().lower()
-        if not bot_slug:
-            console.print("[yellow]Skipped bot creation (no slug).[/yellow]")
-            return True
-
-        bot_name = Prompt.ask("Bot display name", default=bot_slug.replace("-", " ").title()).strip()
-        bot_system_prompt = Prompt.ask(
-            "System prompt (leave blank for none)",
-            default="",
-        ).strip()
-
-        bot_payload = {
-            "name": bot_name,
-            "description": f"OpenClaw agent ({selected_session_key})",
-            "system_prompt": bot_system_prompt,
-            "requires_memory": True,
-            "default_model": alias,
-            "agent_backend": "openclaw",
-            "agent_backend_config": {"session_key": selected_session_key},
-        }
-
-        try:
-            service_client = get_service_client(config)
-            if service_client and service_client.is_available(force_check=True):
-                result = service_client.upsert_bot_profile(bot_slug, bot_payload)
-                if result:
-                    console.print(f"[green]Created bot '{bot_slug}' -> model '{alias}'[/green]")
-                else:
-                    console.print("[yellow]Service did not confirm bot creation.[/yellow]")
+                # Refresh service model catalog to register the virtual model
+                try:
+                    reloaded = service_client.reload_models()
+                    if isinstance(reloaded, dict) and reloaded.get("ok"):
+                        console.print("[dim]Refreshed service model catalog.[/dim]")
+                except Exception:
+                    pass
             else:
-                console.print("[yellow]Service not available — bot not created. Create manually via API.[/yellow]")
-        except Exception as e:
-            console.print(f"[yellow]Warning:[/yellow] Could not create bot: {e}")
+                console.print("[yellow]Service did not confirm bot creation.[/yellow]")
+                return False
+        else:
+            console.print("[yellow]Service not available — bot not created. Start the service first.[/yellow]")
+            return False
+    except Exception as e:
+        console.print(f"[red]Could not create bot:[/red] {e}")
+        return False
 
     return True
