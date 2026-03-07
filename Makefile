@@ -177,10 +177,10 @@ dev-tui-debug: ## [uv] Run memory TUI with textual console
 
 .PHONY: run up docker-dev down restart rebuild logs docker-status docker-shell docker-exec
 
-run: ## Stop app, rebuild dev, tail logs (sidecars untouched)
-	docker compose -f $(COMPOSE_BASE) -f $(COMPOSE_DEV) down --remove-orphans --timeout 5 app
-	docker compose -f $(COMPOSE_BASE) -f $(COMPOSE_DEV) up -d app
-	docker compose logs -f --tail=50 app
+run: ## Stop app + bridge, rebuild dev, tail logs
+	docker compose -f $(COMPOSE_BASE) -f $(COMPOSE_DEV) down --remove-orphans --timeout 5 app openclaw-bridge
+	docker compose -f $(COMPOSE_BASE) -f $(COMPOSE_DEV) up -d app openclaw-bridge
+	docker compose logs -f --tail=50 app openclaw-bridge
 
 up: ## Docker compose up (production)
 	@echo "Starting containers (production mode)..."
