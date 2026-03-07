@@ -69,32 +69,41 @@ class BridgeConfig:
             f"@{self.postgres_host}:{self.postgres_port}/{self.postgres_database}"
         )
 
-    def fetch_session_to_bot(self) -> dict[str, str]:
-        """Fetch session_key -> bot_id mapping from the main app's /v1/bots API."""
+    def fetch_session_to_bot(self, *, retries: int = 10, delay: float = 5.0) -> dict[str, str]:
+        """Fetch session_key -> bot_id mapping from the main app's /v1/bots API.
+
+        Retries on failure since the main app may still be starting up.
+        """
         if not self.app_api_url:
             return {}
         import json
         import logging
+        import time
         import urllib.request
         logger = logging.getLogger(__name__)
         url = f"{self.app_api_url.rstrip('/')}/v1/bots"
-        try:
-            with urllib.request.urlopen(url, timeout=10) as resp:
-                data = json.loads(resp.read())
-            mapping: dict[str, str] = {}
-            for bot in data.get("data", []):
-                if bot.get("agent_backend") != "openclaw":
-                    continue
-                bc = bot.get("agent_backend_config") or {}
-                sk = bc.get("session_key", "")
-                if sk:
-                    # Normalize "agent:main:main" -> "main"
-                    if sk.startswith("agent:"):
-                        parts = sk.split(":")
-                        if len(parts) >= 2:
-                            sk = parts[1]
-                    mapping[sk] = bot["slug"]
-            return mapping
-        except Exception as e:
-            logger.warning("Failed to fetch bot mapping from %s: %s", url, e)
-            return {}
+        for attempt in range(1, retries + 1):
+            try:
+                with urllib.request.urlopen(url, timeout=10) as resp:
+                    data = json.loads(resp.read())
+                mapping: dict[str, str] = {}
+                for bot in data.get("data", []):
+                    if bot.get("agent_backend") != "openclaw":
+                        continue
+                    bc = bot.get("agent_backend_config") or {}
+                    sk = bc.get("session_key", "")
+                    if sk:
+                        # Normalize "agent:main:main" -> "main"
+                        if sk.startswith("agent:"):
+                            parts = sk.split(":")
+                            if len(parts) >= 2:
+                                sk = parts[1]
+                        mapping[sk] = bot["slug"]
+                return mapping
+            except Exception as e:
+                if attempt < retries:
+                    logger.info("Waiting for main app API (%s, attempt %d/%d)...", e, attempt, retries)
+                    time.sleep(delay)
+                else:
+                    logger.warning("Failed to fetch bot mapping from %s after %d attempts: %s", url, retries, e)
+        return {}
