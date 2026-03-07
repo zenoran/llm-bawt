@@ -114,7 +114,6 @@ class ModelManager:
 
     def load_config(self) -> bool:
         if not self.config_path.is_file():
-            console.print(f"[yellow]Warning:[/yellow] Config file {self.config_path} not found. Assuming empty structure.")
             self.models_data = {"models": {}}
             return True
         try:
@@ -169,7 +168,8 @@ class ModelManager:
         defined_models = self.models_data.get("models", {})
         available_aliases = set(self.config.get_model_options())
 
-        console.print(f"[bold green]Local Models[/bold green]  [dim]{self.config_path}[/dim]")
+        source = str(self.config_path) if self.config_path.is_file() else "database"
+        console.print(f"[bold green]Local Models[/bold green]  [dim]{source}[/dim]")
         console.print()
 
         if not defined_models:
