@@ -34,7 +34,10 @@ class SessionBridge:
 
     async def start(self) -> None:
         """Start the bridge: connect WS, begin consuming events, and listen for commands."""
-        self._ws_client.on_event(self._on_raw_event)
+        # DEACTIVATED: passive event feed disabled — causes duplicate history
+        # writes and wastes resources.  Active chat.send path uses per-run
+        # queues in ws_client and does not depend on this callback.
+        # self._ws_client.on_event(self._on_raw_event)
         await self._ws_client.connect()
         self._command_task = asyncio.create_task(self._command_listener())
         logger.info("SessionBridge started (sessions=%s)", list(self._ws_client.subscribed_sessions))

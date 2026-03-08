@@ -109,17 +109,21 @@ async def lifespan(app):
                 # Make subscriber available to OpenClawBackend instances
                 set_openclaw_subscriber(redis_subscriber)
 
-                # Start history drain background task
-                def _history_sink(bot_id: str, role: str, content: str) -> None:
-                    client = service.get_memory_client(bot_id)
-                    if client:
-                        client.add_message(role=role, content=content)
-
-                import asyncio
-                history_drain_task = asyncio.create_task(
-                    redis_subscriber.drain_history(_history_sink)
-                )
-                service._history_drain_task = history_drain_task
+                # DEACTIVATED: passive history drain causes duplicates with
+                # finalize_response().  The active chat.send path persists via
+                # finalize_response() and does not need this consumer.
+                # Re-enable when async/cron traffic persistence is redesigned.
+                #
+                # def _history_sink(bot_id: str, role: str, content: str) -> None:
+                #     client = service.get_memory_client(bot_id)
+                #     if client:
+                #         client.add_message(role=role, content=content)
+                #
+                # import asyncio
+                # history_drain_task = asyncio.create_task(
+                #     redis_subscriber.drain_history(_history_sink)
+                # )
+                # service._history_drain_task = history_drain_task
 
                 log.info(
                     "OpenClaw Redis subscriber started (redis=%s, sessions=%s)",
@@ -148,12 +152,13 @@ async def lifespan(app):
     try:
         yield
     finally:
-        if history_drain_task:
-            history_drain_task.cancel()
-            try:
-                await history_drain_task
-            except (asyncio.CancelledError, Exception):
-                pass
+        # DEACTIVATED: history drain task (see above)
+        # if history_drain_task:
+        #     history_drain_task.cancel()
+        #     try:
+        #         await history_drain_task
+        #     except (asyncio.CancelledError, Exception):
+        #         pass
         if redis_subscriber:
             from ..agent_backends.openclaw import set_openclaw_subscriber
             set_openclaw_subscriber(None)
