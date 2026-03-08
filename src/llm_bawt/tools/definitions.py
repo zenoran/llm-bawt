@@ -759,6 +759,8 @@ def get_tools_prompt(
         )
 
     handler = get_format_handler(tool_format)
+    if handler is None:
+        return ""  # tool_format="none" — no tool prompt needed
     return handler.get_system_prompt(tools)
 
 

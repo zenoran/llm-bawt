@@ -108,6 +108,8 @@ class ToolLoop:
         self.tool_format = tool_format
         self.tools = tools
         self.format_handler = get_format_handler(tool_format)
+        if self.format_handler is None:
+            raise ValueError(f"ToolLoop requires a valid tool format, got: {tool_format}")
         self._using_native_tools = False
         self.adapter = adapter
         self.generation_kwargs = generation_kwargs or {}

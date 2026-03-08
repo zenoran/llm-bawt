@@ -156,20 +156,23 @@ class RedisSubscriber:
     ) -> AsyncIterator[OpenClawEvent]:
         """Subscribe to the per-run response stream published by the bridge.
 
-        Yields events until the bridge signals 'done' or timeout.
+        Yields events until the bridge signals 'done' or inactivity timeout.
+        The timeout resets on each received event, so long-running tasks
+        (e.g. backups) that continue producing events won't time out.
         """
         stream_key = f"{RUN_STREAM_PREFIX}{request_id}"
         last_id = "0"  # read from beginning (stream is created fresh per run)
-        deadline = asyncio.get_event_loop().time() + timeout_s
+        loop_time = asyncio.get_event_loop().time
+        deadline = loop_time() + timeout_s
         logger.info(
             "subscribe_run started: request_id=%s timeout_s=%.0f stream=%s",
             request_id, timeout_s, stream_key,
         )
 
         while True:
-            remaining = deadline - asyncio.get_event_loop().time()
+            remaining = deadline - loop_time()
             if remaining <= 0:
-                logger.warning("subscribe_run timeout for request_id=%s", request_id)
+                logger.warning("subscribe_run inactivity timeout for request_id=%s", request_id)
                 return
 
             block_ms = min(int(remaining * 1000), 2000)
@@ -190,6 +193,8 @@ class RedisSubscriber:
             for _stream_name, messages in results:
                 for msg_id, fields in messages:
                     last_id = msg_id
+                    # Reset inactivity deadline on each event
+                    deadline = loop_time() + timeout_s
 
                     # Check for done sentinel
                     if fields.get("done"):

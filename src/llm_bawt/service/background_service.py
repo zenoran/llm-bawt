@@ -284,9 +284,15 @@ class BackgroundService:
         self._bg_client: Any | None = None
         self._bg_client_model: str | None = None
         
-        # Session model overrides: when user switches model via tool, 
+        # Session model overrides: when user switches model via tool,
         # remember it for the rest of the session. Keyed by (bot_id, user_id).
         self._session_model_overrides: dict[tuple[str, str], str] = {}
+
+        # SSE event fan-out: buffer events per turn so new clients can subscribe
+        # to in-progress streams (e.g. after page refresh).
+        self._turn_event_buffers: dict[str, list[str]] = {}
+        self._turn_subscribers: dict[str, list[asyncio.Queue]] = {}
+        self._turn_event_lock = asyncio.Lock()
         
         # Model configuration
         self._available_models: list[str] = []
@@ -496,6 +502,66 @@ class BackgroundService:
 
         raise ValueError("No models available on service.")
     
+    # ---- SSE event fan-out for turn reconnection ----
+
+    def _broadcast_turn_event(self, turn_id: str, sse_line: str) -> None:
+        """Buffer an SSE event and fan out to any live subscribers."""
+        buf = self._turn_event_buffers.get(turn_id)
+        if buf is None:
+            buf = []
+            self._turn_event_buffers[turn_id] = buf
+        buf.append(sse_line)
+        for q in self._turn_subscribers.get(turn_id, []):
+            try:
+                q.put_nowait(sse_line)
+            except Exception:
+                pass
+
+    def _cleanup_turn_buffer(self, turn_id: str) -> None:
+        """Remove event buffer for a completed turn (after a short delay)."""
+        async def _deferred():
+            await asyncio.sleep(60)  # keep buffer 60s after completion
+            self._turn_event_buffers.pop(turn_id, None)
+            self._turn_subscribers.pop(turn_id, None)
+        try:
+            asyncio.get_event_loop().create_task(_deferred())
+        except Exception:
+            self._turn_event_buffers.pop(turn_id, None)
+
+    async def subscribe_turn_events(self, turn_id: str):
+        """Subscribe to SSE events for an in-progress turn.
+
+        Yields buffered events first, then live events as they arrive.
+        """
+        # Send buffered events
+        for event in list(self._turn_event_buffers.get(turn_id, [])):
+            yield event
+
+        # Check if turn is already done (buffer ends with [DONE])
+        buf = self._turn_event_buffers.get(turn_id, [])
+        if buf and "data: [DONE]" in buf[-1]:
+            return
+
+        # Subscribe to live events
+        q: asyncio.Queue[str | None] = asyncio.Queue()
+        self._turn_subscribers.setdefault(turn_id, []).append(q)
+        try:
+            while True:
+                try:
+                    event = await asyncio.wait_for(q.get(), timeout=30.0)
+                except asyncio.TimeoutError:
+                    yield ": keepalive\n\n"
+                    continue
+                if event is None:
+                    break
+                yield event
+                if "data: [DONE]" in event:
+                    break
+        finally:
+            subs = self._turn_subscribers.get(turn_id, [])
+            if q in subs:
+                subs.remove(q)
+
     async def _start_generation(self) -> tuple[threading.Event, threading.Event]:
         """Start a new generation, cancelling and waiting for any in-progress one.
         
@@ -789,13 +855,17 @@ class BackgroundService:
         
         log.cache_miss("llm_bawt", f"{model_alias}/{bot_id}/{user_id}")
         
-        # Check if we already have a client for this model in the client cache
-        # If so, reuse it to avoid reloading GGUF models into VRAM
-        existing_client = self._client_cache.get(model_alias)
-        
-        # Get model type for logging
+        # Get model type for logging and cache decisions
         model_def = self.config.defined_models.get("models", {}).get(model_alias, {})
         model_type = model_def.get("type", "unknown")
+
+        # Check if we already have a client for this model in the client cache
+        # If so, reuse it to avoid reloading GGUF models into VRAM.
+        # Skip for agent_backend models — they're lightweight and hold per-bot
+        # state (_bot_config with session_key) that must not be shared.
+        existing_client = None
+        if model_type != "agent_backend":
+            existing_client = self._client_cache.get(model_alias)
         
         # Only log model loading if we don't have the client cached
         if not existing_client:
@@ -817,8 +887,9 @@ class BackgroundService:
             )
             self._llm_bawt_cache[cache_key] = llm_bawt
             
-            # Also cache the client for future reuse by extraction tasks
-            if model_alias not in self._client_cache:
+            # Also cache the client for future reuse by extraction tasks.
+            # Skip agent_backend clients — they hold per-bot state.
+            if model_alias not in self._client_cache and model_type != "agent_backend":
                 self._client_cache[model_alias] = llm_bawt.client
             # Note: BaseLLMBawt.__init__ already registers with lifecycle manager
             
@@ -1683,6 +1754,17 @@ class BackgroundService:
             bot = get_bot(bot_id)
             emote_filter = StreamingEmoteFilter() if (bot and bot.voice_optimized) else None
             
+            # Emit turn ID so the frontend can reconnect after page refresh
+            turn_meta = {
+                "object": "service.turn_id",
+                "turn_id": turn_log_id,
+                "model": model_alias,
+                "bot_id": bot_id,
+            }
+            turn_meta_line = f"data: {json.dumps(turn_meta)}\n\n"
+            self._broadcast_turn_event(turn_log_id, turn_meta_line)
+            yield turn_meta_line
+
             # Send service warnings (e.g. model fallback) before content
             if model_warnings:
                 warning_data = {
@@ -1690,10 +1772,17 @@ class BackgroundService:
                     "model": model_alias,
                     "warnings": model_warnings,
                 }
-                yield f"data: {json.dumps(warning_data)}\n\n"
+                warning_line = f"data: {json.dumps(warning_data)}\n\n"
+                self._broadcast_turn_event(turn_log_id, warning_line)
+                yield warning_line
 
             # Start streaming in single-thread executor
             loop.run_in_executor(self._llm_executor, _stream_to_queue)
+
+            # Helper: yield SSE line and broadcast to turn subscribers
+            def _sse(line: str) -> str:
+                self._broadcast_turn_event(turn_log_id, line)
+                return line
 
             # Yield SSE chunks (with keepalive to prevent client timeout
             # during slow backends like vLLM first-inference)
@@ -1704,7 +1793,7 @@ class BackgroundService:
                     # Send SSE comment as keepalive to prevent client/proxy timeout
                     yield ": keepalive\n\n"
                     continue
-                
+
                 if chunk is None:
                     # Stream complete - flush any buffered content from emote filter
                     if emote_filter:
@@ -1717,8 +1806,8 @@ class BackgroundService:
                                 "model": model_alias,
                                 "choices": [{"index": 0, "delta": {"content": final_chunk}, "finish_reason": None}],
                             }
-                            yield f"data: {json.dumps(data)}\n\n"
-                    
+                            yield _sse(f"data: {json.dumps(data)}\n\n")
+
                     # Send final chunk
                     data = {
                         "id": response_id,
@@ -1727,10 +1816,11 @@ class BackgroundService:
                         "model": model_alias,
                         "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
                     }
-                    yield f"data: {json.dumps(data)}\n\n"
-                    yield "data: [DONE]\n\n"
+                    yield _sse(f"data: {json.dumps(data)}\n\n")
+                    yield _sse("data: [DONE]\n\n")
+                    self._cleanup_turn_buffer(turn_log_id)
                     break
-                
+
                 if isinstance(chunk, Exception):
                     # Upstream stream failed; close SSE cleanly so downstream clients
                     # don't see an incomplete chunked read protocol error.
@@ -1740,7 +1830,7 @@ class BackgroundService:
                         "model": model_alias,
                         "warnings": [f"stream_interrupted: {chunk}"],
                     }
-                    yield f"data: {json.dumps(warning_data)}\n\n"
+                    yield _sse(f"data: {json.dumps(warning_data)}\n\n")
 
                     # Flush any buffered content from emote filter.
                     if emote_filter:
@@ -1753,7 +1843,7 @@ class BackgroundService:
                                 "model": model_alias,
                                 "choices": [{"index": 0, "delta": {"content": final_chunk}, "finish_reason": None}],
                             }
-                            yield f"data: {json.dumps(data)}\n\n"
+                            yield _sse(f"data: {json.dumps(data)}\n\n")
 
                     data = {
                         "id": response_id,
@@ -1762,8 +1852,9 @@ class BackgroundService:
                         "model": model_alias,
                         "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
                     }
-                    yield f"data: {json.dumps(data)}\n\n"
-                    yield "data: [DONE]\n\n"
+                    yield _sse(f"data: {json.dumps(data)}\n\n")
+                    yield _sse("data: [DONE]\n\n")
+                    self._cleanup_turn_buffer(turn_log_id)
                     break
 
                 if isinstance(chunk, dict) and chunk.get("event") == "tool_call":
@@ -1780,7 +1871,7 @@ class BackgroundService:
                         "result": result,
                         "status": "completed" if (has_result or error) else "pending",
                     }
-                    yield f"data: {json.dumps(event_data)}\n\n"
+                    yield _sse(f"data: {json.dumps(event_data)}\n\n")
                     continue
 
                 if isinstance(chunk, dict) and chunk.get("event") == "tool_result":
@@ -1790,16 +1881,16 @@ class BackgroundService:
                         "name": chunk.get("name", "unknown"),
                         "result": chunk.get("result"),
                     }
-                    yield f"data: {json.dumps(event_data)}\n\n"
+                    yield _sse(f"data: {json.dumps(event_data)}\n\n")
                     continue
-                
+
                 # Apply emote filter for voice_optimized bots
                 if emote_filter:
                     chunk = emote_filter.process(chunk)
                     if not chunk:
                         # Chunk was filtered out or buffered
                         continue
-                
+
                 # Normal chunk
                 data = {
                     "id": response_id,
@@ -1808,7 +1899,7 @@ class BackgroundService:
                     "model": model_alias,
                     "choices": [{"index": 0, "delta": {"content": chunk}, "finish_reason": None}],
                 }
-                yield f"data: {json.dumps(data)}\n\n"
+                yield _sse(f"data: {json.dumps(data)}\n\n")
         finally:
             # Mark generation as complete
             self._end_generation(cancel_event, done_event)

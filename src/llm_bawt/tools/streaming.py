@@ -173,7 +173,9 @@ def stream_with_tools(
         log.debug(f"Using adapter: {adapter.name}")
 
     handler = get_format_handler(tool_format)
-    
+    if handler is None:
+        raise ValueError(f"Tool streaming requires a valid tool format, got: {tool_format}")
+
     # Combine stop sequences from both handler and adapter
     handler_stops = handler.get_stop_sequences()
     adapter_stops = adapter.get_stop_sequences()

@@ -9,13 +9,20 @@ class ToolFormat(Enum):
     REACT = "react"
     NATIVE_OPENAI = "native"
     XML = "xml"
+    NONE = "none"
 
 
-def get_format_handler(tool_format: ToolFormat | str) -> ToolFormatHandler:
-    """Return a handler instance for the requested tool format."""
+def get_format_handler(tool_format: ToolFormat | str) -> ToolFormatHandler | None:
+    """Return a handler instance for the requested tool format.
+
+    Returns ``None`` for :pyattr:`ToolFormat.NONE` (no tool support).
+    """
     if isinstance(tool_format, str):
         normalized = tool_format.strip().lower()
         tool_format = ToolFormat(normalized)
+
+    if tool_format == ToolFormat.NONE:
+        return None
 
     if tool_format == ToolFormat.REACT:
         from .react import ReActFormatHandler
