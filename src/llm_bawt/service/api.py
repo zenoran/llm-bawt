@@ -125,6 +125,66 @@ async def lifespan(app):
                 # )
                 # service._history_drain_task = history_drain_task
 
+                # Start background task to clean up stale consumer groups
+                async def _cleanup_stale_groups():
+                    """Periodically destroy idle ui:* consumer groups."""
+                    import asyncio as _asyncio
+                    while True:
+                        await _asyncio.sleep(300)  # every 5 minutes
+                        try:
+                            streams = await redis_subscriber.list_unified_streams()
+                            total = 0
+                            for stream_key in streams:
+                                total += await redis_subscriber.cleanup_stale_groups(stream_key)
+                            if total:
+                                log.info("Cleaned up %d stale consumer groups", total)
+                        except Exception:
+                            log.debug("Stale group cleanup error", exc_info=True)
+
+                import asyncio
+                service._group_cleanup_task = asyncio.create_task(_cleanup_stale_groups())
+
+                # Start persistence consumer for tool events → Postgres
+                def _tool_event_sink(event_data: dict) -> None:
+                    """Persist tool_start/tool_end events to tool_call_records table."""
+                    store = service._turn_log_store
+                    event_type = event_data.get("event", "")
+                    if event_type == "tool_start":
+                        store.save_tool_call(
+                            turn_id=event_data.get("turn_id"),
+                            bot_id=event_data.get("bot_id"),
+                            user_id=event_data.get("user_id"),
+                            call_id=event_data.get("call_id"),
+                            tool_name=event_data.get("tool_name", "unknown"),
+                            arguments=event_data.get("arguments"),
+                            iteration=event_data.get("iteration", 1),
+                            started_at=event_data.get("ts"),
+                        )
+                    elif event_type == "tool_end":
+                        call_id = event_data.get("call_id")
+                        if call_id:
+                            store.update_tool_call_result(
+                                call_id=call_id,
+                                result=event_data.get("result", ""),
+                                ended_at=event_data.get("ts"),
+                            )
+                        else:
+                            # No call_id — save as complete record
+                            store.save_tool_call(
+                                turn_id=event_data.get("turn_id"),
+                                bot_id=event_data.get("bot_id"),
+                                user_id=event_data.get("user_id"),
+                                call_id=None,
+                                tool_name=event_data.get("tool_name", "unknown"),
+                                result=event_data.get("result", ""),
+                                iteration=event_data.get("iteration", 1),
+                                ended_at=event_data.get("ts"),
+                            )
+
+                service._tool_persist_task = asyncio.create_task(
+                    redis_subscriber.drain_tool_events(_tool_event_sink)
+                )
+
                 log.info(
                     "OpenClaw Redis subscriber started (redis=%s, sessions=%s)",
                     config.REDIS_URL,
@@ -159,6 +219,15 @@ async def lifespan(app):
         #         await history_drain_task
         #     except (asyncio.CancelledError, Exception):
         #         pass
+        # Cancel background tasks
+        for task_attr in ("_group_cleanup_task", "_tool_persist_task"):
+            task = getattr(service, task_attr, None)
+            if task:
+                task.cancel()
+                try:
+                    await task
+                except (asyncio.CancelledError, Exception):
+                    pass
         if redis_subscriber:
             from ..agent_backends.openclaw import set_openclaw_subscriber
             set_openclaw_subscriber(None)

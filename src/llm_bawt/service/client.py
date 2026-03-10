@@ -329,21 +329,6 @@ class ServiceClient:
                             if chunk.get("object") == "service.warning":
                                 yield {"warnings": chunk.get("warnings", []), "model": chunk.get("model")}
                                 continue
-                            # Service tool-call event (subtle UI indicator)
-                            if chunk.get("object") == "service.tool_call":
-                                yield {
-                                    "tool_call": chunk.get("name") or chunk.get("tool") or "tool",
-                                    "tool_args": chunk.get("arguments", {}),
-                                    "model": chunk.get("model"),
-                                }
-                                continue
-                            if chunk.get("object") == "service.tool_result":
-                                yield {
-                                    "tool_result": chunk.get("name") or chunk.get("tool") or "tool",
-                                    "result_text": chunk.get("result"),
-                                    "model": chunk.get("model"),
-                                }
-                                continue
                             # On first chunk, yield metadata with actual model used
                             if first_chunk:
                                 actual_model = chunk.get("model")
@@ -351,6 +336,21 @@ class ServiceClient:
                                     yield {"model": actual_model}
                                 first_chunk = False
                             delta = chunk.get("choices", [{}])[0].get("delta", {})
+                            # OpenAI-compat tool_calls in delta
+                            tool_calls = delta.get("tool_calls")
+                            if tool_calls:
+                                for tc in tool_calls:
+                                    func = tc.get("function", {})
+                                    yield {
+                                        "tool_call": func.get("name") or "tool",
+                                        "tool_args": func.get("arguments", ""),
+                                        "model": chunk.get("model"),
+                                    }
+                                continue
+                            # Check finish_reason for tool_calls
+                            finish_reason = chunk.get("choices", [{}])[0].get("finish_reason")
+                            if finish_reason == "tool_calls":
+                                continue  # Server executing tools, follow-up content coming
                             content = delta.get("content", "")
                             if content:
                                 yield content
@@ -630,6 +630,53 @@ class ServiceClient:
                 return response
         except Exception as e:
             logger.warning(f"Reload models via service failed: {e}")
+
+        return None
+
+    def upsert_model_definition(self, alias: str, model_data: dict[str, Any]) -> dict[str, Any] | None:
+        """Create or update a model definition on the service.
+
+        model_data should contain keys like type, model_id, description, etc.
+        Returns the response dict on success, None on failure.
+        """
+        if not self.is_available():
+            return None
+
+        # Separate known top-level fields from extras
+        top_fields = {"type", "model_id", "repo_id", "filename", "description"}
+        payload: dict[str, Any] = {}
+        extra: dict[str, Any] = {}
+        for k, v in model_data.items():
+            if k in top_fields:
+                payload[k] = v
+            else:
+                extra[k] = v
+        if extra:
+            payload["extra"] = extra
+
+        try:
+            response = self._request("PUT", f"/v1/models/definitions/{alias}", data=payload)
+            if isinstance(response, dict):
+                return response
+        except Exception as e:
+            logger.warning(f"Upsert model definition '{alias}' via service failed: {e}")
+
+        return None
+
+    def delete_model_definition(self, alias: str) -> dict[str, Any] | None:
+        """Delete a model definition from the service.
+
+        Returns the response dict on success, None on failure.
+        """
+        if not self.is_available():
+            return None
+
+        try:
+            response = self._request("DELETE", f"/v1/models/definitions/{alias}")
+            if isinstance(response, dict):
+                return response
+        except Exception as e:
+            logger.warning(f"Delete model definition '{alias}' via service failed: {e}")
 
         return None
 

@@ -83,9 +83,11 @@ class _PathWrapper:
 class ModelManager:
     """Manages models defined in the configuration file."""
 
-    def __init__(self, config: Config, local_only: bool = False):
+    def __init__(self, config: Config, local_only: bool = False, service_client=None):
         self.config = config
         self.local_only = local_only
+        self.service_client = service_client
+        self._changed_aliases: set = set()  # Track aliases modified this session
         raw_path = Path(self.config.MODELS_CONFIG_PATH)
         self.config_path = _PathWrapper(raw_path)
         self.models_data: Dict[str, Any] = {}
@@ -137,6 +139,8 @@ class ModelManager:
             return False
 
     def save_config(self, added: int = 0, updated: int = 0, deleted: int = 0) -> bool:
+        if self.service_client:
+            return self._save_via_service(added, updated, deleted)
         console.print(f"\nSaving configuration to {self.config_path}...")
         try:
             self.config_path.parent.mkdir(parents=True, exist_ok=True)
@@ -164,6 +168,40 @@ class ModelManager:
         except Exception as e:
             console.print(f"[bold red]Error saving configuration to {self.config_path}:[/bold red] {e}")
             return False
+
+    def _save_via_service(self, added: int = 0, updated: int = 0, deleted: int = 0) -> bool:
+        """Push changed model definitions to the service instead of writing YAML."""
+        models = self.models_data.get('models', {})
+        ok = 0
+        failed = 0
+        for alias in self._changed_aliases:
+            entry = models.get(alias)
+            if entry is None:
+                continue
+            resp = self.service_client.upsert_model_definition(alias, entry)
+            if resp:
+                ok += 1
+            else:
+                console.print(f"[red]Failed to push '{alias}' to service.[/red]")
+                failed += 1
+        self._changed_aliases.clear()
+
+        if failed:
+            console.print(f"[red]Service update: {ok} succeeded, {failed} failed.[/red]")
+            return False
+
+        messages = []
+        if added > 0:
+            messages.append(f"{added} added")
+        if updated > 0:
+            messages.append(f"{updated} updated")
+        if deleted > 0:
+            messages.append(f"{deleted} deleted")
+        if messages:
+            console.print(f"[bold green]Successfully processed via service: {', '.join(messages)}.[/bold green]")
+        else:
+            console.print(f"[green]Models synced to service.[/green]")
+        return True
 
     def list_available_models(self):
         """Display locally-defined models from models.yaml / DB (local mode)."""
@@ -236,7 +274,16 @@ class ModelManager:
             return True
         del models[alias]
 
-        # Delete from DB (authoritative store)
+        if self.service_client:
+            resp = self.service_client.delete_model_definition(alias)
+            if resp:
+                console.print(f"[bold green]Deleted '{alias}' from service.[/bold green]")
+                return True
+            else:
+                console.print(f"[red]Failed to delete '{alias}' from service.[/red]")
+                return False
+
+        # Local mode: delete from DB directly + YAML
         db_deleted = False
         try:
             store = ModelDefinitionStore(self.config)
@@ -247,10 +294,13 @@ class ModelManager:
         except Exception as e:
             console.print(f"[yellow]Warning:[/yellow] Could not delete from DB: {e}")
 
-        # Also remove from yaml
         return self.save_config(deleted=1)
 
     def update_models(self, provider_type: Optional[str] = None):
+        if self.service_client:
+            console.print("[dim]Mode: service[/dim]")
+        else:
+            console.print("[dim]Mode: local (models.yaml)[/dim]")
         targets = [provider_type] if provider_type else [PROVIDER_OPENAI, PROVIDER_OLLAMA]
         success = True # Track overall success
         for prov in targets:
@@ -293,7 +343,7 @@ class ModelManager:
                     self.config.force_ollama_check()
             return save_ok
         else:
-            console.print("[green]Local configuration is up-to-date.[/green]")
+            console.print("[green]Configuration is up-to-date.[/green]")
             return True
 
     def _fetch_api_models(self, provider_type: str) -> Tuple[bool, List[Dict[str, Any]]]:
@@ -319,6 +369,11 @@ class ModelManager:
         return False, []
 
     def _update_existing_descriptions(self, provider_type: str, api_models: List[Dict[str, Any]], existing_map: Dict[str, str]) -> int:
+        """Update auto-generated timestamp descriptions for existing models.
+
+        Only overwrites descriptions that match the auto-generated pattern
+        (contain 'Created:' or 'Modified:').  Custom descriptions are left alone.
+        """
         tz = pytz.timezone('US/Eastern')
         count = 0
         for m in api_models:
@@ -331,8 +386,13 @@ class ModelManager:
                     continue
                 label = 'Created' if provider_type in (PROVIDER_OPENAI, PROVIDER_GROK) else 'Modified'
                 expected = f"{mid} ({label}: {ts})"
-                if ts not in entry.get('description', '') or mid not in entry.get('description', ''):
+                current_desc = entry.get('description', '')
+                # Skip models with custom (non-auto-generated) descriptions
+                if current_desc and f'{label}:' not in current_desc:
+                    continue
+                if current_desc != expected:
                     entry['description'] = expected
+                    self._changed_aliases.add(alias)
                     count += 1
                     console.print(f"Updated description for alias '{alias}'.")
         return count
@@ -371,13 +431,20 @@ class ModelManager:
         existing = set(self.models_data['models'].keys())
         count = 0
         for m in selected_models:
-            alias = self._generate_alias(provider_type, m, existing)
+            default_alias = self._generate_alias(provider_type, m, existing)
+            alias = Prompt.ask(f"Alias for [bright_blue]{m['id']}[/bright_blue]", default=default_alias).strip()
+            if not alias:
+                alias = default_alias
+            if alias in existing:
+                console.print(f"[yellow]Alias '{alias}' already exists, using '{default_alias}'.[/yellow]")
+                alias = default_alias
             existing.add(alias)
             ts = self._format_model_timestamp_str(provider_type, m, tz)
             label = 'Created' if provider_type in (PROVIDER_OPENAI, PROVIDER_GROK) else 'Modified'
             desc = f"{m['id']} ({label}: {ts})"
             entry = {'type': provider_type, 'model_id': m['id'], 'description': desc}
             self.models_data['models'][alias] = entry
+            self._changed_aliases.add(alias)
             count += 1
             console.print(f"Added new alias '{alias}'.")
         return count
@@ -514,10 +581,11 @@ class ModelManager:
         return PROVIDER_OPENAI
 
     def set_context_window(self, alias: str, context_window: int) -> bool:
-        """Set or create a model's context_window in models.yaml.
+        """Set or create a model's context_window.
 
-        If the alias is missing, create a minimal model entry so overrides work
-        consistently, especially for service-reported models like Grok.
+        In service mode, upserts via the service API.
+        In local mode, writes to models.yaml.
+        If the alias is missing, creates a minimal model entry.
         """
         if context_window <= 0:
             console.print("[bold red]Error:[/bold red] context_window must be a positive integer.")
@@ -541,6 +609,7 @@ class ModelManager:
             added = 1
 
         entry["context_window"] = int(context_window)
+        self._changed_aliases.add(alias)
         if not added:
             updated = 1
 
@@ -708,11 +777,11 @@ def _list_models_from_service(config: Config):
             console.print(f"  [bold]{alias}[/bold]  {detail}")
         console.print()
 
-def delete_model(alias: str, config: Config) -> bool:
-    manager = ModelManager(config)
+def delete_model(alias: str, config: Config, service_client=None) -> bool:
+    manager = ModelManager(config, service_client=service_client)
     # Get model info before deletion from config
     model_info = manager.models_data.get('models', {}).get(alias)
-    
+
     delete_ok = manager.delete_model_alias(alias)
     if delete_ok:
         config._load_models_config()
@@ -742,13 +811,13 @@ def delete_model(alias: str, config: Config) -> bool:
     
     return delete_ok
 
-def update_models_interactive(config: Config, provider: Optional[str] = None):
-    return ModelManager(config).update_models(provider)
+def update_models_interactive(config: Config, provider: Optional[str] = None, service_client=None):
+    return ModelManager(config, service_client=service_client).update_models(provider)
 
 
-def set_model_context_window(alias: str, context_window: int, config: Config) -> bool:
+def set_model_context_window(alias: str, context_window: int, config: Config, service_client=None) -> bool:
     """CLI wrapper: set per-model context window override."""
-    return ModelManager(config).set_context_window(alias=alias, context_window=context_window)
+    return ModelManager(config, service_client=service_client).set_context_window(alias=alias, context_window=context_window)
 
 
 def _parse_iso(ts_str: str) -> Optional[datetime]:

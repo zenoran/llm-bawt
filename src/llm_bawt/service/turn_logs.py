@@ -8,7 +8,7 @@ import time
 from datetime import datetime, timedelta, timezone
 from urllib.parse import quote_plus
 
-from sqlalchemy import Column, DateTime, Text, text as sa_text
+from sqlalchemy import Column, DateTime, Float, Integer, Text, text as sa_text
 from sqlmodel import Field, SQLModel, Session, create_engine, delete, select
 
 from ..utils.config import Config, has_database_credentials
@@ -57,6 +57,29 @@ class TurnLog(SQLModel, table=True):
     trigger_message_id: str | None = Field(default=None, index=True)
 
 
+class ToolCallRecord(SQLModel, table=True):
+    """Individual tool call persisted incrementally via event stream."""
+
+    __tablename__ = "tool_call_records"
+
+    id: int | None = Field(default=None, sa_column=Column(Integer, primary_key=True, autoincrement=True))
+    created_at: datetime = Field(
+        default_factory=lambda: datetime.now(timezone.utc),
+        sa_column=Column(DateTime(timezone=True), nullable=False, index=True),
+    )
+    turn_id: str | None = Field(default=None, index=True)
+    bot_id: str | None = Field(default=None, index=True)
+    user_id: str | None = Field(default=None, index=True)
+    call_id: str | None = Field(default=None, index=True)
+    tool_name: str = Field(default="unknown", max_length=128)
+    arguments_json: str | None = Field(default=None, sa_column=Column(Text, nullable=True))
+    result_text: str | None = Field(default=None, sa_column=Column(Text, nullable=True))
+    iteration: int = Field(default=1)
+    started_at: float | None = Field(default=None, sa_column=Column(Float, nullable=True))
+    ended_at: float | None = Field(default=None, sa_column=Column(Float, nullable=True))
+    duration_ms: float | None = Field(default=None, sa_column=Column(Float, nullable=True))
+
+
 class TurnLogStore:
     """DB access helper for persistent turn logs."""
 
@@ -88,7 +111,7 @@ class TurnLogStore:
     def _ensure_tables_exist(self) -> None:
         if self.engine is None:
             return
-        SQLModel.metadata.create_all(self.engine, tables=[TurnLog.__table__])
+        SQLModel.metadata.create_all(self.engine, tables=[TurnLog.__table__, ToolCallRecord.__table__])
         # Add columns that may not exist on older tables.
         with self.engine.connect() as conn:
             try:
@@ -311,3 +334,86 @@ class TurnLogStore:
             rows = session.exec(statement.offset(offset).limit(limit)).all()
 
         return rows, total_count
+
+    # ---- Tool call records (event-based persistence) ----
+
+    def save_tool_call(
+        self,
+        *,
+        turn_id: str | None,
+        bot_id: str | None,
+        user_id: str | None,
+        call_id: str | None,
+        tool_name: str,
+        arguments: dict | None = None,
+        result: str | None = None,
+        iteration: int = 1,
+        started_at: float | None = None,
+        ended_at: float | None = None,
+    ) -> None:
+        """Persist a single tool call record."""
+        if self.engine is None:
+            return
+        duration_ms = None
+        if started_at and ended_at:
+            duration_ms = (ended_at - started_at) * 1000
+        row = ToolCallRecord(
+            turn_id=turn_id,
+            bot_id=bot_id,
+            user_id=user_id,
+            call_id=call_id,
+            tool_name=tool_name,
+            arguments_json=json.dumps(arguments or {}, ensure_ascii=False, default=str),
+            result_text=result,
+            iteration=iteration,
+            started_at=started_at,
+            ended_at=ended_at,
+            duration_ms=duration_ms,
+        )
+        try:
+            with Session(self.engine) as session:
+                session.add(row)
+                session.commit()
+        except Exception as e:
+            logger.debug("Failed to save tool call record: %s", e)
+
+    def update_tool_call_result(
+        self,
+        *,
+        call_id: str,
+        result: str,
+        ended_at: float | None = None,
+    ) -> None:
+        """Update a tool call record with the result (tool_end event)."""
+        if self.engine is None or not call_id:
+            return
+        try:
+            with Session(self.engine) as session:
+                row = session.exec(
+                    select(ToolCallRecord).where(ToolCallRecord.call_id == call_id)
+                ).first()
+                if row is None:
+                    return
+                row.result_text = result
+                if ended_at:
+                    row.ended_at = ended_at
+                    if row.started_at:
+                        row.duration_ms = (ended_at - row.started_at) * 1000
+                session.add(row)
+                session.commit()
+        except Exception as e:
+            logger.debug("Failed to update tool call record: %s", e)
+
+    def get_tool_calls_for_turn(self, turn_id: str) -> list[ToolCallRecord]:
+        """Get all tool call records for a turn."""
+        if self.engine is None:
+            return []
+        try:
+            with Session(self.engine) as session:
+                return list(session.exec(
+                    select(ToolCallRecord)
+                    .where(ToolCallRecord.turn_id == turn_id)
+                    .order_by(ToolCallRecord.created_at)
+                ).all())
+        except Exception:
+            return []

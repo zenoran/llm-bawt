@@ -75,9 +75,9 @@ def test_finalize_turn_extracts_agent_backend_tools(monkeypatch) -> None:
                 }
             ]
 
-    from llm_bawt.service import background_service as bg_module
+    from llm_bawt.service import turn_lifecycle as tl_module
 
-    monkeypatch.setattr(bg_module, "AgentBackendClient", FakeAgentBackendClient)
+    monkeypatch.setattr(tl_module, "AgentBackendClient", FakeAgentBackendClient)
     llm_bawt = SimpleNamespace(finalize_response=Mock(), adapter=None, client=FakeAgentBackendClient())
 
     tool_calls: list[dict] = []

@@ -1,0 +1,1028 @@
+"""Chat completion streaming mixin (native + OpenClaw bridge).
+
+Extracted from background_service.py — handles SSE streaming for
+chat completions including tool call handling and bridge integration.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import json
+import time
+import uuid
+from typing import Any, AsyncIterator
+
+from ..bots import StreamingEmoteFilter, get_bot
+from .chat_stream_worker import consume_stream_chunks, put_queue_item_threadsafe
+from .logging import RequestContext, generate_request_id, get_service_logger
+from .schemas import ChatCompletionRequest
+
+log = get_service_logger(__name__)
+
+
+class ChatStreamingMixin:
+    """Mixin providing streaming chat completions for BackgroundService."""
+
+    def _is_openclaw_bot(self, model_alias: str) -> bool:
+        """Check if this model alias maps to an openclaw agent backend."""
+        model_def = self.config.defined_models.get("models", {}).get(model_alias, {})
+        if model_def.get("type") == "agent_backend" and model_def.get("backend") == "openclaw":
+            return True
+        return model_alias == "openclaw"
+
+    def _get_openclaw_session_key(self, model_alias: str) -> str:
+        """Get the session_key for an OpenClaw model from its bot_config."""
+        model_def = self.config.defined_models.get("models", {}).get(model_alias, {})
+        return (
+            (model_def.get("bot_config") or {}).get("session_key")
+            or "agent:main:main"
+        )
+
+    async def _stream_via_bridge(
+        self,
+        *,
+        user_prompt: str,
+        session_key: str,
+        response_id: str,
+        created: int,
+        model_alias: str,
+        bot_id: str,
+        user_id: str,
+        ctx: Any,
+        turn_log_id: str,
+        llm_bawt: Any,
+    ) -> AsyncIterator[str]:
+        """Stream an OpenClaw response via the WS SessionBridge."""
+        bridge = self._session_bridge
+        start_time = time.time()
+
+        self._persist_turn_log(
+            turn_id=turn_log_id,
+            request_id=ctx.request_id,
+            path=ctx.path,
+            stream=True,
+            model=model_alias,
+            bot_id=bot_id,
+            user_id=user_id,
+            status="streaming",
+            latency_ms=None,
+            user_prompt=user_prompt,
+            prepared_messages=[],
+            response_text="",
+        )
+
+        try:
+            # Persist user message to bot history so it appears in /v1/history
+            llm_bawt.history_manager.add_message("user", user_prompt)
+
+            # Send user message and subscribe to events
+            redis_sub = getattr(self, '_redis_subscriber', None)
+            if redis_sub:
+                # Redis mode: send via Gateway HTTP, subscribe via Redis
+                gateway = getattr(self, '_gateway_http', None)
+                if not gateway:
+                    from openclaw_bridge.gateway_http import GatewayHttpClient
+                    gateway = GatewayHttpClient(
+                        self.config.OPENCLAW_GATEWAY_URL,
+                        self.config.OPENCLAW_GATEWAY_TOKEN,
+                    )
+                    self._gateway_http = gateway
+                run_id = await gateway.send_user_message(session_key, user_prompt)
+                log.info("OpenClaw gateway HTTP: sent message, run_id=%s", run_id)
+                event_source = redis_sub.subscribe(session_key, run_id=run_id)
+            else:
+                # In-process mode: send via WS bridge, subscribe via fanout
+                run_id = await bridge.send_user_message(session_key, user_prompt)
+                bridge._api_run_ids.add(run_id)
+                log.info("OpenClaw bridge: sent message, run_id=%s", run_id)
+                event_source = bridge._fanout.subscribe(session_key)
+
+            from openclaw_bridge.events import OpenClawEventKind
+
+            full_text_parts: list[str] = []
+            tool_call_details: list[dict] = []
+            # Track tool call state for OpenAI-compat delta.tool_calls
+            _tool_call_index = 0
+            _in_tool_calls = False
+            _last_call_id = ""
+
+            async for event in event_source:
+                if event.kind == OpenClawEventKind.ASSISTANT_DELTA:
+                    delta = event.text or ""
+                    if delta:
+                        # If transitioning from tool calls to content, emit finish_reason first
+                        if _in_tool_calls:
+                            finish_data = {
+                                "id": response_id,
+                                "object": "chat.completion.chunk",
+                                "created": created,
+                                "model": model_alias,
+                                "choices": [{"index": 0, "delta": {}, "finish_reason": "tool_calls"}],
+                            }
+                            yield f"data: {json.dumps(finish_data)}\n\n"
+                            _in_tool_calls = False
+                            _tool_call_index = 0
+                            _last_call_id = ""
+
+                        full_text_parts.append(delta)
+                        data = {
+                            "id": response_id,
+                            "object": "chat.completion.chunk",
+                            "created": created,
+                            "model": model_alias,
+                            "choices": [{"index": 0, "delta": {"content": delta}, "finish_reason": None}],
+                        }
+                        yield f"data: {json.dumps(data)}\n\n"
+
+                elif event.kind == OpenClawEventKind.TOOL_START:
+                    tool_name = event.tool_name or "unknown"
+                    tool_args = event.tool_arguments or {}
+                    call_id = f"call_{uuid.uuid4().hex[:8]}"
+                    _last_call_id = call_id
+                    # Emit as OpenAI delta.tool_calls
+                    data = {
+                        "id": response_id,
+                        "object": "chat.completion.chunk",
+                        "created": created,
+                        "model": model_alias,
+                        "choices": [{
+                            "index": 0,
+                            "delta": {
+                                "tool_calls": [{
+                                    "index": _tool_call_index,
+                                    "id": call_id,
+                                    "type": "function",
+                                    "function": {
+                                        "name": tool_name,
+                                        "arguments": json.dumps(tool_args, ensure_ascii=False) if isinstance(tool_args, dict) else str(tool_args),
+                                    },
+                                }],
+                            },
+                            "finish_reason": None,
+                        }],
+                    }
+                    yield f"data: {json.dumps(data)}\n\n"
+                    _in_tool_calls = True
+                    _tool_call_index += 1
+                    tool_call_details.append({
+                        "iteration": 1,
+                        "tool": tool_name,
+                        "parameters": tool_args,
+                        "result": "",
+                        "call_id": call_id,
+                    })
+                    # Publish tool_start to unified event stream
+                    if redis_sub:
+                        try:
+                            await redis_sub.publish_tool_event(bot_id, user_id, {
+                                "_type": "tool_event",
+                                "event": "tool_start",
+                                "turn_id": turn_log_id,
+                                "bot_id": bot_id,
+                                "user_id": user_id,
+                                "tool_name": tool_name,
+                                "arguments": tool_args,
+                                "call_id": call_id,
+                                "iteration": _tool_call_index,
+                                "ts": time.time(),
+                            })
+                        except Exception:
+                            pass
+
+                elif event.kind == OpenClawEventKind.TOOL_END:
+                    tool_result = str(event.tool_result or "")
+                    # Recover the call_id from the matching tool_start
+                    end_call_id = _last_call_id or ""
+                    if tool_call_details:
+                        tool_call_details[-1]["result"] = tool_result
+                        end_call_id = tool_call_details[-1].get("call_id", end_call_id)
+                    # Publish tool_end to unified event stream
+                    if redis_sub:
+                        try:
+                            await redis_sub.publish_tool_event(bot_id, user_id, {
+                                "_type": "tool_event",
+                                "event": "tool_end",
+                                "turn_id": turn_log_id,
+                                "bot_id": bot_id,
+                                "user_id": user_id,
+                                "tool_name": event.tool_name or "unknown",
+                                "call_id": end_call_id,
+                                "iteration": _tool_call_index,
+                                "result": tool_result[:2000],
+                                "ts": time.time(),
+                            })
+                        except Exception:
+                            pass
+
+                elif event.kind == OpenClawEventKind.RUN_COMPLETED:
+                    if event.run_id == run_id or not run_id:
+                        break
+
+                elif event.kind == OpenClawEventKind.ERROR:
+                    warning_data = {
+                        "object": "service.warning",
+                        "model": model_alias,
+                        "warnings": [f"openclaw_error: {event.text}"],
+                    }
+                    yield f"data: {json.dumps(warning_data)}\n\n"
+                    break
+
+            # Final chunk
+            data = {
+                "id": response_id,
+                "object": "chat.completion.chunk",
+                "created": created,
+                "model": model_alias,
+                "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+            }
+            yield f"data: {json.dumps(data)}\n\n"
+            yield "data: [DONE]\n\n"
+
+            # Fetch tool calls from chat history (gateway doesn't stream them)
+            try:
+                if redis_sub and gateway:
+                    history_msgs = await gateway.get_chat_history(session_key, limit=20)
+                elif bridge:
+                    history_msgs = await bridge._ws_client.get_chat_history(session_key, limit=20)
+                else:
+                    history_msgs = []
+                for msg in reversed(history_msgs):
+                    if not isinstance(msg, dict):
+                        continue
+                    # Look for tool_calls in the most recent assistant message
+                    if msg.get("role") == "assistant":
+                        for tc in msg.get("tool_calls") or []:
+                            fn = tc.get("function") or {}
+                            tool_call_details.append({
+                                "iteration": 1,
+                                "tool": fn.get("name") or tc.get("name") or "unknown",
+                                "parameters": fn.get("arguments") or {},
+                                "result": "",
+                            })
+                        break
+                    # Also capture tool results
+                    if msg.get("role") == "tool":
+                        # Will be matched to tool_call above
+                        pass
+            except Exception as e:
+                log.debug("Could not fetch tool calls from chat.history: %s", e)
+
+            # Finalize turn
+            full_text = "".join(full_text_parts)
+            elapsed_ms = (time.time() - start_time) * 1000
+            if full_text:
+                self._finalize_turn(
+                    llm_bawt=llm_bawt,
+                    turn_id=turn_log_id,
+                    response_text=full_text,
+                    tool_context="",
+                    tool_call_details=tool_call_details,
+                    prepared_messages=[],
+                    user_prompt=user_prompt,
+                    model=model_alias,
+                    bot_id=bot_id,
+                    user_id=user_id,
+                    elapsed_ms=elapsed_ms,
+                    stream=True,
+                )
+            else:
+                self._update_turn_log(
+                    turn_id=turn_log_id,
+                    status="timeout",
+                    latency_ms=elapsed_ms,
+                )
+
+        except Exception as e:
+            log.error("OpenClaw bridge stream failed: %s", e)
+            elapsed_ms = (time.time() - start_time) * 1000
+            self._update_turn_log(
+                turn_id=turn_log_id,
+                status="error",
+                latency_ms=elapsed_ms,
+                error_text=str(e),
+            )
+            warning_data = {
+                "object": "service.warning",
+                "model": model_alias,
+                "warnings": [f"bridge_error: {e}"],
+            }
+            yield f"data: {json.dumps(warning_data)}\n\n"
+            data = {
+                "id": response_id,
+                "object": "chat.completion.chunk",
+                "created": created,
+                "model": model_alias,
+                "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+            }
+            yield f"data: {json.dumps(data)}\n\n"
+            yield "data: [DONE]\n\n"
+
+    async def chat_completion_stream(
+        self,
+        request: ChatCompletionRequest,
+    ) -> AsyncIterator[str]:
+        """Handle a streaming chat completion request.
+
+        Uses llm_bawt's internal history + memory for context.
+        Yields Server-Sent Events (SSE) formatted chunks.
+        """
+        # Create request context for logging
+        if request.client_system_context is not None:
+            req_path = f"/v1/botchat/{request.bot_id}/{request.user}/chat/completions"
+        else:
+            req_path = "/v1/chat/completions"
+        ctx = RequestContext(
+            request_id=generate_request_id(),
+            method="POST",
+            path=req_path,
+            model=request.model,
+            bot_id=request.bot_id,
+            user_id=request.user,
+            stream=True,
+        )
+
+        # Log incoming request (verbose mode will show the full payload)
+        log.api_request(ctx, request.model_dump(exclude_none=True))
+
+        bot_id = request.bot_id or self._default_bot
+        user_id = request.user or self.config.DEFAULT_USER
+        local_mode = not request.augment_memory
+
+        # Resolve model using shared bot/config logic
+        # Agent-backend bots resolve to their virtual model (e.g. "openclaw")
+        try:
+            model_alias, model_warnings = self._resolve_request_model(request.model, bot_id, local_mode)
+        except Exception as e:
+            log.api_error(ctx, str(e), 400)
+            raise
+
+        response_id = f"chatcmpl-{uuid.uuid4().hex[:12]}"
+        created = int(time.time())
+
+        # Get cached LLMBawt instance
+        try:
+            llm_bawt = self._get_llm_bawt(model_alias, bot_id, user_id, local_mode)
+        except Exception as e:
+            log.api_error(ctx, str(e), 500)
+            warning_data = {
+                "object": "service.warning",
+                "model": model_alias,
+                "warnings": [f"request_failed: {e}"],
+            }
+            yield f"data: {json.dumps(warning_data)}\n\n"
+            data = {
+                "id": response_id,
+                "object": "chat.completion.chunk",
+                "created": created,
+                "model": model_alias,
+                "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+            }
+            yield f"data: {json.dumps(data)}\n\n"
+            yield "data: [DONE]\n\n"
+            return
+
+        # Get the user's prompt (last user message)
+        user_prompt = ""
+        for m in reversed(request.messages):
+            if m.role == "user":
+                user_prompt = m.content or ""
+                break
+
+        if not user_prompt:
+            warning_data = {
+                "object": "service.warning",
+                "model": model_alias,
+                "warnings": ["request_failed: No user message found in request"],
+            }
+            yield f"data: {json.dumps(warning_data)}\n\n"
+            data = {
+                "id": response_id,
+                "object": "chat.completion.chunk",
+                "created": created,
+                "model": model_alias,
+                "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+            }
+            yield f"data: {json.dumps(data)}\n\n"
+            yield "data: [DONE]\n\n"
+            return
+
+        # OpenClaw bots now flow through the normal AgentBackendClient.stream_raw()
+        # pipeline, which routes via Redis -> Bridge -> WS automatically.
+
+        chunk_queue: asyncio.Queue = asyncio.Queue()
+        full_response_holder = [""]  # Use list to allow mutation in nested function
+        tool_context_holder = [""]  # Store tool context from native tool calls
+        tool_call_details_holder: list[dict] = []
+        timing_holder = [0.0, 0.0]  # [start_time, end_time]
+        cancelled_holder = [False]  # Track if we were cancelled
+
+        # Capture the event loop before entering the thread
+        loop = asyncio.get_running_loop()
+
+        # Start new generation (cancels previous for the SAME bot only)
+        cancel_event, done_event = await self._start_generation(bot_id)
+        turn_log_id = f"turn-{uuid.uuid4().hex}"
+
+        # Persist turn log immediately so the user's prompt is recorded
+        # even if the backend times out or errors before responding.
+        self._persist_turn_log(
+            turn_id=turn_log_id,
+            request_id=ctx.request_id,
+            path=ctx.path,
+            stream=True,
+            model=model_alias,
+            bot_id=bot_id,
+            user_id=user_id,
+            status="streaming",
+            latency_ms=None,
+            user_prompt=user_prompt,
+            prepared_messages=[],
+            response_text="",
+        )
+
+        # Capture Redis subscriber for direct publish from the background
+        # thread — ensures tool events (and turn_complete) reach Redis even
+        # if the SSE generator is cancelled (client disconnect / page refresh).
+        _redis_sub = getattr(self, "_redis_subscriber", None)
+
+        def _publish_event_direct(event_dict):
+            """Publish an event to Redis from the worker thread."""
+            if not _redis_sub:
+                return
+            try:
+                asyncio.run_coroutine_threadsafe(
+                    _redis_sub.publish_tool_event(bot_id, user_id, event_dict),
+                    loop,
+                )
+            except Exception:
+                pass  # fire-and-forget
+
+        def _stream_to_queue():
+            """Run streaming in a thread and push chunks to the async queue."""
+            try:
+                # Check if already cancelled before starting
+                if cancel_event.is_set():
+                    cancelled_holder[0] = True
+                    return
+
+                # Inject client-supplied system context (e.g. HA device list)
+                llm_bawt._client_system_context = request.client_system_context
+                llm_bawt._ha_mode = request.ha_mode
+                llm_bawt._include_summaries = request.include_summaries
+                llm_bawt._tts_mode = request.tts_mode
+
+                # Use llm_bawt.prepare_messages_for_query to get full context
+                # (history from DB + memory + system prompt)
+                messages = llm_bawt.prepare_messages_for_query(user_prompt)
+
+                # Backfill prepared messages into the turn log
+                self._update_turn_log(
+                    turn_id=turn_log_id,
+                    prepared_messages=messages,
+                )
+
+                # Log what we're sending to the LLM (verbose mode)
+                log.llm_context(messages)
+
+                # Track when first token arrives
+                timing_holder[0] = time.time()
+
+                # Choose streaming method based on whether bot uses tools
+                if llm_bawt.bot.uses_tools and (llm_bawt.memory or llm_bawt.home_client or llm_bawt.ha_native_client):
+                    # Check if client supports native streaming with tools (OpenAI)
+                    use_native_streaming = (
+                        llm_bawt.client.supports_native_tools()
+                        and llm_bawt.tool_format in ("native", "NATIVE_OPENAI")
+                        and hasattr(llm_bawt.client, "stream_with_tools")
+                    )
+
+                    # Resolve per-bot generation parameters
+                    gen_kwargs = llm_bawt._get_generation_kwargs()
+
+                    if use_native_streaming:
+                        # Native streaming with tools - streams content AND handles tool calls
+                        from ..tools.executor import ToolExecutor
+                        from ..tools.formats import get_format_handler
+                        from ..models.message import Message as Msg
+
+                        log.debug("Using native streaming with tools")
+
+                        tool_definitions = llm_bawt._get_tool_definitions()
+                        handler = get_format_handler(llm_bawt.tool_format)
+                        tools_schema = handler.get_tools_schema(tool_definitions)
+
+                        # Log tool names for debugging
+                        tool_names = [t.get("function", {}).get("name", "?") for t in tools_schema]
+                        ha_tools = [n for n in tool_names if n.startswith("Hass") or n in ("GetLiveContext",)]
+                        log.info(f"📋 {len(tools_schema)} tools in schema ({len(ha_tools)} HA: {', '.join(ha_tools[:5])}{'...' if len(ha_tools) > 5 else ''})")
+
+                        executor = ToolExecutor(
+                            memory_client=llm_bawt.memory,
+                            profile_manager=llm_bawt.profile_manager,
+                            search_client=llm_bawt.search_client,
+                            home_client=llm_bawt.home_client,
+                            ha_native_client=llm_bawt.ha_native_client,
+                            model_lifecycle=llm_bawt.model_lifecycle,
+                            config=llm_bawt.config,
+                            user_id=llm_bawt.user_id,
+                            bot_id=llm_bawt.bot_id,
+                        )
+
+                        def native_stream_with_tool_loop():
+                            """Stream with native tool support, handling tool calls inline."""
+                            import json as _json
+                            from ..tools.parser import ToolCall
+
+                            current_msgs = list(messages)
+                            max_iterations = 3 if llm_bawt._ha_mode else 5
+                            has_executed_tools = False
+
+                            for iteration in range(max_iterations):
+                                # After first tool execution, don't pass tools_schema
+                                # so the model generates a text response instead of
+                                # looping on more tool calls.
+                                current_tools = None if has_executed_tools else tools_schema
+
+                                for item in llm_bawt.client.stream_with_tools(
+                                    current_msgs,
+                                    tools_schema=current_tools,
+                                    tool_choice="auto",
+                                    **gen_kwargs,
+                                ):
+                                    if isinstance(item, str):
+                                        # Content chunk - yield to user immediately
+                                        yield item
+                                    elif isinstance(item, dict) and "tool_calls" in item:
+                                        # Tool calls at end of stream
+                                        tool_calls = item["tool_calls"]
+                                        content = item.get("content", "")
+
+                                        if not tool_calls:
+                                            return  # No tools, done
+
+                                        # Emit tool calls as OpenAI delta.tool_calls, then execute
+                                        tool_results = []
+                                        for idx, tc in enumerate(tool_calls):
+                                            func = tc.get("function", {})
+                                            name = func.get("name", "")
+                                            call_id = tc.get("id", f"call_{uuid.uuid4().hex[:8]}")
+                                            args_str = func.get("arguments", "{}")
+                                            try:
+                                                args = _json.loads(args_str) if args_str else {}
+                                            except _json.JSONDecodeError:
+                                                args = {}
+
+                                            log.info(f"🔧 {name}({args})")
+                                            # Push OpenAI-format tool_call delta to queue
+                                            put_queue_item_threadsafe(
+                                                loop,
+                                                chunk_queue,
+                                                {
+                                                    "_type": "tool_call_delta",
+                                                    "index": idx,
+                                                    "id": call_id,
+                                                    "name": name,
+                                                    "arguments": args_str,
+                                                },
+                                            )
+                                            # Publish tool_start directly to Redis
+                                            # (bypasses chunk_queue so events reach
+                                            # Redis even if the SSE generator is dead)
+                                            _publish_event_direct({
+                                                "_type": "tool_event",
+                                                "event": "tool_start",
+                                                "turn_id": turn_log_id,
+                                                "bot_id": bot_id,
+                                                "user_id": user_id,
+                                                "tool_name": name,
+                                                "arguments": args,
+                                                "call_id": call_id,
+                                                "iteration": iteration + 1,
+                                                "ts": time.time(),
+                                            })
+
+                                            tool_call_obj = ToolCall(name=name, arguments=args, raw_text="")
+                                            result = executor.execute(tool_call_obj)
+                                            tool_results.append({
+                                                "tool_call_id": tc.get("id", ""),
+                                                "content": result,
+                                            })
+                                            # Publish tool_end directly to Redis
+                                            _publish_event_direct({
+                                                "_type": "tool_event",
+                                                "event": "tool_end",
+                                                "turn_id": turn_log_id,
+                                                "bot_id": bot_id,
+                                                "user_id": user_id,
+                                                "tool_name": name,
+                                                "arguments": args,
+                                                "call_id": call_id,
+                                                "result": result[:2000] if result else "",
+                                                "iteration": iteration + 1,
+                                                "ts": time.time(),
+                                            })
+
+                                            # Persist for TurnLog.tool_calls_json
+                                            tool_call_details_holder.append({
+                                                "tool": name,
+                                                "arguments": args,
+                                                "call_id": call_id,
+                                                "result": result[:2000] if result else "",
+                                                "iteration": iteration + 1,
+                                            })
+
+                                        has_executed_tools = True
+
+                                        # Signal finish_reason: "tool_calls" to consumer
+                                        put_queue_item_threadsafe(
+                                            loop,
+                                            chunk_queue,
+                                            {"_type": "tool_calls_finish"},
+                                        )
+
+                                        # Store tool context
+                                        tool_context_holder[0] = "\n\n".join(
+                                            f"[{tc['function']['name']}]\n{tr['content']}"
+                                            for tc, tr in zip(tool_calls, tool_results)
+                                        )
+
+                                        # Build continuation messages
+                                        assistant_msg = Msg(
+                                            role="assistant",
+                                            content=content,
+                                            tool_calls=[
+                                                {"id": tc.get("id"), "name": tc["function"]["name"], "arguments": tc["function"]["arguments"]}
+                                                for tc in tool_calls
+                                            ],
+                                        )
+                                        current_msgs.append(assistant_msg)
+
+                                        for tc, tr in zip(tool_calls, tool_results):
+                                            current_msgs.append(Msg(
+                                                role="tool",
+                                                content=tr["content"],
+                                                tool_call_id=tr["tool_call_id"],
+                                            ))
+
+                                        # Continue to next iteration (will stream the follow-up)
+                                        break
+                                else:
+                                    # Stream finished without tool calls dict (pure content response)
+                                    return
+
+                            log.warning(f"Tool loop: max iterations ({max_iterations}) reached")
+
+                        stream_iter = native_stream_with_tool_loop()
+                    else:
+                        # Fall back to text-based streaming for non-native models (GGUF, etc.)
+                        from ..tools import stream_with_tools
+                        log.debug(f"Using stream_with_tools for tool format: {llm_bawt.tool_format}")
+
+                        adapter = getattr(llm_bawt, 'adapter', None)
+                        if adapter:
+                            log.debug(f"Passing adapter '{adapter.name}' to stream_with_tools")
+                        else:
+                            log.warning("No adapter found on llm_bawt instance")
+
+                        def stream_fn(msgs, stop_sequences=None):
+                            return llm_bawt.client.stream_raw(msgs, stop=stop_sequences, **gen_kwargs)
+
+                        stream_iter = stream_with_tools(
+                            messages=messages,
+                            stream_fn=stream_fn,
+                            memory_client=llm_bawt.memory,
+                            profile_manager=llm_bawt.profile_manager,
+                            search_client=llm_bawt.search_client,
+                            home_client=llm_bawt.home_client,
+                            ha_native_client=llm_bawt.ha_native_client,
+                            model_lifecycle=llm_bawt.model_lifecycle,
+                            config=llm_bawt.config,
+                            user_id=llm_bawt.user_id,
+                            bot_id=llm_bawt.bot_id,
+                            tool_format=llm_bawt.tool_format,
+                            adapter=adapter,
+                            history_manager=llm_bawt.history_manager,
+                            tool_call_details=tool_call_details_holder,
+                        )
+                else:
+                    # Resolve per-bot generation parameters
+                    gen_kwargs = llm_bawt._get_generation_kwargs()
+                    # Pass adapter stop sequences even without tools
+                    adapter = getattr(llm_bawt, 'adapter', None)
+                    adapter_stops = adapter.get_stop_sequences() if adapter else []
+                    stream_iter = llm_bawt.client.stream_raw(
+                        messages, stop=adapter_stops or None, **gen_kwargs
+                    )
+
+                # Wrap stream to publish tool events directly to Redis
+                # from this thread (survives SSE generator cancellation).
+                _oc_call_index = [0]
+                _oc_last_call_id = [""]
+
+                def _intercept_tool_events(inner):
+                    for item in inner:
+                        if isinstance(item, dict):
+                            evt = item.get("event")
+                            if evt == "tool_call":
+                                _oc_call_index[0] += 1
+                                cid = f"call_{uuid.uuid4().hex[:8]}"
+                                _oc_last_call_id[0] = cid
+                                _publish_event_direct({
+                                    "_type": "tool_event",
+                                    "event": "tool_start",
+                                    "turn_id": turn_log_id,
+                                    "bot_id": bot_id,
+                                    "user_id": user_id,
+                                    "tool_name": item.get("name", "unknown"),
+                                    "arguments": item.get("arguments", {}),
+                                    "call_id": cid,
+                                    "iteration": 1,
+                                    "ts": time.time(),
+                                })
+                            elif evt == "tool_result":
+                                _publish_event_direct({
+                                    "_type": "tool_event",
+                                    "event": "tool_end",
+                                    "turn_id": turn_log_id,
+                                    "bot_id": bot_id,
+                                    "user_id": user_id,
+                                    "tool_name": item.get("name", "unknown"),
+                                    "call_id": _oc_last_call_id[0],
+                                    "result": str(item.get("result", ""))[:2000],
+                                    "iteration": 1,
+                                    "ts": time.time(),
+                                })
+                        yield item
+
+                # Stream chunks to queue
+                cancelled_holder[0] = consume_stream_chunks(
+                    _intercept_tool_events(stream_iter),
+                    cancel_event=cancel_event,
+                    loop=loop,
+                    chunk_queue=chunk_queue,
+                    full_response_holder=full_response_holder,
+                )
+                if cancelled_holder[0]:
+                    log.info("Generation cancelled - newer request received")
+
+                timing_holder[1] = time.time()
+
+            except Exception as e:
+                if not cancel_event.is_set():
+                    put_queue_item_threadsafe(loop, chunk_queue, e)
+                elapsed_ms = (time.time() - timing_holder[0]) * 1000 if timing_holder[0] else None
+                self._update_turn_log(
+                    turn_id=turn_log_id,
+                    status="error",
+                    latency_ms=elapsed_ms,
+                    response_text=full_response_holder[0] or None,
+                    error_text=str(e),
+                )
+            finally:
+                end_time = timing_holder[1] or time.time()
+                start_time = timing_holder[0] or end_time
+                elapsed_ms = (end_time - start_time) * 1000
+                if full_response_holder[0]:
+                    self._finalize_turn(
+                        llm_bawt=llm_bawt,
+                        turn_id=turn_log_id,
+                        response_text=full_response_holder[0],
+                        tool_context=tool_context_holder[0],
+                        tool_call_details=tool_call_details_holder,
+                        prepared_messages=messages if "messages" in locals() else [],
+                        user_prompt=user_prompt,
+                        model=model_alias,
+                        bot_id=bot_id,
+                        user_id=user_id,
+                        elapsed_ms=elapsed_ms,
+                        stream=True,
+                    )
+                else:
+                    # No response received — mark as timeout so turn doesn't
+                    # stay stuck at status='streaming' forever.
+                    self._update_turn_log(
+                        turn_id=turn_log_id,
+                        status="timeout",
+                        latency_ms=elapsed_ms,
+                    )
+
+                # Notify SSE consumers that the turn is done so they
+                # can finalize without polling the turn-log API.
+                status = "completed" if full_response_holder[0] else "timeout"
+                if cancelled_holder[0]:
+                    status = "cancelled"
+                _publish_event_direct({
+                    "_type": "turn_complete",
+                    "turn_id": turn_log_id,
+                    "bot_id": bot_id,
+                    "user_id": user_id,
+                    "status": status,
+                    "ts": time.time(),
+                })
+
+                put_queue_item_threadsafe(loop, chunk_queue, None)  # Sentinel
+
+        try:
+            # Check if this bot needs emote filtering for TTS
+            bot = get_bot(bot_id)
+            emote_filter = StreamingEmoteFilter() if (bot and bot.voice_optimized) else None
+            oc_tool_call_index = 0  # OpenClaw agent backend tool call index
+            oc_last_call_id = ""   # Track last call_id for tool_end matching
+
+            # Send service warnings (e.g. model fallback) before content
+            if model_warnings:
+                warning_data = {
+                    "object": "service.warning",
+                    "model": model_alias,
+                    "warnings": model_warnings,
+                }
+                yield f"data: {json.dumps(warning_data)}\n\n"
+
+            # Start streaming — API clients (openai/grok) use the default
+            # thread pool so multiple bots can stream concurrently.  Local
+            # models (gguf) keep the single-worker executor to avoid CUDA /
+            # llama-cpp-python thread-safety issues.
+            model_type = llm_bawt.client.model_definition.get("type", "")
+            if model_type in ("openai", "grok", "agent_backend"):
+                loop.run_in_executor(None, _stream_to_queue)
+            else:
+                loop.run_in_executor(self._llm_executor, _stream_to_queue)
+
+            # Yield SSE chunks (with keepalive to prevent client timeout
+            # during slow backends like vLLM first-inference)
+            while True:
+                try:
+                    chunk = await asyncio.wait_for(chunk_queue.get(), timeout=15.0)
+                except asyncio.TimeoutError:
+                    # Send SSE comment as keepalive to prevent client/proxy timeout
+                    yield ": keepalive\n\n"
+                    continue
+
+                if chunk is None:
+                    # Stream complete - flush any buffered content from emote filter
+                    if emote_filter:
+                        final_chunk = emote_filter.flush()
+                        if final_chunk:
+                            data = {
+                                "id": response_id,
+                                "object": "chat.completion.chunk",
+                                "created": created,
+                                "model": model_alias,
+                                "choices": [{"index": 0, "delta": {"content": final_chunk}, "finish_reason": None}],
+                            }
+                            yield (f"data: {json.dumps(data)}\n\n")
+
+                    # Send final chunk
+                    data = {
+                        "id": response_id,
+                        "object": "chat.completion.chunk",
+                        "created": created,
+                        "model": model_alias,
+                        "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+                    }
+                    yield (f"data: {json.dumps(data)}\n\n")
+                    yield ("data: [DONE]\n\n")
+                    break
+
+                if isinstance(chunk, Exception):
+                    # Upstream stream failed; close SSE cleanly so downstream clients
+                    # don't see an incomplete chunked read protocol error.
+                    log.error("Streaming backend failed: %s", chunk)
+                    warning_data = {
+                        "object": "service.warning",
+                        "model": model_alias,
+                        "warnings": [f"stream_interrupted: {chunk}"],
+                    }
+                    yield (f"data: {json.dumps(warning_data)}\n\n")
+
+                    # Flush any buffered content from emote filter.
+                    if emote_filter:
+                        final_chunk = emote_filter.flush()
+                        if final_chunk:
+                            data = {
+                                "id": response_id,
+                                "object": "chat.completion.chunk",
+                                "created": created,
+                                "model": model_alias,
+                                "choices": [{"index": 0, "delta": {"content": final_chunk}, "finish_reason": None}],
+                            }
+                            yield (f"data: {json.dumps(data)}\n\n")
+
+                    data = {
+                        "id": response_id,
+                        "object": "chat.completion.chunk",
+                        "created": created,
+                        "model": model_alias,
+                        "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+                    }
+                    yield (f"data: {json.dumps(data)}\n\n")
+                    yield ("data: [DONE]\n\n")
+                    break
+
+                # OpenAI-compatible delta.tool_calls streaming
+                if isinstance(chunk, dict) and chunk.get("_type") == "tool_call_delta":
+                    data = {
+                        "id": response_id,
+                        "object": "chat.completion.chunk",
+                        "created": created,
+                        "model": model_alias,
+                        "choices": [{
+                            "index": 0,
+                            "delta": {
+                                "tool_calls": [{
+                                    "index": chunk["index"],
+                                    "id": chunk["id"],
+                                    "type": "function",
+                                    "function": {
+                                        "name": chunk["name"],
+                                        "arguments": chunk["arguments"],
+                                    },
+                                }],
+                            },
+                            "finish_reason": None,
+                        }],
+                    }
+                    yield (f"data: {json.dumps(data)}\n\n")
+                    continue
+
+                if isinstance(chunk, dict) and chunk.get("_type") == "tool_event":
+                    # Already published directly from the background thread
+                    # via _publish_tool_event_direct — just skip.
+                    continue
+
+                # OpenClaw agent backend tool events (from openclaw.py queue)
+                if isinstance(chunk, dict) and chunk.get("event") == "tool_call":
+                    tc_name = chunk.get("name", "unknown")
+                    tc_args = chunk.get("arguments", {})
+                    tc_id = f"call_{uuid.uuid4().hex[:8]}"
+                    data = {
+                        "id": response_id,
+                        "object": "chat.completion.chunk",
+                        "created": created,
+                        "model": model_alias,
+                        "choices": [{
+                            "index": 0,
+                            "delta": {
+                                "tool_calls": [{
+                                    "index": oc_tool_call_index,
+                                    "id": tc_id,
+                                    "type": "function",
+                                    "function": {
+                                        "name": tc_name,
+                                        "arguments": json.dumps(tc_args, ensure_ascii=False) if isinstance(tc_args, dict) else str(tc_args),
+                                    },
+                                }],
+                            },
+                            "finish_reason": None,
+                        }],
+                    }
+                    yield (f"data: {json.dumps(data)}\n\n")
+                    oc_tool_call_index += 1
+                    oc_last_call_id = tc_id
+                    # Tool events already published from background thread
+                    continue
+
+                if isinstance(chunk, dict) and chunk.get("event") == "tool_result":
+                    tc_result = str(chunk.get("result", ""))
+                    if oc_tool_call_index > 0:
+                        data = {
+                            "id": response_id,
+                            "object": "chat.completion.chunk",
+                            "created": created,
+                            "model": model_alias,
+                            "choices": [{"index": 0, "delta": {}, "finish_reason": "tool_calls"}],
+                        }
+                        yield (f"data: {json.dumps(data)}\n\n")
+                        oc_tool_call_index = 0
+                    continue
+
+                if isinstance(chunk, dict) and chunk.get("_type") == "tool_calls_finish":
+                    data = {
+                        "id": response_id,
+                        "object": "chat.completion.chunk",
+                        "created": created,
+                        "model": model_alias,
+                        "choices": [{"index": 0, "delta": {}, "finish_reason": "tool_calls"}],
+                    }
+                    yield (f"data: {json.dumps(data)}\n\n")
+                    continue
+
+                # Apply emote filter for voice_optimized bots
+                if emote_filter:
+                    chunk = emote_filter.process(chunk)
+                    if not chunk:
+                        # Chunk was filtered out or buffered
+                        continue
+
+                # Normal chunk
+                data = {
+                    "id": response_id,
+                    "object": "chat.completion.chunk",
+                    "created": created,
+                    "model": model_alias,
+                    "choices": [{"index": 0, "delta": {"content": chunk}, "finish_reason": None}],
+                }
+                yield (f"data: {json.dumps(data)}\n\n")
+        finally:
+            # Mark generation as complete
+            self._end_generation(cancel_event, done_event, bot_id)

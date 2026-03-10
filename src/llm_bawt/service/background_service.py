@@ -1,32 +1,37 @@
-"""Background task service and chat execution runtime."""
+"""Background task service and chat execution runtime.
+
+Core orchestrator that composes focused mixins:
+- InstanceManagerMixin  — model/bot instance management
+- TurnLifecycleMixin    — turn persistence + generation cancellation
+- ChatStreamingMixin    — streaming chat completions + bridge
+- BackgroundTasksMixin  — background task processing
+"""
 
 import asyncio
 import json
-import os
 import threading
 import time
 import uuid
-from datetime import datetime, timezone
 from queue import PriorityQueue
 from typing import Any, AsyncIterator
 from urllib.parse import urlparse
 
-from ..bots import BotManager, StreamingEmoteFilter, get_bot, strip_emotes
-from ..clients.agent_backend_client import AgentBackendClient
+from ..bots import get_bot, strip_emotes
 from ..utils.config import Config
-from ..utils.paths import resolve_log_dir
-from .chat_stream_worker import consume_stream_chunks, put_queue_item_threadsafe
+from .background_tasks import BackgroundTasksMixin
+from .chat_streaming import ChatStreamingMixin
+from .instance_manager import InstanceManagerMixin
 from .logging import RequestContext, generate_request_id, get_service_logger
 from .schemas import (
     ChatCompletionChoice,
-    ChatCompletionChunk,
     ChatCompletionRequest,
     ChatCompletionResponse,
     ChatMessage,
     ServiceStatusResponse,
     UsageInfo,
 )
-from .tasks import Task, TaskResult, TaskStatus, TaskType
+from .tasks import Task, TaskResult, TaskStatus
+from .turn_lifecycle import TurnLifecycleMixin
 
 log = get_service_logger(__name__)
 
@@ -41,156 +46,6 @@ def _is_tcp_listening(host: str, port: int) -> bool:
             return sock.connect_ex((host, port)) == 0
     except OSError:
         return False
-
-
-def _message_to_dict(msg: Any) -> dict[str, Any]:
-    """Normalize message objects for JSON logging."""
-    if hasattr(msg, "to_dict"):
-        value = msg.to_dict()
-        if isinstance(value, dict):
-            if not value.get("id") and value.get("db_id"):
-                value = dict(value)
-                value["id"] = value.get("db_id")
-            return value
-        return {"value": value}
-    if hasattr(msg, "role"):
-        return {
-            "role": getattr(msg, "role", "unknown"),
-            "content": getattr(msg, "content", ""),
-            "timestamp": getattr(msg, "timestamp", 0),
-            "id": getattr(msg, "db_id", None),
-        }
-    if isinstance(msg, dict):
-        return msg
-    return {"value": str(msg)}
-
-
-def _normalize_tool_call_details(tool_calls: list[dict] | None) -> list[dict]:
-    """Normalize tool-call details into request/response shape."""
-    if not tool_calls:
-        return []
-
-    normalized: list[dict] = []
-    for idx, item in enumerate(tool_calls, start=1):
-        if not isinstance(item, dict):
-            normalized.append({"index": idx, "name": "unknown", "arguments": {}, "result": str(item)})
-            continue
-        name = item.get("tool") or item.get("name") or "unknown"
-        args = item.get("parameters") or item.get("arguments") or {}
-        result = item.get("result") or item.get("response") or ""
-        normalized.append(
-            {
-                "index": idx,
-                "iteration": item.get("iteration", 1),
-                "name": name,
-                "arguments": args if isinstance(args, dict) else {"raw": args},
-                "result": result,
-            }
-        )
-    return normalized
-
-
-def _write_debug_turn_log(
-    prepared_messages: list,
-    user_prompt: str,
-    response: str,
-    model: str,
-    bot_id: str,
-    user_id: str,
-    tool_calls: list[dict] | None = None,
-) -> None:
-    """Write the current turn's request/response data to a debug log file.
-
-    Called when debug logging is enabled. Overwrites the file on each turn
-    to show the most recent request/response for review.
-    """
-    try:
-        logs_dir = resolve_log_dir()
-        logs_dir.mkdir(parents=True, exist_ok=True)
-
-        log_file = logs_dir / "debug_turn.txt"
-
-        # Build the log content
-        lines = []
-        lines.append("=" * 80)
-        lines.append(f"DEBUG TURN LOG - {datetime.now().isoformat()}")
-        lines.append(f"Model: {model}")
-        lines.append(f"Bot: {bot_id}")
-        lines.append(f"User: {user_id}")
-        lines.append("=" * 80)
-        lines.append("")
-
-        # Request data - all context messages
-        lines.append("─" * 40)
-        lines.append("REQUEST MESSAGES")
-        lines.append("─" * 40)
-        for i, msg in enumerate(prepared_messages):
-            role = msg.role if hasattr(msg, 'role') else msg.get('role', 'unknown')
-            content = msg.content if hasattr(msg, 'content') else msg.get('content', '')
-            timestamp = msg.timestamp if hasattr(msg, 'timestamp') else msg.get('timestamp', 0)
-            lines.append(f"\n[{i}] Role: {role}")
-            lines.append(f"    Timestamp: {timestamp}")
-            lines.append(f"    Content ({len(content)} chars):")
-            lines.append("    " + "─" * 36)
-            # Indent content for readability
-            for content_line in str(content).split("\n"):
-                lines.append(f"    {content_line}")
-            lines.append("")
-
-        # Tool calls section (between request and response)
-        if tool_calls:
-            total_calls = len(tool_calls)
-            iterations = max((tc.get("iteration", 1) for tc in tool_calls), default=1)
-            lines.append("─" * 40)
-            lines.append(f"TOOL CALLS ({total_calls} call{'s' if total_calls != 1 else ''} across {iterations} iteration{'s' if iterations != 1 else ''})")
-            lines.append("─" * 40)
-            for idx, tc in enumerate(tool_calls, 1):
-                lines.append("")
-                lines.append(f"[{idx}] Tool: {tc.get('tool', 'unknown')}")
-                params = tc.get('parameters', {})
-                if isinstance(params, dict):
-                    for pk, pv in params.items():
-                        lines.append(f"    {pk}: {pv}")
-                else:
-                    lines.append(f"    Parameters: {params}")
-                result = tc.get('result', '')
-                lines.append(f"    Result ({len(result)} chars):")
-                lines.append("    " + "─" * 36)
-                for result_line in str(result)[:2000].split("\n"):
-                    lines.append(f"    {result_line}")
-            lines.append("")
-
-        # Response data
-        lines.append("─" * 40)
-        lines.append("RESPONSE")
-        lines.append("─" * 40)
-        lines.append(f"Length: {len(response)} chars")
-        lines.append("")
-        lines.append(response)
-        lines.append("")
-
-        # Also dump as JSON for machine parsing
-        lines.append("─" * 40)
-        lines.append("JSON FORMAT (for parsing)")
-        lines.append("─" * 40)
-
-        json_data = {
-            "timestamp": datetime.now().isoformat(),
-            "model": model,
-            "bot_id": bot_id,
-            "user_id": user_id,
-            "request": [_message_to_dict(msg) for msg in prepared_messages],
-            "tool_calls": _normalize_tool_call_details(tool_calls),
-            "response": response,
-        }
-        lines.append(json.dumps(json_data, indent=2, ensure_ascii=False, default=str))
-
-        # Write to file (overwrite)
-        log_file.write_text("\n".join(lines), encoding="utf-8")
-        log.debug(f"Debug turn log written to: {log_file}")
-
-    except Exception as e:
-        log.warning(f"Failed to write debug turn log: {e}")
 
 
 _memory_mcp_thread: threading.Thread | None = None
@@ -229,11 +84,17 @@ def _ensure_memory_mcp_server(config: Config) -> None:
     _memory_mcp_thread.start()
     log.info("Started MCP memory server at %s", config.MEMORY_SERVER_URL)
 
-class BackgroundService:
+
+class BackgroundService(
+    InstanceManagerMixin,
+    TurnLifecycleMixin,
+    ChatStreamingMixin,
+    BackgroundTasksMixin,
+):
     """
     The main background service that processes async tasks.
     """
-    
+
     def __init__(self, config: Config):
         self.config = config
         self.start_time = time.time()
@@ -244,34 +105,34 @@ class BackgroundService:
         self._result_events: dict[str, asyncio.Event] = {}
         self._shutdown_event = asyncio.Event()
         self._worker_task: asyncio.Task | None = None
-        
+
         # Initialize model lifecycle manager (singleton)
         from ..core.model_lifecycle import get_model_lifecycle
         self._model_lifecycle = get_model_lifecycle(config)
-        
+
         # Cached LLMBawt instances keyed by (model_alias, bot_id, user_id)
         self._llm_bawt_cache: dict[tuple[str, str, str], Any] = {}
         self._cache_lock = asyncio.Lock()
-        
+
         # Cached LLM clients keyed by model_alias only
         # This prevents loading the same model (especially GGUF) multiple times
         # when different bot contexts need the same underlying model
         self._client_cache: dict[str, Any] = {}
-        
+
         # Lock to serialize LLM calls - prevents CUDA crashes from concurrent access
         # llama-cpp-python is NOT thread-safe for concurrent inference
         self._llm_lock = asyncio.Lock()
-        
+
         # Single-threaded executor for LLM calls - ensures only one runs at a time
         from concurrent.futures import ThreadPoolExecutor
         self._llm_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="llm")
-        
+
         # Cancellation support: when a new request comes in, cancel the current one
         # This handles the case where UI sends partial transcriptions that build up
         self._current_generation_cancel: threading.Event | None = None
         self._generation_done: threading.Event | None = None  # Signals when generation finishes
         self._cancel_lock = threading.Lock()
-        
+
         # Memory client cache keyed by bot_id
         self._memory_clients: dict[tuple[str, str], Any] = {}
         from .turn_logs import TurnLogStore
@@ -283,656 +144,38 @@ class BackgroundService:
         # Background client for summarization/extraction (isolated from chat model lifecycle)
         self._bg_client: Any | None = None
         self._bg_client_model: str | None = None
-        
+
         # Session model overrides: when user switches model via tool,
         # remember it for the rest of the session. Keyed by (bot_id, user_id).
         self._session_model_overrides: dict[tuple[str, str], str] = {}
 
-        # SSE event fan-out: buffer events per turn so new clients can subscribe
-        # to in-progress streams (e.g. after page refresh).
-        self._turn_event_buffers: dict[str, list[str]] = {}
-        self._turn_subscribers: dict[str, list[asyncio.Queue]] = {}
-        self._turn_event_lock = asyncio.Lock()
-        
         # Model configuration
         self._available_models: list[str] = []
         self._default_model: str | None = None
         self._default_bot: str = config.DEFAULT_BOT or "nova"
         self._load_available_models()
-        
+
         # Register callback for model unload - clears caches when model changes
         self._model_lifecycle.on_model_unloaded(self._on_model_unloaded)
-    
-    def _on_model_unloaded(self, model_alias: str):
-        """Called when a model is unloaded - clears related caches."""
-        log.debug(f"Model '{model_alias}' unloaded - clearing caches")
-        
-        # Clear client cache for this model
-        if model_alias in self._client_cache:
-            del self._client_cache[model_alias]
-        
-        # Clear all LLMBawt instances that use this model
-        keys_to_remove = [
-            key for key in self._llm_bawt_cache
-            if key[0] == model_alias
-        ]
-        for key in keys_to_remove:
-            del self._llm_bawt_cache[key]
-        
-        log.debug(f"Cleared {len(keys_to_remove)} cached instances for model '{model_alias}'")
-
-    def invalidate_bot_instances(self, bot_id: str) -> int:
-        """Invalidate cached ServiceLLMBawt instances for a bot across models/users."""
-        normalized_bot_id = (bot_id or "").strip().lower()
-        if not normalized_bot_id:
-            return 0
-        keys_to_remove = [
-            key for key in self._llm_bawt_cache
-            if key[1] == normalized_bot_id
-        ]
-        for key in keys_to_remove:
-            del self._llm_bawt_cache[key]
-        if keys_to_remove:
-            log.debug(
-                "Cleared %s cached instances for bot '%s'",
-                len(keys_to_remove),
-                normalized_bot_id,
-            )
-        return len(keys_to_remove)
-
-    def invalidate_all_instances(self) -> int:
-        """Invalidate all cached ServiceLLMBawt instances."""
-        cleared = len(self._llm_bawt_cache)
-        self._llm_bawt_cache.clear()
-        if cleared:
-            log.debug("Cleared all cached instances (%s)", cleared)
-        return cleared
-
-    def clear_session_model_overrides(self, bot_id: str | None = None, user_id: str | None = None) -> int:
-        """Clear session model overrides, optionally scoped by bot and/or user."""
-        if not self._session_model_overrides:
-            return 0
-
-        normalized_bot = (bot_id or "").strip().lower() if bot_id is not None else None
-        normalized_user = (user_id or "").strip() if user_id is not None else None
-
-        keys_to_remove: list[tuple[str, str]] = []
-        for key in self._session_model_overrides:
-            key_bot, key_user = key
-            if normalized_bot is not None and key_bot != normalized_bot:
-                continue
-            if normalized_user is not None and key_user != normalized_user:
-                continue
-            keys_to_remove.append(key)
-
-        for key in keys_to_remove:
-            del self._session_model_overrides[key]
-
-        if keys_to_remove:
-            scope = []
-            if normalized_bot is not None:
-                scope.append(f"bot={normalized_bot}")
-            if normalized_user is not None:
-                scope.append(f"user={normalized_user}")
-            detail = " ".join(scope) if scope else "all sessions"
-            log.info("Cleared %s session model override(s) for %s", len(keys_to_remove), detail)
-
-        return len(keys_to_remove)
-    
-    def _load_available_models(self):
-        """Load list of available models from config.
-
-        Builds the canonical model catalog for the service:
-        1. All models from models.yaml / DB
-        2. Virtual model aliases for agent-backend bots
-        3. A mapping from bot slug → backend model for agent-backend bots
-           (stored separately — does NOT mutate bot objects)
-        """
-        models = self.config.defined_models.get("models", {})
-        self._available_models = list(models.keys())
-
-        # Agent-backend bot → virtual model mapping (no bot mutation)
-        self._agent_backend_models: dict[str, str] = {}
-
-        bot_manager = BotManager(self.config)
-        for bot in bot_manager.list_bots():
-            backend_name = getattr(bot, "agent_backend", None)
-            if not backend_name:
-                continue
-            backend_config = getattr(bot, "agent_backend_config", {}) or {}
-            # Register the virtual model definition if not already a real model
-            if backend_name not in models:
-                models[backend_name] = {
-                    "type": "agent_backend",
-                    "backend": backend_name,
-                    "bot_config": backend_config,
-                    "tool_support": "none",
-                }
-                if backend_name not in self._available_models:
-                    self._available_models.append(backend_name)
-                log.info(
-                    "Registered virtual model '%s' for agent backend (bot=%s)",
-                    backend_name,
-                    bot.slug,
-                )
-            # Track the mapping without mutating the bot object
-            self._agent_backend_models[bot.slug] = backend_name
-
-        # Resolve default model: bot default → config default → first available
-        default_bot = bot_manager.get_bot(self._default_bot) or bot_manager.get_default_bot()
-        if default_bot:
-            if default_bot.slug in self._agent_backend_models:
-                self._default_model = self._agent_backend_models[default_bot.slug]
-            elif default_bot.default_model and default_bot.default_model in self._available_models:
-                self._default_model = default_bot.default_model
-        if not self._default_model:
-            config_default = getattr(self.config, "DEFAULT_MODEL_ALIAS", None)
-            if config_default and config_default in self._available_models:
-                self._default_model = config_default
-        if not self._default_model and self._available_models:
-            self._default_model = self._available_models[0]
-
-        log.debug(
-            "Loaded %d models (default=%s, agent_backends=%s)",
-            len(self._available_models), self._default_model,
-            list(self._agent_backend_models.values()),
-        )
-
-    def _resolve_request_model(
-        self,
-        requested_model: str | None,
-        bot_id: str,
-        local_mode: bool,
-    ) -> tuple[str, list[str]]:
-        """Resolve the model alias for a request.
-
-        This is the single authoritative resolution point. The CLI in service
-        mode sends only the user's explicit --model (or None).
-
-        Priority:
-        1. Agent-backend bots are locked to their backend model
-        2. Explicit requested model (if available on service)
-        3. Bot's default_model (from bots.yaml / DB)
-        4. Service default model
-        5. First available model (with warning)
-
-        Returns:
-            Tuple of (resolved_model_alias, list_of_warnings)
-        """
-        warnings: list[str] = []
-        bot_manager = BotManager(self.config)
-        bot = bot_manager.get_bot(bot_id) or bot_manager.get_default_bot()
-
-        # 1. Agent-backend bots are locked to their backend model
-        backend_model = self._agent_backend_models.get(bot.slug if bot else bot_id)
-        if backend_model and backend_model in self._available_models:
-            if requested_model and requested_model != backend_model:
-                warnings.append(
-                    f"Bot '{bot_id}' uses agent backend; ignoring requested model '{requested_model}'"
-                )
-            return backend_model, warnings
-
-        # 2. Explicit requested model
-        model = requested_model.strip() if requested_model else None
-        if model:
-            if model in self._available_models:
-                return model, warnings
-            # Requested model not available — fall through with warning
-            warnings.append(f"Model '{model}' not available on service")
-
-        # 3. Bot's default_model
-        if bot and bot.default_model and bot.default_model in self._available_models:
-            if warnings:
-                warnings[-1] += f", using bot default '{bot.default_model}'"
-            return bot.default_model, warnings
-
-        # 4. Service default model
-        if self._default_model and self._default_model in self._available_models:
-            if warnings:
-                warnings[-1] += f", using service default '{self._default_model}'"
-            return self._default_model, warnings
-
-        # 5. First available
-        if self._available_models:
-            fallback = self._available_models[0]
-            msg = f"No preferred model available, using '{fallback}'"
-            log.warning(msg)
-            warnings.append(msg)
-            return fallback, warnings
-
-        raise ValueError("No models available on service.")
-    
-    # ---- SSE event fan-out for turn reconnection ----
-
-    def _broadcast_turn_event(self, turn_id: str, sse_line: str) -> None:
-        """Buffer an SSE event and fan out to any live subscribers."""
-        buf = self._turn_event_buffers.get(turn_id)
-        if buf is None:
-            buf = []
-            self._turn_event_buffers[turn_id] = buf
-        buf.append(sse_line)
-        for q in self._turn_subscribers.get(turn_id, []):
-            try:
-                q.put_nowait(sse_line)
-            except Exception:
-                pass
-
-    def _cleanup_turn_buffer(self, turn_id: str) -> None:
-        """Remove event buffer for a completed turn (after a short delay)."""
-        async def _deferred():
-            await asyncio.sleep(60)  # keep buffer 60s after completion
-            self._turn_event_buffers.pop(turn_id, None)
-            self._turn_subscribers.pop(turn_id, None)
-        try:
-            asyncio.get_event_loop().create_task(_deferred())
-        except Exception:
-            self._turn_event_buffers.pop(turn_id, None)
-
-    async def subscribe_turn_events(self, turn_id: str):
-        """Subscribe to SSE events for an in-progress turn.
-
-        Yields buffered events first, then live events as they arrive.
-        """
-        # Send buffered events
-        for event in list(self._turn_event_buffers.get(turn_id, [])):
-            yield event
-
-        # Check if turn is already done (buffer ends with [DONE])
-        buf = self._turn_event_buffers.get(turn_id, [])
-        if buf and "data: [DONE]" in buf[-1]:
-            return
-
-        # Subscribe to live events
-        q: asyncio.Queue[str | None] = asyncio.Queue()
-        self._turn_subscribers.setdefault(turn_id, []).append(q)
-        try:
-            while True:
-                try:
-                    event = await asyncio.wait_for(q.get(), timeout=30.0)
-                except asyncio.TimeoutError:
-                    yield ": keepalive\n\n"
-                    continue
-                if event is None:
-                    break
-                yield event
-                if "data: [DONE]" in event:
-                    break
-        finally:
-            subs = self._turn_subscribers.get(turn_id, [])
-            if q in subs:
-                subs.remove(q)
-
-    async def _start_generation(self) -> tuple[threading.Event, threading.Event]:
-        """Start a new generation, cancelling and waiting for any in-progress one.
-        
-        Returns:
-            tuple of (cancel_event, done_event):
-            - cancel_event: The generation should check this periodically and abort if set
-            - done_event: The generation MUST set this when complete (in finally block)
-        
-        This ensures only one generation runs at a time by:
-        1. Signalling the previous generation to cancel
-        2. Waiting for it to actually finish (up to 5 seconds)
-        3. Then allowing the new generation to start
-        """
-        loop = asyncio.get_event_loop()
-        
-        with self._cancel_lock:
-            # Cancel any existing generation and wait for it to finish
-            if self._current_generation_cancel is not None:
-                log.debug("Cancelling previous generation for new request")
-                self._current_generation_cancel.set()
-                
-                # Wait for the previous generation to signal it's done
-                if self._generation_done is not None:
-                    done_event = self._generation_done
-                    # Release lock while waiting to avoid deadlock
-                    self._cancel_lock.release()
-                    try:
-                        # Wait in executor to avoid blocking the event loop
-                        await loop.run_in_executor(
-                            None,  # Use default executor
-                            lambda: done_event.wait(timeout=5.0)
-                        )
-                    finally:
-                        self._cancel_lock.acquire()
-            
-            # Create new events for this generation
-            cancel_event = threading.Event()
-            done_event = threading.Event()
-            self._current_generation_cancel = cancel_event
-            self._generation_done = done_event
-            return cancel_event, done_event
-    
-    def _end_generation(self, cancel_event: threading.Event, done_event: threading.Event):
-        """Mark a generation as complete."""
-        # Signal that we're done FIRST (before acquiring lock)
-        done_event.set()
-        
-        with self._cancel_lock:
-            # Only clear if this is still the current generation
-            if self._current_generation_cancel is cancel_event:
-                self._current_generation_cancel = None
-                self._generation_done = None
-
-    def _persist_turn_log(
-        self,
-        *,
-        turn_id: str,
-        request_id: str | None,
-        path: str,
-        stream: bool,
-        model: str | None,
-        bot_id: str,
-        user_id: str,
-        status: str,
-        latency_ms: float | None,
-        user_prompt: str,
-        prepared_messages: list,
-        response_text: str,
-        tool_calls: list[dict] | None = None,
-        error_text: str | None = None,
-    ) -> None:
-        """Persist one turn record to short-lived DB storage."""
-        try:
-            request_payload = {
-                "messages": [_message_to_dict(msg) for msg in prepared_messages],
-            }
-            self._turn_log_store.save_turn(
-                turn_id=turn_id,
-                request_id=request_id,
-                path=path,
-                stream=stream,
-                model=model,
-                bot_id=bot_id,
-                user_id=user_id,
-                status=status,
-                latency_ms=latency_ms,
-                user_prompt=user_prompt,
-                request_payload=request_payload,
-                response_text=response_text,
-                tool_calls=_normalize_tool_call_details(tool_calls),
-                error_text=error_text,
-            )
-        except Exception as e:
-            log.debug("Failed to persist turn log: %s", e)
-
-    def _update_turn_log(
-        self,
-        *,
-        turn_id: str,
-        status: str | None = None,
-        latency_ms: float | None = None,
-        response_text: str | None = None,
-        prepared_messages: list | None = None,
-        tool_calls: list[dict] | None = None,
-        error_text: str | None = None,
-    ) -> None:
-        """Update an existing turn log row with new data."""
-        try:
-            request_payload = None
-            if prepared_messages is not None:
-                request_payload = {
-                    "messages": [_message_to_dict(msg) for msg in prepared_messages],
-                }
-            self._turn_log_store.update_turn(
-                turn_id=turn_id,
-                status=status,
-                latency_ms=latency_ms,
-                response_text=response_text,
-                request_payload=request_payload,
-                tool_calls=_normalize_tool_call_details(tool_calls) if tool_calls is not None else None,
-                error_text=error_text,
-            )
-        except Exception as e:
-            log.debug("Failed to update turn log: %s", e)
-
-    def _extract_agent_backend_tool_calls(
-        self,
-        *,
-        llm_bawt: Any,
-    ) -> list[dict]:
-        """Extract normalized tool-call details from agent backend clients."""
-        if not isinstance(getattr(llm_bawt, "client", None), AgentBackendClient):
-            return []
-
-        extracted: list[dict] = []
-        for tc in llm_bawt.client.get_tool_calls():
-            result_payload = tc.get("result")
-            if result_payload is None:
-                result_payload = "Result not exposed by OpenClaw API (see assistant response)."
-            extracted.append(
-                {
-                    "iteration": 1,
-                    "tool": tc.get("display_name") or tc.get("name", "unknown"),
-                    "parameters": tc.get("arguments", {}),
-                    "result": result_payload,
-                }
-            )
-        return extracted
-
-    def _finalize_turn(
-        self,
-        *,
-        llm_bawt,
-        turn_id: str,
-        response_text: str,
-        tool_context: str,
-        tool_call_details: list[dict],
-        prepared_messages: list,
-        user_prompt: str,
-        model: str,
-        bot_id: str,
-        user_id: str,
-        elapsed_ms: float,
-        stream: bool,
-    ) -> None:
-        """Finalize a turn in one place for both non-streaming and streaming paths."""
-        if not response_text:
-            return
-
-        # Safety-net output cleaning in case adapter-level cleanup did not run upstream.
-        adapter = getattr(llm_bawt, "adapter", None)
-        if adapter:
-            cleaned = adapter.clean_output(response_text)
-            if cleaned != response_text:
-                log.info(
-                    "Adapter '%s' cleaned response: %s -> %s chars",
-                    adapter.name,
-                    len(response_text),
-                    len(cleaned),
-                )
-                response_text = cleaned
-
-        extracted_tool_calls = self._extract_agent_backend_tool_calls(llm_bawt=llm_bawt)
-        if extracted_tool_calls:
-            tool_call_details.extend(extracted_tool_calls)
-            # For agent backends (e.g. OpenClaw), tools execute remotely so
-            # tool_context is empty.  Synthesize it from the extracted calls
-            # so that tool usage is persisted alongside the response.
-            if not tool_context:
-                parts = []
-                for tc in extracted_tool_calls:
-                    name = tc.get("tool") or tc.get("name", "unknown")
-                    result = tc.get("result", "")
-                    parts.append(f"[{name}]\n{result}")
-                tool_context = "\n\n".join(parts)
-
-        llm_bawt.finalize_response(response_text, tool_context)
-
-        self._update_turn_log(
-            turn_id=turn_id,
-            status="ok",
-            latency_ms=elapsed_ms,
-            prepared_messages=prepared_messages,
-            response_text=response_text,
-            tool_calls=tool_call_details,
-        )
-
-        if stream:
-            log.llm_response(response_text, elapsed_ms=elapsed_ms)
-
-        if self.config.DEBUG_TURN_LOG or os.environ.get("LLM_BAWT_DEBUG_TURN_LOG"):
-            _write_debug_turn_log(
-                prepared_messages=prepared_messages,
-                user_prompt=user_prompt,
-                response=response_text,
-                model=model,
-                bot_id=bot_id,
-                user_id=user_id,
-                tool_calls=tool_call_details,
-            )
 
     @property
     def uptime_seconds(self) -> float:
         return time.time() - self.start_time
-    
+
     @property
     def model_lifecycle(self):
         """Get the model lifecycle manager for tool access."""
         return self._model_lifecycle
-    
-    def get_memory_client(self, bot_id: str, user_id: str | None = None):
-        """Get or create memory client for a bot/user pair."""
-        cache_key = (bot_id, user_id)
 
-        if cache_key not in self._memory_clients:
-            try:
-                from ..memory_server.client import get_memory_client
-                self._memory_clients[cache_key] = get_memory_client(
-                    config=self.config,
-                    bot_id=bot_id,
-                    user_id=user_id,
-                    server_url=getattr(self.config, "MEMORY_SERVER_URL", None),
-                )
-                log.memory_operation("client_init", bot_id, details="MemoryClient created")
-            except Exception as e:
-                log.warning(f"Memory client unavailable for {bot_id}: {e}")
-                self._memory_clients[cache_key] = None
-        return self._memory_clients.get(cache_key)
-    
-    def _get_llm_bawt(self, model_alias: str, bot_id: str, user_id: str, local_mode: bool = False):
-        """Get or create an LLMBawt instance with caching.
-        
-        This method enforces single-model loading through the ModelLifecycleManager.
-        If a different model is requested, the current model will be unloaded first.
-        
-        Model selection priority:
-        1. Pending model switch (from switch_model tool) - becomes the new session model
-        2. Current session model override (from previous switch)
-        3. Model from API request
-        """
-        from .core import ServiceLLMBawt
-        
-        # Session key for model overrides (per bot+user)
-        session_key = (bot_id, user_id)
-        
-        # Check for pending model switch (from switch_model tool)
-        pending = self._model_lifecycle.clear_pending_switch()
-        if pending:
-            log.info(f"🔄 Switching to model: {pending}")
-            # Store as session override so subsequent requests use this model
-            self._session_model_overrides[session_key] = pending
-            model_alias = pending
-        elif session_key in self._session_model_overrides:
-            # Use the session model override from a previous switch
-            model_alias = self._session_model_overrides[session_key]
-            log.debug(f"Using session model override: {model_alias}")
-        
-        cache_key = (model_alias, bot_id, user_id)
-        
-        # Check if we need to switch models (different model requested)
-        current_model = self._model_lifecycle.current_model
-        if current_model and current_model != model_alias:
-            log.info(f"🔄 Model: {current_model} → {model_alias}")
-            # Unloading will trigger _on_model_unloaded callback which clears caches
-            self._model_lifecycle.unload_current_model()
-        
-        if cache_key in self._llm_bawt_cache:
-            log.cache_hit("llm_bawt", f"{model_alias}/{bot_id}/{user_id}")
-            log.debug(f"Reusing cached ServiceLLMBawt instance for {cache_key}")
-            return self._llm_bawt_cache[cache_key]
-        
-        log.cache_miss("llm_bawt", f"{model_alias}/{bot_id}/{user_id}")
-        
-        # Get model type for logging and cache decisions
-        model_def = self.config.defined_models.get("models", {}).get(model_alias, {})
-        model_type = model_def.get("type", "unknown")
+    # ---- Non-streaming chat completion ----
 
-        # Check if we already have a client for this model in the client cache
-        # If so, reuse it to avoid reloading GGUF models into VRAM.
-        # Skip for agent_backend models — they're lightweight and hold per-bot
-        # state (_bot_config with session_key) that must not be shared.
-        existing_client = None
-        if model_type != "agent_backend":
-            existing_client = self._client_cache.get(model_alias)
-        
-        # Only log model loading if we don't have the client cached
-        if not existing_client:
-            log.model_loading(model_alias, model_type, cached=False)
-        else:
-            log.model_loading(model_alias, model_type, cached=True)
-        try:
-            # Create a copy of config for each ServiceLLMBawt instance
-            # This is necessary because it modifies config.SYSTEM_MESSAGE
-            # based on the bot's system prompt
-            instance_config = self.config.model_copy(deep=True)
-            llm_bawt = ServiceLLMBawt(
-                resolved_model_alias=model_alias,
-                config=instance_config,
-                local_mode=local_mode,
-                bot_id=bot_id,
-                user_id=user_id,
-                existing_client=existing_client,  # Reuse cached client if available
-            )
-            self._llm_bawt_cache[cache_key] = llm_bawt
-            
-            # Also cache the client for future reuse by extraction tasks.
-            # Skip agent_backend clients — they hold per-bot state.
-            if model_alias not in self._client_cache and model_type != "agent_backend":
-                self._client_cache[model_alias] = llm_bawt.client
-            # Note: BaseLLMBawt.__init__ already registers with lifecycle manager
-            
-        except Exception as e:
-            log.model_error(model_alias, str(e))
-            raise
-        
-        return self._llm_bawt_cache[cache_key]
-    
-    def get_client(self, model_alias: str):
-        """Get LLM client for a given model (for extraction tasks).
-        
-        Uses a dedicated client cache to avoid reloading models.
-        GGUF models especially are expensive to load into VRAM,
-        so we cache the client independently from LLMBawt instances.
-        """
-        if model_alias in self._client_cache:
-            log.cache_hit("llm_client", model_alias)
-            return self._client_cache[model_alias]
-        
-        log.cache_miss("llm_client", model_alias)
-        
-        # Check if we already have an LLMBawt instance with this model
-        # and can reuse its client
-        for (cached_model, _, _), llm_bawt in self._llm_bawt_cache.items():
-            if cached_model == model_alias:
-                log.debug(f"Reusing client from existing LLMBawt instance for '{model_alias}'")
-                self._client_cache[model_alias] = llm_bawt.client
-                return llm_bawt.client
-        
-        # Need to create a new client - use spark bot (no memory overhead)
-        log.debug(f"Creating new client for model '{model_alias}' (extraction context)")
-        llm_bawt = self._get_llm_bawt(model_alias, "spark", "system", local_mode=True)
-        self._client_cache[model_alias] = llm_bawt.client
-        return llm_bawt.client
-    
     async def chat_completion(
         self,
         request: ChatCompletionRequest,
-    ) -> ChatCompletionResponse | AsyncIterator[ChatCompletionChunk]:
+    ) -> ChatCompletionResponse | AsyncIterator:
         """
         Handle an OpenAI-compatible chat completion request.
-        
+
         This is the main entry point for the API. It:
         1. Uses llm_bawt's internal history + memory for context
         2. Augments with bot system prompt and memory context (if enabled)
@@ -956,7 +199,7 @@ class BackgroundService:
 
         # Log incoming request (verbose mode will show the full payload)
         log.api_request(ctx, request.model_dump(exclude_none=True))
-        
+
         bot_id = request.bot_id or self._default_bot
         user_id = request.user or self.config.DEFAULT_USER
         local_mode = not request.augment_memory
@@ -976,22 +219,22 @@ class BackgroundService:
             f"Memory settings: augment_memory={request.augment_memory}, "
             f"local_mode={local_mode}, bot={bot_id}, user={user_id}"
         )
-        
+
         # Get cached LLMBawt instance
         llm_bawt = self._get_llm_bawt(model_alias, bot_id, user_id, local_mode)
-        
+
         # Get the user's prompt (last user message)
         user_prompt = ""
         for m in reversed(request.messages):
             if m.role == "user":
                 user_prompt = m.content or ""
                 break
-        
+
         if not user_prompt:
             raise ValueError("No user message found in request")
-        
-        # Start new generation (cancels and waits for any previous one)
-        cancel_event, done_event = await self._start_generation()
+
+        # Start new generation (cancels previous for the SAME bot only)
+        cancel_event, done_event = await self._start_generation(bot_id)
         turn_log_id = f"turn-{uuid.uuid4().hex}"
 
         # Persist turn log immediately so the user's prompt is recorded
@@ -1065,9 +308,13 @@ class BackgroundService:
                 )
 
                 return response
-            
+
             try:
-                response_text = await loop.run_in_executor(self._llm_executor, _do_query)
+                model_type = llm_bawt.client.model_definition.get("type", "")
+                if model_type in ("openai", "grok", "agent_backend"):
+                    response_text = await loop.run_in_executor(None, _do_query)
+                else:
+                    response_text = await loop.run_in_executor(self._llm_executor, _do_query)
             except Exception as e:
                 elapsed_ms = (time.time() - llm_start_time) * 1000
                 self._update_turn_log(
@@ -1093,8 +340,8 @@ class BackgroundService:
                     usage=UsageInfo(prompt_tokens=0, completion_tokens=0, total_tokens=0),
                 )
         finally:
-            self._end_generation(cancel_event, done_event)
-        
+            self._end_generation(cancel_event, done_event, bot_id)
+
         # Post-process for voice_optimized bots (strip emotes for TTS)
         bot = get_bot(bot_id)
         if bot and bot.voice_optimized:
@@ -1102,17 +349,17 @@ class BackgroundService:
             response_text = strip_emotes(response_text)
             if len(response_text) != original_len:
                 log.debug(f"Stripped emotes for TTS: {original_len} -> {len(response_text)} chars")
-        
+
         # Estimate token counts (rough approximation: 1 token ≈ 4 characters)
         prompt_text = " ".join(m.content or "" for m in request.messages)
         prompt_tokens = len(prompt_text) // 4
         completion_tokens = len(response_text) // 4
         total_tokens = prompt_tokens + completion_tokens
-        
+
         # Log response (verbose shows content summary with tokens/sec)
         log.llm_response(response_text, tokens=completion_tokens, elapsed_ms=llm_elapsed_ms)
         log.api_response(ctx, status=200, tokens=total_tokens)
-        
+
         # Build response
         response = ChatCompletionResponse(
             model=model_alias,
@@ -1129,1347 +376,21 @@ class BackgroundService:
                 total_tokens=total_tokens,
             ),
         )
-        
+
         return response
 
-    def _is_openclaw_bot(self, model_alias: str) -> bool:
-        """Check if this model alias maps to an openclaw agent backend."""
-        model_def = self.config.defined_models.get("models", {}).get(model_alias, {})
-        if model_def.get("type") == "agent_backend" and model_def.get("backend") == "openclaw":
-            return True
-        return model_alias == "openclaw"
-
-    def _get_openclaw_session_key(self, model_alias: str) -> str:
-        """Get the session_key for an OpenClaw model from its bot_config."""
-        model_def = self.config.defined_models.get("models", {}).get(model_alias, {})
-        return (
-            (model_def.get("bot_config") or {}).get("session_key")
-            or "agent:main:main"
-        )
-
-    async def _stream_via_bridge(
-        self,
-        *,
-        user_prompt: str,
-        session_key: str,
-        response_id: str,
-        created: int,
-        model_alias: str,
-        bot_id: str,
-        user_id: str,
-        ctx: Any,
-        turn_log_id: str,
-        llm_bawt: Any,
-    ) -> AsyncIterator[str]:
-        """Stream an OpenClaw response via the WS SessionBridge."""
-        import json
-
-        bridge = self._session_bridge
-        start_time = time.time()
-
-        self._persist_turn_log(
-            turn_id=turn_log_id,
-            request_id=ctx.request_id,
-            path=ctx.path,
-            stream=True,
-            model=model_alias,
-            bot_id=bot_id,
-            user_id=user_id,
-            status="streaming",
-            latency_ms=None,
-            user_prompt=user_prompt,
-            prepared_messages=[],
-            response_text="",
-        )
-
-        try:
-            # Persist user message to bot history so it appears in /v1/history
-            llm_bawt.history_manager.add_message("user", user_prompt)
-
-            # Send user message and subscribe to events
-            redis_sub = getattr(self, '_redis_subscriber', None)
-            if redis_sub:
-                # Redis mode: send via Gateway HTTP, subscribe via Redis
-                gateway = getattr(self, '_gateway_http', None)
-                if not gateway:
-                    from openclaw_bridge.gateway_http import GatewayHttpClient
-                    gateway = GatewayHttpClient(
-                        self.config.OPENCLAW_GATEWAY_URL,
-                        self.config.OPENCLAW_GATEWAY_TOKEN,
-                    )
-                    self._gateway_http = gateway
-                run_id = await gateway.send_user_message(session_key, user_prompt)
-                log.info("OpenClaw gateway HTTP: sent message, run_id=%s", run_id)
-                event_source = redis_sub.subscribe(session_key, run_id=run_id)
-            else:
-                # In-process mode: send via WS bridge, subscribe via fanout
-                run_id = await bridge.send_user_message(session_key, user_prompt)
-                bridge._api_run_ids.add(run_id)
-                log.info("OpenClaw bridge: sent message, run_id=%s", run_id)
-                event_source = bridge._fanout.subscribe(session_key)
-
-            full_text_parts: list[str] = []
-            tool_call_details: list[dict] = []
-
-            async for event in event_source:
-                from openclaw_bridge.events import OpenClawEventKind
-
-                if event.kind == OpenClawEventKind.ASSISTANT_DELTA:
-                    delta = event.text or ""
-                    if delta:
-                        full_text_parts.append(delta)
-                        data = {
-                            "id": response_id,
-                            "object": "chat.completion.chunk",
-                            "created": created,
-                            "model": model_alias,
-                            "choices": [{"index": 0, "delta": {"content": delta}, "finish_reason": None}],
-                        }
-                        yield f"data: {json.dumps(data)}\n\n"
-
-                elif event.kind == OpenClawEventKind.TOOL_START:
-                    tool_data = {
-                        "object": "service.tool_call",
-                        "name": event.tool_name or "unknown",
-                        "arguments": event.tool_arguments or {},
-                    }
-                    yield f"data: {json.dumps(tool_data)}\n\n"
-                    tool_call_details.append({
-                        "iteration": 1,
-                        "tool": event.tool_name or "unknown",
-                        "parameters": event.tool_arguments or {},
-                        "result": "",
-                    })
-
-                elif event.kind == OpenClawEventKind.TOOL_END:
-                    tool_result_data = {
-                        "object": "service.tool_result",
-                        "name": event.tool_name or "unknown",
-                        "result": event.tool_result,
-                    }
-                    yield f"data: {json.dumps(tool_result_data)}\n\n"
-                    if tool_call_details:
-                        tool_call_details[-1]["result"] = str(event.tool_result or "")
-
-                elif event.kind == OpenClawEventKind.RUN_COMPLETED:
-                    if event.run_id == run_id or not run_id:
-                        break
-
-                elif event.kind == OpenClawEventKind.ERROR:
-                    warning_data = {
-                        "object": "service.warning",
-                        "model": model_alias,
-                        "warnings": [f"openclaw_error: {event.text}"],
-                    }
-                    yield f"data: {json.dumps(warning_data)}\n\n"
-                    break
-
-            # Final chunk
-            data = {
-                "id": response_id,
-                "object": "chat.completion.chunk",
-                "created": created,
-                "model": model_alias,
-                "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
-            }
-            yield f"data: {json.dumps(data)}\n\n"
-            yield "data: [DONE]\n\n"
-
-            # Fetch tool calls from chat history (gateway doesn't stream them)
-            try:
-                if redis_sub and gateway:
-                    history_msgs = await gateway.get_chat_history(session_key, limit=20)
-                elif bridge:
-                    history_msgs = await bridge._ws_client.get_chat_history(session_key, limit=20)
-                else:
-                    history_msgs = []
-                for msg in reversed(history_msgs):
-                    if not isinstance(msg, dict):
-                        continue
-                    # Look for tool_calls in the most recent assistant message
-                    if msg.get("role") == "assistant":
-                        for tc in msg.get("tool_calls") or []:
-                            fn = tc.get("function") or {}
-                            tool_call_details.append({
-                                "iteration": 1,
-                                "tool": fn.get("name") or tc.get("name") or "unknown",
-                                "parameters": fn.get("arguments") or {},
-                                "result": "",
-                            })
-                        break
-                    # Also capture tool results
-                    if msg.get("role") == "tool":
-                        # Will be matched to tool_call above
-                        pass
-            except Exception as e:
-                log.debug("Could not fetch tool calls from chat.history: %s", e)
-
-            # Finalize turn
-            full_text = "".join(full_text_parts)
-            elapsed_ms = (time.time() - start_time) * 1000
-            if full_text:
-                self._finalize_turn(
-                    llm_bawt=llm_bawt,
-                    turn_id=turn_log_id,
-                    response_text=full_text,
-                    tool_context="",
-                    tool_call_details=tool_call_details,
-                    prepared_messages=[],
-                    user_prompt=user_prompt,
-                    model=model_alias,
-                    bot_id=bot_id,
-                    user_id=user_id,
-                    elapsed_ms=elapsed_ms,
-                    stream=True,
-                )
-            else:
-                self._update_turn_log(
-                    turn_id=turn_log_id,
-                    status="timeout",
-                    latency_ms=elapsed_ms,
-                )
-
-        except Exception as e:
-            log.error("OpenClaw bridge stream failed: %s", e)
-            elapsed_ms = (time.time() - start_time) * 1000
-            self._update_turn_log(
-                turn_id=turn_log_id,
-                status="error",
-                latency_ms=elapsed_ms,
-                error_text=str(e),
-            )
-            warning_data = {
-                "object": "service.warning",
-                "model": model_alias,
-                "warnings": [f"bridge_error: {e}"],
-            }
-            yield f"data: {json.dumps(warning_data)}\n\n"
-            data = {
-                "id": response_id,
-                "object": "chat.completion.chunk",
-                "created": created,
-                "model": model_alias,
-                "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
-            }
-            yield f"data: {json.dumps(data)}\n\n"
-            yield "data: [DONE]\n\n"
-
-    async def chat_completion_stream(
-        self,
-        request: ChatCompletionRequest,
-    ) -> AsyncIterator[str]:
-        """
-        Handle a streaming chat completion request.
-        
-        Uses llm_bawt's internal history + memory for context.
-        Yields Server-Sent Events (SSE) formatted chunks.
-        """
-        import json
-        # Create request context for logging
-        if request.client_system_context is not None:
-            req_path = f"/v1/botchat/{request.bot_id}/{request.user}/chat/completions"
-        else:
-            req_path = "/v1/chat/completions"
-        ctx = RequestContext(
-            request_id=generate_request_id(),
-            method="POST",
-            path=req_path,
-            model=request.model,
-            bot_id=request.bot_id,
-            user_id=request.user,
-            stream=True,
-        )
-
-        # Log incoming request (verbose mode will show the full payload)
-        log.api_request(ctx, request.model_dump(exclude_none=True))
-        
-        bot_id = request.bot_id or self._default_bot
-        user_id = request.user or self.config.DEFAULT_USER
-        local_mode = not request.augment_memory
-
-        # Resolve model using shared bot/config logic
-        # Agent-backend bots resolve to their virtual model (e.g. "openclaw")
-        try:
-            model_alias, model_warnings = self._resolve_request_model(request.model, bot_id, local_mode)
-        except Exception as e:
-            log.api_error(ctx, str(e), 400)
-            raise
-
-        response_id = f"chatcmpl-{uuid.uuid4().hex[:12]}"
-        created = int(time.time())
-
-        # Get cached LLMBawt instance
-        try:
-            llm_bawt = self._get_llm_bawt(model_alias, bot_id, user_id, local_mode)
-        except Exception as e:
-            log.api_error(ctx, str(e), 500)
-            warning_data = {
-                "object": "service.warning",
-                "model": model_alias,
-                "warnings": [f"request_failed: {e}"],
-            }
-            yield f"data: {json.dumps(warning_data)}\n\n"
-            data = {
-                "id": response_id,
-                "object": "chat.completion.chunk",
-                "created": created,
-                "model": model_alias,
-                "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
-            }
-            yield f"data: {json.dumps(data)}\n\n"
-            yield "data: [DONE]\n\n"
-            return
-        
-        # Get the user's prompt (last user message)
-        user_prompt = ""
-        for m in reversed(request.messages):
-            if m.role == "user":
-                user_prompt = m.content or ""
-                break
-        
-        if not user_prompt:
-            warning_data = {
-                "object": "service.warning",
-                "model": model_alias,
-                "warnings": ["request_failed: No user message found in request"],
-            }
-            yield f"data: {json.dumps(warning_data)}\n\n"
-            data = {
-                "id": response_id,
-                "object": "chat.completion.chunk",
-                "created": created,
-                "model": model_alias,
-                "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
-            }
-            yield f"data: {json.dumps(data)}\n\n"
-            yield "data: [DONE]\n\n"
-            return
-
-        # OpenClaw bots now flow through the normal AgentBackendClient.stream_raw()
-        # pipeline, which routes via Redis -> Bridge -> WS automatically.
-
-        chunk_queue: asyncio.Queue = asyncio.Queue()
-        full_response_holder = [""]  # Use list to allow mutation in nested function
-        tool_context_holder = [""]  # Store tool context from native tool calls
-        tool_call_details_holder: list[dict] = []
-        timing_holder = [0.0, 0.0]  # [start_time, end_time]
-        cancelled_holder = [False]  # Track if we were cancelled
-        
-        # Capture the event loop before entering the thread
-        loop = asyncio.get_running_loop()
-        
-        # Start new generation (cancels and waits for any previous one)
-        cancel_event, done_event = await self._start_generation()
-        turn_log_id = f"turn-{uuid.uuid4().hex}"
-
-        # Persist turn log immediately so the user's prompt is recorded
-        # even if the backend times out or errors before responding.
-        self._persist_turn_log(
-            turn_id=turn_log_id,
-            request_id=ctx.request_id,
-            path=ctx.path,
-            stream=True,
-            model=model_alias,
-            bot_id=bot_id,
-            user_id=user_id,
-            status="streaming",
-            latency_ms=None,
-            user_prompt=user_prompt,
-            prepared_messages=[],
-            response_text="",
-        )
-
-        def _stream_to_queue():
-            """Run streaming in a thread and push chunks to the async queue."""
-            try:
-                # Check if already cancelled before starting
-                if cancel_event.is_set():
-                    cancelled_holder[0] = True
-                    return
-                
-                # Inject client-supplied system context (e.g. HA device list)
-                llm_bawt._client_system_context = request.client_system_context
-                llm_bawt._ha_mode = request.ha_mode
-                llm_bawt._include_summaries = request.include_summaries
-                llm_bawt._tts_mode = request.tts_mode
-
-                # Use llm_bawt.prepare_messages_for_query to get full context
-                # (history from DB + memory + system prompt)
-                messages = llm_bawt.prepare_messages_for_query(user_prompt)
-
-                # Backfill prepared messages into the turn log
-                self._update_turn_log(
-                    turn_id=turn_log_id,
-                    prepared_messages=messages,
-                )
-
-                # Log what we're sending to the LLM (verbose mode)
-                log.llm_context(messages)
-
-                # Track when first token arrives
-                timing_holder[0] = time.time()
-                
-                # Choose streaming method based on whether bot uses tools
-                if llm_bawt.bot.uses_tools and (llm_bawt.memory or llm_bawt.home_client or llm_bawt.ha_native_client):
-                    # Check if client supports native streaming with tools (OpenAI)
-                    use_native_streaming = (
-                        llm_bawt.client.supports_native_tools()
-                        and llm_bawt.tool_format in ("native", "NATIVE_OPENAI")
-                        and hasattr(llm_bawt.client, "stream_with_tools")
-                    )
-
-                    # Resolve per-bot generation parameters
-                    gen_kwargs = llm_bawt._get_generation_kwargs()
-
-                    if use_native_streaming:
-                        # Native streaming with tools - streams content AND handles tool calls
-                        from ..tools.executor import ToolExecutor
-                        from ..tools.formats import get_format_handler
-                        from ..models.message import Message as Msg
-
-                        log.debug("Using native streaming with tools")
-
-                        tool_definitions = llm_bawt._get_tool_definitions()
-                        handler = get_format_handler(llm_bawt.tool_format)
-                        tools_schema = handler.get_tools_schema(tool_definitions)
-
-                        # Log tool names for debugging
-                        tool_names = [t.get("function", {}).get("name", "?") for t in tools_schema]
-                        ha_tools = [n for n in tool_names if n.startswith("Hass") or n in ("GetLiveContext",)]
-                        log.info(f"📋 {len(tools_schema)} tools in schema ({len(ha_tools)} HA: {', '.join(ha_tools[:5])}{'...' if len(ha_tools) > 5 else ''})")
-
-                        executor = ToolExecutor(
-                            memory_client=llm_bawt.memory,
-                            profile_manager=llm_bawt.profile_manager,
-                            search_client=llm_bawt.search_client,
-                            home_client=llm_bawt.home_client,
-                            ha_native_client=llm_bawt.ha_native_client,
-                            model_lifecycle=llm_bawt.model_lifecycle,
-                            config=llm_bawt.config,
-                            user_id=llm_bawt.user_id,
-                            bot_id=llm_bawt.bot_id,
-                        )
-
-                        def native_stream_with_tool_loop():
-                            """Stream with native tool support, handling tool calls inline."""
-                            import json as _json
-                            from ..tools.parser import ToolCall
-
-                            current_msgs = list(messages)
-                            max_iterations = 3 if llm_bawt._ha_mode else 5
-                            has_executed_tools = False
-
-                            for iteration in range(max_iterations):
-                                # After first tool execution, don't pass tools_schema
-                                # so the model generates a text response instead of
-                                # looping on more tool calls.
-                                current_tools = None if has_executed_tools else tools_schema
-
-                                for item in llm_bawt.client.stream_with_tools(
-                                    current_msgs,
-                                    tools_schema=current_tools,
-                                    tool_choice="auto",
-                                    **gen_kwargs,
-                                ):
-                                    if isinstance(item, str):
-                                        # Content chunk - yield to user immediately
-                                        yield item
-                                    elif isinstance(item, dict) and "tool_calls" in item:
-                                        # Tool calls at end of stream
-                                        tool_calls = item["tool_calls"]
-                                        content = item.get("content", "")
-
-                                        if not tool_calls:
-                                            return  # No tools, done
-
-                                        # Execute tools and log with their arguments
-                                        tool_results = []
-                                        for tc in tool_calls:
-                                            func = tc.get("function", {})
-                                            name = func.get("name", "")
-                                            args_str = func.get("arguments", "{}")
-                                            try:
-                                                args = _json.loads(args_str) if args_str else {}
-                                            except _json.JSONDecodeError:
-                                                args = {}
-
-                                            log.info(f"🔧 {name}({args})")
-                                            put_queue_item_threadsafe(
-                                                loop,
-                                                chunk_queue,
-                                                {
-                                                    "event": "tool_call",
-                                                    "name": name,
-                                                    "arguments": args,
-                                                },
-                                            )
-
-                                            tool_call_obj = ToolCall(name=name, arguments=args, raw_text="")
-                                            result = executor.execute(tool_call_obj)
-                                            tool_results.append({
-                                                "tool_call_id": tc.get("id", ""),
-                                                "content": result,
-                                            })
-                                            tool_call_details_holder.append(
-                                                {
-                                                    "iteration": iteration + 1,
-                                                    "tool": name,
-                                                    "parameters": args,
-                                                    "result": result,
-                                                }
-                                            )
-
-                                        has_executed_tools = True
-
-                                        # Store tool context
-                                        tool_context_holder[0] = "\n\n".join(
-                                            f"[{tc['function']['name']}]\n{tr['content']}"
-                                            for tc, tr in zip(tool_calls, tool_results)
-                                        )
-
-                                        # Build continuation messages
-                                        assistant_msg = Msg(
-                                            role="assistant",
-                                            content=content,
-                                            tool_calls=[
-                                                {"id": tc.get("id"), "name": tc["function"]["name"], "arguments": tc["function"]["arguments"]}
-                                                for tc in tool_calls
-                                            ],
-                                        )
-                                        current_msgs.append(assistant_msg)
-
-                                        for tc, tr in zip(tool_calls, tool_results):
-                                            current_msgs.append(Msg(
-                                                role="tool",
-                                                content=tr["content"],
-                                                tool_call_id=tr["tool_call_id"],
-                                            ))
-
-                                        # Continue to next iteration (will stream the follow-up)
-                                        break
-                                else:
-                                    # Stream finished without tool calls dict (pure content response)
-                                    return
-
-                            log.warning(f"Tool loop: max iterations ({max_iterations}) reached")
-
-                        stream_iter = native_stream_with_tool_loop()
-                    else:
-                        # Fall back to text-based streaming for non-native models (GGUF, etc.)
-                        from ..tools import stream_with_tools
-                        log.debug(f"Using stream_with_tools for tool format: {llm_bawt.tool_format}")
-                        
-                        adapter = getattr(llm_bawt, 'adapter', None)
-                        if adapter:
-                            log.debug(f"Passing adapter '{adapter.name}' to stream_with_tools")
-                        else:
-                            log.warning("No adapter found on llm_bawt instance")
-
-                        def stream_fn(msgs, stop_sequences=None):
-                            return llm_bawt.client.stream_raw(msgs, stop=stop_sequences, **gen_kwargs)
-
-                        stream_iter = stream_with_tools(
-                            messages=messages,
-                            stream_fn=stream_fn,
-                            memory_client=llm_bawt.memory,
-                            profile_manager=llm_bawt.profile_manager,
-                            search_client=llm_bawt.search_client,
-                            home_client=llm_bawt.home_client,
-                            ha_native_client=llm_bawt.ha_native_client,
-                            model_lifecycle=llm_bawt.model_lifecycle,
-                            config=llm_bawt.config,
-                            user_id=llm_bawt.user_id,
-                            bot_id=llm_bawt.bot_id,
-                            tool_format=llm_bawt.tool_format,
-                            adapter=adapter,
-                            history_manager=llm_bawt.history_manager,
-                            tool_call_details=tool_call_details_holder,
-                        )
-                else:
-                    # Resolve per-bot generation parameters
-                    gen_kwargs = llm_bawt._get_generation_kwargs()
-                    # Pass adapter stop sequences even without tools
-                    adapter = getattr(llm_bawt, 'adapter', None)
-                    adapter_stops = adapter.get_stop_sequences() if adapter else []
-                    stream_iter = llm_bawt.client.stream_raw(
-                        messages, stop=adapter_stops or None, **gen_kwargs
-                    )
-                
-                # Stream chunks to queue
-                cancelled_holder[0] = consume_stream_chunks(
-                    stream_iter,
-                    cancel_event=cancel_event,
-                    loop=loop,
-                    chunk_queue=chunk_queue,
-                    full_response_holder=full_response_holder,
-                )
-                if cancelled_holder[0]:
-                    log.info("Generation cancelled - newer request received")
-
-                timing_holder[1] = time.time()
-                    
-            except Exception as e:
-                if not cancel_event.is_set():
-                    put_queue_item_threadsafe(loop, chunk_queue, e)
-                elapsed_ms = (time.time() - timing_holder[0]) * 1000 if timing_holder[0] else None
-                self._update_turn_log(
-                    turn_id=turn_log_id,
-                    status="error",
-                    latency_ms=elapsed_ms,
-                    response_text=full_response_holder[0] or None,
-                    error_text=str(e),
-                )
-            finally:
-                end_time = timing_holder[1] or time.time()
-                start_time = timing_holder[0] or end_time
-                elapsed_ms = (end_time - start_time) * 1000
-                if full_response_holder[0]:
-                    self._finalize_turn(
-                        llm_bawt=llm_bawt,
-                        turn_id=turn_log_id,
-                        response_text=full_response_holder[0],
-                        tool_context=tool_context_holder[0],
-                        tool_call_details=tool_call_details_holder,
-                        prepared_messages=messages if "messages" in locals() else [],
-                        user_prompt=user_prompt,
-                        model=model_alias,
-                        bot_id=bot_id,
-                        user_id=user_id,
-                        elapsed_ms=elapsed_ms,
-                        stream=True,
-                    )
-                else:
-                    # No response received — mark as timeout so turn doesn't
-                    # stay stuck at status='streaming' forever.
-                    self._update_turn_log(
-                        turn_id=turn_log_id,
-                        status="timeout",
-                        latency_ms=elapsed_ms,
-                    )
-
-                put_queue_item_threadsafe(loop, chunk_queue, None)  # Sentinel
-        
-        try:
-            # Check if this bot needs emote filtering for TTS
-            bot = get_bot(bot_id)
-            emote_filter = StreamingEmoteFilter() if (bot and bot.voice_optimized) else None
-            
-            # Emit turn ID so the frontend can reconnect after page refresh
-            turn_meta = {
-                "object": "service.turn_id",
-                "turn_id": turn_log_id,
-                "model": model_alias,
-                "bot_id": bot_id,
-            }
-            turn_meta_line = f"data: {json.dumps(turn_meta)}\n\n"
-            self._broadcast_turn_event(turn_log_id, turn_meta_line)
-            yield turn_meta_line
-
-            # Send service warnings (e.g. model fallback) before content
-            if model_warnings:
-                warning_data = {
-                    "object": "service.warning",
-                    "model": model_alias,
-                    "warnings": model_warnings,
-                }
-                warning_line = f"data: {json.dumps(warning_data)}\n\n"
-                self._broadcast_turn_event(turn_log_id, warning_line)
-                yield warning_line
-
-            # Start streaming in single-thread executor
-            loop.run_in_executor(self._llm_executor, _stream_to_queue)
-
-            # Helper: yield SSE line and broadcast to turn subscribers
-            def _sse(line: str) -> str:
-                self._broadcast_turn_event(turn_log_id, line)
-                return line
-
-            # Yield SSE chunks (with keepalive to prevent client timeout
-            # during slow backends like vLLM first-inference)
-            while True:
-                try:
-                    chunk = await asyncio.wait_for(chunk_queue.get(), timeout=15.0)
-                except asyncio.TimeoutError:
-                    # Send SSE comment as keepalive to prevent client/proxy timeout
-                    yield ": keepalive\n\n"
-                    continue
-
-                if chunk is None:
-                    # Stream complete - flush any buffered content from emote filter
-                    if emote_filter:
-                        final_chunk = emote_filter.flush()
-                        if final_chunk:
-                            data = {
-                                "id": response_id,
-                                "object": "chat.completion.chunk",
-                                "created": created,
-                                "model": model_alias,
-                                "choices": [{"index": 0, "delta": {"content": final_chunk}, "finish_reason": None}],
-                            }
-                            yield _sse(f"data: {json.dumps(data)}\n\n")
-
-                    # Send final chunk
-                    data = {
-                        "id": response_id,
-                        "object": "chat.completion.chunk",
-                        "created": created,
-                        "model": model_alias,
-                        "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
-                    }
-                    yield _sse(f"data: {json.dumps(data)}\n\n")
-                    yield _sse("data: [DONE]\n\n")
-                    self._cleanup_turn_buffer(turn_log_id)
-                    break
-
-                if isinstance(chunk, Exception):
-                    # Upstream stream failed; close SSE cleanly so downstream clients
-                    # don't see an incomplete chunked read protocol error.
-                    log.error("Streaming backend failed: %s", chunk)
-                    warning_data = {
-                        "object": "service.warning",
-                        "model": model_alias,
-                        "warnings": [f"stream_interrupted: {chunk}"],
-                    }
-                    yield _sse(f"data: {json.dumps(warning_data)}\n\n")
-
-                    # Flush any buffered content from emote filter.
-                    if emote_filter:
-                        final_chunk = emote_filter.flush()
-                        if final_chunk:
-                            data = {
-                                "id": response_id,
-                                "object": "chat.completion.chunk",
-                                "created": created,
-                                "model": model_alias,
-                                "choices": [{"index": 0, "delta": {"content": final_chunk}, "finish_reason": None}],
-                            }
-                            yield _sse(f"data: {json.dumps(data)}\n\n")
-
-                    data = {
-                        "id": response_id,
-                        "object": "chat.completion.chunk",
-                        "created": created,
-                        "model": model_alias,
-                        "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
-                    }
-                    yield _sse(f"data: {json.dumps(data)}\n\n")
-                    yield _sse("data: [DONE]\n\n")
-                    self._cleanup_turn_buffer(turn_log_id)
-                    break
-
-                if isinstance(chunk, dict) and chunk.get("event") == "tool_call":
-                    has_result = chunk.get("result") is not None
-                    error = chunk.get("error")
-                    # Treat errors as completed results so the frontend never
-                    # gets stuck showing "Pending result..." forever.
-                    result = chunk.get("result") if has_result else (f"Error: {error}" if error else None)
-                    event_data = {
-                        "object": "service.tool_call",
-                        "model": model_alias,
-                        "name": chunk.get("name", "unknown"),
-                        "arguments": chunk.get("arguments", {}),
-                        "result": result,
-                        "status": "completed" if (has_result or error) else "pending",
-                    }
-                    yield _sse(f"data: {json.dumps(event_data)}\n\n")
-                    continue
-
-                if isinstance(chunk, dict) and chunk.get("event") == "tool_result":
-                    event_data = {
-                        "object": "service.tool_result",
-                        "model": model_alias,
-                        "name": chunk.get("name", "unknown"),
-                        "result": chunk.get("result"),
-                    }
-                    yield _sse(f"data: {json.dumps(event_data)}\n\n")
-                    continue
-
-                # Apply emote filter for voice_optimized bots
-                if emote_filter:
-                    chunk = emote_filter.process(chunk)
-                    if not chunk:
-                        # Chunk was filtered out or buffered
-                        continue
-
-                # Normal chunk
-                data = {
-                    "id": response_id,
-                    "object": "chat.completion.chunk",
-                    "created": created,
-                    "model": model_alias,
-                    "choices": [{"index": 0, "delta": {"content": chunk}, "finish_reason": None}],
-                }
-                yield _sse(f"data: {json.dumps(data)}\n\n")
-        finally:
-            # Mark generation as complete
-            self._end_generation(cancel_event, done_event)
-
-    async def process_task(self, task: Task) -> TaskResult:
-        """Process a single background task."""
-        start_time = time.time()
-        task_type_str = task.task_type.value
-        
-        log.debug(f"Processing task {task.task_id[:8]} ({task_type_str})")
-        
-        try:
-            if task.task_type == TaskType.CONTEXT_COMPACTION:
-                result = await self._process_compaction(task)
-            elif task.task_type == TaskType.EMBEDDING_GENERATION:
-                result = await self._process_embeddings(task)
-            elif task.task_type == TaskType.MEANING_UPDATE:
-                result = await self._process_meaning_update(task)
-            elif task.task_type == TaskType.MEMORY_MAINTENANCE:
-                result = await self._process_maintenance(task)
-            elif task.task_type == TaskType.PROFILE_MAINTENANCE:
-                result = await self._process_profile_maintenance(task)
-            elif task.task_type == TaskType.HISTORY_SUMMARIZATION:
-                result = await self._process_history_summarization(task)
-            else:
-                raise ValueError(f"Unknown task type: {task.task_type}")
-            
-            elapsed_ms = (time.time() - start_time) * 1000
-            log.task_completed(task.task_id, task_type_str, elapsed_ms, result)
-            
-            return TaskResult(
-                task_id=task.task_id,
-                status=TaskStatus.COMPLETED,
-                result=result,
-                processing_time_ms=elapsed_ms,
-            )
-            
-        except Exception as e:
-            elapsed_ms = (time.time() - start_time) * 1000
-            log.task_failed(task.task_id, task_type_str, str(e), elapsed_ms)
-            return TaskResult(
-                task_id=task.task_id,
-                status=TaskStatus.FAILED,
-                error=str(e),
-                processing_time_ms=elapsed_ms,
-            )
-    
-    async def _process_compaction(self, task: Task) -> dict:
-        """Process a context compaction task."""
-        # TODO: Implement with summarization model
-        return {"compacted": False, "reason": "Not yet implemented"}
-    
-    async def _process_embeddings(self, task: Task) -> dict:
-        """Process an embedding generation task."""
-        # TODO: Implement with embedding model
-        return {"embeddings_generated": 0, "reason": "Not yet implemented"}
-
-    async def _process_meaning_update(self, task: Task) -> dict:
-        """Process a meaning update task (via MCP tools)."""
-        bot_id = task.bot_id
-        payload = task.payload
-        memory_id = payload.get("memory_id")
-        if not memory_id:
-            return {"updated": False, "reason": "No memory_id provided"}
-
-        memory_client = self.get_memory_client(bot_id)
-        if not memory_client:
-            return {"updated": False, "reason": "Memory client unavailable"}
-
-        loop = asyncio.get_event_loop()
-        success = await loop.run_in_executor(
-            None,
-            lambda: memory_client.update_memory_meaning(
-                memory_id=memory_id,
-                intent=payload.get("intent"),
-                stakes=payload.get("stakes"),
-                emotional_charge=payload.get("emotional_charge"),
-                recurrence_keywords=payload.get("recurrence_keywords"),
-                updated_tags=payload.get("updated_tags"),
-            ),
-        )
-        return {"updated": bool(success), "memory_id": memory_id}
-
-    async def _process_maintenance(self, task: Task) -> dict:
-        """Process a unified memory maintenance task.
-        
-        Uses a cached LLM client if available, otherwise runs without LLM.
-        Will NOT load a new model to avoid VRAM conflicts.
-        """
-        bot_id = task.bot_id
-        payload = task.payload
-
-        memory_client = self.get_memory_client(bot_id)
-        if not memory_client:
-            return {"error": "Memory client unavailable"}
-
-        loop = asyncio.get_event_loop()
-        result = await loop.run_in_executor(
-            None,
-            lambda: memory_client.run_maintenance(
-                run_consolidation=payload.get("run_consolidation", True),
-                run_recurrence_detection=payload.get("run_recurrence_detection", True),
-                run_decay_pruning=payload.get("run_decay_pruning", False),
-                run_orphan_cleanup=payload.get("run_orphan_cleanup", False),
-                dry_run=payload.get("dry_run", False),
-            ),
-        )
-        return result
-
-    async def _process_profile_maintenance(self, task: Task) -> dict:
-        """Process profile maintenance - consolidate attributes into summary.
-        
-        Uses configured maintenance model resolution and loads that model
-        deterministically when needed.
-        """
-        from ..memory.profile_maintenance import ProfileMaintenanceService
-        from ..profiles import ProfileManager
-        
-        entity_id = task.payload.get("entity_id", task.user_id)
-        entity_type = task.payload.get("entity_type", "user")
-        dry_run = task.payload.get("dry_run", False)
-        
-        requested_model = (
-            task.payload.get("model")
-            or getattr(self.config, "MAINTENANCE_MODEL", None)
-            or (self.config.PROFILE_MAINTENANCE_MODEL or None)
-            or getattr(self.config, "SUMMARIZATION_MODEL", None)
-        )
-        try:
-            model_to_use, _ = self._resolve_request_model(
-                requested_model,
-                task.bot_id or self._default_bot,
-                local_mode=False,
-            )
-        except Exception as e:
-            log.error(f"Failed to resolve model for profile maintenance: {e}")
-            return {"error": f"Failed to resolve model: {e}"}
-
-        if not model_to_use:
-            err = "No model available for profile maintenance"
-            log.error(err)
-            return {"error": err}
-
-        model_def = self.config.defined_models.get("models", {}).get(model_to_use, {})
-        if model_def.get("type") == "openai" and not (self.config.OPENAI_API_KEY or self.config.XAI_API_KEY):
-            err = f"Profile maintenance model '{model_to_use}' requires API key configuration"
-            log.error(err)
-            return {"error": err}
-
-        if model_to_use not in self._available_models:
-            err = f"Model '{model_to_use}' unavailable for profile maintenance"
-            log.error(err)
-            return {"error": err}
-        
-        log.info(f"🔧 Profile maintenance: {entity_type}/{entity_id} (model={model_to_use})")
-        
-        # Get or create profile manager
-        profile_manager = ProfileManager(self.config)
-        
-        # Use isolated background client — never interferes with main chat model
-        llm_client, _ = self._get_background_client(model_override=model_to_use)
-        if not llm_client:
-            return {"error": f"Failed to create background client for profile maintenance"}
-        
-        service = ProfileMaintenanceService(profile_manager, llm_client)
-        
-        loop = asyncio.get_event_loop()
-        result = await loop.run_in_executor(
-            self._llm_executor,  # Use same executor as extraction
-            lambda: service.run(entity_id, entity_type, dry_run)
-        )
-        
-        return {
-            "entity_id": result.entity_id,
-            "attributes_before": result.attributes_before,
-            "attributes_after": result.attributes_after,
-            "categories_updated": result.categories_updated,
-            "error": result.error,
-        }
-
-    def _get_background_client(self, model_override: str | None = None) -> tuple[Any | None, str | None]:
-        """Get or create an API client for background tasks (summarization, extraction).
-
-        This client is completely isolated from the main chat model lifecycle —
-        it never triggers model switches or unloads the active chat model.
-
-        Only API-based models (openai/grok) are supported.
-
-        Returns:
-            ``(client, model_alias)`` or ``(None, None)`` if unavailable.
-        """
-        preferred = (
-            model_override
-            or getattr(self.config, "EXTRACTION_MODEL", None)
-            or getattr(self.config, "MAINTENANCE_MODEL", None)
-            or getattr(self.config, "SUMMARIZATION_MODEL", None)
-        )
-
-        # Reuse cached client if same model
-        if self._bg_client is not None and (not preferred or preferred == self._bg_client_model):
-            return self._bg_client, self._bg_client_model
-
-        # Resolve alias
-        try:
-            model_alias, _ = self._resolve_request_model(
-                preferred, bot_id="nova", local_mode=False,
-            )
-        except Exception as e:
-            log.error(f"Failed to resolve background model '{preferred}': {e}")
-            return None, None
-
-        models = self.config.defined_models.get("models", {})
-        model_def = models.get(model_alias, {})
-        model_type = model_def.get("type")
-
-        if model_type not in ("openai", "grok"):
-            if preferred:
-                log.warning(
-                    "Background model '%s' is type '%s' (only openai/grok supported). "
-                    "Falling back to heuristics.", preferred, model_type,
-                )
-            return None, None
-
-        # Create a standalone client — no model lifecycle involvement
-        try:
-            from ..clients.openai_client import OpenAIClient
-            from ..clients.grok_client import GrokClient
-
-            model_id = model_def.get("model_id", model_alias)
-            if model_type == "grok":
-                client = GrokClient(
-                    model=model_id, config=self.config, model_definition=model_def,
-                )
-            else:
-                client = OpenAIClient(
-                    model=model_id, config=self.config, model_definition=model_def,
-                )
-
-            self._bg_client = client
-            self._bg_client_model = model_alias
-            log.info("Background client ready: %s (%s)", model_alias, model_type)
-            return client, model_alias
-
-        except Exception as e:
-            log.error("Failed to create background client for '%s': %s", model_alias, e)
-            return None, None
-
-    async def _extract_from_summaries(
-        self,
-        summarization_results: list[dict],
-        bot_id: str,
-        user_id: str,
-    ) -> dict:
-        """Extract facts from newly created summaries using an API model.
-
-        Called after ``summarize_eligible_sessions()`` completes.  Only
-        processes results where ``created`` is ``True``.
-
-        Args:
-            summarization_results: Result dicts from ``HistorySummarizer``
-            bot_id: Bot whose memories are being updated
-            user_id: User identity for memory storage
-
-        Returns:
-            Stats dict with extraction outcome.
-        """
-        from ..memory.extraction.service import MemoryExtractionService, MemoryAction
-
-        extraction_client, extraction_model = self._get_background_client()
-        use_llm = extraction_client is not None
-
-        if not use_llm:
-            return {
-                "summaries_processed": 0,
-                "facts_extracted": 0,
-                "facts_stored": 0,
-                "extraction_method": "skipped",
-            }
-
-        extraction_service = MemoryExtractionService(llm_client=extraction_client)
-        memory_client = self.get_memory_client(bot_id, user_id)
-
-        if not memory_client:
-            log.warning("No memory client available — skipping extraction")
-            return {
-                "summaries_processed": 0,
-                "facts_extracted": 0,
-                "facts_stored": 0,
-                "extraction_method": "skipped",
-            }
-
-        min_importance = getattr(self.config, "MEMORY_EXTRACTION_MIN_IMPORTANCE", 0.5)
-        profile_enabled = getattr(self.config, "MEMORY_PROFILE_ATTRIBUTE_ENABLED", True)
-
-        total_facts = 0
-        total_stored = 0
-        summaries_processed = 0
-
-        for result in summarization_results:
-            if not result.get("created", False):
-                continue
-
-            summary_text = result.get("summary_text")
-            summary_id = result.get("summary_id")
-            session_start = result.get("session_start", 0)
-            session_end = result.get("session_end", 0)
-
-            if not summary_text or not summary_id:
-                continue
-
-            try:
-                facts = extraction_service.extract_from_summary(
-                    summary_text=summary_text,
-                    session_start=session_start,
-                    session_end=session_end,
-                    summary_id=summary_id,
-                    use_llm=use_llm,
-                )
-
-                summaries_processed += 1
-                total_facts += len(facts)
-
-                log.info(
-                    f"[Extraction] Summary {summary_id[:8]}: "
-                    f"{len(facts)} facts extracted from: {summary_text[:200]}"
-                )
-
-                if not facts:
-                    log.info(f"[Extraction] Summary {summary_id[:8]}: no facts found — skipping")
-                    self._mark_summary_extracted(bot_id, summary_id)
-                    continue
-
-                # Filter by importance
-                pre_filter = len(facts)
-                facts = [f for f in facts if f.importance >= min_importance]
-                if not facts:
-                    log.info(
-                        f"[Extraction] Summary {summary_id[:8]}: "
-                        f"all {pre_filter} facts below importance threshold ({min_importance})"
-                    )
-                    self._mark_summary_extracted(bot_id, summary_id)
-                    continue
-
-                # Deduplicate against existing memories
-                existing_memories = memory_client.list_memories(limit=100, min_importance=0.0)
-
-                if existing_memories:
-                    actions = extraction_service.determine_memory_actions(
-                        new_facts=facts,
-                        existing_memories=existing_memories,
-                    )
-                else:
-                    actions = [MemoryAction(action="ADD", fact=f) for f in facts]
-
-                for action in actions:
-                    fact = action.fact
-                    if not fact:
-                        continue
-
-                    try:
-                        tag_str = ",".join(fact.tags)
-                        if action.action == "ADD":
-                            log.info(
-                                f"[Extraction] ADD: '{fact.content}' "
-                                f"[{tag_str}] importance={fact.importance:.2f}"
-                            )
-                            memory_client.add_memory(
-                                content=fact.content,
-                                tags=fact.tags,
-                                importance=fact.importance,
-                                source_message_ids=fact.source_message_ids,
-                            )
-                            total_stored += 1
-                        elif action.action == "UPDATE" and action.target_memory_id:
-                            log.info(
-                                f"[Extraction] UPDATE ({action.target_memory_id[:8]}): "
-                                f"'{fact.content}' [{tag_str}] importance={fact.importance:.2f}"
-                            )
-                            memory_client.update_memory(
-                                memory_id=action.target_memory_id,
-                                content=fact.content,
-                                importance=fact.importance,
-                                tags=fact.tags,
-                            )
-                            total_stored += 1
-                        elif action.action == "DELETE" and action.target_memory_id:
-                            log.info(
-                                f"[Extraction] DELETE: {action.target_memory_id[:8]} "
-                                f"reason='{action.reason}'"
-                            )
-                            memory_client.delete_memory(memory_id=action.target_memory_id)
-
-                        # Profile attribute extraction
-                        if action.action in ("ADD", "UPDATE") and profile_enabled:
-                            from ..memory_server.extraction import extract_profile_attributes_from_fact
-                            extract_profile_attributes_from_fact(
-                                fact=fact,
-                                user_id=user_id,
-                                config=self.config,
-                            )
-                    except Exception as e:
-                        log.warning(f"Failed to process memory action {action.action}: {e}")
-
-                # Mark summary as extracted (crash recovery marker)
-                self._mark_summary_extracted(bot_id, summary_id)
-
-            except Exception as e:
-                log.error(f"Failed to extract from summary {summary_id[:8]}: {e}")
-                continue
-
-        log.info(
-            f"[Extraction] Done: {summaries_processed} summaries processed, "
-            f"{total_facts} facts extracted, {total_stored} stored"
-        )
-
-        return {
-            "summaries_processed": summaries_processed,
-            "facts_extracted": total_facts,
-            "facts_stored": total_stored,
-            "extraction_method": extraction_model or "heuristic",
-        }
-
-    def _mark_summary_extracted(self, bot_id: str, summary_id: str) -> None:
-        """Set ``extracted_at`` in a summary's metadata for crash recovery."""
-        try:
-            memory_client = self.get_memory_client(bot_id, "system")
-            if not memory_client:
-                return
-            backend = getattr(memory_client, "_backend", None) or getattr(memory_client, "backend", None)
-            if not backend or not hasattr(backend, "engine"):
-                return
-            from sqlalchemy import text as sa_text
-            table = f"{bot_id}_messages"
-            with backend.engine.connect() as conn:
-                conn.execute(
-                    sa_text(f"""
-                        UPDATE {table}
-                        SET summary_metadata = jsonb_set(
-                            COALESCE(summary_metadata::jsonb, '{{}}'::jsonb),
-                            '{{extracted_at}}',
-                            to_jsonb(:ts)
-                        )
-                        WHERE id = :sid AND role = 'summary'
-                    """),
-                    {"ts": datetime.now(timezone.utc).isoformat(), "sid": summary_id},
-                )
-                conn.commit()
-        except Exception as e:
-            log.debug(f"Failed to mark summary {summary_id[:8]} as extracted: {e}")
-
-    async def _process_history_summarization(self, task: Task) -> dict:
-        """Process proactive history summarization and extraction for a bot."""
-        from ..memory.summarization import (
-            HistorySummarizer,
-            format_session_for_summarization,
-        )
-        from ..models.message import Message
-        from ..prompt_registry import PromptResolver
-
-        bot_id = task.bot_id or self._default_bot
-        requested_model = (
-            task.payload.get("model")
-            or getattr(self.config, "MAINTENANCE_MODEL", None)
-            or getattr(self.config, "SUMMARIZATION_MODEL", None)
-        )
-        use_heuristic_fallback = bool(task.payload.get("use_heuristic_fallback", True))
-        max_tokens_per_chunk = int(task.payload.get("max_tokens_per_chunk", 4000))
-
-        # Use isolated background client — never interferes with main chat model
-        client, model_alias = self._get_background_client(model_override=requested_model)
-
-        prompt_resolver = PromptResolver(self.config)
-
-        def summarize_with_loaded_client(session) -> str | None:
-            if not client:
-                return None
-
-            conversation_text = format_session_for_summarization(session)
-            prompt = prompt_resolver.render(
-                key="history.summarization.single",
-                variables={"messages": conversation_text},
-            )
-
-            # Conservative budget to reduce context overflows on smaller models.
-            if len(prompt) // 4 > 6000:
-                return None
-
-            try:
-                messages = [
-                    Message(
-                        role="system",
-                        content="You are a helpful assistant that summarizes conversations concisely.",
-                    ),
-                    Message(role="user", content=prompt),
-                ]
-                response = client.query(
-                    messages=messages,
-                    max_tokens=320,
-                    temperature=0.3,
-                    plaintext_output=True,
-                    stream=False,
-                )
-                if not response:
-                    return None
-
-                lower = response.lower()
-                error_indicators = ("error:", "exception occurred", "exceed context window", "tokens exceed")
-                if any(ind in lower for ind in error_indicators):
-                    return None
-                return response.strip()
-            except Exception as e:
-                log.error(f"History summarization LLM call failed: {e}")
-                return None
-
-        # Create a settings resolver for per-bot summarization tunables
-        from ..runtime_settings import RuntimeSettingsResolver
-        from ..bots import BotManager
-        bot_manager = BotManager(self.config)
-        bot_obj = bot_manager.get_bot(bot_id) or bot_manager.get_default_bot()
-        resolver = RuntimeSettingsResolver(config=self.config, bot=bot_obj, bot_id=bot_id)
-
-        summarizer = HistorySummarizer(
-            self.config,
-            bot_id=bot_id,
-            summarize_fn=summarize_with_loaded_client,
-            settings_getter=resolver.resolve,
-        )
-
-        loop = asyncio.get_event_loop()
-        result = await loop.run_in_executor(
-            self._llm_executor,
-            lambda: summarizer.summarize_eligible_sessions(
-                use_heuristic_fallback=use_heuristic_fallback,
-                max_tokens_per_chunk=max_tokens_per_chunk,
-            ),
-        )
-
-        if model_alias:
-            result["model"] = model_alias
-        result["used_heuristic_fallback"] = use_heuristic_fallback
-
-        # Phase 2: Extract memories from newly created summaries
-        extraction_results = await self._extract_from_summaries(
-            result.get("results", []),
-            bot_id=bot_id,
-            user_id=task.user_id or "system",
-        )
-        result["extraction"] = extraction_results
-
-        # Summary writes change context composition; invalidate cached history views
-        # for this bot so next request reloads from DB immediately.
-        for (_model, cached_bot_id, _user), llm_bawt in self._llm_bawt_cache.items():
-            if cached_bot_id != bot_id:
-                continue
-            invalidate = getattr(llm_bawt, "invalidate_history_cache", None)
-            if callable(invalidate):
-                invalidate()
-
-        return result
+    # ---- Task queue ----
 
     def submit_task(self, task: Task) -> str:
         """Submit a task to the processing queue."""
         from dataclasses import dataclass, field as dataclass_field
-        
+
         @dataclass(order=True)
         class PrioritizedTask:
             priority: int
             timestamp: float
             task: Task = dataclass_field(compare=False)
-        
+
         prioritized = PrioritizedTask(
             priority=-task.priority,
             timestamp=time.time(),
@@ -2479,27 +400,27 @@ class BackgroundService:
         self._submitted_tasks[task.task_id] = task
         self._result_events[task.task_id] = asyncio.Event()
         return task.task_id
-    
+
     def get_result(self, task_id: str) -> TaskResult | None:
         """Get the result of a completed task."""
         return self._results.get(task_id)
-    
+
     async def wait_for_result(self, task_id: str, timeout: float = 30.0) -> TaskResult | None:
         """Wait for a task result with timeout."""
         event = self._result_events.get(task_id)
         if not event:
             return self._results.get(task_id)
-        
+
         try:
             await asyncio.wait_for(event.wait(), timeout=timeout)
             return self._results.get(task_id)
         except asyncio.TimeoutError:
             return None
-    
+
     async def worker_loop(self):
         """Main worker loop that processes tasks from the queue."""
         log.debug("Background task worker started")
-        
+
         while not self._shutdown_event.is_set():
             try:
                 try:
@@ -2509,17 +430,17 @@ class BackgroundService:
                     )
                 except Exception:
                     continue
-                
+
                 task = prioritized.task
                 log.task_submitted(task.task_id, task.task_type.value, task.bot_id, task.payload)
-                
+
                 result = await self.process_task(task)
                 self._results[task.task_id] = result
                 self.tasks_processed += 1
-                
+
                 if task.task_id in self._result_events:
                     self._result_events[task.task_id].set()
-                
+
                 # Cleanup old results
                 if len(self._results) > 1000:
                     oldest = sorted(self._results.keys())[:100]
@@ -2527,25 +448,25 @@ class BackgroundService:
                         self._results.pop(key, None)
                         self._submitted_tasks.pop(key, None)
                         self._result_events.pop(key, None)
-                
+
             except Exception as e:
                 log.exception(f"Worker loop error: {e}")
                 await asyncio.sleep(1)
-        
+
         log.debug("Background task worker stopped")
-    
+
     def start_worker(self):
         """Start the background worker task."""
         if self._worker_task is None or self._worker_task.done():
             self._worker_task = asyncio.create_task(self.worker_loop())
-    
+
     async def shutdown(self):
         """Gracefully shutdown the service."""
         log.shutdown()
         self._shutdown_event.set()
         if self._worker_task:
             self._worker_task.cancel()
-    
+
     def get_status(self) -> ServiceStatusResponse:
         """Get service status."""
         from ..core.status import _collect_mcp_info, _collect_memory_info

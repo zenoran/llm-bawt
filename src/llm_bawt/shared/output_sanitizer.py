@@ -16,6 +16,7 @@ _TOOL_USES_JSON_RE = re.compile(
 )
 
 
+
 def strip_tool_protocol_leakage(text: str) -> str:
     """Remove leaked tool-routing protocol fragments from model text.
 

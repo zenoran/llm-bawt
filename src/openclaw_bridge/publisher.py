@@ -27,9 +27,13 @@ EVENTS_STREAM_PREFIX = "openclaw:events:"
 HISTORY_STREAM = "openclaw:history"
 COMMANDS_STREAM = "openclaw:commands"
 RUN_STREAM_PREFIX = "openclaw:run:"
+# Unified event stream for all bots (native + OpenClaw): events:{bot_id}:{user_id}
+UNIFIED_EVENTS_PREFIX = "events:"
 
 # Keep last 10k events per session stream (auto-trimmed)
 STREAM_MAXLEN = 10_000
+# Unified event streams are smaller — tool events + lifecycle only
+UNIFIED_STREAM_MAXLEN = 5_000
 # Run response streams are shorter-lived
 RUN_STREAM_MAXLEN = 5_000
 
@@ -133,6 +137,35 @@ class RedisPublisher:
             self._redis.expire(stream_key, 300)
         except Exception:
             logger.exception("Failed to publish run done to %s", stream_key)
+
+    def publish_unified_event(
+        self,
+        bot_id: str,
+        user_id: str,
+        event_data: dict[str, Any],
+    ) -> str | None:
+        """Publish an event to the unified event stream for a bot+user pair.
+
+        Used for tool execution events, OpenClaw agent events, and any
+        application-level events that the UI consumes via consumer groups.
+        """
+        if not self._connected:
+            return None
+        stream_key = f"{UNIFIED_EVENTS_PREFIX}{bot_id}:{user_id}"
+        try:
+            fields = {"payload": json.dumps(event_data, ensure_ascii=False, default=str)}
+            stream_id = self._redis.xadd(
+                stream_key,
+                fields,
+                maxlen=UNIFIED_STREAM_MAXLEN,
+                approximate=True,
+            )
+            get_metrics().incr("unified.redis_publish", stream="events")
+            return stream_id
+        except Exception:
+            logger.exception("Failed to publish unified event to %s", stream_key)
+            get_metrics().incr("unified.redis_publish_errors", stream="events")
+            return None
 
     def close(self) -> None:
         try:

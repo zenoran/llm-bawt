@@ -3,7 +3,7 @@ import asyncio
 import json
 import logging
 
-from .events import OpenClawEventKind
+from .events import OpenClawEvent, OpenClawEventKind
 from .ingest import EventIngestPipeline
 from .metrics import get_metrics
 from .publisher import COMMANDS_STREAM, RedisPublisher
@@ -145,6 +145,10 @@ class SessionBridge:
         )
 
         try:
+            bot_id = self._resolve_bot_id(session_key)
+            # Resolve user_id — for now use "default" as bridge doesn't track per-user
+            unified_user_id = "default"
+
             async for raw_event in self._ws_client.send_and_stream(
                 session_key, message, timeout=600,
             ):
@@ -153,6 +157,28 @@ class SessionBridge:
                 if event is not None:
                     self._publisher.publish_run_event(request_id, event)
 
+                    # Also publish tool events to unified stream
+                    if bot_id and event.kind in (
+                        OpenClawEventKind.TOOL_START,
+                        OpenClawEventKind.TOOL_END,
+                    ):
+                        import time
+                        tool_event = {
+                            "_type": "tool_event",
+                            "event": "tool_start" if event.kind == OpenClawEventKind.TOOL_START else "tool_end",
+                            "tool_name": event.tool_name or "unknown",
+                            "run_id": event.run_id,
+                            "session_key": session_key,
+                            "ts": time.time(),
+                        }
+                        if event.kind == OpenClawEventKind.TOOL_START:
+                            tool_event["arguments"] = event.tool_arguments or {}
+                        else:
+                            tool_event["result"] = str(event.tool_result or "")[:2000]
+                        self._publisher.publish_unified_event(
+                            bot_id, unified_user_id, tool_event,
+                        )
+
             self._publisher.publish_run_done(request_id)
             get_metrics().incr("openclaw.commands_completed")
             logger.info("Send command completed: request_id=%s", request_id)
@@ -160,7 +186,6 @@ class SessionBridge:
         except Exception as e:
             logger.exception("Send command failed: request_id=%s", request_id)
             # Publish error event
-            from .events import OpenClawEvent, OpenClawEventKind
             err_event = OpenClawEvent(
                 event_id=f"err_{request_id}",
                 session_key=session_key,

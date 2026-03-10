@@ -14,7 +14,14 @@ from typing import AsyncIterator
 import redis.asyncio as aioredis
 
 from .events import OpenClawEvent
-from .publisher import COMMANDS_STREAM, EVENTS_STREAM_PREFIX, HISTORY_STREAM, RUN_STREAM_PREFIX
+from .publisher import (
+    COMMANDS_STREAM,
+    EVENTS_STREAM_PREFIX,
+    HISTORY_STREAM,
+    RUN_STREAM_PREFIX,
+    UNIFIED_EVENTS_PREFIX,
+    UNIFIED_STREAM_MAXLEN,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -209,6 +216,263 @@ class RedisSubscriber:
                         continue
 
                     yield event
+
+    # ---- Unified event stream (consumer groups) ----
+
+    async def ensure_consumer_group(
+        self,
+        stream_key: str,
+        group_name: str,
+    ) -> None:
+        """Idempotent XGROUP CREATE — creates the group starting from latest."""
+        try:
+            await self._redis.xgroup_create(
+                stream_key, group_name, id="$", mkstream=True,
+            )
+        except Exception:
+            pass  # group already exists
+
+    async def subscribe_group(
+        self,
+        bot_id: str | list[str],
+        user_id: str,
+        consumer_id: str,
+        *,
+        timeout_s: float = 300,
+    ) -> AsyncIterator[dict]:
+        """Subscribe to unified event stream(s) via consumer groups.
+
+        ``bot_id`` may be a single bot or a list of bots.  When multiple bots
+        are given, events from ALL of them are interleaved and yielded.
+
+        Two-phase read per stream:
+        1. Replay pending (unacked) messages from previous connection
+        2. Read new messages as they arrive
+
+        Yields raw event dicts (not OpenClawEvent — unified stream carries
+        tool events, OpenClaw events, and application events).
+        """
+        bot_ids = [bot_id] if isinstance(bot_id, str) else list(bot_id)
+        group_name = f"ui:{consumer_id}"
+        consumer_name = "reader"
+
+        # Build {stream_key: bot_id} mapping
+        stream_keys: dict[str, str] = {}
+        for bid in bot_ids:
+            sk = f"{UNIFIED_EVENTS_PREFIX}{bid}:{user_id}"
+            stream_keys[sk] = bid
+
+        # Ensure consumer groups exist for all streams
+        for sk in stream_keys:
+            await self.ensure_consumer_group(sk, group_name)
+
+        # Phase 1: replay pending (unacked) messages from all streams
+        try:
+            results = await self._redis.xreadgroup(
+                group_name, consumer_name,
+                {sk: "0" for sk in stream_keys},
+                count=500,
+            )
+            if results:
+                # Interleave messages from all streams by Redis message ID
+                # (timestamp-based) so events aren't serialized per-stream.
+                all_msgs: list[tuple[str, str, dict]] = []
+                for stream_name, messages in results:
+                    for msg_id, fields in messages:
+                        all_msgs.append((msg_id, stream_name, fields))
+                all_msgs.sort(key=lambda x: x[0])
+
+                for msg_id, stream_name, fields in all_msgs:
+                    payload_str = fields.get("payload", "{}")
+                    try:
+                        data = json.loads(payload_str)
+                    except Exception:
+                        data = {"raw": payload_str}
+                    data["_replayed"] = True
+                    yield data
+                    await self._redis.xack(stream_name, group_name, msg_id)
+        except Exception:
+            logger.exception("Error replaying pending messages for %s", list(stream_keys))
+
+        # Phase 2: live events from all streams
+        deadline = asyncio.get_event_loop().time() + timeout_s
+        while True:
+            remaining = deadline - asyncio.get_event_loop().time()
+            if remaining <= 0:
+                return
+
+            block_ms = min(int(remaining * 1000), 2000)
+            try:
+                results = await self._redis.xreadgroup(
+                    group_name, consumer_name,
+                    {sk: ">" for sk in stream_keys},
+                    count=100,
+                    block=block_ms,
+                )
+            except Exception:
+                logger.exception("Redis XREADGROUP error on %s", list(stream_keys))
+                await asyncio.sleep(1)
+                continue
+
+            if not results:
+                continue
+
+            # Interleave messages from all streams by Redis message ID
+            # so concurrent bot events are delivered in chronological order
+            # instead of all-of-stream-A then all-of-stream-B.
+            all_msgs: list[tuple[str, str, dict]] = []
+            for stream_name, messages in results:
+                for msg_id, fields in messages:
+                    all_msgs.append((msg_id, stream_name, fields))
+            all_msgs.sort(key=lambda x: x[0])
+
+            for msg_id, stream_name, fields in all_msgs:
+                deadline = asyncio.get_event_loop().time() + timeout_s
+                payload_str = fields.get("payload", "{}")
+                try:
+                    data = json.loads(payload_str)
+                except Exception:
+                    data = {"raw": payload_str}
+                yield data
+                await self._redis.xack(stream_name, group_name, msg_id)
+
+    async def publish_tool_event(
+        self,
+        bot_id: str,
+        user_id: str,
+        event: dict,
+    ) -> str | None:
+        """Publish a tool_start/tool_end event to the unified stream."""
+        stream_key = f"{UNIFIED_EVENTS_PREFIX}{bot_id}:{user_id}"
+        try:
+            fields = {"payload": json.dumps(event, ensure_ascii=False, default=str)}
+            stream_id = await self._redis.xadd(
+                stream_key,
+                fields,
+                maxlen=UNIFIED_STREAM_MAXLEN,
+                approximate=True,
+            )
+            return stream_id
+        except Exception:
+            logger.exception("Failed to publish tool event to %s", stream_key)
+            return None
+
+    async def cleanup_stale_groups(
+        self,
+        stream_key: str,
+        *,
+        max_idle_ms: int = 1_800_000,
+    ) -> int:
+        """Destroy consumer groups that have been idle too long.
+
+        Only targets ui:* groups (not system groups like llm-bawt).
+        Returns the number of groups destroyed.
+        """
+        destroyed = 0
+        try:
+            groups = await self._redis.xinfo_groups(stream_key)
+        except Exception:
+            return 0
+
+        for group in groups:
+            name = group.get("name", "")
+            if not name.startswith("ui:"):
+                continue
+            # Check last delivered ID and pending count
+            # If no pending and idle > threshold, destroy
+            consumers = group.get("consumers", 0)
+            pending = group.get("pending", 0)
+            if pending > 0:
+                continue  # has unacked messages, keep alive
+            # Check consumer idle time
+            try:
+                consumer_info = await self._redis.xinfo_consumers(stream_key, name)
+                all_idle = all(
+                    (c.get("idle", 0) > max_idle_ms) for c in consumer_info
+                ) if consumer_info else (consumers == 0)
+            except Exception:
+                all_idle = consumers == 0
+
+            if all_idle:
+                try:
+                    await self._redis.xgroup_destroy(stream_key, name)
+                    destroyed += 1
+                    logger.debug("Destroyed stale consumer group %s on %s", name, stream_key)
+                except Exception:
+                    logger.debug("Failed to destroy group %s on %s", name, stream_key)
+
+        return destroyed
+
+    async def drain_tool_events(
+        self,
+        callback,
+        *,
+        consumer_group: str = "persist:tools",
+        consumer_name: str = "writer",
+    ) -> None:
+        """Continuously drain tool events from ALL unified streams.
+
+        Uses a dedicated consumer group so persistence is independent
+        of UI consumers. Calls ``callback(event_data)`` for each tool event.
+        """
+        while True:
+            try:
+                # Discover active unified streams
+                streams = await self.list_unified_streams()
+                if not streams:
+                    await asyncio.sleep(5)
+                    continue
+
+                # Ensure consumer group on each stream
+                for stream_key in streams:
+                    await self.ensure_consumer_group(stream_key, consumer_group)
+
+                # Build read dict
+                read_streams = {sk: ">" for sk in streams}
+
+                results = await self._redis.xreadgroup(
+                    consumer_group,
+                    consumer_name,
+                    read_streams,
+                    count=50,
+                    block=5000,
+                )
+                if not results:
+                    continue
+
+                for stream_key, messages in results:
+                    for msg_id, fields in messages:
+                        payload_str = fields.get("payload", "{}")
+                        try:
+                            data = json.loads(payload_str)
+                        except Exception:
+                            await self._redis.xack(stream_key, consumer_group, msg_id)
+                            continue
+
+                        # Only process tool events
+                        if data.get("_type") == "tool_event":
+                            try:
+                                callback(data)
+                            except Exception:
+                                logger.exception("Tool event persistence callback failed")
+                        await self._redis.xack(stream_key, consumer_group, msg_id)
+
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception("Tool event drain error")
+                await asyncio.sleep(2)
+
+    async def list_unified_streams(self) -> list[str]:
+        """List all active unified event stream keys."""
+        try:
+            keys = []
+            async for key in self._redis.scan_iter(match=f"{UNIFIED_EVENTS_PREFIX}*", count=100):
+                keys.append(key)
+            return keys
+        except Exception:
+            logger.exception("Failed to list unified streams")
+            return []
 
     async def drain_history(
         self,

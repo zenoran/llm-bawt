@@ -122,7 +122,6 @@ class OpenClawBackend(AgentBackend):
         termination_reason = "completed"
 
         import queue as queue_mod
-        from openclaw_bridge.events import OpenClawEventKind
 
         result_queue: queue_mod.Queue[str | dict | None] = queue_mod.Queue()
         error_holder: list[Exception] = []
@@ -136,6 +135,7 @@ class OpenClawBackend(AgentBackend):
 
             def _run_in_thread():
                 async def _worker():
+                    from openclaw_bridge.events import OpenClawEventKind
                     # Create a fresh async Redis client for this thread's loop
                     redis_url = subscriber._redis.connection_pool.connection_kwargs.get(
                         "url", None

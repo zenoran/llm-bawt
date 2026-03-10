@@ -1300,7 +1300,16 @@ def main():
             console.print(f"[bold red]Invalid token count:[/bold red] '{token_value}' is not an integer.")
             sys.exit(1)
 
-        success = set_model_context_window(alias, context_window, config_obj)
+        service_mode = _is_service_mode(args, config_obj)
+        svc_client = None
+        if service_mode:
+            svc_client = get_service_client(config_obj)
+            if not svc_client or not svc_client.is_available():
+                console.print("[bold red]Service not available.[/bold red] Start with: [yellow]llm-service[/yellow]")
+                console.print("[dim]Or use --local to write directly to models.yaml.[/dim]")
+                sys.exit(1)
+
+        success = set_model_context_window(alias, context_window, config_obj, service_client=svc_client)
         sys.exit(0 if success else 1)
     # Handle listing config values
     elif getattr(args, 'list_config', False):
@@ -1473,9 +1482,17 @@ def main():
         sys.exit(0)
         return
     if args.delete_model:
+        service_mode = _is_service_mode(args, config_obj)
+        svc_client = None
+        if service_mode:
+            svc_client = get_service_client(config_obj)
+            if not svc_client or not svc_client.is_available():
+                console.print("[bold red]Service not available.[/bold red] Start with: [yellow]llm-service[/yellow]")
+                console.print("[dim]Or use --local to write directly to models.yaml.[/dim]")
+                sys.exit(1)
         success = False
         try:
-            success = delete_model(args.delete_model, config_obj)
+            success = delete_model(args.delete_model, config_obj, service_client=svc_client)
             if success:
                 console.print(f"[green]Model alias '{args.delete_model}' deleted successfully.[/green]")
         except Exception as e:
@@ -1486,14 +1503,18 @@ def main():
         sys.exit(0 if success else 1)
         return
     if args.add_model:
+        service_mode = _is_service_mode(args, config_obj)
+        svc_client = None
+        if service_mode:
+            svc_client = get_service_client(config_obj)
+            if not svc_client or not svc_client.is_available():
+                console.print("[bold red]Service not available.[/bold red] Start with: [yellow]llm-service[/yellow]")
+                console.print("[dim]Or use --local to write directly to models.yaml.[/dim]")
+                sys.exit(1)
         success = False
         try:
-            if args.add_model == 'openai':
-                success = update_models_interactive(config_obj, provider='openai')
-            elif args.add_model == 'grok':
-                success = update_models_interactive(config_obj, provider='grok')
-            elif args.add_model == 'ollama':
-                success = update_models_interactive(config_obj, provider='ollama')
+            if args.add_model in ('openai', 'grok', 'ollama'):
+                success = update_models_interactive(config_obj, provider=args.add_model, service_client=svc_client)
             elif args.add_model == 'gguf':
                 # Prompt for HuggingFace repo ID
                 repo_id = Prompt.ask("Enter HuggingFace repo ID (e.g., TheBloke/Llama-2-7B-GGUF)")
