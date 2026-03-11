@@ -55,6 +55,8 @@ class TurnLog(SQLModel, table=True):
     tool_calls_json: str | None = Field(default=None, sa_column=Column(Text, nullable=True))
     error_text: str | None = Field(default=None, sa_column=Column(Text, nullable=True))
     trigger_message_id: str | None = Field(default=None, index=True)
+    agent_session_key: str | None = Field(default=None, max_length=128, index=True)
+    agent_request_id: str | None = Field(default=None, max_length=128, index=True)
 
 
 class ToolCallRecord(SQLModel, table=True):
@@ -122,6 +124,22 @@ class TurnLogStore:
                 conn.execute(sa_text(
                     "CREATE INDEX IF NOT EXISTS ix_turn_logs_trigger_message_id"
                     " ON turn_logs (trigger_message_id)"
+                ))
+                conn.execute(sa_text(
+                    "ALTER TABLE turn_logs ADD COLUMN IF NOT EXISTS"
+                    " agent_session_key VARCHAR(128)"
+                ))
+                conn.execute(sa_text(
+                    "CREATE INDEX IF NOT EXISTS ix_turn_logs_agent_session_key"
+                    " ON turn_logs (agent_session_key)"
+                ))
+                conn.execute(sa_text(
+                    "ALTER TABLE turn_logs ADD COLUMN IF NOT EXISTS"
+                    " agent_request_id VARCHAR(128)"
+                ))
+                conn.execute(sa_text(
+                    "CREATE INDEX IF NOT EXISTS ix_turn_logs_agent_request_id"
+                    " ON turn_logs (agent_request_id)"
                 ))
                 conn.commit()
             except Exception:
@@ -194,6 +212,8 @@ class TurnLogStore:
         tool_calls: list[dict] | None,
         error_text: str | None = None,
         trigger_message_id: str | None = None,
+        agent_session_key: str | None = None,
+        agent_request_id: str | None = None,
     ) -> None:
         """Persist one turn entry and enforce short TTL cleanup."""
         if self.engine is None:
@@ -221,6 +241,8 @@ class TurnLogStore:
             tool_calls_json=json.dumps(tool_calls or [], ensure_ascii=False, default=str),
             error_text=error_text,
             trigger_message_id=trigger_message_id,
+            agent_session_key=agent_session_key,
+            agent_request_id=agent_request_id,
         )
 
         with Session(self.engine) as session:
@@ -237,6 +259,8 @@ class TurnLogStore:
         request_payload: dict | None = None,
         tool_calls: list[dict] | None = None,
         error_text: str | None = None,
+        agent_session_key: str | None = None,
+        agent_request_id: str | None = None,
     ) -> None:
         """Update an existing turn log row with new data."""
         if self.engine is None:
@@ -264,6 +288,10 @@ class TurnLogStore:
                 row.tool_calls_json = json.dumps(tool_calls, ensure_ascii=False, default=str)
             if error_text is not None:
                 row.error_text = error_text
+            if agent_session_key is not None:
+                row.agent_session_key = agent_session_key
+            if agent_request_id is not None:
+                row.agent_request_id = agent_request_id
             session.add(row)
             session.commit()
 

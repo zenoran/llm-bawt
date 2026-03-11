@@ -76,6 +76,8 @@ async def list_turn_logs(
                 response_preview_truncated=bool(response_text and len(response_text) > len(response_preview or "")),
                 tool_call_count=len(tool_calls) if isinstance(tool_calls, list) else 0,
                 error_text=row.error_text,
+                agent_session_key=getattr(row, "agent_session_key", None),
+                agent_request_id=getattr(row, "agent_request_id", None),
             )
         )
 
@@ -130,6 +132,8 @@ async def get_turn_log(turn_id: str):
         response=row.response_text,
         tool_calls=parsed_tools,
         error_text=row.error_text,
+        agent_session_key=getattr(row, "agent_session_key", None),
+        agent_request_id=getattr(row, "agent_request_id", None),
     )
 
 

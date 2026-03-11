@@ -91,6 +91,7 @@ class OpenClawBackend(AgentBackend):
     def __init__(self) -> None:
         self._config = Config()
         self._last_stream_result: OpenClawResult | None = None
+        self._active_request_id: str | None = None
 
     def _resolve_session_key(self, config: dict) -> str:
         explicit = str(config.get("session_key") or "").strip()
@@ -114,6 +115,7 @@ class OpenClawBackend(AgentBackend):
         session_key = self._resolve_session_key(config)
         timeout = int(config.get("timeout_seconds", 600))
         request_id = f"req_{uuid.uuid4().hex}"
+        self._active_request_id = request_id
 
         request_started = time.time()
         first_delta_at: float | None = None

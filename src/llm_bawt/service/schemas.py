@@ -347,6 +347,8 @@ class TurnLogListItem(BaseModel):
     response_preview_truncated: bool = False
     tool_call_count: int = 0
     error_text: str | None = None
+    agent_session_key: str | None = None
+    agent_request_id: str | None = None
 
 
 class TurnLogListResponse(BaseModel):
@@ -373,6 +375,8 @@ class TurnLogDetail(BaseModel):
     response: str | None = None
     tool_calls: list[dict[str, Any]] = Field(default_factory=list)
     error_text: str | None = None
+    agent_session_key: str | None = None
+    agent_request_id: str | None = None
 
 
 class ToolCallEvent(BaseModel):

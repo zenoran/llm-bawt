@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import threading
 import time
 import uuid
 from typing import Any, AsyncIterator
@@ -419,9 +420,24 @@ class ChatStreamingMixin:
         # Capture the event loop before entering the thread
         loop = asyncio.get_running_loop()
 
-        # Start new generation (cancels previous for the SAME bot only)
-        cancel_event, done_event = await self._start_generation(bot_id)
+        # Start new generation.
+        # For agent_backend (OpenClaw) bots the gateway queues messages as
+        # separate runs, so we must NOT cancel a previous generation — each
+        # request streams independently.  For native models we cancel the
+        # previous generation so only the latest request runs.
+        is_agent_backend = llm_bawt.client.model_definition.get("type") == "agent_backend"
+        if is_agent_backend:
+            cancel_event = threading.Event()
+            done_event = threading.Event()
+        else:
+            cancel_event, done_event = await self._start_generation(bot_id)
         turn_log_id = f"turn-{uuid.uuid4().hex}"
+
+        # Resolve agent session_key from bot config for OpenClaw turns
+        oc_session_key: str | None = None
+        if is_agent_backend:
+            bc = getattr(llm_bawt.bot, "agent_backend_config", None) or {}
+            oc_session_key = bc.get("session_key")
 
         # Persist turn log immediately so the user's prompt is recorded
         # even if the backend times out or errors before responding.
@@ -438,6 +454,7 @@ class ChatStreamingMixin:
             user_prompt=user_prompt,
             prepared_messages=[],
             response_text="",
+            agent_session_key=oc_session_key,
         )
 
         # Capture Redis subscriber for direct publish from the background
@@ -531,22 +548,29 @@ class ChatStreamingMixin:
                         def native_stream_with_tool_loop():
                             """Stream with native tool support, handling tool calls inline."""
                             import json as _json
-                            from ..tools.parser import ToolCall
+                            from ..tools.parser import ToolCall, strip_tool_result_tags
 
                             current_msgs = list(messages)
                             max_iterations = 3 if llm_bawt._ha_mode else 5
                             has_executed_tools = False
 
                             for iteration in range(max_iterations):
-                                # After first tool execution, don't pass tools_schema
-                                # so the model generates a text response instead of
-                                # looping on more tool calls.
-                                current_tools = None if has_executed_tools else tools_schema
+                                # After first tool execution, keep tools_schema
+                                # but force tool_choice="none" so the model
+                                # generates a text response.  Dropping the schema
+                                # entirely causes some providers (xAI) to ignore
+                                # function_call_output items and return nothing.
+                                if has_executed_tools:
+                                    current_tools = tools_schema
+                                    current_tool_choice = "none"
+                                else:
+                                    current_tools = tools_schema
+                                    current_tool_choice = "auto"
 
                                 for item in llm_bawt.client.stream_with_tools(
                                     current_msgs,
                                     tools_schema=current_tools,
-                                    tool_choice="auto",
+                                    tool_choice=current_tool_choice,
                                     **gen_kwargs,
                                 ):
                                     if isinstance(item, str):
@@ -602,7 +626,11 @@ class ChatStreamingMixin:
                                             })
 
                                             tool_call_obj = ToolCall(name=name, arguments=args, raw_text="")
-                                            result = executor.execute(tool_call_obj)
+                                            raw_result = executor.execute(tool_call_obj)
+                                            # Strip <tool_result> XML tags — native tool path
+                                            # sends results as structured function_call_output
+                                            # items, not inline text.
+                                            result = strip_tool_result_tags(raw_result)
                                             tool_results.append({
                                                 "tool_call_id": tc.get("id", ""),
                                                 "content": result,
@@ -719,8 +747,20 @@ class ChatStreamingMixin:
                 _oc_call_index = [0]
                 _oc_last_call_id = [""]
 
+                _oc_request_id_captured = [False]
+
                 def _intercept_tool_events(inner):
                     for item in inner:
+                        # Capture agent_request_id on first yielded item
+                        if is_agent_backend and not _oc_request_id_captured[0]:
+                            _oc_request_id_captured[0] = True
+                            backend = getattr(llm_bawt.client, "_backend", None)
+                            oc_req_id = getattr(backend, "_active_request_id", None)
+                            if oc_req_id:
+                                self._update_turn_log(
+                                    turn_id=turn_log_id,
+                                    agent_request_id=oc_req_id,
+                                )
                         if isinstance(item, dict):
                             evt = item.get("event")
                             if evt == "tool_call":
@@ -800,10 +840,13 @@ class ChatStreamingMixin:
                 else:
                     # No response received — mark as timeout so turn doesn't
                     # stay stuck at status='streaming' forever.
+                    # Persist any tool_call_details that were collected before
+                    # the follow-up model call failed.
                     self._update_turn_log(
                         turn_id=turn_log_id,
                         status="timeout",
                         latency_ms=elapsed_ms,
+                        tool_calls=tool_call_details_holder or None,
                     )
 
                 # Notify SSE consumers that the turn is done so they
@@ -1024,5 +1067,8 @@ class ChatStreamingMixin:
                 }
                 yield (f"data: {json.dumps(data)}\n\n")
         finally:
-            # Mark generation as complete
-            self._end_generation(cancel_event, done_event, bot_id)
+            # Mark generation as complete (only if we used _start_generation)
+            if is_agent_backend:
+                done_event.set()
+            else:
+                self._end_generation(cancel_event, done_event, bot_id)

@@ -26,7 +26,7 @@ import pytest
 LLM = "llm"
 LLM_MEMORY = "llm-memory"
 BOT = "nova"
-MODEL = "grok-3-mini"          # valid alias available in all environments
+MODEL = "grok-4-fast"          # valid alias available in all environments
 SAFE_BOT = "spark"             # no persistent memory — safe to wipe in tests
 
 # ---------------------------------------------------------------------------
@@ -136,7 +136,7 @@ class TestLLMInfo:
 
     def test_list_models(self):
         o = assert_ok(run(f"{LLM} --list-models"), "--list-models")
-        assert "grok-3-mini" in o
+        assert "grok-4-fast" in o
         assert no_traceback(o)
 
     def test_list_models_shows_service_section(self, service_up):

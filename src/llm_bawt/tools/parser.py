@@ -279,6 +279,34 @@ def has_tool_call(text: str) -> bool:
     return False
 
 
+import re as _re
+
+_TOOL_RESULT_RE = _re.compile(
+    r'^<tool_result\b[^>]*>\n?(.*?)\n?</tool_result>',
+    _re.DOTALL,
+)
+
+
+def strip_tool_result_tags(text: str) -> str:
+    """Remove ``<tool_result>`` wrapper tags, returning the inner content.
+
+    Used by the native tool-calling path where results go into structured
+    ``function_call_output`` items and the XML wrapper is wasted tokens.
+    Also strips the ``[IMPORTANT: ...]`` error suffix injected for text-based formats.
+    """
+    m = _TOOL_RESULT_RE.match(text)
+    if m:
+        inner = m.group(1)
+        # Drop the text-format error instruction suffix if present
+        remainder = text[m.end():]
+        if remainder.startswith("\n"):
+            remainder = remainder[1:]
+        if remainder.startswith("[IMPORTANT:"):
+            remainder = ""
+        return (inner + remainder).strip()
+    return text
+
+
 def format_tool_result(tool_name: str, result: Any, error: str | None = None) -> str:
     """Format a tool result for injection back into the conversation.
     

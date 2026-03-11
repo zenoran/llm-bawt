@@ -153,6 +153,8 @@ class TurnLifecycleMixin:
         response_text: str,
         tool_calls: list[dict] | None = None,
         error_text: str | None = None,
+        agent_session_key: str | None = None,
+        agent_request_id: str | None = None,
     ) -> None:
         """Persist one turn record to short-lived DB storage."""
         try:
@@ -174,6 +176,8 @@ class TurnLifecycleMixin:
                 response_text=response_text,
                 tool_calls=_normalize_tool_call_details(tool_calls),
                 error_text=error_text,
+                agent_session_key=agent_session_key,
+                agent_request_id=agent_request_id,
             )
         except Exception as e:
             log.debug("Failed to persist turn log: %s", e)
@@ -188,6 +192,8 @@ class TurnLifecycleMixin:
         prepared_messages: list | None = None,
         tool_calls: list[dict] | None = None,
         error_text: str | None = None,
+        agent_session_key: str | None = None,
+        agent_request_id: str | None = None,
     ) -> None:
         """Update an existing turn log row with new data."""
         try:
@@ -204,6 +210,8 @@ class TurnLifecycleMixin:
                 request_payload=request_payload,
                 tool_calls=_normalize_tool_call_details(tool_calls) if tool_calls is not None else None,
                 error_text=error_text,
+                agent_session_key=agent_session_key,
+                agent_request_id=agent_request_id,
             )
         except Exception as e:
             log.debug("Failed to update turn log: %s", e)

@@ -15,6 +15,11 @@ _TOOL_USES_JSON_RE = re.compile(
     re.DOTALL | re.IGNORECASE,
 )
 
+_TOOL_CALL_XML_RE = re.compile(
+    r"<tool_call>.*?</tool_call>",
+    re.DOTALL,
+)
+
 
 
 def strip_tool_protocol_leakage(text: str) -> str:
@@ -24,11 +29,13 @@ def strip_tool_protocol_leakage(text: str) -> str:
     - ``to=functions.some_tool commentary ...``
     - ``to=multi_tool_use.parallel ...``
     - Raw JSON payloads like ``{"tool_uses": [...]}``
+    - ``<tool_call>...</tool_call>`` XML blocks
     """
     if not text:
         return ""
 
-    cleaned = _TOOL_USES_JSON_RE.sub("", text)
+    cleaned = _TOOL_CALL_XML_RE.sub("", text)
+    cleaned = _TOOL_USES_JSON_RE.sub("", cleaned)
     cleaned = _ROUTING_FRAGMENT_RE.sub(" ", cleaned)
 
     # Remove control characters often left behind after malformed protocol output.
