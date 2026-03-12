@@ -2,7 +2,6 @@
 
 from .botchat import router as botchat_router
 from .chat import router as chat_router
-from .evolution import router as evolution_router
 from .health import router as health_router
 from .history import router as history_router
 from .jobs import router as jobs_router
@@ -35,7 +34,6 @@ all_routers = [
     settings_router,
     profiles_router,
     llm_router,
-    evolution_router,
 ]
 
 __all__ = ["all_routers"]

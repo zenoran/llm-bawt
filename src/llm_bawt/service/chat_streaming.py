@@ -567,6 +567,12 @@ class ChatStreamingMixin:
                                     current_tools = tools_schema
                                     current_tool_choice = "auto"
 
+                                # Buffer text until we know if tool_calls follow.
+                                # If tools fire, discard the buffer (stale pre-tool
+                                # text like "I don't have live access…").
+                                # If no tools, flush the buffer to the client.
+                                text_buffer: list[str] = []
+
                                 for item in llm_bawt.client.stream_with_tools(
                                     current_msgs,
                                     tools_schema=current_tools,
@@ -574,15 +580,19 @@ class ChatStreamingMixin:
                                     **gen_kwargs,
                                 ):
                                     if isinstance(item, str):
-                                        # Content chunk - yield to user immediately
-                                        yield item
+                                        # Buffer — don't yield until we know no tools follow
+                                        text_buffer.append(item)
                                     elif isinstance(item, dict) and "tool_calls" in item:
-                                        # Tool calls at end of stream
                                         tool_calls = item["tool_calls"]
                                         content = item.get("content", "")
 
                                         if not tool_calls:
-                                            return  # No tools, done
+                                            # Empty tool_calls list — treat as pure text response
+                                            yield from text_buffer
+                                            return
+
+                                        # Real tool calls follow — discard stale pre-tool text
+                                        text_buffer.clear()
 
                                         # Emit tool calls as OpenAI delta.tool_calls, then execute
                                         tool_results = []
@@ -674,10 +684,12 @@ class ChatStreamingMixin:
                                             for tc, tr in zip(tool_calls, tool_results)
                                         )
 
-                                        # Build continuation messages
+                                        # Build continuation messages — empty content so the
+                                        # follow-up pass is grounded on tool results, not the
+                                        # discarded pre-tool fallback text.
                                         assistant_msg = Msg(
                                             role="assistant",
-                                            content=content,
+                                            content="",
                                             tool_calls=[
                                                 {"id": tc.get("id"), "name": tc["function"]["name"], "arguments": tc["function"]["arguments"]}
                                                 for tc in tool_calls
@@ -692,10 +704,21 @@ class ChatStreamingMixin:
                                                 tool_call_id=tr["tool_call_id"],
                                             ))
 
+                                        # Ground the synthesis pass on tool results.
+                                        # Without this, stale history summaries (e.g.
+                                        # "assistant lacks live access") can override
+                                        # the actual retrieved data in the model's response.
+                                        current_msgs.append(Msg(
+                                            role="system",
+                                            content="You have retrieved live data using tools above. Answer the user's question directly and confidently using those results. Do not claim to lack live access.",
+                                        ))
+
                                         # Continue to next iteration (will stream the follow-up)
                                         break
                                 else:
                                     # Stream finished without tool calls dict (pure content response)
+                                    # Flush any buffered text that wasn't already consumed
+                                    yield from text_buffer
                                     return
 
                             log.warning(f"Tool loop: max iterations ({max_iterations}) reached")
