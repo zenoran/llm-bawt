@@ -492,10 +492,15 @@ class BackgroundTasksMixin:
         result["used_heuristic_fallback"] = use_heuristic_fallback
 
         # Phase 2: Extract memories from newly created summaries
+        # For profile attribute extraction, use the actual human user — not the
+        # technical "system" user_id that history summarization jobs carry.
+        profile_user_id = task.user_id
+        if not profile_user_id or profile_user_id == "system":
+            profile_user_id = getattr(self.config, "DEFAULT_USER", None) or "system"
         extraction_results = await self._extract_from_summaries(
             result.get("results", []),
             bot_id=bot_id,
-            user_id=task.user_id or "system",
+            user_id=profile_user_id,
         )
         result["extraction"] = extraction_results
 

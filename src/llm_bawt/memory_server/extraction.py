@@ -40,12 +40,14 @@ ALLOWED_PROFILE_KEYS = {
     "hobbies", "interests", "favorite_genres", "gaming_preferences",
 }
 
-# Blocked patterns - content that should NEVER be profile attributes
+# Blocked patterns - content that should NEVER be profile attributes.
+# IMPORTANT: Patterns must be targeted enough to avoid blocking identity facts.
+# e.g. "has 2 dogs" and "has chronic back issues" must NOT be blocked.
 BLOCKED_PROFILE_PATTERNS = [
-    r"(?:has|have|uses|built|developing|working on|project|system|app|tool)",  # Projects/tools
-    r"(?:available|search|internet|integration)",  # Technical capabilities
-    r"(?:often|sometimes|usually|currently|now|today)",  # Temporal/conditional
-    r"(?:open to|willing to|might|maybe)",  # Conditional/vague
+    # Projects, tools, technical systems (but NOT "has/have" alone — too broad)
+    r"(?:(?:built|developing|working on|maintains)\s+(?:a |an |the )?(?:[\w-]+\s+){0,3}(?:project|system|app|tool|framework|platform|server|bot|integration|chatbot|assistant))",
+    r"(?:uses\s+(?:a |an |the )?(?:tool|app|system|framework|platform|service|stack|server))",
+    r"(?:(?:search|internet)\s+(?:integration|provider|capability))",  # Technical capabilities
 ]
 
 
