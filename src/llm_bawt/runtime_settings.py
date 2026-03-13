@@ -67,6 +67,7 @@ class BotProfile(SQLModel, table=True):
     uses_home_assistant: bool = Field(default=False)
     default_model: str | None = Field(default=None, sa_column=Column(String(255), nullable=True))
     color: str | None = Field(default=None, sa_column=Column(String(64), nullable=True))
+    avatar: str | None = Field(default=None, sa_column=Column(String(512), nullable=True))
     default_voice: str | None = Field(default=None, sa_column=Column(String(128), nullable=True))
     nextcloud_config: dict[str, Any] | None = Field(default=None, sa_column=Column(JSONB, nullable=True))
     agent_backend: str | None = Field(default=None, sa_column=Column(String(128), nullable=True))
@@ -126,6 +127,7 @@ class BotProfileStore:
             "ALTER TABLE bot_profiles ADD COLUMN IF NOT EXISTS tts_mode BOOLEAN DEFAULT FALSE",
             "ALTER TABLE bot_profiles ADD COLUMN IF NOT EXISTS include_summaries BOOLEAN DEFAULT TRUE",
             "ALTER TABLE bot_profiles ADD COLUMN IF NOT EXISTS default_voice VARCHAR(128)",
+            "ALTER TABLE bot_profiles ADD COLUMN IF NOT EXISTS avatar VARCHAR(512)",
         ]
         try:
             with self.engine.connect() as conn:
@@ -183,6 +185,7 @@ class BotProfileStore:
                     uses_home_assistant=bool(payload.get("uses_home_assistant", False)),
                     default_model=payload.get("default_model"),
                     color=payload.get("color"),
+                    avatar=payload.get("avatar"),
                     default_voice=payload.get("default_voice"),
                     nextcloud_config=payload.get("nextcloud_config"),
                     agent_backend=payload.get("agent_backend"),
@@ -205,6 +208,8 @@ class BotProfileStore:
                     row.default_model = payload["default_model"]
                 if payload.get("color") is not None:
                     row.color = payload["color"]
+                if "avatar" in payload:
+                    row.avatar = payload.get("avatar")
                 if payload.get("default_voice") is not None:
                     row.default_voice = payload["default_voice"]
                 if payload.get("nextcloud_config") is not None:

@@ -16,7 +16,9 @@ SERVICE_VERSION = "0.1.0"
 class ChatMessage(BaseModel):
     """OpenAI-compatible chat message."""
     role: Literal["system", "user", "assistant", "function", "tool"]
-    content: str | list[dict] | None = None
+    # list[dict] before str so Pydantic v2 left-to-right union matching
+    # tries the list variant first for OpenAI content-array payloads.
+    content: list[dict] | str | None = None
     name: str | None = None
 
 
@@ -185,6 +187,7 @@ class BotInfo(BaseModel):
     uses_home_assistant: bool = False
     default_model: str | None = None
     color: str | None = None
+    avatar: str | None = None
     agent_backend: str | None = None
     agent_backend_config: dict[str, Any] = Field(default_factory=dict)
     settings: dict[str, Any] = Field(default_factory=dict)
@@ -212,6 +215,7 @@ class BotProfileResponse(BaseModel):
     uses_home_assistant: bool = False
     default_model: str | None = None
     color: str | None = None
+    avatar: str | None = None
     default_voice: str | None = None
     nextcloud_config: dict[str, Any] | None = None
     agent_backend: str | None = None
@@ -235,6 +239,7 @@ class BotProfileUpsertRequest(BaseModel):
     uses_home_assistant: bool = False
     default_model: str | None = None
     color: str | None = None
+    avatar: str | None = None
     default_voice: str | None = None
     nextcloud_config: dict[str, Any] | None = None
     agent_backend: str | None = None

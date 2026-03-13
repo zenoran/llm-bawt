@@ -18,6 +18,10 @@ class Message:
         tool_calls: list[dict[str, Any]] | None = None,
         tool_call_id: str | None = None,
         db_id: str | None = None,
+        # OpenAI content-array parts (images etc.) attached to this message.
+        # When set, to_api_format() emits a multimodal content array instead
+        # of a plain string.
+        content_parts: list[dict[str, Any]] | None = None,
     ):
         self.role = role
         self.content = content if content is not None else ""
@@ -25,6 +29,7 @@ class Message:
         self.tool_calls = tool_calls  # For assistant messages that make tool calls
         self.tool_call_id = tool_call_id  # For tool result messages
         self.db_id = db_id  # Primary key from the database (when loaded from PostgreSQL)
+        self.content_parts = content_parts  # Extra multimodal parts (image_url, etc.)
 
     @classmethod
     def from_dict(cls, data: dict) -> 'Message':
@@ -64,8 +69,14 @@ class Message:
         if api_role == "summary":
             api_role = "system"
 
-        # Ensure content is never None (OpenAI API rejects null content)
-        d = {"role": api_role, "content": self.content or ""}
+        # Build content: use multimodal content array when extra parts exist
+        if self.content_parts:
+            content_array: list[dict[str, Any]] = [{"type": "text", "text": self.content or ""}]
+            content_array.extend(self.content_parts)
+            d = {"role": api_role, "content": content_array}
+        else:
+            # Ensure content is never None (OpenAI API rejects null content)
+            d = {"role": api_role, "content": self.content or ""}
         
         # Include tool_calls for assistant messages that made tool calls
         if self.tool_calls:

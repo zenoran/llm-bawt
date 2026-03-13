@@ -282,13 +282,21 @@ class ServiceLLMBawt(BaseLLMBawt):
     # Service API methods - used by api.py for request handling
     # =========================================================================
     
-    def prepare_messages_for_query(self, prompt: str) -> list[Message]:
+    def prepare_messages_for_query(
+        self,
+        prompt: str,
+        user_attachments: list[dict] | None = None,
+    ) -> list[Message]:
         """Prepare messages for query including history and memory context.
 
         Called by the service API before sending to the LLM.
 
         Args:
             prompt: User's prompt
+            user_attachments: Optional list of image attachments in the format
+                [{"mimeType": "image/png", "content": "<base64>"}].
+                When present, the last user message will use a multimodal
+                content array so the LLM can see the images.
 
         Returns:
             List of messages ready for LLM query
@@ -301,7 +309,25 @@ class ServiceLLMBawt(BaseLLMBawt):
         self.history_manager.add_message("user", prompt)
 
         # Build context with system prompt, memory, and history
-        return self._build_context_messages(prompt)
+        messages = self._build_context_messages(prompt)
+
+        # If there are image attachments, convert the last user message to
+        # a multimodal content array so the LLM receives the images.
+        if user_attachments:
+            for i in range(len(messages) - 1, -1, -1):
+                if messages[i].role == "user":
+                    image_parts = []
+                    for att in user_attachments:
+                        mime = att.get("mimeType", "image/png")
+                        b64 = att.get("content", "")
+                        image_parts.append({
+                            "type": "image_url",
+                            "image_url": {"url": f"data:{mime};base64,{b64}"},
+                        })
+                    messages[i].content_parts = image_parts
+                    break
+
+        return messages
     
     def execute_llm_query(
         self,

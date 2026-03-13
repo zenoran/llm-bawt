@@ -507,7 +507,10 @@ class ChatStreamingMixin:
 
                 # Use llm_bawt.prepare_messages_for_query to get full context
                 # (history from DB + memory + system prompt)
-                messages = llm_bawt.prepare_messages_for_query(user_prompt)
+                messages = llm_bawt.prepare_messages_for_query(
+                    user_prompt,
+                    user_attachments=user_attachments or None,
+                )
 
                 # Backfill prepared messages into the turn log
                 self._update_turn_log(

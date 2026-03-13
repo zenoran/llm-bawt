@@ -104,7 +104,29 @@ class ResponsesClient(LLMClient):
                 continue
 
             # user (or any other role)
-            input_items.append({"role": role, "content": api.get("content", "")})
+            content = api.get("content", "")
+            # Convert Chat Completions multimodal content array to Responses API
+            # input format:  text → input_text, image_url → input_image
+            if isinstance(content, list):
+                converted_parts: list[dict] = []
+                for part in content:
+                    if not isinstance(part, dict):
+                        continue
+                    ptype = part.get("type", "")
+                    if ptype == "text":
+                        converted_parts.append({"type": "input_text", "text": part.get("text", "")})
+                    elif ptype == "image_url":
+                        img_obj = part.get("image_url") or {}
+                        url = img_obj.get("url", "") if isinstance(img_obj, dict) else str(img_obj)
+                        detail = img_obj.get("detail", "high") if isinstance(img_obj, dict) else "high"
+                        if url:
+                            converted_parts.append({"type": "input_image", "image_url": url, "detail": detail})
+                if converted_parts:
+                    input_items.append({"role": role, "content": converted_parts})
+                else:
+                    input_items.append({"role": role, "content": ""})
+            else:
+                input_items.append({"role": role, "content": content})
 
         instructions = "\n\n".join(instructions_parts) if instructions_parts else (system_message or None)
 

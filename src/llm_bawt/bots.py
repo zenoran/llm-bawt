@@ -54,6 +54,7 @@ class Bot:
     uses_search: bool = False  # Whether this bot can search the web
     uses_home_assistant: bool = False  # Whether this bot can control Home Assistant via MCP
     color: str | None = None  # Optional Rich color name for CLI panel styling
+    avatar: str | None = None  # Optional emoji or image URL for bot avatar
     nextcloud: dict | None = None  # Nextcloud integration config (bot_id, secret, etc.)
     agent_backend: str | None = None  # External agent backend slug (e.g. "openclaw")
     agent_backend_config: dict[str, Any] = field(default_factory=dict)  # Backend-specific config
@@ -196,6 +197,8 @@ def _load_db_bot_overrides() -> dict[str, dict[str, Any]]:
                 entry["default_model"] = row.default_model
             if row.color is not None:
                 entry["color"] = row.color
+            if row.avatar is not None:
+                entry["avatar"] = row.avatar
             if row.default_voice is not None:
                 entry["default_voice"] = row.default_voice
             if row.nextcloud_config is not None:
@@ -278,6 +281,7 @@ def _build_bots_from_data(
             uses_search=bot_data.get("uses_search", False),
             uses_home_assistant=bot_data.get("uses_home_assistant", False),
             color=bot_color,
+            avatar=bot_data.get("avatar"),
             nextcloud=bot_data.get("nextcloud"),
             agent_backend=bot_data.get("agent_backend"),
             agent_backend_config=bot_data.get("agent_backend_config") or {},
