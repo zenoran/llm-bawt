@@ -100,20 +100,27 @@ class RedisSubscriber:
         session_key: str,
         message: str,
         request_id: str,
+        attachments: list | None = None,
     ) -> None:
         """Publish a chat.send command to the bridge's command stream."""
+        fields: dict = {
+            "action": "chat.send",
+            "session_key": session_key,
+            "message": message,
+            "request_id": request_id,
+        }
+        if attachments:
+            fields["attachments"] = json.dumps(attachments, ensure_ascii=False)
         await self._redis.xadd(
             COMMANDS_STREAM,
-            {
-                "action": "chat.send",
-                "session_key": session_key,
-                "message": message,
-                "request_id": request_id,
-            },
+            fields,
             maxlen=1000,
             approximate=True,
         )
-        logger.debug("Sent command: request_id=%s session=%s", request_id, session_key)
+        logger.debug(
+            "Sent command: request_id=%s session=%s attachments=%d",
+            request_id, session_key, len(attachments or []),
+        )
 
     async def send_rpc(
         self,

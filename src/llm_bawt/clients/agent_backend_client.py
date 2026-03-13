@@ -108,15 +108,24 @@ class AgentBackendClient(LLMClient):
         prompt = ""
         for msg in reversed(messages):
             if msg.role == "user":
-                prompt = msg.content or ""
+                content = msg.content
+                if isinstance(content, list):
+                    prompt = "".join(
+                        p.get("text", "") for p in content
+                        if isinstance(p, dict) and p.get("type") == "text"
+                    )
+                else:
+                    prompt = content or ""
                 break
 
         if not prompt:
             logger.warning("AgentBackendClient.stream_raw() called with no user message")
             return
 
+        attachments: list = kwargs.pop("attachments", None) or []
+
         if hasattr(self._backend, "stream_raw"):
-            for item in self._backend.stream_raw(prompt, self._bot_config):
+            for item in self._backend.stream_raw(prompt, self._bot_config, attachments=attachments):
                 yield item
             if hasattr(self._backend, "get_last_stream_result"):
                 self.last_result = self._backend.get_last_stream_result()

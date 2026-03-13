@@ -99,7 +99,7 @@ class OpenClawBackend(AgentBackend):
             return explicit
         return os.getenv("OPENCLAW_SESSION_KEY", "main")
 
-    def stream_raw(self, prompt: str, config: dict) -> Iterator[str | dict[str, Any]]:
+    def stream_raw(self, prompt: str, config: dict, attachments: list | None = None) -> Iterator[str | dict[str, Any]]:
         """Stream OpenClaw response deltas and tool events via the bridge.
 
         Sends a command to the bridge via Redis, then subscribes to the
@@ -158,6 +158,7 @@ class OpenClawBackend(AgentBackend):
                             session_key=session_key,
                             message=prompt,
                             request_id=request_id,
+                            attachments=attachments or [],
                         )
                         logger.info(
                             "OpenClaw request via bridge: session=%s request_id=%s",

@@ -133,6 +133,14 @@ class SessionBridge:
         request_id = fields.get("request_id", "")
         session_key = fields.get("session_key", "main")
         message = fields.get("message", "")
+        attachments_raw = fields.get("attachments", "")
+        attachments: list = []
+        if attachments_raw:
+            try:
+                import json as _json
+                attachments = _json.loads(attachments_raw)
+            except Exception:
+                logger.warning("Failed to parse attachments for request_id=%s", request_id)
 
         if not request_id or not message:
             logger.warning("Invalid send command: missing request_id or message")
@@ -150,7 +158,7 @@ class SessionBridge:
             unified_user_id = "default"
 
             async for raw_event in self._ws_client.send_and_stream(
-                session_key, message, timeout=600,
+                session_key, message, attachments=attachments, timeout=600,
             ):
                 # Parse through ingest pipeline to get structured event
                 event = self._ingest.parse(raw_event, session_key)

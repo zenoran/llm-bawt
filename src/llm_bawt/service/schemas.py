@@ -16,7 +16,7 @@ SERVICE_VERSION = "0.1.0"
 class ChatMessage(BaseModel):
     """OpenAI-compatible chat message."""
     role: Literal["system", "user", "assistant", "function", "tool"]
-    content: str | None = None
+    content: str | list[dict] | None = None
     name: str | None = None
 
 

@@ -384,9 +384,26 @@ class ChatStreamingMixin:
 
         # Get the user's prompt (last user message)
         user_prompt = ""
+        user_attachments: list[dict] = []
         for m in reversed(request.messages):
             if m.role == "user":
-                user_prompt = m.content or ""
+                if isinstance(m.content, list):
+                    for part in m.content:
+                        if not isinstance(part, dict):
+                            continue
+                        if part.get("type") == "text":
+                            user_prompt += part.get("text", "")
+                        elif part.get("type") == "image_url":
+                            url = (part.get("image_url") or {}).get("url", "")
+                            if url.startswith("data:"):
+                                try:
+                                    header, data = url.split(",", 1)
+                                    mime = header.split(":")[1].split(";")[0]
+                                    user_attachments.append({"mimeType": mime, "content": data})
+                                except Exception:
+                                    pass
+                else:
+                    user_prompt = m.content or ""
                 break
 
         if not user_prompt:
@@ -761,8 +778,11 @@ class ChatStreamingMixin:
                     # Pass adapter stop sequences even without tools
                     adapter = getattr(llm_bawt, 'adapter', None)
                     adapter_stops = adapter.get_stop_sequences() if adapter else []
+                    extra_kwargs = {}
+                    if is_agent_backend and user_attachments:
+                        extra_kwargs["attachments"] = user_attachments
                     stream_iter = llm_bawt.client.stream_raw(
-                        messages, stop=adapter_stops or None, **gen_kwargs
+                        messages, stop=adapter_stops or None, **gen_kwargs, **extra_kwargs
                     )
 
                 # Wrap stream to publish tool events directly to Redis

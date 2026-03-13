@@ -220,12 +220,14 @@ class OpenClawWsClient:
             self._pending_requests.pop(req_id, None)
             raise RuntimeError(f"Timed out waiting for gateway response: {method}")
 
-    async def send_user_message(self, session_key: str, text: str) -> str:
-        params = {
+    async def send_user_message(self, session_key: str, text: str, attachments: list | None = None) -> str:
+        params: dict = {
             "sessionKey": session_key,
             "message": text,
             "idempotencyKey": f"idem_{uuid.uuid4().hex}",
         }
+        if attachments:
+            params["attachments"] = attachments
 
         res = await self._request("chat.send", params)
         payload = res.get("payload") or {}
@@ -237,6 +239,7 @@ class OpenClawWsClient:
         session_key: str,
         text: str,
         *,
+        attachments: list | None = None,
         timeout: float = 600,
     ) -> AsyncIterator[dict]:
         """Send a message via chat.send and yield raw WS events for the resulting run.
@@ -245,7 +248,7 @@ class OpenClawWsClient:
         or until timeout. The caller gets the full stream of agent events
         (assistant deltas, tool events, lifecycle, errors) for this run.
         """
-        run_id = await self.send_user_message(session_key, text)
+        run_id = await self.send_user_message(session_key, text, attachments=attachments)
         queue: asyncio.Queue[dict | None] = asyncio.Queue(maxsize=2000)
         self._run_queues[run_id] = queue
 
