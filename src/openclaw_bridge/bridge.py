@@ -156,13 +156,56 @@ class SessionBridge:
             bot_id = self._resolve_bot_id(session_key)
             # Resolve user_id — for now use "default" as bridge doesn't track per-user
             unified_user_id = "default"
+            saw_assistant_text = False
 
             async for raw_event in self._ws_client.send_and_stream(
-                session_key, message, attachments=attachments, timeout=600,
+                session_key, message, attachments=attachments,
             ):
                 # Parse through ingest pipeline to get structured event
                 event = self._ingest.parse(raw_event, session_key)
                 if event is not None:
+                    if event.kind == OpenClawEventKind.ASSISTANT_DELTA and event.text:
+                        saw_assistant_text = True
+
+                    if event.kind == OpenClawEventKind.ASSISTANT_DONE and not saw_assistant_text:
+                        final_text = event.text or await self._fetch_latest_assistant_text(
+                            session_key
+                        )
+                        if final_text:
+                            saw_assistant_text = True
+                            if not event.text:
+                                event = OpenClawEvent(
+                                    event_id=event.event_id,
+                                    session_key=event.session_key,
+                                    run_id=event.run_id,
+                                    kind=event.kind,
+                                    origin=event.origin,
+                                    text=final_text,
+                                    tool_name=event.tool_name,
+                                    tool_arguments=event.tool_arguments,
+                                    tool_result=event.tool_result,
+                                    model=event.model,
+                                    seq=event.seq,
+                                    timestamp=event.timestamp,
+                                    raw=event.raw,
+                                    db_id=event.db_id,
+                                )
+                            self._publisher.publish_run_event(
+                                request_id,
+                                OpenClawEvent(
+                                    event_id=f"{event.event_id}:final-text",
+                                    session_key=event.session_key,
+                                    run_id=event.run_id,
+                                    kind=OpenClawEventKind.ASSISTANT_DELTA,
+                                    origin=event.origin,
+                                    text=final_text,
+                                    model=event.model,
+                                    seq=event.seq,
+                                    timestamp=event.timestamp,
+                                    raw=event.raw,
+                                ),
+                            )
+
                     self._publisher.publish_run_event(request_id, event)
 
                     # Also publish tool events to unified stream
@@ -206,6 +249,43 @@ class SessionBridge:
             self._publisher.publish_run_done(request_id)
         finally:
             await async_redis.xack(COMMANDS_STREAM, "bridge", msg_id)
+
+    async def _fetch_latest_assistant_text(self, session_key: str) -> str:
+        """Resolve the final assistant message from chat history as a fallback."""
+        try:
+            messages = await self._ws_client.get_chat_history(session_key, limit=8)
+        except Exception:
+            logger.debug("Could not fetch chat history for session=%s", session_key)
+            return ""
+
+        for message in reversed(messages):
+            if not isinstance(message, dict):
+                continue
+            if message.get("role") != "assistant":
+                continue
+            text = self._extract_message_text(message)
+            if text:
+                return text
+        return ""
+
+    @staticmethod
+    def _extract_message_text(message: dict) -> str:
+        """Extract plain assistant text from chat.history message payloads."""
+        content = message.get("content")
+        if isinstance(content, str):
+            return content
+        if isinstance(content, list):
+            parts: list[str] = []
+            for item in content:
+                if not isinstance(item, dict):
+                    continue
+                text = item.get("text")
+                if isinstance(text, str) and text:
+                    parts.append(text)
+            return "".join(parts)
+
+        text = message.get("text")
+        return text if isinstance(text, str) else ""
 
     async def _handle_rpc_command(
         self, fields: dict, msg_id: str, async_redis

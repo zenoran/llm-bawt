@@ -272,6 +272,270 @@ class BotProfileStore:
         return seeded
 
 
+def purge_bot_data(config: Config, slug: str) -> dict[str, Any]:
+    """Delete all data for a bot from the database.
+
+    Drops the per-bot dynamic tables (_messages, _memories, _forgotten_messages)
+    and removes rows from every shared table that references this bot.
+    Does NOT delete the bot_profiles row — call BotProfileStore.delete() for that.
+    """
+    import re as _re
+
+    from sqlalchemy import create_engine as _create_engine, text as _text
+
+    normalized = (slug or "").strip().lower()
+    if not normalized:
+        return {"error": "Invalid slug"}
+    if not has_database_credentials(config):
+        return {"error": "No database credentials configured"}
+
+    sanitized = _re.sub(r"[^a-z0-9_]", "", normalized) or "default"
+
+    host = getattr(config, "POSTGRES_HOST", "localhost")
+    port = int(getattr(config, "POSTGRES_PORT", 5432))
+    user = getattr(config, "POSTGRES_USER", "llm_bawt")
+    password = getattr(config, "POSTGRES_PASSWORD", "")
+    database = getattr(config, "POSTGRES_DATABASE", "llm_bawt")
+    from urllib.parse import quote_plus as _qp
+    url = f"postgresql+psycopg2://{user}:{_qp(password)}@{host}:{port}/{database}"
+    engine = _create_engine(url, echo=False)
+
+    result: dict[str, Any] = {"slug": normalized, "dropped_tables": [], "deleted_rows": {}}
+
+    try:
+        with engine.connect() as conn:
+            # 1. Drop per-bot dynamic tables
+            for suffix in ("_messages", "_memories", "_forgotten_messages"):
+                tbl = f"{sanitized}{suffix}"
+                conn.execute(_text(f'DROP TABLE IF EXISTS "{tbl}" CASCADE'))
+                result["dropped_tables"].append(tbl)
+
+            # 2. runtime_settings
+            r = conn.execute(
+                _text("DELETE FROM runtime_settings WHERE scope_type='bot' AND scope_id=:s"),
+                {"s": normalized},
+            )
+            result["deleted_rows"]["runtime_settings"] = r.rowcount
+
+            # 3. entity_profile_attributes (before entity_profiles — no FK cascade)
+            r = conn.execute(
+                _text("DELETE FROM entity_profile_attributes WHERE entity_type::text='bot' AND entity_id=:s"),
+                {"s": normalized},
+            )
+            result["deleted_rows"]["entity_profile_attributes"] = r.rowcount
+
+            # 4. entity_profiles
+            r = conn.execute(
+                _text("DELETE FROM entity_profiles WHERE entity_type::text='bot' AND entity_id=:s"),
+                {"s": normalized},
+            )
+            result["deleted_rows"]["entity_profiles"] = r.rowcount
+
+            # 5. job_runs (FK → scheduled_jobs.id, must go first)
+            r = conn.execute(
+                _text("DELETE FROM job_runs WHERE job_id IN (SELECT id FROM scheduled_jobs WHERE bot_id=:s)"),
+                {"s": normalized},
+            )
+            result["deleted_rows"]["job_runs"] = r.rowcount
+
+            # 6. scheduled_jobs
+            r = conn.execute(
+                _text("DELETE FROM scheduled_jobs WHERE bot_id=:s"),
+                {"s": normalized},
+            )
+            result["deleted_rows"]["scheduled_jobs"] = r.rowcount
+
+            # 7. prompt_template_versions
+            r = conn.execute(
+                _text("DELETE FROM prompt_template_versions WHERE scope_type='bot' AND scope_id=:s"),
+                {"s": normalized},
+            )
+            result["deleted_rows"]["prompt_template_versions"] = r.rowcount
+
+            # 8. prompt_templates
+            r = conn.execute(
+                _text("DELETE FROM prompt_templates WHERE scope_type='bot' AND scope_id=:s"),
+                {"s": normalized},
+            )
+            result["deleted_rows"]["prompt_templates"] = r.rowcount
+
+            # 9. tool_call_records
+            r = conn.execute(
+                _text("DELETE FROM tool_call_records WHERE bot_id=:s"),
+                {"s": normalized},
+            )
+            result["deleted_rows"]["tool_call_records"] = r.rowcount
+
+            # 10. turn_logs
+            r = conn.execute(
+                _text("DELETE FROM turn_logs WHERE bot_id=:s"),
+                {"s": normalized},
+            )
+            result["deleted_rows"]["turn_logs"] = r.rowcount
+
+            conn.commit()
+    finally:
+        engine.dispose()
+
+    # Evict cached SQLAlchemy table objects so they aren't revived on next access
+    try:
+        from .memory.postgresql import (
+            _memory_table_cache,
+            _message_table_cache,
+            _forgotten_table_cache,
+        )
+        for cache in (_memory_table_cache, _message_table_cache, _forgotten_table_cache):
+            for key in list(cache.keys()):
+                if key.startswith(f"{sanitized}_"):
+                    del cache[key]
+    except Exception:
+        pass
+
+    return result
+
+
+def cleanup_orphaned_bot_data(config: Config, dry_run: bool = False) -> dict[str, Any]:
+    """Find and remove data for bot IDs that no longer exist in bot_profiles.
+
+    Checks dynamic tables (*_messages, *_memories, *_forgotten_messages) and rows
+    in shared tables.  Pass dry_run=True to report without deleting anything.
+    """
+    import re as _re
+
+    from sqlalchemy import create_engine as _create_engine, text as _text
+
+    if not has_database_credentials(config):
+        return {"error": "No database credentials configured"}
+
+    host = getattr(config, "POSTGRES_HOST", "localhost")
+    port = int(getattr(config, "POSTGRES_PORT", 5432))
+    user = getattr(config, "POSTGRES_USER", "llm_bawt")
+    password = getattr(config, "POSTGRES_PASSWORD", "")
+    database = getattr(config, "POSTGRES_DATABASE", "llm_bawt")
+    from urllib.parse import quote_plus as _qp
+    url = f"postgresql+psycopg2://{user}:{_qp(password)}@{host}:{port}/{database}"
+    engine = _create_engine(url, echo=False)
+
+    result: dict[str, Any] = {
+        "dry_run": dry_run,
+        "orphaned_bot_ids": [],
+        "dropped_tables": [],
+        "deleted_rows": {},
+    }
+
+    try:
+        with engine.connect() as conn:
+            # Known slugs from bot_profiles
+            rows = conn.execute(_text("SELECT slug FROM bot_profiles")).fetchall()
+            known_slugs: set[str] = {r[0].strip().lower() for r in rows}
+            known_sanitized: set[str] = {
+                _re.sub(r"[^a-z0-9_]", "", s) or "default" for s in known_slugs
+            }
+
+            # --- Dynamic tables ---
+            table_rows = conn.execute(
+                _text(
+                    "SELECT table_name FROM information_schema.tables "
+                    "WHERE table_schema='public' AND table_type='BASE TABLE'"
+                )
+            ).fetchall()
+            all_tables = {r[0] for r in table_rows}
+
+            dynamic_suffixes = ("_messages", "_memories", "_forgotten_messages")
+            for tbl in sorted(all_tables):
+                for suffix in dynamic_suffixes:
+                    if tbl.endswith(suffix):
+                        prefix = tbl[: -len(suffix)]
+                        if prefix not in known_sanitized:
+                            result["dropped_tables"].append(tbl)
+                            if not dry_run:
+                                conn.execute(_text(f'DROP TABLE IF EXISTS "{tbl}" CASCADE'))
+                        break
+
+            # --- Shared tables ---
+            # bot_id column tables
+            bot_id_tables = [
+                "runtime_settings",  # scope_type='bot', scope_id
+                "turn_logs",
+                "tool_call_records",
+                "scheduled_jobs",
+                "entity_profiles",
+                "entity_profile_attributes",
+                "prompt_templates",
+                "prompt_template_versions",
+            ]
+
+            def _find_orphan_ids(table: str, id_col: str, extra_where: str = "") -> set[str]:
+                where = f"WHERE {extra_where}" if extra_where else ""
+                q = f"SELECT DISTINCT {id_col} FROM {table} {where}"
+                rs = conn.execute(_text(q)).fetchall()
+                return {r[0] for r in rs if r[0] and r[0].strip().lower() not in known_slugs}
+
+            def _delete_orphans(table: str, id_col: str, ids: set[str], extra_where: str = "") -> int:
+                if not ids:
+                    return 0
+                and_clause = f" AND {extra_where}" if extra_where else ""
+                total = 0
+                for oid in ids:
+                    r = conn.execute(
+                        _text(f"DELETE FROM {table} WHERE {id_col}=:v{and_clause}"),
+                        {"v": oid},
+                    )
+                    total += r.rowcount
+                return total
+
+            # Accumulate all orphaned bot IDs across shared tables
+            orphan_ids: set[str] = set()
+
+            for table, id_col, extra in [
+                ("turn_logs", "bot_id", ""),
+                ("tool_call_records", "bot_id", ""),
+                ("scheduled_jobs", "bot_id", "bot_id != '*'"),
+                ("entity_profiles", "entity_id", "entity_type::text = 'bot'"),
+                ("entity_profile_attributes", "entity_id", "entity_type::text = 'bot'"),
+                ("prompt_templates", "scope_id", "scope_type='bot'"),
+                ("prompt_template_versions", "scope_id", "scope_type='bot'"),
+            ]:
+                if table not in all_tables:
+                    continue
+                orphans = _find_orphan_ids(table, id_col, extra)
+                orphan_ids |= orphans
+                if not dry_run and orphans:
+                    # job_runs must be cleaned before scheduled_jobs
+                    if table == "scheduled_jobs":
+                        for oid in orphans:
+                            conn.execute(
+                                _text("DELETE FROM job_runs WHERE job_id IN (SELECT id FROM scheduled_jobs WHERE bot_id=:v)"),
+                                {"v": oid},
+                            )
+                    cnt = _delete_orphans(table, id_col, orphans, extra)
+                    result["deleted_rows"][table] = result["deleted_rows"].get(table, 0) + cnt
+                elif dry_run:
+                    result["deleted_rows"][table] = len(orphans)
+
+            # runtime_settings uses scope_id not bot_id
+            if "runtime_settings" in all_tables:
+                rs = conn.execute(
+                    _text("SELECT DISTINCT scope_id FROM runtime_settings WHERE scope_type='bot'")
+                ).fetchall()
+                orphan_rs = {r[0] for r in rs if r[0] and r[0].strip().lower() not in known_slugs}
+                orphan_ids |= orphan_rs
+                if not dry_run and orphan_rs:
+                    cnt = _delete_orphans("runtime_settings", "scope_id", orphan_rs, "scope_type='bot'")
+                    result["deleted_rows"]["runtime_settings"] = cnt
+                elif dry_run:
+                    result["deleted_rows"]["runtime_settings"] = len(orphan_rs)
+
+            result["orphaned_bot_ids"] = sorted(orphan_ids)
+
+            if not dry_run:
+                conn.commit()
+    finally:
+        engine.dispose()
+
+    return result
+
+
 class RuntimeSettingsStore:
     """Low-level DB access for runtime settings."""
 

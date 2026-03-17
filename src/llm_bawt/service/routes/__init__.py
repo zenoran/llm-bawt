@@ -16,6 +16,7 @@ from .settings import router as settings_router
 from .tasks import router as tasks_router
 from .ha_weather import router as ha_weather_router
 from .turn_logs import router as turn_logs_router
+from .avatar_animations import router as avatar_animations_router
 
 all_routers = [
     health_router,
@@ -34,6 +35,7 @@ all_routers = [
     settings_router,
     profiles_router,
     llm_router,
+    avatar_animations_router,
 ]
 
 __all__ = ["all_routers"]

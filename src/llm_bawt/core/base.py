@@ -597,7 +597,7 @@ class BaseLLMBawt(ABC):
 
         Priority: HA native MCP > legacy custom MCP server.
         """
-        if not self.bot.uses_tools:
+        if not self.bot.uses_tools or not self.bot.uses_home_assistant:
             return
 
         # Try native MCP first (direct connection to HA's /api/mcp)

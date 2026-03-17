@@ -13,6 +13,7 @@ import logging
 from typing import TYPE_CHECKING
 
 from mcp.server.fastmcp import FastMCP
+from mcp.server.transport_security import TransportSecuritySettings
 
 from llm_bawt.shared.logging import LogConfig
 
@@ -25,10 +26,25 @@ logger = logging.getLogger(__name__)
 # MCP Server instance
 # ---------------------------------------------------------------------------
 
+# Allow LAN access for OpenClaw and local services
+# The MCP library matches host:port patterns — use ":*" suffix to allow any port.
+_allowed_hosts = [
+    h.strip() for h in os.getenv(
+        "LLM_BAWT_MCP_ALLOWED_HOSTS",
+        "127.0.0.1:*,localhost:*,ubuntu:*,ubuntu.lan.ferreri.us:*,echo.lan.ferreri.us:*,10.0.0.101:*",
+    ).split(",")
+]
+_allowed_origins = [f"http://{h}" for h in _allowed_hosts]
+
 mcp = FastMCP(
     "llm-memory",
     json_response=True,
     stateless_http=True,
+    transport_security=TransportSecuritySettings(
+        enable_dns_rebinding_protection=True,
+        allowed_hosts=_allowed_hosts,
+        allowed_origins=_allowed_origins,
+    ),
 )
 
 # Suppress uvicorn access logs by setting log_level to WARNING

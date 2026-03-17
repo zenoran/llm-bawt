@@ -7,7 +7,7 @@ from sqlmodel import Session, select
 
 from fastapi import APIRouter, HTTPException, Query
 
-from ...runtime_settings import BotProfileStore, RuntimeSetting, RuntimeSettingsStore
+from ...runtime_settings import BotProfileStore, RuntimeSetting, RuntimeSettingsStore, purge_bot_data, cleanup_orphaned_bot_data
 from ..dependencies import get_service
 from ..schemas import (
     BotProfileListResponse,
@@ -449,8 +449,11 @@ async def reload_bots():
 
 
 @router.delete("/v1/bots/{slug}/profile", tags=["System"])
-async def delete_bot_profile(slug: str):
-    """Delete a bot personality profile."""
+async def delete_bot_profile(
+    slug: str,
+    purge: bool = Query(False, description="Also purge all bot data (messages, memories, settings, etc.)"),
+):
+    """Delete a bot personality profile. Pass ?purge=true to also wipe all associated data."""
     service = get_service()
     store = BotProfileStore(service.config)
     if store.engine is None:
@@ -465,7 +468,39 @@ async def delete_bot_profile(slug: str):
     _invalidate_bot_instance_cache(service, normalized_slug)
     _clear_session_model_overrides(service, bot_id=normalized_slug)
 
-    return {"success": True, "slug": normalized_slug}
+    response: dict = {"success": True, "slug": normalized_slug}
+    if purge:
+        response["purge"] = purge_bot_data(service.config, normalized_slug)
+    return response
+
+
+@router.post("/v1/bots/{slug}/purge-data", tags=["System"])
+async def purge_bot_data_endpoint(slug: str):
+    """Purge all data for a bot (messages, memories, settings, etc.) without deleting the profile."""
+    service = get_service()
+    normalized_slug = slug.strip().lower()
+    if not normalized_slug:
+        raise HTTPException(status_code=400, detail="Invalid slug")
+    result = purge_bot_data(service.config, normalized_slug)
+    if "error" in result:
+        raise HTTPException(status_code=503, detail=result["error"])
+    return result
+
+
+@router.post("/v1/bots/cleanup-orphans", tags=["System"])
+async def cleanup_orphans(
+    dry_run: bool = Query(True, description="Report orphans without deleting (default true)"),
+):
+    """Find and remove data for bot IDs that no longer exist in bot_profiles.
+
+    Run with ?dry_run=false to actually delete. Defaults to dry-run so you can
+    preview what would be cleaned up first.
+    """
+    service = get_service()
+    result = cleanup_orphaned_bot_data(service.config, dry_run=dry_run)
+    if "error" in result:
+        raise HTTPException(status_code=503, detail=result["error"])
+    return result
 
 
 @router.post("/v1/bots/{slug}/sync-soul", tags=["System"])

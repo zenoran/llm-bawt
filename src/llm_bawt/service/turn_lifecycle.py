@@ -194,6 +194,7 @@ class TurnLifecycleMixin:
         error_text: str | None = None,
         agent_session_key: str | None = None,
         agent_request_id: str | None = None,
+        animation: str | None = None,
     ) -> None:
         """Update an existing turn log row with new data."""
         try:
@@ -212,6 +213,7 @@ class TurnLifecycleMixin:
                 error_text=error_text,
                 agent_session_key=agent_session_key,
                 agent_request_id=agent_request_id,
+                animation=animation,
             )
         except Exception as e:
             log.debug("Failed to update turn log: %s", e)
@@ -255,6 +257,7 @@ class TurnLifecycleMixin:
         user_id: str,
         elapsed_ms: float,
         stream: bool,
+        animation: str | None = None,
     ) -> None:
         """Finalize a turn in one place for both non-streaming and streaming paths."""
         if not response_text:
@@ -296,6 +299,7 @@ class TurnLifecycleMixin:
             prepared_messages=prepared_messages,
             response_text=response_text,
             tool_calls=tool_call_details,
+            animation=animation,
         )
 
         if stream:

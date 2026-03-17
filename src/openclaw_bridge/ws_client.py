@@ -240,28 +240,32 @@ class OpenClawWsClient:
         text: str,
         *,
         attachments: list | None = None,
-        timeout: float = 600,
+        timeout: float | None = None,
     ) -> AsyncIterator[dict]:
         """Send a message via chat.send and yield raw WS events for the resulting run.
 
         Events are yielded until a lifecycle end/error event is received,
-        or until timeout. The caller gets the full stream of agent events
-        (assistant deltas, tool events, lifecycle, errors) for this run.
+        WS disconnects, or optional timeout. The caller gets the full stream
+        of agent events (assistant deltas, tool events, lifecycle, errors).
         """
         run_id = await self.send_user_message(session_key, text, attachments=attachments)
         queue: asyncio.Queue[dict | None] = asyncio.Queue(maxsize=2000)
         self._run_queues[run_id] = queue
 
         try:
-            deadline = asyncio.get_event_loop().time() + timeout
+            deadline = (asyncio.get_event_loop().time() + timeout) if timeout else None
             while True:
-                remaining = deadline - asyncio.get_event_loop().time()
-                if remaining <= 0:
-                    logger.warning("send_and_stream timeout for run %s", run_id)
-                    return
+                if deadline is not None:
+                    remaining = deadline - asyncio.get_event_loop().time()
+                    if remaining <= 0:
+                        logger.warning("send_and_stream timeout for run %s", run_id)
+                        return
+                    wait = min(remaining, 5.0)
+                else:
+                    wait = 5.0
 
                 try:
-                    raw = await asyncio.wait_for(queue.get(), timeout=min(remaining, 5.0))
+                    raw = await asyncio.wait_for(queue.get(), timeout=wait)
                 except asyncio.TimeoutError:
                     if not self._connected:
                         logger.warning("WS disconnected during send_and_stream for run %s", run_id)
@@ -275,13 +279,18 @@ class OpenClawWsClient:
 
                 # Check if this is a lifecycle end/error -> run done
                 payload = raw.get("payload") or {}
-                if raw.get("type") == "event" and raw.get("event") == "agent":
-                    stream = payload.get("stream")
-                    data = payload.get("data") or {}
-                    if stream == "lifecycle" and data.get("phase") in ("end", "error"):
-                        return
-                    if stream == "error":
-                        return
+                if raw.get("type") == "event":
+                    if raw.get("event") == "agent":
+                        stream = payload.get("stream")
+                        data = payload.get("data") or {}
+                        if stream == "lifecycle" and data.get("phase") in ("end", "error"):
+                            return
+                        if stream == "error":
+                            return
+                    if raw.get("event") == "chat":
+                        state = str(payload.get("state") or "").lower()
+                        if state == "final":
+                            return
         finally:
             self._run_queues.pop(run_id, None)
 

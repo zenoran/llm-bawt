@@ -271,7 +271,7 @@ class BackgroundService(
                 llm_bawt._client_system_context = request.client_system_context
                 llm_bawt._ha_mode = request.ha_mode
                 llm_bawt._include_summaries = request.include_summaries
-                llm_bawt._tts_mode = request.tts_mode
+                llm_bawt._tts_mode = request.tts_mode or llm_bawt.bot.tts_mode
 
                 # Prepare messages with history and memory context
                 prepared_messages = llm_bawt.prepare_messages_for_query(user_prompt)

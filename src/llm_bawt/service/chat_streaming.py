@@ -429,6 +429,7 @@ class ChatStreamingMixin:
 
         chunk_queue: asyncio.Queue = asyncio.Queue()
         full_response_holder = [""]  # Use list to allow mutation in nested function
+        animation_holder = [None]   # Captures trigger_animation choice (tts_mode only)
         tool_context_holder = [""]  # Store tool context from native tool calls
         tool_call_details_holder: list[dict] = []
         timing_holder = [0.0, 0.0]  # [start_time, end_time]
@@ -503,7 +504,23 @@ class ChatStreamingMixin:
                 llm_bawt._client_system_context = request.client_system_context
                 llm_bawt._ha_mode = request.ha_mode
                 llm_bawt._include_summaries = request.include_summaries
-                llm_bawt._tts_mode = request.tts_mode
+                llm_bawt._tts_mode = request.tts_mode or llm_bawt.bot.tts_mode
+
+                # Load animations for tts_mode — must happen before streaming starts
+                _animations: list = []
+                if llm_bawt._tts_mode:
+                    try:
+                        from .animation_tool import AvatarAnimationStore
+                        _animations = AvatarAnimationStore(self.config).list_enabled()
+                    except Exception as _e:
+                        log.debug("Could not load animations: %s", _e)
+                _use_animation_tool = bool(
+                    _animations
+                    and llm_bawt.client.supports_native_tools()
+                    and hasattr(llm_bawt.client, "stream_with_tools")
+                )
+                log.info("🎬 tts_mode=%s (req=%s bot=%s), %d animations, use_animation_tool=%s",
+                         llm_bawt._tts_mode, request.tts_mode, llm_bawt.bot.tts_mode, len(_animations), _use_animation_tool)
 
                 # Use llm_bawt.prepare_messages_for_query to get full context
                 # (history from DB + memory + system prompt)
@@ -511,6 +528,28 @@ class ChatStreamingMixin:
                     user_prompt,
                     user_attachments=user_attachments or None,
                 )
+
+                # When animation tool is active, append a system instruction
+                # so the model always calls trigger_animation.
+                if _use_animation_tool:
+                    from ..models.message import Message as _Msg
+                    anim_list = "\n".join(
+                        f'- "{a.name}": {a.description or a.name}'
+                        for a in _animations
+                    )
+                    messages.append(_Msg(
+                        role="system",
+                        content=(
+                            "AVATAR ANIMATION: You MUST call trigger_animation exactly once "
+                            "at the end of every response — no exceptions. Write your full "
+                            "text reply first, then call the function. Pick the animation "
+                            "that best matches your response's emotional tone. If none of "
+                            "the other gestures fit, the minimum should be a talking "
+                            "animation like 'Acknowledging' or 'Head Nod Yes'. Never skip "
+                            "calling this function.\n\n"
+                            f"Available animations:\n{anim_list}"
+                        ),
+                    ))
 
                 # Backfill prepared messages into the turn log
                 self._update_turn_log(
@@ -525,11 +564,11 @@ class ChatStreamingMixin:
                 timing_holder[0] = time.time()
 
                 # Choose streaming method based on whether bot uses tools
-                if llm_bawt.bot.uses_tools and (llm_bawt.memory or llm_bawt.home_client or llm_bawt.ha_native_client):
+                if (llm_bawt.bot.uses_tools and (llm_bawt.memory or llm_bawt.home_client or llm_bawt.ha_native_client)) or _use_animation_tool:
                     # Check if client supports native streaming with tools (OpenAI)
                     use_native_streaming = (
                         llm_bawt.client.supports_native_tools()
-                        and llm_bawt.tool_format in ("native", "NATIVE_OPENAI")
+                        and (llm_bawt.tool_format in ("native", "NATIVE_OPENAI") or _use_animation_tool)
                         and hasattr(llm_bawt.client, "stream_with_tools")
                     )
 
@@ -544,9 +583,14 @@ class ChatStreamingMixin:
 
                         log.debug("Using native streaming with tools")
 
-                        tool_definitions = llm_bawt._get_tool_definitions()
+                        tool_definitions = llm_bawt._get_tool_definitions() if llm_bawt.bot.uses_tools else []
                         handler = get_format_handler(llm_bawt.tool_format)
                         tools_schema = handler.get_tools_schema(tool_definitions)
+
+                        # Inject trigger_animation virtual tool for tts_mode requests
+                        if _use_animation_tool:
+                            from .animation_tool import build_trigger_animation_tool
+                            tools_schema = tools_schema + [build_trigger_animation_tool(_animations)]
 
                         # Log tool names for debugging
                         tool_names = [t.get("function", {}).get("name", "?") for t in tools_schema]
@@ -611,12 +655,50 @@ class ChatStreamingMixin:
                                             yield from text_buffer
                                             return
 
+                                        # Separate virtual tools (trigger_animation) from real tools
+                                        real_tool_calls = [
+                                            tc for tc in tool_calls
+                                            if tc.get("function", {}).get("name") != "trigger_animation"
+                                        ]
+                                        for tc in tool_calls:
+                                            func = tc.get("function", {})
+                                            if func.get("name") == "trigger_animation":
+                                                try:
+                                                    a_args = _json.loads(func.get("arguments", "{}") or "{}")
+                                                except _json.JSONDecodeError:
+                                                    a_args = {}
+                                                if not animation_holder[0]:
+                                                    # Try "name" first (matches tool schema), then
+                                                    # common alternatives models sometimes use.
+                                                    anim_name = (
+                                                        a_args.get("name")
+                                                        or a_args.get("animation")
+                                                        or a_args.get("animation_name")
+                                                    )
+                                                    # Last resort: take the first string value
+                                                    if not anim_name:
+                                                        for v in a_args.values():
+                                                            if isinstance(v, str):
+                                                                anim_name = v
+                                                                break
+                                                    animation_holder[0] = anim_name
+                                                log.info("🎭 trigger_animation: %s (raw args: %s)", animation_holder[0], a_args)
+
+                                        if not real_tool_calls:
+                                            # Only animation tool — flush buffered text.
+                                            # Do NOT yield content here — it is the same
+                                            # text already accumulated in text_buffer
+                                            # (yielded chunk-by-chunk above), so yielding
+                                            # it again would double the response.
+                                            yield from text_buffer
+                                            return
+
                                         # Real tool calls follow — discard stale pre-tool text
                                         text_buffer.clear()
 
                                         # Emit tool calls as OpenAI delta.tool_calls, then execute
                                         tool_results = []
-                                        for idx, tc in enumerate(tool_calls):
+                                        for idx, tc in enumerate(real_tool_calls):
                                             func = tc.get("function", {})
                                             name = func.get("name", "")
                                             call_id = tc.get("id", f"call_{uuid.uuid4().hex[:8]}")
@@ -701,7 +783,7 @@ class ChatStreamingMixin:
                                         # Store tool context
                                         tool_context_holder[0] = "\n\n".join(
                                             f"[{tc['function']['name']}]\n{tr['content']}"
-                                            for tc, tr in zip(tool_calls, tool_results)
+                                            for tc, tr in zip(real_tool_calls, tool_results)
                                         )
 
                                         # Build continuation messages — empty content so the
@@ -712,12 +794,12 @@ class ChatStreamingMixin:
                                             content="",
                                             tool_calls=[
                                                 {"id": tc.get("id"), "name": tc["function"]["name"], "arguments": tc["function"]["arguments"]}
-                                                for tc in tool_calls
+                                                for tc in real_tool_calls
                                             ],
                                         )
                                         current_msgs.append(assistant_msg)
 
-                                        for tc, tr in zip(tool_calls, tool_results):
+                                        for tc, tr in zip(real_tool_calls, tool_results):
                                             current_msgs.append(Msg(
                                                 role="tool",
                                                 content=tr["content"],
@@ -851,6 +933,13 @@ class ChatStreamingMixin:
                 if cancelled_holder[0]:
                     log.info("Generation cancelled - newer request received")
 
+                # Fallback: if animation tool was active but model didn't
+                # call it, default to "Acknowledging" so every tts_mode
+                # response gets a gesture.
+                if _use_animation_tool and not animation_holder[0] and full_response_holder[0]:
+                    animation_holder[0] = "Acknowledging"
+                    log.info("🎭 animation fallback → Acknowledging (model skipped trigger_animation)")
+
                 timing_holder[1] = time.time()
 
             except Exception as e:
@@ -882,6 +971,7 @@ class ChatStreamingMixin:
                         user_id=user_id,
                         elapsed_ms=elapsed_ms,
                         stream=True,
+                        animation=animation_holder[0],
                     )
                 else:
                     # No response received — mark as timeout so turn doesn't
@@ -906,6 +996,7 @@ class ChatStreamingMixin:
                     "bot_id": bot_id,
                     "user_id": user_id,
                     "status": status,
+                    "animation": animation_holder[0],
                     "ts": time.time(),
                 })
 
@@ -960,6 +1051,11 @@ class ChatStreamingMixin:
                                 "choices": [{"index": 0, "delta": {"content": final_chunk}, "finish_reason": None}],
                             }
                             yield (f"data: {json.dumps(data)}\n\n")
+
+                    # Emit animation event (tts_mode only, normal completion only)
+                    if animation_holder[0]:
+                        anim_data = {"object": "service.animation", "animation": animation_holder[0]}
+                        yield (f"data: {json.dumps(anim_data)}\n\n")
 
                     # Send final chunk
                     data = {

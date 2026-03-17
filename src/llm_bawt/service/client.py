@@ -887,16 +887,38 @@ class ServiceClient:
             logger.warning(f"Upsert bot profile via service failed: {e}")
             return None
 
-    def delete_bot_profile(self, slug: str) -> bool:
-        """Delete a bot profile via the service. Returns True on success."""
+    def delete_bot_profile(self, slug: str, purge: bool = False) -> bool:
+        """Delete a bot profile via the service. Pass purge=True to also wipe all data."""
         if not self.is_available():
             return False
         try:
-            self._request("DELETE", f"/v1/bots/{slug}/profile")
+            params = "?purge=true" if purge else ""
+            self._request("DELETE", f"/v1/bots/{slug}/profile{params}")
             return True
         except Exception as e:
             logger.warning(f"Delete bot profile via service failed: {e}")
             return False
+
+    def purge_bot_data(self, slug: str) -> dict | None:
+        """Purge all bot data without deleting the profile."""
+        if not self.is_available():
+            return None
+        try:
+            return self._request("POST", f"/v1/bots/{slug}/purge-data")
+        except Exception as e:
+            logger.warning(f"Purge bot data via service failed: {e}")
+            return None
+
+    def cleanup_orphaned_bot_data(self, dry_run: bool = True) -> dict | None:
+        """Find/remove data for bot IDs not in bot_profiles. dry_run=True just reports."""
+        if not self.is_available():
+            return None
+        try:
+            params = f"?dry_run={'true' if dry_run else 'false'}"
+            return self._request("POST", f"/v1/bots/cleanup-orphans{params}")
+        except Exception as e:
+            logger.warning(f"Cleanup orphaned bot data via service failed: {e}")
+            return None
 
     # -----------------------------------------------------------------
     # User/bot profiles

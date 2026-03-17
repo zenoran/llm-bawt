@@ -8,7 +8,7 @@ import time
 from datetime import datetime, timedelta, timezone
 from urllib.parse import quote_plus
 
-from sqlalchemy import Column, DateTime, Float, Integer, Text, text as sa_text
+from sqlalchemy import Column, DateTime, Float, Integer, String, Text, text as sa_text
 from sqlmodel import Field, SQLModel, Session, create_engine, delete, select
 
 from ..utils.config import Config, has_database_credentials
@@ -57,6 +57,7 @@ class TurnLog(SQLModel, table=True):
     trigger_message_id: str | None = Field(default=None, index=True)
     agent_session_key: str | None = Field(default=None, max_length=128, index=True)
     agent_request_id: str | None = Field(default=None, max_length=128, index=True)
+    animation: str | None = Field(default=None, sa_column=Column(String(255), nullable=True))
 
 
 class ToolCallRecord(SQLModel, table=True):
@@ -141,6 +142,9 @@ class TurnLogStore:
                     "CREATE INDEX IF NOT EXISTS ix_turn_logs_agent_request_id"
                     " ON turn_logs (agent_request_id)"
                 ))
+                conn.execute(sa_text(
+                    "ALTER TABLE turn_logs ADD COLUMN IF NOT EXISTS animation VARCHAR(255)"
+                ))
                 conn.commit()
             except Exception:
                 pass
@@ -214,6 +218,7 @@ class TurnLogStore:
         trigger_message_id: str | None = None,
         agent_session_key: str | None = None,
         agent_request_id: str | None = None,
+        animation: str | None = None,
     ) -> None:
         """Persist one turn entry and enforce short TTL cleanup."""
         if self.engine is None:
@@ -243,6 +248,7 @@ class TurnLogStore:
             trigger_message_id=trigger_message_id,
             agent_session_key=agent_session_key,
             agent_request_id=agent_request_id,
+            animation=animation,
         )
 
         with Session(self.engine) as session:
@@ -261,6 +267,7 @@ class TurnLogStore:
         error_text: str | None = None,
         agent_session_key: str | None = None,
         agent_request_id: str | None = None,
+        animation: str | None = None,
     ) -> None:
         """Update an existing turn log row with new data."""
         if self.engine is None:
@@ -292,6 +299,8 @@ class TurnLogStore:
                 row.agent_session_key = agent_session_key
             if agent_request_id is not None:
                 row.agent_request_id = agent_request_id
+            if animation is not None:
+                row.animation = animation
             session.add(row)
             session.commit()
 
