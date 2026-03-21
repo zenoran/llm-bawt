@@ -8,6 +8,7 @@ from typing import Any, Literal
 from pydantic import BaseModel, Field
 
 SERVICE_VERSION = "0.1.0"
+BotKind = Literal["chat", "agent"]
 
 # =============================================================================
 # OpenAI-Compatible Schemas
@@ -188,6 +189,7 @@ class BotInfo(BaseModel):
     default_model: str | None = None
     color: str | None = None
     avatar: str | None = None
+    bot_type: BotKind = "chat"
     agent_backend: str | None = None
     agent_backend_config: dict[str, Any] = Field(default_factory=dict)
     settings: dict[str, Any] = Field(default_factory=dict)
@@ -218,6 +220,7 @@ class BotProfileResponse(BaseModel):
     avatar: str | None = None
     default_voice: str | None = None
     nextcloud_config: dict[str, Any] | None = None
+    bot_type: BotKind = "chat"
     agent_backend: str | None = None
     agent_backend_config: dict[str, Any] | None = None
     created_at: datetime | None = None
@@ -242,8 +245,15 @@ class BotProfileUpsertRequest(BaseModel):
     avatar: str | None = None
     default_voice: str | None = None
     nextcloud_config: dict[str, Any] | None = None
+    bot_type: BotKind | None = None
     agent_backend: str | None = None
     agent_backend_config: dict[str, Any] | None = None
+
+
+class BotCreateRequest(BotProfileUpsertRequest):
+    """Request payload for creating a new bot profile."""
+
+    slug: str
 
 
 class TaskSubmitRequest(BaseModel):

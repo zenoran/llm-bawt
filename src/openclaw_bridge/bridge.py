@@ -2,6 +2,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+from datetime import datetime
 
 from .events import OpenClawEvent, OpenClawEventKind
 from .ingest import EventIngestPipeline
@@ -31,6 +32,10 @@ class SessionBridge:
         self._run_tool_calls: dict[str, list[dict]] = {}  # run_id -> tool calls
         self._session_to_bot: dict[str, str] = session_to_bot or {}
         self._command_task: asyncio.Task | None = None
+        # When the live run stream ends without assistant text, poll history
+        # briefly to recover replies produced by upstream provider fallback.
+        self._history_reply_timeout_s = 45.0
+        self._history_reply_poll_interval_s = 1.0
 
     async def start(self) -> None:
         """Start the bridge: connect WS, begin consuming events, and listen for commands."""
@@ -167,44 +172,31 @@ class SessionBridge:
                     if event.kind == OpenClawEventKind.ASSISTANT_DELTA and event.text:
                         saw_assistant_text = True
 
-                    if event.kind == OpenClawEventKind.ASSISTANT_DONE and not saw_assistant_text:
-                        final_text = event.text or await self._fetch_latest_assistant_text(
-                            session_key
+                    # If ASSISTANT_DONE carries inline text but no deltas
+                    # were streamed, emit a synthetic delta so the consumer
+                    # sees the text.  Do NOT fall back to chat history —
+                    # that risks replaying a stale response from a prior turn.
+                    if (
+                        event.kind == OpenClawEventKind.ASSISTANT_DONE
+                        and not saw_assistant_text
+                        and event.text
+                    ):
+                        saw_assistant_text = True
+                        self._publisher.publish_run_event(
+                            request_id,
+                            OpenClawEvent(
+                                event_id=f"{event.event_id}:final-text",
+                                session_key=event.session_key,
+                                run_id=event.run_id,
+                                kind=OpenClawEventKind.ASSISTANT_DELTA,
+                                origin=event.origin,
+                                text=event.text,
+                                model=event.model,
+                                seq=event.seq,
+                                timestamp=event.timestamp,
+                                raw=event.raw,
+                            ),
                         )
-                        if final_text:
-                            saw_assistant_text = True
-                            if not event.text:
-                                event = OpenClawEvent(
-                                    event_id=event.event_id,
-                                    session_key=event.session_key,
-                                    run_id=event.run_id,
-                                    kind=event.kind,
-                                    origin=event.origin,
-                                    text=final_text,
-                                    tool_name=event.tool_name,
-                                    tool_arguments=event.tool_arguments,
-                                    tool_result=event.tool_result,
-                                    model=event.model,
-                                    seq=event.seq,
-                                    timestamp=event.timestamp,
-                                    raw=event.raw,
-                                    db_id=event.db_id,
-                                )
-                            self._publisher.publish_run_event(
-                                request_id,
-                                OpenClawEvent(
-                                    event_id=f"{event.event_id}:final-text",
-                                    session_key=event.session_key,
-                                    run_id=event.run_id,
-                                    kind=OpenClawEventKind.ASSISTANT_DELTA,
-                                    origin=event.origin,
-                                    text=final_text,
-                                    model=event.model,
-                                    seq=event.seq,
-                                    timestamp=event.timestamp,
-                                    raw=event.raw,
-                                ),
-                            )
 
                     self._publisher.publish_run_event(request_id, event)
 
@@ -230,6 +222,27 @@ class SessionBridge:
                             bot_id, unified_user_id, tool_event,
                         )
 
+            if not saw_assistant_text:
+                history_text = await self._wait_for_history_reply(session_key)
+                if history_text:
+                    saw_assistant_text = True
+                    logger.info(
+                        "Recovered assistant text from chat.history after empty stream: "
+                        "request_id=%s session=%s chars=%d",
+                        request_id, session_key, len(history_text),
+                    )
+                    self._publisher.publish_run_event(
+                        request_id,
+                        OpenClawEvent(
+                            event_id=f"history_{request_id}",
+                            session_key=session_key,
+                            run_id=None,
+                            kind=OpenClawEventKind.ASSISTANT_DELTA,
+                            origin="bridge",
+                            text=history_text,
+                        ),
+                    )
+
             self._publisher.publish_run_done(request_id)
             get_metrics().incr("openclaw.commands_completed")
             logger.info("Send command completed: request_id=%s", request_id)
@@ -249,43 +262,6 @@ class SessionBridge:
             self._publisher.publish_run_done(request_id)
         finally:
             await async_redis.xack(COMMANDS_STREAM, "bridge", msg_id)
-
-    async def _fetch_latest_assistant_text(self, session_key: str) -> str:
-        """Resolve the final assistant message from chat history as a fallback."""
-        try:
-            messages = await self._ws_client.get_chat_history(session_key, limit=8)
-        except Exception:
-            logger.debug("Could not fetch chat history for session=%s", session_key)
-            return ""
-
-        for message in reversed(messages):
-            if not isinstance(message, dict):
-                continue
-            if message.get("role") != "assistant":
-                continue
-            text = self._extract_message_text(message)
-            if text:
-                return text
-        return ""
-
-    @staticmethod
-    def _extract_message_text(message: dict) -> str:
-        """Extract plain assistant text from chat.history message payloads."""
-        content = message.get("content")
-        if isinstance(content, str):
-            return content
-        if isinstance(content, list):
-            parts: list[str] = []
-            for item in content:
-                if not isinstance(item, dict):
-                    continue
-                text = item.get("text")
-                if isinstance(text, str) and text:
-                    parts.append(text)
-            return "".join(parts)
-
-        text = message.get("text")
-        return text if isinstance(text, str) else ""
 
     async def _handle_rpc_command(
         self, fields: dict, msg_id: str, async_redis
@@ -318,6 +294,129 @@ class SessionBridge:
             self._publisher.publish_rpc_result(request_id, {"ok": False, "error": str(e)})
         finally:
             await async_redis.xack(COMMANDS_STREAM, "bridge", msg_id)
+
+    async def _wait_for_history_reply(self, session_key: str) -> str | None:
+        """Poll chat.history for a fresh assistant reply after empty streams.
+
+        Some gateway/provider fallback paths end the original run without
+        emitting assistant deltas, then continue the conversation internally
+        and only persist the final reply to session history. In that case we
+        recover the most recent non-empty assistant message that follows the
+        latest non-empty user message in the session.
+        """
+        deadline = asyncio.get_event_loop().time() + self._history_reply_timeout_s
+        while asyncio.get_event_loop().time() < deadline:
+            try:
+                messages = await self._ws_client.get_chat_history(session_key, limit=20)
+            except Exception:
+                logger.debug("chat.history fallback failed for session=%s", session_key, exc_info=True)
+                return None
+
+            reply = self._extract_latest_history_reply(messages)
+            if reply:
+                return reply
+
+            await asyncio.sleep(self._history_reply_poll_interval_s)
+
+        return None
+
+    @classmethod
+    def _extract_latest_history_reply(cls, messages: list[dict] | None) -> str | None:
+        """Return the latest non-empty assistant reply after the latest user message."""
+        if not isinstance(messages, list) or not messages:
+            return None
+
+        ordered = sorted(
+            enumerate(messages),
+            key=lambda item: (cls._message_sort_key(item[1], item[0]), item[0]),
+        )
+        normalized = [message for _, message in ordered]
+
+        latest_user_idx: int | None = None
+        for idx in range(len(normalized) - 1, -1, -1):
+            msg = normalized[idx]
+            if cls._message_role(msg) == "user" and cls._extract_message_text(msg):
+                latest_user_idx = idx
+                break
+
+        if latest_user_idx is None:
+            return None
+
+        reply_text: str | None = None
+        for msg in normalized[latest_user_idx + 1:]:
+            if cls._message_role(msg) != "assistant":
+                continue
+            text = cls._extract_message_text(msg)
+            if text:
+                reply_text = text
+
+        return reply_text
+
+    @staticmethod
+    def _message_role(message: dict) -> str:
+        role = message.get("role")
+        if isinstance(role, str):
+            return role
+        inner = message.get("message")
+        if isinstance(inner, dict) and isinstance(inner.get("role"), str):
+            return inner["role"]
+        return ""
+
+    @staticmethod
+    def _message_sort_key(message: dict, fallback_index: int) -> tuple[int, float]:
+        ts = message.get("timestamp")
+        if ts is None and isinstance(message.get("message"), dict):
+            ts = message["message"].get("timestamp")
+        if isinstance(ts, (int, float)):
+            return (0, float(ts))
+        if isinstance(ts, str):
+            try:
+                return (0, datetime.fromisoformat(ts.replace("Z", "+00:00")).timestamp())
+            except ValueError:
+                pass
+        return (1, float(fallback_index))
+
+    @staticmethod
+    def _extract_message_text(message: dict) -> str:
+        if not isinstance(message, dict):
+            return ""
+
+        if isinstance(message.get("text"), str):
+            return message["text"]
+
+        inner = message.get("message")
+        if isinstance(inner, dict):
+            message = inner
+
+        content = message.get("content")
+        if isinstance(content, str):
+            return content
+        if not isinstance(content, list):
+            return ""
+
+        parts: list[str] = []
+        for item in content:
+            if isinstance(item, str):
+                parts.append(item)
+                continue
+            if not isinstance(item, dict):
+                continue
+
+            text = item.get("text")
+            if isinstance(text, str) and text:
+                parts.append(text)
+                continue
+            if isinstance(text, dict):
+                value = text.get("value") or text.get("text")
+                if isinstance(value, str) and value:
+                    parts.append(value)
+                    continue
+
+            value = item.get("value")
+            if isinstance(value, str) and value:
+                parts.append(value)
+
+        return "".join(parts)
 
     async def _on_raw_event(self, raw: dict) -> None:
         """Process a raw WS message: parse -> store -> update run state -> publish to Redis."""

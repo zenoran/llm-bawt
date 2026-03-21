@@ -17,6 +17,8 @@ from llm_bawt.model_manager import (
     update_models_interactive,
 )
 from llm_bawt.gguf_handler import handle_add_gguf
+from llm_bawt.bot_types import format_bot_type
+from llm_bawt.cli.bot_create import handle_add_chat_bot
 from llm_bawt.cli.vllm_handler import handle_add_vllm
 from llm_bawt.cli.openclaw_handler import handle_add_openclaw
 from llm_bawt.bots import BotManager
@@ -557,6 +559,7 @@ def _show_bots_from_service(config: Config, bots_data: list[dict]):
     table = Table(show_header=True, box=None, padding=(0, 2))
     table.add_column("Slug", style="cyan")
     table.add_column("Name", style="bold")
+    table.add_column("Type")
     table.add_column("Color")
     table.add_column("Description")
     table.add_column("Default Model")
@@ -572,6 +575,7 @@ def _show_bots_from_service(config: Config, bots_data: list[dict]):
         table.add_row(
             f"{slug}{is_default}",
             bot.get("name", slug),
+            format_bot_type(bot.get("bot_type"), bot.get("agent_backend")),
             f"[{color}]{color}[/]" if color else "[dim]default[/dim]",
             bot.get("description", ""),
             default_model,
@@ -596,6 +600,7 @@ def _show_bots_from_local(config: Config):
     table = Table(show_header=True, box=None, padding=(0, 2))
     table.add_column("Slug", style="cyan")
     table.add_column("Name", style="bold")
+    table.add_column("Type")
     table.add_column("Color")
     table.add_column("Description")
     table.add_column("Default Model")
@@ -609,6 +614,7 @@ def _show_bots_from_local(config: Config):
         table.add_row(
             f"{bot.slug}{is_default}",
             bot.name,
+            format_bot_type(bot.bot_type, bot.agent_backend),
             f"[{bot.color}]{bot.color}[/]" if bot.color else "[dim]default[/dim]",
             bot.description,
             default_model,
@@ -1206,7 +1212,8 @@ def parse_arguments(config_obj: Config) -> argparse.Namespace:
     parser.add_argument("-m","--model",type=str,default=None,help=f"Model alias defined in {config_obj.MODELS_CONFIG_PATH}. Supports partial matching. (Default: bot's default or {config_obj.DEFAULT_MODEL_ALIAS or 'None'})")
     parser.add_argument("--list-models",action="store_true",help="List available model aliases defined in the configuration file and exit.")
     parser.add_argument("--add-gguf",type=str,metavar="REPO_ID",help="(Deprecated: use --add-model gguf) Add a GGUF model from a Hugging Face repo ID.")
-    parser.add_argument("--add-model",type=str,choices=['ollama', 'openai', 'grok', 'gguf', 'vllm', 'openclaw'],metavar="TYPE",help="Add models: 'ollama' (refresh from server), 'openai' (query API), 'grok' (query xAI API), 'gguf' (add from HuggingFace repo), 'vllm' (add vLLM model from HuggingFace), 'openclaw' (bind OpenClaw session/channel)")
+    parser.add_argument("--add-model",type=str,choices=['ollama', 'openai', 'grok', 'gguf', 'vllm', 'openclaw'],metavar="TYPE",help="Add models: 'ollama' (refresh from server), 'openai' (query API), 'grok' (query xAI API), 'gguf' (add from HuggingFace repo), 'vllm' (add vLLM model from HuggingFace), 'openclaw' (deprecated: use --add-bot openclaw)")
+    parser.add_argument("--add-bot", type=str, choices=["chat", "openclaw"], metavar="TYPE", help="Add bots: 'chat' (create a chat bot profile), 'openclaw' (create an OpenClaw agent bot)")
     parser.add_argument("--delete-model",type=str,metavar="ALIAS",help="Delete the specified model alias from the configuration file after confirmation.")
     parser.add_argument(
         "--set-context-window",
@@ -1502,6 +1509,27 @@ def main():
             success = False
         sys.exit(0 if success else 1)
         return
+    if args.add_bot:
+        success = False
+        try:
+            if args.add_bot == "chat":
+                success = handle_add_chat_bot(config_obj)
+            elif args.add_bot == "openclaw":
+                success = handle_add_openclaw(config_obj)
+            if success:
+                console.print(f"[green]Bot add for '{args.add_bot}' completed.[/green]")
+            else:
+                console.print(f"[red]Bot add for '{args.add_bot}' failed or was cancelled.[/red]")
+        except KeyboardInterrupt:
+            console.print("[bold red]Bot add cancelled.[/bold red]")
+            success = False
+        except Exception as e:
+            console.print(f"[bold red]Error during bot add:[/bold red] {e}")
+            if config_obj.VERBOSE:
+                traceback.print_exc()
+            success = False
+        sys.exit(0 if success else 1)
+        return
     if args.add_model:
         service_mode = _is_service_mode(args, config_obj)
         svc_client = None
@@ -1526,6 +1554,7 @@ def main():
             elif args.add_model == 'vllm':
                 success = handle_add_vllm(config_obj)
             elif args.add_model == 'openclaw':
+                console.print("[yellow]`--add-model openclaw` is deprecated. Use `--add-bot openclaw`.[/yellow]")
                 success = handle_add_openclaw(config_obj)
             if success:
                 console.print(f"[green]Model add for '{args.add_model}' completed.[/green]")

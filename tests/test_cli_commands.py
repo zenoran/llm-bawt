@@ -131,6 +131,7 @@ class TestLLMInfo:
         o = assert_ok(run(f"{LLM} --help"), "--help")
         assert "Query LLM models" in o
         assert "--list-models" in o
+        assert "--add-bot" in o
         assert "--list-bots" in o
         assert no_traceback(o)
 

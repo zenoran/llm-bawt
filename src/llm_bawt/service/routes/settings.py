@@ -7,9 +7,11 @@ from sqlmodel import Session, select
 
 from fastapi import APIRouter, HTTPException, Query
 
+from ...bot_types import normalize_bot_type
 from ...runtime_settings import BotProfileStore, RuntimeSetting, RuntimeSettingsStore, purge_bot_data, cleanup_orphaned_bot_data
 from ..dependencies import get_service
 from ..schemas import (
+    BotCreateRequest,
     BotProfileListResponse,
     BotProfileResponse,
     BotProfileUpsertRequest,
@@ -81,6 +83,7 @@ def _to_profile_response(profile) -> BotProfileResponse:
         avatar=profile.avatar,
         default_voice=profile.default_voice,
         nextcloud_config=profile.nextcloud_config,
+        bot_type=normalize_bot_type(getattr(profile, "bot_type", None), profile.agent_backend),
         agent_backend=profile.agent_backend,
         agent_backend_config=profile.agent_backend_config,
         created_at=profile.created_at,
@@ -145,6 +148,87 @@ def _invalidate_all_instance_cache(service) -> int:
     cleared = len(service._llm_bawt_cache)
     service._llm_bawt_cache.clear()
     return cleared
+
+
+def _request_to_profile_payload(
+    slug: str,
+    request: BotProfileUpsertRequest | BotCreateRequest,
+) -> dict[str, object]:
+    payload: dict[str, object] = {
+        "slug": slug,
+        "name": request.name,
+        "description": request.description,
+        "system_prompt": request.system_prompt,
+        "requires_memory": request.requires_memory,
+        "voice_optimized": request.voice_optimized,
+        "tts_mode": request.tts_mode,
+        "include_summaries": request.include_summaries,
+        "uses_tools": request.uses_tools,
+        "uses_search": request.uses_search,
+        "uses_home_assistant": request.uses_home_assistant,
+    }
+    for field_name in (
+        "default_model",
+        "color",
+        "avatar",
+        "default_voice",
+        "nextcloud_config",
+        "bot_type",
+        "agent_backend",
+        "agent_backend_config",
+    ):
+        if field_name in request.model_fields_set:
+            payload[field_name] = getattr(request, field_name)
+    return payload
+
+
+def _validate_profile_payload(payload: dict[str, object]) -> None:
+    resolved_type = normalize_bot_type(
+        str(payload.get("bot_type")) if payload.get("bot_type") is not None else None,
+        str(payload.get("agent_backend")) if payload.get("agent_backend") is not None else None,
+    )
+    agent_backend = str(payload.get("agent_backend")).strip() if payload.get("agent_backend") is not None else ""
+    if resolved_type == "agent" and not agent_backend:
+        raise HTTPException(status_code=400, detail="Agent bots require agent_backend")
+
+
+async def _persist_bot_profile(
+    payload: dict[str, object],
+    *,
+    create_only: bool,
+) -> BotProfileResponse:
+    service = get_service()
+    store = BotProfileStore(service.config)
+    if store.engine is None:
+        raise HTTPException(status_code=503, detail="Bot profiles DB unavailable")
+
+    slug = str(payload.get("slug") or "").strip().lower()
+    if not slug:
+        raise HTTPException(status_code=400, detail="Bot slug is required")
+    if create_only and store.get(slug) is not None:
+        raise HTTPException(status_code=409, detail=f"Bot '{slug}' already exists")
+
+    _validate_profile_payload(payload)
+
+    profile = store.upsert(payload)
+    _reload_bot_registry()
+    _invalidate_bot_instance_cache(service, profile.slug)
+    _clear_session_model_overrides(service, bot_id=profile.slug)
+
+    if (
+        profile.agent_backend == "openclaw"
+        and (profile.system_prompt or "").strip()
+    ):
+        profile_config = profile.agent_backend_config or {}
+        session_key = profile_config.get("session_key", "")
+        agent_id = "main"
+        if session_key.startswith("agent:"):
+            parts = session_key.split(":")
+            if len(parts) >= 2:
+                agent_id = parts[1]
+        await _push_soul_background(profile.slug, agent_id, profile.system_prompt)
+
+    return _to_profile_response(profile)
 
 
 @router.get("/v1/settings", response_model=RuntimeSettingsResponse, tags=["System"])
@@ -368,6 +452,13 @@ async def list_bot_profiles(
     )
 
 
+@router.post("/v1/bots", response_model=BotProfileResponse, tags=["System"])
+async def create_bot(request: BotCreateRequest):
+    """Create a new bot profile. Returns 409 when slug already exists."""
+    payload = _request_to_profile_payload(request.slug, request)
+    return await _persist_bot_profile(payload, create_only=True)
+
+
 @router.get("/v1/bots/{slug}/profile", response_model=BotProfileResponse, tags=["System"])
 async def get_bot_profile(slug: str):
     """Get bot personality profile by slug."""
@@ -385,53 +476,8 @@ async def get_bot_profile(slug: str):
 @router.put("/v1/bots/{slug}/profile", response_model=BotProfileResponse, tags=["System"])
 async def upsert_bot_profile(slug: str, request: BotProfileUpsertRequest):
     """Create or update a bot personality profile."""
-    service = get_service()
-    store = BotProfileStore(service.config)
-    if store.engine is None:
-        raise HTTPException(status_code=503, detail="Bot profiles DB unavailable")
-
-    profile = store.upsert(
-        {
-            "slug": slug,
-            "name": request.name,
-            "description": request.description,
-            "system_prompt": request.system_prompt,
-            "requires_memory": request.requires_memory,
-            "voice_optimized": request.voice_optimized,
-            "tts_mode": request.tts_mode,
-            "include_summaries": request.include_summaries,
-            "uses_tools": request.uses_tools,
-            "uses_search": request.uses_search,
-            "uses_home_assistant": request.uses_home_assistant,
-            "default_model": request.default_model,
-            "color": request.color,
-            "avatar": request.avatar,
-            "default_voice": request.default_voice,
-            "nextcloud_config": request.nextcloud_config,
-            "agent_backend": request.agent_backend,
-            "agent_backend_config": request.agent_backend_config,
-        }
-    )
-    _reload_bot_registry()
-    _invalidate_bot_instance_cache(service, profile.slug)
-    _clear_session_model_overrides(service, bot_id=profile.slug)
-
-    # Auto-push system_prompt to SOUL.md for openclaw bots
-    if (
-        profile.agent_backend == "openclaw"
-        and request.system_prompt is not None
-        and (profile.system_prompt or "").strip()
-    ):
-        _config = profile.agent_backend_config or {}
-        _session_key = _config.get("session_key", "")
-        _agent_id = "main"
-        if _session_key.startswith("agent:"):
-            _parts = _session_key.split(":")
-            if len(_parts) >= 2:
-                _agent_id = _parts[1]
-        await _push_soul_background(profile.slug, _agent_id, profile.system_prompt)
-
-    return _to_profile_response(profile)
+    payload = _request_to_profile_payload(slug, request)
+    return await _persist_bot_profile(payload, create_only=False)
 
 
 @router.post("/v1/admin/reload-bots", tags=["Admin"])

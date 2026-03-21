@@ -392,10 +392,12 @@ def handle_add_openclaw(config: Config) -> bool:
     ).strip()
 
     bot_payload = {
+        "slug": bot_slug,
         "name": bot_name,
         "description": f"OpenClaw agent ({selected_session_key})",
         "system_prompt": bot_system_prompt,
         "requires_memory": True,
+        "bot_type": "agent",
         "agent_backend": "openclaw",
         "agent_backend_config": {
             "session_key": selected_session_key,
@@ -406,9 +408,12 @@ def handle_add_openclaw(config: Config) -> bool:
     try:
         service_client = get_service_client(config)
         if service_client and service_client.is_available(force_check=True):
-            result = service_client.upsert_bot_profile(bot_slug, bot_payload)
+            result = service_client.create_bot(bot_payload)
             if result:
                 console.print(f"[green]Created OpenClaw bot '{bot_slug}'[/green]")
+                detail = getattr(service_client, "last_error", None)
+                if detail and "legacy PUT" in detail:
+                    console.print(f"[yellow]{detail}[/yellow]")
                 console.print(f"[dim]Session key: {selected_session_key}[/dim]")
                 console.print(f"[dim]Usage: llm -b {bot_slug} \"your message\"[/dim]")
 
@@ -420,7 +425,10 @@ def handle_add_openclaw(config: Config) -> bool:
                 except Exception:
                     pass
             else:
-                console.print("[yellow]Service did not confirm bot creation.[/yellow]")
+                if getattr(service_client, "last_error", None):
+                    console.print(f"[yellow]{service_client.last_error}[/yellow]")
+                else:
+                    console.print("[yellow]Service did not confirm bot creation.[/yellow]")
                 return False
         else:
             console.print("[yellow]Service not available — bot not created. Start the service first.[/yellow]")

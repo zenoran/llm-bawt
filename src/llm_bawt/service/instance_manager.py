@@ -273,9 +273,43 @@ class InstanceManagerMixin:
             self._model_lifecycle.unload_current_model()
 
         if cache_key in self._llm_bawt_cache:
-            log.cache_hit("llm_bawt", f"{model_alias}/{bot_id}/{user_id}")
-            log.debug(f"Reusing cached ServiceLLMBawt instance for {cache_key}")
-            return self._llm_bawt_cache[cache_key]
+            cached = self._llm_bawt_cache[cache_key]
+            # If cached instance has no memory (local_mode=True) but this request
+            # needs memory (local_mode=False), discard the stale instance so we
+            # create a fresh memory-enabled one.
+            #
+            # The reverse (memory-enabled instance reused for a local_mode=True
+            # request) is harmless — extra context won't break anything, and
+            # memory extraction is gated by request.extract_memory separately.
+            cached_local = getattr(cached, "local_mode", False)
+            discard = False
+            if cached_local and not local_mode:
+                log.info(
+                    "Upgrading cached local-mode instance → memory-enabled for %s/%s/%s",
+                    model_alias, bot_id, user_id,
+                )
+                discard = True
+            elif not local_mode and not cached_local:
+                # Non-local instance whose memory init failed (e.g. transient DB
+                # outage).  _db_available=False + memory=None means the init
+                # exception path was hit — discard so we retry the connection.
+                # (requires_memory=False sets _db_available=True, so won't match.)
+                from ..utils.config import has_database_credentials
+                has_memory = getattr(cached, "memory", None) is not None
+                db_available = getattr(cached, "_db_available", False)
+                if not has_memory and not db_available and has_database_credentials(self.config):
+                    log.info(
+                        "Discarding cached instance with failed memory init for %s/%s/%s — retrying",
+                        model_alias, bot_id, user_id,
+                    )
+                    discard = True
+
+            if discard:
+                del self._llm_bawt_cache[cache_key]
+            else:
+                log.cache_hit("llm_bawt", f"{model_alias}/{bot_id}/{user_id}")
+                log.debug(f"Reusing cached ServiceLLMBawt instance for {cache_key}")
+                return cached
 
         log.cache_miss("llm_bawt", f"{model_alias}/{bot_id}/{user_id}")
 

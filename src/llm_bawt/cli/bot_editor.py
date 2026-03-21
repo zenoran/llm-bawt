@@ -220,6 +220,9 @@ def edit_bot_yaml(config: Config, bot_slug: str) -> bool:
         "color": edited_color,
         "default_voice": out.get("default_voice"),
         "nextcloud_config": out.get("nextcloud", raw.get("nextcloud")),
+        "bot_type": raw.get("bot_type", bot.bot_type),
+        "agent_backend": bot.agent_backend,
+        "agent_backend_config": raw.get("agent_backend_config", bot.agent_backend_config),
     }
 
     client = _get_service_client(config)

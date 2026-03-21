@@ -13,6 +13,8 @@ from typing import Any
 
 import yaml
 
+from .bot_types import normalize_bot_type
+
 logger = logging.getLogger(__name__)
 
 # Path to the repo bots.yaml file (in the same directory as this module)
@@ -56,12 +58,14 @@ class Bot:
     color: str | None = None  # Optional Rich color name for CLI panel styling
     avatar: str | None = None  # Optional emoji or image URL for bot avatar
     nextcloud: dict | None = None  # Nextcloud integration config (bot_id, secret, etc.)
+    bot_type: str = "chat"  # High-level bot type (chat or agent)
     agent_backend: str | None = None  # External agent backend slug (e.g. "openclaw")
     agent_backend_config: dict[str, Any] = field(default_factory=dict)  # Backend-specific config
     settings: dict[str, Any] = field(default_factory=dict)  # Effective bot settings (template + overrides)
     
     def __post_init__(self):
         self.slug = self.slug.lower().strip()
+        self.bot_type = normalize_bot_type(self.bot_type, self.agent_backend)
 
 
 @dataclass
@@ -203,6 +207,7 @@ def _load_db_bot_overrides() -> dict[str, dict[str, Any]]:
                 entry["default_voice"] = row.default_voice
             if row.nextcloud_config is not None:
                 entry["nextcloud"] = row.nextcloud_config
+            entry["bot_type"] = normalize_bot_type(getattr(row, "bot_type", None), row.agent_backend)
             if row.agent_backend is not None:
                 entry["agent_backend"] = row.agent_backend
             if row.agent_backend_config is not None:
@@ -263,6 +268,11 @@ def _build_bots_from_data(
     for slug, bot_data in effective_bots.items():
         effective_settings = _build_settings(bot_data)
         merged_bot_data = dict(bot_data)
+        resolved_bot_type = normalize_bot_type(
+            bot_data.get("bot_type"),
+            bot_data.get("agent_backend"),
+        )
+        merged_bot_data["bot_type"] = resolved_bot_type
         merged_bot_data["settings"] = effective_settings
         raw_data[slug] = merged_bot_data
         bot_color = bot_data.get("color") or effective_settings.get("ui_color")
@@ -283,6 +293,7 @@ def _build_bots_from_data(
             color=bot_color,
             avatar=bot_data.get("avatar"),
             nextcloud=bot_data.get("nextcloud"),
+            bot_type=resolved_bot_type,
             agent_backend=bot_data.get("agent_backend"),
             agent_backend_config=bot_data.get("agent_backend_config") or {},
             settings=effective_settings,

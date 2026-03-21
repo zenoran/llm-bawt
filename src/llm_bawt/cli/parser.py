@@ -46,7 +46,14 @@ def parse_arguments(config_obj: "Config") -> argparse.Namespace:
         type=str,
         choices=['ollama', 'openai', 'gguf', 'vllm', 'openclaw'],
         metavar="TYPE",
-        help="Add models: 'ollama' (refresh from server), 'openai' (query API), 'gguf' (add from HuggingFace repo), 'vllm' (add vLLM model from HuggingFace), 'openclaw' (add OpenClaw bot profile)"
+        help="Add models: 'ollama' (refresh from server), 'openai' (query API), 'gguf' (add from HuggingFace repo), 'vllm' (add vLLM model from HuggingFace), 'openclaw' (deprecated: use --add-bot openclaw)"
+    )
+    parser.add_argument(
+        "--add-bot",
+        type=str,
+        choices=["chat", "openclaw"],
+        metavar="TYPE",
+        help="Add bots: 'chat' (create a chat bot profile), 'openclaw' (create an OpenClaw agent bot)"
     )
     parser.add_argument(
         "--delete-model",

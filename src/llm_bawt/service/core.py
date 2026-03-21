@@ -80,10 +80,46 @@ class ServiceLLMBawt(BaseLLMBawt):
         if isinstance(self.client, AgentBackendClient) and self.bot.agent_backend_config:
             self.client._bot_config = self.bot.agent_backend_config
 
+    def _init_history(self):
+        """Ensure history always persists to PostgreSQL, even in local_mode.
+
+        The base implementation uses ``self.memory`` for the DB backend,
+        which is None in local_mode.  Here we create a lightweight memory
+        client solely for history persistence so that ``local_mode`` only
+        controls *prompt augmentation*, not *persistence*.
+        """
+        db_backend = None
+        if self.memory:
+            db_backend = self.memory.get_short_term_manager()
+        elif has_database_credentials(self.config):
+            try:
+                from ..memory_server.client import get_memory_client
+                _history_client = get_memory_client(
+                    config=self.config,
+                    bot_id=self.bot_id,
+                    user_id=self.user_id,
+                    server_url=getattr(self.config, "MEMORY_SERVER_URL", None),
+                )
+                db_backend = _history_client.get_short_term_manager()
+                self._db_available = True
+                logger.debug("History-only DB backend initialized for %s (local_mode=%s)", self.bot_id, self.local_mode)
+            except Exception as e:
+                logger.warning("Failed to init history DB backend: %s", e)
+
+        from ..utils.history import HistoryManager
+        self.history_manager = HistoryManager(
+            client=self.client,
+            config=self.config,
+            db_backend=db_backend,
+            bot_id=self.bot_id,
+            settings_getter=self._resolve_setting,
+        )
+        self.load_history()
+
     def _init_memory(self, config: Config):
         """Initialize memory client and profile manager for service-side operation."""
         if self.local_mode:
-            logger.debug("Local mode enabled - using filesystem for history")
+            logger.debug("Local mode enabled - skipping memory augmentation")
             return
 
         if not has_database_credentials(config):

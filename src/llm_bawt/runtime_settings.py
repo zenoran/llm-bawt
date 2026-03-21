@@ -19,6 +19,7 @@ from sqlalchemy.dialects.postgresql import JSONB
 from sqlmodel import Field, Session, SQLModel, create_engine, select
 
 from .utils.config import Config, has_database_credentials
+from .bot_types import normalize_bot_type
 
 if TYPE_CHECKING:
     from .bots import Bot
@@ -70,6 +71,7 @@ class BotProfile(SQLModel, table=True):
     avatar: str | None = Field(default=None, sa_column=Column(String(512), nullable=True))
     default_voice: str | None = Field(default=None, sa_column=Column(String(128), nullable=True))
     nextcloud_config: dict[str, Any] | None = Field(default=None, sa_column=Column(JSONB, nullable=True))
+    bot_type: str | None = Field(default=None, sa_column=Column(String(32), nullable=True))
     agent_backend: str | None = Field(default=None, sa_column=Column(String(128), nullable=True))
     agent_backend_config: dict[str, Any] | None = Field(default=None, sa_column=Column(JSONB, nullable=True))
     created_at: datetime = Field(
@@ -122,6 +124,7 @@ class BotProfileStore:
 
         migrations = [
             "ALTER TABLE bot_profiles ADD COLUMN IF NOT EXISTS color VARCHAR(64)",
+            "ALTER TABLE bot_profiles ADD COLUMN IF NOT EXISTS bot_type VARCHAR(32)",
             "ALTER TABLE bot_profiles ADD COLUMN IF NOT EXISTS agent_backend VARCHAR(128)",
             "ALTER TABLE bot_profiles ADD COLUMN IF NOT EXISTS agent_backend_config JSONB",
             "ALTER TABLE bot_profiles ADD COLUMN IF NOT EXISTS tts_mode BOOLEAN DEFAULT FALSE",
@@ -170,6 +173,9 @@ class BotProfileStore:
         now = datetime.now(timezone.utc)
         with Session(self.engine) as session:
             row = session.exec(select(BotProfile).where(BotProfile.slug == slug)).first()
+            payload_agent_backend = payload.get("agent_backend") if "agent_backend" in payload else None
+            if isinstance(payload_agent_backend, str):
+                payload_agent_backend = payload_agent_backend.strip().lower() or None
             if row is None:
                 row = BotProfile(
                     slug=slug,
@@ -188,7 +194,8 @@ class BotProfileStore:
                     avatar=payload.get("avatar"),
                     default_voice=payload.get("default_voice"),
                     nextcloud_config=payload.get("nextcloud_config"),
-                    agent_backend=payload.get("agent_backend"),
+                    bot_type=normalize_bot_type(payload.get("bot_type"), payload_agent_backend),
+                    agent_backend=payload_agent_backend,
                     agent_backend_config=payload.get("agent_backend_config"),
                     created_at=now,
                     updated_at=now,
@@ -214,11 +221,17 @@ class BotProfileStore:
                     row.default_voice = payload["default_voice"]
                 if payload.get("nextcloud_config") is not None:
                     row.nextcloud_config = payload["nextcloud_config"]
-                # Only overwrite agent_backend fields if explicitly provided (not None)
-                if payload.get("agent_backend") is not None:
-                    row.agent_backend = payload["agent_backend"]
-                if payload.get("agent_backend_config") is not None:
+                if "agent_backend" in payload:
+                    row.agent_backend = payload_agent_backend
+                    if payload_agent_backend is None and "agent_backend_config" not in payload:
+                        row.agent_backend_config = {}
+                if "agent_backend_config" in payload:
                     row.agent_backend_config = payload["agent_backend_config"]
+                if "bot_type" in payload or "agent_backend" in payload or not row.bot_type:
+                    row.bot_type = normalize_bot_type(
+                        payload.get("bot_type") if "bot_type" in payload else row.bot_type,
+                        row.agent_backend,
+                    )
                 row.updated_at = now
 
             session.add(row)
@@ -266,6 +279,12 @@ class BotProfileStore:
                 "uses_home_assistant": bot_data.get("uses_home_assistant", False),
                 "default_model": bot_data.get("default_model"),
                 "nextcloud_config": bot_data.get("nextcloud"),
+                "bot_type": normalize_bot_type(
+                    bot_data.get("bot_type"),
+                    bot_data.get("agent_backend"),
+                ),
+                "agent_backend": bot_data.get("agent_backend"),
+                "agent_backend_config": bot_data.get("agent_backend_config"),
             }
             self.upsert(payload)
             seeded += 1

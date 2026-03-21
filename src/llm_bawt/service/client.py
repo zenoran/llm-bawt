@@ -783,6 +783,40 @@ class ServiceClient:
             logger.warning(f"List bots via service failed: {e}")
         return None
 
+    def create_bot(self, data: dict[str, Any]) -> dict[str, Any] | None:
+        """Create a new bot profile via the service."""
+        if not self.is_available():
+            return None
+        import urllib.error
+
+        slug = str(data.get("slug") or "").strip().lower()
+        try:
+            return self._request("POST", "/v1/bots", data=data)
+        except urllib.error.HTTPError as e:
+            if e.code in (404, 405) and slug:
+                existing = self.get_bot_profile(slug)
+                if existing is not None:
+                    self.last_error = (
+                        f"Bot '{slug}' already exists. "
+                        "Legacy service fallback refused to overwrite it."
+                    )
+                    logger.warning(self.last_error)
+                    return None
+
+                legacy_payload = dict(data)
+                legacy_payload.pop("slug", None)
+                result = self.upsert_bot_profile(slug, legacy_payload)
+                if result is not None:
+                    self.last_error = (
+                        "Connected service does not support POST /v1/bots yet; "
+                        f"used legacy PUT /v1/bots/{slug}/profile fallback."
+                    )
+                    logger.warning(self.last_error)
+                    return result
+        except Exception as e:
+            logger.warning(f"Create bot via service failed: {e}")
+            return None
+
     # -----------------------------------------------------------------
     # Jobs (GET /v1/jobs, GET /v1/jobs/runs)
     # -----------------------------------------------------------------

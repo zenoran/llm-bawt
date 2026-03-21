@@ -123,7 +123,7 @@ The bridge also handles history persistence for non-API runs (e.g., messages sen
 ### Interactive wizard
 
 ```bash
-llm --add-model openclaw
+llm --add-bot openclaw
 ```
 
 This discovers available sessions from the gateway, lets you pick or enter a custom session key, and creates a bot profile directly.
@@ -133,9 +133,11 @@ This discovers available sessions from the gateway, lets you pick or enter a cus
 Create bot profile via API:
 
 ```bash
-curl -X PUT http://localhost:8642/v1/bots/mybot/profile \
+curl -X POST http://localhost:8642/v1/bots \
   -H "Content-Type: application/json" \
   -d '{
+    "slug": "mybot",
+    "bot_type": "agent",
     "name": "My Bot",
     "system_prompt": "You are a helpful assistant.",
     "agent_backend": "openclaw",
@@ -146,7 +148,7 @@ curl -X PUT http://localhost:8642/v1/bots/mybot/profile \
   }'
 ```
 
-Then restart the service (or call `/v1/models/reload`) to register the virtual model.
+Then restart the service (or call `/v1/admin/reload-bots`) to refresh bot state if needed. The service will still register the internal virtual model automatically for agent bots.
 
 ## Running
 

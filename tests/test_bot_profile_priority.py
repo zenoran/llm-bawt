@@ -60,6 +60,20 @@ def test_db_bot_profile_overrides_yaml(monkeypatch, tmp_path: Path) -> None:
             "default_model": None,
             "nextcloud": None,
         },
+        "claw": {
+            "name": "Claw",
+            "description": "openclaw agent bot",
+            "system_prompt": "claw prompt",
+            "requires_memory": True,
+            "voice_optimized": False,
+            "uses_tools": False,
+            "uses_search": False,
+            "uses_home_assistant": False,
+            "default_model": None,
+            "nextcloud": None,
+            "agent_backend": "openclaw",
+            "agent_backend_config": {"session_key": "agent:claw:main"},
+        },
     }
 
     def fake_load_yaml_file(path: Path) -> dict[str, Any]:
@@ -83,6 +97,7 @@ def test_db_bot_profile_overrides_yaml(monkeypatch, tmp_path: Path) -> None:
     assert nova.requires_memory is False
     assert nova.voice_optimized is True
     assert nova.default_model == "db-model"
+    assert nova.bot_type == "chat"
     assert nova.color == "red"  # Keep YAML-presentational metadata.
     assert nova.settings["temperature"] == 0.8  # Keep YAML settings.
     assert bots_module.get_raw_bot_data("nova")["nextcloud"]["bot_id"] == "nc-nova"
@@ -90,8 +105,15 @@ def test_db_bot_profile_overrides_yaml(monkeypatch, tmp_path: Path) -> None:
     ember = bots_module.get_bot("ember")
     assert ember is not None
     assert ember.system_prompt == "ember prompt"
+    assert ember.bot_type == "chat"
     assert ember.settings["temperature"] == 0.55
     assert ember.color == "blue"
+
+    claw = bots_module.get_bot("claw")
+    assert claw is not None
+    assert claw.bot_type == "agent"
+    assert claw.agent_backend == "openclaw"
+    assert bots_module.get_raw_bot_data("claw")["bot_type"] == "agent"
 
 
 def test_background_service_invalidates_bot_instances() -> None:
