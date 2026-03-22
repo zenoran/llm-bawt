@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import threading
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -90,7 +91,9 @@ class OpenClawBackend(AgentBackend):
 
     def __init__(self) -> None:
         self._config = Config()
-        self._last_stream_result: OpenClawResult | None = None
+        # Per-request state is stored in threading.local to avoid races
+        # between concurrent stream_raw() calls (e.g. different bots).
+        self._thread_local = threading.local()
         self._active_request_id: str | None = None
 
     def _resolve_session_key(self, config: dict) -> str:
@@ -253,7 +256,7 @@ class OpenClawBackend(AgentBackend):
                 request_id,
             )
             full_text = "".join(text_parts)
-            self._last_stream_result = OpenClawResult(
+            result = OpenClawResult(
                 text=full_text,
                 model="openclaw",
                 provider="openclaw-bridge",
@@ -261,9 +264,10 @@ class OpenClawBackend(AgentBackend):
                 tool_calls=tool_calls,
                 raw={"request_id": request_id, "termination_reason": termination_reason},
             )
+            self._thread_local.last_stream_result = result
 
     def get_last_stream_result(self) -> OpenClawResult | None:
-        return self._last_stream_result
+        return getattr(self._thread_local, "last_stream_result", None)
 
     # ----- public API -----------------------------------------------------
 

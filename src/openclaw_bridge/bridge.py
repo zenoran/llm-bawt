@@ -32,6 +32,10 @@ class SessionBridge:
         self._run_tool_calls: dict[str, list[dict]] = {}  # run_id -> tool calls
         self._session_to_bot: dict[str, str] = session_to_bot or {}
         self._command_task: asyncio.Task | None = None
+        # Per-session locks — the gateway processes one run at a time per
+        # session, so we serialize sends to avoid _run_queues overwrites
+        # and history-fallback returning a stale prior response.
+        self._session_locks: dict[str, asyncio.Lock] = {}
         # When the live run stream ends without assistant text, poll history
         # briefly to recover replies produced by upstream provider fallback.
         self._history_reply_timeout_s = 45.0
@@ -157,111 +161,120 @@ class SessionBridge:
             request_id, session_key, message,
         )
 
-        try:
-            bot_id = self._resolve_bot_id(session_key)
-            # Resolve user_id — for now use "default" as bridge doesn't track per-user
-            unified_user_id = "default"
-            saw_assistant_text = False
+        # Serialize sends per session — the gateway queues messages in the
+        # same run when concurrent sends arrive, causing _run_queues overwrites
+        # and history-fallback returning the wrong response.
+        lock = self._session_locks.get(session_key)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._session_locks[session_key] = lock
 
-            async for raw_event in self._ws_client.send_and_stream(
-                session_key, message, attachments=attachments,
-            ):
-                # Parse through ingest pipeline to get structured event
-                event = self._ingest.parse(raw_event, session_key)
-                if event is not None:
-                    if event.kind == OpenClawEventKind.ASSISTANT_DELTA and event.text:
-                        saw_assistant_text = True
+        async with lock:
+            try:
+                bot_id = self._resolve_bot_id(session_key)
+                # Resolve user_id — for now use "default" as bridge doesn't track per-user
+                unified_user_id = "default"
+                saw_assistant_text = False
 
-                    # If ASSISTANT_DONE carries inline text but no deltas
-                    # were streamed, emit a synthetic delta so the consumer
-                    # sees the text.  Do NOT fall back to chat history —
-                    # that risks replaying a stale response from a prior turn.
-                    if (
-                        event.kind == OpenClawEventKind.ASSISTANT_DONE
-                        and not saw_assistant_text
-                        and event.text
-                    ):
+                async for raw_event in self._ws_client.send_and_stream(
+                    session_key, message, attachments=attachments,
+                ):
+                    # Parse through ingest pipeline to get structured event
+                    event = self._ingest.parse(raw_event, session_key)
+                    if event is not None:
+                        if event.kind == OpenClawEventKind.ASSISTANT_DELTA and event.text:
+                            saw_assistant_text = True
+
+                        # If ASSISTANT_DONE carries inline text but no deltas
+                        # were streamed, emit a synthetic delta so the consumer
+                        # sees the text.  Do NOT fall back to chat history —
+                        # that risks replaying a stale response from a prior turn.
+                        if (
+                            event.kind == OpenClawEventKind.ASSISTANT_DONE
+                            and not saw_assistant_text
+                            and event.text
+                        ):
+                            saw_assistant_text = True
+                            self._publisher.publish_run_event(
+                                request_id,
+                                OpenClawEvent(
+                                    event_id=f"{event.event_id}:final-text",
+                                    session_key=event.session_key,
+                                    run_id=event.run_id,
+                                    kind=OpenClawEventKind.ASSISTANT_DELTA,
+                                    origin=event.origin,
+                                    text=event.text,
+                                    model=event.model,
+                                    seq=event.seq,
+                                    timestamp=event.timestamp,
+                                    raw=event.raw,
+                                ),
+                            )
+
+                        self._publisher.publish_run_event(request_id, event)
+
+                        # Also publish tool events to unified stream
+                        if bot_id and event.kind in (
+                            OpenClawEventKind.TOOL_START,
+                            OpenClawEventKind.TOOL_END,
+                        ):
+                            import time
+                            tool_event = {
+                                "_type": "tool_event",
+                                "event": "tool_start" if event.kind == OpenClawEventKind.TOOL_START else "tool_end",
+                                "tool_name": event.tool_name or "unknown",
+                                "run_id": event.run_id,
+                                "session_key": session_key,
+                                "ts": time.time(),
+                            }
+                            if event.kind == OpenClawEventKind.TOOL_START:
+                                tool_event["arguments"] = event.tool_arguments or {}
+                            else:
+                                tool_event["result"] = str(event.tool_result or "")[:2000]
+                            self._publisher.publish_unified_event(
+                                bot_id, unified_user_id, tool_event,
+                            )
+
+                if not saw_assistant_text:
+                    history_text = await self._wait_for_history_reply(session_key)
+                    if history_text:
                         saw_assistant_text = True
+                        logger.info(
+                            "Recovered assistant text from chat.history after empty stream: "
+                            "request_id=%s session=%s chars=%d",
+                            request_id, session_key, len(history_text),
+                        )
                         self._publisher.publish_run_event(
                             request_id,
                             OpenClawEvent(
-                                event_id=f"{event.event_id}:final-text",
-                                session_key=event.session_key,
-                                run_id=event.run_id,
+                                event_id=f"history_{request_id}",
+                                session_key=session_key,
+                                run_id=None,
                                 kind=OpenClawEventKind.ASSISTANT_DELTA,
-                                origin=event.origin,
-                                text=event.text,
-                                model=event.model,
-                                seq=event.seq,
-                                timestamp=event.timestamp,
-                                raw=event.raw,
+                                origin="bridge",
+                                text=history_text,
                             ),
                         )
 
-                    self._publisher.publish_run_event(request_id, event)
+                self._publisher.publish_run_done(request_id)
+                get_metrics().incr("openclaw.commands_completed")
+                logger.info("Send command completed: request_id=%s", request_id)
 
-                    # Also publish tool events to unified stream
-                    if bot_id and event.kind in (
-                        OpenClawEventKind.TOOL_START,
-                        OpenClawEventKind.TOOL_END,
-                    ):
-                        import time
-                        tool_event = {
-                            "_type": "tool_event",
-                            "event": "tool_start" if event.kind == OpenClawEventKind.TOOL_START else "tool_end",
-                            "tool_name": event.tool_name or "unknown",
-                            "run_id": event.run_id,
-                            "session_key": session_key,
-                            "ts": time.time(),
-                        }
-                        if event.kind == OpenClawEventKind.TOOL_START:
-                            tool_event["arguments"] = event.tool_arguments or {}
-                        else:
-                            tool_event["result"] = str(event.tool_result or "")[:2000]
-                        self._publisher.publish_unified_event(
-                            bot_id, unified_user_id, tool_event,
-                        )
-
-            if not saw_assistant_text:
-                history_text = await self._wait_for_history_reply(session_key)
-                if history_text:
-                    saw_assistant_text = True
-                    logger.info(
-                        "Recovered assistant text from chat.history after empty stream: "
-                        "request_id=%s session=%s chars=%d",
-                        request_id, session_key, len(history_text),
-                    )
-                    self._publisher.publish_run_event(
-                        request_id,
-                        OpenClawEvent(
-                            event_id=f"history_{request_id}",
-                            session_key=session_key,
-                            run_id=None,
-                            kind=OpenClawEventKind.ASSISTANT_DELTA,
-                            origin="bridge",
-                            text=history_text,
-                        ),
-                    )
-
-            self._publisher.publish_run_done(request_id)
-            get_metrics().incr("openclaw.commands_completed")
-            logger.info("Send command completed: request_id=%s", request_id)
-
-        except Exception as e:
-            logger.exception("Send command failed: request_id=%s", request_id)
-            # Publish error event
-            err_event = OpenClawEvent(
-                event_id=f"err_{request_id}",
-                session_key=session_key,
-                run_id=None,
-                kind=OpenClawEventKind.ERROR,
-                origin="bridge",
-                text=str(e),
-            )
-            self._publisher.publish_run_event(request_id, err_event)
-            self._publisher.publish_run_done(request_id)
-        finally:
-            await async_redis.xack(COMMANDS_STREAM, "bridge", msg_id)
+            except Exception as e:
+                logger.exception("Send command failed: request_id=%s", request_id)
+                # Publish error event
+                err_event = OpenClawEvent(
+                    event_id=f"err_{request_id}",
+                    session_key=session_key,
+                    run_id=None,
+                    kind=OpenClawEventKind.ERROR,
+                    origin="bridge",
+                    text=str(e),
+                )
+                self._publisher.publish_run_event(request_id, err_event)
+                self._publisher.publish_run_done(request_id)
+            finally:
+                await async_redis.xack(COMMANDS_STREAM, "bridge", msg_id)
 
     async def _handle_rpc_command(
         self, fields: dict, msg_id: str, async_redis
