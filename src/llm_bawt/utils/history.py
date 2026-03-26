@@ -111,8 +111,7 @@ class HistoryManager:
         except Exception as e:
             self.client.console.print(f"[bold red]Error loading history:[/bold red] {e}")
         if since_minutes is not None and self.messages:
-            # Note: since_minutes is actually in seconds for backward compatibility
-            # (HISTORY_DURATION is in seconds, not minutes)
+            # Note: since_minutes param is actually in seconds (legacy naming)
             logger.debug(f"Loading history from {since_minutes} seconds ago ({len(self.messages)} messages)")
             cutoff = time.time() - since_minutes
             self.messages = [msg for msg in self.messages if msg.timestamp >= cutoff]
@@ -137,10 +136,6 @@ class HistoryManager:
         """Reduce summary verbosity for prompt context while preserving key continuity."""
         text = (content or "").strip()
         if not text:
-            return text
-
-        # Pass through active-session summaries unchanged.
-        if text.startswith("[ACTIVE SESSION SUMMARY]"):
             return text
 
         compact_enabled = bool(
@@ -195,7 +190,7 @@ class HistoryManager:
         Includes (in order):
         - System messages (always)
         - Summaries of older sessions (role='summary') with time context
-        - Recent messages (within HISTORY_DURATION)
+        - Recent messages (newest-first within token budget)
 
         If max_tokens > 0, applies a token budget:
         1. System messages are always included
@@ -206,51 +201,32 @@ class HistoryManager:
             max_tokens: Maximum token budget for the returned messages.
                         0 = no limit (backward-compatible default).
         """
-        import time
-        history_duration = int(self._setting("history_duration_seconds", self.config.HISTORY_DURATION_SECONDS))
-        cutoff = time.time() - history_duration
         system_messages = []
         summary_messages = []
-        recent_messages = []
-        older_messages = []
-        
+        regular_messages = []
+
         for msg in self.messages:
             if msg.role == "system":
                 system_messages.append(msg)
             elif msg.role == "summary":
-                if msg.content.startswith("[ACTIVE SESSION SUMMARY]"):
-                    enhanced_content = msg.content
-                else:
-                    # Add time context to historical summaries
-                    time_ago = self._format_time_ago(msg.timestamp)
-                    compact_summary = self._compact_summary_content(msg.content)
-                    enhanced_content = f"[Previous conversation {time_ago}]\n{compact_summary}"
+                # Add time context to summaries
+                time_ago = self._format_time_ago(msg.timestamp)
+                compact_summary = self._compact_summary_content(msg.content)
+                enhanced_content = f"[Previous conversation {time_ago}]\n{compact_summary}"
                 summary_messages.append(Message(
                     role="summary",
                     content=enhanced_content,
                     timestamp=msg.timestamp
                 ))
-            elif msg.timestamp >= cutoff:
-                # Recent messages
-                recent_messages.append(msg)
             else:
-                older_messages.append(msg)
+                regular_messages.append(msg)
 
-        # Bridge continuity gaps around the cutoff to avoid abrupt jumps into summaries.
-        bridge_count = max(
-            0,
-            int(self._setting("history_bridge_messages", getattr(self.config, "HISTORY_BRIDGE_MESSAGES", 4))),
-        )
-        if bridge_count > 0 and older_messages:
-            bridge_messages = older_messages[-bridge_count:]
-            recent_messages = bridge_messages + recent_messages
-        
         if not system_messages:
             system_messages.append(Message(role="system", content=self.config.SYSTEM_MESSAGE))
 
         # Without a token budget, return everything
         if max_tokens <= 0:
-            return system_messages + summary_messages + recent_messages
+            return system_messages + summary_messages + regular_messages
 
         # ── Token-budget enforcement ──────────────────────────────
         protected_turns = int(
@@ -260,9 +236,9 @@ class HistoryManager:
             )
         )
         # Protect the last N user+assistant pairs (= 2*N messages from the end)
-        n_protected = min(protected_turns * 2, len(recent_messages))
-        protected = recent_messages[-n_protected:] if n_protected > 0 else []
-        droppable = recent_messages[:-n_protected] if n_protected > 0 else list(recent_messages)
+        n_protected = min(protected_turns * 2, len(regular_messages))
+        protected = regular_messages[-n_protected:] if n_protected > 0 else []
+        droppable = regular_messages[:-n_protected] if n_protected > 0 else list(regular_messages)
 
         # Calculate baseline usage (system + protected)
         system_cost = estimate_messages_tokens(system_messages)
@@ -272,20 +248,13 @@ class HistoryManager:
 
         # Fill from summaries (oldest context → newest)
         included_summaries: list[Message] = []
-        active_summaries = [s for s in summary_messages if s.content.startswith("[ACTIVE SESSION SUMMARY]")]
-        historical_summaries = [s for s in summary_messages if not s.content.startswith("[ACTIVE SESSION SUMMARY]")]
         max_summaries = int(
             self._setting(
                 "summarization_max_in_context",
                 getattr(self.config, "SUMMARIZATION_MAX_IN_CONTEXT", 5),
             )
         )
-        for s in historical_summaries[-max_summaries:]:
-            cost = estimate_messages_tokens([s])
-            if used + cost <= budget:
-                included_summaries.append(s)
-                used += cost
-        for s in active_summaries[-1:]:
+        for s in summary_messages[-max_summaries:]:
             cost = estimate_messages_tokens([s])
             if used + cost <= budget:
                 included_summaries.append(s)

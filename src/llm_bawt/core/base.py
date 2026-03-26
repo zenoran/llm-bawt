@@ -276,9 +276,11 @@ class BaseLLMBawt(ABC):
         self.load_history()
     
     def load_history(self, since_minutes: int | None = None) -> list[dict]:
-        """Load conversation history."""
-        if since_minutes is None:
-            since_minutes = int(self._resolve_setting("history_duration_seconds", self.config.HISTORY_DURATION_SECONDS))
+        """Load conversation history.
+
+        With budget-driven summarization, all messages are loaded by default.
+        The token budget in get_context_messages() handles windowing.
+        """
         self.history_manager.load_history(since_minutes=since_minutes)
         return [msg.to_dict() for msg in self.history_manager.messages]
 

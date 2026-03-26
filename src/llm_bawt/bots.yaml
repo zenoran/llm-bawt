@@ -7,10 +7,8 @@
 bot_settings_template:
   max_context_tokens: 12000
   max_output_tokens: 4096
-  history_duration_seconds: 1800
-  history_bridge_messages: 4
   summarization_session_gap_seconds: 3600
-  summarization_min_messages: 4
+  summarization_min_messages_per_session: 2
   summarization_max_in_context: 5
   summarization_compact_context: true
   memory_n_results: 10
@@ -123,8 +121,6 @@ bots:
     default_model: grok-4-fast
     settings:
       max_context_tokens: 10000
-      history_duration_seconds: 1800
-      history_bridge_messages: 12
       summarization_max_in_context: 16
       memory_n_results: 20
       memory_max_token_percent: 50

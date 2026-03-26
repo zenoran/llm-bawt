@@ -471,11 +471,20 @@ class BackgroundTasksMixin:
         bot_obj = bot_manager.get_bot(bot_id) or bot_manager.get_default_bot()
         resolver = RuntimeSettingsResolver(config=self.config, bot=bot_obj, bot_id=bot_id)
 
+        # Compute effective context budget from the resolved model
+        max_context_tokens = 0
+        if model_alias:
+            ctx_window = int(self.config.get_model_context_window(model_alias) or 0)
+            max_output = int(self.config.get_model_max_tokens(model_alias) or 4096)
+            if ctx_window > 0:
+                max_context_tokens = ctx_window - max_output
+
         summarizer = HistorySummarizer(
             self.config,
             bot_id=bot_id,
             summarize_fn=summarize_with_loaded_client,
             settings_getter=resolver.resolve,
+            max_context_tokens=max_context_tokens,
         )
 
         loop = asyncio.get_event_loop()

@@ -84,4 +84,4 @@ class OpenClawEvent:
 def synthesize_event_id(session_key: str, event_type: str, data: dict, stream_seq: int) -> str:
     canonical = json.dumps(data, sort_keys=True, ensure_ascii=False, default=str)
     payload = f"{session_key}:{event_type}:{canonical}:{stream_seq}"
-    return hashlib.sha256(payload.encode()).hexdigest()
+    return hashlib.sha256(payload.encode("utf-8", errors="surrogateescape")).hexdigest()

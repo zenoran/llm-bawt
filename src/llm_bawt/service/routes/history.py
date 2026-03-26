@@ -347,8 +347,9 @@ async def get_history(
         # Get all messages then paginate in-memory (includes both embedded and MCP server modes).
         messages = client.get_messages(since_seconds=None)
 
-        # Filter out system messages and normalize chronological ordering.
-        visible_messages = [m for m in messages if m.get("role") != "system"]
+        # Filter out system and summary messages and normalize chronological ordering.
+        # Summaries have their own endpoint at /v1/history/summaries.
+        visible_messages = [m for m in messages if m.get("role") not in ("system", "summary")]
         visible_messages.sort(key=lambda m: (float(m.get("timestamp") or 0.0), str(m.get("id") or "")))
 
         # Resolve `before` cursor to timestamp cutoff.
@@ -434,7 +435,7 @@ async def search_history(
         
         matching = [
             msg for msg in messages
-            if msg.get("role") != "system" and query_lower in msg.get("content", "").lower()
+            if msg.get("role") not in ("system", "summary") and query_lower in msg.get("content", "").lower()
         ]
         
         # Apply limit
@@ -532,7 +533,16 @@ async def preview_summarizable_sessions(
     effective_bot_id = bot_id or service._default_bot
 
     try:
-        summarizer = HistorySummarizer(service.config, effective_bot_id)
+        # Compute context budget for budget-driven eligibility
+        ctx_window = int(service.config.get_model_context_window(None) or 0)
+        max_output = int(service.config.get_model_max_tokens(None) or 4096)
+        max_context_tokens = max(0, ctx_window - max_output) if ctx_window > 0 else 0
+
+        summarizer = HistorySummarizer(
+            service.config,
+            effective_bot_id,
+            max_context_tokens=max_context_tokens,
+        )
         sessions = summarizer.preview_summarizable_sessions()
 
         session_infos = []
@@ -584,11 +594,21 @@ async def summarize_history(
             user_id="system",
             model=model,
         )
+        # Compute context budget from model
+        resolved_model = model or getattr(service, '_default_model', None)
+        max_prompt_tokens, max_chunk_tokens_resolved = _resolve_summarization_limits(service, resolved_model)
+        if max_chunk_tokens == 0:
+            max_chunk_tokens = max_chunk_tokens_resolved
+        ctx_window = int(service.config.get_model_context_window(resolved_model) or 0)
+        max_output = int(service.config.get_model_max_tokens(resolved_model) or 4096)
+        max_context_tokens = max(0, ctx_window - max_output) if ctx_window > 0 else 0
+
         summarizer = HistorySummarizer(
-            service.config, 
+            service.config,
             effective_bot_id,
             summarize_fn=summarize_with_loaded_client,
             summarize_batch_fn=summarize_batch_with_loaded_client,
+            max_context_tokens=max_context_tokens,
         )
         result = summarizer.summarize_eligible_sessions(
             use_heuristic_fallback=use_heuristic,
@@ -632,11 +652,18 @@ async def rebuild_history_summaries(
             user_id="system",
             model=model,
         )
+        # Compute context budget from model
+        resolved_model = model or getattr(service, '_default_model', None)
+        ctx_window = int(service.config.get_model_context_window(resolved_model) or 0)
+        max_output = int(service.config.get_model_max_tokens(resolved_model) or 4096)
+        max_context_tokens = max(0, ctx_window - max_output) if ctx_window > 0 else 0
+
         summarizer = HistorySummarizer(
             service.config,
             effective_bot_id,
             summarize_fn=summarize_with_loaded_client,
             summarize_batch_fn=summarize_batch_with_loaded_client,
+            max_context_tokens=max_context_tokens,
         )
         result = summarizer.rebuild_recent_sessions(
             session_limit=sessions,

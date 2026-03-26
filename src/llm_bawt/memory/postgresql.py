@@ -1951,19 +1951,20 @@ class PostgreSQLShortTermManager:
             return session.execute(stmt).scalar() or 0
 
     def get_messages(self, since_minutes: int | None = None, include_summaries: bool = True) -> list:
-        """Get messages, optionally filtered by time.
+        """Get messages with smart summary filtering.
 
-        When include_summaries is True (default), applies smart filtering:
-        - Recent messages (within since_minutes): included as-is
-        - Older messages: skipped if summarized=TRUE, but summaries (role='summary') are included
+        When include_summaries is True (default), returns:
+        - All summary rows (role='summary')
+        - All unsummarized user/assistant/system messages
+        - Excludes messages with summarized=TRUE (their content is in a summary)
 
-        This allows summaries to condense older history while keeping recent context intact.
+        This prevents double-loading: raw messages that have been summarized
+        won't appear alongside their summaries.
 
         Args:
-            since_minutes: If provided, only return messages from the last N seconds
-                          (note: despite the name, this is actually in seconds for
-                          backward compatibility with HISTORY_DURATION).
-            include_summaries: If True, include summary rows for older sessions
+            since_minutes: If provided, only return messages from the last N seconds.
+                          When None, returns all messages (token budget handles windowing).
+            include_summaries: If True, include summary rows and exclude summarized messages.
 
         Returns:
             List of Message objects.
@@ -1971,31 +1972,32 @@ class PostgreSQLShortTermManager:
         from ..models.message import Message
 
         with self._backend.engine.connect() as conn:
-            if since_minutes is not None and include_summaries:
-                # Smart filtering: recent messages + older summaries
-                cutoff = time.time() - since_minutes
-
-                # Query: get recent messages OR summaries of older sessions
-                # Exclude old messages that have been summarized
-                sql = text(f"""
+            if include_summaries:
+                # Smart filtering: summaries + unsummarized messages
+                sql = f"""
                     SELECT id, role, content, timestamp
                     FROM {self._backend._messages_table_name}
                     WHERE
-                        -- Recent messages (within history window)
-                        (timestamp >= :cutoff)
+                        (role = 'summary')
                         OR
-                        -- Summaries of older sessions
-                        (role = 'summary' AND timestamp < :cutoff)
-                    ORDER BY timestamp ASC
-                """)
-                rows = conn.execute(sql, {"cutoff": cutoff}).fetchall()
+                        (role != 'summary' AND (summarized IS NULL OR summarized = FALSE))
+                """
+                params: dict = {}
+
+                if since_minutes is not None:
+                    cutoff = time.time() - since_minutes
+                    sql += " AND (timestamp >= :cutoff OR role = 'summary')"
+                    params["cutoff"] = cutoff
+
+                sql += " ORDER BY timestamp ASC"
+                rows = conn.execute(text(sql), params).fetchall()
 
                 return [
                     Message(role=row.role, content=row.content, timestamp=row.timestamp, db_id=row.id)
                     for row in rows
                 ]
             else:
-                # Simple time-based filtering (original behavior)
+                # Raw messages only (no summary filtering)
                 stmt = (
                     select(self._backend.messages_table)
                     .order_by(self._backend.messages_table.c.timestamp.asc())

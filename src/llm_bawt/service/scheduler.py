@@ -376,7 +376,20 @@ class JobScheduler:
         try:
             from ..memory.summarization import HistorySummarizer
 
-            summarizer = HistorySummarizer(self.task_processor.config, bot_id=bot_id)
+            config = self.task_processor.config
+            # Resolve context budget from the bot's default model
+            max_context_tokens = int(getattr(config, "MAX_CONTEXT_TOKENS", 0) or 0)
+            if max_context_tokens <= 0:
+                ctx_window = config.get_model_context_window(None)
+                max_output = getattr(config, "MAX_OUTPUT_TOKENS", 4096)
+                if ctx_window > 0:
+                    max_context_tokens = ctx_window - max_output
+
+            summarizer = HistorySummarizer(
+                config,
+                bot_id=bot_id,
+                max_context_tokens=max_context_tokens,
+            )
             eligible_sessions = summarizer.preview_summarizable_sessions()
             count = len(eligible_sessions)
             return count > 0, count

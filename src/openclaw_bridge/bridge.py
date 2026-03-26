@@ -171,6 +171,8 @@ class SessionBridge:
 
         async with lock:
             try:
+                # Clear any previous cancel signal before starting a new send
+                self._ws_client.clear_session_cancel(session_key)
                 bot_id = self._resolve_bot_id(session_key)
                 # Resolve user_id — for now use "default" as bridge doesn't track per-user
                 unified_user_id = "default"
@@ -299,6 +301,13 @@ class SessionBridge:
         logger.info("Handling RPC command: method=%s request_id=%s", method, request_id)
 
         try:
+            # If this is a chat.abort, signal the active send_and_stream to stop
+            # so the session lock is released and the next send can proceed.
+            if method == "chat.abort":
+                params_session = params.get("sessionKey", "")
+                if params_session:
+                    self._ws_client.cancel_session(params_session)
+
             res = await self._ws_client._request(method, params)
             payload = res.get("payload", {})
             self._publisher.publish_rpc_result(request_id, {"ok": True, "payload": payload})

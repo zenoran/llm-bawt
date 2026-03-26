@@ -36,6 +36,8 @@ class OpenClawWsClient:
         self._stream_seq = 0
         self._pending_requests: dict[str, asyncio.Future] = {}
         self._run_queues: dict[str, asyncio.Queue[dict | None]] = {}
+        # Per-session cancel events — set by chat.abort to unblock send_and_stream
+        self._session_cancel_events: dict[str, asyncio.Event] = {}
 
     async def connect(self) -> None:
         if not self._config.url:
@@ -252,9 +254,21 @@ class OpenClawWsClient:
         queue: asyncio.Queue[dict | None] = asyncio.Queue(maxsize=2000)
         self._run_queues[run_id] = queue
 
+        # Ensure a cancel event exists for this session so cancel_session()
+        # can signal it.  We grab the reference once; cancel_session() sets
+        # the same Event object.
+        if session_key not in self._session_cancel_events:
+            self._session_cancel_events[session_key] = asyncio.Event()
+        cancel_event = self._session_cancel_events[session_key]
+
         try:
             deadline = (asyncio.get_event_loop().time() + timeout) if timeout else None
             while True:
+                # Check if session was cancelled (chat.abort)
+                if cancel_event and cancel_event.is_set():
+                    logger.info("send_and_stream cancelled via chat.abort for run %s session=%s", run_id, session_key)
+                    return
+
                 if deadline is not None:
                     remaining = deadline - asyncio.get_event_loop().time()
                     if remaining <= 0:
@@ -302,6 +316,25 @@ class OpenClawWsClient:
 
     def on_event(self, callback: Callable[[dict], Awaitable[None]]) -> None:
         self._event_callback = callback
+
+    def cancel_session(self, session_key: str) -> None:
+        """Signal any active send_and_stream for this session to stop.
+
+        Called when chat.abort is received so the bridge releases the
+        session lock and allows the next send to proceed.
+        """
+        event = self._session_cancel_events.get(session_key)
+        if event is None:
+            event = asyncio.Event()
+            self._session_cancel_events[session_key] = event
+        event.set()
+        logger.info("Session cancel signalled: %s", session_key)
+
+    def clear_session_cancel(self, session_key: str) -> None:
+        """Reset the cancel event for a session before a new send."""
+        event = self._session_cancel_events.get(session_key)
+        if event is not None:
+            event.clear()
 
     @property
     def connected(self) -> bool:

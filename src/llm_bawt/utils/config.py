@@ -107,17 +107,11 @@ class RuntimeTunables(BaseModel):
     # --- Context & History --- #
     MAX_CONTEXT_TOKENS: int = Field(default=0, description="Total token budget for the prompt (system + history + memory). 0 = auto from model context window.")
     MAX_OUTPUT_TOKENS: int = Field(default=1024 * 4, description="Max tokens the model may generate per reply")
-    HISTORY_DURATION_SECONDS: int = Field(default=60 * 30, description="How far back (seconds) to load raw chat history. Older messages only available as summaries. (1800 = 30 min)")
-    HISTORY_BRIDGE_MESSAGES: int = Field(default=4, description="Most-recent messages always kept in context even beyond the duration window")
     HISTORY_RELOAD_TTL_SECONDS: float = Field(default=2.0, description="How long service history cache stays fresh before reloading from DB (0 = every request)")
 
-    # --- Summarization --- #
+    # --- Summarization (budget-driven) --- #
     SUMMARIZATION_SESSION_GAP_SECONDS: int = Field(default=3600, description="Gap (seconds) between messages that splits history into separate sessions (3600 = 1 hr)")
-    SUMMARIZATION_MIN_MESSAGES: int = Field(default=4, description="Minimum messages a session must have to be worth summarizing")
-    SUMMARIZATION_SKIP_LOW_SIGNAL: bool = Field(default=True, description="Skip low-value sessions (greetings/tests/noise) during summarization")
-    SUMMARIZATION_MIN_USER_MESSAGES: int = Field(default=2, description="Minimum user messages required before a session can be summarized")
-    SUMMARIZATION_MIN_CONTENT_CHARS: int = Field(default=160, description="Minimum total user+assistant content chars required for summarization")
-    SUMMARIZATION_MIN_MEANINGFUL_TURNS: int = Field(default=3, description="Minimum substantial user/assistant turns required for summarization")
+    SUMMARIZATION_MIN_MESSAGES_PER_SESSION: int = Field(default=2, description="Minimum messages in a session for it to be summarizable")
     SUMMARIZATION_MAX_IN_CONTEXT: int = Field(default=5, description="Max past session summaries injected into the prompt")
     SUMMARIZATION_COMPACT_CONTEXT: bool = Field(default=True, description="Use shorter summary representations in the prompt to save tokens")
 

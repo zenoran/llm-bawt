@@ -4,8 +4,9 @@ This module provides session detection and summarization functionality
 to condense older conversation history, allowing more context to fit
 in the LLM window.
 
-Sessions are detected by timestamp gaps (default 1 hour). Sessions older
-than HISTORY_DURATION (default 30 min) are eligible for summarization.
+Summarization is budget-driven: sessions are only summarized when their
+messages would be dropped from context due to token budget overflow.
+Sessions are detected by timestamp gaps (default 1 hour).
 Summaries are non-destructive: raw messages remain in the messages table.
 """
 
@@ -421,108 +422,88 @@ def detect_sessions(
     return sessions
 
 
-def find_summarizable_sessions(
-    sessions: list[Session],
-    history_duration_seconds: int = 1800,  # 30 minutes
-    min_messages: int = 4,
-    skip_low_signal: bool = True,
-    min_user_messages: int = 2,
-    min_total_content_chars: int = 160,
-    min_meaningful_turns: int = 3,
+def find_budget_overflow_sessions(
+    all_messages: list[dict],
+    session_gap_seconds: int = 3600,
+    max_context_tokens: int = 0,
+    protected_recent_turns: int = 3,
+    min_messages_per_session: int = 2,
 ) -> list[Session]:
-    """Filter sessions to those eligible for summarization.
+    """Find sessions whose messages would be dropped from context due to budget overflow.
 
-    A session is eligible if:
-    - It ended more than history_duration_seconds ago
-    - It has at least min_messages messages
-    
+    Instead of using a time-based cutoff, this computes which messages won't fit
+    in the token budget and returns the sessions they belong to.
+
     Args:
-        sessions: List of Session objects
-        history_duration_seconds: Sessions must be older than this to summarize
-        min_messages: Minimum messages in a session to summarize
-        skip_low_signal: If True, skip short/test/greeting-only sessions
-        min_user_messages: Minimum user messages required for a meaningful session
-        min_total_content_chars: Minimum total non-whitespace chars across user+assistant turns
-        min_meaningful_turns: Minimum count of substantial user/assistant turns
+        all_messages: All message dicts (user/assistant only, no summaries or recalled).
+        session_gap_seconds: Gap between messages to split into sessions.
+        max_context_tokens: Total token budget for context. 0 = no budget, nothing to summarize.
+        protected_recent_turns: Number of recent user+assistant pairs always kept raw.
+        min_messages_per_session: Minimum messages in a session for it to be summarizable.
 
     Returns:
-        List of eligible Session objects
+        List of Session objects whose messages would overflow the budget, oldest first.
     """
-    cutoff = time.time() - history_duration_seconds
+    if max_context_tokens <= 0 or not all_messages:
+        return []
 
-    eligible = []
-    for session in sessions:
-        # Must be older than the history window
-        if session.end_timestamp >= cutoff:
-            continue
+    # Sort chronologically
+    sorted_msgs = sorted(all_messages, key=lambda m: (m.get("timestamp", 0), str(m.get("id", ""))))
 
-        # Must have enough messages
-        if session.message_count < min_messages:
-            continue
+    # Separate protected recent messages from the rest
+    n_protected = min(protected_recent_turns * 2, len(sorted_msgs))
+    protected = sorted_msgs[-n_protected:] if n_protected > 0 else []
+    candidates = sorted_msgs[:-n_protected] if n_protected > 0 else list(sorted_msgs)
 
-        if skip_low_signal and is_low_signal_session(
-            session,
-            min_user_messages=min_user_messages,
-            min_total_content_chars=min_total_content_chars,
-            min_meaningful_turns=min_meaningful_turns,
-        ):
-            continue
+    if not candidates:
+        return []
 
-        eligible.append(session)
+    # Estimate token cost of protected messages
+    protected_cost = sum(_estimate_msg_tokens(m) for m in protected)
 
-    return eligible
+    # Reserve budget for system message overhead (~500 tokens) and existing summaries
+    system_overhead = 500
+    remaining_budget = max(0, max_context_tokens - protected_cost - system_overhead)
+
+    # Walk candidates newest-to-oldest, accumulating cost.
+    # Messages that fit stay raw; the rest overflow and need summarization.
+    fits_budget = 0
+    for msg in reversed(candidates):
+        cost = _estimate_msg_tokens(msg)
+        if fits_budget + cost <= remaining_budget:
+            fits_budget += cost
+        else:
+            break
+    else:
+        # Everything fits — nothing to summarize
+        return []
+
+    # Find the overflow boundary index in candidates
+    overflow_end_idx = len(candidates)
+    accumulated = 0
+    for i in range(len(candidates) - 1, -1, -1):
+        cost = _estimate_msg_tokens(candidates[i])
+        if accumulated + cost <= remaining_budget:
+            accumulated += cost
+        else:
+            overflow_end_idx = i + 1
+            break
+
+    overflow_messages = candidates[:overflow_end_idx]
+    if not overflow_messages:
+        return []
+
+    # Detect sessions within the overflow messages
+    sessions = detect_sessions(overflow_messages, session_gap_seconds)
+
+    # Filter to sessions with enough messages to be worth summarizing
+    return [s for s in sessions if s.message_count >= min_messages_per_session]
 
 
-def is_low_signal_session(
-    session: Session,
-    min_user_messages: int = 2,
-    min_total_content_chars: int = 160,
-    min_meaningful_turns: int = 3,
-) -> bool:
-    """Heuristic filter for low-value sessions (greetings/tests/noise)."""
-    user_messages = [
-        (msg.get("content", "") or "").strip().lower()
-        for msg in session.messages
-        if msg.get("role") == "user"
-    ]
-    assistant_messages = [
-        (msg.get("content", "") or "").strip()
-        for msg in session.messages
-        if msg.get("role") == "assistant"
-    ]
-
-    if len(user_messages) < min_user_messages:
-        return True
-
-    total_chars = sum(len(m.strip()) for m in user_messages) + sum(len(m.strip()) for m in assistant_messages)
-    if total_chars < min_total_content_chars:
-        return True
-
-    meaningful_turns = 0
-    for msg in session.messages:
-        role = msg.get("role")
-        if role not in {"user", "assistant"}:
-            continue
-        content = (msg.get("content", "") or "").strip()
-        if len(content) >= 20:
-            meaningful_turns += 1
-    if meaningful_turns < min_meaningful_turns:
-        return True
-
-    noise_patterns = {
-        "hi", "hey", "hello", "yo", "sup", "test", "testing", "ok", "okay", "k", "lol", "lmao", "...",
-    }
-    short_noise_count = 0
-    for user_text in user_messages:
-        normalized = re.sub(r"[^a-z0-9\s]+", "", user_text).strip()
-        compact = re.sub(r"\s+", " ", normalized)
-        if compact in noise_patterns or len(compact) <= 3:
-            short_noise_count += 1
-
-    if user_messages and short_noise_count / len(user_messages) >= 0.8:
-        return True
-
-    return False
+def _estimate_msg_tokens(msg: dict) -> int:
+    """Estimate token cost of a single message dict (4 chars/token + overhead)."""
+    content = msg.get("content", "") or ""
+    return len(content) // 4 + 4
 
 
 def estimate_session_token_savings(session: Session) -> int:
@@ -803,6 +784,7 @@ class HistorySummarizer:
         summarize_fn: "Callable[[Session], str | None] | None" = None,
         summarize_batch_fn: "Callable[[list[Session]], dict[int, str] | None] | None" = None,
         settings_getter: "Callable[[str, Any], Any] | None" = None,
+        max_context_tokens: int = 0,
     ):
         self.config = config
         self.bot_id = bot_id
@@ -817,43 +799,38 @@ class HistorySummarizer:
         self._summarize_fn = summarize_fn
         self._summarize_batch_fn = summarize_batch_fn
 
-        # Get summarization settings — resolved via runtime settings if available
+        # Budget-driven summarization settings
         self.session_gap_seconds = self._setting(
             "summarization_session_gap_seconds",
             getattr(config, "SUMMARIZATION_SESSION_GAP_SECONDS", 3600),
         )
-        self.min_messages = self._setting(
-            "summarization_min_messages",
-            getattr(config, "SUMMARIZATION_MIN_MESSAGES", 4),
+        self.min_messages_per_session = self._setting(
+            "summarization_min_messages_per_session",
+            getattr(config, "SUMMARIZATION_MIN_MESSAGES_PER_SESSION", 2),
         )
-        self.skip_low_signal = bool(
+        self.protected_recent_turns = int(
             self._setting(
-                "summarization_skip_low_signal",
-                getattr(config, "SUMMARIZATION_SKIP_LOW_SIGNAL", True),
+                "memory_protected_recent_turns",
+                getattr(config, "MEMORY_PROTECTED_RECENT_TURNS", 3),
             )
         )
-        self.min_user_messages_for_summary = int(
-            self._setting(
-                "summarization_min_user_messages",
-                getattr(config, "SUMMARIZATION_MIN_USER_MESSAGES", 2),
+        # Token budget: explicit override > config > auto from model context window
+        if max_context_tokens > 0:
+            self.max_context_tokens = max_context_tokens
+        else:
+            cfg_val = int(
+                self._setting(
+                    "max_context_tokens",
+                    getattr(config, "MAX_CONTEXT_TOKENS", 0),
+                ) or 0
             )
-        )
-        self.min_content_chars_for_summary = int(
-            self._setting(
-                "summarization_min_content_chars",
-                getattr(config, "SUMMARIZATION_MIN_CONTENT_CHARS", 160),
-            )
-        )
-        self.min_meaningful_turns_for_summary = int(
-            self._setting(
-                "summarization_min_meaningful_turns",
-                getattr(config, "SUMMARIZATION_MIN_MEANINGFUL_TURNS", 3),
-            )
-        )
-        self.history_duration = self._setting(
-            "history_duration_seconds",
-            getattr(config, "HISTORY_DURATION_SECONDS", 1800),
-        )
+            if cfg_val > 0:
+                self.max_context_tokens = cfg_val
+            else:
+                # Auto from model context window — conservative default
+                ctx_window = getattr(config, "get_model_context_window", lambda _: 0)(None)
+                max_output = getattr(config, "MAX_OUTPUT_TOKENS", 4096)
+                self.max_context_tokens = max(0, ctx_window - max_output) if ctx_window > 0 else 0
 
         # Initialize the PostgreSQL backend
         from .postgresql import PostgreSQLMemoryBackend
@@ -999,9 +976,12 @@ class HistorySummarizer:
 
     def preview_summarizable_sessions(self) -> list[Session]:
         """Preview sessions that would be summarized (dry run).
+
+        Uses budget-driven eligibility: only sessions whose messages would
+        overflow the token budget are candidates for summarization.
         """
         messages = self._get_all_messages()
-        # Only detect sessions on raw, non-recalled, unsummarized messages.
+        # Only consider raw, non-recalled, unsummarized messages.
         regular_messages = [
             m
             for m in messages
@@ -1009,15 +989,12 @@ class HistorySummarizer:
             and not bool(m.get("recalled_history"))
             and not bool(m.get("summarized"))
         ]
-        sessions = detect_sessions(regular_messages, self.session_gap_seconds)
-        eligible = find_summarizable_sessions(
-            sessions,
-            history_duration_seconds=self.history_duration,
-            min_messages=self.min_messages,
-            skip_low_signal=self.skip_low_signal,
-            min_user_messages=self.min_user_messages_for_summary,
-            min_total_content_chars=self.min_content_chars_for_summary,
-            min_meaningful_turns=self.min_meaningful_turns_for_summary,
+        eligible = find_budget_overflow_sessions(
+            regular_messages,
+            session_gap_seconds=self.session_gap_seconds,
+            max_context_tokens=self.max_context_tokens,
+            protected_recent_turns=self.protected_recent_turns,
+            min_messages_per_session=self.min_messages_per_session,
         )
         return prioritize_summarizable_sessions(eligible)
 
@@ -1332,229 +1309,74 @@ class HistorySummarizer:
             conn.commit()
             return len(to_delete)
 
-    def _find_active_session(self) -> Session | None:
-        """Find the current in-progress session (newest, unsummarized raw messages)."""
-        messages = self._get_all_messages()
-        regular_messages = [
-            m
-            for m in messages
-            if m.get("role") != "summary"
-            and not bool(m.get("recalled_history"))
-            and not bool(m.get("summarized"))
-        ]
-        sessions = detect_sessions(regular_messages, self.session_gap_seconds)
-        if not sessions:
-            return None
-        candidate = sessions[-1]
-        if candidate.message_count < self.min_messages:
-            return None
-        cutoff = time.time() - self.history_duration
-        if candidate.end_timestamp < cutoff:
-            return None
-        return candidate
+    def _cleanup_active_session_summaries(self) -> int:
+        """Remove any legacy active-session summary rows from the database.
 
-    def _find_active_summary_id(self, conn: Any, session: Session) -> str | None:
-        """Find existing active-session summary row for this session."""
-        for summary_id in self._iter_active_summary_ids(conn):
-            meta = self._summary_metadata_by_id(conn, summary_id)
-            if not isinstance(meta, dict):
-                continue
-            try:
-                existing_start = float(meta.get("session_start"))
-            except (TypeError, ValueError):
-                continue
-            if abs(existing_start - session.start_timestamp) < 1:
-                return summary_id
-        return None
-
-    def _iter_active_summary_ids(self, conn: Any) -> list[str]:
-        """Return active-session summary ids for this bot."""
+        These are no longer created by the budget-driven summarization system.
+        """
         from sqlalchemy import text
-
-        sql = text(
-            f"""
-            SELECT id, summary_metadata
-            FROM {self._backend._messages_table_name}
-            WHERE role = 'summary'
-            ORDER BY created_at DESC
-            LIMIT 200
-            """
-        )
-        rows = conn.execute(sql).fetchall()
-        active_ids: list[str] = []
-        for row in rows:
-            meta = row.summary_metadata or {}
-            if isinstance(meta, str):
-                try:
-                    meta = json.loads(meta)
-                except Exception:
-                    continue
-            if not isinstance(meta, dict):
-                continue
-            if meta.get("summary_type") != "active_session":
-                continue
-            active_ids.append(row.id)
-        return active_ids
-
-    def _summary_metadata_by_id(self, conn: Any, summary_id: str) -> dict[str, Any] | None:
-        from sqlalchemy import text
-
-        sql = text(
-            f"""
-            SELECT summary_metadata
-            FROM {self._backend._messages_table_name}
-            WHERE id = :id
-            LIMIT 1
-            """
-        )
-        row = conn.execute(sql, {"id": summary_id}).fetchone()
-        if not row:
-            return None
-        meta = row.summary_metadata or {}
-        if isinstance(meta, str):
-            try:
-                meta = json.loads(meta)
-            except Exception:
-                return None
-        return meta if isinstance(meta, dict) else None
-
-    def upsert_active_session_summary(self, use_heuristic_fallback: bool = True) -> dict:
-        """Create or update rolling summary for the current active session."""
-        session = self._find_active_session()
-        if not session:
-            with self._backend.engine.connect() as conn:
-                from sqlalchemy import text
-
-                active_ids = self._iter_active_summary_ids(conn)
-                if active_ids:
-                    delete_sql = text(
-                        f"""
-                        DELETE FROM {self._backend._messages_table_name}
-                        WHERE id = ANY(:ids)
-                        """
-                    )
-                    conn.execute(delete_sql, {"ids": active_ids})
-                    conn.commit()
-            return {
-                "active_summary_updated": False,
-                "reason": "no_active_session",
-                "active_summary_cleared": len(active_ids) if 'active_ids' in locals() else 0,
-            }
-
-        if self._summarize_fn:
-            summary_text = self._summarize_fn(session)
-        else:
-            summary_text = summarize_session_with_llm(session, self.service_url, config=self.config)
-        method = "llm"
-
-        if not summary_text and use_heuristic_fallback:
-            summary_text = summarize_session_heuristic(session)
-            method = "heuristic"
-
-        if not summary_text:
-            return {"active_summary_updated": False, "reason": "summary_failed"}
-
-        normalized_text = compress_structured_summary_text(
-            normalize_structured_summary_text(summary_text),
-            source_session=session,
-        )
-        normalized_text = f"[ACTIVE SESSION SUMMARY]\n{normalized_text.strip()}"
-        sections = extract_summary_sections(normalized_text)
-        summary_metadata = {
-            "summary_type": "active_session",
-            "session_start": session.start_timestamp,
-            "session_end": session.end_timestamp,
-            "message_count": session.message_count,
-            "message_ids": session.message_ids,
-            "summarization_method": method,
-            "updated_at": time.time(),
-            "summary_sections": sections,
-            "intent": sections.get("intent", ""),
-            "tone": sections.get("tone", ""),
-            "open_loops": sections.get("open_loops", ""),
-        }
 
         with self._backend.engine.connect() as conn:
-            from sqlalchemy import text
+            sql = text(
+                f"""
+                SELECT id, summary_metadata
+                FROM {self._backend._messages_table_name}
+                WHERE role = 'summary'
+                ORDER BY created_at DESC
+                LIMIT 200
+                """
+            )
+            rows = conn.execute(sql).fetchall()
+            active_ids: list[str] = []
+            for row in rows:
+                meta = row.summary_metadata or {}
+                if isinstance(meta, str):
+                    try:
+                        meta = json.loads(meta)
+                    except Exception:
+                        continue
+                if not isinstance(meta, dict):
+                    continue
+                if meta.get("summary_type") == "active_session":
+                    active_ids.append(row.id)
 
-            summary_id = self._find_active_summary_id(conn, session)
-            if summary_id:
-                update_sql = text(
+            if active_ids:
+                delete_sql = text(
                     f"""
-                    UPDATE {self._backend._messages_table_name}
-                    SET content = :content,
-                        timestamp = :timestamp,
-                        summary_metadata = :metadata
-                    WHERE id = :id
+                    DELETE FROM {self._backend._messages_table_name}
+                    WHERE id = ANY(:ids)
                     """
                 )
-                conn.execute(
-                    update_sql,
-                    {
-                        "id": summary_id,
-                        "content": normalized_text,
-                        "timestamp": session.end_timestamp,
-                        "metadata": json.dumps(summary_metadata),
-                    },
-                )
-                created = False
-            else:
-                summary_id = str(uuid.uuid4())
-                insert_sql = text(
-                    f"""
-                    INSERT INTO {self._backend._messages_table_name}
-                    (id, role, content, timestamp, summary_metadata, created_at)
-                    VALUES (:id, 'summary', :content, :timestamp, :metadata, CURRENT_TIMESTAMP)
-                    """
-                )
-                conn.execute(
-                    insert_sql,
-                    {
-                        "id": summary_id,
-                        "content": normalized_text,
-                        "timestamp": session.end_timestamp,
-                        "metadata": json.dumps(summary_metadata),
-                    },
-                )
-                created = True
-            conn.commit()
+                conn.execute(delete_sql, {"ids": active_ids})
+                conn.commit()
+                logger.info("Cleaned up %d legacy active-session summary rows", len(active_ids))
 
-        logger.info(
-            "Active session summary %s for %s messages",
-            "created" if created else "updated",
-            session.message_count,
-        )
-        return {
-            "active_summary_updated": True,
-            "active_summary_id": summary_id,
-            "active_summary_created": created,
-            "method": method,
-            "message_count": session.message_count,
-        }
+            return len(active_ids)
 
     def summarize_eligible_sessions(
         self,
         use_heuristic_fallback: bool = True,
         max_tokens_per_chunk: int = 4000,
     ) -> dict:
-        """Summarize all eligible sessions.
-        
+        """Summarize sessions whose messages would overflow the token budget.
+
         Large sessions are automatically split into chunks that fit within
         the model's context window.
 
         Returns:
             Dict with 'sessions_summarized', 'messages_summarized', 'results', 'errors'
         """
+        # Clean up any legacy active-session summary rows
+        self._cleanup_active_session_summaries()
+
         eligible = self.preview_summarizable_sessions()
 
         if not eligible:
-            active_result = self.upsert_active_session_summary(use_heuristic_fallback=use_heuristic_fallback)
             return {
                 "sessions_summarized": 0,
                 "messages_summarized": 0,
                 "results": [],
                 "errors": [],
-                "active_summary": active_result,
             }
 
         results = []
@@ -1581,7 +1403,7 @@ class HistorySummarizer:
                 try:
                     # Check if session needs to be chunked
                     chunks = split_session_into_chunks(session, max_tokens_per_chunk)
-                    
+
                     for i, chunk in enumerate(chunks):
                         chunk_label = f" (chunk {i+1}/{len(chunks)})" if len(chunks) > 1 else ""
                         try:
@@ -1606,15 +1428,12 @@ class HistorySummarizer:
                     logger.error(f"Error processing session: {e}")
                     errors.append(str(e))
 
-        active_result = self.upsert_active_session_summary(use_heuristic_fallback=use_heuristic_fallback)
-
         return {
             "sessions_summarized": created_count,
             "messages_summarized": total_messages,
             "sessions_skipped_existing": skipped_existing_count,
             "results": results,
             "errors": errors,
-            "active_summary": active_result,
         }
 
     def rebuild_recent_sessions(
@@ -1626,10 +1445,11 @@ class HistorySummarizer:
         end_timestamp: float | None = None,
         purge_existing: bool = False,
     ) -> dict:
-        """Recalculate summaries for the most recent eligible historical sessions.
+        """Recalculate summaries for the most recent eligible sessions.
 
         Unlike normal summarization, this uses raw history regardless of existing
         summarized flags and replaces existing summaries for the targeted sessions.
+        Uses budget-driven eligibility.
         """
         messages = self._get_all_messages()
         regular_messages = [
@@ -1638,15 +1458,12 @@ class HistorySummarizer:
             if m.get("role") != "summary"
             and not bool(m.get("recalled_history"))
         ]
-        sessions = detect_sessions(regular_messages, self.session_gap_seconds)
-        eligible = find_summarizable_sessions(
-            sessions,
-            history_duration_seconds=self.history_duration,
-            min_messages=self.min_messages,
-            skip_low_signal=self.skip_low_signal,
-            min_user_messages=self.min_user_messages_for_summary,
-            min_total_content_chars=self.min_content_chars_for_summary,
-            min_meaningful_turns=self.min_meaningful_turns_for_summary,
+        eligible = find_budget_overflow_sessions(
+            regular_messages,
+            session_gap_seconds=self.session_gap_seconds,
+            max_context_tokens=self.max_context_tokens,
+            protected_recent_turns=self.protected_recent_turns,
+            min_messages_per_session=self.min_messages_per_session,
         )
         eligible = prioritize_summarizable_sessions(eligible)
 
@@ -1669,7 +1486,6 @@ class HistorySummarizer:
             )
 
         if not eligible:
-            active_result = self.upsert_active_session_summary(use_heuristic_fallback=use_heuristic_fallback)
             return {
                 "sessions_targeted": 0,
                 "sessions_summarized": 0,
@@ -1677,7 +1493,6 @@ class HistorySummarizer:
                 "summaries_replaced": 0,
                 "results": [],
                 "errors": [],
-                "active_summary": active_result,
                 "summaries_purged": purged_count,
             }
 
@@ -1732,7 +1547,6 @@ class HistorySummarizer:
                     logger.error(f"Error rebuilding session: {e}")
                     errors.append(str(e))
 
-        active_result = self.upsert_active_session_summary(use_heuristic_fallback=use_heuristic_fallback)
         return {
             "sessions_targeted": len(eligible),
             "sessions_summarized": created_count,
@@ -1740,7 +1554,6 @@ class HistorySummarizer:
             "summaries_replaced": replaced_count,
             "results": results,
             "errors": errors,
-            "active_summary": active_result,
             "summaries_purged": purged_count,
         }
 
