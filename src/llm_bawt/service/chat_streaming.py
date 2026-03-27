@@ -124,6 +124,11 @@ class ChatStreamingMixin:
                             _in_tool_calls = False
                             _tool_call_index = 0
                             _last_call_id = ""
+                            # Insert paragraph break between tool-call
+                            # segment and resumed content so it persists
+                            # to DB and survives page reload.
+                            full_text_parts.append("\n\n")
+                            delta = "\n\n" + delta
 
                         full_text_parts.append(delta)
                         data = {
@@ -816,6 +821,11 @@ class ChatStreamingMixin:
                                         ))
 
                                         # Continue to next iteration (will stream the follow-up)
+                                        # Yield paragraph break so post-tool text is
+                                        # separated from any prior content.  This flows
+                                        # into full_response_holder (persisted to DB)
+                                        # and the SSE stream.
+                                        yield "\n\n"
                                         break
                                 else:
                                     # Stream finished without tool calls dict (pure content response)
@@ -878,6 +888,9 @@ class ChatStreamingMixin:
                 _oc_request_id_captured = [False]
 
                 def _intercept_tool_events(inner):
+                    _saw_tool = False  # Track tool→content transitions
+                    _saw_text = False  # Track whether any text has been yielded
+
                     for item in inner:
                         # Capture agent_request_id on first yielded item
                         if is_agent_backend and not _oc_request_id_captured[0]:
@@ -889,8 +902,21 @@ class ChatStreamingMixin:
                                     turn_id=turn_log_id,
                                     agent_request_id=oc_req_id,
                                 )
+
+                        # Inject paragraph break when transitioning from
+                        # tool events back to text content.  This flows into
+                        # full_response_holder (persisted to DB) and the SSE
+                        # stream, ensuring paragraph breaks survive reload.
+                        if isinstance(item, str) and item.strip():
+                            if _saw_tool and _saw_text:
+                                yield "\n\n"
+                            _saw_tool = False
+                            _saw_text = True
+
                         if isinstance(item, dict):
                             evt = item.get("event")
+                            if evt in ("tool_call", "tool_result"):
+                                _saw_tool = True
                             if evt == "tool_call":
                                 _oc_call_index[0] += 1
                                 cid = f"call_{uuid.uuid4().hex[:8]}"
