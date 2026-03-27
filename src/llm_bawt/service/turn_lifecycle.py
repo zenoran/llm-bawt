@@ -53,15 +53,16 @@ def _normalize_tool_call_details(tool_calls: list[dict] | None) -> list[dict]:
         name = item.get("tool") or item.get("name") or "unknown"
         args = item.get("parameters") or item.get("arguments") or {}
         result = item.get("result") or item.get("response") or ""
-        normalized.append(
-            {
+        entry = {
                 "index": idx,
                 "iteration": item.get("iteration", 1),
                 "name": name,
                 "arguments": args if isinstance(args, dict) else {"raw": args},
                 "result": result,
             }
-        )
+        if item.get("call_id"):
+            entry["call_id"] = item["call_id"]
+        normalized.append(entry)
     return normalized
 
 
@@ -232,14 +233,15 @@ class TurnLifecycleMixin:
             result_payload = tc.get("result")
             if result_payload is None:
                 result_payload = "Result not exposed by OpenClaw API (see assistant response)."
-            extracted.append(
-                {
+            entry = {
                     "iteration": 1,
                     "tool": tc.get("display_name") or tc.get("name", "unknown"),
                     "parameters": tc.get("arguments", {}),
                     "result": result_payload,
                 }
-            )
+            if tc.get("call_id"):
+                entry["call_id"] = tc["call_id"]
+            extracted.append(entry)
         return extracted
 
     def _finalize_turn(
@@ -277,7 +279,10 @@ class TurnLifecycleMixin:
                 response_text = cleaned
 
         extracted_tool_calls = self._extract_agent_backend_tool_calls(llm_bawt=llm_bawt)
-        if extracted_tool_calls:
+        if extracted_tool_calls and not tool_call_details:
+            # Only use extracted calls when streaming didn't already capture them.
+            # Streaming-captured calls have call_id for reliable dedup; extracted
+            # calls from the agent backend API may lack it.
             tool_call_details.extend(extracted_tool_calls)
             # For agent backends (e.g. OpenClaw), tools execute remotely so
             # tool_context is empty.  Synthesize it from the extracted calls

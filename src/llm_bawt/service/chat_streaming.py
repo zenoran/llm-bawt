@@ -245,33 +245,36 @@ class ChatStreamingMixin:
             yield "data: [DONE]\n\n"
 
             # Fetch tool calls from chat history (gateway doesn't stream them)
-            try:
-                if redis_sub and gateway:
-                    history_msgs = await gateway.get_chat_history(session_key, limit=20)
-                elif bridge:
-                    history_msgs = await bridge._ws_client.get_chat_history(session_key, limit=20)
-                else:
-                    history_msgs = []
-                for msg in reversed(history_msgs):
-                    if not isinstance(msg, dict):
-                        continue
-                    # Look for tool_calls in the most recent assistant message
-                    if msg.get("role") == "assistant":
-                        for tc in msg.get("tool_calls") or []:
-                            fn = tc.get("function") or {}
-                            tool_call_details.append({
-                                "iteration": 1,
-                                "tool": fn.get("name") or tc.get("name") or "unknown",
-                                "parameters": fn.get("arguments") or {},
-                                "result": "",
-                            })
-                        break
-                    # Also capture tool results
-                    if msg.get("role") == "tool":
-                        # Will be matched to tool_call above
-                        pass
-            except Exception as e:
-                log.debug("Could not fetch tool calls from chat.history: %s", e)
+            # Only fetch if streaming didn't already capture tool calls —
+            # otherwise this duplicates them (they lack call_id so dedup fails).
+            if not tool_call_details:
+                try:
+                    if redis_sub and gateway:
+                        history_msgs = await gateway.get_chat_history(session_key, limit=20)
+                    elif bridge:
+                        history_msgs = await bridge._ws_client.get_chat_history(session_key, limit=20)
+                    else:
+                        history_msgs = []
+                    for msg in reversed(history_msgs):
+                        if not isinstance(msg, dict):
+                            continue
+                        # Look for tool_calls in the most recent assistant message
+                        if msg.get("role") == "assistant":
+                            for tc in msg.get("tool_calls") or []:
+                                fn = tc.get("function") or {}
+                                tool_call_details.append({
+                                    "iteration": 1,
+                                    "tool": fn.get("name") or tc.get("name") or "unknown",
+                                    "parameters": fn.get("arguments") or {},
+                                    "result": "",
+                                })
+                            break
+                        # Also capture tool results
+                        if msg.get("role") == "tool":
+                            # Will be matched to tool_call above
+                            pass
+                except Exception as e:
+                    log.debug("Could not fetch tool calls from chat.history: %s", e)
 
             # Finalize turn
             full_text = "".join(full_text_parts)
