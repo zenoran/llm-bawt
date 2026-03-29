@@ -1,5 +1,6 @@
 from __future__ import annotations
 import asyncio
+import uuid
 import json
 import logging
 from datetime import datetime
@@ -43,10 +44,10 @@ class SessionBridge:
 
     async def start(self) -> None:
         """Start the bridge: connect WS, begin consuming events, and listen for commands."""
-        # DEACTIVATED: passive event feed disabled — causes duplicate history
-        # writes and wastes resources.  Active chat.send path uses per-run
-        # queues in ws_client and does not depend on this callback.
-        # self._ws_client.on_event(self._on_raw_event)
+        # Passive event feed: only publishes tool events to the unified SSE
+        # stream so the frontend sees real-time activity without an active
+        # chat request. Does NOT write history or manage run state.
+        self._ws_client.on_event(self._on_passive_event)
         await self._ws_client.connect()
         self._command_task = asyncio.create_task(self._command_listener())
         logger.info("SessionBridge started (sessions=%s)", list(self._ws_client.subscribed_sessions))
@@ -215,27 +216,9 @@ class SessionBridge:
 
                         self._publisher.publish_run_event(request_id, event)
 
-                        # Also publish tool events to unified stream
-                        if bot_id and event.kind in (
-                            OpenClawEventKind.TOOL_START,
-                            OpenClawEventKind.TOOL_END,
-                        ):
-                            import time
-                            tool_event = {
-                                "_type": "tool_event",
-                                "event": "tool_start" if event.kind == OpenClawEventKind.TOOL_START else "tool_end",
-                                "tool_name": event.tool_name or "unknown",
-                                "run_id": event.run_id,
-                                "session_key": session_key,
-                                "ts": time.time(),
-                            }
-                            if event.kind == OpenClawEventKind.TOOL_START:
-                                tool_event["arguments"] = event.tool_arguments or {}
-                            else:
-                                tool_event["result"] = str(event.tool_result or "")[:2000]
-                            self._publisher.publish_unified_event(
-                                bot_id, unified_user_id, tool_event,
-                            )
+                        # Tool events are published to the unified stream by
+                        # chat_streaming.py (with proper call_id and user_id).
+                        # Do not duplicate here.
 
                 if not saw_assistant_text:
                     history_text = await self._wait_for_history_reply(session_key)
@@ -440,6 +423,90 @@ class SessionBridge:
 
         return "".join(parts)
 
+    # Per-run tool call counters for generating stable iteration numbers
+    _passive_tool_counters: dict[str, int] = {}
+    _passive_call_ids: dict[str, str] = {}
+
+    async def _on_passive_event(self, raw: dict) -> None:
+        """Lightweight passive handler: only publishes tool events to the
+        unified SSE stream. No history writes, no Postgres, no run state."""
+        import time as _time
+
+        session_key = raw.get("session_key", "")
+        if not session_key:
+            sessions = self._ws_client.subscribed_sessions
+            session_key = next(iter(sessions), "unknown")
+
+        event = self._ingest.parse(raw, session_key)
+        if event is None:
+            return
+
+        bot_id = self._resolve_bot_id(event.session_key)
+        logger.info("PASSIVE: session=%s kind=%s bot=%s run=%s locked=%s",
+                     event.session_key, event.kind.value if event.kind else "?",
+                     bot_id, event.run_id,
+                     event.session_key in self._session_locks and self._session_locks[event.session_key].locked())
+        if not bot_id:
+            return
+
+        # Default user_id — could be parsed from session key if needed
+        user_id = "nick"
+        run_id = event.run_id or "unknown"
+        ts = event.timestamp.timestamp() if event.timestamp else _time.time()
+
+        # Skip if this session has an active chat request streaming —
+        # the active path (chat_streaming.py) already publishes tool events.
+        if event.session_key in self._session_locks and self._session_locks[event.session_key].locked():
+            return
+
+        if event.kind == OpenClawEventKind.TOOL_START:
+            call_id = f"call_{uuid.uuid4().hex[:8]}"
+            self._passive_tool_counters.setdefault(run_id, 0)
+            self._passive_tool_counters[run_id] += 1
+            iteration = self._passive_tool_counters[run_id]
+            self._passive_call_ids[run_id] = call_id
+
+            self._publisher.publish_unified_event(bot_id, user_id, {
+                "_type": "tool_event",
+                "event": "tool_start",
+                "turn_id": run_id,
+                "bot_id": bot_id,
+                "user_id": user_id,
+                "tool_name": event.tool_name or "unknown",
+                "arguments": event.tool_arguments or {},
+                "call_id": call_id,
+                "iteration": iteration,
+                "ts": ts,
+            })
+
+        elif event.kind == OpenClawEventKind.TOOL_END:
+            call_id = self._passive_call_ids.get(run_id, f"call_{uuid.uuid4().hex[:8]}")
+            iteration = self._passive_tool_counters.get(run_id, 1)
+            self._publisher.publish_unified_event(bot_id, user_id, {
+                "_type": "tool_event",
+                "event": "tool_end",
+                "turn_id": run_id,
+                "bot_id": bot_id,
+                "user_id": user_id,
+                "tool_name": event.tool_name or "unknown",
+                "call_id": call_id,
+                "result": str(event.tool_result or "")[:2000],
+                "iteration": iteration,
+                "ts": ts,
+            })
+
+        elif event.kind == OpenClawEventKind.RUN_COMPLETED:
+            self._passive_tool_counters.pop(run_id, None)
+            self._passive_call_ids.pop(run_id, None)
+            self._publisher.publish_unified_event(bot_id, user_id, {
+                "_type": "turn_complete",
+                "turn_id": run_id,
+                "bot_id": bot_id,
+                "user_id": user_id,
+                "status": "completed",
+                "ts": ts,
+            })
+
     async def _on_raw_event(self, raw: dict) -> None:
         """Process a raw WS message: parse -> store -> update run state -> publish to Redis."""
         metrics = get_metrics()
@@ -521,7 +588,16 @@ class SessionBridge:
     def _resolve_bot_id(self, session_key: str) -> str | None:
         if not self._session_to_bot:
             return None
-        return self._session_to_bot.get(session_key)
+        # Direct match first
+        bot_id = self._session_to_bot.get(session_key)
+        if bot_id:
+            return bot_id
+        # Sub-agent sessions: "agent:{bot}:subagent:{uuid}" -> resolve to parent bot
+        parts = session_key.split(":")
+        if len(parts) >= 3 and parts[0] == "agent" and "subagent" in parts:
+            parent_key = f"agent:{parts[1]}:main"
+            return self._session_to_bot.get(parent_key)
+        return None
 
     @property
     def connected(self) -> bool:
