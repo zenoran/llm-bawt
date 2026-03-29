@@ -924,6 +924,9 @@ class ChatStreamingMixin:
                                 _oc_call_index[0] += 1
                                 cid = f"call_{uuid.uuid4().hex[:8]}"
                                 _oc_last_call_id[0] = cid
+                                # Inject call_id into the dict so the queue consumer
+                                # uses the same ID as the SSE event (no double-ID).
+                                item["_call_id"] = cid
                                 tool_call_details_holder.append({
                                     'tool': item.get('name', 'unknown'),
                                     'parameters': item.get('arguments', {}),
@@ -942,6 +945,7 @@ class ChatStreamingMixin:
                                     "ts": time.time(),
                                 })
                             elif evt == "tool_result":
+                                item["_call_id"] = _oc_last_call_id[0]
                                 _publish_event_direct({
                                     "_type": "tool_event",
                                     "event": "tool_end",
@@ -1178,7 +1182,9 @@ class ChatStreamingMixin:
                 if isinstance(chunk, dict) and chunk.get("event") == "tool_call":
                     tc_name = chunk.get("name", "unknown")
                     tc_args = chunk.get("arguments", {})
-                    tc_id = f"call_{uuid.uuid4().hex[:8]}"
+                    # Use the call_id injected by _intercept_tool_events so
+                    # HTTP stream and SSE events share the same ID.
+                    tc_id = chunk.get("_call_id") or f"call_{uuid.uuid4().hex[:8]}"
                     data = {
                         "id": response_id,
                         "object": "chat.completion.chunk",
