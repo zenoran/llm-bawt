@@ -75,6 +75,7 @@ services:
       - INFLUXDB_BUCKET=${INFLUXDB_BUCKET:-llm-bawt}
     volumes:
       - ./.logs:/app/.logs
+      - ${HOME}/.config/llm-bawt:/root/.config/llm-bawt
     depends_on:
       redis:
         condition: service_healthy
