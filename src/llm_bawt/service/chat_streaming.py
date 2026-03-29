@@ -924,6 +924,11 @@ class ChatStreamingMixin:
                                 _oc_call_index[0] += 1
                                 cid = f"call_{uuid.uuid4().hex[:8]}"
                                 _oc_last_call_id[0] = cid
+                                tool_call_details_holder.append({
+                                    'tool': item.get('name', 'unknown'),
+                                    'parameters': item.get('arguments', {}),
+                                    'call_id': cid,
+                                })
                                 _publish_event_direct({
                                     "_type": "tool_event",
                                     "event": "tool_start",
@@ -949,6 +954,11 @@ class ChatStreamingMixin:
                                     "iteration": 1,
                                     "ts": time.time(),
                                 })
+                                # Update the matching detail entry with result
+                                for _td in reversed(tool_call_details_holder):
+                                    if _td.get("call_id") == _oc_last_call_id[0]:
+                                        _td["result"] = str(item.get("result", ""))[:2000]
+                                        break
                         yield item
 
                 # Stream chunks to queue
