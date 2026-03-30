@@ -246,7 +246,7 @@ class RedisSubscriber:
         consumer_id: str,
         *,
         timeout_s: float = 300,
-    ) -> AsyncIterator[dict]:
+    ) -> AsyncIterator[dict | None]:
         """Subscribe to unified event stream(s) via consumer groups.
 
         ``bot_id`` may be a single bot or a list of bots.  When multiple bots
@@ -322,6 +322,7 @@ class RedisSubscriber:
                 continue
 
             if not results:
+                yield None  # keepalive tick — lets caller send SSE ping
                 continue
 
             # Interleave messages from all streams by Redis message ID

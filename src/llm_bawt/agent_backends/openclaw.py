@@ -185,6 +185,49 @@ class OpenClawBackend(AgentBackend):
                                     text_parts.append(delta)
                                     result_queue.put(delta)
 
+                            elif event.kind == OpenClawEventKind.ASSISTANT_DONE:
+                                # ASSISTANT_DONE carries the complete response
+                                # text.  Yield any portion not already streamed
+                                # as deltas — this is critical for tool-heavy
+                                # turns where the final synthesis text only
+                                # appears in the done event, not as individual
+                                # ASSISTANT_DELTA events.
+                                done_text = event.text or ""
+                                if done_text:
+                                    accumulated = "".join(text_parts)
+                                    if done_text.startswith(accumulated):
+                                        extra = done_text[len(accumulated):]
+                                        if extra.strip():
+                                            text_parts.append(extra)
+                                            result_queue.put(extra)
+                                            logger.info(
+                                                "ASSISTANT_DONE: supplemented %d chars "
+                                                "(accumulated=%d, done=%d) request_id=%s",
+                                                len(extra), len(accumulated),
+                                                len(done_text), request_id,
+                                            )
+                                    elif len(done_text) > len(accumulated):
+                                        # Deltas don't prefix-match done text;
+                                        # yield the full done text so the
+                                        # response is at least complete for
+                                        # persistence.  May duplicate some
+                                        # content in the SSE stream, but the
+                                        # DB record will be correct on reload.
+                                        logger.warning(
+                                            "ASSISTANT_DONE: prefix mismatch, "
+                                            "yielding full done_text (done=%d, "
+                                            "accumulated=%d) request_id=%s",
+                                            len(done_text), len(accumulated),
+                                            request_id,
+                                        )
+                                        text_parts.clear()
+                                        text_parts.append(done_text)
+                                        result_queue.put(
+                                            done_text[len(accumulated):]
+                                            if accumulated
+                                            else done_text
+                                        )
+
                             elif event.kind == OpenClawEventKind.TOOL_START:
                                 tc = OpenClawToolCall(
                                     name=event.tool_name or "unknown",

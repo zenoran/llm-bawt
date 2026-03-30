@@ -224,6 +224,40 @@ class ChatStreamingMixin:
                         except Exception:
                             pass
 
+                elif event.kind == OpenClawEventKind.ASSISTANT_DONE:
+                    # ASSISTANT_DONE carries the complete response text.
+                    # Yield any portion not already streamed as deltas.
+                    done_text = event.text or ""
+                    if done_text:
+                        accumulated = "".join(full_text_parts)
+                        extra = ""
+                        if done_text.startswith(accumulated):
+                            extra = done_text[len(accumulated):]
+                        elif len(done_text) > len(accumulated):
+                            extra = done_text[len(accumulated):] if accumulated else done_text
+                        if extra.strip():
+                            if _in_tool_calls:
+                                finish_data = {
+                                    "id": response_id,
+                                    "object": "chat.completion.chunk",
+                                    "created": created,
+                                    "model": model_alias,
+                                    "choices": [{"index": 0, "delta": {}, "finish_reason": "tool_calls"}],
+                                }
+                                yield f"data: {json.dumps(finish_data)}\n\n"
+                                _in_tool_calls = False
+                                full_text_parts.append("\n\n")
+                                extra = "\n\n" + extra
+                            full_text_parts.append(extra)
+                            data = {
+                                "id": response_id,
+                                "object": "chat.completion.chunk",
+                                "created": created,
+                                "model": model_alias,
+                                "choices": [{"index": 0, "delta": {"content": extra}, "finish_reason": None}],
+                            }
+                            yield f"data: {json.dumps(data)}\n\n"
+
                 elif event.kind == OpenClawEventKind.RUN_COMPLETED:
                     if event.run_id == run_id or not run_id:
                         break

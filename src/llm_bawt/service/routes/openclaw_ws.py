@@ -92,11 +92,18 @@ async def _unified_event_stream(redis_sub, bot_ids: list[str], user_id: str, con
         async for event_data in redis_sub.subscribe_group(
             bot_ids, user_id, consumer_id, timeout_s=300,
         ):
+            if event_data is None:
+                # Keepalive tick from subscriber — send SSE comment to prevent proxy idle timeout
+                now = asyncio.get_running_loop().time()
+                if now - last_ping > 25:
+                    yield ": ping\n\n"
+                    last_ping = now
+                continue
             replayed = event_data.pop("_replayed", False)
             yield _sse("event", {**event_data, "replayed": replayed})
 
             now = asyncio.get_running_loop().time()
-            if now - last_ping > 20:
+            if now - last_ping > 25:
                 yield ": ping\n\n"
                 last_ping = now
     except asyncio.CancelledError:
@@ -137,7 +144,7 @@ async def _legacy_event_stream(redis_sub, session_key: str):
             yield _sse("event", payload)
 
             now = asyncio.get_running_loop().time()
-            if now - last_ping > 20:
+            if now - last_ping > 25:
                 yield ": ping\n\n"
                 last_ping = now
     except asyncio.CancelledError:
