@@ -72,6 +72,12 @@ class ChatStreamingMixin:
             response_text="",
         )
 
+        # Accumulate response data outside try so the finally block can
+        # always access them (including on GeneratorExit from client disconnect).
+        full_text_parts: list[str] = []
+        tool_call_details: list[dict] = []
+        _finalized = False
+
         try:
             # Persist user message to bot history so it appears in /v1/history
             llm_bawt.history_manager.add_message("user", user_prompt)
@@ -100,8 +106,6 @@ class ChatStreamingMixin:
 
             from openclaw_bridge.events import OpenClawEventKind
 
-            full_text_parts: list[str] = []
-            tool_call_details: list[dict] = []
             # Track tool call state for OpenAI-compat delta.tool_calls
             _tool_call_index = 0
             _in_tool_calls = False
@@ -300,6 +304,7 @@ class ChatStreamingMixin:
                     status="timeout",
                     latency_ms=elapsed_ms,
                 )
+            _finalized = True
 
         except Exception as e:
             log.error("OpenClaw bridge stream failed: %s", e)
@@ -310,6 +315,7 @@ class ChatStreamingMixin:
                 latency_ms=elapsed_ms,
                 error_text=str(e),
             )
+            _finalized = True
             warning_data = {
                 "object": "service.warning",
                 "model": model_alias,
@@ -325,6 +331,48 @@ class ChatStreamingMixin:
             }
             yield f"data: {json.dumps(data)}\n\n"
             yield "data: [DONE]\n\n"
+
+        finally:
+            # Ensure turn is finalized even on GeneratorExit (client disconnect).
+            # GeneratorExit inherits from BaseException, not Exception, so the
+            # except block above does not catch it.
+            if not _finalized:
+                full_text = "".join(full_text_parts)
+                elapsed_ms = (time.time() - start_time) * 1000
+                try:
+                    if full_text:
+                        self._finalize_turn(
+                            llm_bawt=llm_bawt,
+                            turn_id=turn_log_id,
+                            response_text=full_text,
+                            tool_context="",
+                            tool_call_details=tool_call_details,
+                            prepared_messages=[],
+                            user_prompt=user_prompt,
+                            model=model_alias,
+                            bot_id=bot_id,
+                            user_id=user_id,
+                            elapsed_ms=elapsed_ms,
+                            stream=True,
+                        )
+                    else:
+                        self._update_turn_log(
+                            turn_id=turn_log_id,
+                            status="disconnected",
+                            latency_ms=elapsed_ms,
+                            tool_calls=tool_call_details or None,
+                        )
+                except Exception as fin_err:
+                    log.error("Bridge finalization failed (turn %s): %s", turn_log_id, fin_err)
+                    try:
+                        self._update_turn_log(
+                            turn_id=turn_log_id,
+                            status="error",
+                            latency_ms=elapsed_ms,
+                            error_text=f"finalize_error: {fin_err}",
+                        )
+                    except Exception:
+                        pass
 
     async def chat_completion_stream(
         self,
@@ -497,8 +545,8 @@ class ChatStreamingMixin:
                     _redis_sub.publish_tool_event(bot_id, user_id, event_dict),
                     loop,
                 )
-            except Exception:
-                pass  # fire-and-forget
+            except Exception as pub_err:
+                log.debug("Direct event publish failed: %s", pub_err)
 
         def _stream_to_queue():
             """Run streaming in a thread and push chunks to the async queue."""
@@ -1000,33 +1048,50 @@ class ChatStreamingMixin:
                 end_time = timing_holder[1] or time.time()
                 start_time = timing_holder[0] or end_time
                 elapsed_ms = (end_time - start_time) * 1000
-                if full_response_holder[0]:
-                    self._finalize_turn(
-                        llm_bawt=llm_bawt,
-                        turn_id=turn_log_id,
-                        response_text=full_response_holder[0],
-                        tool_context=tool_context_holder[0],
-                        tool_call_details=tool_call_details_holder,
-                        prepared_messages=messages if "messages" in locals() else [],
-                        user_prompt=user_prompt,
-                        model=model_alias,
-                        bot_id=bot_id,
-                        user_id=user_id,
-                        elapsed_ms=elapsed_ms,
-                        stream=True,
-                        animation=animation_holder[0],
-                    )
-                else:
-                    # No response received — mark as timeout so turn doesn't
-                    # stay stuck at status='streaming' forever.
-                    # Persist any tool_call_details that were collected before
-                    # the follow-up model call failed.
-                    self._update_turn_log(
-                        turn_id=turn_log_id,
-                        status="timeout",
-                        latency_ms=elapsed_ms,
-                        tool_calls=tool_call_details_holder or None,
-                    )
+
+                # Wrap finalization in try/except so that the sentinel,
+                # turn_complete event, and generation cleanup always fire
+                # even if persistence raises (e.g. database failure).
+                try:
+                    if full_response_holder[0]:
+                        self._finalize_turn(
+                            llm_bawt=llm_bawt,
+                            turn_id=turn_log_id,
+                            response_text=full_response_holder[0],
+                            tool_context=tool_context_holder[0],
+                            tool_call_details=tool_call_details_holder,
+                            prepared_messages=messages if "messages" in locals() else [],
+                            user_prompt=user_prompt,
+                            model=model_alias,
+                            bot_id=bot_id,
+                            user_id=user_id,
+                            elapsed_ms=elapsed_ms,
+                            stream=True,
+                            animation=animation_holder[0],
+                        )
+                    else:
+                        # No response received — mark as timeout so turn doesn't
+                        # stay stuck at status='streaming' forever.
+                        # Persist any tool_call_details that were collected before
+                        # the follow-up model call failed.
+                        self._update_turn_log(
+                            turn_id=turn_log_id,
+                            status="timeout",
+                            latency_ms=elapsed_ms,
+                            tool_calls=tool_call_details_holder or None,
+                        )
+                except Exception as fin_err:
+                    log.error("Finalization failed (turn %s): %s", turn_log_id, fin_err)
+                    try:
+                        self._update_turn_log(
+                            turn_id=turn_log_id,
+                            status="error",
+                            latency_ms=elapsed_ms,
+                            response_text=full_response_holder[0] or None,
+                            error_text=f"finalize_error: {fin_err}",
+                        )
+                    except Exception:
+                        pass
 
                 # Notify SSE consumers that the turn is done so they
                 # can finalize without polling the turn-log API.
@@ -1044,6 +1109,14 @@ class ChatStreamingMixin:
                 })
 
                 put_queue_item_threadsafe(loop, chunk_queue, None)  # Sentinel
+
+                # Signal generation complete from the worker thread so
+                # that _start_generation() properly waits for us before
+                # starting a new generation for the same bot.
+                if is_agent_backend:
+                    done_event.set()
+                else:
+                    self._end_generation(cancel_event, done_event, bot_id)
 
         try:
             # Check if this bot needs emote filtering for TTS
@@ -1254,8 +1327,9 @@ class ChatStreamingMixin:
                 }
                 yield (f"data: {json.dumps(data)}\n\n")
         finally:
-            # Mark generation as complete (only if we used _start_generation)
-            if is_agent_backend:
-                done_event.set()
-            else:
-                self._end_generation(cancel_event, done_event, bot_id)
+            # Generation lifecycle (done_event / _end_generation) is now
+            # signalled from the worker thread's finally block so that it
+            # fires only after _finalize_turn completes.  The worker runs
+            # independently of this async generator, so a client disconnect
+            # (GeneratorExit here) does not interrupt persistence.
+            pass
