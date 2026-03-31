@@ -203,7 +203,7 @@ async def _handle_subscribe(conn: GatewayConnection, req_id: str, params: dict) 
         except Exception as e:
             log.exception("WS gateway subscription error")
             try:
-                await conn.send_evt("chat.warning", {"error": str(e)})
+                await conn.send_evt("chat.warning", {"warnings": [str(e)]})
             except Exception:
                 pass
 
@@ -337,7 +337,7 @@ async def _handle_chat_send(conn: GatewayConnection, req_id: str, params: dict) 
         except Exception as e:
             log.exception("WS gateway chat.send failed for run %s", run_id)
             try:
-                await conn.send_evt("chat.warning", {
+                await conn.send_evt("chat.error", {
                     "runId": run_id,
                     "botId": bot_id,
                     "error": str(e),
