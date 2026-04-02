@@ -17,6 +17,7 @@ from .tasks import router as tasks_router
 from .ha_weather import router as ha_weather_router
 from .turn_logs import router as turn_logs_router
 from .avatar_animations import router as avatar_animations_router
+from .ws_gateway import router as ws_gateway_router
 
 all_routers = [
     health_router,
@@ -24,6 +25,7 @@ all_routers = [
     nextcloud_router,
     models_router,
     openclaw_ws_router,
+    ws_gateway_router,
     botchat_router,
     chat_router,
     tasks_router,
