@@ -124,6 +124,7 @@ class OpenClawBackend(AgentBackend):
         first_delta_at: float | None = None
         tool_calls: list[OpenClawToolCall] = []
         text_parts: list[str] = []
+        upstream_model: str = ""
         termination_reason = "completed"
 
         import queue as queue_mod
@@ -162,9 +163,13 @@ class OpenClawBackend(AgentBackend):
                             message=prompt,
                             request_id=request_id,
                             attachments=attachments or [],
+                            system_prompt=config.get("system_prompt"),
+                            model=config.get("model"),
+                            backend=self.name,
                         )
                         logger.info(
-                            "OpenClaw request via bridge: session=%s request_id=%s",
+                            "%s request via bridge: session=%s request_id=%s",
+                            self.name,
                             session_key, request_id,
                         )
 
@@ -178,7 +183,8 @@ class OpenClawBackend(AgentBackend):
                                     if first_delta_at is None:
                                         first_delta_at = time.time()
                                         logger.info(
-                                            "OpenClaw first-token latency: %.1fms request_id=%s",
+                                            "%s first-token latency: %.1fms request_id=%s",
+                                        self.name,
                                             (first_delta_at - request_started) * 1000,
                                             request_id,
                                         )
@@ -186,6 +192,14 @@ class OpenClawBackend(AgentBackend):
                                     result_queue.put(delta)
 
                             elif event.kind == OpenClawEventKind.ASSISTANT_DONE:
+                                # Capture actual upstream model if provided
+                                if event.model:
+                                    nonlocal upstream_model
+                                    upstream_model = event.model
+                                    result_queue.put({
+                                        "event": "metadata",
+                                        "upstream_model": upstream_model,
+                                    })
                                 # ASSISTANT_DONE carries the complete response
                                 # text.  Yield any portion not already streamed
                                 # as deltas — this is critical for tool-heavy
@@ -234,7 +248,7 @@ class OpenClawBackend(AgentBackend):
                                     arguments=event.tool_arguments or {},
                                 )
                                 tool_calls.append(tc)
-                                logger.info("OpenClaw tool event: %s", tc.display_name)
+                                logger.info("%s tool event: %s", self.name, tc.display_name)
                                 result_queue.put({
                                     "event": "tool_call",
                                     "name": tc.display_name,
@@ -255,7 +269,7 @@ class OpenClawBackend(AgentBackend):
                                     })
 
                             elif event.kind == OpenClawEventKind.ERROR:
-                                raise RuntimeError(f"OpenClaw error: {event.text}")
+                                raise RuntimeError(f"{self.name} error: {event.text}")
                     finally:
                         await local_sub.close()
 
@@ -293,7 +307,8 @@ class OpenClawBackend(AgentBackend):
         finally:
             end_time = time.time()
             logger.info(
-                "OpenClaw stream termination: reason=%s total_latency_ms=%.1f request_id=%s",
+                "%s stream termination: reason=%s total_latency_ms=%.1f request_id=%s",
+                self.name,
                 termination_reason,
                 (end_time - request_started) * 1000,
                 request_id,
@@ -301,8 +316,8 @@ class OpenClawBackend(AgentBackend):
             full_text = "".join(text_parts)
             result = OpenClawResult(
                 text=full_text,
-                model="openclaw",
-                provider="openclaw-bridge",
+                model=upstream_model or self.name,
+                provider=self.name,
                 duration_ms=int((end_time - request_started) * 1000),
                 tool_calls=tool_calls,
                 raw={"request_id": request_id, "termination_reason": termination_reason},

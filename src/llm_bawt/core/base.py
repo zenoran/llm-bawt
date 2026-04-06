@@ -445,9 +445,11 @@ class BaseLLMBawt(ABC):
         builder = self._prompt_builder.copy()
 
         # Temporal grounding so relative-time references remain unambiguous.
+        # Agent backends manage their own history — don't reference llm-bawt's
+        is_agent = self.model_definition.get("type") == "agent_backend"
         builder.add_section(
             "temporal_context",
-            build_temporal_context(self.history_manager.messages),
+            build_temporal_context(None if is_agent else self.history_manager.messages),
             position=SectionPosition.DATETIME,
         )
         
@@ -520,6 +522,12 @@ class BaseLLMBawt(ABC):
             logger.debug(f"System message: {len(system_content)} chars")
             logger.debug(f"Sections: {[s.name for s in builder.enabled_sections]}")
         
+        # Agent backends manage their own conversation history —
+        # only include the current user message, skip old history
+        if self.model_definition.get("type") == "agent_backend":
+            messages.append(Message(role="user", content=prompt))
+            return messages
+
         # Always include history — two-layer architecture handles context overflow
         max_context_tokens = int(self._resolve_setting("max_context_tokens", getattr(self.config, "MAX_CONTEXT_TOKENS", 0)) or 0)
         if max_context_tokens <= 0 and self.client:

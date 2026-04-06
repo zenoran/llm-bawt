@@ -10,7 +10,7 @@ llm-bawt is the brain behind an AI assistant that:
 
 - **Remembers you** — facts from past conversations persist in semantic memory, decay over time unless reinforced, and are recalled when relevant
 - **Uses tools** — the LLM can search the web, store/recall memories, control smart home devices, and fetch web pages mid-conversation
-- **Works with any model** — swap between OpenAI, Grok (xAI), local GGUF models, Ollama, or vLLM without changing how you interact
+- **Works with any model** — swap between OpenAI, Grok (xAI), Claude (via Agent SDK), local GGUF models, Ollama, or vLLM without changing how you interact
 - **Has personalities** — different bots with their own system prompts, memory spaces, tool access, and default models
 - **Streams everything** — responses stream to the terminal or web UI in real time with rich formatting
 
@@ -83,9 +83,10 @@ The Docker build is a multi-stage CUDA-enabled image (~12 GB) that compiles llam
 | Container | Port | Purpose |
 |-----------|------|---------|
 | `llm-bawt-app` | 8001, 8642 | MCP memory server + OpenAI-compatible LLM API |
-| `llm-bawt-redis` | 6379 | Event transport (for agent bridge) |
+| `llm-bawt-redis` | 6379 | Event transport (for agent bridges) |
 | `llm-bawt-crawl4ai` | 11235 | Web page extraction for the `web_fetch` tool |
 | `llm-bawt-openclaw-bridge` | — | WebSocket bridge for OpenClaw agent backend (optional) |
+| `llm-bawt-claude-code-bridge` | — | Claude Agent SDK bridge for Claude Code (optional) |
 
 ### Option B: CLI-Only Install (pipx)
 
@@ -255,9 +256,12 @@ curl http://localhost:8642/health
 | Endpoint | Purpose |
 |----------|---------|
 | `POST /v1/chat/completions` | OpenAI-compatible chat (streaming SSE) |
+| `POST /v1/chat/session/reset` | Reset agent backend session for a bot |
 | `POST /v1/bots/{bot_id}/chat` | Bot-scoped chat with isolated memory |
 | `GET /v1/models` | List available models |
 | `GET/POST /v1/bots` | Bot CRUD and management |
+| `PUT /v1/bots/{slug}/profile` | Full bot profile update |
+| `PATCH /v1/bots/{slug}/profile` | Partial bot profile update |
 | `GET/POST /v1/memory/*` | Memory operations |
 | `GET /v1/history/*` | Conversation history |
 | `GET /v1/settings/*` | Runtime settings |
@@ -296,8 +300,8 @@ unmute connects to llm-bawt via `UNMUTE_LLM_URL=http://host.docker.internal:8642
 │  └──────────────────────┘  └───────────┬──────────────────────────────┘ │
 │                                        │                                │
 │  ┌────────────────┐  ┌────────────────┐│ ┌──────────────────────────┐   │
-│  │ Redis          │  │ Crawl4AI       ││ │ OpenClaw Bridge          │   │
-│  │ Event transport│  │ Web scraping   ││ │ Agent backend (optional) │   │
+│  │ Redis          │  │ Crawl4AI       ││ │ Agent Bridges (optional) │   │
+│  │ Event transport│  │ Web scraping   ││ │ OpenClaw + Claude Code   │   │
 │  └────────────────┘  └────────────────┘│ └──────────────────────────┘   │
 └────────────────────────────────────────┼────────────────────────────────┘
                                          │
@@ -306,7 +310,7 @@ unmute connects to llm-bawt via `UNMUTE_LLM_URL=http://host.docker.internal:8642
 │                                                                         │
 │  ┌─────────────────────────┐  ┌──────────────────────────────────────┐  │
 │  │ PostgreSQL + pgvector   │  │  LLM Providers                       │  │
-│  │ Semantic memory storage │  │  OpenAI, Grok (xAI), Ollama, GGUF    │  │
+│  │ Semantic memory storage │  │  OpenAI, Grok, Claude, Ollama, GGUF  │  │
 │  └─────────────────────────┘  └──────────────────────────────────────┘  │
 └─────────────────────────────────────────────────────────────────────────┘
 ```
@@ -368,8 +372,12 @@ src/llm_bawt/
 ├── clients/             # LLM provider clients
 │   ├── openai_client.py # OpenAI + compatible APIs
 │   ├── grok_client.py   # Grok (xAI) — also used for memory extraction
+│   ├── agent_backend_client.py # Agent backend wrapper (OpenClaw, Claude Code)
 │   ├── llamacpp_client.py # Local GGUF models via llama-cpp-python
 │   └── vllm_client.py   # vLLM GPU inference server
+├── agent_backends/      # Pluggable agent backend system
+│   ├── openclaw.py      # OpenClaw gateway backend (Redis → WS bridge)
+│   └── claude_code.py   # Claude Code backend (Redis → Agent SDK bridge)
 ├── adapters/            # Per-model output cleanup (role markers, BBCode, etc.)
 ├── tools/               # Tool definitions, executor, format handlers
 │   ├── loop.py          # Multi-turn tool calling orchestration
@@ -422,6 +430,7 @@ make docker-exec CMD="llm --status"   # Run a command inside the container
 | `llm-memory` | Memory debugging utilities |
 | `llm-nextcloud` | Nextcloud Talk bot provisioning |
 | `openclaw-bridge` | OpenClaw WebSocket agent bridge |
+| `claude-code-bridge` | Claude Code Agent SDK bridge |
 | `./server.sh start` | Start both services (MCP + LLM) for local development |
 
 ## Testing
@@ -465,6 +474,7 @@ Gitflow model: `main` (releases) ← `develop` (integration) ← `feature/*` (wo
 | [docs/WEB_FETCH_INTEGRATION.md](docs/WEB_FETCH_INTEGRATION.md) | Crawl4AI web page extraction |
 | [docs/BACKGROUND_SCHEDULER.md](docs/BACKGROUND_SCHEDULER.md) | Background job scheduler |
 | [docs/OPENCLAW_INTEGRATION.md](docs/OPENCLAW_INTEGRATION.md) | OpenClaw agent backend architecture |
+| [docs/CLAUDE_CODE_BRIDGE.md](docs/CLAUDE_CODE_BRIDGE.md) | Claude Code Agent SDK bridge — setup, auth, session management |
 | [docs/HA_NATIVE_MCP_INTEGRATION.md](docs/HA_NATIVE_MCP_INTEGRATION.md) | Home Assistant integration |
 | [docs/NEXTCLOUD_INTEGRATION.md](docs/NEXTCLOUD_INTEGRATION.md) | Nextcloud Talk bot provisioning |
 

@@ -43,6 +43,7 @@ class ChatCompletionRequest(BaseModel):
     tts_mode: bool = Field(default=False, description="Whether to append TTS output formatting instructions to the system prompt")
     client_system_context: str | None = Field(default=None, description="System context extracted from client messages (set by routes, not by callers)", exclude=True)
     ha_mode: bool = Field(default=False, description="HA-mode: cap history, force tool_choice=required on first call (set by routes)", exclude=True)
+    user_message_id: str | None = Field(default=None, description="Frontend-generated UUID for the user message (used as trigger_message_id in turn logs)")
 
 
 class ChatCompletionChoice(BaseModel):
@@ -240,6 +241,29 @@ class BotProfileUpsertRequest(BaseModel):
     uses_tools: bool = False
     uses_search: bool = False
     uses_home_assistant: bool = False
+    default_model: str | None = None
+    color: str | None = None
+    avatar: str | None = None
+    default_voice: str | None = None
+    nextcloud_config: dict[str, Any] | None = None
+    bot_type: BotKind | None = None
+    agent_backend: str | None = None
+    agent_backend_config: dict[str, Any] | None = None
+
+
+class BotProfilePatchRequest(BaseModel):
+    """Partial update — only provided fields are changed."""
+
+    name: str | None = None
+    description: str | None = None
+    system_prompt: str | None = None
+    requires_memory: bool | None = None
+    voice_optimized: bool | None = None
+    tts_mode: bool | None = None
+    include_summaries: bool | None = None
+    uses_tools: bool | None = None
+    uses_search: bool | None = None
+    uses_home_assistant: bool | None = None
     default_model: str | None = None
     color: str | None = None
     avatar: str | None = None

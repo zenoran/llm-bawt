@@ -101,6 +101,9 @@ class RedisSubscriber:
         message: str,
         request_id: str,
         attachments: list | None = None,
+        system_prompt: str | None = None,
+        model: str | None = None,
+        backend: str | None = None,
     ) -> None:
         """Publish a chat.send command to the bridge's command stream."""
         fields: dict = {
@@ -111,6 +114,12 @@ class RedisSubscriber:
         }
         if attachments:
             fields["attachments"] = json.dumps(attachments, ensure_ascii=False)
+        if system_prompt:
+            fields["system_prompt"] = system_prompt
+        if model:
+            fields["model"] = model
+        if backend:
+            fields["backend"] = backend
         await self._redis.xadd(
             COMMANDS_STREAM,
             fields,

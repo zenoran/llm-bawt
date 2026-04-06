@@ -56,8 +56,10 @@ def _load_entry_points() -> None:
 
 def _register_builtins() -> None:
     from .openclaw import OpenClawBackend
+    from .claude_code import ClaudeCodeBackend
 
     register_backend("openclaw", OpenClawBackend)
+    register_backend("claude-code", ClaudeCodeBackend)
 
 
 _register_builtins()

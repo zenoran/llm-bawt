@@ -78,7 +78,9 @@ class ServiceLLMBawt(BaseLLMBawt):
         # so each bot uses its own session_key / settings.
         from ..clients.agent_backend_client import AgentBackendClient
         if isinstance(self.client, AgentBackendClient) and self.bot.agent_backend_config:
-            self.client._bot_config = self.bot.agent_backend_config
+            self.client._bot_config = dict(self.bot.agent_backend_config)
+            # Include bot_id so backends can scope sessions per bot
+            self.client._bot_config["bot_id"] = self.bot_id
 
     def _init_history(self):
         """Ensure history always persists to PostgreSQL, even in local_mode.

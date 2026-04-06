@@ -201,11 +201,14 @@ class ChatStreamingMixin:
 
                 elif event.kind == OpenClawEventKind.TOOL_END:
                     tool_result = str(event.tool_result or "")
-                    # Recover the call_id from the matching tool_start
+                    # Recover the call_id from the matching tool_start.
+                    # Tool calls can nest (e.g. Agent > Grep > Read), so pop
+                    # the stack to pair each tool_end with its tool_start.
                     end_call_id = _last_call_id or ""
                     if tool_call_details:
-                        tool_call_details[-1]["result"] = tool_result
-                        end_call_id = tool_call_details[-1].get("call_id", end_call_id)
+                        matched = tool_call_details.pop()
+                        matched["result"] = tool_result
+                        end_call_id = matched.get("call_id", end_call_id)
                     # Publish tool_end to unified event stream
                     if redis_sub:
                         try:
@@ -541,11 +544,16 @@ class ChatStreamingMixin:
             cancel_event, done_event = await self._start_generation(bot_id)
         turn_log_id = f"turn-{uuid.uuid4().hex}"
 
-        # Resolve agent session_key from bot config for OpenClaw turns
+        # Resolve agent session_key for abort support
         oc_session_key: str | None = None
         if is_agent_backend:
             bc = getattr(llm_bawt.bot, "agent_backend_config", None) or {}
-            oc_session_key = bc.get("session_key")
+            backend_name = getattr(llm_bawt.bot, "agent_backend", "")
+            if backend_name == "claude-code":
+                # Claude-code uses bot_id as the routing key
+                oc_session_key = bot_id
+            else:
+                oc_session_key = bc.get("session_key")
 
         # Persist turn log immediately so the user's prompt is recorded
         # even if the backend times out or errors before responding.
@@ -593,7 +601,11 @@ class ChatStreamingMixin:
                 # Inject client-supplied system context (e.g. HA device list)
                 llm_bawt._client_system_context = request.client_system_context
                 llm_bawt._ha_mode = request.ha_mode
-                llm_bawt._include_summaries = request.include_summaries
+                # Bot's include_summaries=false overrides request default
+                if hasattr(llm_bawt.bot, 'include_summaries') and not llm_bawt.bot.include_summaries:
+                    llm_bawt._include_summaries = False
+                else:
+                    llm_bawt._include_summaries = request.include_summaries
                 llm_bawt._tts_mode = request.tts_mode or llm_bawt.bot.tts_mode
 
                 # Load animations for tts_mode — must happen before streaming starts
@@ -1000,6 +1012,10 @@ class ChatStreamingMixin:
 
                         if isinstance(item, dict):
                             evt = item.get("event")
+                            if evt == "metadata":
+                                if item.get("upstream_model"):
+                                    _upstream_model[0] = item["upstream_model"]
+                                continue
                             if evt in ("tool_call", "tool_result"):
                                 _saw_tool = True
                             if evt == "tool_call":
@@ -1158,6 +1174,7 @@ class ChatStreamingMixin:
             emote_filter = StreamingEmoteFilter() if (bot and bot.voice_optimized) else None
             oc_tool_call_index = 0  # OpenClaw agent backend tool call index
             oc_last_call_id = ""   # Track last call_id for tool_end matching
+            _upstream_model = [None]  # Actual model reported by agent backend
 
             # Send service warnings (e.g. model fallback) before content
             if model_warnings:
@@ -1207,12 +1224,15 @@ class ChatStreamingMixin:
                         anim_data = {"object": "service.animation", "animation": animation_holder[0]}
                         yield (f"data: {json.dumps(anim_data)}\n\n")
 
+                    # Use upstream model name if available (e.g. "claude-opus-4-6[1m]")
+                    final_model = _upstream_model[0] or model_alias
+
                     # Send final chunk
                     data = {
                         "id": response_id,
                         "object": "chat.completion.chunk",
                         "created": created,
-                        "model": model_alias,
+                        "model": final_model,
                         "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
                     }
                     yield (f"data: {json.dumps(data)}\n\n")
@@ -1317,6 +1337,11 @@ class ChatStreamingMixin:
                     oc_tool_call_index += 1
                     oc_last_call_id = tc_id
                     # Tool events already published from background thread
+                    continue
+
+                if isinstance(chunk, dict) and chunk.get("event") == "metadata":
+                    if chunk.get("upstream_model"):
+                        _upstream_model[0] = chunk["upstream_model"]
                     continue
 
                 if isinstance(chunk, dict) and chunk.get("event") == "tool_result":

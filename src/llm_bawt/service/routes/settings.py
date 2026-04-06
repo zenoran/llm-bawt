@@ -13,6 +13,7 @@ from ..dependencies import get_service
 from ..schemas import (
     BotCreateRequest,
     BotProfileListResponse,
+    BotProfilePatchRequest,
     BotProfileResponse,
     BotProfileUpsertRequest,
     RuntimeSettingRecord,
@@ -477,6 +478,46 @@ async def get_bot_profile(slug: str):
 async def upsert_bot_profile(slug: str, request: BotProfileUpsertRequest):
     """Create or update a bot personality profile."""
     payload = _request_to_profile_payload(slug, request)
+    return await _persist_bot_profile(payload, create_only=False)
+
+
+@router.patch("/v1/bots/{slug}/profile", response_model=BotProfileResponse, tags=["System"])
+async def patch_bot_profile(slug: str, request: BotProfilePatchRequest):
+    """Partially update a bot profile. Only provided fields are changed."""
+    service = get_service()
+    store = BotProfileStore(service.config)
+    if store.engine is None:
+        raise HTTPException(status_code=503, detail="Bot profiles DB unavailable")
+
+    existing = store.get(slug.strip().lower())
+    if not existing:
+        raise HTTPException(status_code=404, detail=f"Bot '{slug}' not found")
+
+    # Build payload from existing + only the fields that were explicitly set
+    payload: dict[str, object] = {
+        "slug": existing.slug,
+        "name": existing.name,
+        "description": existing.description,
+        "system_prompt": existing.system_prompt,
+        "requires_memory": existing.requires_memory,
+        "voice_optimized": existing.voice_optimized,
+        "tts_mode": existing.tts_mode,
+        "include_summaries": existing.include_summaries,
+        "uses_tools": existing.uses_tools,
+        "uses_search": existing.uses_search,
+        "uses_home_assistant": existing.uses_home_assistant,
+        "default_model": existing.default_model,
+        "color": existing.color,
+        "avatar": existing.avatar,
+        "default_voice": existing.default_voice,
+        "nextcloud_config": existing.nextcloud_config,
+        "bot_type": existing.bot_type,
+        "agent_backend": existing.agent_backend,
+        "agent_backend_config": existing.agent_backend_config,
+    }
+    for field_name in request.model_fields_set:
+        payload[field_name] = getattr(request, field_name)
+
     return await _persist_bot_profile(payload, create_only=False)
 
 

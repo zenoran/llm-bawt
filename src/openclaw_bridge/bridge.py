@@ -47,7 +47,7 @@ class SessionBridge:
         # Passive event feed: only publishes tool events to the unified SSE
         # stream so the frontend sees real-time activity without an active
         # chat request. Does NOT write history or manage run state.
-        self._ws_client.on_event(self._on_passive_event)
+        # self._ws_client.on_event(self._on_passive_event)  # disabled — use active path only
         await self._ws_client.connect()
         self._command_task = asyncio.create_task(self._command_listener())
         logger.info("SessionBridge started (sessions=%s)", list(self._ws_client.subscribed_sessions))
@@ -117,6 +117,13 @@ class SessionBridge:
                 for _stream, messages in results:
                     for msg_id, fields in messages:
                         action = fields.get("action", "")
+                        session_key = fields.get("session_key", "")
+
+                        # Skip commands for sessions this bridge doesn't own
+                        if session_key and not self._resolve_bot_id(session_key):
+                            await async_redis.xack(COMMANDS_STREAM, "bridge", msg_id)
+                            continue
+
                         if action == "chat.send":
                             asyncio.create_task(
                                 self._handle_send_command(fields, msg_id, async_redis)
@@ -425,7 +432,9 @@ class SessionBridge:
 
     # Per-run tool call counters for generating stable iteration numbers
     _passive_tool_counters: dict[str, int] = {}
-    _passive_call_ids: dict[str, str] = {}
+    # Stack of call_ids per run — tool calls can nest (e.g. Agent containing
+    # Grep/Read), so a single slot loses the outer call_id.
+    _passive_call_id_stacks: dict[str, list[str]] = {}
 
     async def _on_passive_event(self, raw: dict) -> None:
         """Lightweight passive handler: only publishes tool events to the
@@ -464,7 +473,7 @@ class SessionBridge:
             self._passive_tool_counters.setdefault(run_id, 0)
             self._passive_tool_counters[run_id] += 1
             iteration = self._passive_tool_counters[run_id]
-            self._passive_call_ids[run_id] = call_id
+            self._passive_call_id_stacks.setdefault(run_id, []).append(call_id)
 
             self._publisher.publish_unified_event(bot_id, user_id, {
                 "_type": "tool_event",
@@ -480,7 +489,8 @@ class SessionBridge:
             })
 
         elif event.kind == OpenClawEventKind.TOOL_END:
-            call_id = self._passive_call_ids.get(run_id, f"call_{uuid.uuid4().hex[:8]}")
+            stack = self._passive_call_id_stacks.get(run_id, [])
+            call_id = stack.pop() if stack else f"call_{uuid.uuid4().hex[:8]}"
             iteration = self._passive_tool_counters.get(run_id, 1)
             self._publisher.publish_unified_event(bot_id, user_id, {
                 "_type": "tool_event",
@@ -497,7 +507,7 @@ class SessionBridge:
 
         elif event.kind == OpenClawEventKind.RUN_COMPLETED:
             self._passive_tool_counters.pop(run_id, None)
-            self._passive_call_ids.pop(run_id, None)
+            self._passive_call_id_stacks.pop(run_id, None)
             self._publisher.publish_unified_event(bot_id, user_id, {
                 "_type": "turn_complete",
                 "turn_id": run_id,

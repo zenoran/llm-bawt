@@ -12,6 +12,10 @@ import os
 import logging
 from typing import TYPE_CHECKING
 
+# Suppress noisy MCP library session lifecycle logging
+logging.getLogger("mcp.server").setLevel(logging.WARNING)
+logging.getLogger("mcp.server.streamable_http").setLevel(logging.WARNING)
+
 from mcp.server.fastmcp import FastMCP
 from mcp.server.transport_security import TransportSecuritySettings
 
@@ -26,12 +30,12 @@ logger = logging.getLogger(__name__)
 # MCP Server instance
 # ---------------------------------------------------------------------------
 
-# Allow LAN access for OpenClaw and local services
+# Allow localhost by default; add LAN hosts via LLM_BAWT_MCP_ALLOWED_HOSTS env var.
 # The MCP library matches host:port patterns — use ":*" suffix to allow any port.
 _allowed_hosts = [
     h.strip() for h in os.getenv(
         "LLM_BAWT_MCP_ALLOWED_HOSTS",
-        "127.0.0.1:*,localhost:*,ubuntu:*,ubuntu.lan.ferreri.us:*,echo.lan.ferreri.us:*,10.0.0.101:*",
+        "127.0.0.1:*,localhost:*",
     ).split(",")
 ]
 _allowed_origins = [f"http://{h}" for h in _allowed_hosts]
@@ -520,6 +524,146 @@ async def remove_last_message_if_partial(bot_id: str = "default", role: str = "a
     logger.debug("MCP tool invoked: tools/remove_last_message_if_partial bot_id=%s role=%s", bot_id, role)
     storage = _get_storage()
     return await storage.remove_last_message_if_partial(bot_id=bot_id, role=role)
+
+
+# ---------------------------------------------------------------------------
+# Profile Tools
+# ---------------------------------------------------------------------------
+
+
+def _get_profile_manager():
+    """Lazy-load ProfileManager."""
+    from llm_bawt.profiles import ProfileManager
+    from llm_bawt.utils.config import Config
+    config = Config()
+    return ProfileManager(config)
+
+
+@mcp.tool()
+async def profile(
+    action: str,
+    entity_type: str = "user",
+    entity_id: str = "nick",
+    category: str | None = None,
+    key: str | None = None,
+    value: str | None = None,
+) -> str:
+    """User/bot profile database — structured attributes like name, preferences, facts, personality traits.
+
+    This is NOT the semantic memory system. Use this tool for structured profile data:
+    - User profiles: name, location, occupation, preferences, interests, communication style
+    - Bot profiles: personality traits, developed behaviors
+
+    Use search_memories for free-text semantic memory search instead.
+
+    Args:
+        action: One of: "summary", "list", "get", "set", "delete".
+            - summary: Get a human-readable profile overview.
+            - list: List all profile attributes (optionally filtered by category).
+            - get: Get a specific attribute by key.
+            - set: Set/update an attribute (requires key and value).
+            - delete: Delete an attribute by key.
+        entity_type: "user" or "bot".
+        entity_id: The user ID (for users) or bot slug (for bots).
+            IMPORTANT: When entity_type="bot", pass YOUR bot slug as entity_id,
+            not the user's name. e.g. entity_id="snark" for bot snark.
+        category: Attribute category filter for list/set/delete.
+            For users: "fact", "preference", "interest", "context", "communication".
+            For bots: "personality", "preference", "interest".
+        key: Attribute key (required for get/set/delete).
+        value: Attribute value (required for set).
+
+    Returns:
+        Result as text.
+    """
+    from llm_bawt.profiles import EntityType, AttributeCategory
+
+    # Validate entity_id matches entity_type
+    if action in ("set", "delete", "list", "get"):
+        pm = _get_profile_manager()
+        if entity_type == "bot":
+            from llm_bawt.bots import BotManager
+            from llm_bawt.utils.config import Config
+            bot = BotManager(Config()).get_bot(entity_id)
+            if not bot:
+                return f"Error: '{entity_id}' is not a valid bot. Check the bot slug."
+        elif entity_type == "user":
+            profile = pm.get_profile(EntityType.USER, entity_id)
+            if not profile:
+                # Auto-create user profiles, but check it's not a bot slug
+                from llm_bawt.bots import BotManager
+                from llm_bawt.utils.config import Config
+                bot = BotManager(Config()).get_bot(entity_id)
+                if bot:
+                    return f"Error: '{entity_id}' is a bot, not a user. Use entity_type=\"bot\"."
+
+    _ALL_CATEGORIES = [
+        AttributeCategory.FACT, AttributeCategory.PREFERENCE,
+        AttributeCategory.PERSONALITY, AttributeCategory.INTEREST,
+        AttributeCategory.CONTEXT, AttributeCategory.COMMUNICATION,
+    ]
+
+    logger.debug("MCP tool invoked: profile action=%s entity=%s/%s", action, entity_type, entity_id)
+    pm = _get_profile_manager()
+
+    etype = EntityType.USER if entity_type == "user" else EntityType.BOT
+
+    if action == "summary":
+        if entity_type == "user":
+            result = pm.get_user_profile_summary(entity_id)
+        else:
+            result = pm.get_bot_profile_summary(entity_id)
+        return result or f"No profile data found for {entity_type} '{entity_id}'."
+
+    elif action == "list":
+        if category:
+            attrs = pm.get_attributes_by_category(etype, entity_id, category)
+        else:
+            attrs = pm.get_all_attributes(etype, entity_id)
+        if not attrs:
+            return f"No attributes found for {entity_type} '{entity_id}'."
+        lines = []
+        for a in attrs:
+            lines.append(f"[{a.category}] {a.key}: {a.value} (confidence={a.confidence})")
+        return "\n".join(lines)
+
+    elif action == "get":
+        if not key:
+            return "Error: 'key' is required for action='get'."
+        if category:
+            attr = pm.get_attribute(etype, entity_id, category, key)
+        else:
+            attr = None
+            for cat in _ALL_CATEGORIES:
+                attr = pm.get_attribute(etype, entity_id, cat, key)
+                if attr:
+                    break
+        if not attr:
+            return f"Attribute '{key}' not found."
+        return f"[{attr.category}] {attr.key}: {attr.value} (confidence={attr.confidence})"
+
+    elif action == "set":
+        if not key or value is None:
+            return "Error: 'key' and 'value' are required for action='set'."
+        cat = category or AttributeCategory.FACT
+        pm.set_attribute(etype, entity_id, cat, key, value)
+        return f"Set [{cat}] {key} = {value}"
+
+    elif action == "delete":
+        if not key:
+            return "Error: 'key' is required for action='delete'."
+        if category:
+            deleted = pm.delete_attribute(etype, entity_id, category, key)
+        else:
+            deleted = False
+            for cat in _ALL_CATEGORIES:
+                if pm.delete_attribute(etype, entity_id, cat, key):
+                    deleted = True
+                    break
+        return f"Deleted: {deleted}"
+
+    else:
+        return f"Unknown action: {action}. Valid: summary, list, get, set, delete."
 
 
 # ---------------------------------------------------------------------------

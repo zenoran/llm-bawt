@@ -83,6 +83,22 @@ ICONS = {
     "done": "✓",
 }
 
+def _redact_image_data(obj: Any) -> Any:
+    """Deep-copy a payload, replacing base64 image URLs with a placeholder."""
+    if isinstance(obj, dict):
+        result = {}
+        for k, v in obj.items():
+            if k == "url" and isinstance(v, str) and v.startswith("data:image/"):
+                mime = v.split(";")[0].split(":")[1] if ";" in v else "image"
+                result[k] = f"[{mime} base64 redacted]"
+            else:
+                result[k] = _redact_image_data(v)
+        return result
+    if isinstance(obj, list):
+        return [_redact_image_data(item) for item in obj]
+    return obj
+
+
 # Global state
 _verbose = False
 _debug = False
@@ -358,21 +374,36 @@ class ServiceLogger:
                 user_prompt = ""
                 for m in reversed(messages):
                     if isinstance(m, dict) and m.get("role") == "user":
-                        user_prompt = m.get("content", "")[:100]
-                        if len(m.get("content", "")) > 100:
-                            user_prompt += "..."
+                        content = m.get("content", "")
+                        if isinstance(content, list):
+                            # Multimodal — extract text parts, summarize images
+                            parts = []
+                            for block in content:
+                                if isinstance(block, dict):
+                                    if block.get("type") == "text":
+                                        parts.append(block.get("text", ""))
+                                    elif block.get("type") == "image_url":
+                                        parts.append("[image]")
+                            user_prompt = " ".join(parts)[:100]
+                            if len(" ".join(parts)) > 100:
+                                user_prompt += "..."
+                        else:
+                            user_prompt = str(content)[:100]
+                            if len(str(content)) > 100:
+                                user_prompt += "..."
                         break
                 
                 self._console.print(f"  [bold green]← Client[/bold green] | {len(messages)} msg(s)")
                 if user_prompt:
                     self._console.print(f"  [green]prompt:[/green] {user_prompt}")
 
-        # Debug: dump full request payload
+        # Debug: dump request payload (with image data redacted)
         if _debug and payload:
             try:
-                self._logger.info("Request payload: %s", json.dumps(payload, ensure_ascii=False, default=str, indent=2))
+                sanitized = _redact_image_data(payload)
+                self._logger.info("Request payload: %s", json.dumps(sanitized, ensure_ascii=False, default=str))
             except Exception:
-                self._logger.info("Request payload: %s", payload)
+                self._logger.info("Request payload: (unserializable)")
 
     def api_response(self, ctx: RequestContext, status: int = 200, tokens: int | None = None) -> None:
         """Log an API response."""

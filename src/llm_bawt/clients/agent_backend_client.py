@@ -124,8 +124,19 @@ class AgentBackendClient(LLMClient):
 
         attachments: list = kwargs.pop("attachments", None) or []
 
+        # Extract system prompt from messages for backends that support it
+        # (e.g. claude-code bridge). Merge into config so the backend can
+        # pass it through in the Redis command.
+        config = dict(self._bot_config)
+        system_parts = []
+        for msg in messages:
+            if msg.role == "system":
+                system_parts.append(msg.content if isinstance(msg.content, str) else "")
+        if system_parts:
+            config["system_prompt"] = "\n\n".join(p for p in system_parts if p)
+
         if hasattr(self._backend, "stream_raw"):
-            for item in self._backend.stream_raw(prompt, self._bot_config, attachments=attachments):
+            for item in self._backend.stream_raw(prompt, config, attachments=attachments):
                 yield item
             if hasattr(self._backend, "get_last_stream_result"):
                 self.last_result = self._backend.get_last_stream_result()

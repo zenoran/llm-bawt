@@ -58,7 +58,10 @@ services:
       retries: 3
 
   openclaw-bridge:
-    image: llm-bawt-app
+    build:
+      context: .
+      dockerfile: Dockerfile.bridge
+    image: llm-bawt-bridge
     container_name: llm-bawt-openclaw-bridge
     command: ["python", "-m", "openclaw_bridge"]
     env_file:
@@ -75,7 +78,7 @@ services:
       - INFLUXDB_BUCKET=${INFLUXDB_BUCKET:-llm-bawt}
     volumes:
       - ./.logs:/app/.logs
-      - ${HOME}/.config/llm-bawt:/root/.config/llm-bawt
+      - ${HOME}/.config/llm-bawt:/home/bridge/.config/llm-bawt
     depends_on:
       redis:
         condition: service_healthy
@@ -88,6 +91,42 @@ services:
       timeout: 5s
       retries: 3
       start_period: 10s
+
+  claude-code-bridge:
+    image: llm-bawt-bridge
+    container_name: llm-bawt-claude-code-bridge
+    command: ["python", "-m", "claude_code_bridge"]
+    env_file:
+      - ./.env
+    environment:
+      - CLAUDE_CODE_OAUTH_TOKEN=${CLAUDE_CODE_OAUTH_TOKEN:-}
+      # Credentials file mounted for automatic token refresh
+      # Falls back to CLAUDE_CODE_OAUTH_TOKEN if file not present
+      - CLAUDE_CODE_MODEL=${CLAUDE_CODE_MODEL:-claude-sonnet-4-20250514}
+      - CLAUDE_CODE_ADD_DIRS=${CLAUDE_CODE_ADD_DIRS:-}
+      - CLAUDE_CODE_BRIDGE_LOG_LEVEL=${CLAUDE_CODE_BRIDGE_LOG_LEVEL:-INFO}
+      - LLM_BAWT_API_URL=http://app:8642
+      - REDIS_URL=redis://redis:6379/0
+    volumes:
+      - ./.logs:/app/.logs
+      - ${HOME}/dev:/home/bridge/dev
+      - ${HOME}/.config/claude-code-bridge:/home/bridge/.claude
+      - ${HOME}/.config/claude-code-bridge/.claude.json:/home/bridge/.claude.json
+      - ${HOME}/.claude/.credentials.json:/home/bridge/.claude/.credentials.json:ro
+      - ${HOME}/.ssh:/home/bridge/.ssh:ro
+      - ${HOME}/.config/claude-code-bridge/ssh_config:/etc/ssh/ssh_config:ro
+    depends_on:
+      redis:
+        condition: service_healthy
+      app:
+        condition: service_started
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8681/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
 
   crawl4ai:
     image: unclecode/crawl4ai:latest

@@ -75,6 +75,71 @@ async def chat_abort(request: ChatAbortRequest) -> ChatAbortResponse:
         turn_id=turn.id,
     )
 
+class SessionResetRequest(BaseModel):
+    """Request to reset an agent backend session."""
+    bot_id: str = Field(..., description="Bot slug to reset session for")
+
+
+class SessionResetResponse(BaseModel):
+    ok: bool
+    bot_id: str
+    session_key: str | None = None
+    detail: str | None = None
+
+
+@router.post("/v1/chat/session/reset", tags=["Agent Backends"])
+async def session_reset(request: SessionResetRequest) -> SessionResetResponse:
+    """Reset the agent backend session for a bot.
+
+    Sends a session.reset RPC to the bridge, which clears the stored
+    conversation and starts fresh on the next message. Works for any
+    agent backend that supports the RPC.
+    """
+    service = get_service()
+    from ...bots import BotManager
+
+    bot = BotManager(service.config).get_bot(request.bot_id)
+    if not bot:
+        raise HTTPException(status_code=404, detail=f"Bot '{request.bot_id}' not found")
+
+    backend_name = getattr(bot, "agent_backend", None)
+    if not backend_name:
+        raise HTTPException(status_code=400, detail=f"Bot '{request.bot_id}' is not an agent backend bot")
+
+    bc = getattr(bot, "agent_backend_config", {}) or {}
+    session_key = bc.get("session_key", "")
+    # Claude-code backend auto-generates session key from bot_id
+    if not session_key and backend_name == "claude-code":
+        session_key = request.bot_id
+
+    from ...agent_backends.openclaw import get_openclaw_subscriber
+
+    subscriber = get_openclaw_subscriber()
+    if not subscriber:
+        raise HTTPException(status_code=503, detail="Redis subscriber not available")
+
+    rpc_req_id = f"reset_{uuid.uuid4().hex}"
+    try:
+        await subscriber.send_rpc(
+            "session.reset",
+            {"sessionKey": session_key},
+            rpc_req_id,
+            timeout_s=10,
+        )
+    except Exception as e:
+        log.warning("session.reset RPC failed for bot %s: %s", request.bot_id, e)
+        # Even if the bridge doesn't handle this RPC, we still return ok
+        # — the bridge may not support it (e.g. openclaw)
+
+    log.info("Session reset requested: bot=%s session=%s", request.bot_id, session_key)
+    return SessionResetResponse(
+        ok=True,
+        bot_id=request.bot_id,
+        session_key=session_key,
+        detail="reset",
+    )
+
+
 @router.post("/v1/chat/completions", tags=["OpenAI Compatible"])
 async def chat_completions(request: ChatCompletionRequest):
     """

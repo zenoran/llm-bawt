@@ -188,11 +188,19 @@ class ModelLifecycleManager:
             True if registration successful
         """
         with self._model_lock:
-            # Unload any existing model first
+            # Only unload if the previous model holds local resources (GGUF/vLLM).
+            # API clients (openai, grok) and agent backends (openclaw, claude-code)
+            # are stateless — no need to unload/reload when switching between them.
             if self._current_client is not None and self._current_model_alias != alias:
-                logger.info(f"Switching model: {self._current_model_alias} -> {alias}")
-                self.unload_current_model()
-            
+                prev_info = self.get_model_info(self._current_model_alias) or {}
+                prev_type = prev_info.get("type", "")
+                needs_unload = prev_type in ("gguf", "vllm", "llamacpp")
+                if needs_unload:
+                    logger.info(f"Switching model: {self._current_model_alias} -> {alias}")
+                    self.unload_current_model()
+                else:
+                    logger.debug(f"Model switch: {self._current_model_alias} -> {alias} (no unload needed)")
+
             self._current_model_alias = alias
             self._current_client = client
             

@@ -1,0 +1,42 @@
+# Lightweight bridge image — no CUDA/GPU, just Python + bridge deps
+FROM python:3.12-slim
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    curl libpq5 openssh-client git \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN curl -LsSf https://astral.sh/uv/install.sh | sh
+ENV PATH="/root/.local/bin:$PATH"
+
+WORKDIR /app
+
+# Copy project metadata for dependency resolution
+COPY pyproject.toml ./
+
+# Copy only the bridge packages + shared deps
+COPY src/openclaw_bridge/ ./src/openclaw_bridge/
+COPY src/claude_code_bridge/ ./src/claude_code_bridge/
+
+# Minimal venv with only what bridges need
+RUN uv venv && uv pip install \
+    "redis[hiredis]>=5.0.0" \
+    "sqlalchemy>=2.0" \
+    "psycopg2-binary>=2.9" \
+    "websockets>=13.0" \
+    "httpx>=0.26.0" \
+    "anyio>=4.0" \
+    "claude-agent-sdk>=0.1.56" \
+    "pydantic>=2.0"
+
+# Install project in editable mode so both bridge packages are importable
+RUN uv pip install -e . --no-deps
+
+RUN useradd -m -s /bin/bash bridge && chown -R bridge:bridge /app
+USER bridge
+
+ENV PATH="/app/.venv/bin:$PATH" \
+    PYTHONUNBUFFERED=1 \
+    HOME=/home/bridge
+
+# Default command — overridden per service in docker-compose.yml
+CMD ["python", "-m", "openclaw_bridge"]
