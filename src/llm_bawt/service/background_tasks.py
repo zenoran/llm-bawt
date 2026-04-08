@@ -41,6 +41,8 @@ class BackgroundTasksMixin:
                 result = await self._process_profile_maintenance(task)
             elif task.task_type == TaskType.HISTORY_SUMMARIZATION:
                 result = await self._process_history_summarization(task)
+            elif task.task_type == TaskType.MEMORY_EXTRACTION:
+                result = await self._process_memory_extraction(task)
             else:
                 raise ValueError(f"Unknown task type: {task.task_type}")
 
@@ -523,3 +525,191 @@ class BackgroundTasksMixin:
                 invalidate()
 
         return result
+
+    async def _process_memory_extraction(self, task: Task) -> dict:
+        """Extract memories from unprocessed conversation messages.
+
+        Reads batches of unprocessed messages from the bot's message table,
+        runs LLM-based fact extraction, stores resulting memories, and marks
+        the source messages as processed.
+        """
+        from ..memory.extraction.service import MemoryExtractionService, MemoryAction
+
+        bot_id = task.bot_id or self._default_bot
+        user_id = task.user_id
+        if not user_id or user_id == "system":
+            user_id = getattr(self.config, "DEFAULT_USER", None) or "system"
+        batch_size = int(task.payload.get("batch_size", 50))
+
+        # Check config gate
+        if not getattr(self.config, "MEMORY_EXTRACTION_ENABLED", True):
+            return {"skipped": True, "reason": "Memory extraction disabled in config"}
+
+        memory_client = self.get_memory_client(bot_id, user_id)
+        if not memory_client:
+            return {"error": "Memory client unavailable", "bot_id": bot_id}
+
+        # Get the underlying PostgreSQL backend for direct message table access
+        try:
+            storage = memory_client._get_storage()
+            backend = storage.get_backend(bot_id)
+        except Exception:
+            backend = None
+        if not backend or not hasattr(backend, "get_unprocessed_messages"):
+            return {"error": "Memory backend lacks message processing support"}
+
+        loop = asyncio.get_event_loop()
+
+        unprocessed = await loop.run_in_executor(
+            None,
+            lambda: backend.get_unprocessed_messages(limit=batch_size),
+        )
+
+        if not unprocessed:
+            return {
+                "bot_id": bot_id,
+                "messages_found": 0,
+                "facts_extracted": 0,
+                "facts_stored": 0,
+            }
+
+        log.info(
+            "[MemExtract] %s: %d unprocessed messages found",
+            bot_id,
+            len(unprocessed),
+        )
+
+        # Use isolated background client for LLM calls
+        extraction_client, extraction_model = self._get_background_client(
+            model_override=task.payload.get("model"),
+        )
+        use_llm = extraction_client is not None
+
+        extraction_service = MemoryExtractionService(llm_client=extraction_client)
+        min_importance = getattr(self.config, "MEMORY_EXTRACTION_MIN_IMPORTANCE", 0.5)
+        profile_enabled = getattr(self.config, "MEMORY_PROFILE_ATTRIBUTE_ENABLED", True)
+
+        # Build conversation chunks for extraction — group consecutive messages
+        conversation = [
+            {"role": m["role"], "content": m["content"]}
+            for m in unprocessed
+            if m.get("role") in ("user", "assistant") and m.get("content")
+        ]
+        message_ids = [m["id"] for m in unprocessed]
+
+        total_facts = 0
+        total_stored = 0
+
+        if conversation:
+            try:
+                facts = await loop.run_in_executor(
+                    self._llm_executor,
+                    lambda: extraction_service.extract_from_conversation(
+                        messages=conversation,
+                        use_llm=use_llm and extraction_service.llm_client is not None,
+                    ),
+                )
+
+                # Filter by importance
+                facts = [f for f in facts if f.importance >= min_importance]
+                total_facts = len(facts)
+
+                if facts:
+                    # Deduplicate against existing memories
+                    existing_memories = memory_client.list_memories(
+                        limit=100, min_importance=0.0,
+                    )
+
+                    if existing_memories:
+                        actions = extraction_service.determine_memory_actions(
+                            new_facts=facts,
+                            existing_memories=existing_memories,
+                        )
+                    else:
+                        actions = [MemoryAction(action="ADD", fact=f) for f in facts]
+
+                    for action in actions:
+                        fact = action.fact
+                        if not fact:
+                            continue
+                        try:
+                            tag_str = ",".join(fact.tags)
+                            if action.action == "ADD":
+                                log.info(
+                                    "[MemExtract] ADD: '%s' [%s] importance=%.2f",
+                                    fact.content,
+                                    tag_str,
+                                    fact.importance,
+                                )
+                                memory_client.add_memory(
+                                    content=fact.content,
+                                    tags=fact.tags,
+                                    importance=fact.importance,
+                                    source_message_ids=message_ids[:5],
+                                )
+                                total_stored += 1
+                            elif action.action == "UPDATE" and action.target_memory_id:
+                                log.info(
+                                    "[MemExtract] UPDATE (%s): '%s'",
+                                    action.target_memory_id[:8],
+                                    fact.content,
+                                )
+                                memory_client.update_memory(
+                                    memory_id=action.target_memory_id,
+                                    content=fact.content,
+                                    importance=fact.importance,
+                                    tags=fact.tags,
+                                )
+                                total_stored += 1
+                            elif action.action == "DELETE" and action.target_memory_id:
+                                log.info(
+                                    "[MemExtract] DELETE: %s reason='%s'",
+                                    action.target_memory_id[:8],
+                                    action.reason,
+                                )
+                                memory_client.delete_memory(
+                                    memory_id=action.target_memory_id,
+                                )
+
+                            # Profile attribute extraction
+                            if action.action in ("ADD", "UPDATE") and profile_enabled:
+                                from ..memory_server.extraction import (
+                                    extract_profile_attributes_from_fact,
+                                )
+                                extract_profile_attributes_from_fact(
+                                    fact=fact,
+                                    user_id=user_id,
+                                    config=self.config,
+                                )
+                        except Exception as e:
+                            log.warning(
+                                "[MemExtract] Failed action %s: %s",
+                                action.action,
+                                e,
+                            )
+
+            except Exception as e:
+                log.error("[MemExtract] Extraction failed for %s: %s", bot_id, e)
+
+        # Mark messages as processed regardless of extraction outcome
+        # so they aren't re-processed on the next run
+        await loop.run_in_executor(
+            None,
+            lambda: backend.mark_messages_processed(message_ids),
+        )
+
+        log.info(
+            "[MemExtract] %s: %d messages processed, %d facts extracted, %d stored",
+            bot_id,
+            len(unprocessed),
+            total_facts,
+            total_stored,
+        )
+
+        return {
+            "bot_id": bot_id,
+            "messages_found": len(unprocessed),
+            "facts_extracted": total_facts,
+            "facts_stored": total_stored,
+            "extraction_method": extraction_model or "heuristic",
+        }

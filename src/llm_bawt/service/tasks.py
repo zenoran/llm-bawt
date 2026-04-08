@@ -18,6 +18,7 @@ class TaskType(Enum):
     MEMORY_MAINTENANCE = "memory_maintenance"
     PROFILE_MAINTENANCE = "profile_maintenance"
     HISTORY_SUMMARIZATION = "history_summarization"
+    MEMORY_EXTRACTION = "memory_extraction"
 
 
 class TaskStatus(Enum):
@@ -225,6 +226,29 @@ def create_history_summarization_task(
         payload={
             "use_heuristic_fallback": use_heuristic_fallback,
             "max_tokens_per_chunk": max_tokens_per_chunk,
+            "model": model,
+        },
+    )
+
+
+def create_memory_extraction_task(
+    bot_id: str = "nova",
+    user_id: str = "system",
+    batch_size: int = 50,
+    model: str | None = None,
+    priority: int = -1,
+) -> Task:
+    """Create a memory extraction task.
+
+    Processes unprocessed messages into semantic memories via LLM extraction.
+    """
+    return Task(
+        task_type=TaskType.MEMORY_EXTRACTION,
+        bot_id=bot_id,
+        user_id=user_id,
+        priority=priority,
+        payload={
+            "batch_size": batch_size,
             "model": model,
         },
     )

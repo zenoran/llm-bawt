@@ -195,6 +195,7 @@ class Config(RuntimeTunables, BaseSettings):
     # --- Memory Extraction Settings --- #
     MEMORY_EXTRACTION_ENABLED: bool = Field(default=True, description="Enable LLM-based memory extraction from conversations")
     MEMORY_EXTRACTION_MIN_IMPORTANCE: float = Field(default=0.5, description="Minimum importance score for extracted memories to be stored (0.5 = moderately important)")
+    MEMORY_EXTRACTION_INTERVAL_MINUTES: int = Field(default=30, description="How often to run automatic memory extraction from unprocessed messages")
     MEMORY_PROFILE_ATTRIBUTE_ENABLED: bool = Field(default=True, description="Create profile attributes from extracted memories")
     MEMORY_PROFILE_ATTRIBUTE_MIN_IMPORTANCE: float = Field(default=0.7, description="Minimum importance for extracted profile attributes")
     MEMORY_EMBEDDING_DIM: int = Field(default=384, description="Dimension of embedding vectors for semantic search (384 for all-MiniLM-L6-v2)")

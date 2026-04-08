@@ -31,6 +31,7 @@ class JobType(str, Enum):
     MEMORY_CONSOLIDATION = "memory_consolidation"
     MEMORY_DECAY = "memory_decay"
     HISTORY_SUMMARIZATION = "history_summarization"
+    MEMORY_EXTRACTION = "memory_extraction"
 
 
 class ScheduledJob(SQLModel, table=True):
@@ -95,11 +96,11 @@ def _migrate_postgres_jobtype_enum(engine) -> None:
             )
         }
 
-        needed_label = JobType.HISTORY_SUMMARIZATION.name
-        if needed_label not in labels:
-            safe_label = needed_label.replace("'", "''")
-            conn.execute(text(f"ALTER TYPE jobtype ADD VALUE IF NOT EXISTS '{safe_label}'"))
-            logger.info("Added missing enum value to jobtype: %s", needed_label)
+        for member in JobType:
+            if member.name not in labels:
+                safe_label = member.name.replace("'", "''")
+                conn.execute(text(f"ALTER TYPE jobtype ADD VALUE IF NOT EXISTS '{safe_label}'"))
+                logger.info("Added missing enum value to jobtype: %s", member.name)
 
 
 class JobScheduler:
@@ -324,14 +325,34 @@ class JobScheduler:
                 return latest
             return None
 
-    def _max_profile_updated_at(self, entity_id: str, entity_type: str) -> datetime | None:
-        """Return latest profile/attribute update time for an entity."""
+    def _count_unprocessed_messages(self, bot_id: str) -> int:
+        """Return count of unprocessed messages for a bot."""
+        table_bot = self._sanitize_identifier(bot_id)
+        if not table_bot:
+            return 0
+        table_name = f"{table_bot}_messages"
+        sql = text(
+            f"""
+            SELECT COUNT(*) AS cnt
+            FROM {table_name}
+            WHERE COALESCE(processed, FALSE) = FALSE
+              AND role IN ('user', 'assistant')
+            """
+        )
+        try:
+            with self.engine.connect() as conn:
+                row = conn.execute(sql).fetchone()
+                return int(row[0]) if row else 0
+        except Exception:
+            return 0
+
+    def _profile_needs_rebuild(self, entity_id: str, entity_type: str) -> tuple[bool, str | None]:
+        """Check if profile attributes were modified after the last summary build."""
         safe_entity_id = (entity_id or "").strip().lower()
         safe_entity_type = (entity_type or "user").strip().lower()
         if not safe_entity_id:
-            return None
+            return False, "No entity_id"
 
-        latest: datetime | None = None
         with self.engine.connect() as conn:
             attr_row = conn.execute(
                 text(
@@ -344,10 +365,10 @@ class JobScheduler:
                 ),
                 {"entity_id": safe_entity_id, "entity_type": safe_entity_type},
             ).fetchone()
-            profile_row = conn.execute(
+            summary_row = conn.execute(
                 text(
                     """
-                    SELECT MAX(updated_at) AS latest_updated_at
+                    SELECT summary_updated_at
                     FROM entity_profiles
                     WHERE entity_id = :entity_id
                       AND entity_type = :entity_type
@@ -356,15 +377,16 @@ class JobScheduler:
                 {"entity_id": safe_entity_id, "entity_type": safe_entity_type},
             ).fetchone()
 
-            candidates = []
-            if attr_row and isinstance(attr_row[0], datetime):
-                candidates.append(attr_row[0])
-            if profile_row and isinstance(profile_row[0], datetime):
-                candidates.append(profile_row[0])
-            if candidates:
-                latest = max(candidates)
+            latest_attr = attr_row[0] if attr_row and isinstance(attr_row[0], datetime) else None
+            summary_at = summary_row[0] if summary_row and isinstance(summary_row[0], datetime) else None
 
-        return latest
+            if latest_attr is None:
+                return False, "No profile attributes found"
+            if summary_at is None:
+                return True, "Profile summary has never been built"
+            if latest_attr > summary_at:
+                return True, None
+            return False, "No profile attribute changes since last summary build"
 
     def _has_pending_history_summaries(self, bot_id: str) -> tuple[bool, int]:
         """Return whether there are currently eligible unsummarized sessions.
@@ -439,10 +461,7 @@ class JobScheduler:
             if job.job_type == JobType.PROFILE_MAINTENANCE:
                 entity_id = config.get("entity_id", "user")
                 entity_type = config.get("entity_type", "user")
-                latest_profile_update = self._max_profile_updated_at(entity_id, entity_type)
-                if self._has_datetime_activity_since(latest_profile_update, last_run_at):
-                    return True, None
-                return False, "No profile attribute changes since last run"
+                return self._profile_needs_rebuild(entity_id, entity_type)
 
             if job.job_type == JobType.MEMORY_CONSOLIDATION:
                 latest_memory_update = self._max_memory_updated_at(job.bot_id)
@@ -455,6 +474,13 @@ class JobScheduler:
                 if latest_memory_update is None:
                     return False, "No memories available for decay"
                 return True, None
+
+            if job.job_type == JobType.MEMORY_EXTRACTION:
+                # Check if there are unprocessed messages
+                count = self._count_unprocessed_messages(job.bot_id)
+                if count > 0:
+                    return True, f"{count} unprocessed message(s)"
+                return False, "No unprocessed messages"
         except Exception as e:
             logger.debug(
                 "Activity-gate check failed for job %s (%s); falling back to run: %s",
@@ -471,6 +497,7 @@ class JobScheduler:
         from llm_bawt.service.tasks import (
             create_history_summarization_task,
             create_maintenance_task,
+            create_memory_extraction_task,
             create_profile_maintenance_task,
         )
         
@@ -512,7 +539,15 @@ class JobScheduler:
                 max_tokens_per_chunk=config.get("max_tokens_per_chunk", 4000),
                 model=config.get("model"),
             )
-        
+        elif job.job_type == JobType.MEMORY_EXTRACTION:
+            config = self._parse_config_json(job.config_json)
+            return create_memory_extraction_task(
+                bot_id=job.bot_id,
+                user_id=config.get("user_id", "system"),
+                batch_size=config.get("batch_size", 50),
+                model=config.get("model"),
+            )
+
         return None
 
 
@@ -551,10 +586,6 @@ def init_default_jobs(engine, config) -> None:
         ).all()
         existing_history_bot_ids = {job.bot_id for job in existing_history_jobs}
 
-        # Backward compatibility: if an all-bots wildcard exists, do nothing.
-        if "*" in existing_history_bot_ids:
-            return
-
         from llm_bawt.bots import BotManager
 
         bot_manager = BotManager(config)
@@ -562,9 +593,12 @@ def init_default_jobs(engine, config) -> None:
         if not target_bots:
             target_bots = [config.DEFAULT_BOT or "nova"]
 
+        # Backward compatibility: if an all-bots wildcard exists, skip per-bot creation.
+        skip_history = "*" in existing_history_bot_ids
+
         created = 0
         for bot_id in target_bots:
-            if bot_id in existing_history_bot_ids:
+            if skip_history or bot_id in existing_history_bot_ids:
                 continue
             bot_settings = RuntimeSettingsResolver(config=config, bot_id=bot_id)
 
@@ -592,3 +626,36 @@ def init_default_jobs(engine, config) -> None:
         if created:
             session.commit()
             logger.debug("Created %d history summarization job(s)", created)
+
+        # Ensure memory extraction jobs exist for each configured bot.
+        existing_extraction_jobs = session.exec(
+            select(ScheduledJob).where(ScheduledJob.job_type == JobType.MEMORY_EXTRACTION)
+        ).all()
+        existing_extraction_bot_ids = {job.bot_id for job in existing_extraction_jobs}
+
+        if "*" not in existing_extraction_bot_ids:
+            extraction_created = 0
+            default_user = config.DEFAULT_USER or "user"
+            for bot_id in target_bots:
+                if bot_id in existing_extraction_bot_ids:
+                    continue
+                extraction_job = ScheduledJob(
+                    job_type=JobType.MEMORY_EXTRACTION,
+                    bot_id=bot_id,
+                    enabled=config.SCHEDULER_ENABLED,
+                    interval_minutes=int(
+                        getattr(config, "MEMORY_EXTRACTION_INTERVAL_MINUTES", 30),
+                    ),
+                    config_json=json.dumps(
+                        {
+                            "user_id": default_user,
+                            "batch_size": 50,
+                        }
+                    ),
+                )
+                session.add(extraction_job)
+                extraction_created += 1
+
+            if extraction_created:
+                session.commit()
+                logger.debug("Created %d memory extraction job(s)", extraction_created)
