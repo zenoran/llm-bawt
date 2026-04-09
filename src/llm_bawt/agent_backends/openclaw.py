@@ -364,7 +364,7 @@ class OpenClawBackend(AgentBackend):
                             arguments=item.get("arguments", {}),
                         ))
 
-        result = self._last_stream_result
+        result = self.get_last_stream_result()
         if result:
             return result
 

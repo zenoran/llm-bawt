@@ -35,6 +35,9 @@ services:
       - ${LLM_BAWT_MODEL_CACHE_DIR:-${HOME}/.cache/llm-bawt/models}:/root/.cache/llm-bawt/models
       # Mount HuggingFace cache for GGUF models
       - ${HF_HOME:-${HOME}/.cache/huggingface}:/root/.cache/huggingface
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+      - "echo.lan.zenoran.com:${ECHO_LAN_HOST_IP:-10.0.0.101}"
     depends_on:
       redis:
         condition: service_healthy
@@ -76,6 +79,9 @@ services:
       - INFLUXDB_TOKEN=${INFLUXDB_TOKEN:-}
       - INFLUXDB_ORG=${INFLUXDB_ORG:-homeassistant}
       - INFLUXDB_BUCKET=${INFLUXDB_BUCKET:-llm-bawt}
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+      - "echo.lan.zenoran.com:${ECHO_LAN_HOST_IP:-10.0.0.101}"
     volumes:
       - ./.logs:/app/.logs
       - ${HOME}/.config/llm-bawt:/home/bridge/.config/llm-bawt
@@ -100,19 +106,21 @@ services:
       - ./.env
     environment:
       - CLAUDE_CODE_OAUTH_TOKEN=${CLAUDE_CODE_OAUTH_TOKEN:-}
-      # Credentials file mounted for automatic token refresh
-      # Falls back to CLAUDE_CODE_OAUTH_TOKEN if file not present
       - CLAUDE_CODE_MODEL=${CLAUDE_CODE_MODEL:-claude-sonnet-4-20250514}
       - CLAUDE_CODE_ADD_DIRS=${CLAUDE_CODE_ADD_DIRS:-}
       - CLAUDE_CODE_BRIDGE_LOG_LEVEL=${CLAUDE_CODE_BRIDGE_LOG_LEVEL:-INFO}
       - LLM_BAWT_API_URL=http://app:8642
       - REDIS_URL=redis://redis:6379/0
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+      - "echo.lan.zenoran.com:${ECHO_LAN_HOST_IP:-10.0.0.101}"
     volumes:
       - ./.logs:/app/.logs
       - ${HOME}/dev:/home/bridge/dev
       - ${HOME}/.config/claude-code-bridge:/home/bridge/.claude
+      - ${HOME}/dev/agent-skills:/home/bridge/.claude/skills
       - ${HOME}/.config/claude-code-bridge/.claude.json:/home/bridge/.claude.json
-      - ${HOME}/.claude/.credentials.json:/home/bridge/.claude/.credentials.json:ro
+      - ${HOME}/.claude/.credentials.json:/home/bridge/.claude/.credentials.json
       - ${HOME}/.ssh:/home/bridge/.ssh:ro
       - ${HOME}/.config/claude-code-bridge/ssh_config:/etc/ssh/ssh_config:ro
     depends_on:

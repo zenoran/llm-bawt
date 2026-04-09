@@ -83,6 +83,7 @@ def main() -> None:
         cwd=os.getenv("CLAUDE_CODE_CWD", "/app"),
         permission_mode=os.getenv("CLAUDE_CODE_PERMISSION_MODE", "bypassPermissions"),
         add_dirs=add_dirs,
+        request_timeout=float(os.getenv("CLAUDE_CODE_REQUEST_TIMEOUT", "300")),
     )
 
     health_port = int(os.getenv("CLAUDE_CODE_BRIDGE_HEALTH_PORT", "8681"))

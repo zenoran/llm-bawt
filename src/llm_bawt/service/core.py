@@ -296,7 +296,7 @@ class ServiceLLMBawt(BaseLLMBawt):
             slog.model_loaded(self.resolved_model_alias, model_type, load_time_ms)
             return client
         
-        elif model_type == "agent_backend":
+        elif model_type in ("agent_backend", "claude-code"):
             from ..clients.agent_backend_client import AgentBackendClient
             backend_name = self.model_definition.get("backend", self.resolved_model_alias)
             bot_config = self.model_definition.get("bot_config", {})
@@ -313,7 +313,7 @@ class ServiceLLMBawt(BaseLLMBawt):
         else:
             raise ValueError(
                 f"Unsupported model type: '{model_type}'. "
-                f"Supported types: openai, grok, gguf, vllm, agent_backend"
+                f"Supported types: openai, grok, gguf, vllm, agent_backend, claude-code"
             )
     
     # =========================================================================

@@ -361,7 +361,12 @@ class TurnLogStore:
         elif has_tools is False:
             conditions.append((TurnLog.tool_calls_json.is_(None)) | (TurnLog.tool_calls_json == "[]"))
         if trigger_message_ids:
-            conditions.append(TurnLog.trigger_message_id.in_(trigger_message_ids))
+            # Include rows matching the given IDs OR rows with NULL trigger
+            # (agent-backend turns that need post-processing via turn_id fallback).
+            conditions.append(
+                TurnLog.trigger_message_id.in_(trigger_message_ids)
+                | TurnLog.trigger_message_id.is_(None)
+            )
 
         statement = select(TurnLog).where(*conditions).order_by(TurnLog.created_at.desc())
         count_statement = select(TurnLog).where(*conditions)

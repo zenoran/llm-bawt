@@ -446,7 +446,7 @@ class BaseLLMBawt(ABC):
 
         # Temporal grounding so relative-time references remain unambiguous.
         # Agent backends manage their own history — don't reference llm-bawt's
-        is_agent = self.model_definition.get("type") == "agent_backend"
+        is_agent = self.model_definition.get("type") in ("agent_backend", "claude-code")
         builder.add_section(
             "temporal_context",
             build_temporal_context(None if is_agent else self.history_manager.messages),
@@ -524,7 +524,7 @@ class BaseLLMBawt(ABC):
         
         # Agent backends manage their own conversation history —
         # only include the current user message, skip old history
-        if self.model_definition.get("type") == "agent_backend":
+        if self.model_definition.get("type") in ("agent_backend", "claude-code"):
             messages.append(Message(role="user", content=prompt))
             return messages
 

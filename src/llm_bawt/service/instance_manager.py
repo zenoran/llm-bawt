@@ -322,7 +322,7 @@ class InstanceManagerMixin:
         # Skip for agent_backend models — they're lightweight and hold per-bot
         # state (_bot_config with session_key) that must not be shared.
         existing_client = None
-        if model_type != "agent_backend":
+        if model_type not in ("agent_backend", "claude-code"):
             existing_client = self._client_cache.get(model_alias)
 
         # Only log model loading if we don't have the client cached

@@ -100,6 +100,13 @@ def _reload_bot_registry() -> None:
     _check_reload()
 
 
+def _reload_service_model_catalog(service) -> None:
+    """Rebuild available-model and agent-backend mappings after bot changes."""
+    reload_models = getattr(service, "_load_available_models", None)
+    if callable(reload_models):
+        reload_models()
+
+
 def _invalidate_bot_instance_cache(service, bot_id: str) -> int:
     """Drop cached ServiceLLMBawt instances for a bot so prompt changes apply."""
     invalidate = getattr(service, "invalidate_bot_instances", None)
@@ -213,6 +220,7 @@ async def _persist_bot_profile(
 
     profile = store.upsert(payload)
     _reload_bot_registry()
+    _reload_service_model_catalog(service)
     _invalidate_bot_instance_cache(service, profile.slug)
     _clear_session_model_overrides(service, bot_id=profile.slug)
 
@@ -526,6 +534,7 @@ async def reload_bots():
     """Force reload bot registry from DB + YAML."""
     service = get_service()
     _reload_bot_registry()
+    _reload_service_model_catalog(service)
     cleared_instances = _invalidate_all_instance_cache(service)
     cleared_session_overrides = _clear_session_model_overrides(service)
     return {
@@ -552,6 +561,7 @@ async def delete_bot_profile(
 
     normalized_slug = slug.strip().lower()
     _reload_bot_registry()
+    _reload_service_model_catalog(service)
     _invalidate_bot_instance_cache(service, normalized_slug)
     _clear_session_model_overrides(service, bot_id=normalized_slug)
 

@@ -175,11 +175,72 @@ class JobScheduler:
             await self._execute_job(job)
     
     async def _execute_job(self, job: ScheduledJob) -> None:
-        """Execute a single job."""
-        logger.debug(f"Running scheduled job: {job.job_type}")
-        
+        """Execute a single job.
+
+        When ``job.bot_id`` is ``"*"``, the job is expanded into one run per
+        bot so that newly-created bots are automatically included without
+        needing a restart or per-bot job rows.
+        """
+        # Expand wildcard jobs into per-bot runs
+        if job.bot_id == "*" and job.job_type in (
+            JobType.HISTORY_SUMMARIZATION,
+            JobType.MEMORY_EXTRACTION,
+            JobType.MEMORY_CONSOLIDATION,
+            JobType.MEMORY_DECAY,
+        ):
+            from llm_bawt.bots import BotManager
+            bot_manager = BotManager(self.task_processor.config)
+            all_bots = [bot.slug for bot in bot_manager.list_bots()]
+            if not all_bots:
+                logger.debug("No bots found for wildcard job %s", job.job_type)
+                return
+
+            logger.debug(
+                "Expanding wildcard job %s to %d bots: %s",
+                job.job_type, len(all_bots), all_bots,
+            )
+            for bot_id in all_bots:
+                # Create a lightweight copy with the specific bot_id
+                per_bot_job = ScheduledJob(
+                    id=job.id,
+                    job_type=job.job_type,
+                    bot_id=bot_id,
+                    enabled=job.enabled,
+                    interval_minutes=job.interval_minutes,
+                    last_run_at=job.last_run_at,
+                    next_run_at=job.next_run_at,
+                    config_json=job.config_json,
+                )
+                await self._execute_single_job(per_bot_job)
+
+            # Update the real job's timestamps
+            await self._update_job_timestamps(job)
+            return
+
+        await self._execute_single_job(job)
+
+    async def _update_job_timestamps(self, job: ScheduledJob) -> None:
+        """Update last_run_at and next_run_at for a job after execution."""
         loop = asyncio.get_event_loop()
-        
+        now = datetime.now(timezone.utc)
+
+        def _update():
+            with Session(self.engine) as session:
+                db_job = session.get(ScheduledJob, job.id)
+                if db_job:
+                    db_job.last_run_at = now
+                    db_job.next_run_at = now + timedelta(minutes=db_job.interval_minutes)
+                    session.add(db_job)
+                    session.commit()
+
+        await loop.run_in_executor(None, _update)
+
+    async def _execute_single_job(self, job: ScheduledJob) -> None:
+        """Execute a single job for a specific bot."""
+        logger.debug(f"Running scheduled job: {job.job_type} for bot {job.bot_id}")
+
+        loop = asyncio.get_event_loop()
+
         # Create job run record
         def create_run():
             with Session(self.engine) as session:
@@ -192,13 +253,13 @@ class JobScheduler:
                 session.commit()
                 session.refresh(run)
                 return run.id
-        
+
         run_id = await loop.run_in_executor(None, create_run)
         start_time = datetime.now(timezone.utc)
         status = JobStatus.RUNNING
         result_json: str | None = None
         error_message: str | None = None
-        
+
         try:
             should_run, skip_reason = await loop.run_in_executor(
                 None,
@@ -243,7 +304,7 @@ class JobScheduler:
             result_json = None
             error_message = str(e)
             logger.exception(f"Job {job.id} failed")
-        
+
         # Update job run record
         finish_time = datetime.now(timezone.utc)
         duration_ms = int((finish_time - start_time).total_seconds() * 1000)
@@ -578,36 +639,36 @@ def init_default_jobs(engine, config) -> None:
             session.commit()
             logger.debug("Created default profile maintenance job")
 
-        # Ensure history summarization jobs exist for each configured bot.
-        # Track A/Track F history behavior is bot-scoped; a single default-bot
-        # job leaves other bots (e.g., mira) without summary rows.
+        # Ensure a single wildcard history summarization job exists.
+        # At execution time, _execute_job expands bot_id="*" to all bots
+        # so newly-created bots are automatically included.
+        # Migrate: remove legacy per-bot jobs if a wildcard doesn't exist yet.
         existing_history_jobs = session.exec(
             select(ScheduledJob).where(ScheduledJob.job_type == JobType.HISTORY_SUMMARIZATION)
         ).all()
-        existing_history_bot_ids = {job.bot_id for job in existing_history_jobs}
+        existing_history_bot_ids = {j.bot_id for j in existing_history_jobs}
+        if "*" not in existing_history_bot_ids:
+            # Delete old per-bot jobs — the wildcard replaces them
+            for old_job in existing_history_jobs:
+                session.delete(old_job)
+            if existing_history_jobs:
+                session.commit()
+                logger.info(
+                    "Migrated %d per-bot history summarization jobs to wildcard",
+                    len(existing_history_jobs),
+                )
 
-        from llm_bawt.bots import BotManager
+        existing_history = session.exec(
+            select(ScheduledJob).where(ScheduledJob.job_type == JobType.HISTORY_SUMMARIZATION)
+        ).first()
 
-        bot_manager = BotManager(config)
-        target_bots = [bot.slug for bot in bot_manager.list_bots()]
-        if not target_bots:
-            target_bots = [config.DEFAULT_BOT or "nova"]
-
-        # Backward compatibility: if an all-bots wildcard exists, skip per-bot creation.
-        skip_history = "*" in existing_history_bot_ids
-
-        created = 0
-        for bot_id in target_bots:
-            if skip_history or bot_id in existing_history_bot_ids:
-                continue
-            bot_settings = RuntimeSettingsResolver(config=config, bot_id=bot_id)
-
+        if not existing_history:
             history_job = ScheduledJob(
                 job_type=JobType.HISTORY_SUMMARIZATION,
-                bot_id=bot_id,
+                bot_id="*",
                 enabled=config.SCHEDULER_ENABLED,
                 interval_minutes=int(
-                    bot_settings.resolve(
+                    global_settings.resolve(
                         "history_summarization_interval_minutes",
                         getattr(config, "HISTORY_SUMMARIZATION_INTERVAL_MINUTES", 30),
                     )
@@ -621,41 +682,45 @@ def init_default_jobs(engine, config) -> None:
                 ),
             )
             session.add(history_job)
-            created += 1
-
-        if created:
             session.commit()
-            logger.debug("Created %d history summarization job(s)", created)
+            logger.debug("Created wildcard history summarization job")
 
-        # Ensure memory extraction jobs exist for each configured bot.
+        # Ensure a single wildcard memory extraction job exists.
+        # Migrate: remove legacy per-bot jobs if a wildcard doesn't exist yet.
         existing_extraction_jobs = session.exec(
             select(ScheduledJob).where(ScheduledJob.job_type == JobType.MEMORY_EXTRACTION)
         ).all()
-        existing_extraction_bot_ids = {job.bot_id for job in existing_extraction_jobs}
-
+        existing_extraction_bot_ids = {j.bot_id for j in existing_extraction_jobs}
         if "*" not in existing_extraction_bot_ids:
-            extraction_created = 0
-            default_user = config.DEFAULT_USER or "user"
-            for bot_id in target_bots:
-                if bot_id in existing_extraction_bot_ids:
-                    continue
-                extraction_job = ScheduledJob(
-                    job_type=JobType.MEMORY_EXTRACTION,
-                    bot_id=bot_id,
-                    enabled=config.SCHEDULER_ENABLED,
-                    interval_minutes=int(
-                        getattr(config, "MEMORY_EXTRACTION_INTERVAL_MINUTES", 30),
-                    ),
-                    config_json=json.dumps(
-                        {
-                            "user_id": default_user,
-                            "batch_size": 50,
-                        }
-                    ),
-                )
-                session.add(extraction_job)
-                extraction_created += 1
-
-            if extraction_created:
+            for old_job in existing_extraction_jobs:
+                session.delete(old_job)
+            if existing_extraction_jobs:
                 session.commit()
-                logger.debug("Created %d memory extraction job(s)", extraction_created)
+                logger.info(
+                    "Migrated %d per-bot memory extraction jobs to wildcard",
+                    len(existing_extraction_jobs),
+                )
+
+        existing_extraction = session.exec(
+            select(ScheduledJob).where(ScheduledJob.job_type == JobType.MEMORY_EXTRACTION)
+        ).first()
+
+        if not existing_extraction:
+            default_user = config.DEFAULT_USER or "user"
+            extraction_job = ScheduledJob(
+                job_type=JobType.MEMORY_EXTRACTION,
+                bot_id="*",
+                enabled=config.SCHEDULER_ENABLED,
+                interval_minutes=int(
+                    getattr(config, "MEMORY_EXTRACTION_INTERVAL_MINUTES", 30),
+                ),
+                config_json=json.dumps(
+                    {
+                        "user_id": default_user,
+                        "batch_size": 50,
+                    }
+                ),
+            )
+            session.add(extraction_job)
+            session.commit()
+            logger.debug("Created wildcard memory extraction job")

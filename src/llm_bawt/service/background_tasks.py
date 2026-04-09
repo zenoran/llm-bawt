@@ -549,14 +549,15 @@ class BackgroundTasksMixin:
         if not memory_client:
             return {"error": "Memory client unavailable", "bot_id": bot_id}
 
-        # Get the underlying PostgreSQL backend for direct message table access
+        # Get a PostgreSQL backend directly for message table access.
+        # MemoryClient may be in MCP server mode where _get_storage() is
+        # unavailable, so we create the backend ourselves.
+        from ..memory.postgresql import PostgreSQLMemoryBackend
+
         try:
-            storage = memory_client._get_storage()
-            backend = storage.get_backend(bot_id)
-        except Exception:
-            backend = None
-        if not backend or not hasattr(backend, "get_unprocessed_messages"):
-            return {"error": "Memory backend lacks message processing support"}
+            backend = PostgreSQLMemoryBackend(self.config, bot_id=bot_id)
+        except Exception as e:
+            return {"error": f"Failed to create memory backend: {e}"}
 
         loop = asyncio.get_event_loop()
 

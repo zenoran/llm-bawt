@@ -167,8 +167,8 @@ class TestJobActivityGates:
             config_json='{"entity_id":"user","entity_type":"user"}',
         )
 
-        scheduler._max_profile_updated_at = lambda _entity_id, _entity_type: None  # type: ignore[method-assign]
+        scheduler._profile_needs_rebuild = lambda _entity_id, _entity_type: (False, "No profile attribute changes since last summary build")  # type: ignore[method-assign]
         should_run, reason = scheduler._has_new_activity_for_job(job)
 
         assert should_run is False
-        assert reason == "No profile attribute changes since last run"
+        assert reason == "No profile attribute changes since last summary build"

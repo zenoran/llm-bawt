@@ -182,11 +182,17 @@ async def get_tool_call_events(
         if not trigger_id:
             parsed_request = _parse_json(row.request_json)
             trigger = extract_trigger_message(parsed_request)
-            if trigger is None:
-                continue
-            trigger_id, trigger_role, trigger_timestamp = trigger
-            if target_ids and not message_id_matches(trigger_id, target_ids):
-                continue
+            if trigger is not None:
+                trigger_id, trigger_role, trigger_timestamp = trigger
+                if target_ids and not message_id_matches(trigger_id, target_ids):
+                    continue
+            else:
+                # Agent-backend turns store trigger_message_id directly.
+                # If missing (legacy rows), fall back to the turn's own ID
+                # so tool calls are still returned — the frontend maps them
+                # via turn_id prefix matching.
+                trigger_id = row.id
+                trigger_timestamp = row.created_at.timestamp() if row.created_at else None
 
         events.append(
             ToolCallEvent(

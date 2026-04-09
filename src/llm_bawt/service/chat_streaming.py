@@ -536,7 +536,7 @@ class ChatStreamingMixin:
         # separate runs, so we must NOT cancel a previous generation — each
         # request streams independently.  For native models we cancel the
         # previous generation so only the latest request runs.
-        is_agent_backend = llm_bawt.client.model_definition.get("type") == "agent_backend"
+        is_agent_backend = llm_bawt.client.model_definition.get("type") in ("agent_backend", "claude-code")
         if is_agent_backend:
             cancel_event = threading.Event()
             done_event = threading.Event()
@@ -665,8 +665,17 @@ class ChatStreamingMixin:
                 # Track when first token arrives
                 timing_holder[0] = time.time()
 
-                # Choose streaming method based on whether bot uses tools
-                if (llm_bawt.bot.uses_tools and (llm_bawt.memory or llm_bawt.home_client or llm_bawt.ha_native_client)) or _use_animation_tool:
+                # Choose streaming method based on whether bot uses tools.
+                # Agent-backend models (e.g. claude-code/openclaw) already handle
+                # tool execution in their own bridge/runtime and may report
+                # tool_format="none" at the llm-bawt model layer, so they must not
+                # be forced through llm-bawt's text/native tool loop here.
+                should_use_llm_bawt_tool_streaming = (
+                    not is_agent_backend
+                    and llm_bawt.bot.uses_tools
+                    and (llm_bawt.memory or llm_bawt.home_client or llm_bawt.ha_native_client)
+                )
+                if should_use_llm_bawt_tool_streaming or _use_animation_tool:
                     # Check if client supports native streaming with tools (OpenAI)
                     use_native_streaming = (
                         llm_bawt.client.supports_native_tools()
