@@ -38,6 +38,7 @@ services:
     extra_hosts:
       - "host.docker.internal:host-gateway"
       - "echo.lan.zenoran.com:${ECHO_LAN_HOST_IP:-10.0.0.101}"
+      - "echo:${ECHO_LAN_HOST_IP:-10.0.0.101}"
     depends_on:
       redis:
         condition: service_healthy
@@ -82,6 +83,7 @@ services:
     extra_hosts:
       - "host.docker.internal:host-gateway"
       - "echo.lan.zenoran.com:${ECHO_LAN_HOST_IP:-10.0.0.101}"
+      - "echo:${ECHO_LAN_HOST_IP:-10.0.0.101}"
     volumes:
       - ./.logs:/app/.logs
       - ${HOME}/.config/llm-bawt:/home/bridge/.config/llm-bawt
@@ -114,6 +116,7 @@ services:
     extra_hosts:
       - "host.docker.internal:host-gateway"
       - "echo.lan.zenoran.com:${ECHO_LAN_HOST_IP:-10.0.0.101}"
+      - "echo:${ECHO_LAN_HOST_IP:-10.0.0.101}"
     volumes:
       - ./.logs:/app/.logs
       - ${HOME}/dev:/home/bridge/dev
