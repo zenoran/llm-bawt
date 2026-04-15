@@ -24,6 +24,7 @@ from claude_agent_sdk.types import (
 
 from openclaw_bridge.events import OpenClawEvent, OpenClawEventKind, synthesize_event_id
 from openclaw_bridge.publisher import COMMANDS_STREAM, RedisPublisher
+from openclaw_bridge.session_queue import SessionQueue
 
 logger = logging.getLogger(__name__)
 
@@ -166,8 +167,9 @@ class ClaudeCodeBridge:
         self._command_task: asyncio.Task | None = None
         self._cleanup_task: asyncio.Task | None = None
         self._redis = None  # set in _command_listener
-        # Track active send tasks per session_key for abort support
-        self._active_tasks: dict[str, asyncio.Task] = {}
+        # Shared session queue — serializes sends per session and tracks
+        # active tasks for abort support.
+        self._session_queue = SessionQueue()
         # Load MCP servers from settings file
         self._mcp_servers = self._load_mcp_servers()
 
@@ -395,10 +397,7 @@ class ClaudeCodeBridge:
                                 self._handle_send(fields, msg_id, async_redis)
                             )
                             if session_key:
-                                self._active_tasks[session_key] = task
-                                task.add_done_callback(
-                                    lambda t, sk=session_key: self._active_tasks.pop(sk, None)
-                                )
+                                self._session_queue.set_active_task(session_key, task)
                         elif action == "rpc.call":
                             asyncio.create_task(
                                 self._handle_rpc(fields, msg_id, async_redis)
@@ -453,280 +452,287 @@ class ClaudeCodeBridge:
                 await async_redis.xack(COMMANDS_STREAM, "claude-code-bridge", msg_id)
                 return
 
-        logger.info(
-            "Handling send: request_id=%s session=%s model=%s system_prompt=%s msg=%.60s...",
-            request_id, session_key, model,
-            f"{len(system_prompt)} chars" if system_prompt else "none",
-            message,
-        )
+        if self._session_queue.is_busy(session_key):
+            logger.info(
+                "Session %s busy — queuing send request_id=%s",
+                session_key, request_id,
+            )
 
-        seq = 0
-        text_parts: list[str] = []
-        current_tool_name: str | None = None
-        current_tool_input: str = ""
-        current_tool_id: str | None = None
-        actual_model: str = model  # updated from SystemMessage if available
+        async with self._session_queue.lock(session_key):
+            logger.info(
+                "Handling send: request_id=%s session=%s model=%s system_prompt=%s msg=%.60s...",
+                request_id, session_key, model,
+                f"{len(system_prompt)} chars" if system_prompt else "none",
+                message,
+            )
 
-        try:
-            # Inject MCP tool context so Claude passes the right identifiers
-            if system_prompt and self._mcp_servers and session_key:
-                system_prompt += (
-                    f"\n\n## MCP Tool Context\n"
-                    f"Your bot_id is \"{session_key}\". When using llm-bawt-memory MCP tools:\n"
-                    f"- Memory/message tools: always pass bot_id=\"{session_key}\"\n"
-                    f"- Profile tool with entity_type=\"user\": use entity_id=\"nick\" (the user)\n"
-                    f"- Profile tool with entity_type=\"bot\": use entity_id=\"{session_key}\" (yourself)"
-                )
+            seq = 0
+            text_parts: list[str] = []
+            current_tool_name: str | None = None
+            current_tool_input: str = ""
+            current_tool_id: str | None = None
+            actual_model: str = model  # updated from SystemMessage if available
 
-            # Reuse SDK session for conversation continuity.
-            # If the model changed, start a fresh session.
-            existing = await self._get_session(session_key)
-            resume_id = None
-            if existing:
-                prev_sid, prev_model = existing
-                if prev_model == model:
-                    resume_id = prev_sid
-                else:
-                    logger.info(
-                        "Model changed (%s -> %s), starting new session for %s",
-                        prev_model, model, session_key,
+            try:
+                # Inject MCP tool context so Claude passes the right identifiers
+                if system_prompt and self._mcp_servers and session_key:
+                    system_prompt += (
+                        f"\n\n## MCP Tool Context\n"
+                        f"Your bot_id is \"{session_key}\". When using llm-bawt-memory MCP tools:\n"
+                        f"- Memory/message tools: always pass bot_id=\"{session_key}\"\n"
+                        f"- Profile tool with entity_type=\"user\": use entity_id=\"nick\" (the user)\n"
+                        f"- Profile tool with entity_type=\"bot\": use entity_id=\"{session_key}\" (yourself)"
                     )
-                    await self._clear_session(session_key)
 
-            # Resolve settings file path
-            settings_path = str(Path.home() / ".claude" / "settings.json")
-            if not Path(settings_path).exists():
-                settings_path = None
+                # Reuse SDK session for conversation continuity.
+                # If the model changed, start a fresh session.
+                existing = await self._get_session(session_key)
+                resume_id = None
+                if existing:
+                    prev_sid, prev_model = existing
+                    if prev_model == model:
+                        resume_id = prev_sid
+                    else:
+                        logger.info(
+                            "Model changed (%s -> %s), starting new session for %s",
+                            prev_model, model, session_key,
+                        )
+                        await self._clear_session(session_key)
 
-            # Build prompt — multimodal if attachments present
-            if attachments:
-                content: list[dict] = [{"type": "text", "text": message}]
-                for att in attachments:
-                    mime = att.get("mimeType", "image/png")
-                    data = att.get("content", "")
-                    if data:
-                        content.append({
-                            "type": "image",
-                            "source": {
-                                "type": "base64",
-                                "media_type": mime,
-                                "data": data,
-                            },
-                        })
-                logger.info("Multimodal prompt: %d text + %d images", 1, len(attachments))
+                # Resolve settings file path
+                settings_path = str(Path.home() / ".claude" / "settings.json")
+                if not Path(settings_path).exists():
+                    settings_path = None
 
-                async def _image_prompt():
-                    yield {
-                        "type": "user",
-                        "message": {"role": "user", "content": content},
-                        "parent_tool_use_id": None,
-                        "session_id": "default",
-                    }
+                # Build prompt — multimodal if attachments present
+                if attachments:
+                    content: list[dict] = [{"type": "text", "text": message}]
+                    for att in attachments:
+                        mime = att.get("mimeType", "image/png")
+                        data = att.get("content", "")
+                        if data:
+                            content.append({
+                                "type": "image",
+                                "source": {
+                                    "type": "base64",
+                                    "media_type": mime,
+                                    "data": data,
+                                },
+                            })
+                    logger.info("Multimodal prompt: %d text + %d images", 1, len(attachments))
 
-                prompt_input: str | AsyncIterable = _image_prompt()
-            else:
-                prompt_input = message
+                    async def _image_prompt():
+                        yield {
+                            "type": "user",
+                            "message": {"role": "user", "content": content},
+                            "parent_tool_use_id": None,
+                            "session_id": "default",
+                        }
 
-            auth_retry_attempted = False
-            fresh_session_retry = False
-            while True:
-                stderr_lines: list[str] = []
+                    prompt_input: str | AsyncIterable = _image_prompt()
+                else:
+                    prompt_input = message
 
-                def _log_stderr(line: str) -> None:
-                    line = line.rstrip()
-                    stderr_lines.append(line)
-                    logger.warning("CLI stderr: %s", line)
+                auth_retry_attempted = False
+                fresh_session_retry = False
+                while True:
+                    stderr_lines: list[str] = []
 
-                # Read fresh token on each request (auto-refresh from credentials file)
-                fresh_token = _get_fresh_oauth_token(force_refresh=auth_retry_attempted)
-                sdk_env = {}
-                if fresh_token:
-                    sdk_env["CLAUDE_CODE_OAUTH_TOKEN"] = fresh_token
+                    def _log_stderr(line: str) -> None:
+                        line = line.rstrip()
+                        stderr_lines.append(line)
+                        logger.warning("CLI stderr: %s", line)
 
-                options = ClaudeAgentOptions(
-                    model=model,
-                    system_prompt=system_prompt if not resume_id else None,
-                    cwd=self._cwd,
-                    permission_mode=self._permission_mode,
-                    include_partial_messages=True,
-                    resume=resume_id,
-                    add_dirs=self._add_dirs if self._add_dirs else [],
-                    stderr=_log_stderr,
-                    env=sdk_env,
-                    settings=settings_path,
-                    mcp_servers=self._mcp_servers if self._mcp_servers else {},
-                )
+                    # Read fresh token on each request (auto-refresh from credentials file)
+                    fresh_token = _get_fresh_oauth_token(force_refresh=auth_retry_attempted)
+                    sdk_env = {}
+                    if fresh_token:
+                        sdk_env["CLAUDE_CODE_OAUTH_TOKEN"] = fresh_token
 
-                session_persisted = False
+                    options = ClaudeAgentOptions(
+                        model=model,
+                        system_prompt=system_prompt if not resume_id else None,
+                        cwd=self._cwd,
+                        permission_mode=self._permission_mode,
+                        include_partial_messages=True,
+                        resume=resume_id,
+                        add_dirs=self._add_dirs if self._add_dirs else [],
+                        stderr=_log_stderr,
+                        env=sdk_env,
+                        settings=settings_path,
+                        mcp_servers=self._mcp_servers if self._mcp_servers else {},
+                    )
 
-                try:
-                    msg_stream = query(prompt=prompt_input, options=options).__aiter__()
-                    while True:
-                        try:
-                            msg = await asyncio.wait_for(
-                                msg_stream.__anext__(),
-                                timeout=self._request_timeout,
-                            )
-                        except StopAsyncIteration:
-                            break
-                        except TimeoutError:
-                            raise TimeoutError(
-                                f"No SDK messages for {self._request_timeout}s — CLI may be hung"
-                            )
+                    session_persisted = False
 
-                        # Capture session_id and actual model from first SystemMessage only
-                        if isinstance(msg, SystemMessage) and not session_persisted:
-                            data = getattr(msg, "data", {}) or {}
-                            if data.get("model"):
-                                actual_model = data["model"]
-                                logger.info("Actual model: %s", actual_model)
-                            if not resume_id:
-                                sid = data.get("session_id")
-                                if sid:
-                                    await self._set_session(session_key, sid, model)
-                            session_persisted = True
-                        msg_type = type(msg).__name__
-                        if not isinstance(msg, (StreamEvent, SystemMessage)):
-                            content = getattr(msg, "content", [])
-                            logger.debug(
-                                "SDK msg: %s blocks=%d content_types=%s",
-                                msg_type, len(content) if isinstance(content, list) else 0,
-                                [getattr(b, "type", type(b).__name__) for b in content] if isinstance(content, list) else "n/a",
-                            )
+                    try:
+                        msg_stream = query(prompt=prompt_input, options=options).__aiter__()
+                        while True:
+                            try:
+                                msg = await asyncio.wait_for(
+                                    msg_stream.__anext__(),
+                                    timeout=self._request_timeout,
+                                )
+                            except StopAsyncIteration:
+                                break
+                            except TimeoutError:
+                                raise TimeoutError(
+                                    f"No SDK messages for {self._request_timeout}s — CLI may be hung"
+                                )
 
-                        if isinstance(msg, StreamEvent):
-                            event = msg.event
-                            event_type = event.get("type", "")
+                            # Capture session_id and actual model from first SystemMessage only
+                            if isinstance(msg, SystemMessage) and not session_persisted:
+                                data = getattr(msg, "data", {}) or {}
+                                if data.get("model"):
+                                    actual_model = data["model"]
+                                    logger.info("Actual model: %s", actual_model)
+                                if not resume_id:
+                                    sid = data.get("session_id")
+                                    if sid:
+                                        await self._set_session(session_key, sid, model)
+                                session_persisted = True
+                            msg_type = type(msg).__name__
+                            if not isinstance(msg, (StreamEvent, SystemMessage)):
+                                content = getattr(msg, "content", [])
+                                logger.debug(
+                                    "SDK msg: %s blocks=%d content_types=%s",
+                                    msg_type, len(content) if isinstance(content, list) else 0,
+                                    [getattr(b, "type", type(b).__name__) for b in content] if isinstance(content, list) else "n/a",
+                                )
 
-                            if event_type == "content_block_delta":
-                                delta = event.get("delta", {})
-                                if delta.get("type") == "text_delta":
-                                    text = delta.get("text", "")
-                                    if text:
+                            if isinstance(msg, StreamEvent):
+                                event = msg.event
+                                event_type = event.get("type", "")
+
+                                if event_type == "content_block_delta":
+                                    delta = event.get("delta", {})
+                                    if delta.get("type") == "text_delta":
+                                        text = delta.get("text", "")
+                                        if text:
+                                            seq += 1
+                                            text_parts.append(text)
+                                            self._publish_event(
+                                                request_id, session_key, seq,
+                                                kind=OpenClawEventKind.ASSISTANT_DELTA,
+                                                text=text,
+                                            )
+                                    elif delta.get("type") == "input_json_delta":
+                                        current_tool_input += delta.get("partial_json", "")
+
+                                elif event_type == "content_block_start":
+                                    block = event.get("content_block", {})
+                                    if block.get("type") == "tool_use":
+                                        current_tool_name = block.get("name", "unknown")
+                                        current_tool_id = block.get("id", "")
+                                        current_tool_input = ""
+
+                                elif event_type == "content_block_stop":
+                                    if current_tool_name:
+                                        tool_args = {}
+                                        if current_tool_input:
+                                            try:
+                                                tool_args = json.loads(current_tool_input)
+                                            except json.JSONDecodeError:
+                                                tool_args = {"raw": current_tool_input}
+                                        current_tool_name = None
+                                        current_tool_input = ""
+                                        current_tool_id = None
+
+                            elif isinstance(msg, AssistantMessage):
+                                for block in getattr(msg, "content", []):
+                                    if isinstance(block, ToolUseBlock):
                                         seq += 1
-                                        text_parts.append(text)
                                         self._publish_event(
                                             request_id, session_key, seq,
-                                            kind=OpenClawEventKind.ASSISTANT_DELTA,
-                                            text=text,
+                                            kind=OpenClawEventKind.TOOL_START,
+                                            tool_name=block.name,
+                                            tool_arguments=block.input if isinstance(block.input, dict) else {},
                                         )
-                                elif delta.get("type") == "input_json_delta":
-                                    current_tool_input += delta.get("partial_json", "")
 
-                            elif event_type == "content_block_start":
-                                block = event.get("content_block", {})
-                                if block.get("type") == "tool_use":
-                                    current_tool_name = block.get("name", "unknown")
-                                    current_tool_id = block.get("id", "")
-                                    current_tool_input = ""
-
-                            elif event_type == "content_block_stop":
-                                if current_tool_name:
-                                    tool_args = {}
-                                    if current_tool_input:
-                                        try:
-                                            tool_args = json.loads(current_tool_input)
-                                        except json.JSONDecodeError:
-                                            tool_args = {"raw": current_tool_input}
-                                    current_tool_name = None
-                                    current_tool_input = ""
-                                    current_tool_id = None
-
-                        elif isinstance(msg, AssistantMessage):
-                            for block in getattr(msg, "content", []):
-                                if isinstance(block, ToolUseBlock):
-                                    seq += 1
-                                    self._publish_event(
-                                        request_id, session_key, seq,
-                                        kind=OpenClawEventKind.TOOL_START,
-                                        tool_name=block.name,
-                                        tool_arguments=block.input if isinstance(block.input, dict) else {},
-                                    )
-
-                        elif isinstance(msg, UserMessage):
-                            for block in getattr(msg, "content", []):
-                                if isinstance(block, ToolResultBlock):
-                                    seq += 1
-                                    result_content = block.content or ""
-                                    if isinstance(result_content, list):
-                                        result_content = "\n".join(
-                                            b.get("text", "") if isinstance(b, dict) else str(b)
-                                            for b in result_content
+                            elif isinstance(msg, UserMessage):
+                                for block in getattr(msg, "content", []):
+                                    if isinstance(block, ToolResultBlock):
+                                        seq += 1
+                                        result_content = block.content or ""
+                                        if isinstance(result_content, list):
+                                            result_content = "\n".join(
+                                                b.get("text", "") if isinstance(b, dict) else str(b)
+                                                for b in result_content
+                                            )
+                                        self._publish_event(
+                                            request_id, session_key, seq,
+                                            kind=OpenClawEventKind.TOOL_END,
+                                            tool_name=block.tool_use_id or "unknown",
+                                            tool_result=str(result_content)[:2000],
                                         )
-                                    self._publish_event(
-                                        request_id, session_key, seq,
-                                        kind=OpenClawEventKind.TOOL_END,
-                                        tool_name=block.tool_use_id or "unknown",
-                                        tool_result=str(result_content)[:2000],
-                                    )
 
-                        elif isinstance(msg, ResultMessage):
-                            full_text = "".join(text_parts)
-                            if not full_text:
-                                result_text = getattr(msg, "text", "") or ""
-                                if not result_text:
-                                    for block in getattr(msg, "content", []):
-                                        if isinstance(block, dict) and block.get("type") == "text":
-                                            result_text += block.get("text", "")
-                                full_text = result_text
+                            elif isinstance(msg, ResultMessage):
+                                full_text = "".join(text_parts)
+                                if not full_text:
+                                    result_text = getattr(msg, "text", "") or ""
+                                    if not result_text:
+                                        for block in getattr(msg, "content", []):
+                                            if isinstance(block, dict) and block.get("type") == "text":
+                                                result_text += block.get("text", "")
+                                    full_text = result_text
 
-                            seq += 1
-                            self._publish_event(
-                                request_id, session_key, seq,
-                                kind=OpenClawEventKind.ASSISTANT_DONE,
-                                text=full_text,
-                                model=actual_model,
+                                seq += 1
+                                self._publish_event(
+                                    request_id, session_key, seq,
+                                    kind=OpenClawEventKind.ASSISTANT_DONE,
+                                    text=full_text,
+                                    model=actual_model,
+                                )
+                        break
+                    except Exception as e:
+                        # 1) Auth failure → refresh token and retry once
+                        if (
+                            not auth_retry_attempted
+                            and not text_parts
+                            and _is_auth_failure(e, stderr_lines)
+                        ):
+                            auth_retry_attempted = True
+                            logger.warning(
+                                "Auth failure for %s; refreshing token and retrying",
+                                request_id,
                             )
-                    break
-                except Exception as e:
-                    # 1) Auth failure → refresh token and retry once
-                    if (
-                        not auth_retry_attempted
-                        and not text_parts
-                        and _is_auth_failure(e, stderr_lines)
-                    ):
-                        auth_retry_attempted = True
-                        logger.warning(
-                            "Auth failure for %s; refreshing token and retrying",
-                            request_id,
-                        )
-                        continue
+                            continue
 
-                    # 2) CLI crash or timeout before any text streamed →
-                    #    clear stale session and retry once fresh
-                    if (
-                        not fresh_session_retry
-                        and not text_parts
-                        and (_is_cli_crash(e) or isinstance(e, TimeoutError))
-                    ):
-                        fresh_session_retry = True
-                        reason = "timeout" if isinstance(e, TimeoutError) else "CLI crash (exit code 1)"
-                        logger.warning(
-                            "%s for %s; clearing session and retrying fresh",
-                            reason, request_id,
-                        )
-                        if stderr_lines:
-                            logger.warning("Captured stderr before retry: %s", stderr_lines)
-                        await self._clear_session(session_key)
-                        resume_id = None
-                        continue
+                        # 2) CLI crash or timeout before any text streamed →
+                        #    clear stale session and retry once fresh
+                        if (
+                            not fresh_session_retry
+                            and not text_parts
+                            and (_is_cli_crash(e) or isinstance(e, TimeoutError))
+                        ):
+                            fresh_session_retry = True
+                            reason = "timeout" if isinstance(e, TimeoutError) else "CLI crash (exit code 1)"
+                            logger.warning(
+                                "%s for %s; clearing session and retrying fresh",
+                                reason, request_id,
+                            )
+                            if stderr_lines:
+                                logger.warning("Captured stderr before retry: %s", stderr_lines)
+                            await self._clear_session(session_key)
+                            resume_id = None
+                            continue
 
-                    raise
+                        raise
 
-            self._publisher.publish_run_done(request_id)
-            logger.info("Send completed: request_id=%s session=%s", request_id, session_key)
+                self._publisher.publish_run_done(request_id)
+                logger.info("Send completed: request_id=%s session=%s", request_id, session_key)
 
-        except Exception as e:
-            logger.exception("Send failed: request_id=%s", request_id)
-            seq += 1
-            self._publish_event(
-                request_id, session_key, seq,
-                kind=OpenClawEventKind.ERROR,
-                text=str(e),
-            )
-            self._publisher.publish_run_done(request_id)
-        finally:
-            await async_redis.xack(COMMANDS_STREAM, "claude-code-bridge", msg_id)
+            except Exception as e:
+                logger.exception("Send failed: request_id=%s", request_id)
+                seq += 1
+                self._publish_event(
+                    request_id, session_key, seq,
+                    kind=OpenClawEventKind.ERROR,
+                    text=str(e),
+                )
+                self._publisher.publish_run_done(request_id)
+            finally:
+                await async_redis.xack(COMMANDS_STREAM, "claude-code-bridge", msg_id)
 
     # ----- Event publishing -----
 
@@ -759,10 +765,8 @@ class ClaudeCodeBridge:
                     )
             elif method == "chat.abort":
                 session_key = params.get("sessionKey", "")
-                task = self._active_tasks.get(session_key)
-                if task and not task.done():
-                    task.cancel()
-                    logger.info("Aborted active task for session: %s", session_key)
+                cancelled = self._session_queue.cancel_active(session_key)
+                if cancelled:
                     self._publisher.publish_rpc_result(
                         request_id, {"ok": True, "aborted": session_key}
                     )

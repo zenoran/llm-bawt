@@ -9,6 +9,7 @@ from .events import OpenClawEvent, OpenClawEventKind
 from .ingest import EventIngestPipeline
 from .metrics import get_metrics
 from .publisher import COMMANDS_STREAM, RedisPublisher
+from .session_queue import SessionQueue
 from .store import EventStore
 from .ws_client import OpenClawWsClient
 
@@ -33,10 +34,9 @@ class SessionBridge:
         self._run_tool_calls: dict[str, list[dict]] = {}  # run_id -> tool calls
         self._session_to_bot: dict[str, str] = session_to_bot or {}
         self._command_task: asyncio.Task | None = None
-        # Per-session locks — the gateway processes one run at a time per
-        # session, so we serialize sends to avoid _run_queues overwrites
-        # and history-fallback returning a stale prior response.
-        self._session_locks: dict[str, asyncio.Lock] = {}
+        # Shared session queue — serializes sends per session and tracks
+        # active tasks for abort support.
+        self._session_queue = SessionQueue()
         # When the live run stream ends without assistant text, poll history
         # briefly to recover replies produced by upstream provider fallback.
         self._history_reply_timeout_s = 45.0
@@ -169,15 +169,7 @@ class SessionBridge:
             request_id, session_key, message,
         )
 
-        # Serialize sends per session — the gateway queues messages in the
-        # same run when concurrent sends arrive, causing _run_queues overwrites
-        # and history-fallback returning the wrong response.
-        lock = self._session_locks.get(session_key)
-        if lock is None:
-            lock = asyncio.Lock()
-            self._session_locks[session_key] = lock
-
-        async with lock:
+        async with self._session_queue.lock(session_key):
             try:
                 # Clear any previous cancel signal before starting a new send
                 self._ws_client.clear_session_cancel(session_key)
@@ -454,7 +446,7 @@ class SessionBridge:
         logger.info("PASSIVE: session=%s kind=%s bot=%s run=%s locked=%s",
                      event.session_key, event.kind.value if event.kind else "?",
                      bot_id, event.run_id,
-                     event.session_key in self._session_locks and self._session_locks[event.session_key].locked())
+                     self._session_queue.is_busy(event.session_key))
         if not bot_id:
             return
 
@@ -465,7 +457,7 @@ class SessionBridge:
 
         # Skip if this session has an active chat request streaming —
         # the active path (chat_streaming.py) already publishes tool events.
-        if event.session_key in self._session_locks and self._session_locks[event.session_key].locked():
+        if self._session_queue.is_busy(event.session_key):
             return
 
         if event.kind == OpenClawEventKind.TOOL_START:

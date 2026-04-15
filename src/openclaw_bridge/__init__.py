@@ -5,5 +5,6 @@ Also importable from the main llm-bawt app for shared types.
 """
 
 from .events import OpenClawEvent, OpenClawEventKind
+from .session_queue import SessionQueue
 
-__all__ = ["OpenClawEvent", "OpenClawEventKind"]
+__all__ = ["OpenClawEvent", "OpenClawEventKind", "SessionQueue"]
