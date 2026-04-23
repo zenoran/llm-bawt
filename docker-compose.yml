@@ -35,6 +35,8 @@ services:
       - ${LLM_BAWT_MODEL_CACHE_DIR:-${HOME}/.cache/llm-bawt/models}:/root/.cache/llm-bawt/models
       # Mount HuggingFace cache for GGUF models
       - ${HF_HOME:-${HOME}/.cache/huggingface}:/root/.cache/huggingface
+      # Media generation storage (videos, thumbnails)
+      - ${MEDIA_STORAGE_PATH:-./storage}:/app/storage
     extra_hosts:
       - "host.docker.internal:host-gateway"
       - "echo.lan.zenoran.com:${ECHO_LAN_HOST_IP:-10.0.0.101}"
@@ -138,6 +140,18 @@ services:
       timeout: 5s
       retries: 3
       start_period: 15s
+
+  playwright-mcp:
+    image: mcp/playwright
+    container_name: llm-bawt-playwright-mcp
+    command: ["--headless", "--no-sandbox", "--isolated", "--port", "8931", "--host", "0.0.0.0", "--allowed-hosts", "*"]
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+      - "echo.lan.zenoran.com:${ECHO_LAN_HOST_IP:-10.0.0.101}"
+      - "echo:${ECHO_LAN_HOST_IP:-10.0.0.101}"
+    tmpfs:
+      - /home/bridge:uid=1000,gid=1000
+    restart: unless-stopped
 
   crawl4ai:
     image: unclecode/crawl4ai:latest

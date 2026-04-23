@@ -3,11 +3,12 @@
 import json
 
 from fastapi import APIRouter, HTTPException, Query
+from sqlmodel import Session, select
 
 from ..dependencies import get_service
 from ..schemas import ToolCallEvent, ToolCallEventsResponse, TurnLogDetail, TurnLogListItem, TurnLogListResponse
 from ..tool_call_events import extract_trigger_message, message_id_matches, parse_message_filters
-from ..turn_logs import TurnLogStore
+from ..turn_logs import ToolCallRecord, TurnLogStore
 
 router = APIRouter()
 
@@ -19,6 +20,53 @@ def _parse_json(value: str | None):
         return json.loads(value)
     except Exception:
         return value
+
+
+def _live_tool_calls(store: TurnLogStore, turn_id: str) -> list[dict]:
+    """Read realtime tool-call rows from `tool_call_records` for a turn.
+
+    Tool events are persisted incrementally as they fire (via Redis sink),
+    while `turn_logs.tool_calls_json` is only written at turn finalize.
+    During an in-flight stream this is the only source of partial activity.
+    """
+    if store.engine is None or not turn_id:
+        return []
+    try:
+        with Session(store.engine) as session:
+            rows = list(
+                session.exec(
+                    select(ToolCallRecord)
+                    .where(ToolCallRecord.turn_id == turn_id)
+                    .order_by(ToolCallRecord.created_at)
+                ).all()
+            )
+    except Exception:
+        return []
+
+    out: list[dict] = []
+    for row in rows:
+        args = _parse_json(row.arguments_json) or {}
+        if not isinstance(args, dict):
+            args = {"raw": args}
+        # In-flight calls (no ended_at) MUST have result=None so the frontend
+        # renders "running…".  Empty string would be treated as completed.
+        is_finished = row.ended_at is not None or (row.result_text is not None and row.result_text != "")
+        result_value = row.result_text if is_finished else None
+        out.append({
+            "iteration": row.iteration or 1,
+            "index": len(out) + 1,
+            "tool": row.tool_name,
+            "name": row.tool_name,
+            "arguments": args,
+            "parameters": args,
+            "result": result_value,
+            "status": "completed" if is_finished else "pending",
+            "call_id": row.call_id,
+            "started_at": row.started_at,
+            "ended_at": row.ended_at,
+            "duration_ms": row.duration_ms,
+        })
+    return out
 
 
 @router.get("/v1/turn-logs", response_model=TurnLogListResponse, tags=["Debug"])
@@ -56,6 +104,11 @@ async def list_turn_logs(
     items = []
     for row in rows:
         tool_calls = _parse_json(row.tool_calls_json) or []
+        if not isinstance(tool_calls, list) or not tool_calls:
+            # tool_calls_json is filled at finalize. Streaming/in-flight turns
+            # have realtime rows in tool_call_records — use those for the count
+            # so the UI sees an accurate tool count immediately.
+            tool_calls = _live_tool_calls(store, row.id)
         response_text = row.response_text or ""
         response_preview = response_text[:300] if response_text else None
         items.append(
@@ -79,6 +132,7 @@ async def list_turn_logs(
                 animation=getattr(row, "animation", None),
                 agent_session_key=getattr(row, "agent_session_key", None),
                 agent_request_id=getattr(row, "agent_request_id", None),
+                trigger_message_id=getattr(row, "trigger_message_id", None),
             )
         )
 
@@ -116,6 +170,9 @@ async def get_turn_log(turn_id: str):
     parsed_tools = _parse_json(row.tool_calls_json) or []
     if not isinstance(parsed_tools, list):
         parsed_tools = [{"raw": parsed_tools}]
+    if not parsed_tools:
+        # Fallback to realtime rows for in-flight turns.
+        parsed_tools = _live_tool_calls(store, row.id)
 
     return TurnLogDetail(
         id=row.id,
@@ -161,7 +218,10 @@ async def get_tool_call_events(
     rows, _ = store.list_turns(
         bot_id=bot_id,
         user_id=user_id,
-        has_tools=True,
+        # Don't filter by has_tools at the DB level: streaming/in-flight turns
+        # have empty tool_calls_json but live rows in tool_call_records.  We
+        # filter rows that produce zero events in the loop below.
+        has_tools=None,
         trigger_message_ids=target_ids or None,
         after=after,
         before=before,
@@ -174,6 +234,10 @@ async def get_tool_call_events(
     for row in rows:
         parsed_tools = _parse_json(row.tool_calls_json) or []
         if not isinstance(parsed_tools, list) or not parsed_tools:
+            # Fallback to realtime tool_call_records for in-flight turns so
+            # the UI can render tool activity before the turn finalizes.
+            parsed_tools = _live_tool_calls(store, row.id)
+        if not parsed_tools:
             continue
 
         trigger_id = row.trigger_message_id

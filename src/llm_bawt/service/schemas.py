@@ -389,6 +389,7 @@ class TurnLogListItem(BaseModel):
     animation: str | None = None
     agent_session_key: str | None = None
     agent_request_id: str | None = None
+    trigger_message_id: str | None = None
 
 
 class TurnLogListResponse(BaseModel):

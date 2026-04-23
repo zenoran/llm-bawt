@@ -329,22 +329,29 @@ class MemoryStorage:
         bot_id: str = "default",
         session_id: str | None = None,
         timestamp: float | None = None,
+        message_id: str | None = None,
     ) -> Message:
-        """Add a message to conversation history."""
-        message_id = str(uuid.uuid4())
+        """Add a message to conversation history.
+
+        ``message_id`` allows the client to supply a stable UUID (e.g. the
+        frontend-generated user-message UUID) so downstream joins on
+        ``trigger_message_id`` work without remapping.
+        """
+        provided = (str(message_id).strip() if message_id else "") or None
+        message_id_final = provided or str(uuid.uuid4())
         ts = timestamp if timestamp is not None else time.time()
-        
+
         backend = self._get_backend(bot_id)
         backend.add_message(
-            message_id=message_id,
+            message_id=message_id_final,
             role=role,
             content=content,
             timestamp=ts,
             session_id=session_id,
         )
-        
+
         return Message(
-            id=message_id,
+            id=message_id_final,
             role=role,
             content=content,
             timestamp=ts,

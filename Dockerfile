@@ -15,6 +15,7 @@ RUN apt-get update && apt-get install -y \
     ninja-build \
     libpq-dev \
     git \
+    ffmpeg \
     cuda-compat-12-9 \
     && rm -rf /var/lib/apt/lists/*
 

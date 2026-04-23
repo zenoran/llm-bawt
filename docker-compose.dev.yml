@@ -30,3 +30,7 @@ services:
   openclaw-bridge:
     volumes:
       - ./src:/app/src
+
+  claude-code-bridge:
+    volumes:
+      - ./src:/app/src

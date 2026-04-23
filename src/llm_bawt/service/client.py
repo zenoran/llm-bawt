@@ -283,7 +283,13 @@ class ServiceClient:
             if stream:
                 return self._stream_chat_completion(payload)
             else:
-                response = self._request("POST", "/v1/chat/completions", data=payload)
+                # Use a long timeout for chat completions — agent-backend
+                # turns (claude-code, openclaw) routinely take 30–90s.  The
+                # default self.timeout (5s) is only appropriate for cheap
+                # admin/list endpoints.
+                response = self._request(
+                    "POST", "/v1/chat/completions", data=payload, timeout=600.0,
+                )
                 self.last_error = None  # Clear on success
                 return response
         except Exception as e:
@@ -405,8 +411,13 @@ class ServiceClient:
         path: str,
         data: dict | None = None,
         params: dict | None = None,
+        timeout: float | None = None,
     ) -> dict[str, Any]:
-        """Make a request to the service."""
+        """Make a request to the service.
+
+        ``timeout`` overrides ``self.timeout`` for slow endpoints (e.g.
+        non-streaming chat completions that wait for the full response).
+        """
         import urllib.request
         import urllib.parse
         import urllib.error
@@ -419,8 +430,9 @@ class ServiceClient:
         body = json.dumps(data).encode() if data else None
         
         req = urllib.request.Request(url, data=body, headers=headers, method=method)
+        effective_timeout = timeout if timeout is not None else self.timeout
         try:
-            with urllib.request.urlopen(req, timeout=self.timeout) as resp:
+            with urllib.request.urlopen(req, timeout=effective_timeout) as resp:
                 return json.loads(resp.read().decode())
         except urllib.error.HTTPError as e:
             error_body = ""

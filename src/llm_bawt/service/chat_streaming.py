@@ -77,6 +77,9 @@ class ChatStreamingMixin:
         full_text_parts: list[str] = []
         tool_call_details: list[dict] = []
         _finalized = False
+        # Periodic flush: persist partial response text every N seconds so
+        # clients reconnecting after a page refresh can show progress.
+        _last_partial_flush = time.time()
 
         try:
             # Persist user message to bot history so it appears in /v1/history
@@ -143,6 +146,19 @@ class ChatStreamingMixin:
                             "choices": [{"index": 0, "delta": {"content": delta}, "finish_reason": None}],
                         }
                         yield f"data: {json.dumps(data)}\n\n"
+
+                        # Periodic flush of partial response to DB so resumed
+                        # clients can show progress instead of empty bouncing dots.
+                        now = time.time()
+                        if now - _last_partial_flush >= 5.0:
+                            _last_partial_flush = now
+                            try:
+                                self._update_turn_log(
+                                    turn_id=turn_log_id,
+                                    response_text="".join(full_text_parts),
+                                )
+                            except Exception:
+                                pass  # non-critical
 
                 elif event.kind == OpenClawEventKind.TOOL_START:
                     tool_name = event.tool_name or "unknown"
@@ -499,6 +515,20 @@ class ChatStreamingMixin:
                     user_prompt = m.content or ""
                 break
 
+        # Extract the user message ID so tool-call events and turn logs are
+        # joinable with the frontend's history rendering.  Prefer the explicit
+        # request.user_message_id (frontend-supplied UUID) and fall back to
+        # scanning the trailing user message in request.messages.
+        trigger_message_id = getattr(request, "user_message_id", None)
+        if not trigger_message_id:
+            for _m in reversed(request.messages):
+                if _m.role != "user":
+                    continue
+                _mid = getattr(_m, "id", None) or getattr(_m, "message_id", None)
+                if isinstance(_mid, str) and _mid.strip():
+                    trigger_message_id = _mid.strip()
+                    break
+
         if not user_prompt:
             warning_data = {
                 "object": "service.warning",
@@ -571,6 +601,7 @@ class ChatStreamingMixin:
             prepared_messages=[],
             response_text="",
             agent_session_key=oc_session_key,
+            trigger_message_id=trigger_message_id,
         )
 
         # Capture Redis subscriber for direct publish from the background
@@ -629,6 +660,7 @@ class ChatStreamingMixin:
                 messages = llm_bawt.prepare_messages_for_query(
                     user_prompt,
                     user_attachments=user_attachments or None,
+                    message_id=trigger_message_id,
                 )
 
                 # When animation tool is active, append a system instruction
@@ -989,7 +1021,10 @@ class ChatStreamingMixin:
                 # Wrap stream to publish tool events directly to Redis
                 # from this thread (survives SSE generator cancellation).
                 _oc_call_index = [0]
-                _oc_last_call_id = [""]
+                # Stack of (call_id, tool_name) for in-flight OpenClaw tool
+                # calls.  Each tool_result pops by name match so nested calls
+                # (Agent → Grep → Read) pair correctly with their tool_call.
+                _oc_call_stack: list[tuple[str, str]] = []
 
                 _oc_request_id_captured = [False]
 
@@ -1030,7 +1065,8 @@ class ChatStreamingMixin:
                             if evt == "tool_call":
                                 _oc_call_index[0] += 1
                                 cid = f"call_{uuid.uuid4().hex[:8]}"
-                                _oc_last_call_id[0] = cid
+                                _oc_tool_name = item.get("name", "unknown")
+                                _oc_call_stack.append((cid, _oc_tool_name))
                                 # Inject call_id into the dict so the queue consumer
                                 # uses the same ID as the SSE event (no double-ID).
                                 item["_call_id"] = cid
@@ -1052,22 +1088,38 @@ class ChatStreamingMixin:
                                     "ts": time.time(),
                                 })
                             elif evt == "tool_result":
-                                item["_call_id"] = _oc_last_call_id[0]
+                                # Pair tool_result with its in-flight tool_call.
+                                # Match by tool_name (handles nested calls
+                                # finishing out of declared order); fall back
+                                # to popping the innermost entry.
+                                _result_name = item.get("name") or ""
+                                _end_cid = ""
+                                if _oc_call_stack:
+                                    _matched_idx = -1
+                                    for _i in range(len(_oc_call_stack) - 1, -1, -1):
+                                        _cid_i, _name_i = _oc_call_stack[_i]
+                                        if _name_i == _result_name:
+                                            _matched_idx = _i
+                                            break
+                                    if _matched_idx < 0:
+                                        _matched_idx = len(_oc_call_stack) - 1
+                                    _end_cid, _ = _oc_call_stack.pop(_matched_idx)
+                                item["_call_id"] = _end_cid
                                 _publish_event_direct({
                                     "_type": "tool_event",
                                     "event": "tool_end",
                                     "turn_id": turn_log_id,
                                     "bot_id": bot_id,
                                     "user_id": user_id,
-                                    "tool_name": item.get("name", "unknown"),
-                                    "call_id": _oc_last_call_id[0],
+                                    "tool_name": _result_name or "unknown",
+                                    "call_id": _end_cid,
                                     "result": str(item.get("result", ""))[:2000],
                                     "iteration": 1,
                                     "ts": time.time(),
                                 })
                                 # Update the matching detail entry with result
                                 for _td in reversed(tool_call_details_holder):
-                                    if _td.get("call_id") == _oc_last_call_id[0]:
+                                    if _td.get("call_id") == _end_cid:
                                         _td["result"] = str(item.get("result", ""))[:2000]
                                         break
                         yield item

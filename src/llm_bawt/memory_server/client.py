@@ -735,6 +735,7 @@ class MemoryClient:
         content: str,
         session_id: str | None = None,
         timestamp: float | None = None,
+        message_id: str | None = None,
     ) -> MessageResult:
         """Add a message to conversation history.
         
@@ -742,6 +743,8 @@ class MemoryClient:
             role: Message role (user/assistant/system).
             content: Message content.
             session_id: Optional session ID.
+            message_id: Optional client-supplied message UUID.  When set, used
+                as the persistent ID so frontend/backend share the same key.
             
         Returns:
             MessageResult with the stored message.
@@ -755,6 +758,7 @@ class MemoryClient:
                 "bot_id": self.bot_id,
                 "session_id": session_id,
                 "timestamp": timestamp,
+                "message_id": message_id,
             })
             return MessageResult.from_dict(result)
         
@@ -767,6 +771,7 @@ class MemoryClient:
                 bot_id=self.bot_id,
                 session_id=session_id,
                 timestamp=timestamp,
+                message_id=message_id,
             )
         )
         return MessageResult.from_dict(result.to_dict())
@@ -1131,8 +1136,10 @@ class _MCPShortTermManager:
     def __init__(self, memory_client: MemoryClient):
         self._memory_client = memory_client
 
-    def add_message(self, role: str, content: str, timestamp: float | None = None) -> str:
-        msg = self._memory_client.add_message(role=role, content=content, timestamp=timestamp)
+    def add_message(self, role: str, content: str, timestamp: float | None = None, message_id: str | None = None) -> str:
+        msg = self._memory_client.add_message(
+            role=role, content=content, timestamp=timestamp, message_id=message_id,
+        )
         return msg.id
 
     def get_messages(self, since_minutes: int | None = None) -> list:

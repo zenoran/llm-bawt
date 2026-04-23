@@ -324,6 +324,7 @@ class ServiceLLMBawt(BaseLLMBawt):
         self,
         prompt: str,
         user_attachments: list[dict] | None = None,
+        message_id: str | None = None,
     ) -> list[Message]:
         """Prepare messages for query including history and memory context.
 
@@ -335,6 +336,10 @@ class ServiceLLMBawt(BaseLLMBawt):
                 [{"mimeType": "image/png", "content": "<base64>"}].
                 When present, the last user message will use a multimodal
                 content array so the LLM can see the images.
+            message_id: Optional client-supplied UUID for the persisted user
+                message.  When supplied, it becomes the ID in chat history
+                and matches turn_log.trigger_message_id, enabling clean joins
+                between history rows and tool-call events.
 
         Returns:
             List of messages ready for LLM query
@@ -344,7 +349,7 @@ class ServiceLLMBawt(BaseLLMBawt):
         self._refresh_history_if_stale()
 
         # Add user message to history first
-        self.history_manager.add_message("user", prompt)
+        self.history_manager.add_message("user", prompt, message_id=message_id)
 
         # Build context with system prompt, memory, and history
         messages = self._build_context_messages(prompt)

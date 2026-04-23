@@ -49,6 +49,14 @@ async def lifespan(app):
             config.merge_db_models(db_models)
             log.debug("Loaded %d model definitions from DB", len(db_models))
 
+    # Ensure media_generations table exists
+    try:
+        from ..media.db import MediaGenerationStore
+        _media_store = MediaGenerationStore(config)
+        log.info("media_generations table ready")
+    except Exception as e:
+        log.warning("Failed to initialise media_generations table: %s", e)
+
     service = BackgroundService(config)
     set_service(service)
     service.start_worker()

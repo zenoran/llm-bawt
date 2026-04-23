@@ -184,6 +184,7 @@ async def add_message(
     bot_id: str = "default",
     session_id: str | None = None,
     timestamp: float | None = None,
+    message_id: str | None = None,
 ) -> dict:
     """Add a message to conversation history.
 
@@ -192,6 +193,7 @@ async def add_message(
         content: Message content.
         bot_id: Bot namespace.
         session_id: Optional session grouping.
+        message_id: Optional client-supplied UUID for the message.
 
     Returns:
         Stored message dict.
@@ -204,6 +206,7 @@ async def add_message(
         bot_id=bot_id,
         session_id=session_id,
         timestamp=timestamp,
+        message_id=message_id,
     )
     return message.to_dict()
 

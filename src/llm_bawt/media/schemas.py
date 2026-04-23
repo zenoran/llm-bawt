@@ -1,0 +1,87 @@
+"""Pydantic request/response models for the media generation API."""
+
+from __future__ import annotations
+
+from datetime import datetime
+from typing import Optional
+
+from pydantic import BaseModel, Field
+
+
+class MediaGenerationRequest(BaseModel):
+    """Request body for POST /v1/media/generations."""
+
+    prompt: str = Field(..., description="Text prompt describing the desired media")
+    media_type: str = Field(
+        default="video",
+        description="Type of media to generate: 'video' or 'image'",
+    )
+    model: Optional[str] = Field(
+        default=None,
+        description="Model to use. Auto-selected if omitted (e.g. grok-imagine-video)",
+    )
+    source_image: Optional[str] = Field(
+        default=None,
+        description="Base64 data URI or URL for image-to-video generation",
+    )
+    aspect_ratio: str = Field(
+        default="16:9",
+        description="Aspect ratio (e.g. '16:9', '9:16', '1:1')",
+    )
+    duration: Optional[float] = Field(
+        default=5,
+        ge=1,
+        le=15,
+        description="Video duration in seconds (1-15, default 5). Video only.",
+    )
+    resolution: str = Field(
+        default="720p",
+        description="Output resolution (e.g. '720p', '1080p')",
+    )
+    num_outputs: int = Field(
+        default=1,
+        ge=1,
+        le=4,
+        description="Number of outputs to generate (image only, default 1)",
+    )
+
+
+class MediaOutput(BaseModel):
+    """A single generated media output."""
+
+    file_path: Optional[str] = Field(default=None, description="Relative path in blob storage")
+    thumbnail_path: Optional[str] = Field(default=None, description="Relative path to poster frame")
+    file_size_bytes: Optional[int] = Field(default=None, description="File size in bytes")
+    mime_type: Optional[str] = Field(default=None, description="MIME type of the media file")
+    content_url: Optional[str] = Field(default=None, description="URL to stream the media content")
+    thumbnail_url: Optional[str] = Field(default=None, description="URL to serve the poster frame")
+    width: Optional[int] = Field(default=None, description="Media width in pixels")
+    height: Optional[int] = Field(default=None, description="Media height in pixels")
+    actual_duration: Optional[float] = Field(default=None, description="Actual duration in seconds")
+
+
+class MediaGenerationResponse(BaseModel):
+    """Response for a media generation job."""
+
+    id: str = Field(..., description="Generation ID (prefixed with 'gen_')")
+    status: str = Field(..., description="Job status: pending|processing|completed|failed")
+    media_type: str = Field(..., description="Type of media: video or image")
+    prompt: str = Field(..., description="Original prompt")
+    revised_prompt: Optional[str] = Field(default=None, description="Provider-revised prompt")
+    progress: int = Field(default=0, description="Progress percentage 0-100")
+    outputs: list[MediaOutput] = Field(default_factory=list, description="Generated outputs (populated when completed)")
+    provider: Optional[str] = Field(default=None, description="Provider name (e.g. 'xai')")
+    model: Optional[str] = Field(default=None, description="Model used for generation")
+    aspect_ratio: Optional[str] = Field(default=None, description="Requested aspect ratio")
+    duration: Optional[float] = Field(default=None, description="Requested duration (video)")
+    resolution: Optional[str] = Field(default=None, description="Requested resolution")
+    error: Optional[str] = Field(default=None, description="Error message if failed")
+    created_at: Optional[str] = Field(default=None, description="ISO 8601 creation timestamp")
+    completed_at: Optional[str] = Field(default=None, description="ISO 8601 completion timestamp")
+
+
+class MediaGenerationListResponse(BaseModel):
+    """Paginated list of media generations."""
+
+    items: list[MediaGenerationResponse] = Field(default_factory=list)
+    total: int = Field(default=0)

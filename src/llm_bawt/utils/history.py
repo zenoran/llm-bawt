@@ -335,15 +335,24 @@ class HistoryManager:
             else:
                 return [Message(role="system", content=self.config.SYSTEM_MESSAGE)]
 
-    def add_message(self, role, content):
-        """Append a message to history and save."""
-        message = Message(role, content, db_id=str(uuid.uuid4()))
+    def add_message(self, role, content, message_id=None):
+        """Append a message to history and save.
+
+        If ``message_id`` is provided, it is used as the persistent ID so
+        the frontend's user-message UUID matches the server-side history
+        row — enabling tool-call events keyed by trigger_message_id to join
+        cleanly with chat history without a separate id-mapping step.
+        """
+        provided_id = str(message_id).strip() if message_id else None
+        message = Message(role, content, db_id=provided_id or str(uuid.uuid4()))
         self.messages.append(message)
-        
+
         # Save to PostgreSQL if available, otherwise file
         if self._db_backend:
             try:
-                persisted_id = self._db_backend.add_message(role, content, message.timestamp)
+                persisted_id = self._db_backend.add_message(
+                    role, content, message.timestamp, message_id=provided_id,
+                )
                 if persisted_id:
                     message.db_id = str(persisted_id)
             except Exception as e:

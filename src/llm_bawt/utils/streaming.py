@@ -71,8 +71,9 @@ def render_complete_response(
         return
     
     split_marker = "\n\n"
-    if split_marker in response:
-        first_part, remainder = response.split(split_marker, 1)
+    stripped = response.lstrip()
+    if split_marker in stripped:
+        first_part, remainder = stripped.split(split_marker, 1)
         _print_panel(console, first_part, panel_title, panel_border_style)
         if remainder.strip():
             console.print(Align(Markdown(remainder.strip()), align="left", pad=False))
@@ -139,8 +140,9 @@ def _stream_windows(
             
             if not first_part_printed:
                 first_part_buffer += chunk
-                if split_marker in first_part_buffer:
-                    first_part, remainder = first_part_buffer.split(split_marker, 1)
+                stripped = first_part_buffer.lstrip()
+                if split_marker in stripped:
+                    first_part, remainder = stripped.split(split_marker, 1)
                     _print_panel(console, first_part, panel_title, panel_border_style)
                     first_part_printed = True
                     remainder_buffer = remainder
@@ -234,8 +236,11 @@ def _stream_rich_live(
             
             if not first_part_printed:
                 first_part_buffer += chunk
-                if split_marker in first_part_buffer:
-                    first_part, remainder = first_part_buffer.split(split_marker, 1)
+                # Strip leading whitespace so a response starting with \n\n
+                # doesn't produce an empty panel.
+                stripped = first_part_buffer.lstrip()
+                if split_marker in stripped:
+                    first_part, remainder = stripped.split(split_marker, 1)
                     _print_panel(console, first_part, panel_title, panel_border_style)
                     first_part_printed = True
                     visible_text, overflow_buffer = _split_visible(remainder.lstrip('\n'))
