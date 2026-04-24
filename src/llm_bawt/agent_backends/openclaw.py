@@ -166,6 +166,7 @@ class OpenClawBackend(AgentBackend):
                             system_prompt=config.get("system_prompt"),
                             model=config.get("model"),
                             backend=self.name,
+                            bot_id=str(config.get("bot_id") or "").strip() or None,
                         )
                         logger.info(
                             "%s request via bridge: session=%s request_id=%s",

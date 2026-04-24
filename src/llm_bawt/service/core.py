@@ -77,10 +77,12 @@ class ServiceLLMBawt(BaseLLMBawt):
         # config.  Now that self.bot is loaded, override the client's bot_config
         # so each bot uses its own session_key / settings.
         from ..clients.agent_backend_client import AgentBackendClient
-        if isinstance(self.client, AgentBackendClient) and self.bot.agent_backend_config:
-            self.client._bot_config = dict(self.bot.agent_backend_config)
-            # Include bot_id so backends can scope sessions per bot
+        if isinstance(self.client, AgentBackendClient):
+            self.client._bot_config = dict(self.bot.agent_backend_config or {})
+            # Include bot + user identifiers so agent backends can scope
+            # per-bot and per-user sessions deterministically.
             self.client._bot_config["bot_id"] = self.bot_id
+            self.client._bot_config["user_id"] = self.user_id
 
     def _init_history(self):
         """Ensure history always persists to PostgreSQL, even in local_mode.
@@ -299,7 +301,11 @@ class ServiceLLMBawt(BaseLLMBawt):
         elif model_type in ("agent_backend", "claude-code"):
             from ..clients.agent_backend_client import AgentBackendClient
             backend_name = self.model_definition.get("backend", self.resolved_model_alias)
-            bot_config = self.model_definition.get("bot_config", {})
+            bot_config = {
+                **(self.model_definition.get("bot_config", {}) or {}),
+                "bot_id": self.bot_id,
+                "user_id": self.user_id,
+            }
             client = AgentBackendClient(
                 backend_name=backend_name,
                 config=self.config,
@@ -393,8 +399,12 @@ class ServiceLLMBawt(BaseLLMBawt):
             tool_context is empty if no tools used.
             tool_call_details is a list of per-call dicts for debug logging.
         """
-        # Use tool loop if bot has tools enabled and at least one tool backend is available
-        if self.bot.uses_tools and (
+        tool_format_value = str(getattr(self.tool_format, "value", self.tool_format)).strip().lower()
+        tools_enabled_for_model = tool_format_value != "none"
+
+        # Use tool loop if bot has tools enabled, model supports tool format,
+        # and at least one tool backend is available.
+        if self.bot.uses_tools and tools_enabled_for_model and (
             self.memory
             or self.search_client
             or self.news_client

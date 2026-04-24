@@ -30,6 +30,14 @@ logger = logging.getLogger(__name__)
 
 SESSION_PREFIX = "claude-code:"
 
+
+def _bot_slug_from_session_key(session_key: str) -> str:
+    sk = (session_key or "").strip()
+    if not sk:
+        return ""
+    return sk.split(":", 1)[0]
+
+
 _CREDENTIALS_PATH = Path.home() / ".claude" / ".credentials.json"
 _OAUTH_TOKEN_URL = "https://platform.claude.com/v1/oauth/token"
 _OAUTH_CLIENT_ID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e"
@@ -257,6 +265,12 @@ class ClaudeCodeBridge:
                         sk = bc.get("session_key")
                         model = bc.get("model", "")
                         if sk:
+                            sk = str(sk).strip()
+                            # Guard against legacy bug where routing keys
+                            # like "snark:nick" were stored as SDK session ids.
+                            if ":" in sk:
+                                logger.warning("Ignoring invalid persisted session_key for %s: %s", bot_id, sk)
+                                return None
                             return (sk, model)
                         return None
         except Exception as e:
@@ -419,6 +433,7 @@ class ClaudeCodeBridge:
     ) -> None:
         request_id = fields.get("request_id", "")
         session_key = fields.get("session_key", "")
+        bot_slug = (fields.get("bot_id", "") or "").strip() or _bot_slug_from_session_key(session_key)
         message = fields.get("message", "")
         system_prompt = fields.get("system_prompt") or None
         model = fields.get("model") or self._default_model
@@ -437,8 +452,8 @@ class ClaudeCodeBridge:
 
         # /new resets the session — strip it and start fresh
         if message.lstrip().startswith("/new"):
-            cleared = await self._clear_session(session_key)
-            logger.info("Session reset via /new: %s (had_session=%s)", session_key, cleared)
+            cleared = await self._clear_session(bot_slug or session_key)
+            logger.info("Session reset via /new: %s (had_session=%s)", bot_slug or session_key, cleared)
             message = message.lstrip().removeprefix("/new").strip()
             if not message:
                 # Just "/new" with no follow-up — acknowledge and done
@@ -475,18 +490,18 @@ class ClaudeCodeBridge:
 
             try:
                 # Inject MCP tool context so Claude passes the right identifiers
-                if system_prompt and self._mcp_servers and session_key:
+                if system_prompt and self._mcp_servers and bot_slug:
                     system_prompt += (
                         f"\n\n## MCP Tool Context\n"
-                        f"Your bot_id is \"{session_key}\". When using llm-bawt-memory MCP tools:\n"
-                        f"- Memory/message tools: always pass bot_id=\"{session_key}\"\n"
+                        f"Your bot_id is \"{bot_slug}\". When using llm-bawt-memory MCP tools:\n"
+                        f"- Memory/message tools: always pass bot_id=\"{bot_slug}\"\n"
                         f"- Profile tool with entity_type=\"user\": use entity_id=\"nick\" (the user)\n"
-                        f"- Profile tool with entity_type=\"bot\": use entity_id=\"{session_key}\" (yourself)"
+                        f"- Profile tool with entity_type=\"bot\": use entity_id=\"{bot_slug}\" (yourself)"
                     )
 
                 # Reuse SDK session for conversation continuity.
                 # If the model changed, start a fresh session.
-                existing = await self._get_session(session_key)
+                existing = await self._get_session(bot_slug)
                 resume_id = None
                 if existing:
                     prev_sid, prev_model = existing
@@ -495,9 +510,9 @@ class ClaudeCodeBridge:
                     else:
                         logger.info(
                             "Model changed (%s -> %s), starting new session for %s",
-                            prev_model, model, session_key,
+                            prev_model, model, bot_slug or session_key,
                         )
-                        await self._clear_session(session_key)
+                        await self._clear_session(bot_slug or session_key)
 
                 # Resolve settings file path
                 settings_path = str(Path.home() / ".claude" / "settings.json")
@@ -589,7 +604,7 @@ class ClaudeCodeBridge:
                                 if not resume_id:
                                     sid = data.get("session_id")
                                     if sid:
-                                        await self._set_session(session_key, sid, model)
+                                        await self._set_session(bot_slug or session_key, sid, model)
                                 session_persisted = True
                             msg_type = type(msg).__name__
                             if not isinstance(msg, (StreamEvent, SystemMessage)):
@@ -713,7 +728,7 @@ class ClaudeCodeBridge:
                             )
                             if stderr_lines:
                                 logger.warning("Captured stderr before retry: %s", stderr_lines)
-                            await self._clear_session(session_key)
+                            await self._clear_session(bot_slug or session_key)
                             resume_id = None
                             continue
 
@@ -753,11 +768,12 @@ class ClaudeCodeBridge:
         try:
             if method == "session.reset":
                 session_key = params.get("sessionKey", "")
-                if session_key:
-                    cleared = await self._clear_session(session_key)
-                    logger.info("Session reset: %s (had_session=%s)", session_key, cleared)
+                target = _bot_slug_from_session_key(session_key) or session_key
+                if target:
+                    cleared = await self._clear_session(target)
+                    logger.info("Session reset: %s (had_session=%s)", target, cleared)
                     self._publisher.publish_rpc_result(
-                        request_id, {"ok": True, "reset": session_key, "had_session": cleared}
+                        request_id, {"ok": True, "reset": target, "had_session": cleared}
                     )
                 else:
                     self._publisher.publish_rpc_result(
