@@ -679,74 +679,60 @@ async def send_message_to_bot(
     logger.debug("MCP tool invoked: send_message_to_bot target=%s sender=%s", target_bot_id, sender_bot_id)
 
     try:
-        # Import here to avoid circular imports
-        from ..service.dependencies import get_service
-        from ..service.schemas import ChatCompletionRequest, ChatMessage
+        import httpx
+        import json
 
-        service = get_service()
-        if not service:
-            return {
-                "success": False,
-                "error": "llm-bawt service not available",
-                "content": "",
-                "bot_id": target_bot_id,
-                "sender": sender_bot_id,
-            }
-
-        # Verify target bot exists
-        from ..bots import BotManager
-        bot_manager = BotManager(service.config)
-        target_bot = bot_manager.get_bot(target_bot_id)
-
-        if not target_bot:
-            return {
-                "success": False,
-                "error": f"Bot '{target_bot_id}' not found",
-                "content": "",
-                "bot_id": target_bot_id,
-                "sender": sender_bot_id,
-            }
-
-        # Create chat completion request
         # Add sender context to the message if provided
         formatted_message = message
         if sender_bot_id != "unknown":
             formatted_message = f"Message from bot '{sender_bot_id}': {message}"
 
-        chat_request = ChatCompletionRequest(
-            model=target_bot.default_model or "gpt-4",
-            messages=[
-                ChatMessage(
-                    role="user",
-                    content=formatted_message
-                )
+        # Prepare the request payload
+        payload = {
+            "messages": [
+                {
+                    "role": "user",
+                    "content": formatted_message
+                }
             ],
-            bot_id=target_bot_id,
-            max_tokens=max_tokens,
-            temperature=temperature,
+            "bot_id": target_bot_id,
+            "max_tokens": max_tokens,
+            "temperature": temperature,
             # Don't extract memory from inter-bot conversations by default
             # to avoid cross-contamination unless explicitly desired
-            extract_memory=False,
-            augment_memory=True,  # Allow target bot to use its own memory
-            stream=False,
-        )
+            "extract_memory": False,
+            "augment_memory": True,  # Allow target bot to use its own memory
+            "stream": False,
+        }
 
-        # Make the request
-        response = await service.chat_completion(chat_request)
+        # Make HTTP request to the chat completions API
+        async with httpx.AsyncClient() as client:
+            response = await client.post(
+                "http://localhost:8642/v1/chat/completions",
+                json=payload,
+                timeout=30.0
+            )
+            response.raise_for_status()
+            result = response.json()
 
         # Extract the response content
-        if hasattr(response, 'choices') and response.choices:
-            content = response.choices[0].message.content or ""
+        if "choices" in result and result["choices"]:
+            content = result["choices"][0]["message"]["content"] or ""
+            return {
+                "success": True,
+                "content": content,
+                "bot_id": target_bot_id,
+                "sender": sender_bot_id,
+                "response_model": result.get("model"),
+            }
         else:
-            content = str(response)
-
-        return {
-            "success": True,
-            "content": content,
-            "bot_id": target_bot_id,
-            "sender": sender_bot_id,
-            "response_model": getattr(response, 'model', None),
-        }
+            return {
+                "success": False,
+                "error": f"Invalid response format: {result}",
+                "content": "",
+                "bot_id": target_bot_id,
+                "sender": sender_bot_id,
+            }
 
     except Exception as e:
         logger.error("Inter-bot communication failed: %s", str(e))
@@ -773,28 +759,30 @@ async def list_available_bots() -> list[dict]:
     logger.debug("MCP tool invoked: list_available_bots")
 
     try:
-        # Import here to avoid circular imports
-        from ..service.dependencies import get_service
-        from ..bots import BotManager
+        import httpx
 
-        service = get_service()
-        if not service:
-            return []
+        # Make HTTP request to the bots API
+        async with httpx.AsyncClient() as client:
+            response = await client.get(
+                "http://localhost:8642/v1/bots",
+                timeout=10.0
+            )
+            response.raise_for_status()
+            bots_data = response.json()
 
-        bot_manager = BotManager(service.config)
-        bots = bot_manager.list_bots()
-
+        # Extract bot information
         result = []
-        for bot in bots:
-            bot_info = {
-                "slug": bot.slug,
-                "name": getattr(bot, 'name', bot.slug),
-                "bot_type": getattr(bot, 'bot_type', 'chat'),
-                "description": getattr(bot, 'description', ''),
-                "default_model": getattr(bot, 'default_model', ''),
-                "agent_backend": getattr(bot, 'agent_backend', None),
-            }
-            result.append(bot_info)
+        if isinstance(bots_data, list):
+            for bot in bots_data:
+                bot_info = {
+                    "slug": bot.get("slug", "unknown"),
+                    "name": bot.get("name", bot.get("slug", "Unknown")),
+                    "bot_type": bot.get("bot_type", "chat"),
+                    "description": bot.get("description", ""),
+                    "default_model": bot.get("default_model", ""),
+                    "agent_backend": bot.get("agent_backend"),
+                }
+                result.append(bot_info)
 
         return result
 
