@@ -135,6 +135,122 @@ async def search_memories(
 
 
 @mcp.tool()
+async def list_memory_sources() -> list[dict]:
+    """List available memory sources (bot namespaces that have stored memories).
+
+    Use this to discover which bots have memories you can search with
+    ``search_memory_source``.
+
+    Returns:
+        List of dicts with 'source' (bot_id) and 'memory_count'.
+    """
+    logger.debug("MCP tool invoked: tools/list_memory_sources")
+    storage = _get_storage()
+    return await storage.list_memory_sources()
+
+
+@mcp.tool()
+async def search_memory_source(
+    source: str,
+    query: str,
+    n_results: int = 10,
+    min_relevance: float = 0.0,
+    tags: list[str] | None = None,
+) -> list[dict]:
+    """Search another bot's memories by source (read-only cross-bot search).
+
+    This lets any bot look into a specific bot's memory store without
+    modifying it.  Use ``list_memory_sources`` first to discover available
+    sources.
+
+    Args:
+        source: The bot_id whose memories to search (e.g. "nova", "mira").
+        query: Natural language search query.
+        n_results: Maximum results to return.
+        min_relevance: Minimum similarity threshold 0-1.
+        tags: Optional tag filter.
+
+    Returns:
+        List of memory dicts with relevance scores.  Each dict also
+        includes a 'source' key indicating which bot the memory belongs to.
+    """
+    logger.debug("MCP tool invoked: tools/search_memory_source source=%s", source)
+    storage = _get_storage()
+    memories = await storage.search_memories(
+        query=query,
+        bot_id=source,
+        n_results=n_results,
+        min_relevance=min_relevance,
+        tags=tags,
+    )
+    results = []
+    for m in memories:
+        d = m.to_dict()
+        d["source"] = source
+        results.append(d)
+    return results
+
+
+@mcp.tool()
+async def search_all_messages(
+    query: str,
+    n_results: int = 10,
+    role_filter: str | None = None,
+) -> list[dict]:
+    """Full-text search across ALL bots' message histories at once.
+
+    Use this when you need to find who was talking about a topic, without
+    knowing which bot to search.  Much faster than searching each bot
+    individually.
+
+    Args:
+        query: Search keywords or phrase.
+        n_results: Maximum total results across all bots.
+        role_filter: Only include messages with this role (user/assistant).
+                     System messages are always excluded.
+
+    Returns:
+        List of message dicts with 'source' (bot_id), role, content,
+        timestamp, and full-text rank.
+    """
+    logger.debug("MCP tool invoked: tools/search_all_messages")
+    storage = _get_storage()
+    return await storage.search_all_messages(
+        query=query,
+        n_results=n_results,
+        role_filter=role_filter,
+    )
+
+
+@mcp.tool()
+async def search_all_memories(
+    query: str,
+    n_results: int = 10,
+    min_relevance: float = 0.0,
+) -> list[dict]:
+    """Semantic search across ALL bots' memory stores at once.
+
+    Use this when you need to find remembered facts without knowing which
+    bot stored the memory.
+
+    Args:
+        query: Natural language search query.
+        n_results: Maximum total results across all bots.
+        min_relevance: Minimum similarity threshold 0-1.
+
+    Returns:
+        List of memory dicts with 'source' (bot_id) and relevance scores.
+    """
+    logger.debug("MCP tool invoked: tools/search_all_memories")
+    storage = _get_storage()
+    return await storage.search_all_memories(
+        query=query,
+        n_results=n_results,
+        min_relevance=min_relevance,
+    )
+
+
+@mcp.tool()
 async def get_recent_context(
     bot_id: str = "default",
     n_messages: int = 10,
@@ -530,6 +646,164 @@ async def remove_last_message_if_partial(bot_id: str = "default", role: str = "a
 
 
 # ---------------------------------------------------------------------------
+# Inter-Bot Communication Tools
+# ---------------------------------------------------------------------------
+
+
+@mcp.tool()
+async def send_message_to_bot(
+    target_bot_id: str,
+    message: str,
+    sender_bot_id: str = "unknown",
+    max_tokens: int | None = None,
+    temperature: float = 0.7,
+) -> dict:
+    """Send a message to another bot and get their response.
+
+    This allows bots to communicate with each other by sending messages
+    and receiving responses. The conversation is isolated to this single
+    exchange and doesn't affect either bot's persistent memory unless
+    they choose to store it.
+
+    Args:
+        target_bot_id: The bot slug to send the message to.
+        message: The message content to send.
+        sender_bot_id: The bot slug of the sender (for context).
+        max_tokens: Maximum tokens for the response.
+        temperature: Temperature for the response generation.
+
+    Returns:
+        Dict with keys: 'content' (response text), 'bot_id' (target),
+        'sender' (sender_bot_id), and 'success' (bool).
+    """
+    logger.debug("MCP tool invoked: send_message_to_bot target=%s sender=%s", target_bot_id, sender_bot_id)
+
+    try:
+        # Import here to avoid circular imports
+        from ..service.dependencies import get_service
+        from ..service.schemas import ChatCompletionRequest, ChatMessage
+
+        service = get_service()
+        if not service:
+            return {
+                "success": False,
+                "error": "llm-bawt service not available",
+                "content": "",
+                "bot_id": target_bot_id,
+                "sender": sender_bot_id,
+            }
+
+        # Verify target bot exists
+        from ..bots import BotManager
+        bot_manager = BotManager(service.config)
+        target_bot = bot_manager.get_bot(target_bot_id)
+
+        if not target_bot:
+            return {
+                "success": False,
+                "error": f"Bot '{target_bot_id}' not found",
+                "content": "",
+                "bot_id": target_bot_id,
+                "sender": sender_bot_id,
+            }
+
+        # Create chat completion request
+        # Add sender context to the message if provided
+        formatted_message = message
+        if sender_bot_id != "unknown":
+            formatted_message = f"Message from bot '{sender_bot_id}': {message}"
+
+        chat_request = ChatCompletionRequest(
+            model=target_bot.default_model or "gpt-4",
+            messages=[
+                ChatMessage(
+                    role="user",
+                    content=formatted_message
+                )
+            ],
+            bot_id=target_bot_id,
+            max_tokens=max_tokens,
+            temperature=temperature,
+            # Don't extract memory from inter-bot conversations by default
+            # to avoid cross-contamination unless explicitly desired
+            extract_memory=False,
+            augment_memory=True,  # Allow target bot to use its own memory
+            stream=False,
+        )
+
+        # Make the request
+        response = await service.chat_completion(chat_request)
+
+        # Extract the response content
+        if hasattr(response, 'choices') and response.choices:
+            content = response.choices[0].message.content or ""
+        else:
+            content = str(response)
+
+        return {
+            "success": True,
+            "content": content,
+            "bot_id": target_bot_id,
+            "sender": sender_bot_id,
+            "response_model": getattr(response, 'model', None),
+        }
+
+    except Exception as e:
+        logger.error("Inter-bot communication failed: %s", str(e))
+        return {
+            "success": False,
+            "error": str(e),
+            "content": "",
+            "bot_id": target_bot_id,
+            "sender": sender_bot_id,
+        }
+
+
+@mcp.tool()
+async def list_available_bots() -> list[dict]:
+    """List all available bots that can receive messages.
+
+    This helps bots discover what other bots are available for
+    inter-bot communication via send_message_to_bot.
+
+    Returns:
+        List of bot info dicts with keys: 'slug', 'name', 'bot_type',
+        'description', 'default_model', 'agent_backend'.
+    """
+    logger.debug("MCP tool invoked: list_available_bots")
+
+    try:
+        # Import here to avoid circular imports
+        from ..service.dependencies import get_service
+        from ..bots import BotManager
+
+        service = get_service()
+        if not service:
+            return []
+
+        bot_manager = BotManager(service.config)
+        bots = bot_manager.list_bots()
+
+        result = []
+        for bot in bots:
+            bot_info = {
+                "slug": bot.slug,
+                "name": getattr(bot, 'name', bot.slug),
+                "bot_type": getattr(bot, 'bot_type', 'chat'),
+                "description": getattr(bot, 'description', ''),
+                "default_model": getattr(bot, 'default_model', ''),
+                "agent_backend": getattr(bot, 'agent_backend', None),
+            }
+            result.append(bot_info)
+
+        return result
+
+    except Exception as e:
+        logger.error("Failed to list available bots: %s", str(e))
+        return []
+
+
+# ---------------------------------------------------------------------------
 # Profile Tools
 # ---------------------------------------------------------------------------
 
@@ -667,6 +941,13 @@ async def profile(
 
     else:
         return f"Unknown action: {action}. Valid: summary, list, get, set, delete."
+
+
+# ---------------------------------------------------------------------------
+# Task system tools (registered via import side-effect)
+# ---------------------------------------------------------------------------
+
+from . import task_tools as _task_tools  # noqa: F401, E402
 
 
 # ---------------------------------------------------------------------------
