@@ -262,6 +262,12 @@ class Config(RuntimeTunables, BaseSettings):
     OPENCLAW_INGEST_DROP_EVENTS: str = Field(default="", exclude=True)
     OPENCLAW_INGEST_DROP_MSG_TYPES: str = Field(default="", exclude=True)
 
+    # --- Agent Task API Settings --- #
+    TASK_API_URL: str = Field(
+        default="http://echo.lan.zenoran.com",
+        description="Base URL for the unmute agent task API (Set via LLM_BAWT_TASK_API_URL)",
+    )
+
     # --- Web Search Settings --- #
     NEWSAPI_API_KEY: str = Field(
         default="",
