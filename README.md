@@ -12,6 +12,7 @@ llm-bawt is the brain behind an AI assistant that:
 - **Uses tools** — the LLM can search the web, store/recall memories, control smart home devices, and fetch web pages mid-conversation
 - **Works with any model** — swap between OpenAI, Grok (xAI), Claude (via Agent SDK), local GGUF models, Ollama, or vLLM without changing how you interact
 - **Has personalities** — different bots with their own system prompts, memory spaces, tool access, and default models
+- **Enables bot collaboration** — bots can communicate with each other via MCP tools, enabling delegation, specialist workflows, and multi-bot interactions
 - **Streams everything** — responses stream to the terminal or web UI in real time with rich formatting
 
 ## Prerequisites
