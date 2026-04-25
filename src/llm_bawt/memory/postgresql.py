@@ -40,13 +40,53 @@ logger = logging.getLogger(__name__)
 
 def _sanitize_table_name(bot_id: str) -> str:
     """Sanitize bot_id for use in table names.
-    
+
     Only allows alphanumeric and underscore, lowercase.
     """
     sanitized = re.sub(r'[^a-z0-9_]', '', bot_id.lower())
     if not sanitized:
         sanitized = "default"
     return sanitized
+
+
+# ---------------------------------------------------------------------------
+# Shared full-text search helpers
+# ---------------------------------------------------------------------------
+
+# Stop words for full-text message/memory search queries
+_FTS_STOP_WORDS: set[str] = {
+    # Standard English stop words
+    'the', 'a', 'an', 'and', 'or', 'but', 'in', 'on', 'at', 'to', 'for',
+    'of', 'with', 'by', 'from', 'as', 'is', 'was', 'are', 'were', 'been',
+    'be', 'have', 'has', 'had', 'do', 'does', 'did', 'will', 'would',
+    'could', 'should', 'may', 'might', 'must', 'shall', 'can', 'need',
+    'we', 'you', 'i', 'he', 'she', 'it', 'they', 'them', 'their', 'our',
+    'my', 'your', 'his', 'her', 'its', 'what', 'which', 'who', 'whom',
+    'this', 'that', 'these', 'those', 'am', 'not', 'no', 'yes', 'so',
+    'if', 'then', 'than', 'too', 'very', 'just', 'about', 'before', 'after',
+    # Conversational meta-words (common in memory queries but not content)
+    'remember', 'tell', 'told', 'said', 'say', 'know', 'think', 'thought',
+    'talk', 'talked', 'talking', 'conversation', 'conversations', 'discussed',
+    'discuss', 'discussion', 'mention', 'mentioned', 'anything', 'something',
+    'everything', 'nothing', 'past', 'previous', 'earlier', 'last', 'time',
+    'when', 'where', 'how', 'why', 'like', 'want', 'wanted', 'please',
+}
+
+
+def build_fts_query(query: str) -> str | None:
+    """Build a PostgreSQL OR tsquery string from a natural language query.
+
+    Strips stop words and short tokens, returns ``None`` when no meaningful
+    terms remain.  Result is suitable for ``to_tsquery('english', ...)``.
+    """
+    words = re.findall(r'\b[a-zA-Z]+\b', query.lower())
+    meaningful = [w for w in words if w not in _FTS_STOP_WORDS and len(w) > 2]
+    if not meaningful:
+        # Fallback: use any words > 2 chars
+        meaningful = [w for w in words if len(w) > 2][:3]
+    if not meaningful:
+        return None
+    return ' | '.join(meaningful)
 
 
 # Shared metadata for table definitions
@@ -1087,46 +1127,14 @@ class PostgreSQLMemoryBackend(MemoryBackend):
         if not query or query.isspace():
             return []
 
+        or_query = build_fts_query(query)
+        if not or_query:
+            return []
+
         cutoff_time = time.time() - exclude_recent_seconds
 
         with self.engine.connect() as conn:
             try:
-                # Use websearch_to_tsquery for better handling, but we need OR logic
-                # Extract words and build an OR query manually
-                # Filter out common words AND conversational meta-words that don't help find content
-                stop_words = {
-                    # Standard English stop words
-                    'the', 'a', 'an', 'and', 'or', 'but', 'in', 'on', 'at', 'to', 'for',
-                    'of', 'with', 'by', 'from', 'as', 'is', 'was', 'are', 'were', 'been',
-                    'be', 'have', 'has', 'had', 'do', 'does', 'did', 'will', 'would',
-                    'could', 'should', 'may', 'might', 'must', 'shall', 'can', 'need',
-                    'we', 'you', 'i', 'he', 'she', 'it', 'they', 'them', 'their', 'our',
-                    'my', 'your', 'his', 'her', 'its', 'what', 'which', 'who', 'whom',
-                    'this', 'that', 'these', 'those', 'am', 'not', 'no', 'yes', 'so',
-                    'if', 'then', 'than', 'too', 'very', 'just', 'about', 'before', 'after',
-                    # Conversational meta-words (common in memory queries but not content)
-                    'remember', 'tell', 'told', 'said', 'say', 'know', 'think', 'thought',
-                    'talk', 'talked', 'talking', 'conversation', 'conversations', 'discussed',
-                    'discuss', 'discussion', 'mention', 'mentioned', 'anything', 'something',
-                    'everything', 'nothing', 'past', 'previous', 'earlier', 'last', 'time',
-                    'when', 'where', 'how', 'why', 'like', 'want', 'wanted', 'please',
-                }
-
-                # Extract meaningful words
-                import re
-                words = re.findall(r'\b[a-zA-Z]+\b', query.lower())
-                meaningful_words = [w for w in words if w not in stop_words and len(w) > 2]
-
-                if not meaningful_words:
-                    # Fall back to simple search if no meaningful words
-                    meaningful_words = [w for w in words if len(w) > 2][:3]
-
-                if not meaningful_words:
-                    return []
-
-                # Build OR query: word1 | word2 | word3
-                or_query = ' | '.join(meaningful_words)
-
                 # Build filter clauses
                 role_clause = "AND role = :role" if role_filter else ""
                 since_clause = "AND timestamp >= :since" if since is not None else ""

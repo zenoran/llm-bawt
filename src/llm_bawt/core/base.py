@@ -31,7 +31,7 @@ from ..utils.paths import resolve_log_dir
 from ..utils.history import HistoryManager, Message
 from ..utils.temporal import build_temporal_context
 from ..adapters import get_adapter, ModelAdapter
-from .prompt_builder import PromptBuilder, SectionPosition
+from .prompt_builder import GLOBAL_SYSTEM_PROMPT, PromptBuilder, SectionPosition
 from .model_lifecycle import ModelLifecycleManager, get_model_lifecycle
 
 if TYPE_CHECKING:
@@ -252,7 +252,15 @@ class BaseLLMBawt(ABC):
                 self.bot.system_prompt,
                 position=SectionPosition.BASE_PROMPT,
             )
-        
+
+        # Section 6: Global behavioral instructions (memory-enabled bots only)
+        if self.bot.requires_memory:
+            builder.add_section(
+                "global_instructions",
+                GLOBAL_SYSTEM_PROMPT,
+                position=SectionPosition.GLOBAL_INSTRUCTIONS,
+            )
+
         # Section 4: Tool instructions (added at query time if needed)
         # We store the builder, not the final string, so we can add context later
         self._prompt_builder = builder

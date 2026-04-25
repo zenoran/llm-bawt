@@ -90,7 +90,7 @@ async def _unified_event_stream(redis_sub, bot_ids: list[str], user_id: str, con
     last_ping = asyncio.get_running_loop().time()
     try:
         async for event_data in redis_sub.subscribe_group(
-            bot_ids, user_id, consumer_id, timeout_s=300,
+            bot_ids, user_id, consumer_id, timeout_s=86400,
         ):
             if event_data is None:
                 # Keepalive tick from subscriber — send SSE comment to prevent proxy idle timeout

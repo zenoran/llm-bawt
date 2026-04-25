@@ -126,6 +126,12 @@ class TurnLifecycleMixin:
         done_event.set()
         key = bot_id or "__global__"
 
+        # Some call paths (agent backends) intentionally bypass _start_generation
+        # to allow concurrent requests; in that case the per-bot dicts may not
+        # exist yet and there's nothing to clean up.
+        if not hasattr(self, "_gen_cancels"):
+            return
+
         with self._cancel_lock:
             if self._gen_cancels.get(key) is cancel_event:
                 del self._gen_cancels[key]

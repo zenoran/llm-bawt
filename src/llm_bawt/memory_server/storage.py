@@ -680,6 +680,191 @@ class MemoryStorage:
             return False
 
 
+    # =========================================================================
+    # Cross-bot / Source Discovery & Search
+    # =========================================================================
+
+    def _discover_tables(self, suffix: str) -> list[tuple[str, str]]:
+        """Discover all bot tables matching a naming convention.
+
+        Args:
+            suffix: Table name suffix, e.g. ``_messages`` or ``_memories``.
+
+        Returns:
+            List of ``(bot_id, table_name)`` tuples.
+        """
+        from sqlalchemy import text
+
+        backend = self._get_backend("default")
+        try:
+            with backend.engine.connect() as conn:
+                rows = conn.execute(text("""
+                    SELECT table_name
+                    FROM information_schema.tables
+                    WHERE table_schema = 'public'
+                      AND table_name LIKE :pattern
+                    ORDER BY table_name
+                """), {"pattern": f"%\\{suffix}"}).fetchall()
+
+                results: list[tuple[str, str]] = []
+                for (table_name,) in rows:
+                    bot_id = table_name.removesuffix(suffix)
+                    if bot_id:
+                        results.append((bot_id, table_name))
+                return results
+        except Exception as e:
+            logger.error("Failed to discover %s tables: %s", suffix, e)
+            return []
+
+    async def list_memory_sources(self) -> list[dict[str, Any]]:
+        """Discover all available memory sources (bot_ids with memory tables).
+
+        Queries PostgreSQL for tables matching the ``*_memories`` naming
+        convention and returns basic stats for each source.
+        """
+        from sqlalchemy import text
+
+        backend = self._get_backend("default")
+        tables = self._discover_tables("_memories")
+        if not tables:
+            return []
+
+        try:
+            sources: list[dict[str, Any]] = []
+            with backend.engine.connect() as conn:
+                for bot_id, table_name in tables:
+                    count_row = conn.execute(
+                        text(f"SELECT COUNT(*) FROM {table_name}")  # noqa: S608
+                    ).fetchone()
+                    memory_count = count_row[0] if count_row else 0
+                    sources.append({
+                        "source": bot_id,
+                        "memory_count": memory_count,
+                    })
+            return sources
+        except Exception as e:
+            logger.error("Failed to list memory sources: %s", e)
+            return []
+
+    async def search_all_messages(
+        self,
+        query: str,
+        n_results: int = 10,
+        role_filter: str | None = None,
+    ) -> list[dict[str, Any]]:
+        """Full-text search across ALL bots' message histories.
+
+        Builds a UNION ALL query across every ``*_messages`` table so a single
+        question like *"who was working on the stop button?"* returns ranked
+        results from all bots in one call.
+        """
+        from sqlalchemy import text
+        from llm_bawt.memory.postgresql import build_fts_query
+
+        or_query = build_fts_query(query)
+        if not or_query:
+            return []
+
+        tables = self._discover_tables("_messages")
+        if not tables:
+            return []
+
+        # Build UNION ALL across all message tables
+        sub_selects: list[str] = []
+        for bot_id, table_name in tables:
+            # bot_id is embedded as a literal; table_name comes from information_schema
+            sub_selects.append(f"""(
+                SELECT id, role, content, timestamp,
+                       '{bot_id}' AS source,
+                       ts_rank(to_tsvector('english', content),
+                               to_tsquery('english', :query)) AS rank
+                FROM {table_name}
+                WHERE to_tsvector('english', content) @@ to_tsquery('english', :query)
+                  AND role != 'system'
+                  {("AND role = :role_filter" if role_filter else "")}
+            )""")
+
+        union_sql = "\nUNION ALL\n".join(sub_selects)
+        full_sql = text(f"""
+            {union_sql}
+            ORDER BY rank DESC, timestamp DESC
+            LIMIT :limit
+        """)
+
+        params: dict[str, Any] = {"query": or_query, "limit": n_results}
+        if role_filter:
+            params["role_filter"] = role_filter
+
+        backend = self._get_backend("default")
+        try:
+            with backend.engine.connect() as conn:
+                rows = conn.execute(full_sql, params).fetchall()
+                return [
+                    {
+                        "id": row.id,
+                        "role": row.role,
+                        "content": row.content,
+                        "timestamp": row.timestamp,
+                        "source": row.source,
+                        "rank": row.rank,
+                    }
+                    for row in rows
+                ]
+        except Exception as e:
+            logger.error("search_all_messages failed: %s", e)
+            return []
+
+    async def search_all_memories(
+        self,
+        query: str,
+        n_results: int = 10,
+        min_relevance: float = 0.0,
+    ) -> list[dict[str, Any]]:
+        """Semantic search across ALL bots' memory stores.
+
+        Generates one embedding, runs the existing per-bot search (with
+        temporal decay, access boost, diversity sampling), then merges and
+        ranks across all sources.
+        """
+        from llm_bawt.memory.embeddings import generate_embedding
+
+        query_embedding = generate_embedding(
+            query, self.config.MEMORY_EMBEDDING_MODEL, verbose=self.config.VERBOSE,
+        )
+        if not query_embedding:
+            return []
+
+        tables = self._discover_tables("_memories")
+        if not tables:
+            return []
+
+        all_results: list[dict[str, Any]] = []
+        for bot_id, _table_name in tables:
+            try:
+                backend = self._get_backend(bot_id)
+                results = backend.search_memories_by_embedding(
+                    embedding=query_embedding,
+                    n_results=n_results,
+                    min_importance=0.0,
+                )
+                for r in results:
+                    relevance = r.get("similarity") or r.get("relevance", 0.0)
+                    if relevance < min_relevance:
+                        continue
+                    r["source"] = bot_id
+                    r["relevance"] = relevance
+                    all_results.append(r)
+            except Exception as e:
+                logger.warning("search_all_memories skipped %s: %s", bot_id, e)
+
+        # Sort by effective_score (from the backend's scoring) then relevance
+        all_results.sort(
+            key=lambda r: r.get("effective_score", r.get("relevance", 0.0)),
+            reverse=True,
+        )
+        return all_results[:n_results]
+
+
 # Singleton instance
 _storage: MemoryStorage | None = None
 

@@ -28,6 +28,10 @@ class ClaudeCodeBackend(OpenClawBackend):
     name = "claude-code"
 
     def _resolve_session_key(self, config: dict) -> str:
-        # Always use bot_id — the session_key in agent_backend_config
-        # is the SDK session UUID (written by the bridge), not a routing key
-        return config.get("bot_id", "main")
+        # Route by bot + user so each user gets an independent Claude session
+        # for a given bot. The session_key in agent_backend_config is an SDK
+        # session UUID written by the bridge and should not be used directly
+        # as a routing key.
+        bot_id = str(config.get("bot_id") or "main").strip() or "main"
+        user_id = str(config.get("user_id") or "default").strip() or "default"
+        return f"{bot_id}:{user_id}"

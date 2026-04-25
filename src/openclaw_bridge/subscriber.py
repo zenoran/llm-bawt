@@ -257,7 +257,7 @@ class RedisSubscriber:
         user_id: str,
         consumer_id: str,
         *,
-        timeout_s: float = 300,
+        timeout_s: float = 86400,
     ) -> AsyncIterator[dict | None]:
         """Subscribe to unified event stream(s) via consumer groups.
 

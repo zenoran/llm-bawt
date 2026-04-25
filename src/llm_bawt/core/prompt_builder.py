@@ -57,7 +57,33 @@ class SectionPosition:
     MEMORY_CONTEXT = 3
     TOOLS = 4
     CLIENT_CONTEXT = 5  # System context passed by the calling client
+    GLOBAL_INSTRUCTIONS = 6  # Global behavioral instructions for all bots
     CUSTOM = 50  # For bot-specific additions
+
+
+# ---------------------------------------------------------------------------
+# Global system prompt fragment — injected for every memory-enabled bot
+# ---------------------------------------------------------------------------
+
+GLOBAL_SYSTEM_PROMPT = """\
+CONVERSATION RECALL:
+When asked what you were talking about or to recall a prior conversation, check your recent \
+message history via `get_messages` — don't rely solely on `search_memories`. Your message \
+history contains the full conversation even across session resets.
+
+CROSS-BOT MEMORY:
+You have access to memories from other bots via `list_memory_sources` and `search_memory_source`. \
+When a conversation touches on something that another bot might have context for — a prior discussion, \
+a fact about the user, a project detail — search their memories proactively. Don't wait to be asked. \
+If you're unsure which source to check, call `list_memory_sources` first to see what's available. \
+Weave relevant findings naturally into your response; don't announce that you searched unless the user asks.
+
+CROSS-BOT SEARCH:
+Use `search_all_messages` to keyword-search every bot's conversation history at once — \
+ideal for questions like "who was working on X?" or "when did we discuss Y?". \
+Use `search_all_memories` to search every bot's extracted memories at once. \
+These are faster than searching bots one at a time and should be your first choice for cross-bot lookups.\
+"""
 
 
 class PromptBuilder:

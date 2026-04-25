@@ -233,8 +233,18 @@ class BackgroundService(
         if not user_prompt:
             raise ValueError("No user message found in request")
 
-        # Start new generation (cancels previous for the SAME bot only)
-        cancel_event, done_event = await self._start_generation(bot_id)
+        # Start generation lifecycle.
+        # Agent backends (openclaw / claude-code) can run independent requests
+        # concurrently, so avoid the per-bot cancellation gate used for local
+        # single-model execution.
+        model_type = llm_bawt.client.model_definition.get("type", "")
+        is_agent_backend = model_type in ("agent_backend", "claude-code")
+        if is_agent_backend:
+            cancel_event = threading.Event()
+            done_event = threading.Event()
+        else:
+            # Cancels previous generation for the SAME bot only.
+            cancel_event, done_event = await self._start_generation(bot_id)
         turn_log_id = f"turn-{uuid.uuid4().hex}"
 
         # Persist turn log immediately so the user's prompt is recorded
@@ -310,7 +320,6 @@ class BackgroundService(
                 return response
 
             try:
-                model_type = llm_bawt.client.model_definition.get("type", "")
                 if model_type in ("openai", "grok", "agent_backend"):
                     response_text = await loop.run_in_executor(None, _do_query)
                 else:
