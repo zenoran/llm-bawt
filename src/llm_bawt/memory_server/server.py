@@ -770,19 +770,26 @@ async def list_available_bots() -> list[dict]:
             response.raise_for_status()
             bots_data = response.json()
 
-        # Extract bot information
+        # Extract bot information from API response
         result = []
-        if isinstance(bots_data, list):
-            for bot in bots_data:
-                bot_info = {
-                    "slug": bot.get("slug", "unknown"),
-                    "name": bot.get("name", bot.get("slug", "Unknown")),
-                    "bot_type": bot.get("bot_type", "chat"),
-                    "description": bot.get("description", ""),
-                    "default_model": bot.get("default_model", ""),
-                    "agent_backend": bot.get("agent_backend"),
-                }
-                result.append(bot_info)
+        # Handle OpenAI-style response format with "data" field
+        if isinstance(bots_data, dict) and "data" in bots_data:
+            bot_list = bots_data["data"]
+        elif isinstance(bots_data, list):
+            bot_list = bots_data
+        else:
+            bot_list = []
+
+        for bot in bot_list:
+            bot_info = {
+                "slug": bot.get("slug", "unknown"),
+                "name": bot.get("name", bot.get("slug", "Unknown")),
+                "bot_type": bot.get("bot_type", "chat"),
+                "description": bot.get("description", ""),
+                "default_model": bot.get("default_model", ""),
+                "agent_backend": bot.get("agent_backend"),
+            }
+            result.append(bot_info)
 
         return result
 
