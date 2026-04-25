@@ -91,6 +91,18 @@ async def _api_patch(
     return resp.json()
 
 
+async def _api_delete(
+    path: str, headers: dict | None = None,
+) -> Any:
+    """DELETE helper with standard error handling."""
+    client = _get_client()
+    url = f"{_API_PREFIX}{path}"
+    logger.debug("Task API DELETE %s", url)
+    resp = await client.delete(url, headers=headers or {})
+    resp.raise_for_status()
+    return resp.json()
+
+
 # ---------------------------------------------------------------------------
 # Task Tools
 # ---------------------------------------------------------------------------
@@ -403,6 +415,137 @@ async def get_project(
     logger.debug("MCP tool invoked: tools/get_project id=%s", project_id)
     try:
         return await _api_get(f"/projects/{project_id}")
+    except httpx.HTTPStatusError as e:
+        return {"error": str(e), "status": e.response.status_code}
+
+
+@mcp.tool()
+async def create_project(
+    name: str,
+    description: str | None = None,
+    color: str = "#3b82f6",
+    icon: str = "layers",
+    context_prompt: str | None = None,
+    agent_bot_id: str | None = None,
+    bot_id: str | None = None,
+) -> dict:
+    """Create a new agent project.
+
+    Projects group related tasks and carry a context prompt that agents
+    read before working on tasks in the project.
+
+    Args:
+        name: Project name (required).
+        description: Short description of the project's purpose.
+        color: Hex color for the project badge (default "#3b82f6").
+        icon: Lucide icon name for the project (default "layers").
+        context_prompt: Instructions and conventions for agents working
+                        on tasks in this project. Agents load this
+                        automatically via get_task_context.
+        agent_bot_id: Default bot assigned to new tasks in this project.
+        bot_id: Your bot ID for activity attribution.
+
+    Returns:
+        Created project object with id, name, description, color,
+        icon, contextPrompt, and agentBotId.
+    """
+    logger.debug("MCP tool invoked: tools/create_project name=%s", name)
+    body: dict[str, Any] = {
+        "name": name,
+        "color": color,
+        "icon": icon,
+    }
+    if description is not None:
+        body["description"] = description
+    if context_prompt is not None:
+        body["contextPrompt"] = context_prompt
+    if agent_bot_id is not None:
+        body["agentBotId"] = agent_bot_id
+
+    try:
+        return await _api_post("/projects", json=body, headers=_headers(bot_id))
+    except httpx.HTTPStatusError as e:
+        return {"error": str(e), "status": e.response.status_code}
+
+
+@mcp.tool()
+async def update_project(
+    project_id: str,
+    name: str | None = None,
+    description: str | None = None,
+    color: str | None = None,
+    icon: str | None = None,
+    context_prompt: str | None = None,
+    agent_bot_id: str | None = None,
+    bot_id: str | None = None,
+) -> dict:
+    """Update an existing project. Only provided fields are changed.
+
+    Args:
+        project_id: Project UUID (required).
+        name: Updated project name.
+        description: Updated description.
+        color: Updated hex color (e.g. "#ef4444").
+        icon: Updated Lucide icon name (e.g. "folder", "code").
+        context_prompt: Updated instructions for agents working on
+                        tasks in this project.
+        agent_bot_id: Updated default bot for new tasks.
+        bot_id: Your bot ID for activity attribution.
+
+    Returns:
+        Updated project object, or error dict.
+    """
+    logger.debug("MCP tool invoked: tools/update_project id=%s", project_id)
+    body: dict[str, Any] = {}
+    if name is not None:
+        body["name"] = name
+    if description is not None:
+        body["description"] = description
+    if color is not None:
+        body["color"] = color
+    if icon is not None:
+        body["icon"] = icon
+    if context_prompt is not None:
+        body["contextPrompt"] = context_prompt
+    if agent_bot_id is not None:
+        body["agentBotId"] = agent_bot_id
+
+    if not body:
+        return {"error": "No fields to update"}
+
+    try:
+        return await _api_patch(
+            f"/projects/{project_id}",
+            json=body,
+            headers=_headers(bot_id),
+        )
+    except httpx.HTTPStatusError as e:
+        return {"error": str(e), "status": e.response.status_code}
+
+
+@mcp.tool()
+async def delete_project(
+    project_id: str,
+    bot_id: str | None = None,
+) -> dict:
+    """Delete an agent project.
+
+    WARNING: This permanently deletes the project. Tasks in the project
+    are NOT deleted — they become unassigned.
+
+    Args:
+        project_id: Project UUID (required).
+        bot_id: Your bot ID for activity attribution.
+
+    Returns:
+        Confirmation dict {"ok": true}, or error dict.
+    """
+    logger.debug("MCP tool invoked: tools/delete_project id=%s", project_id)
+    try:
+        return await _api_delete(
+            f"/projects/{project_id}",
+            headers=_headers(bot_id),
+        )
     except httpx.HTTPStatusError as e:
         return {"error": str(e), "status": e.response.status_code}
 
