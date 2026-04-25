@@ -2,7 +2,7 @@
 
 This client provides a unified interface for memory operations that can work in two modes:
 1. Embedded mode (default): Direct calls to storage layer (in-process, no IPC overhead)
-2. Server mode: JSON-RPC calls to a running MCP memory server
+2. Server mode: JSON-RPC calls to a running llm-bawt MCP server
 
 The embedded mode is preferred for single-process usage as it avoids IPC overhead
 while maintaining the same API surface.
@@ -18,7 +18,7 @@ from typing import Any, TYPE_CHECKING
 from llm_bawt.utils.config import Config
 
 if TYPE_CHECKING:
-    from llm_bawt.memory_server.storage import MemoryStorage
+    from llm_bawt.mcp_server.storage import MemoryStorage
 
 logger = logging.getLogger(__name__)
 
@@ -140,7 +140,7 @@ class MemoryClient:
             self._initialized = True
         else:
             # Embedded mode - direct storage access
-            from llm_bawt.memory_server.storage import get_storage
+            from llm_bawt.mcp_server.storage import get_storage
             self._storage = get_storage()
             logger.debug("Memory client using embedded mode")
             self._initialized = True
@@ -187,7 +187,7 @@ class MemoryClient:
         self._ensure_initialized()
         
         if self.server_url:
-            result = self._call_server("store_memory", {
+            result = self._call_server("memory_store", {
                 "content": content,
                 "bot_id": self.bot_id,
                 "tags": tags or ["misc"],
@@ -231,7 +231,7 @@ class MemoryClient:
         min_relevance = min_relevance or self.config.MEMORY_MIN_RELEVANCE
         
         if self.server_url:
-            results = self._call_server("search_memories", {
+            results = self._call_server("memory_search", {
                 "query": query,
                 "bot_id": self.bot_id,
                 "n_results": n_results,
@@ -270,7 +270,7 @@ class MemoryClient:
         self._ensure_initialized()
         
         if self.server_url:
-            return self._call_server("get_recent_context", {
+            return self._call_server("context_get_recent", {
                 "bot_id": self.bot_id,
                 "n_messages": n_messages,
                 "n_memories": n_memories,
@@ -313,7 +313,7 @@ class MemoryClient:
     def stats(self) -> dict[str, Any]:
         self._ensure_initialized()
         if self.server_url:
-            return self._call_server("stats", {"bot_id": self.bot_id})
+            return self._call_server("system_stats", {"bot_id": self.bot_id})
         storage = self._get_storage()
         backend = storage.get_backend(self.bot_id)
         return backend.stats()
@@ -332,7 +332,7 @@ class MemoryClient:
     def preview_recent_messages(self, count: int = 10) -> list[dict[str, Any]]:
         self._ensure_initialized()
         if self.server_url:
-            return self._call_server("preview_recent_messages", {"bot_id": self.bot_id, "count": count})
+            return self._call_server("messages_preview_recent", {"bot_id": self.bot_id, "count": count})
         storage = self._get_storage()
         backend = storage.get_backend(self.bot_id)
         return backend.preview_recent_messages(count)
@@ -351,7 +351,7 @@ class MemoryClient:
     def preview_ignored_messages(self) -> list[dict[str, Any]]:
         self._ensure_initialized()
         if self.server_url:
-            return self._call_server("preview_ignored_messages", {"bot_id": self.bot_id})
+            return self._call_server("messages_preview_ignored", {"bot_id": self.bot_id})
         storage = self._get_storage()
         backend = storage.get_backend(self.bot_id)
         return backend.preview_ignored_messages()
@@ -382,7 +382,7 @@ class MemoryClient:
     def ignore_recent_messages(self, count: int) -> int:
         self._ensure_initialized()
         if self.server_url:
-            return int(self._call_server("ignore_recent_messages", {"bot_id": self.bot_id, "count": count}))
+            return int(self._call_server("messages_ignore_recent", {"bot_id": self.bot_id, "count": count}))
         storage = self._get_storage()
         backend = storage.get_backend(self.bot_id)
         return int(backend.ignore_recent_messages(count))
@@ -391,7 +391,7 @@ class MemoryClient:
         self._ensure_initialized()
         if self.server_url:
             return int(
-                self._call_server("ignore_messages_since_minutes", {"bot_id": self.bot_id, "minutes": minutes})
+                self._call_server("messages_ignore_since_minutes", {"bot_id": self.bot_id, "minutes": minutes})
             )
         storage = self._get_storage()
         backend = storage.get_backend(self.bot_id)
@@ -401,7 +401,7 @@ class MemoryClient:
         """Get a specific message by ID (supports prefix match)."""
         self._ensure_initialized()
         if self.server_url:
-            result = self._call_server("get_message_by_id", {"bot_id": self.bot_id, "message_id": message_id})
+            result = self._call_server("messages_get_by_id", {"bot_id": self.bot_id, "message_id": message_id})
             return result if result else None
         storage = self._get_storage()
         backend = storage.get_backend(self.bot_id)
@@ -412,7 +412,7 @@ class MemoryClient:
         self._ensure_initialized()
         if self.server_url:
             return bool(
-                self._call_server("ignore_message_by_id", {"bot_id": self.bot_id, "message_id": message_id})
+                self._call_server("messages_ignore_by_id", {"bot_id": self.bot_id, "message_id": message_id})
             )
         storage = self._get_storage()
         backend = storage.get_backend(self.bot_id)
@@ -421,7 +421,7 @@ class MemoryClient:
     def restore_ignored_messages(self) -> int:
         self._ensure_initialized()
         if self.server_url:
-            return int(self._call_server("restore_ignored_messages", {"bot_id": self.bot_id}))
+            return int(self._call_server("messages_restore_ignored", {"bot_id": self.bot_id}))
         storage = self._get_storage()
         backend = storage.get_backend(self.bot_id)
         return int(backend.restore_ignored_messages())
@@ -431,7 +431,7 @@ class MemoryClient:
         if self.server_url:
             return int(
                 self._call_server(
-                    "delete_memories_by_source_message_ids",
+                    "memory_delete_by_source_messages",
                     {"bot_id": self.bot_id, "message_ids": message_ids},
                 )
             )
@@ -443,7 +443,7 @@ class MemoryClient:
         self._ensure_initialized()
         if self.server_url:
             return self._call_server(
-                "regenerate_embeddings",
+                "memory_regenerate_embeddings",
                 {"bot_id": self.bot_id, "batch_size": batch_size},
             )
         storage = self._get_storage()
@@ -454,7 +454,7 @@ class MemoryClient:
         self._ensure_initialized()
         if self.server_url:
             return self._call_server(
-                "consolidate_memories",
+                "memory_consolidate",
                 {"bot_id": self.bot_id, "dry_run": dry_run, "similarity_threshold": similarity_threshold},
             )
         storage = self._get_storage()
@@ -493,7 +493,7 @@ class MemoryClient:
         if self.server_url:
             return bool(
                 self._call_server(
-                    "update_memory_meaning",
+                    "memory_update_meaning",
                     {
                         "bot_id": self.bot_id,
                         "memory_id": memory_id,
@@ -531,7 +531,7 @@ class MemoryClient:
         self._ensure_initialized()
         if self.server_url:
             return self._call_server(
-                "run_maintenance",
+                "system_run_maintenance",
                 {
                     "bot_id": self.bot_id,
                     "run_consolidation": run_consolidation,
@@ -578,7 +578,7 @@ class MemoryClient:
         self._ensure_initialized()
         if self.server_url:
             result = self._call_server(
-                "get_messages",
+                "messages_get",
                 {"bot_id": self.bot_id, "since_seconds": since_seconds, "limit": limit},
             )
             # Apply timestamp filtering (server doesn't support since/until yet)
@@ -614,14 +614,14 @@ class MemoryClient:
     def clear_messages(self) -> int:
         self._ensure_initialized()
         if self.server_url:
-            return int(self._call_server("clear_messages", {"bot_id": self.bot_id}))
+            return int(self._call_server("messages_clear", {"bot_id": self.bot_id}))
         storage = self._get_storage()
         return int(_run_async(storage.clear_messages(bot_id=self.bot_id)))
 
     def remove_last_message_if_partial(self, role: str) -> bool:
         self._ensure_initialized()
         if self.server_url:
-            return bool(self._call_server("remove_last_message_if_partial", {"bot_id": self.bot_id, "role": role}))
+            return bool(self._call_server("messages_remove_last_partial", {"bot_id": self.bot_id, "role": role}))
         storage = self._get_storage()
         return bool(_run_async(storage.remove_last_message_if_partial(bot_id=self.bot_id, role=role)))
 
@@ -677,7 +677,7 @@ class MemoryClient:
         self._ensure_initialized()
         
         if self.server_url:
-            result = self._call_server("update_memory", {
+            result = self._call_server("memory_update", {
                 "memory_id": memory_id,
                 "bot_id": self.bot_id,
                 "content": content,
@@ -711,7 +711,7 @@ class MemoryClient:
         self._ensure_initialized()
         
         if self.server_url:
-            return self._call_server("delete_memory", {
+            return self._call_server("memory_delete", {
                 "memory_id": memory_id,
                 "bot_id": self.bot_id,
             })
@@ -752,7 +752,7 @@ class MemoryClient:
         self._ensure_initialized()
         
         if self.server_url:
-            result = self._call_server("add_message", {
+            result = self._call_server("messages_add", {
                 "role": role,
                 "content": content,
                 "bot_id": self.bot_id,
@@ -853,7 +853,7 @@ class MemoryClient:
         if self.server_url:
             if not self.user_id:
                 raise ValueError("user_id is required for extract_facts")
-            results = self._call_server("extract_facts", {
+            results = self._call_server("facts_extract", {
                 "messages": messages,
                 "bot_id": self.bot_id,
                 "user_id": self.user_id,
@@ -863,7 +863,7 @@ class MemoryClient:
             return [MemoryResult.from_dict(r) for r in results]
         
         # Embedded mode - call extraction directly
-        from llm_bawt.memory_server.extraction import extract_facts_from_messages
+        from llm_bawt.mcp_server.extraction import extract_facts_from_messages
         
         if not self.user_id:
             raise ValueError("user_id is required for extract_facts")
@@ -907,7 +907,7 @@ class MemoryClient:
         self._ensure_initialized()
 
         if self.server_url:
-            return self._call_server("list_memory_sources", {})
+            return self._call_server("memory_list_sources", {})
 
         storage = self._get_storage()
         return _run_async(storage.list_memory_sources())
@@ -935,7 +935,7 @@ class MemoryClient:
         self._ensure_initialized()
 
         if self.server_url:
-            results = self._call_server("search_memory_source", {
+            results = self._call_server("memory_search_source", {
                 "source": source,
                 "query": query,
                 "n_results": n_results,
@@ -973,7 +973,7 @@ class MemoryClient:
         self._ensure_initialized()
 
         if self.server_url:
-            return self._call_server("search_all_messages", {
+            return self._call_server("messages_search_all", {
                 "query": query,
                 "n_results": n_results,
                 "role_filter": role_filter,
@@ -999,7 +999,7 @@ class MemoryClient:
         self._ensure_initialized()
 
         if self.server_url:
-            return self._call_server("search_all_memories", {
+            return self._call_server("memory_search_all", {
                 "query": query,
                 "n_results": n_results,
                 "min_relevance": min_relevance,

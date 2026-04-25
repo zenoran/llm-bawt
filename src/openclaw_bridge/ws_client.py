@@ -207,6 +207,16 @@ class OpenClawWsClient:
         self._run_queues: dict[str, asyncio.Queue[dict | None]] = {}
         # Per-session cancel events — set by chat.abort to unblock send_and_stream
         self._session_cancel_events: dict[str, asyncio.Event] = {}
+        # Set whenever the WS is connected; cleared on disconnect.  Used by
+        # _request() to briefly wait through transient gateway restarts
+        # (close code 1012) instead of failing the user's request instantly.
+        self._connected_event: asyncio.Event = asyncio.Event()
+        # How long _request() will wait for the WS to (re)connect before
+        # raising "OpenClaw WS not connected".  The gateway typically comes
+        # back within ~5–15s after a service-restart close.
+        self._connect_wait_timeout: float = float(
+            os.environ.get("OPENCLAW_BRIDGE_CONNECT_WAIT_S", "20")
+        )
         # Device identity (loaded lazily on first connect)
         self._identity: dict | None = None
         self._identity_path: str = config.device_identity_path or ""
@@ -355,6 +365,7 @@ class OpenClawWsClient:
                 logger.info("Device token received from gateway (auto-paired)")
 
             self._connected = True
+            self._connected_event.set()
             logger.info("OpenClaw WS connected to %s (caps=%s)", self._config.url, ",".join(caps))
             from .metrics import get_metrics
             get_metrics().incr("openclaw.ws_connects")
@@ -367,10 +378,12 @@ class OpenClawWsClient:
 
         except _PairingPendingError:
             self._connected = False
+            self._connected_event.clear()
             # Re-raise so callers (reconnect loop) can use shorter retry interval
             raise
         except Exception as e:
             self._connected = False
+            self._connected_event.clear()
             logger.warning("OpenClaw WS connect failed: %s", e)
             from .metrics import get_metrics
             get_metrics().incr("openclaw.ws_connect_failures")
@@ -423,6 +436,7 @@ class OpenClawWsClient:
                 get_metrics().incr("openclaw.ws_disconnects", reason="error")
         finally:
             self._connected = False
+            self._connected_event.clear()
             if not self._closing:
                 self._schedule_reconnect()
 
@@ -509,9 +523,25 @@ class OpenClawWsClient:
             except Exception:
                 pass
         self._connected = False
+        self._connected_event.clear()
         logger.info("OpenClaw WS disconnected")
 
     async def _request(self, method: str, params: dict) -> dict:
+        # If the WS is currently down (e.g. gateway service-restart 1012),
+        # wait briefly for the reconnect loop to bring it back instead of
+        # failing the caller instantly.  This smooths over routine gateway
+        # restarts that take ~5–15s to recover.
+        if (not self._ws or not self._connected) and not self._closing:
+            wait_s = max(0.0, self._connect_wait_timeout)
+            if wait_s > 0:
+                logger.info(
+                    "OpenClaw WS not connected; waiting up to %.1fs for reconnect (method=%s)",
+                    wait_s, method,
+                )
+                try:
+                    await asyncio.wait_for(self._connected_event.wait(), timeout=wait_s)
+                except asyncio.TimeoutError:
+                    pass
         if not self._ws or not self._connected:
             raise RuntimeError("OpenClaw WS not connected")
 

@@ -17,7 +17,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
 from llm_bawt.utils.config import Config
 from llm_bawt.profiles import ProfileManager, EntityType
-from llm_bawt.memory_server.extraction import ALLOWED_PROFILE_KEYS
+from llm_bawt.mcp_server.extraction import ALLOWED_PROFILE_KEYS
 
 logging.basicConfig(level=logging.INFO, format="%(message)s")
 logger = logging.getLogger(__name__)

@@ -9,7 +9,7 @@ The inter-bot communication system provides two MCP tools:
 1. **`send_message_to_bot`** - Send a message to another bot and get their response
 2. **`list_available_bots`** - Discover what bots are available for communication
 
-These tools are exposed via the MCP memory server (port 8001) and can be used by any bot that has access to MCP tools.
+These tools are exposed via the llm-bawt MCP server (port 8001) and can be used by any bot that has access to MCP tools.
 
 ## How It Works
 
@@ -240,7 +240,7 @@ if not response["success"]:
 
 No additional configuration required. Inter-bot communication is enabled automatically when:
 
-1. MCP memory server is running (port 8001)
+1. llm-bawt MCP server is running (port 8001)
 2. Multiple bots are configured
 3. Bots have access to MCP tools
 

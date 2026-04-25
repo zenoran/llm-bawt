@@ -21,7 +21,7 @@ from rich.console import Console
 from ..bots import Bot, BotManager
 from ..clients import LLMClient
 from ..runtime_settings import RuntimeSettingsResolver
-from ..memory_server.client import MemoryClient
+from ..mcp_server.client import MemoryClient
 from ..integrations.ha_mcp.client import HomeAssistantMCPClient, HomeAssistantNativeClient
 from ..integrations.newsapi.client import NewsAPIClient
 from ..search import get_search_client, SearchClient

@@ -150,11 +150,11 @@ class Config(RuntimeTunables, BaseSettings):
         description="User profile to use. Set via LLM_BAWT_DEFAULT_USER env var.",
     )
 
-    # Optional MCP memory server (HTTP JSON-RPC). If set, memory operations use server mode
-    # and you will see tool calls like `tools/search_memories` in logs.
-    MEMORY_SERVER_URL: Optional[str] = Field(
+    # Optional llm-bawt MCP server (HTTP JSON-RPC). If set, memory/messages/tasks
+    # operations route through MCP tool calls instead of direct DB access.
+    MCP_SERVER_URL: Optional[str] = Field(
         default=None,
-        description="Optional MCP memory server base URL (Set via LLM_BAWT_MEMORY_SERVER_URL)",
+        description="Optional llm-bawt MCP server base URL (Set via LLM_BAWT_MCP_SERVER_URL)",
     )
     HA_MCP_ENABLED: bool = Field(
         default=False,

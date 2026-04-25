@@ -127,15 +127,41 @@ def main() -> None:
     for sig in (signal.SIGINT, signal.SIGTERM):
         loop.add_signal_handler(sig, _shutdown, sig)
 
+    async def _refresh_session_map() -> None:
+        """Periodically reload session→bot mapping from the app API.
+
+        This covers the case where the bridge starts before the app is up
+        (fetch_session_to_bot() returns {} at startup).  Once the app is
+        reachable the correct mapping is loaded and commands are routed
+        to the right bot_id.
+        """
+        _log = logging.getLogger("openclaw_bridge.config")
+        try:
+            while True:
+                await asyncio.sleep(30)
+                try:
+                    updated = config.fetch_session_to_bot(retries=1, delay=0)
+                    if updated:
+                        bridge.update_session_map(updated)
+                except Exception as exc:
+                    _log.debug("Session map refresh failed: %s", exc)
+        except asyncio.CancelledError:
+            pass
+
     async def _run() -> None:
         # Start health check server
         health_task = asyncio.create_task(
             _health_server(bridge, publisher, config.health_port)
         )
+        refresh_task = asyncio.create_task(_refresh_session_map())
         try:
             await bridge.run_forever()
         finally:
             health_task.cancel()
+            refresh_task.cancel()
+            # Await cancellations so the tasks finish cleanly before the event
+            # loop is stopped (avoids "Task was destroyed but it is pending").
+            await asyncio.gather(health_task, refresh_task, return_exceptions=True)
 
     try:
         loop.run_until_complete(_run())

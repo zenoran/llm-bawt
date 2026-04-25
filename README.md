@@ -62,7 +62,7 @@ Tables are created automatically on first run via SQLAlchemy migrations.
 
 ### Option A: Docker (Recommended for Full System)
 
-This runs llm-bawt as a background service with the MCP memory server, Redis, web scraping, and GPU inference — all containerized.
+This runs llm-bawt as a background service with the llm-bawt MCP server, Redis, web scraping, and GPU inference — all containerized.
 
 ```bash
 git clone https://github.com/zenoran/llm-bawt.git
@@ -83,7 +83,7 @@ The Docker build is a multi-stage CUDA-enabled image (~12 GB) that compiles llam
 
 | Container | Port | Purpose |
 |-----------|------|---------|
-| `llm-bawt-app` | 8001, 8642 | MCP memory server + OpenAI-compatible LLM API |
+| `llm-bawt-app` | 8001, 8642 | llm-bawt MCP server + OpenAI-compatible LLM API |
 | `llm-bawt-redis` | 6379 | Event transport (for agent bridges) |
 | `llm-bawt-crawl4ai` | 11235 | Web page extraction for the `web_fetch` tool |
 | `llm-bawt-openclaw-bridge` | — | WebSocket bridge for OpenClaw agent backend (optional) |
@@ -165,7 +165,7 @@ LLM_BAWT_DEFAULT_MODEL_ALIAS=grok-4-fast # Default model to use
 LLM_BAWT_USE_SERVICE=true                 # CLI delegates to running service
 LLM_BAWT_SERVICE_HOST=0.0.0.0             # Service bind address
 LLM_BAWT_SERVICE_PORT=8642                # LLM API port
-LLM_BAWT_MEMORY_SERVER_URL=http://127.0.0.1:8001  # MCP memory server
+LLM_BAWT_MCP_SERVER_URL=http://127.0.0.1:8001  # llm-bawt MCP server
 
 # --- Memory ---
 LLM_BAWT_MEMORY_DECAY_ENABLED=true
@@ -294,7 +294,7 @@ unmute connects to llm-bawt via `UNMUTE_LLM_URL=http://host.docker.internal:8642
 │  llm-bawt Service Stack (Docker)                                        │
 │                                                                         │
 │  ┌──────────────────────┐  ┌──────────────────────────────────────────┐ │
-│  │ MCP Memory Server    │  │  LLM Service (FastAPI, port 8642)        │ │
+│  │ llm-bawt MCP Server    │  │  LLM Service (FastAPI, port 8642)        │ │
 │  │ (port 8001)          │←→│  OpenAI-compatible API                   │ │
 │  │ Memory read/write    │  │  Streaming SSE, tool calling             │ │
 │  │ Fact extraction      │  │  Bot management, job scheduler           │ │
@@ -395,7 +395,7 @@ src/llm_bawt/
 │   ├── extraction/      # LLM-based fact extraction from conversations
 │   ├── consolidation.py # Duplicate memory merging
 │   └── summarization.py # Session summarization
-├── memory_server/       # MCP memory server (port 8001)
+├── mcp_server/          # llm-bawt MCP server (port 8001)
 ├── service/             # FastAPI service (port 8642)
 │   ├── routes/          # API endpoint implementations
 │   ├── scheduler.py     # Background job scheduler
@@ -427,7 +427,7 @@ make docker-exec CMD="llm --status"   # Run a command inside the container
 |---------|-------------|
 | `llm` | Main CLI — query LLMs, interactive mode, bot/model management |
 | `llm-service` | Start the FastAPI LLM service (port 8642) |
-| `llm-mcp-server` | Start the MCP memory server (port 8001) |
+| `llm-mcp-server` | Start the llm-bawt MCP server (port 8001) |
 | `llm-memory` | Memory debugging utilities |
 | `llm-nextcloud` | Nextcloud Talk bot provisioning |
 | `openclaw-bridge` | OpenClaw WebSocket agent bridge |

@@ -48,41 +48,41 @@ def _is_tcp_listening(host: str, port: int) -> bool:
         return False
 
 
-_memory_mcp_thread: threading.Thread | None = None
+_mcp_thread: threading.Thread | None = None
 
 
-def _ensure_memory_mcp_server(config: Config) -> None:
-    """Ensure an MCP memory server is running and configure the service to use it.
+def _ensure_mcp_server(config: Config) -> None:
+    """Ensure the llm-bawt MCP server is running and configure the service to use it.
 
-    This makes memory retrieval happen via MCP tool calls (e.g. tools/search_memories),
+    This makes memory retrieval happen via MCP tool calls (e.g. tools/memory_search),
     which can be logged distinctly from embedded DB access.
     """
-    global _memory_mcp_thread
+    global _mcp_thread
 
-    # Default to local MCP memory server for llm-service if not configured.
-    if not getattr(config, "MEMORY_SERVER_URL", None):
-        config.MEMORY_SERVER_URL = "http://127.0.0.1:8001"
+    # Default to local llm-bawt MCP server for llm-service if not configured.
+    if not config.MCP_SERVER_URL:
+        config.MCP_SERVER_URL = "http://127.0.0.1:8001"
 
-    parsed = urlparse(config.MEMORY_SERVER_URL)
+    parsed = urlparse(config.MCP_SERVER_URL)
     host = parsed.hostname or "127.0.0.1"
     port = parsed.port or 8001
 
-    # If something is already listening, assume it's the memory MCP server.
+    # If something is already listening, assume it's the llm-bawt MCP server.
     if _is_tcp_listening(host, port):
-        log.info("Memory MCP server already listening at %s", config.MEMORY_SERVER_URL)
+        log.info("llm-bawt MCP server already listening at %s", config.MCP_SERVER_URL)
         return
 
-    # Start the MCP memory server in-process (HTTP transport) on a daemon thread.
+    # Start the MCP server in-process (HTTP transport) on a daemon thread.
     def _run():
         try:
-            from ..memory_server.server import run_server
+            from ..mcp_server.server import run_server
             run_server(transport="streamable-http", host=host, port=port)
         except Exception as e:
-            log.error("Failed to start MCP memory server: %s", e)
+            log.error("Failed to start llm-bawt MCP server: %s", e)
 
-    _memory_mcp_thread = threading.Thread(target=_run, daemon=True, name="memory-mcp")
-    _memory_mcp_thread.start()
-    log.info("Started MCP memory server at %s", config.MEMORY_SERVER_URL)
+    _mcp_thread = threading.Thread(target=_run, daemon=True, name="llm-bawt-mcp")
+    _mcp_thread.start()
+    log.info("Started llm-bawt MCP server at %s", config.MCP_SERVER_URL)
 
 
 class BackgroundService(

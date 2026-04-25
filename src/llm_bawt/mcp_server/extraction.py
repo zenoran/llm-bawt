@@ -1,4 +1,4 @@
-"""Extraction service wrapper for MCP memory server.
+"""Extraction service wrapper for llm-bawt MCP server.
 
 Wraps the existing MemoryExtractionService for use with MCP tools.
 Handles LLM client initialization and async interface.

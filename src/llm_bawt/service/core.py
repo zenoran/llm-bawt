@@ -97,12 +97,12 @@ class ServiceLLMBawt(BaseLLMBawt):
             db_backend = self.memory.get_short_term_manager()
         elif has_database_credentials(self.config):
             try:
-                from ..memory_server.client import get_memory_client
+                from ..mcp_server.client import get_memory_client
                 _history_client = get_memory_client(
                     config=self.config,
                     bot_id=self.bot_id,
                     user_id=self.user_id,
-                    server_url=getattr(self.config, "MEMORY_SERVER_URL", None),
+                    server_url=self.config.MCP_SERVER_URL,
                 )
                 db_backend = _history_client.get_short_term_manager()
                 self._db_available = True
@@ -136,14 +136,14 @@ class ServiceLLMBawt(BaseLLMBawt):
             return
 
         try:
-            from ..memory_server.client import get_memory_client
+            from ..mcp_server.client import get_memory_client
             from ..profiles import ProfileManager
 
             self.memory = get_memory_client(
                 config=config,
                 bot_id=self.bot_id,
                 user_id=self.user_id,
-                server_url=getattr(config, "MEMORY_SERVER_URL", None),
+                server_url=config.MCP_SERVER_URL,
             )
             self._db_available = True
             logger.debug(f"Memory client initialized for bot: {self.bot_id}")

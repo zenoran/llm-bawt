@@ -22,7 +22,7 @@ if TYPE_CHECKING:
     from ..integrations.ha_mcp.client import HomeAssistantMCPClient, HomeAssistantNativeClient
     from ..integrations.newsapi.client import NewsAPIClient
     from ..integrations.web_fetch.client import WebFetchClient
-    from ..memory_server.client import MemoryClient
+    from ..mcp_server.client import MemoryClient
     from ..profiles import ProfileManager
     from ..search.base import SearchClient
     from ..core.model_lifecycle import ModelLifecycleManager

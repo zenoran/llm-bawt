@@ -1,4 +1,4 @@
-"""Storage wrapper for MCP memory server.
+"""Storage wrapper for llm-bawt MCP server.
 
 Thin async wrapper around the existing PostgreSQLMemoryBackend that:
 1. Provides async-compatible interface for FastMCP tools

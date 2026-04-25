@@ -467,7 +467,7 @@ class ServiceStatusResponse(BaseModel):
     memories_count: int = 0
     pgvector_available: bool = False
     embeddings_available: bool = False
-    # MCP memory server
+    # llm-bawt MCP server
     mcp_mode: str = "embedded"
     mcp_status: str = "up"
     mcp_url: str | None = None
@@ -532,7 +532,7 @@ class DependencyInfoSchema(BaseModel):
 
 
 class McpInfoSchema(BaseModel):
-    """MCP memory server status."""
+    """llm-bawt MCP server status."""
     mode: str = "embedded"
     status: str = "up"
     url: str | None = None

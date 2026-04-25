@@ -589,7 +589,9 @@ class SessionBridge:
 
     def _resolve_bot_id(self, session_key: str) -> str | None:
         if not self._session_to_bot:
-            return None
+            # No mapping loaded (e.g. app was down at startup) — treat all
+            # sessions as owned so commands are never silently discarded.
+            return session_key
         # Direct match first
         bot_id = self._session_to_bot.get(session_key)
         if bot_id:
@@ -600,6 +602,16 @@ class SessionBridge:
             parent_key = f"agent:{parts[1]}:main"
             return self._session_to_bot.get(parent_key)
         return None
+
+    def update_session_map(self, session_to_bot: dict[str, str]) -> None:
+        """Refresh the session→bot mapping (called by background reload task)."""
+        if session_to_bot != self._session_to_bot:
+            logger.info(
+                "Session map updated: %s → %s",
+                list(self._session_to_bot.keys()),
+                list(session_to_bot.keys()),
+            )
+            self._session_to_bot = session_to_bot
 
     @property
     def connected(self) -> bool:

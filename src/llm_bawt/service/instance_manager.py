@@ -222,12 +222,12 @@ class InstanceManagerMixin:
 
         if cache_key not in self._memory_clients:
             try:
-                from ..memory_server.client import get_memory_client
+                from ..mcp_server.client import get_memory_client
                 self._memory_clients[cache_key] = get_memory_client(
                     config=self.config,
                     bot_id=bot_id,
                     user_id=user_id,
-                    server_url=getattr(self.config, "MEMORY_SERVER_URL", None),
+                    server_url=self.config.MCP_SERVER_URL,
                 )
                 log.memory_operation("client_init", bot_id, details="MemoryClient created")
             except Exception as e:

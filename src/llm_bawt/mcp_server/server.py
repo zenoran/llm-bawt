@@ -1,15 +1,28 @@
-"""FastMCP server exposing memory tools.
+"""FastMCP server exposing the llm-bawt MCP toolset.
+
+This server exposes grouped tools for memory, messages, conversation
+context, fact extraction, inter-bot messaging, system maintenance, and
+the agent task system (tasks/steps/projects/activity).
+
+Tools are namespaced by prefix:
+    memory_*    — bot memory CRUD + search + maintenance
+    messages_*  — conversation history CRUD + search + ignore/restore
+    context_*   — combined recent message + memory context
+    facts_*     — LLM-based fact extraction
+    system_*    — service-wide stats and maintenance
+    bots_*      — inter-bot messaging
+    tasks_*, steps_*, projects_*, activity_*  — agent task system
 
 Run standalone:
-    uv run python -m llm_bawt.memory_server
+    uv run python -m llm_bawt.mcp_server
 Or via entry point (after install):
     llm-memory
 """
 
 from __future__ import annotations
 
-import os
 import logging
+import os
 from typing import TYPE_CHECKING
 
 # Suppress noisy MCP library session lifecycle logging
@@ -41,7 +54,7 @@ _allowed_hosts = [
 _allowed_origins = [f"http://{h}" for h in _allowed_hosts]
 
 mcp = FastMCP(
-    "llm-memory",
+    "llm-bawt",
     json_response=True,
     stateless_http=True,
     transport_security=TransportSecuritySettings(
@@ -61,7 +74,7 @@ mcp.settings.log_level = "WARNING"
 # ---------------------------------------------------------------------------
 
 def _get_storage():
-    from llm_bawt.memory_server.storage import get_storage
+    from llm_bawt.mcp_server.storage import get_storage
     return get_storage()
 
 
@@ -70,7 +83,7 @@ def _get_storage():
 # ---------------------------------------------------------------------------
 
 
-@mcp.tool()
+@mcp.tool(name="memory_store")
 async def store_memory(
     content: str,
     tags: list[str] | None = None,
@@ -102,7 +115,7 @@ async def store_memory(
     return memory.to_dict()
 
 
-@mcp.tool()
+@mcp.tool(name="memory_search")
 async def search_memories(
     query: str,
     bot_id: str = "default",
@@ -134,7 +147,7 @@ async def search_memories(
     return [m.to_dict() for m in memories]
 
 
-@mcp.tool()
+@mcp.tool(name="memory_list_sources")
 async def list_memory_sources() -> list[dict]:
     """List available memory sources (bot namespaces that have stored memories).
 
@@ -149,7 +162,7 @@ async def list_memory_sources() -> list[dict]:
     return await storage.list_memory_sources()
 
 
-@mcp.tool()
+@mcp.tool(name="memory_search_source")
 async def search_memory_source(
     source: str,
     query: str,
@@ -191,7 +204,7 @@ async def search_memory_source(
     return results
 
 
-@mcp.tool()
+@mcp.tool(name="messages_search_all")
 async def search_all_messages(
     query: str,
     n_results: int = 10,
@@ -222,7 +235,7 @@ async def search_all_messages(
     )
 
 
-@mcp.tool()
+@mcp.tool(name="memory_search_all")
 async def search_all_memories(
     query: str,
     n_results: int = 10,
@@ -250,7 +263,7 @@ async def search_all_memories(
     )
 
 
-@mcp.tool()
+@mcp.tool(name="context_get_recent")
 async def get_recent_context(
     bot_id: str = "default",
     n_messages: int = 10,
@@ -293,7 +306,7 @@ async def get_recent_context(
     return {"messages": [m.to_dict() for m in messages], "memories": memories}
 
 
-@mcp.tool()
+@mcp.tool(name="messages_add")
 async def add_message(
     role: str,
     content: str,
@@ -327,7 +340,7 @@ async def add_message(
     return message.to_dict()
 
 
-@mcp.tool()
+@mcp.tool(name="facts_extract")
 async def extract_facts(
     messages: list[dict],
     bot_id: str,  # Required - must be passed explicitly
@@ -351,7 +364,7 @@ async def extract_facts(
         raise ValueError("bot_id is required for extract_facts")
     if not user_id:
         raise ValueError("user_id is required for extract_facts")
-    from llm_bawt.memory_server.extraction import extract_facts_from_messages
+    from llm_bawt.mcp_server.extraction import extract_facts_from_messages
     
     facts = await extract_facts_from_messages(
         messages=messages,
@@ -382,7 +395,7 @@ async def extract_facts(
     return facts
 
 
-@mcp.tool()
+@mcp.tool(name="memory_update")
 async def update_memory(
     memory_id: str,
     bot_id: str = "default",
@@ -414,7 +427,7 @@ async def update_memory(
     return memory.to_dict() if memory else None
 
 
-@mcp.tool()
+@mcp.tool(name="memory_delete")
 async def delete_memory(
     memory_id: str,
     bot_id: str = "default",
@@ -437,7 +450,7 @@ async def delete_memory(
     return result
 
 
-@mcp.tool()
+@mcp.tool(name="memory_supersede")
 async def supersede_memory(
     old_memory_id: str,
     new_memory_id: str,
@@ -451,7 +464,7 @@ async def supersede_memory(
     return False
 
 
-@mcp.tool()
+@mcp.tool(name="memory_list_recent")
 async def list_recent(
     bot_id: str = "default",
     n: int = 50,
@@ -461,7 +474,7 @@ async def list_recent(
     return await storage.list_recent_memories(bot_id=bot_id, n=n)
 
 
-@mcp.tool()
+@mcp.tool(name="system_stats")
 async def stats(bot_id: str = "default") -> dict:
     """Get memory/message stats."""
     logger.debug("MCP tool invoked: tools/stats bot_id=%s", bot_id)
@@ -469,7 +482,7 @@ async def stats(bot_id: str = "default") -> dict:
     return await storage.stats(bot_id=bot_id)
 
 
-@mcp.tool()
+@mcp.tool(name="memory_list_high_importance")
 async def list_memories(
     bot_id: str = "default",
     limit: int = 20,
@@ -484,83 +497,83 @@ async def list_memories(
     )
 
 
-@mcp.tool()
+@mcp.tool(name="messages_preview_recent")
 async def preview_recent_messages(bot_id: str = "default", count: int = 10) -> list[dict]:
     storage = _get_storage()
     return await storage.preview_recent_messages(bot_id=bot_id, count=count)
 
 
-@mcp.tool()
+@mcp.tool(name="messages_preview_since_minutes")
 async def preview_messages_since_minutes(bot_id: str = "default", minutes: int = 60) -> list[dict]:
     storage = _get_storage()
     return await storage.preview_messages_since_minutes(bot_id=bot_id, minutes=minutes)
 
 
-@mcp.tool()
+@mcp.tool(name="messages_preview_ignored")
 async def preview_ignored_messages(bot_id: str = "default") -> list[dict]:
     storage = _get_storage()
     return await storage.preview_ignored_messages(bot_id=bot_id)
 
 
-@mcp.tool()
+@mcp.tool(name="messages_ignore_recent")
 async def ignore_recent_messages(bot_id: str = "default", count: int = 10) -> int:
     storage = _get_storage()
     return await storage.ignore_recent_messages(bot_id=bot_id, count=count)
 
 
-@mcp.tool()
+@mcp.tool(name="messages_ignore_since_minutes")
 async def ignore_messages_since_minutes(bot_id: str = "default", minutes: int = 60) -> int:
     storage = _get_storage()
     return await storage.ignore_messages_since_minutes(bot_id=bot_id, minutes=minutes)
 
 
-@mcp.tool()
+@mcp.tool(name="messages_get_by_id")
 async def get_message_by_id(bot_id: str = "default", message_id: str = "") -> dict | None:
     """Get a specific message by ID (supports prefix match)."""
     storage = _get_storage()
     return await storage.get_message_by_id(bot_id=bot_id, message_id=message_id)
 
 
-@mcp.tool()
+@mcp.tool(name="messages_ignore_by_id")
 async def ignore_message_by_id(bot_id: str = "default", message_id: str = "") -> bool:
     """Move a specific message to the forgotten table by ID (soft delete)."""
     storage = _get_storage()
     return await storage.ignore_message_by_id(bot_id=bot_id, message_id=message_id)
 
 
-@mcp.tool()
+@mcp.tool(name="messages_restore_ignored")
 async def restore_ignored_messages(bot_id: str = "default") -> int:
     storage = _get_storage()
     return await storage.restore_ignored_messages(bot_id=bot_id)
 
 
-@mcp.tool()
+@mcp.tool(name="messages_get_for_summary")
 async def get_messages_for_summary(bot_id: str = "default", summary_id: str = "") -> list[dict]:
     """Get raw user/assistant messages referenced by a summary row."""
     storage = _get_storage()
     return await storage.get_messages_for_summary(bot_id=bot_id, summary_id=summary_id)
 
 
-@mcp.tool()
+@mcp.tool(name="messages_mark_recalled")
 async def mark_messages_recalled(bot_id: str = "default", message_ids: list[str] | None = None) -> int:
     """Mark messages as recalled from summary expansion."""
     storage = _get_storage()
     return await storage.mark_messages_recalled(bot_id=bot_id, message_ids=message_ids)
 
 
-@mcp.tool()
+@mcp.tool(name="memory_delete_by_source_messages")
 async def delete_memories_by_source_message_ids(bot_id: str = "default", message_ids: list[str] | None = None) -> int:
     storage = _get_storage()
     return await storage.delete_memories_by_source_message_ids(bot_id=bot_id, message_ids=message_ids)
 
 
-@mcp.tool()
+@mcp.tool(name="memory_regenerate_embeddings")
 async def regenerate_embeddings(bot_id: str = "default", batch_size: int = 50) -> dict:
     storage = _get_storage()
     return await storage.regenerate_embeddings(bot_id=bot_id, batch_size=batch_size)
 
 
-@mcp.tool()
+@mcp.tool(name="memory_consolidate")
 async def consolidate_memories(
     bot_id: str = "default",
     dry_run: bool = True,
@@ -574,7 +587,7 @@ async def consolidate_memories(
     )
 
 
-@mcp.tool()
+@mcp.tool(name="memory_update_meaning")
 async def update_memory_meaning(
     bot_id: str = "default",
     memory_id: str = "",
@@ -597,7 +610,7 @@ async def update_memory_meaning(
     )
 
 
-@mcp.tool()
+@mcp.tool(name="system_run_maintenance")
 async def run_maintenance(
     bot_id: str = "default",
     run_consolidation: bool = True,
@@ -618,7 +631,7 @@ async def run_maintenance(
     )
 
 
-@mcp.tool()
+@mcp.tool(name="messages_get")
 async def get_messages(
     bot_id: str = "default",
     since_seconds: int | None = None,
@@ -630,7 +643,7 @@ async def get_messages(
     return await storage.get_messages(bot_id=bot_id, since_seconds=since_seconds, limit=limit)
 
 
-@mcp.tool()
+@mcp.tool(name="messages_clear")
 async def clear_messages(bot_id: str = "default") -> int:
     """Delete all messages for a bot."""
     logger.debug("MCP tool invoked: tools/clear_messages bot_id=%s", bot_id)
@@ -638,7 +651,7 @@ async def clear_messages(bot_id: str = "default") -> int:
     return await storage.clear_messages(bot_id=bot_id)
 
 
-@mcp.tool()
+@mcp.tool(name="messages_remove_last_partial")
 async def remove_last_message_if_partial(bot_id: str = "default", role: str = "assistant") -> bool:
     logger.debug("MCP tool invoked: tools/remove_last_message_if_partial bot_id=%s role=%s", bot_id, role)
     storage = _get_storage()
@@ -650,72 +663,30 @@ async def remove_last_message_if_partial(bot_id: str = "default", role: str = "a
 # ---------------------------------------------------------------------------
 
 
-@mcp.tool()
-async def send_message_to_bot(
+# Track in-flight fire-and-forget sends so they aren't garbage-collected
+# mid-flight and so we can introspect / await them if needed later.
+_inflight_bot_sends: set = set()
+
+
+async def _dispatch_bot_message(
+    payload: dict,
     target_bot_id: str,
-    message: str,
-    sender_bot_id: str = "unknown",
-    max_tokens: int | None = None,
-    temperature: float = 0.7,
+    sender_bot_id: str,
+    timeout_seconds: float,
 ) -> dict:
-    """Send a message to another bot and get their response.
-
-    This allows bots to communicate with each other by sending messages
-    and receiving responses. The conversation is isolated to this single
-    exchange and doesn't affect either bot's persistent memory unless
-    they choose to store it.
-
-    Args:
-        target_bot_id: The bot slug to send the message to.
-        message: The message content to send.
-        sender_bot_id: The bot slug of the sender (for context).
-        max_tokens: Maximum tokens for the response.
-        temperature: Temperature for the response generation.
-
-    Returns:
-        Dict with keys: 'content' (response text), 'bot_id' (target),
-        'sender' (sender_bot_id), and 'success' (bool).
-    """
-    logger.debug("MCP tool invoked: send_message_to_bot target=%s sender=%s", target_bot_id, sender_bot_id)
+    """Perform the HTTP call to /v1/chat/completions for a bot-to-bot message."""
+    import httpx
 
     try:
-        import httpx
-        import json
-
-        # Add sender context to the message if provided
-        formatted_message = message
-        if sender_bot_id != "unknown":
-            formatted_message = f"Message from bot '{sender_bot_id}': {message}"
-
-        # Prepare the request payload
-        payload = {
-            "messages": [
-                {
-                    "role": "user",
-                    "content": formatted_message
-                }
-            ],
-            "bot_id": target_bot_id,
-            "max_tokens": max_tokens,
-            "temperature": temperature,
-            # Don't extract memory from inter-bot conversations by default
-            # to avoid cross-contamination unless explicitly desired
-            "extract_memory": False,
-            "augment_memory": True,  # Allow target bot to use its own memory
-            "stream": False,
-        }
-
-        # Make HTTP request to the chat completions API
         async with httpx.AsyncClient() as client:
             response = await client.post(
                 "http://localhost:8642/v1/chat/completions",
                 json=payload,
-                timeout=30.0
+                timeout=timeout_seconds,
             )
             response.raise_for_status()
             result = response.json()
 
-        # Extract the response content
         if "choices" in result and result["choices"]:
             content = result["choices"][0]["message"]["content"] or ""
             return {
@@ -725,27 +696,159 @@ async def send_message_to_bot(
                 "sender": sender_bot_id,
                 "response_model": result.get("model"),
             }
-        else:
-            return {
-                "success": False,
-                "error": f"Invalid response format: {result}",
-                "content": "",
-                "bot_id": target_bot_id,
-                "sender": sender_bot_id,
-            }
-
+        return {
+            "success": False,
+            "error": f"Invalid response format: {result}",
+            "content": "",
+            "bot_id": target_bot_id,
+            "sender": sender_bot_id,
+        }
+    except httpx.TimeoutException as e:
+        # The target bot may still be working server-side. The caller MUST NOT
+        # retry on this signal or it will produce duplicate turns.
+        logger.warning(
+            "Inter-bot send to %s timed out after %.1fs (request still in flight server-side)",
+            target_bot_id, timeout_seconds,
+        )
+        return {
+            "success": False,
+            "error": "timeout",
+            "error_detail": str(e),
+            "in_flight": True,
+            "warning": (
+                f"Target bot did not respond within {timeout_seconds:.0f}s. "
+                "The request is likely still being processed server-side. "
+                "DO NOT RETRY — that will cause the target bot to receive the message twice. "
+                "Use fire_and_forget=True for long-running work, or increase timeout_seconds."
+            ),
+            "content": "",
+            "bot_id": target_bot_id,
+            "sender": sender_bot_id,
+        }
     except Exception as e:
         logger.error("Inter-bot communication failed: %s", str(e))
         return {
             "success": False,
-            "error": str(e),
+            "error": str(e) or e.__class__.__name__,
             "content": "",
             "bot_id": target_bot_id,
             "sender": sender_bot_id,
         }
 
 
-@mcp.tool()
+@mcp.tool(name="bots_send_message")
+async def send_message_to_bot(
+    target_bot_id: str,
+    message: str,
+    sender_bot_id: str = "unknown",
+    max_tokens: int | None = None,
+    temperature: float = 0.7,
+    fire_and_forget: bool = False,
+    timeout_seconds: float = 300.0,
+) -> dict:
+    """Send a message to another bot.
+
+    By default, waits for the target bot's full response (up to
+    `timeout_seconds`). For long-running work where you only need to
+    kick off the target bot and continue your own work, set
+    `fire_and_forget=True` — the call returns immediately and the
+    target bot processes the message in the background.
+
+    Args:
+        target_bot_id: The bot slug to send the message to.
+        message: The message content to send.
+        sender_bot_id: The bot slug of the sender (for context).
+        max_tokens: Maximum tokens for the response.
+        temperature: Temperature for the response generation.
+        fire_and_forget: If True, dispatch the message and return
+            immediately without waiting for the response. Use this
+            when you want the target bot to do work asynchronously.
+        timeout_seconds: How long to wait for a response in non-
+            fire-and-forget mode. Defaults to 300s. The previous
+            30s default caused duplicate-turn bugs when the target
+            bot took longer than that.
+
+    Returns:
+        Dict with keys:
+          - 'success' (bool)
+          - 'bot_id' (target), 'sender' (sender_bot_id)
+        For waited calls: 'content' (response text), 'response_model'.
+        For fire-and-forget: 'dispatched' (True), 'content' empty.
+        On timeout: 'error' = 'timeout', 'in_flight' = True, 'warning'
+        explaining that the caller MUST NOT retry.
+    """
+    logger.debug(
+        "MCP tool invoked: send_message_to_bot target=%s sender=%s fire_and_forget=%s",
+        target_bot_id, sender_bot_id, fire_and_forget,
+    )
+
+    # Add sender context to the message if provided
+    formatted_message = message
+    if sender_bot_id != "unknown":
+        formatted_message = f"Message from bot '{sender_bot_id}': {message}"
+
+    payload = {
+        "messages": [
+            {
+                "role": "user",
+                "content": formatted_message,
+            }
+        ],
+        "bot_id": target_bot_id,
+        "max_tokens": max_tokens,
+        "temperature": temperature,
+        # Don't extract memory from inter-bot conversations by default
+        # to avoid cross-contamination unless explicitly desired
+        "extract_memory": False,
+        "augment_memory": True,  # Allow target bot to use its own memory
+        "stream": False,
+    }
+
+    if fire_and_forget:
+        import asyncio
+
+        # Use a generous timeout for the background task; we don't surface
+        # the result, but we don't want it hanging forever either.
+        bg_timeout = max(timeout_seconds, 1800.0)
+
+        async def _run_bg() -> None:
+            result = await _dispatch_bot_message(
+                payload, target_bot_id, sender_bot_id, bg_timeout
+            )
+            if result.get("success"):
+                logger.info(
+                    "fire_and_forget bot message to %s completed (chars=%d)",
+                    target_bot_id, len(result.get("content") or ""),
+                )
+            else:
+                logger.warning(
+                    "fire_and_forget bot message to %s failed: %s",
+                    target_bot_id, result.get("error"),
+                )
+
+        task = asyncio.create_task(_run_bg())
+        _inflight_bot_sends.add(task)
+        task.add_done_callback(_inflight_bot_sends.discard)
+
+        return {
+            "success": True,
+            "dispatched": True,
+            "fire_and_forget": True,
+            "content": "",
+            "bot_id": target_bot_id,
+            "sender": sender_bot_id,
+            "note": (
+                f"Message dispatched to '{target_bot_id}' in the background. "
+                "No response will be returned. The target bot is now processing it server-side."
+            ),
+        }
+
+    return await _dispatch_bot_message(
+        payload, target_bot_id, sender_bot_id, timeout_seconds
+    )
+
+
+@mcp.tool(name="bots_list_available")
 async def list_available_bots() -> list[dict]:
     """List all available bots that can receive messages.
 
@@ -811,7 +914,7 @@ def _get_profile_manager():
     return ProfileManager(config)
 
 
-@mcp.tool()
+@mcp.tool(name="profile")
 async def profile(
     action: str,
     entity_type: str = "user",
@@ -848,7 +951,7 @@ async def profile(
     Returns:
         Result as text.
     """
-    from llm_bawt.profiles import EntityType, AttributeCategory
+    from llm_bawt.profiles import AttributeCategory, EntityType
 
     # Validate entity_id matches entity_type
     if action in ("set", "delete", "list", "get"):
@@ -944,7 +1047,6 @@ async def profile(
 
 from . import task_tools as _task_tools  # noqa: F401, E402
 
-
 # ---------------------------------------------------------------------------
 # Run helpers
 # ---------------------------------------------------------------------------
@@ -968,7 +1070,7 @@ def run_server(
     import argparse
 
     # Parse CLI arguments when called as entry point
-    parser = argparse.ArgumentParser(description="Run the MCP memory server")
+    parser = argparse.ArgumentParser(description="Run the MCP mcp server")
     parser.add_argument(
         "--transport",
         choices=["stdio", "http"],
@@ -994,10 +1096,10 @@ def run_server(
     final_host = args.host if args.host != "0.0.0.0" else host
     final_port = args.port if args.port != 8001 else port
 
-    # Default to verbose logging for the memory server so MCP tool invocations
+    # Default to verbose logging for the MCP server so tool invocations
     # are visible when running standalone. Can be disabled via env.
-    verbose_env = os.getenv("LLM_BAWT_MEMORY_SERVER_VERBOSE", "1").lower()
-    debug_env = os.getenv("LLM_BAWT_MEMORY_SERVER_DEBUG", "0").lower()
+    verbose_env = os.getenv("LLM_BAWT_MCP_SERVER_VERBOSE", "1").lower()
+    debug_env = os.getenv("LLM_BAWT_MCP_SERVER_DEBUG", "0").lower()
     verbose = verbose_env not in {"0", "false", "no"}
     debug = debug_env in {"1", "true", "yes"}
     

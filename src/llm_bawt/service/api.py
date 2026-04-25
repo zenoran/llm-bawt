@@ -4,7 +4,7 @@ import asyncio
 from contextlib import asynccontextmanager
 
 from ..utils.config import Config
-from .background_service import BackgroundService, _ensure_memory_mcp_server
+from .background_service import BackgroundService, _ensure_mcp_server
 from .dependencies import get_service, set_service
 from .logging import get_service_logger, setup_service_logging
 from .schemas import ChatCompletionRequest, ChatMessage
@@ -33,7 +33,7 @@ async def lifespan(app):
 
     # Prefer MCP tool-based memory retrieval for llm-service.
     # This ensures memory retrieval happens via MCP tools and can be logged clearly.
-    _ensure_memory_mcp_server(config)
+    _ensure_mcp_server(config)
 
     # Load model definitions from DB and merge into config.
     # DB always takes priority; YAML is seeded to DB on first run if DB is empty.
@@ -213,8 +213,8 @@ async def lifespan(app):
 
     log.info(
         "Memory mode: %s (%s)",
-        "mcp" if getattr(config, "MEMORY_SERVER_URL", None) else "embedded",
-        getattr(config, "MEMORY_SERVER_URL", ""),
+        "mcp" if config.MCP_SERVER_URL else "embedded",
+        config.MCP_SERVER_URL or "",
     )
 
     try:

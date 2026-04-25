@@ -108,7 +108,7 @@ async def _api_delete(
 # ---------------------------------------------------------------------------
 
 
-@mcp.tool()
+@mcp.tool(name="tasks_list")
 async def list_tasks(
     status: str | None = None,
     project_id: str | None = None,
@@ -147,7 +147,7 @@ async def list_tasks(
         return {"error": str(e), "status": e.response.status_code}
 
 
-@mcp.tool()
+@mcp.tool(name="tasks_get")
 async def get_task(
     task_id: str,
 ) -> dict:
@@ -168,7 +168,7 @@ async def get_task(
         return {"error": str(e), "status": e.response.status_code}
 
 
-@mcp.tool()
+@mcp.tool(name="tasks_update")
 async def update_task(
     task_id: str,
     status: str | None = None,
@@ -242,7 +242,7 @@ async def update_task(
         return {"error": str(e), "status": e.response.status_code}
 
 
-@mcp.tool()
+@mcp.tool(name="tasks_create")
 async def create_task(
     title: str,
     description: str | None = None,
@@ -293,7 +293,7 @@ async def create_task(
 # ---------------------------------------------------------------------------
 
 
-@mcp.tool()
+@mcp.tool(name="steps_update")
 async def update_step(
     task_id: str,
     step_id: str,
@@ -339,7 +339,7 @@ async def update_step(
         return {"error": str(e), "status": e.response.status_code}
 
 
-@mcp.tool()
+@mcp.tool(name="steps_add")
 async def add_steps(
     task_id: str,
     steps: list[dict],
@@ -378,7 +378,7 @@ async def add_steps(
 # ---------------------------------------------------------------------------
 
 
-@mcp.tool()
+@mcp.tool(name="projects_list")
 async def list_projects() -> list[dict]:
     """List all agent projects with task counts.
 
@@ -396,7 +396,7 @@ async def list_projects() -> list[dict]:
         return {"error": str(e), "status": e.response.status_code}
 
 
-@mcp.tool()
+@mcp.tool(name="projects_get")
 async def get_project(
     project_id: str,
 ) -> dict:
@@ -419,7 +419,7 @@ async def get_project(
         return {"error": str(e), "status": e.response.status_code}
 
 
-@mcp.tool()
+@mcp.tool(name="projects_create")
 async def create_project(
     name: str,
     description: str | None = None,
@@ -468,7 +468,7 @@ async def create_project(
         return {"error": str(e), "status": e.response.status_code}
 
 
-@mcp.tool()
+@mcp.tool(name="projects_update")
 async def update_project(
     project_id: str,
     name: str | None = None,
@@ -523,7 +523,7 @@ async def update_project(
         return {"error": str(e), "status": e.response.status_code}
 
 
-@mcp.tool()
+@mcp.tool(name="projects_delete")
 async def delete_project(
     project_id: str,
     bot_id: str | None = None,
@@ -555,7 +555,7 @@ async def delete_project(
 # ---------------------------------------------------------------------------
 
 
-@mcp.tool()
+@mcp.tool(name="activity_get")
 async def get_activity(
     task_id: str | None = None,
     project_id: str | None = None,
@@ -593,7 +593,7 @@ async def get_activity(
 # ---------------------------------------------------------------------------
 
 
-@mcp.tool()
+@mcp.tool(name="tasks_get_context")
 async def get_task_context(
     task_id: str,
 ) -> str:

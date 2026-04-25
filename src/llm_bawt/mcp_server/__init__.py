@@ -1,7 +1,8 @@
-"""MCP-based memory server for llm-bawt.
+"""llm-bawt MCP server.
 
-Exposes memory tools via Model Context Protocol (FastMCP).
-Also provides a MemoryClient for unified access to memory operations.
+Exposes memory, messages, fact-extraction, inter-bot, and agent task tools
+via Model Context Protocol (FastMCP). Also provides MemoryClient for unified
+in-process or remote (HTTP JSON-RPC) access to memory operations.
 """
 
 from typing import TYPE_CHECKING

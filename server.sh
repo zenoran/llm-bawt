@@ -5,15 +5,15 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 RUN_DIR="$ROOT_DIR/.run"
 LOG_DIR="$ROOT_DIR/.logs"
 
-MEMORY_HOST="0.0.0.0"
-MEMORY_PORT="8001"
+MCP_HOST="0.0.0.0"
+MCP_PORT="8001"
 SERVICE_HOST="0.0.0.0"
 SERVICE_PORT="8642"
 
 # Use 127.0.0.1 for inter-service calls (0.0.0.0 causes HTTP 421 from FastMCP)
-MEMORY_URL="http://127.0.0.1:${MEMORY_PORT}"
+MCP_URL="http://127.0.0.1:${MCP_PORT}"
 
-MEMORY_PID_FILE="$RUN_DIR/memory-server.pid"
+MCP_PID_FILE="$RUN_DIR/mcp-server.pid"
 SERVICE_PID_FILE="$RUN_DIR/llm-service.pid"
 
 LOG_MODE="file"  # file | stdout
@@ -31,13 +31,13 @@ is_running() {
   kill -0 "$pid" >/dev/null 2>&1
 }
 
-start_memory_server() {
-  if is_running "$MEMORY_PID_FILE"; then
-    echo "Memory server already running (pid $(cat "$MEMORY_PID_FILE"))"
+start_mcp_server() {
+  if is_running "$MCP_PID_FILE"; then
+    echo "MCP server already running (pid $(cat "$MCP_PID_FILE"))"
     return 0
   fi
 
-  echo "[mcp] Starting on ${MEMORY_HOST}:${MEMORY_PORT}..."
+  echo "[mcp] Starting on ${MCP_HOST}:${MCP_PORT}..."
 
   # --quiet suppresses uv's progress/build output
   # In dev mode, use --no-sync to avoid rebuilding
@@ -48,17 +48,17 @@ start_memory_server() {
 
   if [[ "$LOG_MODE" == "stdout" ]]; then
     LLM_BAWT_LOG_PREFIX="mcp" \
-    LLM_BAWT_MEMORY_SERVER_VERBOSE=${VERBOSE_FLAG:+1} \
-    LLM_BAWT_MEMORY_SERVER_DEBUG=${DEBUG_FLAG:+1} \
-    uv run $UV_FLAGS --extra mcp llm-mcp-server --transport http --host "$MEMORY_HOST" --port "$MEMORY_PORT" &
-    echo $! > "$MEMORY_PID_FILE"
+    LLM_BAWT_MCP_SERVER_VERBOSE=${VERBOSE_FLAG:+1} \
+    LLM_BAWT_MCP_SERVER_DEBUG=${DEBUG_FLAG:+1} \
+    uv run $UV_FLAGS --extra mcp llm-mcp-server --transport http --host "$MCP_HOST" --port "$MCP_PORT" &
+    echo $! > "$MCP_PID_FILE"
   else
     LLM_BAWT_LOG_PREFIX="mcp" \
-    LLM_BAWT_MEMORY_SERVER_VERBOSE=${VERBOSE_FLAG:+1} \
-    LLM_BAWT_MEMORY_SERVER_DEBUG=${DEBUG_FLAG:+1} \
-    nohup uv run $UV_FLAGS --extra mcp llm-mcp-server --transport http --host "$MEMORY_HOST" --port "$MEMORY_PORT" \
-      > "$LOG_DIR/memory-server.log" 2>&1 &
-    echo $! > "$MEMORY_PID_FILE"
+    LLM_BAWT_MCP_SERVER_VERBOSE=${VERBOSE_FLAG:+1} \
+    LLM_BAWT_MCP_SERVER_DEBUG=${DEBUG_FLAG:+1} \
+    nohup uv run $UV_FLAGS --extra mcp llm-mcp-server --transport http --host "$MCP_HOST" --port "$MCP_PORT" \
+      > "$LOG_DIR/mcp-server.log" 2>&1 &
+    echo $! > "$MCP_PID_FILE"
   fi
 }
 
@@ -79,7 +79,7 @@ start_llm_service() {
   # Wait for MCP server to be ready before starting llm-service
   echo "[llm] Waiting for MCP server..."
   for i in {1..20}; do
-    if uv run $UV_FLAGS python -c "import socket; s=socket.socket(); s.settimeout(0.5); exit(0 if s.connect_ex(('127.0.0.1', $MEMORY_PORT))==0 else 1)" 2>/dev/null; then
+    if uv run $UV_FLAGS python -c "import socket; s=socket.socket(); s.settimeout(0.5); exit(0 if s.connect_ex(('127.0.0.1', $MCP_PORT))==0 else 1)" 2>/dev/null; then
       echo "[llm] MCP server ready"
       break
     fi
@@ -94,12 +94,12 @@ start_llm_service() {
 
   if [[ "$LOG_MODE" == "stdout" ]]; then
     LLM_BAWT_LOG_PREFIX="" \
-    LLM_BAWT_MEMORY_SERVER_URL="$MEMORY_URL" \
+    LLM_BAWT_MCP_SERVER_URL="$MCP_URL" \
     uv run $UV_FLAGS --extra service --extra search --extra memory llm-service --host "$SERVICE_HOST" --port "$SERVICE_PORT" $RELOAD_FLAG $VERBOSE_FLAG $DEBUG_FLAG &
     echo $! > "$SERVICE_PID_FILE"
   else
     LLM_BAWT_LOG_PREFIX="" \
-    LLM_BAWT_MEMORY_SERVER_URL="$MEMORY_URL" \
+    LLM_BAWT_MCP_SERVER_URL="$MCP_URL" \
     nohup uv run $UV_FLAGS --extra service --extra search --extra memory llm-service --host "$SERVICE_HOST" --port "$SERVICE_PORT" $RELOAD_FLAG $VERBOSE_FLAG $DEBUG_FLAG \
       > "$LOG_DIR/llm-service.log" 2>&1 &
     echo $! > "$SERVICE_PID_FILE"
@@ -161,10 +161,10 @@ stop_service() {
 }
 
 status() {
-  if is_running "$MEMORY_PID_FILE"; then
-    echo "Memory server: running (pid $(cat "$MEMORY_PID_FILE")) on port ${MEMORY_PORT}"
+  if is_running "$MCP_PID_FILE"; then
+    echo "MCP server: running (pid $(cat "$MCP_PID_FILE")) on port ${MCP_PORT}"
   else
-    echo "Memory server: stopped"
+    echo "MCP server: stopped"
   fi
 
   if is_running "$SERVICE_PID_FILE"; then
@@ -175,7 +175,7 @@ status() {
 
   echo "Logs: $LOG_DIR"
   echo "Mode: $LOG_MODE"
-  echo "Memory URL: $MEMORY_URL"
+  echo "MCP URL: $MCP_URL"
 }
 
 usage() {
@@ -183,7 +183,7 @@ usage() {
 Usage: $(basename "$0") [start|stop|restart|status] [--stdout|--logfile] [--verbose|--debug] [--dev]
 
 Commands:
-  start     Start memory server + llm-service (background, logs in .logs/)
+  start     Start MCP server + llm-service (background, logs in .logs/)
   stop      Stop both services
   restart   Stop then start
   status    Show status + log dir
@@ -217,7 +217,7 @@ while [[ $# -gt 0 ]]; do
 done
 case "$cmd" in
   start)
-    start_memory_server
+    start_mcp_server
     start_llm_service
     status
 
@@ -228,7 +228,7 @@ case "$cmd" in
       # Keep the script running and monitor child processes
       while true; do
         # Check if both services are still running
-        if ! is_running "$MEMORY_PID_FILE" || ! is_running "$SERVICE_PID_FILE"; then
+        if ! is_running "$MCP_PID_FILE" || ! is_running "$SERVICE_PID_FILE"; then
           echo "[ERROR] One or more services stopped unexpectedly"
           status
           exit 1
@@ -239,12 +239,12 @@ case "$cmd" in
     ;;
   stop)
     stop_service "llm-service" "$SERVICE_PID_FILE" "llm-service"
-    stop_service "memory server" "$MEMORY_PID_FILE" "llm-mcp-server"
+    stop_service "mcp server" "$MCP_PID_FILE" "llm-mcp-server"
     ;;
   restart)
     stop_service "llm-service" "$SERVICE_PID_FILE" "llm-service"
-    stop_service "memory server" "$MEMORY_PID_FILE" "llm-mcp-server"
-    start_memory_server
+    stop_service "mcp server" "$MCP_PID_FILE" "llm-mcp-server"
+    start_mcp_server
     start_llm_service
     status
     ;;

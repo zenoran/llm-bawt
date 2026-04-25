@@ -24,7 +24,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
 from llm_bawt.utils.config import Config
 from llm_bawt.profiles import ProfileManager, EntityType
-from llm_bawt.memory_server.client import MemoryClient
+from llm_bawt.mcp_server.client import MemoryClient
 from llm_bawt.memory.extraction import MemoryExtractionService
 from llm_bawt.memory.profile_maintenance import ProfileMaintenanceService
 from llm_bawt.core.client import LLMBawt
@@ -324,13 +324,13 @@ def main():
     profile_manager = ProfileManager(config)
     
     # Memory client - try MCP server first, then fall back to direct PostgreSQL
-    memory_url = getattr(config, "MEMORY_SERVER_URL", None)
+    mcp_url = config.MCP_SERVER_URL
     memory_client = None
     pg_backend = None  # Declare outside try block
     
-    if memory_url:
-        logger.info(f"Using MCP server: {memory_url}")
-        memory_client = MemoryClient(server_url=memory_url, bot_id=args.bot)
+    if mcp_url:
+        logger.info(f"Using MCP server: {mcp_url}")
+        memory_client = MemoryClient(server_url=mcp_url, bot_id=args.bot)
         # For MCP mode, we don't have direct backend access
         logger.error("MCP mode not supported for rebuild - need direct PostgreSQL")
         return 1

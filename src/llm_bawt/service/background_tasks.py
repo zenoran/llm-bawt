@@ -346,7 +346,7 @@ class BackgroundTasksMixin:
 
                         # Profile attribute extraction
                         if action.action in ("ADD", "UPDATE") and profile_enabled:
-                            from ..memory_server.extraction import extract_profile_attributes_from_fact
+                            from ..mcp_server.extraction import extract_profile_attributes_from_fact
                             extract_profile_attributes_from_fact(
                                 fact=fact,
                                 user_id=user_id,
@@ -674,7 +674,7 @@ class BackgroundTasksMixin:
 
                             # Profile attribute extraction
                             if action.action in ("ADD", "UPDATE") and profile_enabled:
-                                from ..memory_server.extraction import (
+                                from ..mcp_server.extraction import (
                                     extract_profile_attributes_from_fact,
                                 )
                                 extract_profile_attributes_from_fact(

@@ -1,4 +1,4 @@
-"""Allow running as: uv run python -m llm_bawt.memory_server"""
+"""Allow running as: uv run python -m llm_bawt.mcp_server"""
 
 from .server import run_server
 

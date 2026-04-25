@@ -57,14 +57,14 @@ COMPOSE_BASE   := docker-compose.yml
 COMPOSE_DEV    := docker-compose.dev.yml
 
 # Local servers
-MEMORY_HOST    ?= 0.0.0.0
-MEMORY_PORT    ?= 8001
+MCP_HOST    ?= 0.0.0.0
+MCP_PORT    ?= 8001
 SERVICE_HOST   ?= 0.0.0.0
 SERVICE_PORT   ?= 8642
-MEMORY_URL     := http://127.0.0.1:$(MEMORY_PORT)
+MCP_URL     := http://127.0.0.1:$(MCP_PORT)
 RUN_DIR        := .run
 LOG_DIR        := .logs
-MEMORY_PID     := $(RUN_DIR)/memory-server.pid
+MCP_PID     := $(RUN_DIR)/mcp-server.pid
 SERVICE_PID    := $(RUN_DIR)/llm-service.pid
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -176,7 +176,7 @@ run: ## Stop app + bridges, rebuild dev, tail logs
 up: ## Docker compose up (production)
 	@echo "Starting containers (production mode)..."
 	docker compose up -d
-	@echo "$(GREEN)✓ Services started on ports $(MEMORY_PORT) (MCP) and $(SERVICE_PORT) (LLM)$(NC)"
+	@echo "$(GREEN)✓ Services started on ports $(MCP_PORT) (MCP) and $(SERVICE_PORT) (LLM)$(NC)"
 
 docker-dev: ## Docker compose up (dev mode — mounts ./src)
 	@echo "Starting containers (dev mode)..."
@@ -226,20 +226,20 @@ $(RUN_DIR) $(LOG_DIR):
 
 server-start: check-uv | $(RUN_DIR) $(LOG_DIR) ## Start MCP + LLM services (background)
 	@# --- Memory/MCP server ---
-	@if [ -f "$(MEMORY_PID)" ] && kill -0 $$(cat "$(MEMORY_PID)") 2>$(NULL); then \
-		echo "Memory server already running (pid $$(cat $(MEMORY_PID)))"; \
+	@if [ -f "$(MCP_PID)" ] && kill -0 $$(cat "$(MCP_PID)") 2>$(NULL); then \
+		echo "MCP server already running (pid $$(cat $(MCP_PID)))"; \
 	else \
-		echo "$(BLUE)[mcp] Starting on $(MEMORY_HOST):$(MEMORY_PORT)...$(NC)"; \
-		LLM_BAWT_MEMORY_SERVER_VERBOSE= \
+		echo "$(BLUE)[mcp] Starting on $(MCP_HOST):$(MCP_PORT)...$(NC)"; \
+		LLM_BAWT_MCP_SERVER_VERBOSE= \
 		nohup uv run --extra mcp llm-mcp-server --transport http \
-			--host $(MEMORY_HOST) --port $(MEMORY_PORT) \
-			> $(LOG_DIR)/memory-server.log 2>&1 & \
-		echo $$! > $(MEMORY_PID); \
+			--host $(MCP_HOST) --port $(MCP_PORT) \
+			> $(LOG_DIR)/mcp-server.log 2>&1 & \
+		echo $$! > $(MCP_PID); \
 	fi
 	@# --- Wait for MCP to be ready ---
 	@echo "$(BLUE)[llm] Waiting for MCP server...$(NC)"
 	@for i in $$(seq 1 20); do \
-		if $(PYTHON) -c "import socket; s=socket.socket(); s.settimeout(0.5); exit(0 if s.connect_ex(('127.0.0.1',$(MEMORY_PORT)))==0 else 1)" 2>$(NULL); then \
+		if $(PYTHON) -c "import socket; s=socket.socket(); s.settimeout(0.5); exit(0 if s.connect_ex(('127.0.0.1',$(MCP_PORT)))==0 else 1)" 2>$(NULL); then \
 			echo "$(GREEN)[llm] MCP server ready$(NC)"; \
 			break; \
 		fi; \
@@ -250,7 +250,7 @@ server-start: check-uv | $(RUN_DIR) $(LOG_DIR) ## Start MCP + LLM services (back
 		echo "llm-service already running (pid $$(cat $(SERVICE_PID)))"; \
 	else \
 		echo "$(BLUE)[llm] Starting on $(SERVICE_HOST):$(SERVICE_PORT)...$(NC)"; \
-		LLM_BAWT_MEMORY_SERVER_URL="$(MEMORY_URL)" \
+		LLM_BAWT_MCP_SERVER_URL="$(MCP_URL)" \
 		nohup uv run --extra service --extra search --extra memory llm-service \
 			--host $(SERVICE_HOST) --port $(SERVICE_PORT) \
 			> $(LOG_DIR)/llm-service.log 2>&1 & \
@@ -269,24 +269,24 @@ server-stop: ## Stop MCP + LLM services
 		echo "llm-service not running"; \
 	fi
 	@rm -f "$(SERVICE_PID)"
-	@if [ -f "$(MEMORY_PID)" ] && kill -0 $$(cat "$(MEMORY_PID)") 2>$(NULL); then \
-		echo "Stopping memory server (pid $$(cat $(MEMORY_PID)))..."; \
-		kill $$(cat "$(MEMORY_PID)") 2>$(NULL) || true; \
+	@if [ -f "$(MCP_PID)" ] && kill -0 $$(cat "$(MCP_PID)") 2>$(NULL); then \
+		echo "Stopping MCP server (pid $$(cat $(MCP_PID)))..."; \
+		kill $$(cat "$(MCP_PID)") 2>$(NULL) || true; \
 		sleep 1; \
-		kill -0 $$(cat "$(MEMORY_PID)") 2>$(NULL) && kill -9 $$(cat "$(MEMORY_PID)") 2>$(NULL) || true; \
+		kill -0 $$(cat "$(MCP_PID)") 2>$(NULL) && kill -9 $$(cat "$(MCP_PID)") 2>$(NULL) || true; \
 	else \
-		echo "Memory server not running"; \
+		echo "MCP server not running"; \
 	fi
-	@rm -f "$(MEMORY_PID)"
+	@rm -f "$(MCP_PID)"
 	@echo "$(GREEN)✓ Services stopped$(NC)"
 
 server-restart: server-stop server-start ## Restart local services
 
 server-status: ## Show local service status
-	@if [ -f "$(MEMORY_PID)" ] && kill -0 $$(cat "$(MEMORY_PID)") 2>$(NULL); then \
-		echo "Memory server: $(GREEN)running$(NC) (pid $$(cat $(MEMORY_PID))) on port $(MEMORY_PORT)"; \
+	@if [ -f "$(MCP_PID)" ] && kill -0 $$(cat "$(MCP_PID)") 2>$(NULL); then \
+		echo "MCP server: $(GREEN)running$(NC) (pid $$(cat $(MCP_PID))) on port $(MCP_PORT)"; \
 	else \
-		echo "Memory server: $(RED)stopped$(NC)"; \
+		echo "MCP server: $(RED)stopped$(NC)"; \
 	fi
 	@if [ -f "$(SERVICE_PID)" ] && kill -0 $$(cat "$(SERVICE_PID)") 2>$(NULL); then \
 		echo "llm-service:   $(GREEN)running$(NC) (pid $$(cat $(SERVICE_PID))) on port $(SERVICE_PORT)"; \

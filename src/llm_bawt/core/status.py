@@ -81,7 +81,7 @@ class DependencyInfo:
 
 @dataclass
 class McpInfo:
-    """MCP memory server status."""
+    """llm-bawt MCP server status."""
 
     mode: str = "embedded"  # "server" | "embedded"
     status: str = "up"  # "up" | "down" | "error"
@@ -171,12 +171,12 @@ def _collect_service_info(config: Config, local_only: bool = False) -> tuple[Ser
 
 
 def _collect_mcp_info(config: Config, default_bot_slug: str) -> McpInfo:
-    """Collect MCP memory server status."""
-    memory_server_url = (config.MEMORY_SERVER_URL or "").strip()
-    if not memory_server_url:
+    """Collect llm-bawt MCP server status."""
+    mcp_server_url = (config.MCP_SERVER_URL or "").strip()
+    if not mcp_server_url:
         return McpInfo(mode="embedded", status="up", url=None)
 
-    mcp_url = memory_server_url.rstrip("/")
+    mcp_url = mcp_server_url.rstrip("/")
     info = McpInfo(mode="server", url=mcp_url)
 
     try:

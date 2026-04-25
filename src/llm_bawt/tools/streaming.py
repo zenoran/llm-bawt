@@ -13,7 +13,7 @@ from ..adapters import ModelAdapter, DefaultAdapter
 
 if TYPE_CHECKING:
     from ..models.message import Message
-    from ..memory_server.client import MemoryClient
+    from ..mcp_server.client import MemoryClient
     from ..profiles import ProfileManager
     from ..search.base import SearchClient
     from ..integrations.ha_mcp.client import HomeAssistantMCPClient, HomeAssistantNativeClient

@@ -1,7 +1,7 @@
 """Tool executor for LLM tool calls.
 
 Executes tool calls by routing them to the appropriate backend
-(MCP memory server, profiles, web search, model management, etc.) and returning formatted results.
+(llm-bawt MCP server, profiles, web search, model management, etc.) and returning formatted results.
 
 Consolidated tools (10 total):
 - memory: action-based (search/store/delete)
@@ -29,7 +29,7 @@ if TYPE_CHECKING:
     from ..integrations.ha_mcp.client import HomeAssistantMCPClient, HomeAssistantNativeClient
     from ..integrations.newsapi.client import NewsAPIClient
     from ..integrations.web_fetch.client import WebFetchClient
-    from ..memory_server.client import MemoryClient
+    from ..mcp_server.client import MemoryClient
     from ..profiles import ProfileManager
     from ..search.base import SearchClient
     from ..core.model_lifecycle import ModelLifecycleManager
