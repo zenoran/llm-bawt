@@ -141,18 +141,29 @@ class RedisSubscriber:
         request_id: str,
         *,
         timeout_s: float = 15,
+        backend: str | None = None,
     ) -> dict:
-        """Send an RPC command to the bridge and wait for the result."""
+        """Send an RPC command to the bridge and wait for the result.
+
+        If ``backend`` is provided it is included in the message so bridges
+        that filter by backend (e.g. codex-bridge) can ACK and skip RPCs
+        that aren't theirs. Bridges that don't filter (e.g. legacy claude-
+        code-bridge) ignore the field.
+        """
         import json as _json
+
+        fields: dict = {
+            "action": "rpc.call",
+            "method": method,
+            "params": _json.dumps(params, ensure_ascii=False),
+            "request_id": request_id,
+        }
+        if backend:
+            fields["backend"] = backend
 
         await self._redis.xadd(
             COMMANDS_STREAM,
-            {
-                "action": "rpc.call",
-                "method": method,
-                "params": _json.dumps(params, ensure_ascii=False),
-                "request_id": request_id,
-            },
+            fields,
             maxlen=1000,
             approximate=True,
         )

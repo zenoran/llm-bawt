@@ -1,0 +1,41 @@
+"""Codex agent backend.
+
+Uses the same Redis command/event protocol as the OpenClaw backend, but
+routes to ``codex-bridge`` (OpenAI Codex SDK / ChatGPT-mode OAuth) instead
+of the openclaw-bridge (WebSocket gateway) or claude-code-bridge (Claude
+Agent SDK).
+
+Each bot+user pair gets its own Codex thread — the persisted ``session_key``
+in ``agent_backend_config`` is the Codex ``thread_id`` written by the
+bridge after thread/started fires for the first turn.
+"""
+
+from __future__ import annotations
+
+from .openclaw import OpenClawBackend
+
+
+class CodexBackend(OpenClawBackend):
+    """Agent backend for OpenAI Codex via the codex-bridge.
+
+    Inherits the full Redis command/event protocol from OpenClawBackend.
+    Session keys are bot+user scoped so each user gets an independent
+    Codex thread for a given bot.
+
+    Configuration keys (``agent_backend_config`` in bot profile):
+        session_key: Codex ``thread_id`` (managed by the bridge — do not
+                     set manually; cleared by ``/new`` or model change)
+        model:       Codex model id (default ``gpt-5.4``)
+        timeout_seconds: Max wait for response (default: 600)
+    """
+
+    name = "codex"
+
+    def _resolve_session_key(self, config: dict) -> str:
+        # Route by bot + user so each user gets an independent Codex thread
+        # for a given bot. The session_key in agent_backend_config is the
+        # Codex thread_id written by the bridge and should not be used
+        # directly as a routing key — match the claude-code semantics.
+        bot_id = str(config.get("bot_id") or "main").strip() or "main"
+        user_id = str(config.get("user_id") or "default").strip() or "default"
+        return f"{bot_id}:{user_id}"

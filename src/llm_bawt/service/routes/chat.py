@@ -50,13 +50,29 @@ async def chat_abort(request: ChatAbortRequest) -> ChatAbortResponse:
     gateway_aborted = False
     if turn.agent_session_key:
         from ...agent_backends.openclaw import get_openclaw_subscriber
+        from ...bots import BotManager
+
+        # Resolve the bot's agent_backend so the abort RPC can be routed to
+        # the right bridge (claude-code, codex, openclaw). Bridges that
+        # filter on `backend` will skip RPCs that aren't theirs, preventing
+        # cross-bridge RPC races.
+        backend_name = None
+        if turn.bot_id:
+            try:
+                bot = BotManager(service.config).get_bot(turn.bot_id)
+                backend_name = getattr(bot, "agent_backend", None) if bot else None
+            except Exception:
+                backend_name = None
 
         subscriber = get_openclaw_subscriber()
         if subscriber:
             params: dict = {"sessionKey": turn.agent_session_key}
             abort_req_id = f"abort_{uuid.uuid4().hex}"
             try:
-                await subscriber.send_rpc("chat.abort", params, abort_req_id, timeout_s=10)
+                await subscriber.send_rpc(
+                    "chat.abort", params, abort_req_id,
+                    timeout_s=10, backend=backend_name,
+                )
                 gateway_aborted = True
             except Exception as e:
                 log.warning("chat.abort RPC failed for turn %s: %s", turn.id, e)
@@ -108,8 +124,9 @@ async def session_reset(request: SessionResetRequest) -> SessionResetResponse:
 
     bc = getattr(bot, "agent_backend_config", {}) or {}
     session_key = bc.get("session_key", "")
-    # Claude-code backend auto-generates session key from bot_id
-    if not session_key and backend_name == "claude-code":
+    # Claude-code and codex backends route by bot+user — fall back to a
+    # bot-only key when the bridge hasn't yet persisted a real session id.
+    if not session_key and backend_name in ("claude-code", "codex"):
         session_key = request.bot_id
 
     from ...agent_backends.openclaw import get_openclaw_subscriber
@@ -125,6 +142,7 @@ async def session_reset(request: SessionResetRequest) -> SessionResetResponse:
             {"sessionKey": session_key},
             rpc_req_id,
             timeout_s=10,
+            backend=backend_name,
         )
     except Exception as e:
         log.warning("session.reset RPC failed for bot %s: %s", request.bot_id, e)

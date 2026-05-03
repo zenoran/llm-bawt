@@ -428,6 +428,12 @@ class CodexBridge:
                         if action == "chat.send" and backend != self._backend_name:
                             await async_redis.xack(COMMANDS_STREAM, CONSUMER_GROUP, msg_id)
                             continue
+                        # Filter RPCs that explicitly target a different backend.
+                        # Legacy callers send RPCs without `backend` — we still
+                        # accept those (they may target any agent backend).
+                        if action == "rpc.call" and backend and backend != self._backend_name:
+                            await async_redis.xack(COMMANDS_STREAM, CONSUMER_GROUP, msg_id)
+                            continue
 
                         if action == "chat.send":
                             session_key = fields.get("session_key", "")

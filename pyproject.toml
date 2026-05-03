@@ -97,6 +97,7 @@ postgresql = "llm_bawt.memory.postgresql:PostgreSQLMemoryBackend"
 [project.entry-points."llm_bawt.agent_backends"]
 openclaw = "llm_bawt.agent_backends.openclaw:OpenClawBackend"
 claude-code = "llm_bawt.agent_backends.claude_code:ClaudeCodeBackend"
+codex = "llm_bawt.agent_backends.codex:CodexBackend"
 
 [tool.setuptools]
 package-dir = {"" = "src"}
