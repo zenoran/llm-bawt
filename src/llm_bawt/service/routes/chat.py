@@ -123,11 +123,16 @@ async def session_reset(request: SessionResetRequest) -> SessionResetResponse:
         raise HTTPException(status_code=400, detail=f"Bot '{request.bot_id}' is not an agent backend bot")
 
     bc = getattr(bot, "agent_backend_config", {}) or {}
-    session_key = bc.get("session_key", "")
-    # Claude-code and codex backends route by bot+user — fall back to a
-    # bot-only key when the bridge hasn't yet persisted a real session id.
-    if not session_key and backend_name in ("claude-code", "codex"):
+    # claude-code and codex bridges route session.reset by parsing the bot
+    # slug out of the sessionKey param (split on ':' or use as-is). Their
+    # persisted ``session_key`` in agent_backend_config is the SDK-internal
+    # thread id, not a routing key — sending it here means the bridge tries
+    # to PATCH /v1/bots/<thread_id>/profile and silently fails. Always send
+    # the bot slug for these backends.
+    if backend_name in ("claude-code", "codex"):
         session_key = request.bot_id
+    else:
+        session_key = bc.get("session_key", "")
 
     from ...agent_backends.openclaw import get_openclaw_subscriber
 

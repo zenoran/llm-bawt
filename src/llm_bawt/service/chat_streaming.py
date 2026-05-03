@@ -638,14 +638,27 @@ class ChatStreamingMixin:
             cancel_event, done_event = await self._start_generation(bot_id)
         turn_log_id = f"turn-{uuid.uuid4().hex}"
 
-        # Resolve agent session_key for abort support
+        # Resolve agent session_key for abort support.
+        #
+        # The bridge tracks active streams keyed by the chat.send command's
+        # ``session_key`` field. chat.abort RPC must arrive with the same
+        # key or the bridge can't find the active controller (results in
+        # "no_active_task" and the abort is a no-op server-side).
+        #
+        # claude-code and codex both produce the routing key as
+        # ``f"{bot_id}:{user_id}"`` in their respective backends — match that
+        # here. The persisted ``session_key`` in their agent_backend_config
+        # is the SDK-internal thread/session id, NOT a routing key.
+        #
+        # OpenClaw (and any other backend) keeps using its persisted
+        # session_key (e.g. ``agent:main:main``), which IS the routing key
+        # for that backend.
         oc_session_key: str | None = None
         if is_agent_backend:
             bc = getattr(llm_bawt.bot, "agent_backend_config", None) or {}
             backend_name = getattr(llm_bawt.bot, "agent_backend", "")
-            if backend_name == "claude-code":
-                # Claude-code uses bot_id as the routing key
-                oc_session_key = bot_id
+            if backend_name in ("claude-code", "codex"):
+                oc_session_key = f"{bot_id}:{user_id}"
             else:
                 oc_session_key = bc.get("session_key")
 
