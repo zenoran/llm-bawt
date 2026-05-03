@@ -476,6 +476,7 @@ Gitflow model: `main` (releases) ← `develop` (integration) ← `feature/*` (wo
 | [docs/BACKGROUND_SCHEDULER.md](docs/BACKGROUND_SCHEDULER.md) | Background job scheduler |
 | [docs/OPENCLAW_INTEGRATION.md](docs/OPENCLAW_INTEGRATION.md) | OpenClaw agent backend architecture |
 | [docs/CLAUDE_CODE_BRIDGE.md](docs/CLAUDE_CODE_BRIDGE.md) | Claude Code Agent SDK bridge — setup, auth, session management |
+| [docs/CODEX_BRIDGE.md](docs/CODEX_BRIDGE.md) | OpenAI Codex SDK bridge — ChatGPT-mode OAuth, multi-thread, smoke tests |
 | [docs/HA_NATIVE_MCP_INTEGRATION.md](docs/HA_NATIVE_MCP_INTEGRATION.md) | Home Assistant integration |
 | [docs/NEXTCLOUD_INTEGRATION.md](docs/NEXTCLOUD_INTEGRATION.md) | Nextcloud Talk bot provisioning |
 
