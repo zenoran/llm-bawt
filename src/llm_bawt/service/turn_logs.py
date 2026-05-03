@@ -58,6 +58,11 @@ class TurnLog(SQLModel, table=True):
     agent_session_key: str | None = Field(default=None, max_length=128, index=True)
     agent_request_id: str | None = Field(default=None, max_length=128, index=True)
     animation: str | None = Field(default=None, sa_column=Column(String(255), nullable=True))
+    # Per-turn token accounting from the upstream SDK (claude_code, etc.).
+    # Stored as JSON text so older rows without this column still load cleanly.
+    # Surfaced on TurnLogListItem / TurnLogDetail so the chat UI's per-bubble
+    # usage pill survives reloads and history syncs.
+    token_usage_json: str | None = Field(default=None, sa_column=Column(Text, nullable=True))
 
 
 class ToolCallRecord(SQLModel, table=True):
@@ -101,10 +106,10 @@ class TurnLogStore:
             password = getattr(config, "POSTGRES_PASSWORD", "")
             database = getattr(config, "POSTGRES_DATABASE", "llm_bawt")
             encoded_password = quote_plus(password)
-            url = f"postgresql+psycopg2://{user}:{encoded_password}@{host}:{port}/{database}"
-            self.engine = create_engine(url, echo=False)
-            from ..utils.db import set_utc_on_connect
-            set_utc_on_connect(self.engine)
+            from ..utils.db import get_shared_engine
+            self.engine = get_shared_engine(config)  # TASK-202: shared pool
+            if self.engine is None:
+                return
             self._ensure_tables_exist()
             self._backfill_trigger_message_ids()
         except Exception as e:
@@ -144,6 +149,9 @@ class TurnLogStore:
                 ))
                 conn.execute(sa_text(
                     "ALTER TABLE turn_logs ADD COLUMN IF NOT EXISTS animation VARCHAR(255)"
+                ))
+                conn.execute(sa_text(
+                    "ALTER TABLE turn_logs ADD COLUMN IF NOT EXISTS token_usage_json TEXT"
                 ))
                 conn.commit()
             except Exception:
@@ -219,6 +227,7 @@ class TurnLogStore:
         agent_session_key: str | None = None,
         agent_request_id: str | None = None,
         animation: str | None = None,
+        token_usage: dict | None = None,
     ) -> None:
         """Persist one turn entry and enforce short TTL cleanup."""
         if self.engine is None:
@@ -249,6 +258,10 @@ class TurnLogStore:
             agent_session_key=agent_session_key,
             agent_request_id=agent_request_id,
             animation=animation,
+            token_usage_json=(
+                json.dumps(token_usage, ensure_ascii=False, default=str)
+                if isinstance(token_usage, dict) else None
+            ),
         )
 
         with Session(self.engine) as session:
@@ -268,6 +281,7 @@ class TurnLogStore:
         agent_session_key: str | None = None,
         agent_request_id: str | None = None,
         animation: str | None = None,
+        token_usage: dict | None = None,
     ) -> None:
         """Update an existing turn log row with new data."""
         if self.engine is None:
@@ -301,6 +315,11 @@ class TurnLogStore:
                 row.agent_request_id = agent_request_id
             if animation is not None:
                 row.animation = animation
+            if token_usage is not None:
+                row.token_usage_json = (
+                    json.dumps(token_usage, ensure_ascii=False, default=str)
+                    if isinstance(token_usage, dict) else None
+                )
             session.add(row)
             session.commit()
 

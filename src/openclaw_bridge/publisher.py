@@ -18,7 +18,6 @@ from typing import Any
 import redis
 
 from .events import OpenClawEvent
-from .metrics import get_metrics
 
 logger = logging.getLogger(__name__)
 
@@ -64,11 +63,9 @@ class RedisPublisher:
                 maxlen=STREAM_MAXLEN,
                 approximate=True,
             )
-            get_metrics().incr("openclaw.redis_publish", stream="events")
             return stream_id
         except Exception:
             logger.exception("Failed to publish event to Redis stream %s", stream_key)
-            get_metrics().incr("openclaw.redis_publish_errors", stream="events")
             return None
 
     def publish_history(self, bot_id: str, role: str, content: str) -> str | None:
@@ -87,11 +84,9 @@ class RedisPublisher:
                 maxlen=1000,
                 approximate=True,
             )
-            get_metrics().incr("openclaw.redis_publish", stream="history")
             return stream_id
         except Exception:
             logger.exception("Failed to publish history command")
-            get_metrics().incr("openclaw.redis_publish_errors", stream="history")
             return None
 
     def publish_run_event(self, request_id: str, event: OpenClawEvent) -> str | None:
@@ -108,7 +103,6 @@ class RedisPublisher:
                 maxlen=RUN_STREAM_MAXLEN,
                 approximate=True,
             )
-            get_metrics().incr("openclaw.redis_publish", stream="run")
             return stream_id
         except Exception:
             logger.exception("Failed to publish run event to %s", stream_key)
@@ -160,11 +154,9 @@ class RedisPublisher:
                 maxlen=UNIFIED_STREAM_MAXLEN,
                 approximate=True,
             )
-            get_metrics().incr("unified.redis_publish", stream="events")
             return stream_id
         except Exception:
             logger.exception("Failed to publish unified event to %s", stream_key)
-            get_metrics().incr("unified.redis_publish_errors", stream="events")
             return None
 
     def close(self) -> None:

@@ -22,6 +22,22 @@ def _parse_json(value: str | None):
         return value
 
 
+def _parse_token_usage(value: str | None) -> dict | None:
+    """Decode token_usage_json from a turn-log row, returning None on bad JSON.
+
+    The column may be missing on rows persisted before this field was added —
+    `getattr(row, "token_usage_json", None)` already handles that case; here we
+    just guard against malformed JSON so a single bad row can't 500 the route.
+    """
+    if not value:
+        return None
+    try:
+        parsed = json.loads(value)
+    except Exception:
+        return None
+    return parsed if isinstance(parsed, dict) else None
+
+
 def _live_tool_calls(store: TurnLogStore, turn_id: str) -> list[dict]:
     """Read realtime tool-call rows from `tool_call_records` for a turn.
 
@@ -133,6 +149,7 @@ async def list_turn_logs(
                 agent_session_key=getattr(row, "agent_session_key", None),
                 agent_request_id=getattr(row, "agent_request_id", None),
                 trigger_message_id=getattr(row, "trigger_message_id", None),
+                token_usage=_parse_token_usage(getattr(row, "token_usage_json", None)),
             )
         )
 
@@ -193,6 +210,7 @@ async def get_turn_log(turn_id: str):
         animation=getattr(row, "animation", None),
         agent_session_key=getattr(row, "agent_session_key", None),
         agent_request_id=getattr(row, "agent_request_id", None),
+        token_usage=_parse_token_usage(getattr(row, "token_usage_json", None)),
     )
 
 

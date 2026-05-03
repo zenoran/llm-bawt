@@ -503,6 +503,12 @@ def _clear_history_direct(config, bot_id: str) -> bool:
     """Clear history directly via PostgreSQL without loading a model.
 
     Returns True if cleared successfully, False if DB is unavailable.
+
+    NOTE on connection pooling (TASK-202): ``PostgreSQLMemoryBackend``
+    instances now share a process-wide engine (see
+    ``llm_bawt.memory.postgresql._get_shared_memory_engine``), so do NOT
+    call ``backend.engine.dispose()`` here — that would tear down the
+    pool used by every other bot.
     """
     try:
         from llm_bawt.memory.postgresql import PostgreSQLMemoryBackend

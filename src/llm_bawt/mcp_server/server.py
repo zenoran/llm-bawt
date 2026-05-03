@@ -906,12 +906,24 @@ async def list_available_bots() -> list[dict]:
 # ---------------------------------------------------------------------------
 
 
+_PROFILE_MANAGER_SINGLETON = None
+
+
 def _get_profile_manager():
-    """Lazy-load ProfileManager."""
-    from llm_bawt.profiles import ProfileManager
-    from llm_bawt.utils.config import Config
-    config = Config()
-    return ProfileManager(config)
+    """Lazy-load ProfileManager (cached singleton).
+
+    NOTE on connection pooling (TASK-202): ``ProfileManager`` owns its own
+    SQLAlchemy engine + connection pool. Returning a fresh instance per MCP
+    call leaks ~5 idle Postgres connections every time. The MCP server runs
+    as its own process inside the app container, so we keep one singleton
+    per process and let the engine's pool absorb concurrent requests.
+    """
+    global _PROFILE_MANAGER_SINGLETON
+    if _PROFILE_MANAGER_SINGLETON is None:
+        from llm_bawt.profiles import ProfileManager
+        from llm_bawt.utils.config import Config
+        _PROFILE_MANAGER_SINGLETON = ProfileManager(Config())
+    return _PROFILE_MANAGER_SINGLETON
 
 
 @mcp.tool(name="profile")

@@ -3,8 +3,6 @@ import asyncio
 import logging
 from typing import Any, Callable
 
-from openclaw_bridge.metrics import get_metrics
-
 from .openclaw_events import OpenClawEventKind
 from .openclaw_fanout import FanoutHub
 from .openclaw_ingest import EventIngestPipeline
@@ -55,9 +53,6 @@ class SessionBridge:
 
     async def _on_raw_event(self, raw: dict) -> None:
         """Process a raw WS message: parse -> store -> update run state -> fanout."""
-        metrics = get_metrics()
-        metrics.incr("openclaw.ws_messages_received")
-
         session_key = raw.get("session_key", "")
         if not session_key:
             # Try to get from subscribed sessions
@@ -66,10 +61,7 @@ class SessionBridge:
 
         event = self._ingest.parse(raw, session_key)
         if event is None:
-            metrics.incr("openclaw.events_dropped", reason="parse_failed")
             return
-
-        metrics.incr("openclaw.events_parsed", kind=event.kind.value, session=session_key)
 
         # Store (idempotent)
         stored = self._store.store(event)
@@ -137,9 +129,6 @@ class SessionBridge:
                 full_text = self._store.assemble_run_text(event.run_id)
             tool_calls = self._run_tool_calls.pop(event.run_id, [])
             self._store.complete_run(event.run_id, full_text, tool_calls or None)
-            metrics.incr("openclaw.runs_completed", session=event.session_key)
-            metrics.gauge("openclaw.last_run_text_len", float(len(full_text)), session=event.session_key)
-            metrics.gauge("openclaw.last_run_tool_calls", float(len(tool_calls)), session=event.session_key)
             logger.info(
                 "OpenClaw run completed: run_id=%s text_len=%d tools=%d",
                 event.run_id, len(full_text), len(tool_calls),

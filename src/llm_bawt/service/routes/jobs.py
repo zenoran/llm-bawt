@@ -6,9 +6,8 @@ from fastapi import APIRouter, HTTPException, Query
 from sqlalchemy import func
 from sqlmodel import Session, select
 
-from ...profiles import ProfileManager
 from ...utils.config import has_database_credentials
-from ..dependencies import get_service
+from ..dependencies import get_profile_manager, get_service
 from ..schemas import JobRunInfo, JobRunsResponse, ScheduledJobInfo, ScheduledJobsResponse
 from ..scheduler import JobRun, JobStatus, JobType, ScheduledJob, create_scheduler_tables
 
@@ -20,7 +19,7 @@ def _get_scheduler_engine():
     if not has_database_credentials(service.config):
         raise HTTPException(status_code=503, detail="Job scheduler requires database connection")
 
-    manager = ProfileManager(service.config)
+    manager = get_profile_manager(service.config)
     create_scheduler_tables(manager.engine)
     return manager.engine
 

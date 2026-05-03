@@ -11,11 +11,9 @@ from datetime import datetime, timezone
 from typing import Any
 from urllib.parse import quote_plus
 
-from sqlalchemy import create_engine, text
-from sqlalchemy.pool import QueuePool
+from sqlalchemy import text
 
 from ..utils.config import Config
-from ..utils.db import set_utc_on_connect
 
 logger = logging.getLogger(__name__)
 
@@ -58,25 +56,14 @@ CREATE_INDEXES_SQL = [
 
 
 def _build_engine(config: Config):
-    """Build a SQLAlchemy engine from the shared config."""
-    host = getattr(config, "POSTGRES_HOST", "localhost")
-    port = int(getattr(config, "POSTGRES_PORT", 5432))
-    user = getattr(config, "POSTGRES_USER", "llm_bawt")
-    password = getattr(config, "POSTGRES_PASSWORD", "")
-    database = getattr(config, "POSTGRES_DATABASE", "llm_bawt")
+    """Return the process-wide shared SQLAlchemy engine (TASK-202).
 
-    encoded_password = quote_plus(password)
-    url = f"postgresql+psycopg2://{user}:{encoded_password}@{host}:{port}/{database}"
-
-    engine = create_engine(
-        url,
-        echo=False,
-        poolclass=QueuePool,
-        pool_size=3,
-        max_overflow=5,
-    )
-    set_utc_on_connect(engine)
-    return engine
+    Every Store in llm-bawt connects to the same Postgres database, so
+    they all share one engine + connection pool — see
+    ``llm_bawt.utils.db.get_shared_engine``.
+    """
+    from ..utils.db import get_shared_engine
+    return get_shared_engine(config)
 
 
 class MediaGenerationStore:

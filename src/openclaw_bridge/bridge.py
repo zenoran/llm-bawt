@@ -7,7 +7,6 @@ from datetime import datetime
 
 from .events import OpenClawEvent, OpenClawEventKind
 from .ingest import EventIngestPipeline
-from .metrics import get_metrics
 from .publisher import COMMANDS_STREAM, RedisPublisher
 from .session_queue import SessionQueue
 from .store import EventStore
@@ -241,7 +240,6 @@ class SessionBridge:
                         )
 
                 self._publisher.publish_run_done(request_id)
-                get_metrics().incr("openclaw.commands_completed")
                 logger.info("Send command completed: request_id=%s", request_id)
 
             except Exception as e:
@@ -427,6 +425,9 @@ class SessionBridge:
     # Stack of call_ids per run — tool calls can nest (e.g. Agent containing
     # Grep/Read), so a single slot loses the outer call_id.
     _passive_call_id_stacks: dict[str, list[str]] = {}
+    # Captured token usage per run from ASSISTANT_DONE — surfaced on the
+    # corresponding turn_complete event so the chat UI can render a usage pill.
+    _passive_token_usage: dict[str, dict] = {}
 
     async def _on_passive_event(self, raw: dict) -> None:
         """Lightweight passive handler: only publishes tool events to the
@@ -497,23 +498,28 @@ class SessionBridge:
                 "ts": ts,
             })
 
+        elif event.kind == OpenClawEventKind.ASSISTANT_DONE:
+            # Stash token usage so RUN_COMPLETED can attach it to turn_complete.
+            # Skipped on the active path (chat_streaming forwards usage there).
+            if event.token_usage:
+                self._passive_token_usage[run_id] = event.token_usage
+
         elif event.kind == OpenClawEventKind.RUN_COMPLETED:
             self._passive_tool_counters.pop(run_id, None)
             self._passive_call_id_stacks.pop(run_id, None)
+            token_usage = self._passive_token_usage.pop(run_id, None)
             self._publisher.publish_unified_event(bot_id, user_id, {
                 "_type": "turn_complete",
                 "turn_id": run_id,
                 "bot_id": bot_id,
                 "user_id": user_id,
                 "status": "completed",
+                "token_usage": token_usage,
                 "ts": ts,
             })
 
     async def _on_raw_event(self, raw: dict) -> None:
         """Process a raw WS message: parse -> store -> update run state -> publish to Redis."""
-        metrics = get_metrics()
-        metrics.incr("openclaw.ws_messages_received")
-
         session_key = raw.get("session_key", "")
         if not session_key:
             sessions = self._ws_client.subscribed_sessions
@@ -521,10 +527,7 @@ class SessionBridge:
 
         event = self._ingest.parse(raw, session_key)
         if event is None:
-            metrics.incr("openclaw.events_dropped", reason="parse_failed")
             return
-
-        metrics.incr("openclaw.events_parsed", kind=event.kind.value, session=session_key)
 
         # Store to Postgres (idempotent)
         stored = self._store.store(event)
@@ -576,9 +579,6 @@ class SessionBridge:
                 full_text = self._store.assemble_run_text(event.run_id)
             tool_calls = self._run_tool_calls.pop(event.run_id, [])
             self._store.complete_run(event.run_id, full_text, tool_calls or None)
-            metrics.incr("openclaw.runs_completed", session=event.session_key)
-            metrics.gauge("openclaw.last_run_text_len", float(len(full_text)), session=event.session_key)
-            metrics.gauge("openclaw.last_run_tool_calls", float(len(tool_calls)), session=event.session_key)
             logger.info(
                 "OpenClaw run completed: run_id=%s text_len=%d tools=%d",
                 event.run_id, len(full_text), len(tool_calls),

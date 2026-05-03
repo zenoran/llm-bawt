@@ -152,9 +152,12 @@ def extract_profile_attributes_from_fact(
     
     # Store as profile attribute
     try:
-        from llm_bawt.profiles import ProfileManager, EntityType
-
-        manager = ProfileManager(config)
+        from llm_bawt.profiles import EntityType
+        # TASK-202: reuse the cached MCP-process ProfileManager singleton
+        # rather than constructing a new one per fact extraction. Each
+        # ProfileManager owns a 5-connection SQLAlchemy pool.
+        from llm_bawt.mcp_server.server import _get_profile_manager
+        manager = _get_profile_manager()
         attr = manager.set_attribute(
             entity_type=EntityType.USER,
             entity_id=user_id,

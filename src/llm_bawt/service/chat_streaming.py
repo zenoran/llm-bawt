@@ -52,6 +52,7 @@ class ChatStreamingMixin:
         ctx: Any,
         turn_log_id: str,
         llm_bawt: Any,
+        trigger_message_id: str | None = None,
     ) -> AsyncIterator[str]:
         """Stream an OpenClaw response via the WS SessionBridge."""
         bridge = self._session_bridge
@@ -204,6 +205,7 @@ class ChatStreamingMixin:
                                 "_type": "tool_event",
                                 "event": "tool_start",
                                 "turn_id": turn_log_id,
+                                "trigger_message_id": trigger_message_id,
                                 "bot_id": bot_id,
                                 "user_id": user_id,
                                 "tool_name": tool_name,
@@ -232,6 +234,7 @@ class ChatStreamingMixin:
                                 "_type": "tool_event",
                                 "event": "tool_end",
                                 "turn_id": turn_log_id,
+                                "trigger_message_id": trigger_message_id,
                                 "bot_id": bot_id,
                                 "user_id": user_id,
                                 "tool_name": event.tool_name or "unknown",
@@ -282,12 +285,48 @@ class ChatStreamingMixin:
                         break
 
                 elif event.kind == OpenClawEventKind.ERROR:
+                    # Surface the error as VISIBLE assistant content (TASK-202).
+                    # Previously this only emitted a sidecar service.warning
+                    # which the UI does not render — leaving the user with a
+                    # blank message and no idea what went wrong. Now the error
+                    # text shows up in the assistant bubble itself, in addition
+                    # to the warning channel for tooling and the error status
+                    # on the turn log.
+                    err_text = (event.text or "").strip() or "(no error text from bridge)"
+                    visible = f"⚠️ openclaw bridge error\n\n```\n{err_text}\n```"
+                    full_text_parts.append(visible)
+                    data = {
+                        "id": response_id,
+                        "object": "chat.completion.chunk",
+                        "created": created,
+                        "model": model_alias,
+                        "choices": [
+                            {"index": 0, "delta": {"content": visible}, "finish_reason": None}
+                        ],
+                    }
+                    yield f"data: {json.dumps(data)}\n\n"
                     warning_data = {
                         "object": "service.warning",
                         "model": model_alias,
-                        "warnings": [f"openclaw_error: {event.text}"],
+                        "warnings": [f"openclaw_error: {err_text}"],
                     }
                     yield f"data: {json.dumps(warning_data)}\n\n"
+                    # Record the error on the turn log so it shows up in
+                    # /v1/turn-logs review.
+                    try:
+                        elapsed_ms = (time.time() - start_time) * 1000
+                        self._update_turn_log(
+                            turn_id=turn_log_id,
+                            status="error",
+                            latency_ms=elapsed_ms,
+                            error_text=err_text,
+                        )
+                    except Exception as _log_err:
+                        log.warning(
+                            "Failed to record openclaw bridge error on turn log %s: %s",
+                            turn_log_id,
+                            _log_err,
+                        )
                     break
 
             # Final chunk
@@ -360,19 +399,43 @@ class ChatStreamingMixin:
             _finalized = True
 
         except Exception as e:
-            log.error("OpenClaw bridge stream failed: %s", e)
+            # TASK-202: don't swallow the exception into a sidecar warning the
+            # UI ignores — render it as VISIBLE assistant content. Include
+            # exception type + message + a short traceback excerpt to help
+            # diagnose what failed.
+            import traceback as _tb
+            log.exception("OpenClaw bridge stream failed: %s", e)
             elapsed_ms = (time.time() - start_time) * 1000
+            tb_excerpt = _tb.format_exc(limit=4).strip()
+            err_text = f"{type(e).__name__}: {e}"
             self._update_turn_log(
                 turn_id=turn_log_id,
                 status="error",
                 latency_ms=elapsed_ms,
-                error_text=str(e),
+                error_text=err_text,
             )
             _finalized = True
+
+            visible = (
+                f"⚠️ bridge stream failed\n\n"
+                f"```\n{err_text}\n\n{tb_excerpt}\n```"
+            )
+            data = {
+                "id": response_id,
+                "object": "chat.completion.chunk",
+                "created": created,
+                "model": model_alias,
+                "choices": [
+                    {"index": 0, "delta": {"content": visible}, "finish_reason": None}
+                ],
+            }
+            yield f"data: {json.dumps(data)}\n\n"
+            full_text_parts.append(visible)
+
             warning_data = {
                 "object": "service.warning",
                 "model": model_alias,
-                "warnings": [f"bridge_error: {e}"],
+                "warnings": [f"bridge_error: {err_text}"],
             }
             yield f"data: {json.dumps(warning_data)}\n\n"
             data = {
@@ -557,6 +620,7 @@ class ChatStreamingMixin:
         tool_call_details_holder: list[dict] = []
         timing_holder = [0.0, 0.0]  # [start_time, end_time]
         cancelled_holder = [False]  # Track if we were cancelled
+        token_usage_holder: list[dict | None] = [None]  # Captures upstream SDK token usage for turn_complete
 
         # Capture the event loop before entering the thread
         loop = asyncio.get_running_loop()
@@ -639,12 +703,15 @@ class ChatStreamingMixin:
                     llm_bawt._include_summaries = request.include_summaries
                 llm_bawt._tts_mode = request.tts_mode or llm_bawt.bot.tts_mode
 
-                # Load animations for tts_mode — must happen before streaming starts
+                # Load animations for tts_mode — must happen before streaming starts.
+                # Use the cached singleton store (TASK-202): constructing
+                # AvatarAnimationStore per chat opens a fresh 5-connection pool
+                # that doesn't get freed until GC.
                 _animations: list = []
                 if llm_bawt._tts_mode:
                     try:
-                        from .animation_tool import AvatarAnimationStore
-                        _animations = AvatarAnimationStore(self.config).list_enabled()
+                        from .dependencies import get_avatar_animation_store
+                        _animations = get_avatar_animation_store(self.config).list_enabled()
                     except Exception as _e:
                         log.debug("Could not load animations: %s", _e)
                 _use_animation_tool = bool(
@@ -871,6 +938,7 @@ class ChatStreamingMixin:
                                                 "_type": "tool_event",
                                                 "event": "tool_start",
                                                 "turn_id": turn_log_id,
+                                                "trigger_message_id": trigger_message_id,
                                                 "bot_id": bot_id,
                                                 "user_id": user_id,
                                                 "tool_name": name,
@@ -895,6 +963,7 @@ class ChatStreamingMixin:
                                                 "_type": "tool_event",
                                                 "event": "tool_end",
                                                 "turn_id": turn_log_id,
+                                                "trigger_message_id": trigger_message_id,
                                                 "bot_id": bot_id,
                                                 "user_id": user_id,
                                                 "tool_name": name,
@@ -1060,6 +1129,14 @@ class ChatStreamingMixin:
                                 if item.get("upstream_model"):
                                     _upstream_model[0] = item["upstream_model"]
                                 continue
+                            if evt == "token_usage":
+                                # Capture for turn_complete payload — frontend
+                                # surfaces input/cache/output + context window
+                                # in the assistant bubble's lower-right pill.
+                                tu = item.get("token_usage")
+                                if isinstance(tu, dict):
+                                    token_usage_holder[0] = tu
+                                continue
                             if evt in ("tool_call", "tool_result"):
                                 _saw_tool = True
                             if evt == "tool_call":
@@ -1079,6 +1156,7 @@ class ChatStreamingMixin:
                                     "_type": "tool_event",
                                     "event": "tool_start",
                                     "turn_id": turn_log_id,
+                                    "trigger_message_id": trigger_message_id,
                                     "bot_id": bot_id,
                                     "user_id": user_id,
                                     "tool_name": item.get("name", "unknown"),
@@ -1109,6 +1187,7 @@ class ChatStreamingMixin:
                                     "_type": "tool_event",
                                     "event": "tool_end",
                                     "turn_id": turn_log_id,
+                                    "trigger_message_id": trigger_message_id,
                                     "bot_id": bot_id,
                                     "user_id": user_id,
                                     "tool_name": _result_name or "unknown",
@@ -1179,6 +1258,7 @@ class ChatStreamingMixin:
                             elapsed_ms=elapsed_ms,
                             stream=True,
                             animation=animation_holder[0],
+                            token_usage=token_usage_holder[0],
                         )
                     else:
                         # No response received — mark as timeout so turn doesn't
@@ -1216,6 +1296,7 @@ class ChatStreamingMixin:
                     "user_id": user_id,
                     "status": status,
                     "animation": animation_holder[0],
+                    "token_usage": token_usage_holder[0],
                     "ts": time.time(),
                 })
 

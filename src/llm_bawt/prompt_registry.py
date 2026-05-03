@@ -149,6 +149,36 @@ def _load_memory_maintenance_intent_content_only() -> str:
     return INTENT_PROMPT_CONTENT_ONLY
 
 
+def _load_agents_task_spec() -> str:
+    from .agent_backends.prompts import TASK_SPEC_PROMPT
+
+    return TASK_SPEC_PROMPT
+
+
+def _load_agents_task_execution() -> str:
+    from .agent_backends.prompts import TASK_EXECUTION_PROMPT
+
+    return TASK_EXECUTION_PROMPT
+
+
+def _load_agents_project_plan() -> str:
+    from .agent_backends.prompts import PROJECT_PLAN_PROMPT
+
+    return PROJECT_PLAN_PROMPT
+
+
+def _load_agents_review() -> str:
+    from .agent_backends.prompts import REVIEW_DISPATCH_PROMPT
+
+    return REVIEW_DISPATCH_PROMPT
+
+
+def _load_agents_docs() -> str:
+    from .agent_backends.prompts import AGENTS_DOCS_PROMPT
+
+    return AGENTS_DOCS_PROMPT
+
+
 TTS_OUTPUT_INSTRUCTIONS = (
     "VOICE OUTPUT:\n"
     "Your response will be spoken via text-to-speech. Only include words to be spoken. "
@@ -223,6 +253,54 @@ DEFAULT_PROMPT_DEFINITIONS: dict[str, PromptDefinition] = {
         required_vars=(),
         loader=lambda: TTS_OUTPUT_INSTRUCTIONS,
     ),
+    "agents.task_spec": PromptDefinition(
+        key="agents.task_spec",
+        title="Agent Task Spec (Planning Mode)",
+        category="agent_execution",
+        required_vars=("task_context", "task_url", "extra_api_lines"),
+        loader=_load_agents_task_spec,
+    ),
+    "agents.task_execution": PromptDefinition(
+        key="agents.task_execution",
+        title="Agent Task Execution",
+        category="agent_execution",
+        required_vars=("task_context", "task_url", "finish_instruction"),
+        loader=_load_agents_task_execution,
+    ),
+    "agents.project_plan": PromptDefinition(
+        key="agents.project_plan",
+        title="Agent Project Plan",
+        category="agent_execution",
+        required_vars=(
+            "project_name",
+            "project_details",
+            "project_context",
+            "tasks_url",
+            "project_url",
+            "project_id",
+        ),
+        loader=_load_agents_project_plan,
+    ),
+    "agents.review": PromptDefinition(
+        key="agents.review",
+        title="Agent Review Dispatch",
+        category="agent_execution",
+        required_vars=(
+            "task_context",
+            "review_comment",
+            "previous_response",
+            "task_url",
+            "finish_instruction",
+        ),
+        loader=_load_agents_review,
+    ),
+    "agents.docs": PromptDefinition(
+        key="agents.docs",
+        title="Agent Task System Reference Doc",
+        category="agent_execution",
+        required_vars=("origin", "task_section"),
+        loader=_load_agents_docs,
+    ),
 }
 
 
@@ -284,16 +362,12 @@ class PromptTemplateStore:
         if not has_database_credentials(config):
             return
         try:
-            host = getattr(config, "POSTGRES_HOST", "localhost")
-            port = int(getattr(config, "POSTGRES_PORT", 5432))
-            user = getattr(config, "POSTGRES_USER", "llm_bawt")
-            password = getattr(config, "POSTGRES_PASSWORD", "")
-            database = getattr(config, "POSTGRES_DATABASE", "llm_bawt")
-            encoded_password = quote_plus(password)
-            self.connection_url = f"postgresql+psycopg2://{user}:{encoded_password}@{host}:{port}/{database}"
-            self.engine = create_engine(self.connection_url, echo=False)
-            from .utils.db import set_utc_on_connect
-            set_utc_on_connect(self.engine)
+            from .utils.db import build_postgres_url, get_shared_engine
+            self.connection_url = build_postgres_url(config)
+            # Process-wide shared engine (TASK-202).
+            self.engine = get_shared_engine(config)
+            if self.engine is None:
+                return
             self._ensure_tables_exist()
         except Exception as e:
             self.engine = None

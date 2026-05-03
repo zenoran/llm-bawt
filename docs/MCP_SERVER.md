@@ -121,13 +121,20 @@ These tools wrap the agent task REST API (`/api/agents/*` on the unmute frontend
 |---|---|
 | `tasks_list(status?, project_id?, q?, limit?)` | List tasks with filters |
 | `tasks_get(task_id)` | Full task with steps, deps, project |
+| `tasks_get_context(task_id)` | Formatted briefing doc (task + steps + project context) |
 | `tasks_create(title, description?, project_id?, priority?, status?, steps?, bot_id?)` | Create a new task |
 | `tasks_update(task_id, status?, response?, model_id?, title?, description?, priority?, planned?, project_id?, agent_bot_id?, bot_id?)` | Update task fields |
-| `tasks_get_context(task_id)` | Formatted briefing doc (task + steps + project context) |
+| `tasks_delete(task_id, bot_id?)` | Hard-delete a task (prefer `status=CANCELLED`) |
+| `tasks_add_dependency(task_id, depends_on_id, bot_id?)` | Declare task waits for another (cycles rejected) |
+| `tasks_remove_dependency(task_id, depends_on_id, bot_id?)` | Disconnect a dependency |
+| `tasks_promote(task_id, bot_id?)` | Spin a task into its own project (re-parents the task) |
+| `tasks_regenerate(task_id, bot_id?)` | Server-side LLM rewrite of title + steps (rarely useful for agents) |
 | `steps_add(task_id, steps, bot_id?)` | Append steps to a task |
 | `steps_update(task_id, step_id, status?, output?, bot_id?)` | Mark step running/completed/failed/skipped |
+| `steps_delete(task_id, step_id, bot_id?)` | Hard-delete a step (prefer `status=SKIPPED`) |
 | `projects_list()` | List projects with task counts |
 | `projects_get(project_id)` | Full project incl. tasks and context prompt |
+| `projects_get_context(project_id)` | Plain markdown briefing of project name + contextPrompt |
 | `projects_create(name, description?, color?, icon?, context_prompt?, agent_bot_id?, bot_id?)` | Create a project |
 | `projects_update(project_id, name?, description?, color?, icon?, context_prompt?, agent_bot_id?, bot_id?)` | Update a project |
 | `projects_delete(project_id, bot_id?)` | Delete a project (tasks become unassigned) |

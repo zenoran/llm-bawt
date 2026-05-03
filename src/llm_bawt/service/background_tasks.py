@@ -175,8 +175,11 @@ class BackgroundTasksMixin:
 
         log.info(f"🔧 Profile maintenance: {entity_type}/{entity_id} (model={model_to_use})")
 
-        # Get or create profile manager
-        profile_manager = ProfileManager(self.config)
+        # Reuse the process-wide ProfileManager singleton — see TASK-202.
+        # Each ProfileManager owns its own 5-connection pool, so creating
+        # one per task on the executor leaks connections.
+        from .dependencies import get_profile_manager
+        profile_manager = get_profile_manager(self.config)
 
         # Use isolated background client — never interferes with main chat model
         llm_client, _ = self._get_background_client(model_override=model_to_use)
@@ -552,7 +555,14 @@ class BackgroundTasksMixin:
         # Get a PostgreSQL backend directly for message table access.
         # MemoryClient may be in MCP server mode where _get_storage() is
         # unavailable, so we create the backend ourselves.
+        #
+        # NOTE on connection pooling (TASK-202): ``PostgreSQLMemoryBackend``
+        # now shares a process-wide SQLAlchemy engine across all bots (see
+        # ``memory.postgresql._get_shared_memory_engine``), so constructing
+        # a backend here is cheap and we MUST NOT call engine.dispose() —
+        # that would tear down the pool used by every other bot.
         from ..memory.postgresql import PostgreSQLMemoryBackend
+        from ..memory.extraction.service import MemoryExtractionService, MemoryAction
 
         try:
             backend = PostgreSQLMemoryBackend(self.config, bot_id=bot_id)

@@ -2,7 +2,7 @@
 
 from fastapi import APIRouter, Depends, HTTPException
 
-from ..dependencies import get_service
+from ..dependencies import get_avatar_animation_store, get_service
 from ..animation_tool import AvatarAnimationStore
 from ..schemas import (
     AvatarAnimationCreate,
@@ -14,7 +14,9 @@ router = APIRouter()
 
 
 def _get_store(service=Depends(get_service)) -> AvatarAnimationStore:
-    return AvatarAnimationStore(service.config)
+    # Singleton — see TASK-202. Constructing per-request leaks a new
+    # SQLAlchemy connection pool until GC catches up.
+    return get_avatar_animation_store(service.config)
 
 
 @router.get("/v1/avatar/animations", response_model=list[AvatarAnimationResponse])

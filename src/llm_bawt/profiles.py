@@ -101,23 +101,30 @@ class AttributeCategory:
 
 
 class ProfileManager:
-    """Manages entity profiles (users and bots) in PostgreSQL."""
-    
+    """Manages entity profiles (users and bots) in PostgreSQL.
+
+    NOTE on connection pooling: callers should treat this object as a
+    long-lived singleton (one per process). It owns a SQLAlchemy engine
+    with its own connection pool — instantiating it per HTTP request
+    leaks connections until GC collects the engine. Routes that need a
+    ProfileManager should resolve a shared instance (see
+    ``llm_bawt.service.dependencies.get_profile_manager``).
+    """
+
     def __init__(self, config: Any):
         self.config = config
-        
+        from .utils.db import get_shared_engine
+
         host = getattr(config, 'POSTGRES_HOST', 'localhost')
         port = int(getattr(config, 'POSTGRES_PORT', 5432))
-        user = getattr(config, 'POSTGRES_USER', 'llm_bawt')
-        password = getattr(config, 'POSTGRES_PASSWORD', '')
         database = getattr(config, 'POSTGRES_DATABASE', 'llm_bawt')
-        
-        encoded_password = quote_plus(password)
-        connection_url = f"postgresql+psycopg2://{user}:{encoded_password}@{host}:{port}/{database}"
-        
-        self.engine = create_engine(connection_url, echo=False)
-        from .utils.db import set_utc_on_connect
-        set_utc_on_connect(self.engine)
+
+        # Process-wide shared engine (TASK-202): every Store talks to the
+        # same DB, so they all share one connection pool.
+        engine = get_shared_engine(config)
+        if engine is None:
+            raise RuntimeError("ProfileManager requires Postgres credentials")
+        self.engine = engine
         self._ensure_tables_exist()
         logger.debug(f"ProfileManager connected to {host}:{port}/{database}")
     

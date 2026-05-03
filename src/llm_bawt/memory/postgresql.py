@@ -25,10 +25,9 @@ from urllib.parse import quote_plus
 
 from sqlalchemy import (
     Column, String, Text, Float, DateTime, Integer, Boolean, MetaData, Table,
-    create_engine, select, delete, text, insert, update, JSON
+    select, delete, text, insert, update, JSON
 )
 from sqlalchemy.orm import Session
-from sqlalchemy.pool import QueuePool
 
 from .base import MemoryBackend
 
@@ -47,6 +46,11 @@ def _sanitize_table_name(bot_id: str) -> str:
     if not sanitized:
         sanitized = "default"
     return sanitized
+
+
+# Memory backends share the process-wide engine (TASK-202): see
+# llm_bawt.utils.db.get_shared_engine. All bots talk to the same Postgres
+# database — only table names differ — so they all share one pool.
 
 
 # ---------------------------------------------------------------------------
@@ -236,19 +240,14 @@ class PostgreSQLMemoryBackend(MemoryBackend):
         self.memories_table = get_memory_table_pg(bot_id)
         self.forgotten_table = get_forgotten_table_pg(bot_id)
         
-        # Build connection URL for PostgreSQL
-        encoded_password = quote_plus(password)
-        connection_url = f"postgresql+psycopg2://{user}:{encoded_password}@{host}:{port}/{database}"
-        
-        self.engine = create_engine(
-            connection_url,
-            echo=False,
-            poolclass=QueuePool,
-            pool_size=5,
-            max_overflow=10,
-        )
-        from ..utils.db import set_utc_on_connect
-        set_utc_on_connect(self.engine)
+        # Use the process-wide shared engine (TASK-202). Every Store +
+        # every bot's memory backend share one connection pool.
+        from ..utils.db import get_shared_engine
+        self.engine = get_shared_engine(config)
+        if self.engine is None:
+            raise RuntimeError(
+                "PostgreSQLMemoryBackend requires Postgres credentials"
+            )
 
         self._ensure_tables_exist()
         logger.debug(f"Connected to PostgreSQL at {host}:{port}/{database} (bot: {bot_id})")

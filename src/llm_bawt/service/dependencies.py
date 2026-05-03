@@ -1,5 +1,25 @@
-"""Shared FastAPI dependencies and service helpers."""
+"""Shared FastAPI dependencies and service helpers.
 
+Process-wide singleton stores
+-----------------------------
+The ``get_*_store`` / ``get_profile_manager`` helpers below return cached
+instances of Stores so that route handlers don't pay the construction
+cost (table-existence checks, schema migrations) on every request.
+
+After the TASK-202 refactor, **all Stores share a single SQLAlchemy
+engine** (see :func:`llm_bawt.utils.db.get_shared_engine`), so caching
+the Store is no longer necessary to avoid connection-pool leaks — the
+underlying pool is the same regardless of how many Store instances
+exist. The cache survives mainly to avoid repeating
+``CREATE TABLE IF NOT EXISTS`` on every call.
+
+The cache is keyed on ``id(config)`` so a fresh config (e.g. after
+``/v1/admin/reload``) yields a fresh Store. **Do NOT** call
+``engine.dispose()`` on evicted Stores — the engine is shared with every
+other Store and disposing it would break the whole process.
+"""
+
+import threading
 from typing import TYPE_CHECKING, Any
 
 try:
@@ -21,6 +41,103 @@ if TYPE_CHECKING:
     from .background_service import BackgroundService
 
 _service: "BackgroundService | None" = None
+
+# --------------------------------------------------------------------------
+# Process-wide store singletons (TASK-202: prevent connection-pool leaks).
+# --------------------------------------------------------------------------
+_store_lock = threading.Lock()
+_store_cache: dict[tuple[str, int], Any] = {}
+
+
+def _get_or_build_store(name: str, config: Any, factory):
+    """Return a cached store instance, building it on first request.
+
+    Keyed on ``(name, id(config))`` so the cache invalidates when the
+    config object is replaced (e.g. settings reload).
+
+    NOTE (TASK-202): every Store now shares one process-wide SQLAlchemy
+    engine. We do **not** call ``engine.dispose()`` on evicted Stores
+    because that would tear down the shared pool used by every other
+    Store. Eviction simply drops the Python reference; the shared engine
+    keeps running.
+    """
+    key = (name, id(config))
+    cached = _store_cache.get(key)
+    if cached is not None:
+        return cached
+    with _store_lock:
+        cached = _store_cache.get(key)
+        if cached is not None:
+            return cached
+        # Drop stale instances under the same name with a different config.
+        # Do NOT dispose their engine — it's the shared pool.
+        for existing_key in [k for k in _store_cache if k[0] == name]:
+            _store_cache.pop(existing_key, None)
+        instance = factory()
+        _store_cache[key] = instance
+        return instance
+
+
+def reset_store_cache() -> None:
+    """Drop all cached stores. Used at shutdown / reload.
+
+    Does NOT dispose the underlying shared engine — that's owned by
+    :mod:`llm_bawt.utils.db` and disposing it would break every other
+    Store. Call ``llm_bawt.utils.db.reset_shared_engines`` separately if
+    you really need to recycle the pool (tests only).
+    """
+    with _store_lock:
+        _store_cache.clear()
+
+
+def get_profile_manager(config: Any):
+    """Process-wide ``ProfileManager`` singleton. See module docstring."""
+    from ..profiles import ProfileManager
+
+    return _get_or_build_store("profile_manager", config, lambda: ProfileManager(config))
+
+
+def get_bot_profile_store(config: Any):
+    """Process-wide ``BotProfileStore`` singleton."""
+    from ..runtime_settings import BotProfileStore
+
+    return _get_or_build_store("bot_profile_store", config, lambda: BotProfileStore(config))
+
+
+def get_runtime_settings_store(config: Any):
+    """Process-wide ``RuntimeSettingsStore`` singleton."""
+    from ..runtime_settings import RuntimeSettingsStore
+
+    return _get_or_build_store(
+        "runtime_settings_store", config, lambda: RuntimeSettingsStore(config)
+    )
+
+
+def get_model_definition_store(config: Any):
+    """Process-wide ``ModelDefinitionStore`` singleton."""
+    from ..runtime_settings import ModelDefinitionStore
+
+    return _get_or_build_store(
+        "model_definition_store", config, lambda: ModelDefinitionStore(config)
+    )
+
+
+def get_avatar_animation_store(config: Any):
+    """Process-wide ``AvatarAnimationStore`` singleton."""
+    from .animation_tool import AvatarAnimationStore
+
+    return _get_or_build_store(
+        "avatar_animation_store", config, lambda: AvatarAnimationStore(config)
+    )
+
+
+def get_prompt_template_store(config: Any):
+    """Process-wide ``PromptTemplateStore`` singleton."""
+    from ..prompt_registry import PromptTemplateStore
+
+    return _get_or_build_store(
+        "prompt_template_store", config, lambda: PromptTemplateStore(config)
+    )
 
 
 def set_service(service: "BackgroundService | None") -> None:

@@ -550,6 +550,16 @@ class ClaudeCodeBridge:
 
                 auth_retry_attempted = False
                 fresh_session_retry = False
+                # Pull (or create) the cooperative cancel event for this session so a
+                # chat.abort that arrives mid-loop is observed at the next message
+                # boundary — without waiting for `task.cancel()` to fire CancelledError
+                # at the next `await` (which can be tens of seconds inside a tool call).
+                cancel_event = (
+                    self._session_queue.cancel_event(session_key) if session_key else None
+                )
+                if cancel_event is not None and cancel_event.is_set():
+                    # Stale signal from a previous run — clear so this turn can proceed.
+                    cancel_event.clear()
                 while True:
                     stderr_lines: list[str] = []
 
@@ -579,10 +589,31 @@ class ClaudeCodeBridge:
                     )
 
                     session_persisted = False
+                    aborted = False
 
+                    msg_stream = None
                     try:
                         msg_stream = query(prompt=prompt_input, options=options).__aiter__()
+                        # Register the live stream so `chat.abort` can call
+                        # `aclose()` on it — that's what actually kills the
+                        # underlying CLI subprocess mid-tool-call. `task.cancel()`
+                        # alone is insufficient because CancelledError only fires
+                        # at the next `await`, and the SDK is awaiting on subprocess
+                        # output that doesn't arrive until the running tool exits.
+                        if session_key:
+                            self._session_queue.set_active_stream(session_key, msg_stream)
                         while True:
+                            # Cooperative abort check — runs before every SDK
+                            # `__anext__`, so an abort signalled by chat.abort is
+                            # observed even if the previous `await` was already
+                            # past the cancel injection point.
+                            if cancel_event is not None and cancel_event.is_set():
+                                logger.info(
+                                    "chat.abort signalled, halting SDK iteration: session=%s request=%s",
+                                    session_key, request_id,
+                                )
+                                aborted = True
+                                break
                             try:
                                 msg = await asyncio.wait_for(
                                     msg_stream.__anext__(),
@@ -691,14 +722,91 @@ class ClaudeCodeBridge:
                                                 result_text += block.get("text", "")
                                     full_text = result_text
 
+                                # Extract token usage + context window for UI surfacing.
+                                # ResultMessage.usage carries per-turn billed tokens; the
+                                # full input_tokens count = input + cache_creation + cache_read
+                                # since the model sees all of it as context. ResultMessage.model_usage
+                                # is keyed by model id and exposes the model's contextWindow so
+                                # consumers can render % used.
+                                token_usage_payload: dict | None = None
+                                try:
+                                    usage = getattr(msg, "usage", None) or {}
+                                    model_usage = getattr(msg, "model_usage", None) or {}
+                                    ctx_window = None
+                                    max_output = None
+                                    if isinstance(model_usage, dict):
+                                        # Prefer the actual model we ran on; fall back to any entry.
+                                        mu_entry = (
+                                            model_usage.get(actual_model)
+                                            if actual_model
+                                            else None
+                                        )
+                                        if mu_entry is None and model_usage:
+                                            mu_entry = next(iter(model_usage.values()), None)
+                                        if isinstance(mu_entry, dict):
+                                            ctx_window = mu_entry.get("contextWindow")
+                                            max_output = mu_entry.get("maxOutputTokens")
+                                    if usage or ctx_window:
+                                        token_usage_payload = {
+                                            "input_tokens": int(usage.get("input_tokens", 0) or 0),
+                                            "cache_read_tokens": int(
+                                                usage.get("cache_read_input_tokens", 0) or 0
+                                            ),
+                                            "cache_creation_tokens": int(
+                                                usage.get("cache_creation_input_tokens", 0) or 0
+                                            ),
+                                            "output_tokens": int(usage.get("output_tokens", 0) or 0),
+                                            "context_window": ctx_window,
+                                            "max_output_tokens": max_output,
+                                            "total_cost_usd": getattr(msg, "total_cost_usd", None),
+                                        }
+                                except Exception as _usage_err:
+                                    logger.debug("Failed to extract token usage: %s", _usage_err)
+
                                 seq += 1
                                 self._publish_event(
                                     request_id, session_key, seq,
                                     kind=OpenClawEventKind.ASSISTANT_DONE,
                                     text=full_text,
                                     model=actual_model,
+                                    token_usage=token_usage_payload,
                                 )
+                        if aborted:
+                            # Cooperative abort fired — fall straight through to
+                            # publish_run_done without retry. We deliberately drop
+                            # any partial response: the user explicitly cancelled.
+                            seq += 1
+                            self._publish_event(
+                                request_id, session_key, seq,
+                                kind=OpenClawEventKind.ASSISTANT_DONE,
+                                text="".join(text_parts),
+                                model=actual_model,
+                            )
                         break
+                    except asyncio.CancelledError:
+                        # task.cancel() arrived from elsewhere (legacy path /
+                        # belt-and-suspenders fallback). Make sure the run is
+                        # finalized before we re-raise so the frontend doesn't
+                        # see a stuck `streaming` turn.
+                        logger.info(
+                            "Send cancelled via task.cancel: request_id=%s session=%s",
+                            request_id, session_key,
+                        )
+                        seq += 1
+                        try:
+                            self._publish_event(
+                                request_id, session_key, seq,
+                                kind=OpenClawEventKind.ASSISTANT_DONE,
+                                text="".join(text_parts),
+                                model=actual_model,
+                            )
+                        except Exception:
+                            logger.debug("Failed to publish ASSISTANT_DONE on cancel", exc_info=True)
+                        try:
+                            self._publisher.publish_run_done(request_id)
+                        except Exception:
+                            logger.debug("Failed to publish run_done on cancel", exc_info=True)
+                        raise
                     except Exception as e:
                         # 1) Auth failure → refresh token and retry once
                         if (
@@ -733,10 +841,44 @@ class ClaudeCodeBridge:
                             continue
 
                         raise
+                    finally:
+                        # Always deregister this iteration's stream so a
+                        # subsequent chat.abort doesn't try to aclose() a
+                        # generator that's already finished. We pop only if
+                        # the registry still points at our stream — concurrent
+                        # aborts may have already popped it to call aclose().
+                        if session_key and msg_stream is not None:
+                            current = self._session_queue.get_active_stream(session_key)
+                            if current is msg_stream:
+                                self._session_queue.pop_active_stream(session_key)
+                            # Best-effort close — kills the SDK subprocess if
+                            # it's still running. Bounded so a stuck SIGKILL
+                            # can't wedge the bridge.
+                            try:
+                                await asyncio.wait_for(msg_stream.aclose(), timeout=10.0)
+                            except (asyncio.TimeoutError, asyncio.CancelledError):
+                                pass
+                            except Exception:
+                                logger.debug(
+                                    "msg_stream.aclose() raised", exc_info=True,
+                                )
 
                 self._publisher.publish_run_done(request_id)
-                logger.info("Send completed: request_id=%s session=%s", request_id, session_key)
+                if aborted:
+                    logger.info(
+                        "Send aborted via chat.abort: request_id=%s session=%s",
+                        request_id, session_key,
+                    )
+                else:
+                    logger.info("Send completed: request_id=%s session=%s", request_id, session_key)
 
+            except asyncio.CancelledError:
+                # Already handled inside the inner try (we published run_done
+                # before re-raising). Suppress here so the asyncio task ends
+                # cleanly without the "Task was destroyed but it is pending"
+                # noise.
+                logger.debug("Send cancellation propagated past inner handler")
+                raise
             except Exception as e:
                 logger.exception("Send failed: request_id=%s", request_id)
                 seq += 1
@@ -781,16 +923,55 @@ class ClaudeCodeBridge:
                     )
             elif method == "chat.abort":
                 session_key = params.get("sessionKey", "")
+                # Three-layer abort:
+                #   1. Set the cooperative cancel event so the SDK message loop
+                #      breaks out at the next iteration boundary.
+                #   2. Pop and aclose() the active SDK message stream — this is
+                #      what actually kills the underlying `claude` CLI subprocess
+                #      mid-tool-call. Without (2), `task.cancel()` only raises
+                #      CancelledError at the next `await` point, which can be
+                #      tens of seconds away inside a long Bash/Read tool call.
+                #   3. Fall back to task.cancel() so a runaway task that didn't
+                #      respect (1) and (2) still gets torn down.
+                self._session_queue.signal_cancel(session_key)
+                stream = self._session_queue.pop_active_stream(session_key)
+                stream_closed = False
+                if stream is not None:
+                    try:
+                        await asyncio.wait_for(stream.aclose(), timeout=10.0)
+                        stream_closed = True
+                    except asyncio.TimeoutError:
+                        logger.warning(
+                            "aclose() timed out for session %s — subprocess may be stuck",
+                            session_key,
+                        )
+                    except Exception:
+                        logger.debug(
+                            "aclose() raised on chat.abort for session %s",
+                            session_key,
+                            exc_info=True,
+                        )
                 cancelled = self._session_queue.cancel_active(session_key)
+                detail_parts: list[str] = []
                 if cancelled:
-                    self._publisher.publish_rpc_result(
-                        request_id, {"ok": True, "aborted": session_key}
-                    )
-                else:
-                    logger.info("No active task to abort for session: %s", session_key)
-                    self._publisher.publish_rpc_result(
-                        request_id, {"ok": True, "aborted": session_key, "detail": "no_active_task"}
-                    )
+                    detail_parts.append("task_cancelled")
+                if stream_closed:
+                    detail_parts.append("stream_closed")
+                if not detail_parts:
+                    detail_parts.append("no_active_task")
+                logger.info(
+                    "chat.abort: session=%s detail=%s",
+                    session_key,
+                    ",".join(detail_parts),
+                )
+                self._publisher.publish_rpc_result(
+                    request_id,
+                    {
+                        "ok": True,
+                        "aborted": session_key,
+                        "detail": ",".join(detail_parts),
+                    },
+                )
             else:
                 # Unknown RPC — return ok so callers don't hang
                 self._publisher.publish_rpc_result(
@@ -839,6 +1020,7 @@ class ClaudeCodeBridge:
         tool_arguments: dict | None = None,
         tool_result: str | None = None,
         model: str | None = None,
+        token_usage: dict | None = None,
     ) -> None:
         text = self._shorten_paths(text)
         tool_result = self._shorten_paths(tool_result)
@@ -862,5 +1044,6 @@ class ClaudeCodeBridge:
             seq=seq,
             timestamp=datetime.now(timezone.utc),
             raw={},
+            token_usage=token_usage,
         )
         self._publisher.publish_run_event(request_id, event)

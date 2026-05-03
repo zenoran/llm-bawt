@@ -108,7 +108,7 @@ curl http://localhost:8642/v1/chat/completions \
 | `CLAUDE_CODE_OAUTH_TOKEN` | (required) | OAuth token from `claude setup-token` |
 | `CLAUDE_CODE_MODEL` | `claude-sonnet-4-20250514` | Fallback model if bot config doesn't specify one |
 | `CLAUDE_CODE_CWD` | `/app` | Working directory for Claude Code |
-| `CLAUDE_CODE_ADD_DIRS` | | Comma-separated dirs to load skills/CLAUDE.md from |
+| `CLAUDE_CODE_ADD_DIRS` | | Optional extra directories to allow tool access to via Claude CLI `--add-dir` |
 | `CLAUDE_CODE_BRIDGE_LOG_LEVEL` | `INFO` | Logging level |
 
 ### Bot Config (`agent_backend_config`)
@@ -148,6 +148,7 @@ The bridge runs in a lightweight container (`python:3.12-slim`) shared with the 
 |-----------|----------------|---------|
 | `~/dev` | `/home/bridge/dev` | Project files — Claude can read/write code |
 | `~/.config/claude-code-bridge` | `/home/bridge/.claude` | Claude Code config, settings, CLAUDE.md |
+| `~/dev/agent-skills` | `/home/bridge/.claude/skills` | Shared skills repo mounted directly into Claude's skills directory |
 | `~/.ssh` | `/home/bridge/.ssh` (ro) | SSH keys for git/remote access |
 | `~/.config/claude-code-bridge/ssh_config` | `/etc/ssh/ssh_config` (ro) | SSH host config |
 
@@ -159,14 +160,11 @@ The bridge runs in a lightweight container (`python:3.12-slim`) shared with the 
 
 ## Skills
 
-Claude Code loads skills from directories specified via `CLAUDE_CODE_ADD_DIRS`. Skills are standard Claude Code skill directories with `CLAUDE.md` files.
+This deployment exposes shared skills by bind-mounting `~/dev/agent-skills` directly to `/home/bridge/.claude/skills`.
 
-```bash
-# In .env:
-CLAUDE_CODE_ADD_DIRS=/home/bridge/dev/agent-skills
-```
+No per-skill symlinks are required for the bridge container. Edit skills on the host at `~/dev/agent-skills/` and the changes are visible immediately inside Claude.
 
-Edit skills on the host at `~/dev/agent-skills/` — changes are visible immediately (bind mount).
+`CLAUDE_CODE_ADD_DIRS` is not part of skill discovery here. If you set it, it is passed through as Claude CLI `--add-dir`, which only grants tool access to additional directories outside the main working tree.
 
 ## Switching a Bot from OpenClaw to Claude Code
 

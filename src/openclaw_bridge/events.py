@@ -35,6 +35,12 @@ class OpenClawEvent:
     timestamp: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
     raw: dict = field(default_factory=dict)
     db_id: int | None = None  # populated after store
+    # Per-turn token accounting from the upstream SDK's ResultMessage.
+    # Populated on ASSISTANT_DONE for backends that expose usage info
+    # (e.g. claude_code_bridge surfaces Claude Code SDK usage + modelUsage).
+    # Shape: {input_tokens, cache_read_tokens, cache_creation_tokens,
+    #         output_tokens, context_window, total_cost_usd}.
+    token_usage: dict | None = None
 
     def to_dict(self) -> dict:
         """Serialize for Redis/JSON transport."""
@@ -53,6 +59,7 @@ class OpenClawEvent:
             "timestamp": self.timestamp.isoformat() if self.timestamp else None,
             "db_id": self.db_id,
             "raw": self.raw,
+            "token_usage": self.token_usage,
         }
 
     @classmethod
@@ -78,6 +85,7 @@ class OpenClawEvent:
             timestamp=ts,
             db_id=data.get("db_id"),
             raw=data.get("raw", {}),
+            token_usage=data.get("token_usage"),
         )
 
 

@@ -201,6 +201,14 @@ class OpenClawBackend(AgentBackend):
                                         "event": "metadata",
                                         "upstream_model": upstream_model,
                                     })
+                                # Forward token usage / context window so the
+                                # SSE generator can surface it on turn_complete
+                                # for the chat UI's per-bubble usage pill.
+                                if event.token_usage:
+                                    result_queue.put({
+                                        "event": "token_usage",
+                                        "token_usage": event.token_usage,
+                                    })
                                 # ASSISTANT_DONE carries the complete response
                                 # text.  Yield any portion not already streamed
                                 # as deltas — this is critical for tool-heavy

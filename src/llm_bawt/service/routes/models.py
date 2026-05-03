@@ -80,10 +80,10 @@ async def reload_models_catalog():
     # Reset from YAML first so aliases removed from DB don't linger in-memory.
     config._load_models_config()
 
-    from ...runtime_settings import ModelDefinitionStore
+    from ..dependencies import get_model_definition_store
 
     db_count = 0
-    store = ModelDefinitionStore(config)
+    store = get_model_definition_store(config)
     if store.engine is not None:
         db_models = store.to_config_dict()
         db_count = len(db_models)
@@ -107,9 +107,9 @@ async def reload_models_catalog():
 
 def _get_model_store():
     """Get a ModelDefinitionStore instance."""
-    from ...runtime_settings import ModelDefinitionStore
+    from ..dependencies import get_model_definition_store
     service = get_service()
-    store = ModelDefinitionStore(service.config)
+    store = get_model_definition_store(service.config)
     if store.engine is None:
         raise HTTPException(status_code=503, detail="Model definitions database unavailable")
     return store

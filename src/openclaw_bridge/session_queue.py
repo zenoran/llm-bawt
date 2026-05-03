@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from typing import Any, AsyncIterator
 
 logger = logging.getLogger(__name__)
 
@@ -44,6 +45,20 @@ class SessionQueue:
     def __init__(self) -> None:
         self._locks: dict[str, asyncio.Lock] = {}
         self._active_tasks: dict[str, asyncio.Task] = {}
+        # Cooperative cancel signals — handlers check this between SDK
+        # messages so an abort takes effect without waiting for the next
+        # `await` point to fire CancelledError.
+        self._cancel_events: dict[str, asyncio.Event] = {}
+        # The active SDK message stream (an async generator) per session.
+        # Only used by the Claude Code bridge today; the OpenClaw bridge's
+        # cooperative cancel happens via `WSClient.cancel_session` instead.
+        # Tracking it here lets `chat.abort` call `aclose()` on the
+        # generator, which propagates GeneratorExit through the SDK's
+        # `try/finally` and forces the underlying `claude` CLI subprocess
+        # to be SIGTERM/SIGKILL'd.  Without this, `task.cancel()` only
+        # raises `CancelledError` at the next `await` point, which lets
+        # the SDK keep running mid-tool-call indefinitely.
+        self._active_streams: dict[str, AsyncIterator[Any]] = {}
 
     # -- Lock management --------------------------------------------------
 
@@ -92,3 +107,65 @@ class SessionQueue:
         """Return True if *session_key* has a running (non-done) task."""
         task = self._active_tasks.get(session_key)
         return task is not None and not task.done()
+
+    # -- Cooperative cancel events ---------------------------------------
+
+    def cancel_event(self, session_key: str) -> asyncio.Event:
+        """Get or create the cooperative cancel event for *session_key*.
+
+        Handlers should check ``event.is_set()`` between SDK messages and
+        bail out cleanly when set. The event survives across handler
+        invocations until explicitly cleared with ``clear_cancel_event``.
+        """
+        existing = self._cancel_events.get(session_key)
+        if existing is None:
+            existing = asyncio.Event()
+            self._cancel_events[session_key] = existing
+        return existing
+
+    def signal_cancel(self, session_key: str) -> bool:
+        """Set the cooperative cancel event for *session_key*.
+
+        Returns True if a fresh signal was raised (event went from clear
+        to set), False if the event was already set or no event existed.
+        Creates the event if it doesn't yet exist so a chat.abort that
+        races a slow chat.send still arms the flag for the next iteration.
+        """
+        event = self.cancel_event(session_key)
+        already_set = event.is_set()
+        event.set()
+        if not already_set:
+            logger.info("Cooperative cancel signalled: %s", session_key)
+        return not already_set
+
+    def clear_cancel_event(self, session_key: str) -> None:
+        """Drop the cancel event for *session_key*.
+
+        Call this from the handler's `finally` block so the next send
+        starts with a fresh, un-set event.
+        """
+        self._cancel_events.pop(session_key, None)
+
+    # -- Active SDK stream tracking (for forced subprocess kill) ----------
+
+    def set_active_stream(
+        self, session_key: str, stream: AsyncIterator[Any]
+    ) -> None:
+        """Register the active SDK message stream for *session_key*.
+
+        The stream is expected to be an async generator (e.g. the one
+        returned by `claude_agent_sdk.query()`). On abort, the bridge
+        will call `aclose()` on this generator to force the underlying
+        subprocess to terminate even mid-tool-call.
+        """
+        self._active_streams[session_key] = stream
+
+    def pop_active_stream(self, session_key: str) -> AsyncIterator[Any] | None:
+        """Remove and return the active SDK stream for *session_key*."""
+        return self._active_streams.pop(session_key, None)
+
+    def get_active_stream(
+        self, session_key: str
+    ) -> AsyncIterator[Any] | None:
+        """Return the active SDK stream for *session_key* without removing it."""
+        return self._active_streams.get(session_key)

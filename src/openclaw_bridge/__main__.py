@@ -12,7 +12,6 @@ import sys
 from .bridge import SessionBridge
 from .config import BridgeConfig
 from .ingest import EventIngestPipeline, IngestFilterConfig
-from .metrics import get_metrics
 from .publisher import RedisPublisher
 from .store import EventStore, create_openclaw_tables
 from .ws_client import OpenClawWsClient, OpenClawWsConfig
@@ -68,9 +67,23 @@ def main() -> None:
         logger.error("OPENCLAW_WS_URL not set, cannot start bridge")
         sys.exit(1)
 
-    # PostgreSQL
+    # PostgreSQL — single shared pool for this process (TASK-202).
+    #
+    # The openclaw bridge runs in its own slim container that does NOT ship
+    # llm_bawt, so we can't import ``utils.db.get_shared_engine``. There's
+    # only one engine in this whole process, so we build it inline with the
+    # same parameters as the main app's shared engine. The askllm role is
+    # shared with the app under Postgres ``max_connections=100``; keep this
+    # process's footprint within (pool_size + max_overflow).
     from sqlalchemy import create_engine
-    engine = create_engine(config.postgres_url)
+    engine = create_engine(
+        config.postgres_url,
+        pool_size=5,
+        max_overflow=10,
+        pool_pre_ping=True,
+        pool_recycle=1800,
+        connect_args={"application_name": "openclaw-bridge"},
+    )
     create_openclaw_tables(engine)
 
     # Redis
@@ -106,10 +119,6 @@ def main() -> None:
         publisher=publisher,
         session_to_bot=session_to_bot,
     )
-
-    # Metrics
-    metrics = get_metrics()
-    metrics.set_tags(service="openclaw-bridge")
 
     logger.info(
         "Starting OpenClaw bridge (sessions=%s, bot_map=%s)",
@@ -169,7 +178,6 @@ def main() -> None:
         pass
     finally:
         loop.run_until_complete(bridge.stop())
-        metrics.close()
         loop.close()
 
 

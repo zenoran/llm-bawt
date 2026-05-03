@@ -94,16 +94,10 @@ class BotProfileStore:
             return
 
         try:
-            host = getattr(config, "POSTGRES_HOST", "localhost")
-            port = int(getattr(config, "POSTGRES_PORT", 5432))
-            user = getattr(config, "POSTGRES_USER", "llm_bawt")
-            password = getattr(config, "POSTGRES_PASSWORD", "")
-            database = getattr(config, "POSTGRES_DATABASE", "llm_bawt")
-            encoded_password = quote_plus(password)
-            connection_url = f"postgresql+psycopg2://{user}:{encoded_password}@{host}:{port}/{database}"
-            self.engine = create_engine(connection_url, echo=False)
-            from .utils.db import set_utc_on_connect
-            set_utc_on_connect(self.engine)
+            from .utils.db import get_shared_engine
+            self.engine = get_shared_engine(config)  # TASK-202: shared pool
+            if self.engine is None:
+                return
             self._ensure_tables_exist()
         except Exception as e:
             self.engine = None
@@ -571,10 +565,10 @@ class RuntimeSettingsStore:
             password = getattr(config, "POSTGRES_PASSWORD", "")
             database = getattr(config, "POSTGRES_DATABASE", "llm_bawt")
             encoded_password = quote_plus(password)
-            connection_url = f"postgresql+psycopg2://{user}:{encoded_password}@{host}:{port}/{database}"
-            self.engine = create_engine(connection_url, echo=False)
-            from .utils.db import set_utc_on_connect
-            set_utc_on_connect(self.engine)
+            from .utils.db import get_shared_engine
+            self.engine = get_shared_engine(config)  # TASK-202: shared pool
+            if self.engine is None:
+                return
             self._ensure_tables_exist()
         except Exception as e:
             self.engine = None
@@ -725,10 +719,10 @@ class ModelDefinitionStore:
             password = getattr(config, "POSTGRES_PASSWORD", "")
             database = getattr(config, "POSTGRES_DATABASE", "llm_bawt")
             encoded_password = quote_plus(password)
-            connection_url = f"postgresql+psycopg2://{user}:{encoded_password}@{host}:{port}/{database}"
-            self.engine = create_engine(connection_url, echo=False)
-            from .utils.db import set_utc_on_connect
-            set_utc_on_connect(self.engine)
+            from .utils.db import get_shared_engine
+            self.engine = get_shared_engine(config)  # TASK-202: shared pool
+            if self.engine is None:
+                return
             self._ensure_tables_exist()
         except Exception as e:
             self.engine = None

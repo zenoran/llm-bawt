@@ -5,7 +5,7 @@ from sqlmodel import Session, select
 
 from fastapi import APIRouter, HTTPException, Query
 
-from ..dependencies import attribute_to_response, get_service
+from ..dependencies import attribute_to_response, get_profile_manager, get_service
 from ..logging import get_service_logger
 from ..schemas import (
     ProfileAttributeUpdateRequest,
@@ -63,9 +63,9 @@ async def list_profiles(entity_type: str | None = None):
     service = get_service()
 
     try:
-        from ...profiles import EntityType, ProfileManager
+        from ...profiles import EntityType
 
-        manager = ProfileManager(service.config)
+        manager = get_profile_manager(service.config)
         normalized_entity_type = _normalize_entity_type(entity_type)
 
         result_profiles: list[ProfileDetail] = []
@@ -113,9 +113,9 @@ async def list_profile_attributes(
     service = get_service()
 
     try:
-        from ...profiles import EntityType, ProfileAttribute, ProfileManager
+        from ...profiles import EntityType, ProfileAttribute
 
-        manager = ProfileManager(service.config)
+        manager = get_profile_manager(service.config)
         normalized_entity_type = _normalize_entity_type(entity_type)
 
         conditions: list = []
@@ -172,9 +172,8 @@ async def lookup_profile_by_email(email: str = Query(..., description="Email add
     service = get_service()
 
     try:
-        from ...profiles import ProfileManager
-
-        manager = ProfileManager(service.config)
+        
+        manager = get_profile_manager(service.config)
         profile = manager.get_profile_by_email(email)
         if not profile:
             return {"found": False, "email": email, "entity_id": None}
@@ -196,9 +195,9 @@ async def get_profile(entity_id: str):
     service = get_service()
 
     try:
-        from ...profiles import EntityType, ProfileManager
+        from ...profiles import EntityType
 
-        manager = ProfileManager(service.config)
+        manager = get_profile_manager(service.config)
 
         user_profile = manager.get_profile(EntityType.USER, entity_id)
         if user_profile:
@@ -222,13 +221,13 @@ async def get_typed_profile(entity_type: str, entity_id: str):
     service = get_service()
 
     try:
-        from ...profiles import EntityType, ProfileManager
+        from ...profiles import EntityType
 
         normalized_entity_type = _normalize_entity_type(entity_type)
         if normalized_entity_type is None:
             raise HTTPException(status_code=400, detail="entity_type is required")
 
-        manager = ProfileManager(service.config)
+        manager = get_profile_manager(service.config)
         target_type = EntityType.USER if normalized_entity_type == "user" else EntityType.BOT
         return _get_profile_detail(manager, target_type, normalized_entity_type, entity_id)
     except HTTPException:
@@ -244,12 +243,11 @@ async def update_profile_attribute(attribute_id: int, request: ProfileAttributeU
     service = get_service()
 
     try:
-        from ...profiles import ProfileManager
-
+        
         if request.value is None and request.confidence is None and request.source is None:
             raise HTTPException(status_code=400, detail="Provide at least one field: value, confidence, or source")
 
-        manager = ProfileManager(service.config)
+        manager = get_profile_manager(service.config)
         updated = manager.update_attribute_by_id(
             attribute_id=attribute_id,
             value=request.value,
@@ -273,14 +271,14 @@ async def update_typed_profile(entity_type: str, entity_id: str, request: Profil
     service = get_service()
 
     try:
-        from ...profiles import EntityType, ProfileManager
+        from ...profiles import EntityType
 
         normalized_entity_type = _normalize_entity_type(entity_type)
         if normalized_entity_type is None:
             raise HTTPException(status_code=400, detail="entity_type is required")
 
         target_type = EntityType.USER if normalized_entity_type == "user" else EntityType.BOT
-        manager = ProfileManager(service.config)
+        manager = get_profile_manager(service.config)
 
         profile = manager.update_profile(
             target_type,
@@ -319,9 +317,9 @@ async def upsert_profile_attribute(request: ProfileAttributeUpsertRequest):
     service = get_service()
 
     try:
-        from ...profiles import EntityType, ProfileManager
+        from ...profiles import EntityType
 
-        manager = ProfileManager(service.config)
+        manager = get_profile_manager(service.config)
         entity_type = EntityType.USER if request.entity_type == "user" else EntityType.BOT
         attr = manager.set_attribute(
             entity_type=entity_type,
@@ -344,9 +342,8 @@ async def delete_profile_attribute(attribute_id: int):
     service = get_service()
 
     try:
-        from ...profiles import ProfileManager
-
-        manager = ProfileManager(service.config)
+        
+        manager = get_profile_manager(service.config)
 
         attr = manager.get_attribute_by_id(attribute_id)
         if not attr:

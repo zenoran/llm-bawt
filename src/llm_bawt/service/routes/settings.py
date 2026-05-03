@@ -8,8 +8,12 @@ from sqlmodel import Session, select
 from fastapi import APIRouter, HTTPException, Query
 
 from ...bot_types import normalize_bot_type
-from ...runtime_settings import BotProfileStore, RuntimeSetting, RuntimeSettingsStore, purge_bot_data, cleanup_orphaned_bot_data
-from ..dependencies import get_service
+from ...runtime_settings import RuntimeSetting, purge_bot_data, cleanup_orphaned_bot_data
+from ..dependencies import (
+    get_bot_profile_store,
+    get_runtime_settings_store,
+    get_service,
+)
 from ..schemas import (
     BotCreateRequest,
     BotProfileListResponse,
@@ -206,7 +210,7 @@ async def _persist_bot_profile(
     create_only: bool,
 ) -> BotProfileResponse:
     service = get_service()
-    store = BotProfileStore(service.config)
+    store = get_bot_profile_store(service.config)
     if store.engine is None:
         raise HTTPException(status_code=503, detail="Bot profiles DB unavailable")
 
@@ -248,7 +252,7 @@ async def list_runtime_settings(
     """List runtime settings for a scope."""
     service = get_service()
     st, sid = _normalize_scope(scope_type, scope_id, service._default_bot)
-    store = RuntimeSettingsStore(service.config)
+    store = get_runtime_settings_store(service.config)
     if store.engine is None:
         raise HTTPException(status_code=503, detail="Runtime settings DB unavailable")
     data = store.get_scope_settings(st, sid)
@@ -267,7 +271,7 @@ async def list_all_runtime_settings(
 ):
     """List runtime settings across all scopes."""
     service = get_service()
-    store = RuntimeSettingsStore(service.config)
+    store = get_runtime_settings_store(service.config)
     if store.engine is None:
         raise HTTPException(status_code=503, detail="Runtime settings DB unavailable")
 
@@ -336,7 +340,7 @@ async def upsert_runtime_setting(request: RuntimeSettingUpsertRequest):
     """Upsert one runtime setting for global or bot scope."""
     service = get_service()
     st, sid = _normalize_scope(request.scope_type, request.scope_id, service._default_bot)
-    store = RuntimeSettingsStore(service.config)
+    store = get_runtime_settings_store(service.config)
     if store.engine is None:
         raise HTTPException(status_code=503, detail="Runtime settings DB unavailable")
     store.set_value(st, sid, request.key, request.value)
@@ -358,7 +362,7 @@ async def delete_runtime_setting(
     """Delete one runtime setting."""
     service = get_service()
     st, sid = _normalize_scope(scope_type, scope_id, service._default_bot)
-    store = RuntimeSettingsStore(service.config)
+    store = get_runtime_settings_store(service.config)
     if store.engine is None:
         raise HTTPException(status_code=503, detail="Runtime settings DB unavailable")
     deleted = store.delete_value(st, sid, key)
@@ -375,7 +379,7 @@ async def delete_runtime_setting(
 async def batch_upsert_runtime_settings(request: RuntimeSettingBatchUpsertRequest):
     """Batch upsert runtime settings."""
     service = get_service()
-    store = RuntimeSettingsStore(service.config)
+    store = get_runtime_settings_store(service.config)
     if store.engine is None:
         raise HTTPException(status_code=503, detail="Runtime settings DB unavailable")
 
@@ -407,7 +411,7 @@ async def list_bot_profiles(
 ):
     """List DB-backed bot personality profiles with filters."""
     service = get_service()
-    store = BotProfileStore(service.config)
+    store = get_bot_profile_store(service.config)
     if store.engine is None:
         raise HTTPException(status_code=503, detail="Bot profiles DB unavailable")
 
@@ -472,7 +476,7 @@ async def create_bot(request: BotCreateRequest):
 async def get_bot_profile(slug: str):
     """Get bot personality profile by slug."""
     service = get_service()
-    store = BotProfileStore(service.config)
+    store = get_bot_profile_store(service.config)
     if store.engine is None:
         raise HTTPException(status_code=503, detail="Bot profiles DB unavailable")
 
@@ -493,7 +497,7 @@ async def upsert_bot_profile(slug: str, request: BotProfileUpsertRequest):
 async def patch_bot_profile(slug: str, request: BotProfilePatchRequest):
     """Partially update a bot profile. Only provided fields are changed."""
     service = get_service()
-    store = BotProfileStore(service.config)
+    store = get_bot_profile_store(service.config)
     if store.engine is None:
         raise HTTPException(status_code=503, detail="Bot profiles DB unavailable")
 
@@ -551,7 +555,7 @@ async def delete_bot_profile(
 ):
     """Delete a bot personality profile. Pass ?purge=true to also wipe all associated data."""
     service = get_service()
-    store = BotProfileStore(service.config)
+    store = get_bot_profile_store(service.config)
     if store.engine is None:
         raise HTTPException(status_code=503, detail="Bot profiles DB unavailable")
 
@@ -606,7 +610,7 @@ async def sync_soul(slug: str):
     import uuid
 
     service = get_service()
-    store = BotProfileStore(service.config)
+    store = get_bot_profile_store(service.config)
     if store.engine is None:
         raise HTTPException(status_code=503, detail="Bot profiles DB unavailable")
 
@@ -677,7 +681,7 @@ async def push_soul(slug: str):
     import uuid
 
     service = get_service()
-    store = BotProfileStore(service.config)
+    store = get_bot_profile_store(service.config)
     if store.engine is None:
         raise HTTPException(status_code=503, detail="Bot profiles DB unavailable")
 

@@ -78,10 +78,6 @@ services:
       - OPENCLAW_BRIDGE_LOG_LEVEL=${OPENCLAW_BRIDGE_LOG_LEVEL:-INFO}
       - LLM_BAWT_API_URL=http://app:8642
       - REDIS_URL=redis://redis:6379/0
-      - INFLUXDB_URL=${INFLUXDB_URL:-}
-      - INFLUXDB_TOKEN=${INFLUXDB_TOKEN:-}
-      - INFLUXDB_ORG=${INFLUXDB_ORG:-homeassistant}
-      - INFLUXDB_BUCKET=${INFLUXDB_BUCKET:-llm-bawt}
     extra_hosts:
       - "host.docker.internal:host-gateway"
       - "echo.lan.zenoran.com:${ECHO_LAN_HOST_IP:-10.0.0.101}"
@@ -111,7 +107,6 @@ services:
     environment:
       - CLAUDE_CODE_OAUTH_TOKEN=${CLAUDE_CODE_OAUTH_TOKEN:-}
       - CLAUDE_CODE_MODEL=${CLAUDE_CODE_MODEL:-claude-sonnet-4-20250514}
-      - CLAUDE_CODE_ADD_DIRS=${CLAUDE_CODE_ADD_DIRS:-}
       - CLAUDE_CODE_BRIDGE_LOG_LEVEL=${CLAUDE_CODE_BRIDGE_LOG_LEVEL:-INFO}
       - LLM_BAWT_API_URL=http://app:8642
       - REDIS_URL=redis://redis:6379/0

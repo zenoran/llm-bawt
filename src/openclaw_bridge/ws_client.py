@@ -367,8 +367,6 @@ class OpenClawWsClient:
             self._connected = True
             self._connected_event.set()
             logger.info("OpenClaw WS connected to %s (caps=%s)", self._config.url, ",".join(caps))
-            from .metrics import get_metrics
-            get_metrics().incr("openclaw.ws_connects")
             self._receive_task = asyncio.create_task(self._receive_loop())
 
             # --- Handle pairing if needed ---
@@ -385,8 +383,6 @@ class OpenClawWsClient:
             self._connected = False
             self._connected_event.clear()
             logger.warning("OpenClaw WS connect failed: %s", e)
-            from .metrics import get_metrics
-            get_metrics().incr("openclaw.ws_connect_failures")
             if not self._closing:
                 self._schedule_reconnect()
 
@@ -432,8 +428,6 @@ class OpenClawWsClient:
         except Exception as e:
             if not self._closing:
                 logger.warning("OpenClaw WS receive loop error: %s", e)
-                from .metrics import get_metrics
-                get_metrics().incr("openclaw.ws_disconnects", reason="error")
         finally:
             self._connected = False
             self._connected_event.clear()

@@ -242,6 +242,169 @@ async def update_task(
         return {"error": str(e), "status": e.response.status_code}
 
 
+@mcp.tool(name="tasks_delete")
+async def delete_task(
+    task_id: str,
+    bot_id: str | None = None,
+) -> dict:
+    """Delete an agent task.
+
+    WARNING: This permanently removes the task and all of its steps.
+    Prefer marking tasks as CANCELLED via tasks_update unless you're
+    cleaning up scratch / duplicate / clearly-bogus entries.
+
+    Args:
+        task_id: Task UUID or shortId (e.g. "TASK-42").
+        bot_id: Your bot ID for activity attribution.
+
+    Returns:
+        Confirmation dict, or error dict.
+    """
+    logger.debug("MCP tool invoked: tools/delete_task id=%s", task_id)
+    try:
+        return await _api_delete(
+            f"/tasks/{task_id}",
+            headers=_headers(bot_id),
+        )
+    except httpx.HTTPStatusError as e:
+        return {"error": str(e), "status": e.response.status_code}
+
+
+@mcp.tool(name="tasks_add_dependency")
+async def add_task_dependency(
+    task_id: str,
+    depends_on_id: str,
+    bot_id: str | None = None,
+) -> dict:
+    """Add a dependency: declare that ``task_id`` must wait for ``depends_on_id``.
+
+    Cycles are rejected by the server. A task cannot depend on itself.
+
+    Args:
+        task_id: The dependent task (UUID or shortId). This is the task
+                 that should NOT start until the dependency is done.
+        depends_on_id: The prerequisite task (UUID or shortId).
+        bot_id: Your bot ID for activity attribution.
+
+    Returns:
+        Updated dependent-task object with refreshed ``dependsOn`` list,
+        or error dict on cycle/missing-target.
+    """
+    logger.debug(
+        "MCP tool invoked: tools/add_task_dependency task=%s deps_on=%s",
+        task_id,
+        depends_on_id,
+    )
+    try:
+        return await _api_post(
+            f"/tasks/{task_id}/dependencies",
+            json={"depId": depends_on_id},
+            headers=_headers(bot_id),
+        )
+    except httpx.HTTPStatusError as e:
+        return {"error": str(e), "status": e.response.status_code}
+
+
+@mcp.tool(name="tasks_remove_dependency")
+async def remove_task_dependency(
+    task_id: str,
+    depends_on_id: str,
+    bot_id: str | None = None,
+) -> dict:
+    """Remove a dependency from a task.
+
+    Args:
+        task_id: The dependent task (UUID or shortId).
+        depends_on_id: The prerequisite task to disconnect (UUID or shortId).
+        bot_id: Your bot ID for activity attribution.
+
+    Returns:
+        Updated dependent-task object with refreshed ``dependsOn`` list.
+    """
+    logger.debug(
+        "MCP tool invoked: tools/remove_task_dependency task=%s deps_on=%s",
+        task_id,
+        depends_on_id,
+    )
+    client = _get_client()
+    url = f"{_API_PREFIX}/tasks/{task_id}/dependencies"
+    try:
+        # Some httpx versions disallow DELETE bodies via the helper, so build
+        # the request explicitly and pass depId as both body and query string.
+        resp = await client.request(
+            "DELETE",
+            url,
+            params={"depId": depends_on_id},
+            json={"depId": depends_on_id},
+            headers=_headers(bot_id),
+        )
+        resp.raise_for_status()
+        return resp.json()
+    except httpx.HTTPStatusError as e:
+        return {"error": str(e), "status": e.response.status_code}
+
+
+@mcp.tool(name="tasks_promote")
+async def promote_task(
+    task_id: str,
+    bot_id: str | None = None,
+) -> dict:
+    """Promote a task into its own project.
+
+    Creates a new project named after the task title (truncated to 100
+    chars) using the task description as the project context, then
+    re-parents the task into the new project. Useful when a task grows
+    into a long-running effort with subtasks.
+
+    Args:
+        task_id: Task UUID or shortId.
+        bot_id: Your bot ID for activity attribution.
+
+    Returns:
+        The newly created project object, or error dict.
+    """
+    logger.debug("MCP tool invoked: tools/promote_task id=%s", task_id)
+    try:
+        return await _api_post(
+            f"/tasks/{task_id}/promote",
+            json={},
+            headers=_headers(bot_id),
+        )
+    except httpx.HTTPStatusError as e:
+        return {"error": str(e), "status": e.response.status_code}
+
+
+@mcp.tool(name="tasks_regenerate")
+async def regenerate_task(
+    task_id: str,
+    bot_id: str | None = None,
+) -> dict:
+    """Server-side LLM regeneration of a task's title and steps.
+
+    The server calls Anthropic with the task description (and any attached
+    images) to generate a fresh title and a 3-8 step plan, then replaces
+    the existing steps. RARELY USEFUL FOR AGENTS — you are already an LLM
+    and can write better steps yourself via tasks_update + steps_add. This
+    tool exists for parity with the human UI's "regenerate" button.
+
+    Args:
+        task_id: Task UUID or shortId.
+        bot_id: Your bot ID for activity attribution.
+
+    Returns:
+        Updated task object with regenerated title + steps, or error dict.
+    """
+    logger.debug("MCP tool invoked: tools/regenerate_task id=%s", task_id)
+    try:
+        return await _api_post(
+            f"/tasks/{task_id}/regenerate",
+            json={},
+            headers=_headers(bot_id),
+        )
+    except httpx.HTTPStatusError as e:
+        return {"error": str(e), "status": e.response.status_code}
+
+
 @mcp.tool(name="tasks_create")
 async def create_task(
     title: str,
@@ -333,6 +496,40 @@ async def update_step(
         return await _api_patch(
             f"/tasks/{task_id}/steps/{step_id}",
             json=body,
+            headers=_headers(bot_id),
+        )
+    except httpx.HTTPStatusError as e:
+        return {"error": str(e), "status": e.response.status_code}
+
+
+@mcp.tool(name="steps_delete")
+async def delete_step(
+    task_id: str,
+    step_id: str,
+    bot_id: str | None = None,
+) -> dict:
+    """Delete a step from a task.
+
+    WARNING: This permanently removes the step. Prefer setting status to
+    SKIPPED via steps_update unless the step is genuinely a mistake — the
+    audit trail is more useful than a silently-deleted row.
+
+    Args:
+        task_id: Parent task UUID or shortId.
+        step_id: Step UUID to delete.
+        bot_id: Your bot ID for activity attribution.
+
+    Returns:
+        Confirmation dict, or error dict.
+    """
+    logger.debug(
+        "MCP tool invoked: tools/delete_step task=%s step=%s",
+        task_id,
+        step_id,
+    )
+    try:
+        return await _api_delete(
+            f"/tasks/{task_id}/steps/{step_id}",
             headers=_headers(bot_id),
         )
     except httpx.HTTPStatusError as e:
@@ -521,6 +718,35 @@ async def update_project(
         )
     except httpx.HTTPStatusError as e:
         return {"error": str(e), "status": e.response.status_code}
+
+
+@mcp.tool(name="projects_get_context")
+async def get_project_context(
+    project_id: str,
+) -> str:
+    """Get a project's context as a plain-text markdown briefing.
+
+    Returns the project name and contextPrompt formatted as readable
+    markdown. Use this for a lightweight read of project conventions
+    when you don't need the full task list (which projects_get returns).
+
+    Args:
+        project_id: Project UUID.
+
+    Returns:
+        Markdown text with the project name as an H1 heading and the
+        contextPrompt under a "## Context" section. Returns an error
+        string if the project is not found.
+    """
+    logger.debug("MCP tool invoked: tools/get_project_context id=%s", project_id)
+    client = _get_client()
+    url = f"{_API_PREFIX}/projects/{project_id}/context"
+    try:
+        resp = await client.get(url)
+        resp.raise_for_status()
+        return resp.text
+    except httpx.HTTPStatusError as e:
+        return f"Error fetching project context: HTTP {e.response.status_code}"
 
 
 @mcp.tool(name="projects_delete")

@@ -164,6 +164,10 @@ def _load_db_bot_overrides() -> dict[str, dict[str, Any]]:
     These values take priority over YAML bot fields when building the active
     in-memory bot registry.
     """
+    # TASK-202: this is called repeatedly (every BotManager rebuild). The
+    # store creates a SQLAlchemy engine with its own connection pool; we
+    # ``dispose()`` it after use so we don't accumulate one pool per reload.
+    store = None
     try:
         from llm_bawt.runtime_settings import BotProfileStore
         from llm_bawt.utils.config import Config, has_database_credentials
@@ -217,6 +221,12 @@ def _load_db_bot_overrides() -> dict[str, dict[str, Any]]:
     except Exception as e:
         logger.warning(f"Could not load DB bot profile overrides: {e}")
         return {}
+    finally:
+        if store is not None and getattr(store, "engine", None) is not None:
+            try:
+                store.engine.dispose()
+            except Exception:
+                pass
 
 
 def _load_merged_yaml() -> tuple[dict, Path, Path]:

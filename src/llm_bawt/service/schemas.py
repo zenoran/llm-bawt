@@ -390,6 +390,11 @@ class TurnLogListItem(BaseModel):
     agent_session_key: str | None = None
     agent_request_id: str | None = None
     trigger_message_id: str | None = None
+    # Per-turn token accounting from the upstream SDK (claude_code, etc.).
+    # Shape: {input_tokens, cache_read_tokens, cache_creation_tokens,
+    #         output_tokens, context_window, max_output_tokens, total_cost_usd}.
+    # None when the upstream backend doesn't expose usage info.
+    token_usage: dict[str, Any] | None = None
 
 
 class TurnLogListResponse(BaseModel):
@@ -419,6 +424,7 @@ class TurnLogDetail(BaseModel):
     animation: str | None = None
     agent_session_key: str | None = None
     agent_request_id: str | None = None
+    token_usage: dict[str, Any] | None = None
 
 
 class ToolCallEvent(BaseModel):
