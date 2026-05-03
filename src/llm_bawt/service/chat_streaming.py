@@ -1178,6 +1178,7 @@ class ChatStreamingMixin:
                                     "arguments": item.get("arguments", {}),
                                     "call_id": cid,
                                     "iteration": 1,
+                                    "provider": item.get("provider"),
                                     "ts": time.time(),
                                 })
                             elif evt == "tool_result":
@@ -1209,6 +1210,7 @@ class ChatStreamingMixin:
                                     "call_id": _end_cid,
                                     "result": str(item.get("result", ""))[:2000],
                                     "iteration": 1,
+                                    "provider": item.get("provider"),
                                     "ts": time.time(),
                                 })
                                 # Update the matching detail entry with result

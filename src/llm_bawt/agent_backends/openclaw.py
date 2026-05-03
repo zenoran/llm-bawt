@@ -262,6 +262,7 @@ class OpenClawBackend(AgentBackend):
                                     "event": "tool_call",
                                     "name": tc.display_name,
                                     "arguments": tc.arguments,
+                                    "provider": event.provider,
                                 })
 
                             elif event.kind == OpenClawEventKind.TOOL_END:
@@ -275,6 +276,7 @@ class OpenClawBackend(AgentBackend):
                                         "event": "tool_result",
                                         "name": tool_calls[-1].display_name,
                                         "result": result,
+                                        "provider": event.provider,
                                     })
 
                             elif event.kind == OpenClawEventKind.ERROR:
