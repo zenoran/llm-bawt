@@ -397,8 +397,13 @@ class CodexBridge:
         self._redis = async_redis
 
         try:
+            # id="$" so a brand-new codex-bridge group skips historical
+            # RPCs (which were authored before the codex bridge existed
+            # and target other backends). Once the group is established,
+            # this id is no longer consulted — xreadgroup uses the
+            # group's last delivered id, so restart-on-codex-RPC works.
             await async_redis.xgroup_create(
-                COMMANDS_STREAM, CONSUMER_GROUP, id="0", mkstream=True,
+                COMMANDS_STREAM, CONSUMER_GROUP, id="$", mkstream=True,
             )
         except Exception:
             pass
@@ -1284,16 +1289,56 @@ class CodexBridge:
 
     # ----- TASK-205: RPC handler -----------------------------------------
 
+    async def _bot_uses_codex(self, bot_id: str) -> bool:
+        """Look up a bot's agent_backend; return True only if it's codex.
+
+        Used to defensively skip legacy RPCs (no `backend` field on the
+        message) that target bots owned by other bridges. Without this
+        guard, the codex bridge would happily clear session_keys on
+        claude-code / openclaw bots — a cross-backend interference bug.
+        """
+        if not self._app_api_url or not bot_id:
+            # No way to verify — fall through to legacy behavior. The
+            # operations the RPC triggers (clear_session, signal_cancel)
+            # are no-ops on unknown bots/sessions anyway.
+            return True
+        try:
+            async with httpx.AsyncClient(timeout=5) as client:
+                resp = await client.get(f"{self._app_api_url}/v1/bots")
+                resp.raise_for_status()
+                for bot in resp.json().get("data", []):
+                    if bot.get("slug") == bot_id:
+                        return (bot.get("agent_backend") or "") == self._backend_name
+        except Exception as e:
+            logger.debug("agent_backend lookup failed for %s: %s", bot_id, e)
+            # On lookup failure, default to True so we don't drop our own
+            # RPCs because the API blipped.
+            return True
+        # Bot not found — definitely not ours.
+        return False
+
     async def _handle_rpc(
         self, fields: dict, msg_id: str, async_redis,
     ) -> None:
         request_id = fields.get("request_id", "")
         method = fields.get("method", "")
+        message_backend = (fields.get("backend") or "").strip()
         params_raw = fields.get("params", "{}")
         try:
             params = json.loads(params_raw) if isinstance(params_raw, str) else params_raw
         except (json.JSONDecodeError, TypeError):
             params = {}
+
+        # Defensive bot-ownership check: when the message has no `backend`
+        # field (legacy callers), look up the bot and skip silently if it
+        # isn't ours. The command-listener already filtered explicit
+        # backend=other; this catches the no-hint case.
+        if not message_backend:
+            session_key = (params.get("sessionKey") or "") if isinstance(params, dict) else ""
+            target = _bot_slug_from_session_key(session_key) or session_key
+            if target and not await self._bot_uses_codex(target):
+                await async_redis.xack(COMMANDS_STREAM, CONSUMER_GROUP, msg_id)
+                return
 
         try:
             if method == "session.reset":
