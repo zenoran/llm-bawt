@@ -1,7 +1,7 @@
 """Codex bridge: Redis command listener + Codex SDK event translator.
 
 Mirrors ``src/claude_code_bridge/bridge.py`` but talks to the OpenAI Codex
-SDK (``codex_app_server``) instead of the Claude Agent SDK. Architectural
+SDK (``openai_codex_sdk``) instead of the Claude Agent SDK. Architectural
 decisions are documented in the project's contextPrompt and the section
 headers below.
 """
@@ -9,9 +9,12 @@ headers below.
 from __future__ import annotations
 
 import asyncio
+import base64
+import binascii
 import json
 import logging
 import shutil
+import tempfile
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -61,24 +64,6 @@ _AUTH_MARKERS = (
 def _is_auth_failure(exc: BaseException) -> bool:
     msg = str(exc).lower()
     return any(marker in msg for marker in _AUTH_MARKERS)
-
-
-_PROCESS_DEAD_MARKERS = (
-    "broken pipe",
-    "connection lost",
-    "connection closed",
-    "process exited",
-    "subprocess died",
-    "stream closed",
-    "rpc transport closed",
-)
-
-
-def _is_process_dead(exc: BaseException) -> bool:
-    if isinstance(exc, (ProcessLookupError, BrokenPipeError, ConnectionResetError)):
-        return True
-    msg = str(exc).lower()
-    return any(marker in msg for marker in _PROCESS_DEAD_MARKERS)
 
 
 # --- TASK-206: recoverable session errors ----------------------------------
@@ -272,7 +257,7 @@ class CodexBridge:
                     await task
                 except (asyncio.CancelledError, Exception):
                     pass
-        await self._transport.shutdown()
+        self._transport.reset()
         self._publisher.close()
         logger.info("CodexBridge stopped")
 
@@ -288,21 +273,23 @@ class CodexBridge:
 
     # ----- TASK-204: supervisor / self-heal -------------------------------
 
-    async def _ensure_codex(self):
-        """Return a live AsyncCodex; rebuilds on transport death."""
-        return await self._transport.ensure_codex()
+    def _ensure_codex(self):
+        """Return the shared ``Codex`` SDK handle (lazy-built on first use)."""
+        return self._transport.ensure_codex()
 
-    async def _supervisor_teardown(self) -> None:
-        """Tear down AsyncCodex so the next ensure rebuilds.
+    def _supervisor_teardown(self) -> None:
+        """Drop the cached ``Codex`` so the next ensure rebuilds.
 
         Re-validates auth.json defensively — useful when a fresh
-        ``codex login`` is the recovery path.
+        ``codex login`` is the recovery path. The codex Rust binary is
+        spawned per-turn, so there's no subprocess to kill here; the next
+        ``run_streamed`` will pick up the rewritten ``auth.json`` on disk.
         """
         try:
             validate_auth_json()
         except RuntimeError as e:
             logger.warning("auth.json still invalid during teardown: %s", e)
-        await self._transport.shutdown()
+        self._transport.reset()
 
     # ----- TASK-206: session persistence helpers --------------------------
 
@@ -521,11 +508,9 @@ class CodexBridge:
             seq = 0
             text_parts: list[str] = []
             actual_model: str = model
+            tmp_image_paths: list[str] = []
 
             try:
-                # Build prompt input — multimodal if attachments present (TASK-208)
-                prompt_input = self._build_prompt_input(message, attachments)
-
                 # MCP context injection (matches claude bridge)
                 if system_prompt and bot_slug:
                     system_prompt += (
@@ -560,7 +545,7 @@ class CodexBridge:
                 fresh_session_retry = False
                 while True:
                     try:
-                        codex = await self._ensure_codex()
+                        codex = self._ensure_codex()
                     except RuntimeError as auth_err:
                         # auth.json missing/invalid at startup — surface to user
                         seq += 1
@@ -573,89 +558,114 @@ class CodexBridge:
                         self._publisher.publish_run_done(request_id)
                         return
 
+                    # Build prompt input fresh each retry attempt — temp files
+                    # for images get rebuilt too (the inner loop may clear and
+                    # rebuild after a recoverable session error).
+                    self._cleanup_tmp_files(tmp_image_paths)
+                    prompt_input, tmp_image_paths = self._build_prompt_input(
+                        message,
+                        attachments,
+                        # Inject system prompt only on a fresh thread; on
+                        # resume the codex thread already carries prior
+                        # context and re-injecting would bloat each turn.
+                        system_prompt=None if resume_id else system_prompt,
+                    )
+
                     aborted = False
-                    handle = None
-                    session_persisted = bool(resume_id)
+                    item_text: dict[str, str] = {}  # last seen text per agent_message item
                     item_buffers: dict[str, dict[str, Any]] = {}
+                    final_usage: Any = None
+                    session_persisted = bool(resume_id)
+
+                    # Per-turn AbortController so chat.abort can interrupt the
+                    # codex subprocess server-side via the SDK's signal plumbing.
+                    from openai_codex_sdk import AbortController, AbortError
+
+                    controller = AbortController()
+                    if session_key:
+                        self._session_queue.set_active_stream(session_key, controller)
 
                     try:
-                        # Open or resume thread
+                        # Open or resume thread (sync API)
+                        thread_options = {
+                            "model": model,
+                            "working_directory": self._cwd,
+                            "approval_policy": "never",
+                            "sandbox_mode": "danger-full-access",
+                            "skip_git_repo_check": True,
+                        }
                         if resume_id:
-                            thread = await codex.thread_resume(
-                                resume_id,
-                                model=model,
-                                cwd=self._cwd,
-                                approval_policy="never",
-                                sandbox="danger-full-access",
-                                developer_instructions=system_prompt,
-                            )
+                            thread = codex.resume_thread(resume_id, thread_options)
                         else:
-                            thread = await codex.thread_start(
-                                model=model,
-                                cwd=self._cwd,
-                                approval_policy="never",
-                                sandbox="danger-full-access",
-                                developer_instructions=system_prompt,
-                                base_instructions=None,
-                                ephemeral=False,
-                            )
+                            thread = codex.start_thread(thread_options)
 
-                        handle = await thread.turn(prompt_input)
+                        streamed = await thread.run_streamed(
+                            prompt_input,
+                            {"signal": controller.signal},
+                        )
 
-                        # Register handle so chat.abort can interrupt server-side
-                        if session_key:
-                            self._session_queue.set_active_stream(session_key, handle)
-
-                        async for note in self._iter_notes(handle):
+                        async for event in self._iter_events(streamed):
                             if cancel_event is not None and cancel_event.is_set():
                                 logger.info(
-                                    "chat.abort signalled, interrupting Codex turn: session=%s request=%s",
+                                    "chat.abort signalled, aborting Codex turn: session=%s request=%s",
                                     session_key, request_id,
                                 )
                                 aborted = True
                                 try:
-                                    await handle.interrupt()
+                                    controller.abort("chat.abort")
                                 except Exception:
-                                    logger.debug("interrupt() raised", exc_info=True)
+                                    logger.debug("controller.abort raised", exc_info=True)
                                 break
 
-                            seq, persisted_now = await self._handle_note(
-                                note,
+                            (
+                                seq,
+                                persisted_now,
+                                usage_now,
+                            ) = await self._handle_event(
+                                event,
                                 bot_slug=bot_slug,
                                 session_key=session_key,
                                 request_id=request_id,
                                 seq=seq,
                                 text_parts=text_parts,
+                                item_text=item_text,
                                 model=model,
                                 actual_model_ref=[actual_model],
                                 resume_id=resume_id,
                                 session_persisted=session_persisted,
                                 item_buffers=item_buffers,
+                                thread=thread,
                             )
                             if persisted_now:
                                 session_persisted = True
+                            if usage_now is not None:
+                                final_usage = usage_now
 
-                        # Drain final result for usage. Bounded timeout — an
-                        # interrupted turn should return quickly; a stuck one
-                        # shouldn't wedge the bridge.
-                        try:
-                            turn_result = await asyncio.wait_for(
-                                handle.run(), timeout=30.0
-                            )
-                        except (asyncio.TimeoutError, Exception) as run_err:
-                            logger.debug("handle.run() raised: %s", run_err)
-                            turn_result = None
+                        # On a fresh thread, capture the id once the stream is
+                        # done in case we never saw a typed thread.started event.
+                        if (
+                            not session_persisted
+                            and not resume_id
+                            and bot_slug
+                            and getattr(thread, "id", None)
+                        ):
+                            await self._set_session(bot_slug, str(thread.id), model)
+                            session_persisted = True
 
-                        # ASSISTANT_DONE if not already sent by turn/completed
                         if not aborted and not self._already_sent_done(seq, item_buffers):
-                            token_usage = self._extract_token_usage(turn_result, actual_model_or_default=actual_model)
+                            token_usage = self._extract_token_usage(
+                                final_usage,
+                                actual_model_or_default=actual_model,
+                            )
                             seq += 1
                             self._publish_event(
                                 request_id, session_key, seq,
                                 kind=OpenClawEventKind.ASSISTANT_DONE,
                                 text="".join(text_parts),
                                 model=actual_model,
-                                token_usage=await self._merge_model_info(token_usage, actual_model),
+                                token_usage=await self._merge_model_info(
+                                    token_usage, actual_model,
+                                ),
                             )
                         elif aborted:
                             seq += 1
@@ -686,46 +696,42 @@ class CodexBridge:
                             self._publisher.publish_run_done(request_id)
                         except Exception:
                             pass
-                        # Try to interrupt Codex too
-                        if handle is not None:
-                            try:
-                                await handle.interrupt()
-                            except Exception:
-                                pass
+                        try:
+                            controller.abort("task_cancelled")
+                        except Exception:
+                            pass
                         raise
+
+                    except AbortError:
+                        # Triggered by controller.abort() — treat as a normal
+                        # aborted turn so the user sees their partial response.
+                        logger.info(
+                            "Codex turn aborted: request_id=%s session=%s",
+                            request_id, session_key,
+                        )
+                        aborted = True
+                        seq += 1
+                        self._publish_event(
+                            request_id, session_key, seq,
+                            kind=OpenClawEventKind.ASSISTANT_DONE,
+                            text="".join(text_parts),
+                            model=actual_model,
+                        )
+                        break
+
                     except Exception as e:
-                        # Auth failure → publish ERROR, tear down transport, no retry.
+                        # Auth failure → publish ERROR, drop SDK handle, no retry.
                         if _is_auth_failure(e):
                             logger.warning(
-                                "Codex auth failure for %s: %s — tearing down transport",
+                                "Codex auth failure for %s: %s — resetting SDK handle",
                                 request_id, e,
                             )
-                            await self._supervisor_teardown()
+                            self._supervisor_teardown()
                             seq += 1
                             self._publish_event(
                                 request_id, session_key, seq,
                                 kind=OpenClawEventKind.ERROR,
                                 text="Codex OAuth failed — re-run codex login on echo",
-                                model=model,
-                            )
-                            self._publisher.publish_run_done(request_id)
-                            return
-
-                        # Process death → tear down so next request rebuilds.
-                        if _is_process_dead(e):
-                            logger.warning(
-                                "Codex app-server died for %s: %s — tearing down",
-                                request_id, e,
-                            )
-                            await self._supervisor_teardown()
-                            seq += 1
-                            self._publish_event(
-                                request_id, session_key, seq,
-                                kind=OpenClawEventKind.ERROR,
-                                text=(
-                                    "Codex subprocess crashed; supervisor will restart "
-                                    "on next request."
-                                ),
                                 model=model,
                             )
                             self._publisher.publish_run_done(request_id)
@@ -748,9 +754,9 @@ class CodexBridge:
 
                         raise
                     finally:
-                        if session_key and handle is not None:
+                        if session_key:
                             current = self._session_queue.get_active_stream(session_key)
-                            if current is handle:
+                            if current is controller:
                                 self._session_queue.pop_active_stream(session_key)
 
                 self._publisher.publish_run_done(request_id)
@@ -778,28 +784,21 @@ class CodexBridge:
                 )
                 self._publisher.publish_run_done(request_id)
             finally:
+                self._cleanup_tmp_files(tmp_image_paths)
                 await async_redis.xack(COMMANDS_STREAM, CONSUMER_GROUP, msg_id)
 
-    # ----- Notification iteration with timeout ----------------------------
+    # ----- Event iteration with timeout -----------------------------------
 
-    async def _iter_notes(self, handle):
-        """Async-iterate handle.stream() with a per-note timeout.
+    async def _iter_events(self, streamed):
+        """Async-iterate ``streamed.events`` with a per-event timeout.
 
         TimeoutError surfaces so the retry-on-session-error path can clear
         a stuck thread and retry fresh (TASK-206 acceptance criteria).
-
-        ``handle.stream()`` may be either a regular method returning an async
-        iterator, or an ``async def`` coroutine that returns one. Probe both.
         """
-        maybe_stream = handle.stream()
-        if asyncio.iscoroutine(maybe_stream):
-            stream = await maybe_stream
-        else:
-            stream = maybe_stream
-        agen = stream.__aiter__() if hasattr(stream, "__aiter__") else stream
+        agen = streamed.events.__aiter__()
         while True:
             try:
-                note = await asyncio.wait_for(
+                event = await asyncio.wait_for(
                     agen.__anext__(),
                     timeout=self._request_timeout,
                 )
@@ -807,46 +806,103 @@ class CodexBridge:
                 return
             except TimeoutError:
                 raise TimeoutError(
-                    f"No Codex notifications for {self._request_timeout}s — app-server may be hung"
+                    f"No Codex events for {self._request_timeout}s — codex CLI may be hung"
                 )
-            yield note
+            yield event
 
     @staticmethod
     def _already_sent_done(seq: int, item_buffers: dict) -> bool:
-        # turn/completed handler sets this sentinel.
+        # turn.completed handler sets this sentinel.
         return bool(item_buffers.get("__done_emitted__"))
 
     # ----- TASK-208: prompt input building --------------------------------
 
     @staticmethod
-    def _build_prompt_input(message: str, attachments: list[dict]):
-        if not attachments:
-            return message
-        # Lazy import so __init__ doesn't pull the SDK before validate_auth_json
-        # has had a chance to fail loudly.
-        from codex_app_server import ImageInput, TextInput
+    def _build_prompt_input(
+        message: str,
+        attachments: list[dict],
+        *,
+        system_prompt: str | None = None,
+    ) -> tuple[Any, list[str]]:
+        """Compose the codex turn input from text + image attachments.
 
-        items: list = [TextInput(text=message)]
+        Returns ``(prompt, tmp_paths)`` where ``tmp_paths`` are temp image
+        files the caller must clean up after the turn completes. Codex SDK
+        only accepts ``LocalImageInput`` (file path), not inline base64, so
+        attachments are decoded into a tempdir.
+
+        ``system_prompt``, when supplied, is prepended to ``message``. The
+        codex CLI has no separate system-prompt slot, so this is the only
+        way the bot's persona/MCP-context reaches the agent.
+        """
+        from openai_codex_sdk import LocalImageInput, TextInput
+
+        text = message
+        if system_prompt:
+            text = f"{system_prompt}\n\n---\n\n{message}"
+
+        if not attachments:
+            return text, []
+
+        tmp_paths: list[str] = []
+        items: list = [TextInput(type="text", text=text)]
         for att in attachments:
             data = att.get("content")
             if not data:
                 continue
-            mime = att.get("mimeType") or "image/png"
-            items.append(ImageInput(data=data, mime_type=mime))
-        return items
+            try:
+                raw = base64.b64decode(data, validate=True)
+            except (binascii.Error, ValueError):
+                logger.warning("Skipping attachment with invalid base64 payload")
+                continue
+            mime = (att.get("mimeType") or "image/png").lower()
+            ext = ".png"
+            if "jpeg" in mime or "jpg" in mime:
+                ext = ".jpg"
+            elif "gif" in mime:
+                ext = ".gif"
+            elif "webp" in mime:
+                ext = ".webp"
+            tmp = tempfile.NamedTemporaryFile(
+                suffix=ext, prefix="codex_img_", delete=False
+            )
+            try:
+                tmp.write(raw)
+            finally:
+                tmp.close()
+            tmp_paths.append(tmp.name)
+            items.append(LocalImageInput(type="local_image", path=tmp.name))
+
+        return items, tmp_paths
+
+    @staticmethod
+    def _cleanup_tmp_files(paths: list[str]) -> None:
+        for p in paths:
+            try:
+                Path(p).unlink(missing_ok=True)
+            except OSError:
+                pass
+        paths.clear()
 
     # ----- TASK-208: token usage extraction -------------------------------
 
     @staticmethod
-    def _extract_token_usage(turn_result: Any, *, actual_model_or_default: str) -> dict | None:
-        if turn_result is None:
+    def _extract_token_usage(usage_or_carrier: Any, *, actual_model_or_default: str) -> dict | None:
+        """Normalize a Codex ``Usage`` (or carrier with a .usage attr) into
+        the OpenClawEvent token_usage dict.
+        """
+        if usage_or_carrier is None:
             return None
-        usage = getattr(turn_result, "usage", None)
-        if usage is None and isinstance(turn_result, dict):
-            usage = turn_result.get("usage")
+        # Allow callers to pass either the Usage directly or a wrapper with
+        # a .usage attribute (e.g. TurnCompletedEvent).
+        usage = usage_or_carrier
+        if hasattr(usage, "usage") and not hasattr(usage, "input_tokens"):
+            usage = getattr(usage, "usage")
+        if isinstance(usage_or_carrier, dict) and "usage" in usage_or_carrier:
+            usage = usage_or_carrier["usage"]
         if usage is None:
             return None
-        # Codex usage may be a dataclass or dict
+
         def _g(key: str, default=0):
             if hasattr(usage, key):
                 return getattr(usage, key)
@@ -856,7 +912,7 @@ class CodexBridge:
         try:
             return {
                 "input_tokens": int(_g("input_tokens", 0) or 0),
-                "cache_read_tokens": 0,
+                "cache_read_tokens": int(_g("cached_input_tokens", 0) or 0),
                 "cache_creation_tokens": 0,
                 "output_tokens": int(_g("output_tokens", 0) or 0),
                 "context_window": None,  # filled in by _merge_model_info
@@ -874,65 +930,62 @@ class CodexBridge:
         usage["max_output_tokens"] = info.get("max_output_tokens")
         return usage
 
-    # ----- TASK-207: notification → OpenClawEvent mapping -----------------
+    # ----- TASK-207: ThreadEvent → OpenClawEvent mapping ------------------
 
-    async def _handle_note(
+    async def _handle_event(
         self,
-        note: Any,
+        event: Any,
         *,
         bot_slug: str,
         session_key: str,
         request_id: str,
         seq: int,
         text_parts: list[str],
+        item_text: dict[str, str],
         model: str,
         actual_model_ref: list[str],
         resume_id: str | None,
         session_persisted: bool,
         item_buffers: dict[str, dict[str, Any]],
-    ) -> tuple[int, bool]:
-        """Translate a single Codex notification into OpenClawEvents.
+        thread: Any,
+    ) -> tuple[int, bool, Any]:
+        """Translate a single ``ThreadEvent`` into OpenClawEvents.
 
-        Returns (next_seq, did_persist_session).
+        Returns ``(next_seq, did_persist_session, usage_or_none)``.
+        ``usage`` is non-None only on ``turn.completed``.
         """
-        method = self._note_method(note)
-        payload = self._note_payload(note)
+        et = getattr(event, "type", None) or self._dig(event, "type") or ""
 
-        # ---- thread/started: capture thread_id, persist on first turn ----
-        if method == "thread/started":
+        # ---- thread.started: capture thread_id, persist on first turn ----
+        if et == "thread.started":
             if not session_persisted and not resume_id and bot_slug:
-                thread_id = self._dig(payload, "thread_id") or self._dig(payload, "thread", "id")
+                thread_id = (
+                    getattr(event, "thread_id", None)
+                    or self._dig(event, "thread_id")
+                    or self._dig(event, "thread", "id")
+                    or getattr(thread, "id", None)
+                )
                 if thread_id:
                     await self._set_session(bot_slug, str(thread_id), model)
-                    return seq, True
-            return seq, False
+                    return seq, True, None
+            return seq, False, None
 
-        # ---- turn/started: no-op ----
-        if method == "turn/started":
-            return seq, False
+        # ---- turn.started: no-op ----
+        if et == "turn.started":
+            return seq, False, None
 
-        # ---- turn/completed: ASSISTANT_DONE or ERROR ----
-        if method == "turn/completed":
-            status = (self._dig(payload, "status") or "").lower()
-            usage = self._dig(payload, "usage")
+        # ---- turn.completed: ASSISTANT_DONE with usage ----
+        if et == "turn.completed":
+            usage = getattr(event, "usage", None) or self._dig(event, "usage")
             full_text = "".join(text_parts)
-            if status == "failed":
-                err_msg = self._dig(payload, "error", "message") or "Codex turn failed"
-                seq += 1
-                self._publish_event(
-                    request_id, session_key, seq,
-                    kind=OpenClawEventKind.ERROR,
-                    text=str(err_msg),
-                    model=actual_model_ref[0],
-                )
-                item_buffers["__done_emitted__"] = True
-                return seq, False
-
             token_usage = None
             if usage is not None:
-                fake_carrier = type("U", (), {"usage": usage})()
-                token_usage = self._extract_token_usage(fake_carrier, actual_model_or_default=actual_model_ref[0])
-                token_usage = await self._merge_model_info(token_usage, actual_model_ref[0])
+                token_usage = self._extract_token_usage(
+                    usage, actual_model_or_default=actual_model_ref[0],
+                )
+                token_usage = await self._merge_model_info(
+                    token_usage, actual_model_ref[0],
+                )
 
             seq += 1
             self._publish_event(
@@ -943,49 +996,16 @@ class CodexBridge:
                 token_usage=token_usage,
             )
             item_buffers["__done_emitted__"] = True
-            return seq, False
+            return seq, False, usage
 
-        # ---- agentMessage delta ----
-        if method == "item/agentMessage/delta":
-            delta = self._dig(payload, "delta") or self._dig(payload, "text") or ""
-            if delta:
-                text_parts.append(delta)
-                seq += 1
-                self._publish_event(
-                    request_id, session_key, seq,
-                    kind=OpenClawEventKind.ASSISTANT_DELTA,
-                    text=delta,
-                )
-            return seq, False
-
-        # ---- item/started: TOOL_START for command/file/web/mcp ----
-        if method == "item/started":
-            item = self._dig(payload, "item") or payload
-            seq = self._emit_tool_start(
-                item, request_id, session_key, seq, item_buffers,
+        # ---- turn.failed: ERROR ----
+        if et == "turn.failed":
+            err = getattr(event, "error", None) or self._dig(event, "error")
+            err_msg = (
+                getattr(err, "message", None)
+                or self._dig(err, "message")
+                or "Codex turn failed"
             )
-            return seq, False
-
-        # ---- buffer command output (don't stream tool result chunks) ----
-        if method == "item/commandExecution/outputDelta":
-            item_id = self._dig(payload, "item_id") or self._dig(payload, "id") or ""
-            chunk = self._dig(payload, "chunk") or self._dig(payload, "text") or ""
-            if item_id and chunk:
-                buf = item_buffers.setdefault(item_id, {"output": []})
-                buf.setdefault("output", []).append(chunk)
-            return seq, False
-
-        # ---- item/completed: TOOL_END (or possibly final agentMessage) ----
-        if method == "item/completed":
-            item = self._dig(payload, "item") or payload
-            seq = self._emit_tool_end(
-                item, request_id, session_key, seq, item_buffers, text_parts,
-            )
-            return seq, False
-
-        # ---- error notification ----
-        if method == "error":
-            err_msg = self._dig(payload, "message") or str(payload)
             seq += 1
             self._publish_event(
                 request_id, session_key, seq,
@@ -993,21 +1013,121 @@ class CodexBridge:
                 text=str(err_msg),
                 model=actual_model_ref[0],
             )
-            return seq, False
+            item_buffers["__done_emitted__"] = True
+            return seq, False, None
 
-        # ---- suppressed: reasoning, plan, review, contextCompaction ----
-        if (
-            method.startswith("item/reasoning/")
-            or method.startswith("item/plan")
-            or method.startswith("item/planUpdate")
-            or method == "item/enteredReviewMode"
-            or method == "item/exitedReviewMode"
-            or method == "item/contextCompaction"
-        ):
-            return seq, False
+        # ---- item events: started / updated / completed --------------------
+        item = getattr(event, "item", None) or self._dig(event, "item")
 
-        logger.debug("Unhandled Codex notification: method=%s", method)
-        return seq, False
+        if et == "item.started":
+            if item is None:
+                return seq, False, None
+            item_type = getattr(item, "type", None) or self._dig(item, "type") or ""
+            item_id = getattr(item, "id", None) or self._dig(item, "id") or ""
+
+            if item_type == "agent_message":
+                # Track baseline text so item.updated can compute deltas.
+                item_text[item_id] = getattr(item, "text", "") or ""
+                # Emit any non-empty initial text as the first delta.
+                initial = item_text[item_id]
+                if initial:
+                    text_parts.append(initial)
+                    seq += 1
+                    self._publish_event(
+                        request_id, session_key, seq,
+                        kind=OpenClawEventKind.ASSISTANT_DELTA,
+                        text=initial,
+                    )
+                return seq, False, None
+
+            seq = self._emit_tool_start(
+                item, request_id, session_key, seq, item_buffers,
+            )
+            return seq, False, None
+
+        if et == "item.updated":
+            if item is None:
+                return seq, False, None
+            item_type = getattr(item, "type", None) or self._dig(item, "type") or ""
+            item_id = getattr(item, "id", None) or self._dig(item, "id") or ""
+
+            if item_type == "agent_message":
+                full = getattr(item, "text", "") or ""
+                prev = item_text.get(item_id, "")
+                if len(full) > len(prev) and full.startswith(prev):
+                    delta = full[len(prev):]
+                else:
+                    delta = full[len(prev):] if len(full) > len(prev) else ""
+                if delta:
+                    item_text[item_id] = full
+                    text_parts.append(delta)
+                    seq += 1
+                    self._publish_event(
+                        request_id, session_key, seq,
+                        kind=OpenClawEventKind.ASSISTANT_DELTA,
+                        text=delta,
+                    )
+                return seq, False, None
+
+            if item_type == "command_execution":
+                # Buffer aggregated_output growth for the eventual TOOL_END.
+                aggregated = (
+                    getattr(item, "aggregated_output", None)
+                    or self._dig(item, "aggregated_output")
+                    or ""
+                )
+                if aggregated:
+                    buf = item_buffers.setdefault(item_id, {})
+                    buf["aggregated_output"] = aggregated
+            return seq, False, None
+
+        if et == "item.completed":
+            if item is None:
+                return seq, False, None
+            item_type = getattr(item, "type", None) or self._dig(item, "type") or ""
+            item_id = getattr(item, "id", None) or self._dig(item, "id") or ""
+
+            if item_type == "agent_message":
+                # Final text — make sure text_parts captures the full message
+                # in case we missed an updated event.
+                full = getattr(item, "text", "") or ""
+                prev = item_text.get(item_id, "")
+                if len(full) > len(prev):
+                    delta = full[len(prev):] if full.startswith(prev) else full[len(prev):]
+                    if delta:
+                        item_text[item_id] = full
+                        text_parts.append(delta)
+                        seq += 1
+                        self._publish_event(
+                            request_id, session_key, seq,
+                            kind=OpenClawEventKind.ASSISTANT_DELTA,
+                            text=delta,
+                        )
+                return seq, False, None
+
+            seq = self._emit_tool_end(
+                item, request_id, session_key, seq, item_buffers, text_parts,
+            )
+            return seq, False, None
+
+        # ---- error event ----
+        if et == "error":
+            err_msg = (
+                getattr(event, "message", None)
+                or self._dig(event, "message")
+                or "Codex stream error"
+            )
+            seq += 1
+            self._publish_event(
+                request_id, session_key, seq,
+                kind=OpenClawEventKind.ERROR,
+                text=str(err_msg),
+                model=actual_model_ref[0],
+            )
+            return seq, False, None
+
+        logger.debug("Unhandled Codex event: type=%s", et)
+        return seq, False, None
 
     # ----- Item-shape helpers ---------------------------------------------
 
@@ -1171,7 +1291,11 @@ class CodexBridge:
             return seq
 
         if item_type in ("commandExecution", "command_execution"):
-            output = "".join(buf.get("output", []))
+            output = (
+                buf.get("aggregated_output")
+                or self._dig(item, "aggregated_output")
+                or "".join(buf.get("output", []))
+            )
             exit_code = self._dig(item, "exit_code") or self._dig(item, "exitCode") or 0
             duration_ms = self._dig(item, "duration_ms") or self._dig(item, "durationMs") or 0
             try:
@@ -1359,26 +1483,22 @@ class CodexBridge:
             elif method == "chat.abort":
                 session_key = params.get("sessionKey", "")
                 self._session_queue.signal_cancel(session_key)
-                handle = self._session_queue.pop_active_stream(session_key)
-                handle_interrupted = False
-                if handle is not None:
+                controller = self._session_queue.pop_active_stream(session_key)
+                turn_interrupted = False
+                if controller is not None:
                     try:
-                        await asyncio.wait_for(handle.interrupt(), timeout=10.0)
-                        handle_interrupted = True
-                    except asyncio.TimeoutError:
-                        logger.warning(
-                            "handle.interrupt() timed out for session %s", session_key,
-                        )
+                        controller.abort("chat.abort")
+                        turn_interrupted = True
                     except Exception:
                         logger.debug(
-                            "handle.interrupt() raised on chat.abort for session %s",
+                            "controller.abort raised on chat.abort for session %s",
                             session_key, exc_info=True,
                         )
                 cancelled = self._session_queue.cancel_active(session_key)
                 detail_parts: list[str] = []
                 if cancelled:
                     detail_parts.append("task_cancelled")
-                if handle_interrupted:
+                if turn_interrupted:
                     detail_parts.append("turn_interrupted")
                 if not detail_parts:
                     detail_parts.append("no_active_task")

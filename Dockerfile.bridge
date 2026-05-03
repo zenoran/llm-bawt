@@ -34,6 +34,10 @@ RUN uv venv && uv pip install \
 RUN uv pip install -e . --no-deps
 
 RUN useradd -m -s /bin/bash bridge && chown -R bridge:bridge /app
+# Pre-create ~/.codex so Docker bind mounts inherit bridge ownership for
+# the parent directory; otherwise codex CLI can't write cache/log/history
+# alongside the bind-mounted auth.json and config.toml.
+RUN mkdir -p /home/bridge/.codex && chown bridge:bridge /home/bridge/.codex
 USER bridge
 
 ENV PATH="/app/.venv/bin:$PATH" \

@@ -95,8 +95,10 @@ billing.
 ### One-time provisioning (on host)
 
 ```bash
-# Install codex CLI (if you haven't)
-brew install codex   # or: pipx install openai-codex-cli, etc.
+# Install codex CLI on the host (npm package — bundles the static-pie
+# Rust binary the bridge depends on; pip's openai-codex-sdk wheel ships
+# without it).
+npm install -g @openai/codex
 
 # Log in with ChatGPT mode — opens browser for OAuth
 codex login
@@ -119,6 +121,12 @@ The compose service mounts `~/.codex/auth.json` **rw** so the codex
 binary inside the container can refresh tokens on disk. The shared
 inode means `codex login` on the host updates the same file the bridge
 sees.
+
+The compose service also bind-mounts the host's npm
+`@openai/codex/node_modules/@openai/codex-linux-x64/vendor` directory
+into the SDK's expected path (`<sdk>/vendor/x86_64-unknown-linux-musl/
+codex/codex`). The static-pie musl binary works on any glibc/musl
+Linux, so no in-container install is needed.
 
 ## Setup
 

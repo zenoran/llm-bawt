@@ -28,6 +28,7 @@ import sys
 from openclaw_bridge.publisher import RedisPublisher
 
 from .bridge import CodexBridge
+from .parser_patch import install as install_parser_patch
 from .transport import auth_path, scrub_api_key_env, validate_auth_json
 
 
@@ -85,7 +86,11 @@ def main() -> None:
     logging.getLogger("httpx").setLevel(logging.WARNING)
     logger = logging.getLogger("codex_bridge")
 
-    # --- TASK-204: scrub API key env vars before constructing AsyncCodex ---
+    # Patch the SDK's strict-literal parser so a single mismatched item
+    # status doesn't kill the whole turn (see parser_patch.py).
+    install_parser_patch()
+
+    # --- TASK-204: scrub API key env vars before constructing the SDK ---
     scrubbed = scrub_api_key_env()
     if scrubbed:
         logger.warning(

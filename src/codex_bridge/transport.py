@@ -1,24 +1,19 @@
-"""Thin async wrapper around ``codex_app_server.AsyncCodex``.
+"""Codex SDK lifecycle: auth validation + lazy ``Codex`` construction.
 
-The transport encapsulates the lazy construction, restart-on-crash, and
-auth.json sanity-check logic so ``bridge.py`` can stay focused on Redis
-command dispatch and event translation.
+The real ``openai_codex_sdk.Codex`` is a thin sync handle around the bundled
+``codex`` Rust binary; each turn spawns a fresh subprocess, so there is no
+long-lived app-server to supervise. We hold a single ``Codex`` per bridge
+container (concurrency between sessions is bounded by ``[agents]
+max_threads`` in ``~/.codex/config.toml``; per-session ordering by
+``SessionQueue.lock`` in ``bridge.py``).
 
-A single ``AsyncCodex`` per bridge container is shared across all sessions
-(per architectural decision #2). Concurrency between sessions is bounded by
-``[agents] max_threads`` in ``~/.codex/config.toml``; per-session ordering
-is enforced by ``SessionQueue.lock`` in ``bridge.py``.
-
-If the codex Rust subprocess dies or the OAuth tokens expire mid-turn, the
-supervisor in ``bridge.py`` detects it, calls ``CodexTransport.shutdown()``
-to tear down, and the next ``ensure_codex()`` call rebuilds with fresh
-auth.json on disk — so ``codex login`` on the host self-heals the bridge
-without a docker restart.
+If the OAuth bundle is invalid at startup we hard-fail. Mid-run auth
+failures surface as ``CodexAuthError`` from ``thread.run_streamed`` and the
+bridge translates them to an ERROR event for the user.
 """
 
 from __future__ import annotations
 
-import asyncio
 import json
 import logging
 import os
@@ -26,7 +21,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from codex_app_server import AsyncCodex
+    from openai_codex_sdk import Codex
 
 logger = logging.getLogger(__name__)
 
@@ -42,10 +37,9 @@ def auth_path() -> Path:
 
 
 def scrub_api_key_env() -> list[str]:
-    """Remove API key env vars so AsyncCodex falls back to OAuth.
+    """Remove API key env vars so the codex binary falls back to OAuth.
 
-    Returns the list of env var names that were actually set (so callers can
-    log a warning — these should never be set when running OAuth-only).
+    Returns the list of env var names that were actually set.
     """
     scrubbed: list[str] = []
     for name in SCRUB_ENV_VARS:
@@ -90,54 +84,46 @@ def validate_auth_json(path: Path | None = None) -> dict:
 
 
 class CodexTransport:
-    """Lazy + restartable wrapper around AsyncCodex.
+    """Lazy holder for a shared ``Codex`` instance.
 
-    Use ``ensure_codex()`` to obtain a live instance; ``shutdown()`` to tear
-    it down (e.g. after a process-death detection). The next ensure call
-    rebuilds and re-reads auth.json off disk.
+    The SDK's ``Codex`` is sync-constructed and spawns a fresh ``codex exec``
+    subprocess per turn, so there's no long-lived server to recycle. The
+    only state we hold is the SDK handle itself, lazily built on first use
+    (and rebuilt only if explicitly torn down — useful when a fresh
+    ``codex login`` rewrites ``auth.json``).
     """
 
     def __init__(self, *, codex_bin: str | None = None) -> None:
         self._codex_bin = codex_bin
-        self._codex: AsyncCodex | None = None
-        self._lock = asyncio.Lock()
+        self._codex: "Codex | None" = None
 
     @property
-    def codex(self) -> AsyncCodex | None:
+    def codex(self) -> "Codex | None":
         return self._codex
 
-    async def ensure_codex(self) -> AsyncCodex:
-        """Return the live AsyncCodex, lazy-constructing on first use."""
+    def ensure_codex(self) -> "Codex":
+        """Return the live ``Codex``, lazy-constructing on first use."""
         if self._codex is not None:
             return self._codex
-        async with self._lock:
-            if self._codex is not None:
-                return self._codex
-            # Validate auth.json on every (re)build so the failure surfaces
-            # before we hand a doomed AsyncCodex back to the caller.
-            validate_auth_json()
-            from codex_app_server import AppServerConfig, AsyncCodex
+        # Validate auth.json on every (re)build so the failure surfaces
+        # before we hand a doomed Codex back to the caller.
+        validate_auth_json()
+        from openai_codex_sdk import Codex
 
-            cfg_kwargs: dict = {}
-            if self._codex_bin:
-                cfg_kwargs["codex_bin"] = self._codex_bin
-            cfg = AppServerConfig(**cfg_kwargs) if cfg_kwargs else AppServerConfig()
+        opts: dict | None = (
+            {"codex_path_override": self._codex_bin} if self._codex_bin else None
+        )
+        self._codex = Codex(opts)
+        logger.info("Codex SDK ready (codex_bin=%s)", self._codex_bin or "<bundled>")
+        return self._codex
 
-            codex = AsyncCodex(cfg)
-            await codex.__aenter__()
-            self._codex = codex
-            logger.info("AsyncCodex started (codex_bin=%s)", self._codex_bin or "<bundled>")
-            return codex
+    def reset(self) -> None:
+        """Drop the cached ``Codex`` so the next ensure rebuilds.
 
-    async def shutdown(self) -> None:
-        """Tear down the AsyncCodex; next ensure rebuilds."""
-        codex = self._codex
+        Used after auth-recovery so a fresh ``codex login`` is picked up
+        without restarting the container. There is no subprocess to tear
+        down — the next ``run_streamed`` call will spawn a fresh codex
+        binary that re-reads ``auth.json``.
+        """
         self._codex = None
-        if codex is None:
-            return
-        try:
-            await codex.__aexit__(None, None, None)
-        except Exception:
-            logger.warning("AsyncCodex shutdown raised", exc_info=True)
-        else:
-            logger.info("AsyncCodex shut down")
+        logger.info("Codex SDK handle reset; next request will rebuild")

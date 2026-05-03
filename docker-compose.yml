@@ -162,12 +162,15 @@ services:
       - ${HOME}/dev:/home/bridge/dev
       # OAuth bundle is bind-mounted RW so codex can self-refresh tokens.
       # `codex login` on the host writes back to this same inode and the
-      # bridge's supervisor picks up the new tokens on the next AsyncCodex
-      # rebuild — no docker restart needed.
+      # bridge picks up the new tokens on the next turn — no restart needed.
       - ${HOME}/.codex/auth.json:/home/bridge/.codex/auth.json
       - ${HOME}/.codex/config.toml:/home/bridge/.codex/config.toml
       - ${HOME}/.codex/sessions:/home/bridge/.codex/sessions
       - ${HOME}/.ssh:/home/bridge/.ssh:ro
+      # The openai-codex-sdk wheel ships without the codex Rust binary;
+      # bind-mount the host's @openai/codex npm package vendor dir so
+      # the SDK's find_codex_path picks up the static-pie musl binary.
+      - ${HOME}/.npm-global/lib/node_modules/@openai/codex/node_modules/@openai/codex-linux-x64/vendor:/app/.venv/lib/python3.12/site-packages/openai_codex_sdk/vendor:ro
     depends_on:
       redis:
         condition: service_healthy
