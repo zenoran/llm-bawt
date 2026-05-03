@@ -85,39 +85,6 @@ def _is_codex_session_error(exc: BaseException) -> bool:
     return any(marker in msg for marker in _SESSION_ERROR_MARKERS)
 
 
-# --- TASK-207: unified-diff old/new synthesis -----------------------------
-
-
-def _synthesize_old_new(diff_text: str) -> tuple[str, str]:
-    """Walk a unified diff and reconstruct the pre/post hunk content.
-
-    '-' lines → old; '+' lines → new; ' '/context lines → both. Header lines
-    (---, +++, @@) are dropped. This produces a best-effort old_string and
-    new_string that ClaudeToolCallCard renders as a red/green diff card.
-    """
-    old_lines: list[str] = []
-    new_lines: list[str] = []
-    for line in (diff_text or "").splitlines():
-        if line.startswith("---") or line.startswith("+++") or line.startswith("@@"):
-            continue
-        if not line:
-            old_lines.append("")
-            new_lines.append("")
-            continue
-        marker, body = line[0], line[1:]
-        if marker == "-":
-            old_lines.append(body)
-        elif marker == "+":
-            new_lines.append(body)
-        elif marker == " ":
-            old_lines.append(body)
-            new_lines.append(body)
-        else:
-            old_lines.append(line)
-            new_lines.append(line)
-    return ("\n".join(old_lines), "\n".join(new_lines))
-
-
 # --- TASK-208: model -> context window/max_output cache --------------------
 
 
@@ -1139,6 +1106,14 @@ class CodexBridge:
         seq: int,
         item_buffers: dict,
     ) -> int:
+        """Emit TOOL_START for a codex thread item.
+
+        Tool names are emitted as their **native codex names** (not aliased
+        to Claude tool names). The UI's provider-aware tool-render registry
+        dispatches on (provider="codex", tool_name) so each item type can
+        render its true shape — e.g. ``file_change`` carries only
+        ``path + kind`` (no diff content, since the SDK doesn't ship it).
+        """
         item_type = self._dig(item, "type") or self._dig(item, "kind") or ""
         item_id = self._dig(item, "id") or ""
 
@@ -1146,35 +1121,27 @@ class CodexBridge:
         tool_args: dict = {}
 
         if item_type in ("commandExecution", "command_execution"):
-            tool_name = "Bash"
+            tool_name = "shell"
             cmd = self._dig(item, "command") or self._dig(item, "cmd") or ""
             cwd = self._dig(item, "cwd") or self._dig(item, "working_dir") or ""
-            tool_args = {"command": cmd, "description": cwd}
-            item_buffers.setdefault(item_id, {"output": [], "tool_name": tool_name, "type": "command"})
+            tool_args = {"command": cmd, "cwd": cwd}
+            item_buffers.setdefault(item_id, {"tool_name": tool_name, "type": "command"})
         elif item_type in ("fileChange", "file_change"):
-            # Each fileChange item may contain multiple changes; emit one
-            # TOOL_START per change so the UI gets per-file cards.
+            # One TOOL_START per change so the UI gets per-file cards.
             return self._emit_filechange_starts(item, request_id, session_key, seq, item_buffers)
         elif item_type in ("webSearch", "web_search"):
             action = self._dig(item, "action") or {}
             atype = self._dig(action, "type") or ""
-            if atype == "search":
-                tool_name = "WebSearch"
-                tool_args = {"query": self._dig(action, "query") or ""}
-            elif atype == "openPage":
-                tool_name = "WebFetch"
-                tool_args = {"url": self._dig(action, "url") or ""}
-            elif atype == "findInPage":
-                tool_name = "Grep"
-                tool_args = {
-                    "pattern": self._dig(action, "pattern") or "",
-                    "path": self._dig(action, "url") or "",
-                }
-            else:
-                tool_name = "WebSearch"
-                tool_args = {"query": str(action)}
+            tool_name = "web_search"
+            tool_args = {
+                "action": atype,
+                "query": self._dig(action, "query") or "",
+                "url": self._dig(action, "url") or "",
+                "pattern": self._dig(action, "pattern") or "",
+            }
             item_buffers.setdefault(item_id, {"tool_name": tool_name, "type": "web"})
         elif item_type in ("mcpToolCall", "mcp_tool_call"):
+            # Pass through the MCP tool's real name; UI dispatches generically.
             tool_name = self._dig(item, "tool") or self._dig(item, "name") or "mcp_tool"
             tool_args = self._dig(item, "arguments") or self._dig(item, "args") or {}
             if not isinstance(tool_args, dict):
@@ -1187,8 +1154,8 @@ class CodexBridge:
                 tool_args = {"raw": str(tool_args)}
             item_buffers.setdefault(item_id, {"tool_name": tool_name, "type": "dynamic"})
         elif item_type in ("imageView", "image_view"):
-            tool_name = "Read"
-            tool_args = {"file_path": self._dig(item, "path") or ""}
+            tool_name = "image_view"
+            tool_args = {"path": self._dig(item, "path") or ""}
             item_buffers.setdefault(item_id, {"tool_name": tool_name, "type": "image"})
         elif item_type in ("agentMessage", "agent_message"):
             # Final agent message — accumulated via deltas; no tool card.
@@ -1214,51 +1181,33 @@ class CodexBridge:
         seq: int,
         item_buffers: dict,
     ) -> int:
+        """Emit one ``file_change`` TOOL_START per touched file.
+
+        The codex SDK exposes ``file_change`` items as ``{path, kind}`` per
+        change — no diff content, no before/after text. We pass that
+        through verbatim; the UI's ``FileChangeBody`` (registered for
+        ``provider="codex", tool_name="file_change"``) renders just the
+        path + a kind badge ("Updated" / "Created" / "Deleted").
+        """
         item_id = self._dig(item, "id") or ""
         changes = self._dig(item, "changes") or []
-        # Group hunks by file_path so multi-hunk modifies get a single MultiEdit.
-        by_path: dict[str, list[dict]] = {}
+
+        emitted: list[dict] = []
         for change in changes or []:
             path = self._dig(change, "path") or self._dig(change, "file_path") or ""
             if not path:
                 continue
-            by_path.setdefault(path, []).append(change)
-
-        emitted: list[dict] = []
-        for path, hunks in by_path.items():
-            kinds = [self._dig(h, "kind") or self._dig(h, "type") or "modify" for h in hunks]
-            if "create" in kinds:
-                tool_name = "Write"
-                diff_text = self._dig(hunks[0], "diff") or ""
-                content_lines = [
-                    line[1:] for line in diff_text.splitlines() if line.startswith("+")
-                ]
-                args = {"file_path": path, "content": "\n".join(content_lines)}
-            elif "delete" in kinds:
-                tool_name = "DeleteFile"
-                args = {"file_path": path}
-            elif len(hunks) == 1:
-                tool_name = "Edit"
-                diff_text = self._dig(hunks[0], "diff") or ""
-                old, new = _synthesize_old_new(diff_text)
-                args = {"file_path": path, "old_string": old, "new_string": new}
-            else:
-                tool_name = "MultiEdit"
-                edits: list[dict] = []
-                for h in hunks:
-                    diff_text = self._dig(h, "diff") or ""
-                    old, new = _synthesize_old_new(diff_text)
-                    edits.append({"old_string": old, "new_string": new})
-                args = {"file_path": path, "edits": edits}
+            kind = self._dig(change, "kind") or self._dig(change, "type") or "update"
+            args = {"file_path": path, "kind": kind}
 
             seq += 1
             self._publish_event(
                 request_id, session_key, seq,
                 kind=OpenClawEventKind.TOOL_START,
-                tool_name=tool_name,
+                tool_name="file_change",
                 tool_arguments=args,
             )
-            emitted.append({"tool_name": tool_name, "args": args, "path": path})
+            emitted.append({"tool_name": "file_change", "args": args, "path": path})
 
         if item_id:
             item_buffers.setdefault(item_id, {})["filechange_started"] = emitted
@@ -1314,32 +1263,33 @@ class CodexBridge:
             self._publish_event(
                 request_id, session_key, seq,
                 kind=OpenClawEventKind.TOOL_END,
-                tool_name="Bash",
+                tool_name="shell",
                 tool_result=result[:4000],
             )
             return seq
 
         if item_type in ("fileChange", "file_change"):
-            # Emit one TOOL_END per matching TOOL_START (path-keyed).
+            # One TOOL_END per matching TOOL_START. Result is the change
+            # status (completed/failed) — codex doesn't expose patch text.
             started = buf.get("filechange_started") or []
-            for entry in started:
+            status = self._dig(item, "status") or "completed"
+            for _entry in started:
                 seq += 1
                 self._publish_event(
                     request_id, session_key, seq,
                     kind=OpenClawEventKind.TOOL_END,
-                    tool_name=entry.get("tool_name") or "Edit",
-                    tool_result="ok",
+                    tool_name="file_change",
+                    tool_result=str(status),
                 )
             return seq
 
         if item_type in ("webSearch", "web_search"):
-            tool_name = buf.get("tool_name") or "WebSearch"
             results = self._dig(item, "results") or self._dig(item, "result") or ""
             seq += 1
             self._publish_event(
                 request_id, session_key, seq,
                 kind=OpenClawEventKind.TOOL_END,
-                tool_name=tool_name,
+                tool_name="web_search",
                 tool_result=str(results)[:4000],
             )
             return seq
@@ -1373,7 +1323,7 @@ class CodexBridge:
             self._publish_event(
                 request_id, session_key, seq,
                 kind=OpenClawEventKind.TOOL_END,
-                tool_name="Read",
+                tool_name="image_view",
                 tool_result="[image]",
             )
             return seq
@@ -1655,5 +1605,6 @@ class CodexBridge:
             timestamp=datetime.now(timezone.utc),
             raw={},
             token_usage=token_usage,
+            provider=self._backend_name,
         )
         self._publisher.publish_run_event(request_id, event)

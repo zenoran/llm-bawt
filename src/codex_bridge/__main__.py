@@ -121,7 +121,10 @@ def main() -> None:
     os.environ["CODEX_HOME"] = codex_home
 
     redis_url = os.getenv("REDIS_URL", "redis://localhost:6379/0")
-    publisher = RedisPublisher(redis_url)
+    publisher = RedisPublisher(
+        redis_url,
+        default_provider=os.getenv("CODEX_BACKEND_NAME", "codex"),
+    )
     if not publisher.connected:
         logger.error("Cannot connect to Redis at %s", redis_url)
         sys.exit(1)

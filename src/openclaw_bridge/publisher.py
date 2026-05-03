@@ -38,9 +38,14 @@ RUN_STREAM_MAXLEN = 5_000
 
 
 class RedisPublisher:
-    def __init__(self, redis_url: str) -> None:
+    def __init__(self, redis_url: str, *, default_provider: str | None = None) -> None:
         self._redis = redis.Redis.from_url(redis_url, decode_responses=True)
         self._connected = False
+        # Bridges instantiate one publisher and pass their backend name here
+        # ("claude-code", "codex", "openclaw"). Stamps every event at the
+        # publish boundary so downstream consumers can dispatch on provider
+        # without each call site remembering to set it.
+        self._default_provider = default_provider
         try:
             self._redis.ping()
             self._connected = True
@@ -48,11 +53,17 @@ class RedisPublisher:
         except redis.ConnectionError as e:
             logger.error("Redis publisher connect failed: %s", e)
 
+    def _stamp_provider(self, event: OpenClawEvent) -> OpenClawEvent:
+        if event.provider is None and self._default_provider is not None:
+            event.provider = self._default_provider
+        return event
+
     def publish_event(self, event: OpenClawEvent) -> str | None:
         """Publish an event to the session's Redis Stream. Returns the stream ID."""
         if not self._connected:
             return None
         stream_key = f"{EVENTS_STREAM_PREFIX}{event.session_key}"
+        self._stamp_provider(event)
         try:
             data = event.to_dict()
             # Redis Streams fields must be flat str->str
@@ -94,6 +105,7 @@ class RedisPublisher:
         if not self._connected:
             return None
         stream_key = f"{RUN_STREAM_PREFIX}{request_id}"
+        self._stamp_provider(event)
         try:
             data = event.to_dict()
             fields = {"payload": json.dumps(data, ensure_ascii=False, default=str)}

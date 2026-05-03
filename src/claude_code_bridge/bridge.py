@@ -1045,5 +1045,6 @@ class ClaudeCodeBridge:
             timestamp=datetime.now(timezone.utc),
             raw={},
             token_usage=token_usage,
+            provider=self._backend_name,
         )
         self._publisher.publish_run_event(request_id, event)

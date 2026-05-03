@@ -87,7 +87,7 @@ def main() -> None:
     create_openclaw_tables(engine)
 
     # Redis
-    publisher = RedisPublisher(config.redis_url)
+    publisher = RedisPublisher(config.redis_url, default_provider="openclaw")
     if not publisher.connected:
         logger.error("Cannot connect to Redis at %s", config.redis_url)
         sys.exit(1)

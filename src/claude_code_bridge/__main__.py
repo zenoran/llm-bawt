@@ -58,7 +58,7 @@ def main() -> None:
     logger = logging.getLogger("claude_code_bridge")
 
     redis_url = os.getenv("REDIS_URL", "redis://localhost:6379/0")
-    publisher = RedisPublisher(redis_url)
+    publisher = RedisPublisher(redis_url, default_provider="claude-code")
     if not publisher.connected:
         logger.error("Cannot connect to Redis at %s", redis_url)
         sys.exit(1)

@@ -212,6 +212,7 @@ class ChatStreamingMixin:
                                 "arguments": tool_args,
                                 "call_id": call_id,
                                 "iteration": _tool_call_index,
+                                "provider": event.provider,
                                 "ts": time.time(),
                             })
                         except Exception:
@@ -240,6 +241,7 @@ class ChatStreamingMixin:
                                 "tool_name": event.tool_name or "unknown",
                                 "call_id": end_call_id,
                                 "iteration": _tool_call_index,
+                                "provider": event.provider,
                                 "result": tool_result[:2000],
                                 "ts": time.time(),
                             })

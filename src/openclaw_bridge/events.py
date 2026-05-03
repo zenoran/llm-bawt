@@ -41,6 +41,11 @@ class OpenClawEvent:
     # Shape: {input_tokens, cache_read_tokens, cache_creation_tokens,
     #         output_tokens, context_window, total_cost_usd}.
     token_usage: dict | None = None
+    # Identifies which agent backend produced this event ("claude-code",
+    # "codex", "openclaw"). Lets the UI dispatch tool rendering by
+    # (provider, tool_name) so each harness can show its own native tool
+    # shapes (e.g. codex file_change carries only path+kind, no diff).
+    provider: str | None = None
 
     def to_dict(self) -> dict:
         """Serialize for Redis/JSON transport."""
@@ -60,6 +65,7 @@ class OpenClawEvent:
             "db_id": self.db_id,
             "raw": self.raw,
             "token_usage": self.token_usage,
+            "provider": self.provider,
         }
 
     @classmethod
@@ -86,6 +92,7 @@ class OpenClawEvent:
             db_id=data.get("db_id"),
             raw=data.get("raw", {}),
             token_usage=data.get("token_usage"),
+            provider=data.get("provider"),
         )
 
 
