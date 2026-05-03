@@ -136,6 +136,51 @@ services:
       retries: 3
       start_period: 15s
 
+  codex-bridge:
+    image: llm-bawt-bridge
+    container_name: llm-bawt-codex-bridge
+    command: ["python", "-m", "codex_bridge"]
+    env_file:
+      - ./.env
+    environment:
+      - CODEX_HOME=/home/bridge/.codex
+      - CODEX_AUTH_PATH=/home/bridge/.codex/auth.json
+      - CODEX_MODEL=${CODEX_MODEL:-gpt-5.4}
+      - CODEX_BACKEND_NAME=${CODEX_BACKEND_NAME:-codex}
+      - CODEX_BRIDGE_LOG_LEVEL=${CODEX_BRIDGE_LOG_LEVEL:-INFO}
+      - CODEX_BRIDGE_HEALTH_PORT=8682
+      - CODEX_BRIDGE_REQUEST_TIMEOUT=${CODEX_BRIDGE_REQUEST_TIMEOUT:-300}
+      - CODEX_BRIDGE_CWD=${CODEX_BRIDGE_CWD:-/home/bridge/dev}
+      - LLM_BAWT_API_URL=http://app:8642
+      - REDIS_URL=redis://redis:6379/0
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+      - "echo.lan.zenoran.com:${ECHO_LAN_HOST_IP:-10.0.0.101}"
+      - "echo:${ECHO_LAN_HOST_IP:-10.0.0.101}"
+    volumes:
+      - ./.logs:/app/.logs
+      - ${HOME}/dev:/home/bridge/dev
+      # OAuth bundle is bind-mounted RW so codex can self-refresh tokens.
+      # `codex login` on the host writes back to this same inode and the
+      # bridge's supervisor picks up the new tokens on the next AsyncCodex
+      # rebuild — no docker restart needed.
+      - ${HOME}/.codex/auth.json:/home/bridge/.codex/auth.json
+      - ${HOME}/.codex/config.toml:/home/bridge/.codex/config.toml
+      - ${HOME}/.codex/sessions:/home/bridge/.codex/sessions
+      - ${HOME}/.ssh:/home/bridge/.ssh:ro
+    depends_on:
+      redis:
+        condition: service_healthy
+      app:
+        condition: service_started
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8682/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+
   playwright-mcp:
     image: mcp/playwright
     container_name: llm-bawt-playwright-mcp

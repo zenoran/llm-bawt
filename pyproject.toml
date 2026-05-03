@@ -30,6 +30,7 @@ dependencies = [
     "redis[hiredis]>=5.0.0",
     "anthropic>=0.84.0",
     "claude-agent-sdk>=0.1.56",
+    "openai-codex-sdk>=0.1.11",
 ]
 
 [project.optional-dependencies]
@@ -88,6 +89,7 @@ llm-mcp-server = "llm_bawt.mcp_server:run_server"
 llm-nextcloud = "llm_bawt.integrations.nextcloud.cli:nextcloud_cli"
 openclaw-bridge = "openclaw_bridge.__main__:main"
 claude-code-bridge = "claude_code_bridge.__main__:main"
+codex-bridge = "codex_bridge.__main__:main"
 
 [project.entry-points."llm_bawt.memory"]
 postgresql = "llm_bawt.memory.postgresql:PostgreSQLMemoryBackend"

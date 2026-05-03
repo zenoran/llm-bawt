@@ -16,6 +16,7 @@ COPY pyproject.toml ./
 # Copy only the bridge packages + shared deps
 COPY src/openclaw_bridge/ ./src/openclaw_bridge/
 COPY src/claude_code_bridge/ ./src/claude_code_bridge/
+COPY src/codex_bridge/ ./src/codex_bridge/
 
 # Minimal venv with only what bridges need
 RUN uv venv && uv pip install \
@@ -26,6 +27,7 @@ RUN uv venv && uv pip install \
     "httpx>=0.26.0" \
     "anyio>=4.0" \
     "claude-agent-sdk>=0.1.56" \
+    "openai-codex-sdk>=0.1.11" \
     "pydantic>=2.0"
 
 # Install project in editable mode so both bridge packages are importable
