@@ -1098,6 +1098,11 @@ class ChatStreamingMixin:
                     extra_kwargs = {}
                     if is_agent_backend and user_attachments:
                         extra_kwargs["attachments"] = user_attachments
+                    if is_agent_backend and trigger_message_id:
+                        # Forward the frontend user-message UUID to the bridge
+                        # so every emitted tool event carries it (frontend
+                        # buckets tool activity by trigger_message_id).
+                        extra_kwargs["trigger_message_id"] = trigger_message_id
                     stream_iter = llm_bawt.client.stream_raw(
                         messages, stop=adapter_stops or None, **gen_kwargs, **extra_kwargs
                     )
@@ -1171,7 +1176,11 @@ class ChatStreamingMixin:
                                     "_type": "tool_event",
                                     "event": "tool_start",
                                     "turn_id": turn_log_id,
-                                    "trigger_message_id": trigger_message_id,
+                                    # Prefer the bridge-stamped value from the
+                                    # event itself (authoritative for that turn),
+                                    # falling back to the request-scope value
+                                    # for backends that haven't been updated yet.
+                                    "trigger_message_id": item.get("trigger_message_id") or trigger_message_id,
                                     "bot_id": bot_id,
                                     "user_id": user_id,
                                     "tool_name": item.get("name", "unknown"),
@@ -1203,7 +1212,8 @@ class ChatStreamingMixin:
                                     "_type": "tool_event",
                                     "event": "tool_end",
                                     "turn_id": turn_log_id,
-                                    "trigger_message_id": trigger_message_id,
+                                    # Prefer bridge-stamped value (see tool_start above).
+                                    "trigger_message_id": item.get("trigger_message_id") or trigger_message_id,
                                     "bot_id": bot_id,
                                     "user_id": user_id,
                                     "tool_name": _result_name or "unknown",

@@ -123,6 +123,11 @@ class AgentBackendClient(LLMClient):
             return
 
         attachments: list = kwargs.pop("attachments", None) or []
+        # Frontend-supplied user-message UUID (or "local-user-*" placeholder).
+        # Bridges stamp this on every emitted tool event so the frontend can
+        # bucket tool activity under the originating user message without
+        # relying on the brittle turn_id / activeStreamMessageId fallback chain.
+        trigger_message_id: str | None = kwargs.pop("trigger_message_id", None)
 
         # Extract system prompt from messages for backends that support it
         # (e.g. claude-code bridge). Merge into config so the backend can
@@ -136,7 +141,19 @@ class AgentBackendClient(LLMClient):
             config["system_prompt"] = "\n\n".join(p for p in system_parts if p)
 
         if hasattr(self._backend, "stream_raw"):
-            for item in self._backend.stream_raw(prompt, config, attachments=attachments):
+            backend_kwargs: dict[str, Any] = {"attachments": attachments}
+            # Only forward trigger_message_id to backends that accept it
+            # (OpenClaw + subclasses do; older custom backends may not).
+            try:
+                import inspect
+                sig = inspect.signature(self._backend.stream_raw)
+                if "trigger_message_id" in sig.parameters:
+                    backend_kwargs["trigger_message_id"] = trigger_message_id
+            except (TypeError, ValueError):
+                # Builtins / C-extensions may not have a signature; pass it
+                # anyway and let the backend ignore unknown kwargs if it can.
+                backend_kwargs["trigger_message_id"] = trigger_message_id
+            for item in self._backend.stream_raw(prompt, config, **backend_kwargs):
                 yield item
             if hasattr(self._backend, "get_last_stream_result"):
                 self.last_result = self._backend.get_last_stream_result()

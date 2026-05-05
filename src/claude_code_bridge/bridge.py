@@ -178,6 +178,11 @@ class ClaudeCodeBridge:
         # Shared session queue — serializes sends per session and tracks
         # active tasks for abort support.
         self._session_queue = SessionQueue()
+        # request_id → frontend user-message UUID, populated in _handle_send
+        # and read by _publish_event so every emitted OpenClawEvent (tool_*,
+        # assistant_*, etc.) carries the originating message id.  Cleared on
+        # _handle_send finally.
+        self._trigger_message_ids: dict[str, str] = {}
         # Load MCP servers from settings file
         self._mcp_servers = self._load_mcp_servers()
 
@@ -437,6 +442,10 @@ class ClaudeCodeBridge:
         message = fields.get("message", "")
         system_prompt = fields.get("system_prompt") or None
         model = fields.get("model") or self._default_model
+        # Frontend-supplied user-message UUID; stamped on every emitted event
+        # so the frontend can bucket tool activity under the originating user
+        # message without falling back to turn_id heuristics.
+        trigger_message_id = (fields.get("trigger_message_id") or "").strip() or None
         attachments_raw = fields.get("attachments", "")
         attachments: list[dict] = []
         if attachments_raw:
@@ -449,6 +458,9 @@ class ClaudeCodeBridge:
             logger.warning("Invalid send command: missing request_id or message")
             await async_redis.xack(COMMANDS_STREAM, "claude-code-bridge", msg_id)
             return
+
+        if trigger_message_id:
+            self._trigger_message_ids[request_id] = trigger_message_id
 
         # /new resets the session — strip it and start fresh
         if message.lstrip().startswith("/new"):
@@ -889,6 +901,8 @@ class ClaudeCodeBridge:
                 )
                 self._publisher.publish_run_done(request_id)
             finally:
+                # Drop the per-run trigger_message_id mapping so we don't leak.
+                self._trigger_message_ids.pop(request_id, None)
                 await async_redis.xack(COMMANDS_STREAM, "claude-code-bridge", msg_id)
 
     # ----- Event publishing -----
@@ -1046,5 +1060,10 @@ class ClaudeCodeBridge:
             raw={},
             token_usage=token_usage,
             provider=self._backend_name,
+            # Inherit from the active run so every event for this request
+            # (TOOL_START, TOOL_END, ASSISTANT_*, RUN_*) carries the same
+            # originating user-message UUID without each call site needing
+            # to remember to thread it through.
+            trigger_message_id=self._trigger_message_ids.get(request_id),
         )
         self._publisher.publish_run_event(request_id, event)

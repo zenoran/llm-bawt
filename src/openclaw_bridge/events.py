@@ -46,6 +46,13 @@ class OpenClawEvent:
     # (provider, tool_name) so each harness can show its own native tool
     # shapes (e.g. codex file_change carries only path+kind, no diff).
     provider: str | None = None
+    # Frontend-supplied user-message UUID (or "local-user-*" placeholder)
+    # that triggered this run.  Stamped on TOOL_START / TOOL_END events by
+    # every bridge so the frontend can bucket tool activity under the
+    # originating user message without relying on turn_id heuristics.
+    # Optional because passive subscription paths (e.g. CLI sessions on
+    # the OpenClaw gateway) have no originating frontend message.
+    trigger_message_id: str | None = None
 
     def to_dict(self) -> dict:
         """Serialize for Redis/JSON transport."""
@@ -66,6 +73,7 @@ class OpenClawEvent:
             "raw": self.raw,
             "token_usage": self.token_usage,
             "provider": self.provider,
+            "trigger_message_id": self.trigger_message_id,
         }
 
     @classmethod
@@ -93,6 +101,7 @@ class OpenClawEvent:
             raw=data.get("raw", {}),
             token_usage=data.get("token_usage"),
             provider=data.get("provider"),
+            trigger_message_id=data.get("trigger_message_id"),
         )
 
 

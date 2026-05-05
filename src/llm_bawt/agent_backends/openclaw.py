@@ -102,11 +102,20 @@ class OpenClawBackend(AgentBackend):
             return explicit
         return os.getenv("OPENCLAW_SESSION_KEY", "main")
 
-    def stream_raw(self, prompt: str, config: dict, attachments: list | None = None) -> Iterator[str | dict[str, Any]]:
+    def stream_raw(
+        self,
+        prompt: str,
+        config: dict,
+        attachments: list | None = None,
+        trigger_message_id: str | None = None,
+    ) -> Iterator[str | dict[str, Any]]:
         """Stream OpenClaw response deltas and tool events via the bridge.
 
         Sends a command to the bridge via Redis, then subscribes to the
         per-run response stream. Yields text deltas and tool event dicts.
+
+        ``trigger_message_id`` is forwarded to the bridge so every emitted
+        tool event carries the originating frontend user-message UUID.
         """
         subscriber = get_openclaw_subscriber()
         if not subscriber:
@@ -119,6 +128,12 @@ class OpenClawBackend(AgentBackend):
         timeout = int(config.get("timeout_seconds", 600))
         request_id = f"req_{uuid.uuid4().hex}"
         self._active_request_id = request_id
+        # Fall back to config so callers that thread it through agent_backend_config
+        # (rather than as a kwarg) still propagate.
+        if not trigger_message_id:
+            tmid = config.get("trigger_message_id")
+            if isinstance(tmid, str) and tmid.strip():
+                trigger_message_id = tmid.strip()
 
         request_started = time.time()
         first_delta_at: float | None = None
@@ -167,6 +182,7 @@ class OpenClawBackend(AgentBackend):
                             model=config.get("model"),
                             backend=self.name,
                             bot_id=str(config.get("bot_id") or "").strip() or None,
+                            trigger_message_id=trigger_message_id,
                         )
                         logger.info(
                             "%s request via bridge: session=%s request_id=%s",
@@ -263,6 +279,10 @@ class OpenClawBackend(AgentBackend):
                                     "name": tc.display_name,
                                     "arguments": tc.arguments,
                                     "provider": event.provider,
+                                    # Forward bridge-stamped originating user-msg UUID
+                                    # so the SSE emitter doesn't have to fall back to
+                                    # request-scope state.
+                                    "trigger_message_id": event.trigger_message_id,
                                 })
 
                             elif event.kind == OpenClawEventKind.TOOL_END:
@@ -277,6 +297,7 @@ class OpenClawBackend(AgentBackend):
                                         "name": tool_calls[-1].display_name,
                                         "result": result,
                                         "provider": event.provider,
+                                        "trigger_message_id": event.trigger_message_id,
                                     })
 
                             elif event.kind == OpenClawEventKind.ERROR:

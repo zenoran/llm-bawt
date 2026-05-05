@@ -149,6 +149,10 @@ class SessionBridge:
         request_id = fields.get("request_id", "")
         session_key = fields.get("session_key", "main")
         message = fields.get("message", "")
+        # Frontend-supplied user-message UUID; stamped on every emitted event
+        # so the frontend can bucket tool activity under the originating user
+        # message without falling back to turn_id heuristics.
+        trigger_message_id = (fields.get("trigger_message_id") or "").strip() or None
         attachments_raw = fields.get("attachments", "")
         attachments: list = []
         if attachments_raw:
@@ -183,6 +187,11 @@ class SessionBridge:
                     # Parse through ingest pipeline to get structured event
                     event = self._ingest.parse(raw_event, session_key)
                     if event is not None:
+                        # Stamp the originating user-message UUID on every
+                        # event from this run so downstream consumers can
+                        # bucket tool activity without turn_id guessing.
+                        if trigger_message_id and not event.trigger_message_id:
+                            event.trigger_message_id = trigger_message_id
                         if event.kind == OpenClawEventKind.ASSISTANT_DELTA and event.text:
                             saw_assistant_text = True
 
@@ -209,6 +218,7 @@ class SessionBridge:
                                     seq=event.seq,
                                     timestamp=event.timestamp,
                                     raw=event.raw,
+                                    trigger_message_id=trigger_message_id,
                                 ),
                             )
 
@@ -236,6 +246,7 @@ class SessionBridge:
                                 kind=OpenClawEventKind.ASSISTANT_DELTA,
                                 origin="bridge",
                                 text=history_text,
+                                trigger_message_id=trigger_message_id,
                             ),
                         )
 
@@ -252,6 +263,7 @@ class SessionBridge:
                     kind=OpenClawEventKind.ERROR,
                     origin="bridge",
                     text=str(e),
+                    trigger_message_id=trigger_message_id,
                 )
                 self._publisher.publish_run_event(request_id, err_event)
                 self._publisher.publish_run_done(request_id)
@@ -472,6 +484,11 @@ class SessionBridge:
                 "_type": "tool_event",
                 "event": "tool_start",
                 "turn_id": run_id,
+                # Passive events come from external WS sessions (CLI, etc.)
+                # that have no originating frontend message — None is correct
+                # here.  Field is included for protocol consistency with the
+                # active path so the frontend can rely on its presence.
+                "trigger_message_id": event.trigger_message_id,
                 "bot_id": bot_id,
                 "user_id": user_id,
                 "tool_name": event.tool_name or "unknown",
@@ -489,6 +506,7 @@ class SessionBridge:
                 "_type": "tool_event",
                 "event": "tool_end",
                 "turn_id": run_id,
+                "trigger_message_id": event.trigger_message_id,
                 "bot_id": bot_id,
                 "user_id": user_id,
                 "tool_name": event.tool_name or "unknown",

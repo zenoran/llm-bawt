@@ -191,6 +191,11 @@ class CodexBridge:
         self._session_queue = SessionQueue()
         self._transport = CodexTransport(codex_bin=codex_bin)
         self._model_info = _ModelInfoCache(app_api_url)
+        # request_id → frontend user-message UUID, populated in _handle_send
+        # and read by _publish_event so every emitted OpenClawEvent (tool_*,
+        # assistant_*, etc.) carries the originating message id.  Cleared on
+        # publish_run_done.
+        self._trigger_message_ids: dict[str, str] = {}
 
     # ----- Public properties (used by __main__ for log lines) -------------
 
@@ -426,6 +431,10 @@ class CodexBridge:
         message = fields.get("message", "")
         system_prompt = fields.get("system_prompt") or None
         model = fields.get("model") or self._default_model
+        # Frontend-supplied user-message UUID; stamped on every emitted event
+        # so the frontend can bucket tool activity under the originating user
+        # message without falling back to turn_id heuristics.
+        trigger_message_id = (fields.get("trigger_message_id") or "").strip() or None
         attachments_raw = fields.get("attachments", "")
         attachments: list[dict] = []
         if attachments_raw:
@@ -438,6 +447,9 @@ class CodexBridge:
             logger.warning("Invalid send command: missing request_id or message")
             await async_redis.xack(COMMANDS_STREAM, CONSUMER_GROUP, msg_id)
             return
+
+        if trigger_message_id:
+            self._trigger_message_ids[request_id] = trigger_message_id
 
         # /new resets the session (TASK-206)
         if message.lstrip().startswith("/new"):
@@ -752,6 +764,8 @@ class CodexBridge:
                 self._publisher.publish_run_done(request_id)
             finally:
                 self._cleanup_tmp_files(tmp_image_paths)
+                # Drop the per-run trigger_message_id mapping so we don't leak.
+                self._trigger_message_ids.pop(request_id, None)
                 await async_redis.xack(COMMANDS_STREAM, CONSUMER_GROUP, msg_id)
 
     # ----- Event iteration with timeout -----------------------------------
@@ -1606,5 +1620,10 @@ class CodexBridge:
             raw={},
             token_usage=token_usage,
             provider=self._backend_name,
+            # Inherit from the active run so every event for this request
+            # (TOOL_START, TOOL_END, ASSISTANT_*, RUN_*) carries the same
+            # originating user-message UUID without each call site needing
+            # to remember to thread it through.
+            trigger_message_id=self._trigger_message_ids.get(request_id),
         )
         self._publisher.publish_run_event(request_id, event)

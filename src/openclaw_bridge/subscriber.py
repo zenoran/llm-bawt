@@ -105,8 +105,16 @@ class RedisSubscriber:
         model: str | None = None,
         backend: str | None = None,
         bot_id: str | None = None,
+        trigger_message_id: str | None = None,
     ) -> None:
-        """Publish a chat.send command to the bridge's command stream."""
+        """Publish a chat.send command to the bridge's command stream.
+
+        ``trigger_message_id`` is the frontend-supplied user-message UUID
+        (or ``local-user-*`` placeholder).  Bridges stamp it on every
+        ``tool_start`` / ``tool_end`` event they emit so the frontend can
+        bucket activity under the originating user message without relying
+        on the brittle ``turn_id`` / ``activeStreamMessageId`` fallback chain.
+        """
         fields: dict = {
             "action": "chat.send",
             "session_key": session_key,
@@ -123,6 +131,8 @@ class RedisSubscriber:
             fields["backend"] = backend
         if bot_id:
             fields["bot_id"] = bot_id
+        if trigger_message_id:
+            fields["trigger_message_id"] = trigger_message_id
         await self._redis.xadd(
             COMMANDS_STREAM,
             fields,
