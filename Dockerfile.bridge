@@ -1,9 +1,26 @@
 # Lightweight bridge image — no CUDA/GPU, just Python + bridge deps
 FROM python:3.12-slim
 
+# Tools grouped by purpose (one group per line):
+#   core:       curl libpq5 openssh-client git ca-certificates
+#   data:       jq yq
+#   search:     ripgrep fd-find
+#   db clients: postgresql-client redis-tools sqlite3
+#   sys/proc:   procps iproute2 less tree
+#   net debug:  dnsutils iputils-ping netcat-openbsd
+#   archives:   unzip zip xz-utils
+#   build:      make
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    curl libpq5 openssh-client git \
-    && rm -rf /var/lib/apt/lists/*
+    curl libpq5 openssh-client git ca-certificates \
+    jq yq \
+    ripgrep fd-find \
+    postgresql-client redis-tools sqlite3 \
+    procps iproute2 less tree \
+    dnsutils iputils-ping netcat-openbsd \
+    unzip zip xz-utils \
+    make \
+    && rm -rf /var/lib/apt/lists/* \
+    && ln -s "$(which fdfind)" /usr/local/bin/fd
 
 RUN curl -LsSf https://astral.sh/uv/install.sh | sh
 ENV PATH="/root/.local/bin:$PATH"
