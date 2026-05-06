@@ -165,6 +165,145 @@ def backfill_meaning_embeddings(
     return {"updated": updated, "failed": failed, "total": total}
 
 
+def backfill_sessions(
+    backend: Any,
+    dry_run: bool = False,
+) -> dict:
+    """Backfill the shared `sessions` table from existing message history.
+
+    Scans every `*_messages` table in the database, finds each distinct
+    session_id, and inserts a corresponding session row with started_at /
+    ended_at inferred from MIN/MAX message timestamps. The bot_id is
+    derived from the table name prefix (`{bot_id}_messages`).
+
+    Sessions backfilled this way are marked `status='completed'` since
+    they predate the new tracking — there's no live process holding them
+    open. Existing rows are left alone (ON CONFLICT DO NOTHING).
+
+    Args:
+        backend: PostgreSQLMemoryBackend instance — only used for the engine.
+        dry_run: If True, only report what would be done.
+
+    Returns:
+        Dict with counts: {scanned_tables, distinct_sessions,
+        inserted, skipped, dry_run}.
+    """
+    from sqlalchemy import text
+    from datetime import datetime, timezone
+
+    inserted = 0
+    skipped = 0
+    distinct_sessions = 0
+
+    with backend.engine.connect() as conn:
+        # First, make sure the sessions table actually exists. If somebody
+        # runs this before any backend has called _ensure_tables_exist(),
+        # we still want a clean run rather than a SQL error.
+        conn.execute(text("""
+            CREATE TABLE IF NOT EXISTS sessions (
+                id VARCHAR(36) PRIMARY KEY,
+                bot_id VARCHAR(64) NOT NULL,
+                started_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                ended_at TIMESTAMP,
+                status VARCHAR(16) NOT NULL DEFAULT 'active',
+                session_metadata JSONB
+            )
+        """))
+        conn.execute(text("""
+            CREATE INDEX IF NOT EXISTS idx_sessions_bot_started
+            ON sessions(bot_id, started_at)
+        """))
+        conn.execute(text("""
+            CREATE INDEX IF NOT EXISTS idx_sessions_status
+            ON sessions(status)
+        """))
+        conn.commit()
+
+        # Discover all *_messages tables. Excludes *_forgotten_messages by
+        # requiring the suffix to be _messages exactly.
+        tables_sql = text("""
+            SELECT table_name
+            FROM information_schema.tables
+            WHERE table_schema = 'public'
+              AND table_name LIKE '%\\_messages' ESCAPE '\\'
+              AND table_name NOT LIKE '%\\_forgotten\\_messages' ESCAPE '\\'
+        """)
+        tables = [row.table_name for row in conn.execute(tables_sql).fetchall()]
+        logger.debug(f"Found {len(tables)} message tables: {tables}")
+
+        for table_name in tables:
+            # Bot id is the part before "_messages"
+            if not table_name.endswith("_messages"):
+                continue
+            bot_id = table_name[: -len("_messages")]
+
+            # Find distinct session_ids and their time ranges. Skip rows
+            # where session_id is NULL — those messages had no session.
+            sessions_sql = text(f"""
+                SELECT
+                    session_id,
+                    MIN(timestamp) AS first_ts,
+                    MAX(timestamp) AS last_ts,
+                    COUNT(*) AS msg_count
+                FROM {table_name}
+                WHERE session_id IS NOT NULL
+                GROUP BY session_id
+            """)
+            rows = conn.execute(sessions_sql).fetchall()
+            logger.debug(
+                f"Bot {bot_id}: {len(rows)} distinct session(s) in {table_name}"
+            )
+
+            for row in rows:
+                distinct_sessions += 1
+                if dry_run:
+                    skipped += 1
+                    continue
+
+                # Convert UNIX timestamps (seconds) to datetimes.
+                started_at = datetime.fromtimestamp(
+                    row.first_ts, tz=timezone.utc
+                )
+                ended_at = datetime.fromtimestamp(
+                    row.last_ts, tz=timezone.utc
+                )
+
+                insert_sql = text("""
+                    INSERT INTO sessions
+                        (id, bot_id, started_at, ended_at, status,
+                         session_metadata)
+                    VALUES
+                        (:id, :bot_id, :started_at, :ended_at, 'completed',
+                         CAST(:metadata AS jsonb))
+                    ON CONFLICT (id) DO NOTHING
+                """)
+                metadata_json = json.dumps({
+                    "backfilled": True,
+                    "message_count": int(row.msg_count),
+                })
+                result = conn.execute(insert_sql, {
+                    "id": row.session_id,
+                    "bot_id": bot_id,
+                    "started_at": started_at,
+                    "ended_at": ended_at,
+                    "metadata": metadata_json,
+                })
+                if result.rowcount and result.rowcount > 0:
+                    inserted += 1
+                else:
+                    skipped += 1
+
+            conn.commit()
+
+    return {
+        "scanned_tables": len(tables) if 'tables' in locals() else 0,
+        "distinct_sessions": distinct_sessions,
+        "inserted": inserted,
+        "skipped": skipped,
+        "dry_run": dry_run,
+    }
+
+
 def add_recalled_history_column(backend: Any, dry_run: bool = False) -> dict:
     """Add recalled_history boolean column to message tables if missing.
 
@@ -221,6 +360,9 @@ def run_all_migrations(backend: Any, dry_run: bool = False) -> dict:
     logger.debug("Running recalled_history column migration...")
     results["recalled_history"] = add_recalled_history_column(backend, dry_run=dry_run)
 
+    logger.debug("Running sessions backfill...")
+    results["sessions"] = backfill_sessions(backend, dry_run=dry_run)
+
     return results
 
 
@@ -231,7 +373,10 @@ def main():
     from .postgresql import PostgreSQLMemoryBackend
 
     parser = argparse.ArgumentParser(description="Run memory schema migrations")
-    parser.add_argument("command", choices=["backfill_tags", "backfill_meaning", "all"])
+    parser.add_argument(
+        "command",
+        choices=["backfill_tags", "backfill_meaning", "backfill_sessions", "all"],
+    )
     parser.add_argument("--bot", default="nova", help="Bot ID to migrate")
     parser.add_argument("--dry-run", action="store_true", help="Only report what would be done")
     parser.add_argument("--verbose", "-v", action="store_true", help="Verbose output")
@@ -247,6 +392,8 @@ def main():
         result = backfill_empty_tags(backend, dry_run=args.dry_run)
     elif args.command == "backfill_meaning":
         result = backfill_meaning_embeddings(backend, dry_run=args.dry_run)
+    elif args.command == "backfill_sessions":
+        result = backfill_sessions(backend, dry_run=args.dry_run)
     elif args.command == "all":
         result = run_all_migrations(backend, dry_run=args.dry_run)
 

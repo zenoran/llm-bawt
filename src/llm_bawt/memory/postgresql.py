@@ -100,6 +100,31 @@ metadata = MetaData()
 _memory_table_cache: dict[str, Table] = {}
 _message_table_cache: dict[str, Table] = {}
 
+# Shared sessions table (not per-bot — sessions are first-class entities,
+# scoped by bot_id column rather than a separate table per bot).
+# Schema:
+#   id          UUID primary key (matches messages.session_id)
+#   bot_id      Which bot the session belongs to
+#   started_at  When the session opened
+#   ended_at    When the session was closed (NULL while active)
+#   status      'active' or 'completed'
+#   metadata    JSONB grab-bag for future extensibility
+sessions_table = Table(
+    "sessions",
+    metadata,
+    Column("id", String(36), primary_key=True),
+    Column("bot_id", String(64), nullable=False),
+    Column("started_at", DateTime, nullable=False, default=_utcnow),
+    Column("ended_at", DateTime, nullable=True),
+    Column("status", String(16), nullable=False, default="active"),
+    Column("session_metadata", JSON, nullable=True),
+    extend_existing=True,
+)
+
+
+# Module-level guard so we only run the shared sessions DDL once per process.
+_sessions_table_initialized = False
+
 
 def get_message_table_pg(bot_id: str) -> Table:
     """Get or create a message Table for a specific bot (PostgreSQL version)."""
@@ -348,11 +373,39 @@ class PostgreSQLMemoryBackend(MemoryBackend):
                 ALTER TABLE {self._messages_table_name}
                 ADD COLUMN IF NOT EXISTS recalled_history BOOLEAN DEFAULT FALSE
             """)
-            
+
+            # Shared sessions table (TASK-183). One row per session across
+            # all bots; promotes session_id from a bare UUID to a first-class
+            # entity with start/end timestamps and a status.
+            sessions_sql = text("""
+                CREATE TABLE IF NOT EXISTS sessions (
+                    id VARCHAR(36) PRIMARY KEY,
+                    bot_id VARCHAR(64) NOT NULL,
+                    started_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    ended_at TIMESTAMP,
+                    status VARCHAR(16) NOT NULL DEFAULT 'active',
+                    session_metadata JSONB
+                )
+            """)
+            sessions_idx_sql = text("""
+                CREATE INDEX IF NOT EXISTS idx_sessions_bot_started
+                ON sessions(bot_id, started_at)
+            """)
+            sessions_status_idx_sql = text("""
+                CREATE INDEX IF NOT EXISTS idx_sessions_status
+                ON sessions(status)
+            """)
+
             try:
                 conn.execute(messages_sql)
                 conn.execute(forgotten_sql)
                 conn.execute(memories_sql)
+                conn.execute(sessions_sql)
+                try:
+                    conn.execute(sessions_idx_sql)
+                    conn.execute(sessions_status_idx_sql)
+                except Exception as e:
+                    logger.debug(f"sessions index creation: {e}")
                 # Run migrations for existing tables
                 try:
                     conn.execute(add_tags_sql)
@@ -1874,15 +1927,74 @@ class PostgreSQLShortTermManager:
         self.bot_id = bot_id
         self._backend = PostgreSQLMemoryBackend(config, bot_id)
         self._current_session_id = str(uuid.uuid4())
-    
+        # Insert a row into the shared sessions table for this session.
+        # Best-effort: log and continue if it fails (e.g. very early bring-up
+        # before the sessions table exists). Subsequent new_session() calls
+        # will retry.
+        try:
+            self._insert_session_row(self._current_session_id)
+        except Exception as e:
+            logger.warning(
+                f"Failed to record initial session row for bot {bot_id}: {e}"
+            )
+
+    def _insert_session_row(self, session_id: str) -> None:
+        """Insert a new row into the shared sessions table.
+
+        Uses INSERT ... ON CONFLICT DO NOTHING so reusing an existing UUID
+        (rare, but possible in a backfill or test scenario) is a no-op.
+        """
+        with self._backend.engine.connect() as conn:
+            stmt = text("""
+                INSERT INTO sessions (id, bot_id, started_at, status)
+                VALUES (:id, :bot_id, CURRENT_TIMESTAMP, 'active')
+                ON CONFLICT (id) DO NOTHING
+            """)
+            conn.execute(stmt, {"id": session_id, "bot_id": self.bot_id})
+            conn.commit()
+
+    def _close_session_row(self, session_id: str) -> None:
+        """Mark a session row as completed (sets ended_at + status)."""
+        with self._backend.engine.connect() as conn:
+            stmt = text("""
+                UPDATE sessions
+                SET ended_at = CURRENT_TIMESTAMP,
+                    status = 'completed'
+                WHERE id = :id AND ended_at IS NULL
+            """)
+            conn.execute(stmt, {"id": session_id})
+            conn.commit()
+
     @property
     def session_id(self) -> str:
         """Get the current session ID."""
         return self._current_session_id
-    
+
     def new_session(self) -> str:
-        """Start a new session and return its ID."""
+        """Start a new session and return its ID.
+
+        Closes the previous session (sets ended_at, status='completed'),
+        then opens a new one with a fresh UUID. Both operations are
+        best-effort: failures are logged but don't block returning the
+        new ID since callers depend on it for message attribution.
+        """
+        previous_session_id = self._current_session_id
         self._current_session_id = str(uuid.uuid4())
+
+        try:
+            self._close_session_row(previous_session_id)
+        except Exception as e:
+            logger.warning(
+                f"Failed to close session {previous_session_id}: {e}"
+            )
+
+        try:
+            self._insert_session_row(self._current_session_id)
+        except Exception as e:
+            logger.warning(
+                f"Failed to record new session {self._current_session_id}: {e}"
+            )
+
         return self._current_session_id
     
     def add_message(self, role: str, content: str, timestamp: float | None = None) -> str:
