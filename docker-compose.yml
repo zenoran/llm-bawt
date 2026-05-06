@@ -77,6 +77,12 @@ services:
       - OPENCLAW_GATEWAY_TOKEN=${OPENCLAW_GATEWAY_TOKEN:-}
       - OPENCLAW_BRIDGE_LOG_LEVEL=${OPENCLAW_BRIDGE_LOG_LEVEL:-INFO}
       - LLM_BAWT_API_URL=http://app:8642
+      # Override SERVICE_HOST inherited from .env (which is 0.0.0.0 — meant
+      # for the app container's bind address). From inside a bridge, the
+      # service is reachable at the compose service name `app`. This lets
+      # the editable `llm` CLI (installed via pipx in Dockerfile.bridge)
+      # talk to the API without a flag override.
+      - LLM_BAWT_SERVICE_HOST=app
       - REDIS_URL=redis://redis:6379/0
     extra_hosts:
       - "host.docker.internal:host-gateway"
@@ -109,6 +115,12 @@ services:
       - CLAUDE_CODE_MODEL=${CLAUDE_CODE_MODEL:-claude-sonnet-4-20250514}
       - CLAUDE_CODE_BRIDGE_LOG_LEVEL=${CLAUDE_CODE_BRIDGE_LOG_LEVEL:-INFO}
       - LLM_BAWT_API_URL=http://app:8642
+      # Override SERVICE_HOST inherited from .env (which is 0.0.0.0 — meant
+      # for the app container's bind address). From inside a bridge, the
+      # service is reachable at the compose service name `app`. This lets
+      # the editable `llm` CLI (installed via pipx in Dockerfile.bridge)
+      # talk to the API without a flag override.
+      - LLM_BAWT_SERVICE_HOST=app
       - REDIS_URL=redis://redis:6379/0
     extra_hosts:
       - "host.docker.internal:host-gateway"
@@ -152,6 +164,12 @@ services:
       - CODEX_BRIDGE_REQUEST_TIMEOUT=${CODEX_BRIDGE_REQUEST_TIMEOUT:-300}
       - CODEX_BRIDGE_CWD=${CODEX_BRIDGE_CWD:-/home/bridge/dev}
       - LLM_BAWT_API_URL=http://app:8642
+      # Override SERVICE_HOST inherited from .env (which is 0.0.0.0 — meant
+      # for the app container's bind address). From inside a bridge, the
+      # service is reachable at the compose service name `app`. This lets
+      # the editable `llm` CLI (installed via pipx in Dockerfile.bridge)
+      # talk to the API without a flag override.
+      - LLM_BAWT_SERVICE_HOST=app
       - REDIS_URL=redis://redis:6379/0
     extra_hosts:
       - "host.docker.internal:host-gateway"
