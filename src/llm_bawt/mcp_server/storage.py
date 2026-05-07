@@ -679,6 +679,64 @@ class MemoryStorage:
             logger.error("Failed to remove last message: %s", e)
             return False
 
+    # =========================================================================
+    # Sessions (shared `sessions` table)
+    # =========================================================================
+
+    async def close_session(
+        self,
+        session_id: str,
+        bot_id: str = "default",
+    ) -> bool:
+        """Mark a session row completed (sets ended_at + status='completed').
+
+        Returns True iff a row was updated. Idempotent: closing an already-
+        closed session returns False without error.
+        """
+        manager = self.get_short_term_manager(bot_id)
+        return manager.close_session(session_id)
+
+    async def get_session(
+        self,
+        session_id: str,
+        bot_id: str = "default",
+    ) -> dict | None:
+        """Return a session row by id (or None). The `sessions` table is
+        shared, so `bot_id` only selects which engine to use — any bot
+        works.
+        """
+        manager = self.get_short_term_manager(bot_id)
+        return manager.get_session(session_id)
+
+    async def list_sessions(
+        self,
+        bot_id: str = "default",
+        since: float | str | None = None,
+        status: str | None = None,
+        limit: int = 50,
+    ) -> list[dict]:
+        """List sessions for a bot, newest first.
+
+        Pass `bot_id=""` to query across all bots.
+        """
+        # Use a default manager engine, but pass the requested bot through
+        # to the query (manager is bot-scoped, the table is not).
+        engine_manager = self.get_short_term_manager(bot_id or "default")
+        return engine_manager.list_sessions(
+            bot_id=bot_id,
+            since=since,
+            status=status,
+            limit=limit,
+        )
+
+    async def get_active_session(
+        self,
+        bot_id: str = "default",
+    ) -> dict | None:
+        """Return the most-recent active session for a bot, or None."""
+        manager = self.get_short_term_manager(bot_id)
+        return manager.get_active_session(bot_id=bot_id)
+
 
     # =========================================================================
     # Cross-bot / Source Discovery & Search

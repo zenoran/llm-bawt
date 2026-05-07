@@ -1965,6 +1965,149 @@ class PostgreSQLShortTermManager:
             conn.execute(stmt, {"id": session_id})
             conn.commit()
 
+    @staticmethod
+    def _row_to_session_dict(row: Any) -> dict:
+        """Coerce a `sessions` row into a JSON-friendly dict."""
+        return {
+            "id": row.id,
+            "bot_id": row.bot_id,
+            "started_at": row.started_at.isoformat() if row.started_at else None,
+            "ended_at": row.ended_at.isoformat() if row.ended_at else None,
+            "status": row.status,
+            "metadata": row.session_metadata,
+        }
+
+    # ---------- Public session query API ----------
+    # The `sessions` table is shared across bots, but the manager is bot-scoped,
+    # so query methods default `bot_id` to `self.bot_id` for ergonomic in-process
+    # calls while still accepting an override for cross-bot lookups.
+
+    def close_session(self, session_id: str | None = None) -> bool:
+        """Close a session: set `ended_at=now()` and `status='completed'`.
+
+        If `session_id` is None, closes this manager's current session and
+        keeps `_current_session_id` pointing at it (no rotation). Use
+        `new_session()` if you also want to open a fresh session.
+
+        Returns True if a row was updated, False otherwise (already closed
+        or not found).
+        """
+        target = session_id or self._current_session_id
+        if not target:
+            return False
+        try:
+            with self._backend.engine.connect() as conn:
+                stmt = text("""
+                    UPDATE sessions
+                    SET ended_at = CURRENT_TIMESTAMP,
+                        status = 'completed'
+                    WHERE id = :id AND ended_at IS NULL
+                    RETURNING id
+                """)
+                result = conn.execute(stmt, {"id": target}).fetchone()
+                conn.commit()
+                return result is not None
+        except Exception as e:
+            logger.warning(f"close_session({target}) failed: {e}")
+            return False
+
+    def get_session(self, session_id: str) -> dict | None:
+        """Return a session row as a dict, or None if not found."""
+        if not session_id:
+            return None
+        try:
+            with self._backend.engine.connect() as conn:
+                stmt = text("""
+                    SELECT id, bot_id, started_at, ended_at, status, session_metadata
+                    FROM sessions
+                    WHERE id = :id
+                """)
+                row = conn.execute(stmt, {"id": session_id}).fetchone()
+                return self._row_to_session_dict(row) if row else None
+        except Exception as e:
+            logger.warning(f"get_session({session_id}) failed: {e}")
+            return None
+
+    def list_sessions(
+        self,
+        bot_id: str | None = None,
+        since: float | str | None = None,
+        status: str | None = None,
+        limit: int = 50,
+    ) -> list[dict]:
+        """List sessions, newest first.
+
+        Args:
+            bot_id: Restrict to this bot. Defaults to ``self.bot_id``. Pass
+                an empty string to query across all bots.
+            since: Only sessions with ``started_at >= since``. Accepts a
+                Unix timestamp (float/int) or an ISO-8601 string.
+            status: Filter by status ('active' or 'completed').
+            limit: Max rows to return.
+
+        Returns:
+            List of session dicts in ``started_at DESC`` order.
+        """
+        target_bot = self.bot_id if bot_id is None else bot_id
+        clauses: list[str] = []
+        params: dict = {"limit": int(limit)}
+
+        if target_bot:
+            clauses.append("bot_id = :bot_id")
+            params["bot_id"] = target_bot
+        if status:
+            clauses.append("status = :status")
+            params["status"] = status
+        if since is not None:
+            if isinstance(since, (int, float)):
+                params["since"] = datetime.fromtimestamp(float(since), tz=timezone.utc)
+            else:
+                params["since"] = since
+            clauses.append("started_at >= :since")
+
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        sql = f"""
+            SELECT id, bot_id, started_at, ended_at, status, session_metadata
+            FROM sessions
+            {where}
+            ORDER BY started_at DESC
+            LIMIT :limit
+        """
+        try:
+            with self._backend.engine.connect() as conn:
+                rows = conn.execute(text(sql), params).fetchall()
+                return [self._row_to_session_dict(r) for r in rows]
+        except Exception as e:
+            logger.warning(f"list_sessions failed: {e}")
+            return []
+
+    def get_active_session(self, bot_id: str | None = None) -> dict | None:
+        """Return the most-recent active session for a bot, or None.
+
+        An "active" session has ``status='active'`` and ``ended_at IS NULL``.
+        If multiple are active (shouldn't happen but possible after a
+        crashed close), returns the most recently started.
+        """
+        target_bot = self.bot_id if bot_id is None else bot_id
+        if not target_bot:
+            return None
+        try:
+            with self._backend.engine.connect() as conn:
+                stmt = text("""
+                    SELECT id, bot_id, started_at, ended_at, status, session_metadata
+                    FROM sessions
+                    WHERE bot_id = :bot_id
+                      AND status = 'active'
+                      AND ended_at IS NULL
+                    ORDER BY started_at DESC
+                    LIMIT 1
+                """)
+                row = conn.execute(stmt, {"bot_id": target_bot}).fetchone()
+                return self._row_to_session_dict(row) if row else None
+        except Exception as e:
+            logger.warning(f"get_active_session({target_bot}) failed: {e}")
+            return None
+
     @property
     def session_id(self) -> str:
         """Get the current session ID."""

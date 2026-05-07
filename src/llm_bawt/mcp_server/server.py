@@ -659,6 +659,102 @@ async def remove_last_message_if_partial(bot_id: str = "default", role: str = "a
 
 
 # ---------------------------------------------------------------------------
+# Session Tools (shared `sessions` table)
+# ---------------------------------------------------------------------------
+
+
+@mcp.tool(name="sessions_close")
+async def close_session(
+    session_id: str,
+    bot_id: str = "default",
+) -> bool:
+    """Close a session (sets ended_at + status='completed').
+
+    Idempotent: returns True if a row was updated, False if the session was
+    already closed or not found.
+
+    Args:
+        session_id: UUID of the session to close.
+        bot_id: Bot namespace (only used to pick a DB engine — the
+            sessions table is shared across bots).
+
+    Returns:
+        True if the session was open and is now closed.
+    """
+    logger.debug("MCP tool invoked: sessions_close bot_id=%s session_id=%s", bot_id, session_id)
+    storage = _get_storage()
+    return await storage.close_session(session_id=session_id, bot_id=bot_id)
+
+
+@mcp.tool(name="sessions_get")
+async def get_session(
+    session_id: str,
+    bot_id: str = "default",
+) -> dict | None:
+    """Get a session record by id.
+
+    Args:
+        session_id: UUID of the session.
+        bot_id: Bot namespace (engine selector only — table is shared).
+
+    Returns:
+        Dict with id, bot_id, started_at, ended_at, status, metadata.
+        None if not found.
+    """
+    logger.debug("MCP tool invoked: sessions_get bot_id=%s session_id=%s", bot_id, session_id)
+    storage = _get_storage()
+    return await storage.get_session(session_id=session_id, bot_id=bot_id)
+
+
+@mcp.tool(name="sessions_list")
+async def list_sessions(
+    bot_id: str = "default",
+    since: float | str | None = None,
+    status: str | None = None,
+    limit: int = 50,
+) -> list[dict]:
+    """List sessions for a bot, newest first.
+
+    Args:
+        bot_id: Bot namespace. Pass empty string to query across all bots.
+        since: Lower bound on started_at — Unix timestamp (float/int) or
+            ISO-8601 string. Optional.
+        status: Filter to 'active' or 'completed'. Optional.
+        limit: Max sessions to return (default 50).
+
+    Returns:
+        List of session dicts in started_at DESC order.
+    """
+    logger.debug("MCP tool invoked: sessions_list bot_id=%s status=%s", bot_id, status)
+    storage = _get_storage()
+    return await storage.list_sessions(
+        bot_id=bot_id,
+        since=since,
+        status=status,
+        limit=limit,
+    )
+
+
+@mcp.tool(name="sessions_get_active")
+async def get_active_session(bot_id: str = "default") -> dict | None:
+    """Get the most-recent active session for a bot.
+
+    An active session has status='active' and ended_at IS NULL. If a bot
+    has multiple active rows (rare — happens after a crash mid-rotation),
+    returns the most recently started.
+
+    Args:
+        bot_id: Bot namespace.
+
+    Returns:
+        Session dict, or None if the bot has no active session.
+    """
+    logger.debug("MCP tool invoked: sessions_get_active bot_id=%s", bot_id)
+    storage = _get_storage()
+    return await storage.get_active_session(bot_id=bot_id)
+
+
+# ---------------------------------------------------------------------------
 # Inter-Bot Communication Tools
 # ---------------------------------------------------------------------------
 
