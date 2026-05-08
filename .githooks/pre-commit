@@ -1,0 +1,35 @@
+#!/bin/sh
+# Block commits unless on the repo's canonical branch.
+#
+# Background: this repo's source is bind-mounted into running Docker
+# containers (llm-bawt-app, codex-bridge, claude-code-bridge, etc.).
+# Switching branches mid-flight swaps the source the running services
+# see — and committing on the wrong branch routinely strands work where
+# nobody expects it. This hook is a backstop for both problems.
+#
+# The canonical branch is read from `git config branch.canonical`
+# (default: master). To unblock a one-off commit on a non-canonical
+# branch, pass `--no-verify`. To change the canonical branch:
+#     git config branch.canonical <new-branch>
+
+canonical=$(git config branch.canonical 2>/dev/null || echo "master")
+current=$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo "")
+
+if [ -z "$current" ] || [ "$current" = "HEAD" ]; then
+    echo "✗ pre-commit: detached HEAD — refusing to commit." >&2
+    echo "  Switch to '$canonical' first: git switch $canonical" >&2
+    exit 1
+fi
+
+if [ "$current" != "$canonical" ]; then
+    echo "✗ pre-commit: blocked." >&2
+    echo "  current branch:    $current" >&2
+    echo "  canonical branch:  $canonical" >&2
+    echo "" >&2
+    echo "  This repo is bind-mounted into live containers. Commits stay" >&2
+    echo "  on '$canonical'. To bypass once: git commit --no-verify ..." >&2
+    echo "  To change the rule:               git config branch.canonical <name>" >&2
+    exit 1
+fi
+
+exit 0
