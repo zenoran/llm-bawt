@@ -416,7 +416,6 @@ class ChatStreamingMixin:
                 latency_ms=elapsed_ms,
                 error_text=err_text,
             )
-            _finalized = True
 
             visible = (
                 f"⚠️ bridge stream failed\n\n"
@@ -449,6 +448,35 @@ class ChatStreamingMixin:
             }
             yield f"data: {json.dumps(data)}\n\n"
             yield "data: [DONE]\n\n"
+
+            # Persist the failed turn (partial response + visible error) to
+            # bot history so it survives a page refresh. Without this the
+            # user sees their prompt without any reply after reload — the
+            # error bubble only existed on the SSE wire. Best-effort: any
+            # persistence failure is logged and swallowed.
+            try:
+                full_text = "".join(full_text_parts)
+                if full_text:
+                    self._finalize_turn(
+                        llm_bawt=llm_bawt,
+                        turn_id=turn_log_id,
+                        response_text=full_text,
+                        tool_context="",
+                        tool_call_details=tool_call_details,
+                        prepared_messages=[],
+                        user_prompt=user_prompt,
+                        model=model_alias,
+                        bot_id=bot_id,
+                        user_id=user_id,
+                        elapsed_ms=elapsed_ms,
+                        stream=True,
+                    )
+            except Exception as _persist_err:
+                log.warning(
+                    "Failed to persist errored turn %s to bot history: %s",
+                    turn_log_id, _persist_err,
+                )
+            _finalized = True
 
         finally:
             # Ensure turn is finalized even on GeneratorExit (client disconnect).

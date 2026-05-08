@@ -204,6 +204,40 @@ def _validate_profile_payload(payload: dict[str, object]) -> None:
         raise HTTPException(status_code=400, detail="Agent bots require agent_backend")
 
 
+def _humanize_bot_constraint_error(exc: Exception) -> str | None:
+    """Extract a clean message from a bot_profiles DB constraint failure.
+
+    The migration ``add_bot_model_constraints`` installs:
+      • a foreign key on ``default_model``
+      • a BEFORE trigger that enforces backend↔model.type compatibility
+
+    Both surface through SQLAlchemy as ``IntegrityError`` wrapping a
+    psycopg ``ForeignKeyViolation`` / ``RaiseException``. The trigger's
+    own ``RAISE EXCEPTION`` text is already user-friendly (e.g.
+    ``bot loopy: agent_backend=codex requires a model of type=openai...``)
+    so we just lift it out of the SQLAlchemy wrapper.
+
+    Returns the cleaned message, or None if this isn't a bot-constraint
+    error (in which case the caller re-raises).
+    """
+    text = str(getattr(exc, "orig", exc) or exc)
+    markers = (
+        "bot_profiles_default_model_fk",
+        "bot_profiles_check_model_backend",
+        "bot_profiles_model_backend_check",
+        "agent_backend=",
+        "default_model",
+    )
+    if not any(m in text for m in markers):
+        return None
+    # Strip psycopg/SQLAlchemy line prefixes and extra context.
+    for line in text.splitlines():
+        line = line.strip()
+        if line.startswith("bot ") and ":" in line:
+            return line
+    return text.split("CONTEXT:")[0].strip() or None
+
+
 async def _persist_bot_profile(
     payload: dict[str, object],
     *,
@@ -222,7 +256,13 @@ async def _persist_bot_profile(
 
     _validate_profile_payload(payload)
 
-    profile = store.upsert(payload)
+    try:
+        profile = store.upsert(payload)
+    except Exception as exc:  # surface DB constraint violations as 400s
+        msg = _humanize_bot_constraint_error(exc)
+        if msg is not None:
+            raise HTTPException(status_code=400, detail=msg)
+        raise
     _reload_bot_registry()
     _reload_service_model_catalog(service)
     _invalidate_bot_instance_cache(service, profile.slug)

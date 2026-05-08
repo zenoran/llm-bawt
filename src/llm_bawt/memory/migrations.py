@@ -347,6 +347,215 @@ def add_recalled_history_column(backend: Any, dry_run: bool = False) -> dict:
         return {"added": True}
 
 
+def add_bot_model_constraints(backend: Any, dry_run: bool = False) -> dict:
+    """Add FK + compatibility trigger linking bot_profiles to model_definitions.
+
+    Two guarantees added:
+      1. ``bot_profiles.default_model`` (when not NULL) must reference an
+         existing ``model_definitions.alias``. ON UPDATE CASCADE so an
+         alias rename ripples; ON DELETE SET NULL so a model removal
+         doesn't take a bot offline.
+      2. A BEFORE INSERT/UPDATE trigger enforces the agent-backend ↔
+         model.type compatibility matrix:
+
+            agent_backend      |  model.type required
+            -------------------+-----------------------
+            'claude-code'      |  'claude-code'
+            'codex'            |  'openai'
+            'openclaw'         |  any (or NULL)
+            NULL               |  any except 'claude-code' (or NULL)
+
+         NULL ``default_model`` is always allowed (lets a backend bridge
+         use its own configured fallback).
+
+    Both are idempotent: re-running is a no-op.
+
+    Args:
+        backend: PostgreSQLMemoryBackend instance (for engine access)
+        dry_run: If True, only report what would be done.
+
+    Returns:
+        Dict with action summary.
+    """
+    from sqlalchemy import text
+
+    actions: list[str] = []
+
+    with backend.engine.connect() as conn:
+        # Skip if bot_profiles doesn't exist (fresh DB without bawthub yet).
+        has_bots = conn.execute(text("""
+            SELECT 1 FROM information_schema.tables
+            WHERE table_name = 'bot_profiles'
+        """)).fetchone()
+        has_models = conn.execute(text("""
+            SELECT 1 FROM information_schema.tables
+            WHERE table_name = 'model_definitions'
+        """)).fetchone()
+        if not (has_bots and has_models):
+            logger.debug(
+                "bot_profiles or model_definitions missing — skipping constraint migration"
+            )
+            return {"skipped": True, "reason": "tables not present"}
+
+        # Quarantine any rows that would violate the FK by NULLing them out
+        # first (with a warning log). Better than crashing the migration.
+        bad_rows = conn.execute(text("""
+            SELECT slug, default_model, agent_backend
+            FROM bot_profiles
+            WHERE default_model IS NOT NULL
+              AND default_model NOT IN (SELECT alias FROM model_definitions)
+        """)).fetchall()
+        for r in bad_rows:
+            logger.warning(
+                "bot_profiles row will be FK-quarantined: slug=%s default_model=%s "
+                "(no matching model_definitions.alias) — clearing default_model",
+                r.slug, r.default_model,
+            )
+
+        # Quarantine rows that would violate the compat trigger.
+        compat_violations = conn.execute(text("""
+            SELECT b.slug, b.default_model, b.agent_backend, m.type AS model_type
+            FROM bot_profiles b
+            LEFT JOIN model_definitions m ON m.alias = b.default_model
+            WHERE b.default_model IS NOT NULL
+              AND m.alias IS NOT NULL
+              AND (
+                (b.agent_backend = 'claude-code' AND m.type <> 'claude-code')
+                OR (b.agent_backend = 'codex'       AND m.type <> 'openai')
+                OR (b.agent_backend IS NULL         AND m.type = 'claude-code')
+              )
+        """)).fetchall()
+        for r in compat_violations:
+            logger.warning(
+                "bot_profiles row will be compat-quarantined: slug=%s "
+                "default_model=%s (type=%s) is incompatible with "
+                "agent_backend=%s — clearing default_model",
+                r.slug, r.default_model, r.model_type, r.agent_backend,
+            )
+
+        if dry_run:
+            return {
+                "dry_run": True,
+                "fk_violations": len(bad_rows),
+                "compat_violations": len(compat_violations),
+                "would_clear": [r.slug for r in bad_rows]
+                                + [r.slug for r in compat_violations],
+            }
+
+        # Apply quarantine before adding the constraint.
+        for r in bad_rows + compat_violations:
+            conn.execute(
+                text(
+                    "UPDATE bot_profiles SET default_model = NULL, updated_at = NOW() "
+                    "WHERE slug = :slug"
+                ),
+                {"slug": r.slug},
+            )
+            actions.append(f"cleared default_model on {r.slug}")
+        if bad_rows or compat_violations:
+            conn.commit()
+
+        # Add FK if missing.
+        fk_exists = conn.execute(text("""
+            SELECT 1
+            FROM pg_constraint
+            WHERE conname = 'bot_profiles_default_model_fk'
+        """)).fetchone()
+        if not fk_exists:
+            conn.execute(text("""
+                ALTER TABLE bot_profiles
+                ADD CONSTRAINT bot_profiles_default_model_fk
+                FOREIGN KEY (default_model)
+                REFERENCES model_definitions (alias)
+                ON UPDATE CASCADE
+                ON DELETE SET NULL
+                DEFERRABLE INITIALLY DEFERRED
+            """))
+            conn.commit()
+            actions.append("added FK bot_profiles_default_model_fk")
+        else:
+            actions.append("FK already present")
+
+        # Compatibility trigger function. Replace on every run so updates
+        # to the rule set roll out without a manual DROP.
+        conn.execute(text("""
+            CREATE OR REPLACE FUNCTION bot_profiles_check_model_backend()
+            RETURNS TRIGGER AS $$
+            DECLARE
+                model_type TEXT;
+            BEGIN
+                IF NEW.default_model IS NULL THEN
+                    RETURN NEW;  -- always allowed; backend uses its fallback
+                END IF;
+
+                SELECT type INTO model_type
+                FROM model_definitions
+                WHERE alias = NEW.default_model;
+
+                IF model_type IS NULL THEN
+                    -- FK should catch this first, but be defensive.
+                    RAISE EXCEPTION
+                        'bot %: default_model % does not exist in model_definitions',
+                        NEW.slug, NEW.default_model
+                    USING ERRCODE = 'foreign_key_violation';
+                END IF;
+
+                IF NEW.agent_backend = 'claude-code' AND model_type <> 'claude-code' THEN
+                    RAISE EXCEPTION
+                        'bot %: agent_backend=claude-code requires a model of type=claude-code, '
+                        'got % (type=%)',
+                        NEW.slug, NEW.default_model, model_type
+                    USING ERRCODE = 'check_violation';
+                END IF;
+
+                IF NEW.agent_backend = 'codex' AND model_type <> 'openai' THEN
+                    RAISE EXCEPTION
+                        'bot %: agent_backend=codex requires a model of type=openai, '
+                        'got % (type=%)',
+                        NEW.slug, NEW.default_model, model_type
+                    USING ERRCODE = 'check_violation';
+                END IF;
+
+                IF NEW.agent_backend IS NULL AND model_type = 'claude-code' THEN
+                    RAISE EXCEPTION
+                        'bot %: chat-only bots (agent_backend=NULL) cannot use a '
+                        'claude-code model directly — set agent_backend=claude-code '
+                        'or pick a chat-completion model',
+                        NEW.slug
+                    USING ERRCODE = 'check_violation';
+                END IF;
+
+                -- 'openclaw' accepts anything; no further checks.
+
+                RETURN NEW;
+            END;
+            $$ LANGUAGE plpgsql
+        """))
+
+        trigger_exists = conn.execute(text("""
+            SELECT 1 FROM pg_trigger
+            WHERE tgname = 'bot_profiles_model_backend_check'
+        """)).fetchone()
+        if not trigger_exists:
+            conn.execute(text("""
+                CREATE TRIGGER bot_profiles_model_backend_check
+                BEFORE INSERT OR UPDATE ON bot_profiles
+                FOR EACH ROW
+                EXECUTE FUNCTION bot_profiles_check_model_backend()
+            """))
+            actions.append("added trigger bot_profiles_model_backend_check")
+        else:
+            actions.append("trigger already present")
+
+        conn.commit()
+
+    return {
+        "actions": actions,
+        "fk_quarantined": [r.slug for r in bad_rows],
+        "compat_quarantined": [r.slug for r in compat_violations],
+    }
+
+
 def run_all_migrations(backend: Any, dry_run: bool = False) -> dict:
     """Run all pending migrations."""
     results = {}
@@ -363,6 +572,9 @@ def run_all_migrations(backend: Any, dry_run: bool = False) -> dict:
     logger.debug("Running sessions backfill...")
     results["sessions"] = backfill_sessions(backend, dry_run=dry_run)
 
+    logger.debug("Adding bot/model constraints...")
+    results["bot_model_constraints"] = add_bot_model_constraints(backend, dry_run=dry_run)
+
     return results
 
 
@@ -375,7 +587,13 @@ def main():
     parser = argparse.ArgumentParser(description="Run memory schema migrations")
     parser.add_argument(
         "command",
-        choices=["backfill_tags", "backfill_meaning", "backfill_sessions", "all"],
+        choices=[
+            "backfill_tags",
+            "backfill_meaning",
+            "backfill_sessions",
+            "bot_model_constraints",
+            "all",
+        ],
     )
     parser.add_argument("--bot", default="nova", help="Bot ID to migrate")
     parser.add_argument("--dry-run", action="store_true", help="Only report what would be done")
@@ -394,6 +612,8 @@ def main():
         result = backfill_meaning_embeddings(backend, dry_run=args.dry_run)
     elif args.command == "backfill_sessions":
         result = backfill_sessions(backend, dry_run=args.dry_run)
+    elif args.command == "bot_model_constraints":
+        result = add_bot_model_constraints(backend, dry_run=args.dry_run)
     elif args.command == "all":
         result = run_all_migrations(backend, dry_run=args.dry_run)
 
