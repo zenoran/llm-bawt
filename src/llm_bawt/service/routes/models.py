@@ -1,6 +1,9 @@
 """Model and bot listing routes."""
 
-from fastapi import APIRouter, HTTPException
+import os
+import time
+
+from fastapi import APIRouter, HTTPException, Query
 
 from ...bots import BotManager
 from ..dependencies import get_service
@@ -22,6 +25,101 @@ from ..schemas import (
 
 router = APIRouter()
 
+
+# Lightweight in-memory cache for upstream model lists. Each provider's
+# discovery result is cached for 5 minutes so the bots admin page doesn't
+# hammer OpenAI / Grok every time the Add Model dialog opens.
+_UPSTREAM_TTL_S = 300.0
+_upstream_cache: dict[str, tuple[float, list[dict]]] = {}
+
+
+def _upstream_lookup(provider: str) -> list[dict]:
+    """Fetch upstream provider catalog with TTL caching.
+
+    Returns a list of ``{id, description}`` dicts. Raises ``HTTPException``
+    on missing API keys or fetch failure (so the UI can surface a clear
+    message).
+    """
+    now = time.time()
+    cached = _upstream_cache.get(provider)
+    if cached and (now - cached[0]) < _UPSTREAM_TTL_S:
+        return cached[1]
+
+    from ...model_manager import (
+        fetch_codex_models,
+        fetch_grok_api_models,
+        fetch_openai_api_models,
+    )
+
+    if provider == "codex":
+        ok, models = fetch_codex_models()
+    elif provider == "openai":
+        ok, models = fetch_openai_api_models()
+    elif provider == "grok":
+        api_key = (
+            os.getenv("LLM_BAWT_XAI_API_KEY")
+            or os.getenv("XAI_API_KEY")
+            or ""
+        )
+        if not api_key:
+            raise HTTPException(
+                status_code=503,
+                detail="Grok discovery requires LLM_BAWT_XAI_API_KEY in env",
+            )
+        ok, models = fetch_grok_api_models(api_key)
+    else:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unknown provider '{provider}'. Use openai, codex, or grok.",
+        )
+
+    if not ok:
+        raise HTTPException(
+            status_code=502,
+            detail=f"Failed to fetch {provider} model catalog from upstream",
+        )
+
+    # Normalize to {id, description}; description is whatever the source gave us.
+    cleaned: list[dict] = []
+    for m in models or []:
+        if not isinstance(m, dict):
+            continue
+        mid = m.get("id") or m.get("model_id")
+        if not mid:
+            continue
+        cleaned.append({
+            "id": mid,
+            "description": (
+                m.get("description")
+                or m.get("summary")
+                or m.get("name")
+                or ""
+            ),
+        })
+
+    _upstream_cache[provider] = (now, cleaned)
+    return cleaned
+
+
+def _public_model_type(info: dict | None) -> str | None:
+    """Return the UI-facing provider type for a model definition."""
+    if not info:
+        return None
+    model_type = info.get("type")
+    if model_type == "agent_backend" and str(info.get("backend") or "").lower() == "codex":
+        return "codex"
+    return model_type
+
+
+def _normalize_model_definition(model_data: dict) -> dict:
+    """Normalize UI-facing model definitions into runtime-compatible storage."""
+    normalized = dict(model_data)
+    if str(normalized.get("type") or "").lower() == "codex":
+        normalized["type"] = "agent_backend"
+        normalized["backend"] = "codex"
+        normalized.setdefault("tool_support", "none")
+    return normalized
+
 @router.get("/v1/models", response_model=ModelsResponse, tags=["OpenAI Compatible"])
 async def list_models():
     """List available models (OpenAI-compatible)."""
@@ -32,11 +130,33 @@ async def list_models():
         info = defined.get(alias, {})
         models.append(ModelInfo(
             id=alias,
-            type=info.get("type"),
+            type=_public_model_type(info),
             model_id=info.get("model_id"),
             description=info.get("description"),
         ))
     return ModelsResponse(data=models)
+
+
+@router.get("/v1/models/upstream", tags=["Models"])
+async def list_upstream_models(
+    provider: str = Query(..., description="Provider catalog: openai | codex | grok"),
+):
+    """List available models from a provider's upstream catalog.
+
+    Used by the bots admin Quick-Add Model dialog so users can pick from
+    real model IDs instead of typing blind. Codex returns a curated static
+    list; OpenAI / Grok hit the live API. Results cached for 5 minutes.
+
+    Returns ``{provider, models: [{id, description}]}``.
+    """
+    provider_key = (provider or "").strip().lower()
+    if not provider_key:
+        raise HTTPException(status_code=400, detail="provider is required")
+    return {
+        "provider": provider_key,
+        "models": _upstream_lookup(provider_key),
+    }
+
 
 @router.get("/v1/models/current", tags=["Models"])
 async def get_current_model():
@@ -48,7 +168,7 @@ async def get_current_model():
     info = service.model_lifecycle.get_model_info(current)
     detail = ModelDetail(
         id=current,
-        type=info.get("type") if info else None,
+        type=_public_model_type(info),
         model_id=info.get("model_id", info.get("repo_id")) if info else None,
         description=info.get("description") if info else None,
         current=True,
@@ -116,9 +236,18 @@ def _get_model_store():
 
 
 def _row_to_response(row) -> ModelDefinitionResponse:
+    data = {
+        "type": row.type,
+        "model_id": row.model_id,
+        "repo_id": row.repo_id,
+        "filename": row.filename,
+        "description": row.description,
+        **(row.extra or {}),
+    }
+    public_type = _public_model_type(data)
     return ModelDefinitionResponse(
         alias=row.alias,
-        type=row.type,
+        type=public_type or row.type,
         model_id=row.model_id,
         repo_id=row.repo_id,
         filename=row.filename,
@@ -165,6 +294,8 @@ async def upsert_model_definition(alias: str, request: ModelDefinitionUpsertRequ
         model_data["description"] = request.description
     if request.extra:
         model_data.update(request.extra)
+
+    model_data = _normalize_model_definition(model_data)
 
     row = store.upsert(alias, model_data)
     # Reload catalog so the new model is immediately available
