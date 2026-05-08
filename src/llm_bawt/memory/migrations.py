@@ -478,17 +478,24 @@ def add_bot_model_constraints(backend: Any, dry_run: bool = False) -> dict:
 
         # Compatibility trigger function. Replace on every run so updates
         # to the rule set roll out without a manual DROP.
+        # NOTE: codex models are stored with type='agent_backend' and
+        # extra->>'backend'='codex' (see _normalize_model_definition in
+        # service/routes/models.py), not type='codex'. The trigger has to
+        # account for that storage normalization.
         conn.execute(text("""
             CREATE OR REPLACE FUNCTION bot_profiles_check_model_backend()
             RETURNS TRIGGER AS $$
             DECLARE
-                model_type TEXT;
+                model_type    TEXT;
+                model_backend TEXT;
+                is_codex      BOOLEAN;
             BEGIN
                 IF NEW.default_model IS NULL THEN
                     RETURN NEW;  -- always allowed; backend uses its fallback
                 END IF;
 
-                SELECT type INTO model_type
+                SELECT type, COALESCE(extra->>'backend', '')
+                INTO model_type, model_backend
                 FROM model_definitions
                 WHERE alias = NEW.default_model;
 
@@ -500,19 +507,26 @@ def add_bot_model_constraints(backend: Any, dry_run: bool = False) -> dict:
                     USING ERRCODE = 'foreign_key_violation';
                 END IF;
 
+                -- "codex-flavored" model: either type=codex (legacy/clean shape)
+                -- or type=agent_backend with extra.backend=codex (normalized
+                -- storage shape used by the model definitions API).
+                is_codex := model_type = 'codex'
+                    OR (model_type = 'agent_backend' AND model_backend = 'codex');
+
                 IF NEW.agent_backend = 'claude-code' AND model_type <> 'claude-code' THEN
                     RAISE EXCEPTION
-                        'bot %: agent_backend=claude-code requires a model of type=claude-code, '
-                        'got % (type=%)',
+                        'bot %: agent_backend=claude-code requires a model of '
+                        'type=claude-code, got % (type=%)',
                         NEW.slug, NEW.default_model, model_type
                     USING ERRCODE = 'check_violation';
                 END IF;
 
-                IF NEW.agent_backend = 'codex' AND model_type <> 'openai' THEN
+                IF NEW.agent_backend = 'codex' AND NOT (is_codex OR model_type = 'openai') THEN
                     RAISE EXCEPTION
-                        'bot %: agent_backend=codex requires a model of type=openai, '
-                        'got % (type=%)',
-                        NEW.slug, NEW.default_model, model_type
+                        'bot %: agent_backend=codex requires a Codex model '
+                        '(type=codex / type=agent_backend+backend=codex) or an '
+                        'OpenAI GPT model (type=openai); got % (type=%, backend=%)',
+                        NEW.slug, NEW.default_model, model_type, model_backend
                     USING ERRCODE = 'check_violation';
                 END IF;
 
