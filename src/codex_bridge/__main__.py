@@ -15,6 +15,9 @@ Environment:
     CODEX_BRIDGE_REQUEST_TIMEOUT    — per-call SDK timeout, seconds (default 300)
     CODEX_BRIDGE_CWD                — codex thread cwd (default /home/bridge/dev)
     CODEX_BIN                       — explicit codex binary path (default bundled)
+    CODEX_LOCAL_PLUGINS_ENABLED     — stage repo-managed local plugins into ~/.agents + ~/plugins
+    CODEX_LOCAL_PLUGINS_SRC         — source mapping root (default /home/bridge/dev/agent-skills/codex)
+    CODEX_DEV_ROOT                  — dev root used to resolve repo-managed skills (default /home/bridge/dev)
 """
 
 from __future__ import annotations
@@ -24,10 +27,13 @@ import logging
 import os
 import signal
 import sys
+from pathlib import Path
 
 from openclaw_bridge.publisher import RedisPublisher
 
 from .bridge import CodexBridge
+from .exec_patch import install as install_exec_patch
+from .local_plugins import install_repo_local_plugins
 from .parser_patch import install as install_parser_patch
 from .transport import auth_path, scrub_api_key_env, validate_auth_json
 
@@ -89,6 +95,7 @@ def main() -> None:
     # Patch the SDK's strict-literal parser so a single mismatched item
     # status doesn't kill the whole turn (see parser_patch.py).
     install_parser_patch()
+    install_exec_patch()
 
     # --- TASK-204: scrub API key env vars before constructing the SDK ---
     scrubbed = scrub_api_key_env()
@@ -119,6 +126,10 @@ def main() -> None:
     # picks up the same files we just validated.
     codex_home = os.getenv("CODEX_HOME") or str(auth_file.parent)
     os.environ["CODEX_HOME"] = codex_home
+    install_repo_local_plugins(
+        logger=logger,
+        codex_home=Path(codex_home),
+    )
 
     redis_url = os.getenv("REDIS_URL", "redis://localhost:6379/0")
     publisher = RedisPublisher(
@@ -136,7 +147,7 @@ def main() -> None:
         default_model=os.getenv("CODEX_MODEL", "gpt-5.4"),
         cwd=os.getenv("CODEX_BRIDGE_CWD", "/home/bridge/dev"),
         codex_bin=os.getenv("CODEX_BIN") or None,
-        request_timeout=float(os.getenv("CODEX_BRIDGE_REQUEST_TIMEOUT", "300")),
+        request_timeout=float(os.getenv("CODEX_BRIDGE_REQUEST_TIMEOUT", "900")),
     )
 
     health_port = int(os.getenv("CODEX_BRIDGE_HEALTH_PORT", "8682"))

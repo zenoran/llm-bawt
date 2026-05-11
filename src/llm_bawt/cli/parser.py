@@ -44,9 +44,9 @@ def parse_arguments(config_obj: "Config") -> argparse.Namespace:
     parser.add_argument(
         "--add-model",
         type=str,
-        choices=['ollama', 'openai', 'gguf', 'vllm', 'openclaw'],
+        choices=['ollama', 'openai', 'codex', 'gguf', 'vllm', 'openclaw'],
         metavar="TYPE",
-        help="Add models: 'ollama' (refresh from server), 'openai' (query API), 'gguf' (add from HuggingFace repo), 'vllm' (add vLLM model from HuggingFace), 'openclaw' (deprecated: use --add-bot openclaw)"
+        help="Add models: 'ollama' (refresh from server), 'openai' (query API), 'codex' (install Codex agent model aliases), 'gguf' (add from HuggingFace repo), 'vllm' (add vLLM model from HuggingFace), 'openclaw' (deprecated: use --add-bot openclaw)"
     )
     parser.add_argument(
         "--add-bot",

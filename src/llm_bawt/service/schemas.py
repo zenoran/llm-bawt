@@ -143,8 +143,8 @@ class ModelDefinitionListResponse(BaseModel):
 
 class ModelDefinitionUpsertRequest(BaseModel):
     """Request to create or update a model definition."""
-    type: str = Field(..., description="Model type: openai, ollama, gguf, huggingface, grok, openclaw")
-    model_id: str | None = Field(default=None, description="Model ID (for openai/ollama/grok/openclaw)")
+    type: str = Field(..., description="Model type: openai, codex, ollama, gguf, huggingface, grok, openclaw")
+    model_id: str | None = Field(default=None, description="Model ID (for openai/codex/ollama/grok/openclaw)")
     repo_id: str | None = Field(default=None, description="HuggingFace repo ID (for gguf/huggingface)")
     filename: str | None = Field(default=None, description="GGUF filename")
     description: str | None = None
@@ -224,6 +224,7 @@ class BotProfileResponse(BaseModel):
     bot_type: BotKind = "chat"
     agent_backend: str | None = None
     agent_backend_config: dict[str, Any] | None = None
+    settings: dict[str, Any] = Field(default_factory=dict)
     created_at: datetime | None = None
     updated_at: datetime | None = None
 

@@ -70,7 +70,7 @@ async def _push_soul_background(slug: str, agent_id: str, system_prompt: str) ->
         logger.warning("Auto-push SOUL.md failed for '%s': %s", slug, e)
 
 
-def _to_profile_response(profile) -> BotProfileResponse:
+def _to_profile_response(profile, settings: dict[str, object] | None = None) -> BotProfileResponse:
     return BotProfileResponse(
         slug=profile.slug,
         name=profile.name,
@@ -91,9 +91,27 @@ def _to_profile_response(profile) -> BotProfileResponse:
         bot_type=normalize_bot_type(getattr(profile, "bot_type", None), profile.agent_backend),
         agent_backend=profile.agent_backend,
         agent_backend_config=profile.agent_backend_config,
+        settings=settings or {},
         created_at=profile.created_at,
         updated_at=profile.updated_at,
     )
+
+
+def _effective_bot_settings(service, slug: str) -> dict[str, object]:
+    """Return effective settings with the same precedence as runtime resolution."""
+    from ...bots import BotManager
+
+    normalized = (slug or "").strip().lower()
+    bot = BotManager(service.config).get_bot(normalized)
+    effective: dict[str, object] = dict(getattr(bot, "settings", {}) or {})
+
+    store = get_runtime_settings_store(service.config)
+    if store.engine is None:
+        return effective
+
+    effective.update(store.get_scope_settings("global", "*"))
+    effective.update(store.get_scope_settings("bot", normalized))
+    return effective
 
 
 def _reload_bot_registry() -> None:
@@ -281,7 +299,7 @@ async def _persist_bot_profile(
                 agent_id = parts[1]
         await _push_soul_background(profile.slug, agent_id, profile.system_prompt)
 
-    return _to_profile_response(profile)
+    return _to_profile_response(profile, settings=_effective_bot_settings(service, profile.slug))
 
 
 @router.get("/v1/settings", response_model=RuntimeSettingsResponse, tags=["System"])
@@ -384,6 +402,10 @@ async def upsert_runtime_setting(request: RuntimeSettingUpsertRequest):
     if store.engine is None:
         raise HTTPException(status_code=503, detail="Runtime settings DB unavailable")
     store.set_value(st, sid, request.key, request.value)
+    if st == "bot":
+        _invalidate_bot_instance_cache(service, sid)
+    else:
+        _invalidate_all_instance_cache(service)
     return {
         "success": True,
         "scope_type": st,
@@ -406,6 +428,10 @@ async def delete_runtime_setting(
     if store.engine is None:
         raise HTTPException(status_code=503, detail="Runtime settings DB unavailable")
     deleted = store.delete_value(st, sid, key)
+    if st == "bot":
+        _invalidate_bot_instance_cache(service, sid)
+    else:
+        _invalidate_all_instance_cache(service)
     return {
         "success": True,
         "scope_type": st,
@@ -424,9 +450,15 @@ async def batch_upsert_runtime_settings(request: RuntimeSettingBatchUpsertReques
         raise HTTPException(status_code=503, detail="Runtime settings DB unavailable")
 
     applied: list[dict] = []
+    touched_bots: set[str] = set()
+    touched_global = False
     for item in request.items:
         st, sid = _normalize_scope(item.scope_type, item.scope_id, service._default_bot)
         store.set_value(st, sid, item.key, item.value)
+        if st == "bot":
+            touched_bots.add(sid)
+        else:
+            touched_global = True
         applied.append(
             {
                 "scope_type": st,
@@ -434,6 +466,11 @@ async def batch_upsert_runtime_settings(request: RuntimeSettingBatchUpsertReques
                 "key": item.key,
             }
         )
+    if touched_global:
+        _invalidate_all_instance_cache(service)
+    else:
+        for bot_id in touched_bots:
+            _invalidate_bot_instance_cache(service, bot_id)
     return {"success": True, "applied_count": len(applied), "applied": applied}
 
 
@@ -489,7 +526,10 @@ async def list_bot_profiles(
     page = filtered[offset : offset + limit]
 
     return BotProfileListResponse(
-        profiles=[_to_profile_response(profile) for profile in page],
+        profiles=[
+            _to_profile_response(profile, settings=_effective_bot_settings(service, profile.slug))
+            for profile in page
+        ],
         total_count=total_count,
         filters={
             "q": query_text,
@@ -523,7 +563,7 @@ async def get_bot_profile(slug: str):
     profile = store.get(slug)
     if profile is None:
         raise HTTPException(status_code=404, detail="Bot profile not found")
-    return _to_profile_response(profile)
+    return _to_profile_response(profile, settings=_effective_bot_settings(service, profile.slug))
 
 
 @router.put("/v1/bots/{slug}/profile", response_model=BotProfileResponse, tags=["System"])

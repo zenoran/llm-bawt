@@ -161,8 +161,11 @@ services:
       - CODEX_BACKEND_NAME=${CODEX_BACKEND_NAME:-codex}
       - CODEX_BRIDGE_LOG_LEVEL=${CODEX_BRIDGE_LOG_LEVEL:-INFO}
       - CODEX_BRIDGE_HEALTH_PORT=8682
-      - CODEX_BRIDGE_REQUEST_TIMEOUT=${CODEX_BRIDGE_REQUEST_TIMEOUT:-300}
+      - CODEX_BRIDGE_REQUEST_TIMEOUT=${CODEX_BRIDGE_REQUEST_TIMEOUT:-900}
       - CODEX_BRIDGE_CWD=${CODEX_BRIDGE_CWD:-/home/bridge/dev}
+      - CODEX_LOCAL_PLUGINS_ENABLED=${CODEX_LOCAL_PLUGINS_ENABLED:-1}
+      - CODEX_LOCAL_PLUGINS_SRC=${CODEX_LOCAL_PLUGINS_SRC:-/home/bridge/dev/agent-skills/codex}
+      - CODEX_DEV_ROOT=${CODEX_DEV_ROOT:-/home/bridge/dev}
       - LLM_BAWT_API_URL=http://app:8642
       # Override SERVICE_HOST inherited from .env (which is 0.0.0.0 — meant
       # for the app container's bind address). From inside a bridge, the

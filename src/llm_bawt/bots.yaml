@@ -6,6 +6,7 @@
 
 bot_settings_template:
   max_context_tokens: 12000
+  max_context_messages: 0
   max_output_tokens: 4096
   summarization_session_gap_seconds: 3600
   summarization_min_messages_per_session: 2

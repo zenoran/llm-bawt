@@ -175,6 +175,7 @@ LLM_BAWT_MAINTENANCE_MODEL=grok-4-fast    # Model used for memory extraction job
 
 # --- Generation ---
 LLM_BAWT_MAX_CONTEXT_TOKENS=12000         # Total prompt token budget
+LLM_BAWT_MAX_CONTEXT_MESSAGES=0           # Raw history message cap (0 = unlimited)
 LLM_BAWT_MAX_OUTPUT_TOKENS=4096           # Max response length
 LLM_BAWT_TEMPERATURE=0.8                  # Sampling temperature
 

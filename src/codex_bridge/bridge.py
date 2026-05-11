@@ -151,7 +151,7 @@ class CodexBridge:
     """Reads chat.send commands from Redis, runs them through the Codex
     SDK, and publishes OpenClawEvent-formatted results back to Redis."""
 
-    DEFAULT_REQUEST_TIMEOUT = 300
+    DEFAULT_REQUEST_TIMEOUT = 900
 
     # TASK-209: cache cleanup parameters
     _CLEANUP_INTERVAL = 6 * 3600  # every 6 hours

@@ -83,6 +83,15 @@ class ServiceLLMBawt(BaseLLMBawt):
             # per-bot and per-user sessions deterministically.
             self.client._bot_config["bot_id"] = self.bot_id
             self.client._bot_config["user_id"] = self.user_id
+            default_alias = getattr(self.bot, "default_model", None)
+            if default_alias:
+                model_def = self.config.defined_models.get("models", {}).get(default_alias, {})
+                if (
+                    model_def.get("type") == "agent_backend"
+                    and model_def.get("backend") == getattr(self.bot, "agent_backend", None)
+                    and model_def.get("model_id")
+                ):
+                    self.client._bot_config["model"] = model_def["model_id"]
 
     def _init_history(self):
         """Ensure history always persists to PostgreSQL, even in local_mode.

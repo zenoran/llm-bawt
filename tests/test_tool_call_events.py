@@ -21,7 +21,13 @@ class _DummyClient:
 
 
 class _DummyBackend:
-    def add_message(self, role: str, content: str, timestamp: float | None = None) -> str:
+    def add_message(
+        self,
+        role: str,
+        content: str,
+        timestamp: float | None = None,
+        message_id: str | None = None,
+    ) -> str:
         return "db-msg-123"
 
 

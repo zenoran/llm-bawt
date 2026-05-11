@@ -15,6 +15,7 @@ DEFAULT_SYSTEM_MESSAGE = """You are Nova, a personal AI assistant running locall
 You have persistent memory across sessions. Keep responses concise and helpful."""
 
 PROVIDER_OPENAI = "openai"
+PROVIDER_CODEX = "codex"
 PROVIDER_OLLAMA = "ollama"
 PROVIDER_GGUF = "gguf"
 PROVIDER_HF = "huggingface"
@@ -106,6 +107,7 @@ class RuntimeTunables(BaseModel):
 
     # --- Context & History --- #
     MAX_CONTEXT_TOKENS: int = Field(default=0, description="Total token budget for the prompt (system + history + memory). 0 = auto from model context window.")
+    MAX_CONTEXT_MESSAGES: int = Field(default=0, description="Max raw history messages to include in prompt context. 0 = no message-count cap.")
     MAX_OUTPUT_TOKENS: int = Field(default=1024 * 4, description="Max tokens the model may generate per reply")
     HISTORY_RELOAD_TTL_SECONDS: float = Field(default=2.0, description="How long service history cache stays fresh before reloading from DB (0 = every request)")
 

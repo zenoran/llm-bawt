@@ -196,6 +196,7 @@ class HistoryManager:
         1. System messages are always included
         2. Protected recent turns are always included (newest N pairs)
         3. Remaining budget fills from newest-first, dropping oldest messages
+        4. Optional max_context_messages caps raw history messages before token budgeting
 
         Args:
             max_tokens: Maximum token budget for the returned messages.
@@ -223,6 +224,16 @@ class HistoryManager:
 
         if not system_messages:
             system_messages.append(Message(role="system", content=self.config.SYSTEM_MESSAGE))
+
+        max_context_messages = int(
+            self._setting(
+                "max_context_messages",
+                getattr(self.config, "MAX_CONTEXT_MESSAGES", 0),
+            )
+            or 0
+        )
+        if max_context_messages > 0 and len(regular_messages) > max_context_messages:
+            regular_messages = regular_messages[-max_context_messages:]
 
         # Without a token budget, return everything
         if max_tokens <= 0:
@@ -285,7 +296,8 @@ class HistoryManager:
             f"system={system_cost} ({pct(system_cost)}), "
             f"protected={protected_cost} ({pct(protected_cost)}, {len(protected)} msgs), "
             f"summaries={summary_cost} ({pct(summary_cost)}, {len(included_summaries)}/{len(summary_messages)}), "
-            f"history={droppable_cost} ({pct(droppable_cost)}, {len(included_droppable)} msgs, {dropped} dropped)"
+            f"history={droppable_cost} ({pct(droppable_cost)}, {len(included_droppable)} msgs, {dropped} dropped), "
+            f"message_cap={max_context_messages or 'none'}"
         )
 
         return system_messages + included_summaries + included_droppable + protected

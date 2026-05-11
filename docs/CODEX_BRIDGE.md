@@ -68,17 +68,23 @@ same `OpenClawEvent` format. The main app consumes them identically.
    Per-session ordering is enforced by the shared `SessionQueue` lock in
    `openclaw_bridge.session_queue`. One bridge container, not many — Docker
    `restart: unless-stopped` handles process death.
-3. **Self-healing supervisor.** If the codex subprocess dies or auth fails
+3. **Repo-managed local plugins are staged at startup.** The bridge mirrors
+   `~/dev/agent-skills/codex/.codex-plugin/marketplace.json` into
+   `~/.agents/plugins/marketplace.json` and materializes plugin directories
+   under `~/plugins/` before the SDK starts. This makes the shared
+   `agent-skills` repo available through Codex's home-local plugin contract
+   even though the bridge cwd is the broader `~/dev`.
+4. **Self-healing supervisor.** If the codex subprocess dies or auth fails
    mid-turn, the supervisor publishes ERROR + run_done, tears down
    `AsyncCodex`, and rebuilds it on the next request. Rebuild re-reads
    `auth.json` off disk, so `codex login` on the host self-heals the
    bridge with no `docker restart` needed.
-4. **Reuses openclaw_bridge infrastructure unchanged.** Imports
+5. **Reuses openclaw_bridge infrastructure unchanged.** Imports
    `RedisPublisher`, `OpenClawEvent`, `OpenClawEventKind`,
    `synthesize_event_id`, `SessionQueue`, `COMMANDS_STREAM` directly.
    Consumer group is `codex-bridge`; filters on `backend == "codex"`
    and ACKs others.
-5. **Session continuity via thread_id.** The bot's
+6. **Session continuity via thread_id.** The bot's
    `agent_backend_config.session_key` stores the Codex `thread_id`
    (managed by the bridge — not human-edited). On `chat.send` the
    bridge looks it up and calls `thread_resume()`. On model change →
@@ -127,6 +133,24 @@ The compose service also bind-mounts the host's npm
 into the SDK's expected path (`<sdk>/vendor/x86_64-unknown-linux-musl/
 codex/codex`). The static-pie musl binary works on any glibc/musl
 Linux, so no in-container install is needed.
+
+### Shared local skills
+
+The bridge does not rely on repo-local `.agents/` discovery because its
+working directory is `~/dev`, not a single repo root. Instead, on startup
+it stages the Codex-specific mapping checked into `~/dev/agent-skills/codex`
+into Codex's home-local layout:
+
+- `~/dev/agent-skills/codex/.codex-plugin/marketplace.json`
+  → `~/.agents/plugins/marketplace.json`
+- `~/dev/agent-skills/codex/plugins/<plugin>`
+  → `~/plugins/<plugin>`
+
+Skill entries inside that plugin are re-linked to the live repo copy under
+`~/dev/agent-skills/<skill>` and to built-in system skills under
+`~/.codex/skills/.system/<skill>`. That avoids host-specific absolute paths
+inside the repo mapping while still making the shared skills available to the
+SDK in-container.
 
 ## Setup
 
@@ -200,6 +224,9 @@ Environment variables read by the bridge (via `docker-compose.yml`):
 | `CODEX_BRIDGE_HEALTH_PORT` | `8682` | `/health` TCP port |
 | `CODEX_BRIDGE_REQUEST_TIMEOUT` | `300` | per-call SDK timeout, seconds |
 | `CODEX_BRIDGE_CWD` | `/home/bridge/dev` | codex thread cwd |
+| `CODEX_LOCAL_PLUGINS_ENABLED` | `1` | stage repo-managed local plugins into `~/.agents` + `~/plugins` before SDK startup |
+| `CODEX_LOCAL_PLUGINS_SRC` | `/home/bridge/dev/agent-skills/codex` | source repo containing the Codex-specific marketplace/plugin mapping |
+| `CODEX_DEV_ROOT` | `/home/bridge/dev` | dev root used to resolve repo-managed skill directories |
 | `CODEX_BIN` | `<bundled>` | optional explicit codex binary path |
 | `LLM_BAWT_API_URL` | (set in compose) | for `/v1/bots` profile read/write |
 | `REDIS_URL` | (set in compose) | shared Redis |

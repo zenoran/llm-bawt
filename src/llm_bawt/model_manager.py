@@ -29,6 +29,7 @@ from rich.prompt import Confirm, Prompt
 from rich.rule import Rule
 
 from llm_bawt.utils.config import (
+    PROVIDER_CODEX,
     PROVIDER_GGUF,
     PROVIDER_GROK,
     PROVIDER_HF,
@@ -57,10 +58,41 @@ def is_service_mode_enabled(config: Config) -> bool:
 
 console = Console()
 
+CODEX_MODEL_CATALOG: tuple[dict[str, str], ...] = (
+    {
+        "id": "gpt-5.5",
+        "summary": "Frontier Codex model for complex coding and real-world work",
+    },
+    {
+        "id": "gpt-5.4",
+        "summary": "Strong general-purpose Codex model for everyday coding",
+    },
+    {
+        "id": "gpt-5.4-mini",
+        "summary": "Smaller, faster Codex model for simpler coding tasks",
+    },
+    {
+        "id": "gpt-5.3-codex",
+        "summary": "Coding-optimized Codex model",
+    },
+    {
+        "id": "gpt-5.2",
+        "summary": "Professional-work Codex model for long-running agents",
+    },
+)
+
 
 def normalize_for_match(text: str) -> str:
     """Normalize text for fuzzy matching by lowercasing and removing special characters."""
     return re.sub(r'[^a-z0-9]', '', text.lower())
+
+
+def _provider_key_for_entry(model_info: dict[str, Any]) -> str:
+    """Return the public provider grouping key for a model entry."""
+    model_type = str(model_info.get("type") or PROVIDER_UNKNOWN).lower()
+    if model_type == PROVIDER_AGENT_BACKEND and str(model_info.get("backend") or "").lower() == PROVIDER_CODEX:
+        return PROVIDER_CODEX
+    return model_type
 
 class _PathWrapper:
     """Wraps a pathlib.Path to delegate file operations while allowing dynamic attributes."""
@@ -147,7 +179,7 @@ class ModelManager:
             defined_models = self.models_data.get('models', {})
             sorted_models = dict(sorted(
                 defined_models.items(),
-                key=lambda item: (item[1].get('type', PROVIDER_UNKNOWN), item[0])
+                key=lambda item: (_provider_key_for_entry(item[1]), item[0])
             ))
             self.models_data['models'] = sorted_models
             with open(self.config_path, 'w', encoding='utf-8') as f:
@@ -218,7 +250,7 @@ class ModelManager:
 
         models_by_type = defaultdict(list)
         for alias, info in defined_models.items():
-            models_by_type[info.get("type", PROVIDER_UNKNOWN)].append(alias)
+            models_by_type[_provider_key_for_entry(info)].append(alias)
 
         for mtype in sorted(models_by_type):
             console.rule(f"[bold magenta]{mtype.upper()}[/bold magenta]")
@@ -301,7 +333,7 @@ class ModelManager:
             console.print("[dim]Mode: service[/dim]")
         else:
             console.print("[dim]Mode: local (models.yaml)[/dim]")
-        targets = [provider_type] if provider_type else [PROVIDER_OPENAI, PROVIDER_OLLAMA]
+        targets = [provider_type] if provider_type else [PROVIDER_OPENAI, PROVIDER_GROK, PROVIDER_CODEX, PROVIDER_OLLAMA]
         success = True # Track overall success
         for prov in targets:
             console.print(Rule(f"Updating models for provider: {prov}"))
@@ -321,7 +353,11 @@ class ModelManager:
             return False
 
         local_models = self.models_data.get('models', {})
-        existing_map = {m['model_id']: alias for alias, m in local_models.items() if m.get('type') == provider_type}
+        existing_map = {
+            m["model_id"]: alias
+            for alias, m in local_models.items()
+            if self._entry_matches_provider(m, provider_type) and m.get("model_id")
+        }
         updated_count = self._update_existing_descriptions(provider_type, api_models, existing_map)
         new_models = [m for m in api_models if m['id'] not in existing_map]
 
@@ -365,8 +401,19 @@ class ModelManager:
                 console.print("[bold red]Error:[/bold red] OLLAMA_URL not set in config.")
                 return False, []
             return fetch_ollama_api_models(ollama_url)
+        if provider_type == PROVIDER_CODEX:
+            return fetch_codex_models()
         console.print(f"[yellow]Provider '{provider_type}' not supported for update.[/yellow]")
         return False, []
+
+    @staticmethod
+    def _entry_matches_provider(model_info: dict[str, Any], provider_type: str) -> bool:
+        if provider_type == PROVIDER_CODEX:
+            return (
+                str(model_info.get("type") or "").lower() == PROVIDER_AGENT_BACKEND
+                and str(model_info.get("backend") or "").lower() == PROVIDER_CODEX
+            )
+        return str(model_info.get("type") or "").lower() == provider_type
 
     def _update_existing_descriptions(self, provider_type: str, api_models: List[Dict[str, Any]], existing_map: Dict[str, str]) -> int:
         """Update auto-generated timestamp descriptions for existing models.
@@ -381,6 +428,15 @@ class ModelManager:
             if mid in existing_map:
                 alias = existing_map[mid]
                 entry = self.models_data['models'][alias]
+                if provider_type == PROVIDER_CODEX:
+                    expected = m.get("summary", mid)
+                    current_desc = entry.get("description", "")
+                    if current_desc != expected:
+                        entry["description"] = expected
+                        self._changed_aliases.add(alias)
+                        count += 1
+                        console.print(f"Updated description for alias '{alias}'.")
+                    continue
                 ts = self._format_model_timestamp_str(provider_type, m, tz)
                 if not ts:
                     continue
@@ -408,10 +464,14 @@ class ModelManager:
         choices_map = {str(idx + 1): model for idx, model in enumerate(new_models)}
 
         for idx, m in enumerate(new_models, start=1):
-            ts = ModelManager._format_model_timestamp_str(None, provider_type, m, tz)
             model_id_colored = f"[bright_blue]{m['id']}[/bright_blue]"
-            console.print(f"  [cyan]{idx}[/cyan]: {model_id_colored} ({ts})")
-        sep = ',' if provider_type == PROVIDER_OPENAI else ' '
+            if provider_type == PROVIDER_CODEX:
+                summary = m.get("summary", "")
+                console.print(f"  [cyan]{idx}[/cyan]: {model_id_colored} - {summary}")
+            else:
+                ts = ModelManager._format_model_timestamp_str(None, provider_type, m, tz)
+                console.print(f"  [cyan]{idx}[/cyan]: {model_id_colored} ({ts})")
+        sep = ',' if provider_type in (PROVIDER_OPENAI, PROVIDER_CODEX) else ' '
         prompt = (
             f"Enter numbers to add ({'comma' if sep == ',' else 'space'}-separated), or press Enter to skip"
         )
@@ -439,10 +499,19 @@ class ModelManager:
                 console.print(f"[yellow]Alias '{alias}' already exists, using '{default_alias}'.[/yellow]")
                 alias = default_alias
             existing.add(alias)
-            ts = self._format_model_timestamp_str(provider_type, m, tz)
-            label = 'Created' if provider_type in (PROVIDER_OPENAI, PROVIDER_GROK) else 'Modified'
-            desc = f"{m['id']} ({label}: {ts})"
-            entry = {'type': provider_type, 'model_id': m['id'], 'description': desc}
+            if provider_type == PROVIDER_CODEX:
+                entry = {
+                    "type": PROVIDER_AGENT_BACKEND,
+                    "backend": PROVIDER_CODEX,
+                    "model_id": m["id"],
+                    "description": m.get("summary", m["id"]),
+                    "tool_support": "none",
+                }
+            else:
+                ts = self._format_model_timestamp_str(provider_type, m, tz)
+                label = 'Created' if provider_type in (PROVIDER_OPENAI, PROVIDER_GROK) else 'Modified'
+                desc = f"{m['id']} ({label}: {ts})"
+                entry = {'type': provider_type, 'model_id': m['id'], 'description': desc}
             self.models_data['models'][alias] = entry
             self._changed_aliases.add(alias)
             count += 1
@@ -492,6 +561,14 @@ class ModelManager:
                 if file_size:
                     parts.append(f"[dim]{file_size}[/dim]")
 
+        elif model_type == PROVIDER_CODEX:
+            mid = model_info.get("model_id")
+            desc = model_info.get("description")
+            if mid:
+                parts.append(f"ID: [bright_blue]{mid}[/bright_blue]")
+            if desc:
+                parts.append(desc)
+
         elif model_type in (PROVIDER_HF, PROVIDER_OLLAMA, PROVIDER_OPENAI, PROVIDER_GROK):
             mid = model_info.get('model_id')
             desc = model_info.get('description')
@@ -519,8 +596,11 @@ class ModelManager:
             backend = model_info.get("backend", "")
             bot_config = model_info.get("bot_config", {})
             session_key = bot_config.get("session_key")
+            model_id = model_info.get("model_id")
             if backend:
                 parts.append(f"Backend: [bright_blue]{backend}[/bright_blue]")
+            if model_id:
+                parts.append(f"Model: [bright_blue]{model_id}[/bright_blue]")
             if session_key:
                 parts.append(f"Session: [bright_blue]{session_key}[/bright_blue]")
 
@@ -696,6 +776,11 @@ def fetch_grok_api_models(api_key: str) -> Tuple[bool, List[Dict[str, Any]]]:
         return False, []
 
 
+def fetch_codex_models() -> Tuple[bool, List[Dict[str, Any]]]:
+    """Return the curated Codex model catalog used for agent backends."""
+    return True, [dict(item) for item in CODEX_MODEL_CATALOG]
+
+
 def list_models(config: Config, service_mode: bool | None = None):
     """CLI wrapper: list models.
 
@@ -720,6 +805,8 @@ def list_models(config: Config, service_mode: bool | None = None):
 def _infer_type(alias: str) -> str:
     """Best-effort type inference from a model alias when the service doesn't report type."""
     low = alias.lower()
+    if "codex" in low:
+        return PROVIDER_CODEX
     if low.startswith("grok"):
         return "grok"
     if low.startswith(("gpt", "o1", "o3", "o4")):
@@ -758,7 +845,7 @@ def _list_models_from_service(config: Config):
         grouped[mtype].append(model)
 
     provider_order = [
-        "openai", "grok", "openclaw", "ollama", "vllm",
+        "openai", "codex", "grok", "openclaw", "ollama", "vllm",
         "gguf", "huggingface", "agent_backend", "other",
     ]
     present = [p for p in provider_order if grouped.get(p)]

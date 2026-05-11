@@ -602,6 +602,14 @@ class ClaudeCodeBridge:
 
                     session_persisted = False
                     aborted = False
+                    # Track the latest AssistantMessage.usage to surface "current
+                    # context fullness" to the UI. ResultMessage.usage is
+                    # cumulative across all internal API iterations in a turn,
+                    # so cache_read_input_tokens can exceed contextWindow on
+                    # multi-tool-use turns and produce >100% counters. The last
+                    # AssistantMessage's usage reflects the actual final API
+                    # call's view of the context.
+                    latest_assistant_usage: dict | None = None
 
                     msg_stream = None
                     try:
@@ -697,6 +705,13 @@ class ClaudeCodeBridge:
                                         current_tool_id = None
 
                             elif isinstance(msg, AssistantMessage):
+                                # Capture per-iteration usage — overwrites on
+                                # each internal API call so the LAST one wins,
+                                # giving the UI the model's true final view
+                                # of the context (not a cumulative sum).
+                                am_usage = getattr(msg, "usage", None)
+                                if isinstance(am_usage, dict) and am_usage:
+                                    latest_assistant_usage = am_usage
                                 for block in getattr(msg, "content", []):
                                     if isinstance(block, ToolUseBlock):
                                         seq += 1
@@ -735,14 +750,27 @@ class ClaudeCodeBridge:
                                     full_text = result_text
 
                                 # Extract token usage + context window for UI surfacing.
-                                # ResultMessage.usage carries per-turn billed tokens; the
-                                # full input_tokens count = input + cache_creation + cache_read
-                                # since the model sees all of it as context. ResultMessage.model_usage
-                                # is keyed by model id and exposes the model's contextWindow so
-                                # consumers can render % used.
+                                #
+                                # IMPORTANT: ResultMessage.usage is CUMULATIVE across all
+                                # internal API iterations in the turn — for a multi-tool-use
+                                # turn that re-reads cached context on each call, the summed
+                                # cache_read_input_tokens can exceed the context_window itself
+                                # and produce nonsense >100% counters in the UI. We instead
+                                # use the LAST AssistantMessage's per-iteration usage, which
+                                # represents the model's final view of the context (what the
+                                # user actually wants to see as "context fullness"). Cumulative
+                                # output_tokens and total_cost_usd still come from ResultMessage
+                                # since those genuinely accumulate across the turn.
+                                #
+                                # ResultMessage.model_usage is keyed by model id and exposes
+                                # the model's contextWindow + maxOutputTokens.
                                 token_usage_payload: dict | None = None
                                 try:
-                                    usage = getattr(msg, "usage", None) or {}
+                                    cumulative_usage = getattr(msg, "usage", None) or {}
+                                    # Per-iteration view (preferred) — falls back to the
+                                    # cumulative usage when no AssistantMessage was seen
+                                    # (e.g., single-API-call turns where they're equal anyway).
+                                    iter_usage = latest_assistant_usage or cumulative_usage
                                     model_usage = getattr(msg, "model_usage", None) or {}
                                     ctx_window = None
                                     max_output = None
@@ -758,16 +786,21 @@ class ClaudeCodeBridge:
                                         if isinstance(mu_entry, dict):
                                             ctx_window = mu_entry.get("contextWindow")
                                             max_output = mu_entry.get("maxOutputTokens")
-                                    if usage or ctx_window:
+                                    if iter_usage or ctx_window:
                                         token_usage_payload = {
-                                            "input_tokens": int(usage.get("input_tokens", 0) or 0),
+                                            "input_tokens": int(iter_usage.get("input_tokens", 0) or 0),
                                             "cache_read_tokens": int(
-                                                usage.get("cache_read_input_tokens", 0) or 0
+                                                iter_usage.get("cache_read_input_tokens", 0) or 0
                                             ),
                                             "cache_creation_tokens": int(
-                                                usage.get("cache_creation_input_tokens", 0) or 0
+                                                iter_usage.get("cache_creation_input_tokens", 0) or 0
                                             ),
-                                            "output_tokens": int(usage.get("output_tokens", 0) or 0),
+                                            # Output is still the cumulative turn total — that's
+                                            # what the user generated overall, regardless of how
+                                            # many internal iterations produced it.
+                                            "output_tokens": int(
+                                                cumulative_usage.get("output_tokens", 0) or 0
+                                            ),
                                             "context_window": ctx_window,
                                             "max_output_tokens": max_output,
                                             "total_cost_usd": getattr(msg, "total_cost_usd", None),
