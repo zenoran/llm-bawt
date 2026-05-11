@@ -94,3 +94,4 @@ cython_debug/
 .run/memory-server.pid
 .logs/
 .vscode/
+storage/
