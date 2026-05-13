@@ -27,6 +27,29 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 RUN curl -LsSf https://astral.sh/uv/install.sh | sh
 ENV PATH="/root/.local/bin:$PATH"
 
+# Bitwarden CLI (OSS build — Vaultwarden-friendly). Used by agents to read
+# secrets from vault.ferreri.us at runtime. Server URL is set per-user below
+# (lands in /home/bridge/.config/Bitwarden CLI/data.json).
+ARG BW_CLI_VERSION=2026.4.1
+RUN set -eux; \
+    arch="$(dpkg --print-architecture)"; \
+    case "$arch" in \
+      amd64) asset="bw-oss-linux-${BW_CLI_VERSION}.zip" ;; \
+      arm64) asset="bw-oss-linux-arm64-${BW_CLI_VERSION}.zip" ;; \
+      *) echo "unsupported arch: $arch" >&2; exit 1 ;; \
+    esac; \
+    curl -fsSL -o /tmp/bw.zip "https://github.com/bitwarden/clients/releases/download/cli-v${BW_CLI_VERSION}/${asset}"; \
+    unzip -j /tmp/bw.zip bw -d /usr/local/bin; \
+    chmod +x /usr/local/bin/bw; \
+    rm /tmp/bw.zip; \
+    /usr/local/bin/bw --version
+
+# Helper: `bw-secret <name>` reads BW_PASSWORD from env, runs `bw login` +
+# `bw unlock` idempotently, prints the requested item value, and reuses
+# BW_SESSION across calls when set. Documented in the bitwarden-cli skill.
+COPY scripts/bw-secret /usr/local/bin/bw-secret
+RUN chmod 0755 /usr/local/bin/bw-secret
+
 WORKDIR /app
 
 # Copy project metadata for dependency resolution
@@ -75,6 +98,12 @@ RUN pipx install --force --editable /app
 ENV PATH="/home/bridge/.local/bin:/app/.venv/bin:$PATH" \
     PYTHONUNBUFFERED=1 \
     HOME=/home/bridge
+
+# Point the Bitwarden CLI at our self-hosted Vaultwarden. Writes to
+# ~/.config/Bitwarden CLI/data.json; baked here so containers start
+# pre-configured (override at runtime with `bw config server <url>`).
+ARG BW_SERVER_URL=https://vault.ferreri.us
+RUN bw config server "$BW_SERVER_URL"
 
 # Default command — overridden per service in docker-compose.yml
 CMD ["python", "-m", "openclaw_bridge"]
