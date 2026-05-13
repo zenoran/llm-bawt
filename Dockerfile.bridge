@@ -44,11 +44,11 @@ RUN set -eux; \
     rm /tmp/bw.zip; \
     /usr/local/bin/bw --version
 
-# Helper: `bw-secret <name>` reads BW_PASSWORD from env, runs `bw login` +
-# `bw unlock` idempotently, prints the requested item value, and reuses
-# BW_SESSION across calls when set. Documented in the bitwarden-cli skill.
-COPY scripts/bw-secret /usr/local/bin/bw-secret
-RUN chmod 0755 /usr/local/bin/bw-secret
+# Shared agent scripts (bw-secret and friends) live in the agent-skills
+# repo and are bind-mounted live at /opt/agent-skills/bin via compose.
+# The directory is added to PATH below so they resolve without an absolute
+# path. Editing a script in agent-skills/scripts is picked up instantly —
+# no image rebuild needed. See agent-skills/scripts/README.md.
 
 WORKDIR /app
 
@@ -95,7 +95,10 @@ RUN pipx install --force --editable /app
 # /home/bridge/.local/bin first so pipx `llm` shadows the dep-less stub
 # in /app/.venv/bin. `python` still resolves to /app/.venv/bin/python,
 # so `python -m openclaw_bridge` etc. continue to use the bridge venv.
-ENV PATH="/home/bridge/.local/bin:/app/.venv/bin:$PATH" \
+# /opt/agent-skills/bin holds bind-mounted scripts from the agent-skills
+# repo (see agent-skills/scripts/README.md); this is intentionally last
+# so agent helpers never shadow the project's own binaries.
+ENV PATH="/home/bridge/.local/bin:/app/.venv/bin:$PATH:/opt/agent-skills/bin" \
     PYTHONUNBUFFERED=1 \
     HOME=/home/bridge
 

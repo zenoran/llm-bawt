@@ -91,6 +91,8 @@ services:
     volumes:
       - ./.logs:/app/.logs
       - ${HOME}/.config/llm-bawt:/home/bridge/.config/llm-bawt
+      # Shared agent scripts (bw-secret etc.) — live, no rebuild needed
+      - ${HOME}/dev/agent-skills/scripts:/opt/agent-skills/bin:ro
     depends_on:
       redis:
         condition: service_healthy
@@ -135,6 +137,8 @@ services:
       - ${HOME}/.claude/.credentials.json:/home/bridge/.claude/.credentials.json
       - ${HOME}/.ssh:/home/bridge/.ssh:ro
       - ${HOME}/.config/claude-code-bridge/ssh_config:/etc/ssh/ssh_config:ro
+      # Shared agent scripts (bw-secret etc.) — live, no rebuild needed
+      - ${HOME}/dev/agent-skills/scripts:/opt/agent-skills/bin:ro
     depends_on:
       redis:
         condition: service_healthy
@@ -192,6 +196,8 @@ services:
       # bind-mount the host's @openai/codex npm package vendor dir so
       # the SDK's find_codex_path picks up the static-pie musl binary.
       - ${HOME}/.npm-global/lib/node_modules/@openai/codex/node_modules/@openai/codex-linux-x64/vendor:/app/.venv/lib/python3.12/site-packages/openai_codex_sdk/vendor:ro
+      # Shared agent scripts (bw-secret etc.) — live, no rebuild needed
+      - ${HOME}/dev/agent-skills/scripts:/opt/agent-skills/bin:ro
     depends_on:
       redis:
         condition: service_healthy
