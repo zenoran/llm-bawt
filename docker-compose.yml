@@ -213,7 +213,18 @@ services:
   playwright-mcp:
     image: mcp/playwright
     container_name: llm-bawt-playwright-mcp
-    command: ["--headless", "--no-sandbox", "--isolated", "--port", "8931", "--host", "0.0.0.0", "--allowed-hosts", "*"]
+    # Token-cost guard:
+    #   --snapshot-mode=none — stops the MCP server from bundling the full
+    #     accessibility tree onto EVERY action result. The auto-snapshot was
+    #     the O(n²) budget incinerator: every navigate/click/screenshot would
+    #     append 50–200 KB of structured text to the tool result, then re-sent
+    #     each iteration. Agents can still call browser_snapshot explicitly
+    #     when they actually want the tree.
+    #   --viewport-size=1280x720 — caps screenshot dimensions (~2,500 image
+    #     tokens vs ~10K for retina-default). Loopy's playwright work was
+    #     vaporizing budget in 2hr windows before these were set; see 2026-05-13
+    #     chat + TASK-218 (lifecycle resilience).
+    command: ["--headless", "--no-sandbox", "--isolated", "--port", "8931", "--host", "0.0.0.0", "--allowed-hosts", "*", "--snapshot-mode", "none", "--viewport-size", "1280x720"]
     extra_hosts:
       - "host.docker.internal:host-gateway"
       - "echo.lan.zenoran.com:${ECHO_LAN_HOST_IP:-10.0.0.101}"
