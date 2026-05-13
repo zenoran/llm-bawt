@@ -220,6 +220,112 @@ def _validate_profile_payload(payload: dict[str, object]) -> None:
     agent_backend = str(payload.get("agent_backend")).strip() if payload.get("agent_backend") is not None else ""
     if resolved_type == "agent" and not agent_backend:
         raise HTTPException(status_code=400, detail="Agent bots require agent_backend")
+    _validate_agent_backend_config_model(agent_backend, payload.get("agent_backend_config"))
+
+
+def _validate_agent_backend_config_model(
+    agent_backend: str,
+    config: object,
+) -> None:
+    """Reject saves whose ``agent_backend_config.model`` would produce a
+    broken bot at runtime.
+
+    The DB trigger ``bot_profiles_check_model_backend`` already validates
+    ``default_model`` against the backend, but it has no view into
+    ``agent_backend_config`` — which is what every backend ACTUALLY reads
+    when it builds the bridge request (see ``openclaw.py``: ``model =
+    config.get("model")``). That gap is how Loopy ended up pinned to
+    ``claude-sonnet-4-20250514`` (a year-old Sonnet from May 2025) even
+    after its ``default_model`` was switched to ``claude-opus-1m``.
+
+    Rules mirror the trigger, with one extra:
+      * ``claude-code``: ``model`` (if set) must match either a
+        ``model_definitions`` alias of ``type='claude-code'`` or its
+        resolved ``model_id``.
+      * ``codex``: ``model`` (if set) must match an alias of
+        ``type='codex'`` / ``type='agent_backend' AND extra.backend='codex'``
+        / ``type='openai'`` (mirrors the trigger's ``is_codex`` rule).
+      * ``openclaw``: free-form (session-path string); no constraint.
+      * No backend: nothing to validate.
+    """
+    if not agent_backend or agent_backend == "default":
+        return
+    if not isinstance(config, dict):
+        return
+    raw_model = config.get("model")
+    if not isinstance(raw_model, str) or not raw_model.strip():
+        return  # blank → fall back to bridge default; that's allowed
+    model_value = raw_model.strip()
+
+    if agent_backend == "openclaw":
+        return  # openclaw model field is a session path, not a definition
+
+    service = get_service()
+    store = get_bot_profile_store(service.config)
+    engine = getattr(store, "engine", None)
+    if engine is None:
+        return  # DB unavailable; let the upsert path surface the failure
+
+    from sqlalchemy import text as sa_text
+
+    try:
+        with engine.connect() as conn:
+            # Try alias first, then model_id, so users can specify either
+            # the curated alias (e.g. ``claude-opus-1m``) or the raw SDK
+            # model id (``opus[1m]``).
+            row = conn.execute(
+                sa_text(
+                    "SELECT alias, type, model_id, COALESCE(extra->>'backend', '') AS extra_backend "
+                    "FROM model_definitions WHERE alias = :v OR model_id = :v LIMIT 1"
+                ),
+                {"v": model_value},
+            ).fetchone()
+    except Exception:
+        # If the lookup itself fails, don't gate the save — the upsert
+        # will still run through the DB trigger for ``default_model``.
+        return
+
+    if row is None:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"agent_backend_config.model={model_value!r} is not a known "
+                f"model. Pick a model registered in model_definitions or "
+                f"leave it blank to use the bridge default."
+            ),
+        )
+
+    model_type = (row[1] or "").lower()
+    extra_backend = (row[3] or "").lower()
+
+    if agent_backend == "claude-code":
+        if model_type != "claude-code":
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"agent_backend=claude-code requires a claude-code typed "
+                    f"model, got {model_value!r} (type={model_type or 'unknown'}). "
+                    f"Pick a model with type='claude-code' or leave the field "
+                    f"blank to use the bridge default."
+                ),
+            )
+        return
+
+    if agent_backend == "codex":
+        is_codex = (
+            model_type == "codex"
+            or (model_type == "agent_backend" and extra_backend == "codex")
+            or model_type == "openai"
+        )
+        if not is_codex:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"agent_backend=codex requires a Codex/OpenAI model, got "
+                    f"{model_value!r} (type={model_type or 'unknown'}, "
+                    f"backend={extra_backend or 'n/a'})."
+                ),
+            )
 
 
 def _humanize_bot_constraint_error(exc: Exception) -> str | None:

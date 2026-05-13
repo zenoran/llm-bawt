@@ -23,6 +23,17 @@ class ChatMessage(BaseModel):
     name: str | None = None
 
 
+class ChatRequestAnimation(BaseModel):
+    """One animation entry passed in by the caller (TASK-214).
+
+    Mirrors the bawthub Prisma `AvatarAnimation` shape but only carries the
+    fields llm-bawt needs at request time: name + description. Caller is
+    expected to filter to enabled rows before sending.
+    """
+    name: str
+    description: str | None = None
+
+
 class ChatCompletionRequest(BaseModel):
     """OpenAI-compatible chat completion request."""
     model: str | None = None  # Optional, will use service default if not specified
@@ -44,6 +55,22 @@ class ChatCompletionRequest(BaseModel):
     client_system_context: str | None = Field(default=None, description="System context extracted from client messages (set by routes, not by callers)", exclude=True)
     ha_mode: bool = Field(default=False, description="HA-mode: cap history, force tool_choice=required on first call (set by routes)", exclude=True)
     user_message_id: str | None = Field(default=None, description="Frontend-generated UUID for the user message (used as trigger_message_id in turn logs)")
+    # TASK-214: animations + avatar visibility now flow on each request.
+    # The avatar catalog is owned by the bawthub frontend; llm-bawt is stateless
+    # w.r.t. animations. `avatar_visible` is currently informational (consumed
+    # by the embedding classifier added in TASK-215).
+    animations: list[ChatRequestAnimation] | None = Field(
+        default=None,
+        description="Available avatar animations the model can pick from when tts_mode=true. "
+                    "When None or empty, no animation tool is injected. "
+                    "Owned by bawthub frontend (Prisma).",
+    )
+    avatar_visible: bool | None = Field(
+        default=None,
+        description="Whether an avatar is currently being rendered on the client. "
+                    "TASK-215 will gate animation work on this so we don't waste "
+                    "compute when no one can see the animation.",
+    )
 
 
 class ChatCompletionChoice(BaseModel):
@@ -1056,29 +1083,7 @@ class PromptTemplateSeedResponse(BaseModel):
 # ---------------------------------------------------------------------------
 # Avatar animation schemas
 # ---------------------------------------------------------------------------
-
-class AvatarAnimationBase(BaseModel):
-    name: str
-    description: str | None = None
-    enabled: bool = True
-    sort_order: int = 0
-
-
-class AvatarAnimationCreate(AvatarAnimationBase):
-    pass
-
-
-class AvatarAnimationUpdate(BaseModel):
-    name: str | None = None
-    description: str | None = None
-    enabled: bool | None = None
-    sort_order: int | None = None
-
-
-class AvatarAnimationResponse(AvatarAnimationBase):
-    id: int
-    created_at: datetime
-    updated_at: datetime
-
-    class Config:
-        from_attributes = True
+# TASK-214: the CRUD schemas (AvatarAnimationBase / Create / Update / Response)
+# were used only by the deleted /v1/avatar/animations routes. The catalog now
+# lives in bawthub Prisma. Per-request animation entries use the lighter
+# ChatRequestAnimation defined near the top of this module.

@@ -122,13 +122,10 @@ def get_model_definition_store(config: Any):
     )
 
 
-def get_avatar_animation_store(config: Any):
-    """Process-wide ``AvatarAnimationStore`` singleton."""
-    from .animation_tool import AvatarAnimationStore
-
-    return _get_or_build_store(
-        "avatar_animation_store", config, lambda: AvatarAnimationStore(config)
-    )
+# TASK-214: get_avatar_animation_store() was removed. The avatar animation
+# catalog now lives in bawthub Prisma and travels on each chat request as
+# `animations: list[ChatRequestAnimation]`. llm-bawt is stateless w.r.t.
+# the catalog.
 
 
 def get_prompt_template_store(config: Any):

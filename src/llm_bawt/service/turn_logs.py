@@ -8,7 +8,7 @@ import time
 from datetime import datetime, timedelta, timezone
 from urllib.parse import quote_plus
 
-from sqlalchemy import Column, DateTime, Float, Integer, String, Text, text as sa_text
+from sqlalchemy import Column, DateTime, Float, Integer, String, Text, func, text as sa_text
 from sqlmodel import Field, SQLModel, Session, create_engine, delete, select
 
 from ..utils.config import Config, has_database_credentials
@@ -388,10 +388,14 @@ class TurnLogStore:
             )
 
         statement = select(TurnLog).where(*conditions).order_by(TurnLog.created_at.desc())
-        count_statement = select(TurnLog).where(*conditions)
+        count_statement = select(func.count()).select_from(TurnLog).where(*conditions)
 
         with Session(self.engine) as session:
-            total_count = len(session.exec(count_statement).all())
+            count_result = session.exec(count_statement).one()
+            try:
+                total_count = int(count_result or 0)
+            except (TypeError, ValueError):
+                total_count = int(count_result[0] or 0)
             rows = session.exec(statement.offset(offset).limit(limit)).all()
 
         return rows, total_count

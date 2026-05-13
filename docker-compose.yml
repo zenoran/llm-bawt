@@ -134,7 +134,6 @@ services:
       - ${HOME}/.config/claude-code-bridge:/home/bridge/.claude
       - ${HOME}/dev/agent-skills:/home/bridge/.claude/skills
       - ${HOME}/.config/claude-code-bridge/.claude.json:/home/bridge/.claude.json
-      - ${HOME}/.claude/.credentials.json:/home/bridge/.claude/.credentials.json
       - ${HOME}/.ssh:/home/bridge/.ssh:ro
       - ${HOME}/.config/claude-code-bridge/ssh_config:/etc/ssh/ssh_config:ro
       # Shared agent scripts (bw-secret etc.) — live, no rebuild needed

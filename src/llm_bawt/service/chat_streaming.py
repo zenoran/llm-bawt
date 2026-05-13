@@ -645,7 +645,7 @@ class ChatStreamingMixin:
 
         chunk_queue: asyncio.Queue = asyncio.Queue()
         full_response_holder = [""]  # Use list to allow mutation in nested function
-        animation_holder = [None]   # Captures trigger_animation choice (tts_mode only)
+        animation_holder = [None]   # Populated by the embedding classifier (TASK-215)
         tool_context_holder = [""]  # Store tool context from native tool calls
         tool_call_details_holder: list[dict] = []
         timing_holder = [0.0, 0.0]  # [start_time, end_time]
@@ -746,24 +746,29 @@ class ChatStreamingMixin:
                     llm_bawt._include_summaries = request.include_summaries
                 llm_bawt._tts_mode = request.tts_mode or llm_bawt.bot.tts_mode
 
-                # Load animations for tts_mode — must happen before streaming starts.
-                # Use the cached singleton store (TASK-202): constructing
-                # AvatarAnimationStore per chat opens a fresh 5-connection pool
-                # that doesn't get freed until GC.
-                _animations: list = []
-                if llm_bawt._tts_mode:
-                    try:
-                        from .dependencies import get_avatar_animation_store
-                        _animations = get_avatar_animation_store(self.config).list_enabled()
-                    except Exception as _e:
-                        log.debug("Could not load animations: %s", _e)
-                _use_animation_tool = bool(
-                    _animations
-                    and llm_bawt.client.supports_native_tools()
-                    and hasattr(llm_bawt.client, "stream_with_tools")
+                # TASK-214: animations now arrive on the request payload from
+                # bawthub (Prisma is the source of truth). llm-bawt no longer
+                # owns the catalog. Caller pre-filters to enabled rows.
+                #
+                # TASK-215: animation selection no longer happens via an
+                # injected tool call. The main LLM prompt is left untouched
+                # (no "you MUST call trigger_animation" hack). Instead, we
+                # run a local embedding classifier on the assistant's
+                # response text *after* it finishes streaming — see the hook
+                # below, before the sentinel is enqueued. The classifier
+                # only runs when an avatar is actually visible so we don't
+                # waste CPU on a response no one can see animated.
+                _animations: list = list(request.animations or []) if llm_bawt._tts_mode else []
+                _avatar_visible: bool = bool(request.avatar_visible) if request.avatar_visible is not None else False
+                _run_classifier = bool(
+                    llm_bawt._tts_mode and _avatar_visible and _animations
                 )
-                log.info("🎬 tts_mode=%s (req=%s bot=%s), %d animations, use_animation_tool=%s",
-                         llm_bawt._tts_mode, request.tts_mode, llm_bawt.bot.tts_mode, len(_animations), _use_animation_tool)
+                llm_bawt._avatar_visible = _avatar_visible
+                log.info(
+                    "🎬 tts_mode=%s (req=%s bot=%s) avatar_visible=%s %d animations classifier=%s",
+                    llm_bawt._tts_mode, request.tts_mode, llm_bawt.bot.tts_mode,
+                    _avatar_visible, len(_animations), _run_classifier,
+                )
 
                 # Use llm_bawt.prepare_messages_for_query to get full context
                 # (history from DB + memory + system prompt)
@@ -773,27 +778,11 @@ class ChatStreamingMixin:
                     message_id=trigger_message_id,
                 )
 
-                # When animation tool is active, append a system instruction
-                # so the model always calls trigger_animation.
-                if _use_animation_tool:
-                    from ..models.message import Message as _Msg
-                    anim_list = "\n".join(
-                        f'- "{a.name}": {a.description or a.name}'
-                        for a in _animations
-                    )
-                    messages.append(_Msg(
-                        role="system",
-                        content=(
-                            "AVATAR ANIMATION: You MUST call trigger_animation exactly once "
-                            "at the end of every response — no exceptions. Write your full "
-                            "text reply first, then call the function. Pick the animation "
-                            "that best matches your response's emotional tone. If none of "
-                            "the other gestures fit, the minimum should be a talking "
-                            "animation like 'Acknowledging' or 'Head Nod Yes'. Never skip "
-                            "calling this function.\n\n"
-                            f"Available animations:\n{anim_list}"
-                        ),
-                    ))
+                # TASK-215: the "AVATAR ANIMATION: You MUST call trigger_animation"
+                # prompt-injection hack has been removed. Animation selection
+                # now runs as a post-hoc embedding classifier (see hook after
+                # consume_stream_chunks below) — the main LLM call no longer
+                # has to manage a tool call on every turn.
 
                 # Backfill prepared messages into the turn log
                 self._update_turn_log(
@@ -817,11 +806,11 @@ class ChatStreamingMixin:
                     and llm_bawt.bot.uses_tools
                     and (llm_bawt.memory or llm_bawt.home_client or llm_bawt.ha_native_client)
                 )
-                if should_use_llm_bawt_tool_streaming or _use_animation_tool:
+                if should_use_llm_bawt_tool_streaming:
                     # Check if client supports native streaming with tools (OpenAI)
                     use_native_streaming = (
                         llm_bawt.client.supports_native_tools()
-                        and (llm_bawt.tool_format in ("native", "NATIVE_OPENAI") or _use_animation_tool)
+                        and llm_bawt.tool_format in ("native", "NATIVE_OPENAI")
                         and hasattr(llm_bawt.client, "stream_with_tools")
                     )
 
@@ -840,10 +829,8 @@ class ChatStreamingMixin:
                         handler = get_format_handler(llm_bawt.tool_format)
                         tools_schema = handler.get_tools_schema(tool_definitions)
 
-                        # Inject trigger_animation virtual tool for tts_mode requests
-                        if _use_animation_tool:
-                            from .animation_tool import build_trigger_animation_tool
-                            tools_schema = tools_schema + [build_trigger_animation_tool(_animations)]
+                        # TASK-215: the virtual trigger_animation tool has been
+                        # removed. The classifier picks the animation post-hoc.
 
                         # Log tool names for debugging
                         tool_names = [t.get("function", {}).get("name", "?") for t in tools_schema]
@@ -884,11 +871,28 @@ class ChatStreamingMixin:
                                     current_tools = tools_schema
                                     current_tool_choice = "auto"
 
-                                # Buffer text until we know if tool_calls follow.
-                                # If tools fire, discard the buffer (stale pre-tool
-                                # text like "I don't have live access…").
-                                # If no tools, flush the buffer to the client.
-                                text_buffer: list[str] = []
+                                # TASK-216: stream text tokens immediately instead
+                                # of buffering until we know whether a tool will
+                                # fire. The original buffer was a workaround for
+                                # models that emit preamble before tool calls
+                                # ("I don't have live access, let me check…").
+                                # Modern Claude / GPT-5 / Grok rarely do that, but
+                                # the buffering imposed 700-2700ms TTFT on every
+                                # tool-capable bot — which is what made voice mode
+                                # feel laggy (see scripts/probe_voice_latency.py).
+                                #
+                                # Trade-off: in the rare case a model does emit
+                                # preamble before a tool call, those tokens will
+                                # leak to the client. For voice that's harmless
+                                # (TTS speaks naturally); for chat the preamble
+                                # text shows up alongside the tool result, which
+                                # is acceptable.
+                                #
+                                # We still track yielded text in `yielded_text` so
+                                # downstream code that previously consumed
+                                # text_buffer (e.g. the no-tool-call early return)
+                                # can be reasoned about.
+                                yielded_text: list[str] = []
 
                                 for item in llm_bawt.client.stream_with_tools(
                                     current_msgs,
@@ -897,57 +901,27 @@ class ChatStreamingMixin:
                                     **gen_kwargs,
                                 ):
                                     if isinstance(item, str):
-                                        # Buffer — don't yield until we know no tools follow
-                                        text_buffer.append(item)
+                                        # Stream immediately — no buffering.
+                                        yielded_text.append(item)
+                                        yield item
                                     elif isinstance(item, dict) and "tool_calls" in item:
                                         tool_calls = item["tool_calls"]
                                         content = item.get("content", "")
 
                                         if not tool_calls:
-                                            # Empty tool_calls list — treat as pure text response
-                                            yield from text_buffer
+                                            # Empty tool_calls list — treat as pure text response.
+                                            # Text was already streamed above; nothing more to flush.
                                             return
 
-                                        # Separate virtual tools (trigger_animation) from real tools
-                                        real_tool_calls = [
-                                            tc for tc in tool_calls
-                                            if tc.get("function", {}).get("name") != "trigger_animation"
-                                        ]
-                                        for tc in tool_calls:
-                                            func = tc.get("function", {})
-                                            if func.get("name") == "trigger_animation":
-                                                try:
-                                                    a_args = _json.loads(func.get("arguments", "{}") or "{}")
-                                                except _json.JSONDecodeError:
-                                                    a_args = {}
-                                                if not animation_holder[0]:
-                                                    # Try "name" first (matches tool schema), then
-                                                    # common alternatives models sometimes use.
-                                                    anim_name = (
-                                                        a_args.get("name")
-                                                        or a_args.get("animation")
-                                                        or a_args.get("animation_name")
-                                                    )
-                                                    # Last resort: take the first string value
-                                                    if not anim_name:
-                                                        for v in a_args.values():
-                                                            if isinstance(v, str):
-                                                                anim_name = v
-                                                                break
-                                                    animation_holder[0] = anim_name
-                                                log.info("🎭 trigger_animation: %s (raw args: %s)", animation_holder[0], a_args)
+                                        # TASK-215: trigger_animation interception removed.
+                                        # All tool calls in this stream are real.
+                                        real_tool_calls = tool_calls
 
-                                        if not real_tool_calls:
-                                            # Only animation tool — flush buffered text.
-                                            # Do NOT yield content here — it is the same
-                                            # text already accumulated in text_buffer
-                                            # (yielded chunk-by-chunk above), so yielding
-                                            # it again would double the response.
-                                            yield from text_buffer
-                                            return
-
-                                        # Real tool calls follow — discard stale pre-tool text
-                                        text_buffer.clear()
+                                        # Tools follow streamed text. The text has
+                                        # already been delivered to the client; we
+                                        # can't take it back. (No-op kept here so
+                                        # downstream diff is small.)
+                                        yielded_text.clear()
 
                                         # Emit tool calls as OpenAI delta.tool_calls, then execute
                                         tool_results = []
@@ -1078,9 +1052,10 @@ class ChatStreamingMixin:
                                         yield "\n\n"
                                         break
                                 else:
-                                    # Stream finished without tool calls dict (pure content response)
-                                    # Flush any buffered text that wasn't already consumed
-                                    yield from text_buffer
+                                    # Stream finished without a tool_calls dict
+                                    # (pure content response). TASK-216: tokens
+                                    # were already yielded inline above, so
+                                    # nothing left to flush.
                                     return
 
                             log.warning(f"Tool loop: max iterations ({max_iterations}) reached")
@@ -1269,12 +1244,20 @@ class ChatStreamingMixin:
                 if cancelled_holder[0]:
                     log.info("Generation cancelled - newer request received")
 
-                # Fallback: if animation tool was active but model didn't
-                # call it, default to "Acknowledging" so every tts_mode
-                # response gets a gesture.
-                if _use_animation_tool and not animation_holder[0] and full_response_holder[0]:
-                    animation_holder[0] = "Acknowledging"
-                    log.info("🎭 animation fallback → Acknowledging (model skipped trigger_animation)")
+                # TASK-215: post-hoc embedding classifier. Runs only when
+                # tts_mode is on, the avatar is actually visible, and we
+                # have a non-empty response. Misses (no match above the
+                # similarity threshold) leave animation_holder[0] as None —
+                # the frontend then stays on its idle animation rather than
+                # forcing an awkward fallback gesture.
+                if _run_classifier and full_response_holder[0] and not animation_holder[0]:
+                    try:
+                        from .animation_classifier import classify_animation
+                        picked = classify_animation(full_response_holder[0], _animations)
+                        if picked:
+                            animation_holder[0] = picked
+                    except Exception as cls_err:
+                        log.debug("animation classifier failed: %s", cls_err)
 
                 timing_holder[1] = time.time()
 

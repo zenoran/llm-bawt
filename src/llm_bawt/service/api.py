@@ -57,6 +57,25 @@ async def lifespan(app):
     except Exception as e:
         log.warning("Failed to initialise media_generations table: %s", e)
 
+    # TASK-216: warm the sentence-transformer used by the animation
+    # classifier (and the memory subsystem) in the background so the first
+    # voice response after a restart doesn't pay a ~6s lazy-load. Fire it
+    # off-thread — the model load is CPU-bound and ~6s, and we don't want
+    # to block the event loop or delay the rest of startup.
+    # NB: a later `import asyncio` inside this lifespan function shadows
+    # the module-level import, so use threading directly to avoid the
+    # UnboundLocalError trap.
+    def _warm_embedding_model() -> None:
+        try:
+            from ..memory.embeddings import generate_embedding
+            generate_embedding("warmup")
+            log.info("🔥 embedding model warm")
+        except Exception as warm_err:
+            log.debug("embedding warmup skipped: %s", warm_err)
+
+    import threading as _threading
+    _threading.Thread(target=_warm_embedding_model, daemon=True, name="embedding-warmup").start()
+
     service = BackgroundService(config)
     set_service(service)
     service.start_worker()

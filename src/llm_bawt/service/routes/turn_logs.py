@@ -3,6 +3,7 @@
 import json
 
 from fastapi import APIRouter, HTTPException, Query
+from sqlalchemy import func
 from sqlmodel import Session, select
 
 from ..dependencies import get_service
@@ -85,6 +86,27 @@ def _live_tool_calls(store: TurnLogStore, turn_id: str) -> list[dict]:
     return out
 
 
+def _live_tool_call_counts(store: TurnLogStore, turn_ids: list[str]) -> dict[str, int]:
+    """Count realtime tool-call rows for multiple turns in one query."""
+    if store.engine is None or not turn_ids:
+        return {}
+    try:
+        with Session(store.engine) as session:
+            rows = session.exec(
+                select(ToolCallRecord.turn_id, func.count())
+                .where(ToolCallRecord.turn_id.in_(turn_ids))
+                .group_by(ToolCallRecord.turn_id)
+            ).all()
+    except Exception:
+        return {}
+
+    counts: dict[str, int] = {}
+    for turn_id, count in rows:
+        if turn_id:
+            counts[str(turn_id)] = int(count or 0)
+    return counts
+
+
 @router.get("/v1/turn-logs", response_model=TurnLogListResponse, tags=["Debug"])
 async def list_turn_logs(
     bot_id: str | None = Query(None, description="Filter by bot ID"),
@@ -117,14 +139,22 @@ async def list_turn_logs(
         offset=offset,
     )
 
-    items = []
+    parsed_tool_calls_by_turn: dict[str, list] = {}
+    turns_needing_live_counts: list[str] = []
     for row in rows:
         tool_calls = _parse_json(row.tool_calls_json) or []
-        if not isinstance(tool_calls, list) or not tool_calls:
-            # tool_calls_json is filled at finalize. Streaming/in-flight turns
-            # have realtime rows in tool_call_records — use those for the count
-            # so the UI sees an accurate tool count immediately.
-            tool_calls = _live_tool_calls(store, row.id)
+        if isinstance(tool_calls, list) and tool_calls:
+            parsed_tool_calls_by_turn[row.id] = tool_calls
+        else:
+            parsed_tool_calls_by_turn[row.id] = []
+            turns_needing_live_counts.append(row.id)
+
+    live_tool_counts = _live_tool_call_counts(store, turns_needing_live_counts)
+
+    items = []
+    for row in rows:
+        tool_calls = parsed_tool_calls_by_turn.get(row.id, [])
+        tool_call_count = len(tool_calls) if tool_calls else live_tool_counts.get(row.id, 0)
         response_text = row.response_text or ""
         response_preview = response_text[:300] if response_text else None
         items.append(
@@ -143,7 +173,7 @@ async def list_turn_logs(
                 response_preview=response_preview,
                 response_chars=len(response_text),
                 response_preview_truncated=bool(response_text and len(response_text) > len(response_preview or "")),
-                tool_call_count=len(tool_calls) if isinstance(tool_calls, list) else 0,
+                tool_call_count=tool_call_count,
                 error_text=row.error_text,
                 animation=getattr(row, "animation", None),
                 agent_session_key=getattr(row, "agent_session_key", None),
