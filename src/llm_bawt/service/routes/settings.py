@@ -50,8 +50,8 @@ async def _push_soul_background(slug: str, agent_id: str, system_prompt: str) ->
 
     logger = logging.getLogger(__name__)
     try:
-        from ...agent_backends.openclaw import get_openclaw_subscriber
-        subscriber = get_openclaw_subscriber()
+        from ...agent_backends.agent_bridge import get_agent_subscriber
+        subscriber = get_agent_subscriber()
         if subscriber is None:
             logger.warning("Auto-push SOUL.md skipped for '%s': no subscriber", slug)
             return
@@ -816,8 +816,8 @@ async def sync_soul(slug: str):
             agent_id = parts[1]
 
     # Call agents.files.get via bridge RPC
-    from ...agent_backends.openclaw import get_openclaw_subscriber
-    subscriber = get_openclaw_subscriber()
+    from ...agent_backends.agent_bridge import get_agent_subscriber
+    subscriber = get_agent_subscriber()
     if subscriber is None:
         raise HTTPException(status_code=503, detail="OpenClaw bridge not connected")
 
@@ -890,8 +890,8 @@ async def push_soul(slug: str):
         if len(parts) >= 2:
             agent_id = parts[1]
 
-    from ...agent_backends.openclaw import get_openclaw_subscriber
-    subscriber = get_openclaw_subscriber()
+    from ...agent_backends.agent_bridge import get_agent_subscriber
+    subscriber = get_agent_subscriber()
     if subscriber is None:
         raise HTTPException(status_code=503, detail="OpenClaw bridge not connected")
 

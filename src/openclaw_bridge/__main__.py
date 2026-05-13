@@ -9,11 +9,11 @@ import logging
 import signal
 import sys
 
+from agent_bridge.publisher import RedisPublisher
+from agent_bridge.store import EventStore, create_agent_event_tables
 from .bridge import SessionBridge
 from .config import BridgeConfig
 from .ingest import EventIngestPipeline, IngestFilterConfig
-from .publisher import RedisPublisher
-from .store import EventStore, create_openclaw_tables
 from .ws_client import OpenClawWsClient, OpenClawWsConfig
 
 
@@ -84,7 +84,7 @@ def main() -> None:
         pool_recycle=1800,
         connect_args={"application_name": "openclaw-bridge"},
     )
-    create_openclaw_tables(engine)
+    create_agent_event_tables(engine)
 
     # Redis
     publisher = RedisPublisher(config.redis_url, default_provider="openclaw")

@@ -7,7 +7,7 @@ from enum import Enum
 from typing import Any
 
 
-class OpenClawEventKind(str, Enum):
+class AgentEventKind(str, Enum):
     ASSISTANT_DELTA = "assistant_delta"
     ASSISTANT_DONE = "assistant_done"
     TOOL_START = "tool_start"
@@ -20,11 +20,11 @@ class OpenClawEventKind(str, Enum):
 
 
 @dataclass
-class OpenClawEvent:
+class AgentEvent:
     event_id: str
     session_key: str
     run_id: str | None
-    kind: OpenClawEventKind
+    kind: AgentEventKind
     origin: str  # "user" | "system" | "heartbeat" | "cron" | "subagent"
     text: str | None = None
     tool_name: str | None = None
@@ -77,7 +77,7 @@ class OpenClawEvent:
         }
 
     @classmethod
-    def from_dict(cls, data: dict) -> OpenClawEvent:
+    def from_dict(cls, data: dict) -> AgentEvent:
         """Deserialize from Redis/JSON transport."""
         ts = data.get("timestamp")
         if isinstance(ts, str):
@@ -88,7 +88,7 @@ class OpenClawEvent:
             event_id=data["event_id"],
             session_key=data["session_key"],
             run_id=data.get("run_id"),
-            kind=OpenClawEventKind(data["kind"]),
+            kind=AgentEventKind(data["kind"]),
             origin=data.get("origin", "system"),
             text=data.get("text"),
             tool_name=data.get("tool_name"),

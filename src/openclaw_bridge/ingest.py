@@ -6,7 +6,7 @@ import re
 from dataclasses import dataclass, field
 from typing import Any
 
-from .events import OpenClawEvent, OpenClawEventKind, synthesize_event_id
+from agent_bridge.events import AgentEvent, AgentEventKind, synthesize_event_id
 
 logger = logging.getLogger(__name__)
 
@@ -60,7 +60,7 @@ class EventIngestPipeline:
         self._stream_seq = 0
         self._filter = filter_config or IngestFilterConfig()
 
-    def parse(self, raw: dict, session_key: str) -> OpenClawEvent | None:
+    def parse(self, raw: dict, session_key: str) -> AgentEvent | None:
         msg_type = str(raw.get("type", ""))
 
         # Ignore infra noise
@@ -92,32 +92,32 @@ class EventIngestPipeline:
                 if stream == "lifecycle":
                     phase = str(data.get("phase", ""))
                     if phase == "start":
-                        return OpenClawEvent(
+                        return AgentEvent(
                             event_id=event_id,
                             session_key=sk,
                             seq=seq,
                             run_id=run_id,
-                            kind=OpenClawEventKind.RUN_STARTED,
+                            kind=AgentEventKind.RUN_STARTED,
                             origin="system",
                             raw=raw,
                         )
                     if phase == "end":
-                        return OpenClawEvent(
+                        return AgentEvent(
                             event_id=event_id,
                             session_key=sk,
                             seq=seq,
                             run_id=run_id,
-                            kind=OpenClawEventKind.RUN_COMPLETED,
+                            kind=AgentEventKind.RUN_COMPLETED,
                             origin="system",
                             raw=raw,
                         )
                     # other lifecycle phases are useful notes (fallback_cleared, etc)
-                    return OpenClawEvent(
+                    return AgentEvent(
                         event_id=event_id,
                         session_key=sk,
                         seq=seq,
                         run_id=run_id,
-                        kind=OpenClawEventKind.SYSTEM_NOTE,
+                        kind=AgentEventKind.SYSTEM_NOTE,
                         origin="system",
                         text=json.dumps(data, ensure_ascii=False),
                         raw=raw,
@@ -125,12 +125,12 @@ class EventIngestPipeline:
 
                 if stream == "assistant":
                     delta = str(data.get("delta") or data.get("text") or "")
-                    return OpenClawEvent(
+                    return AgentEvent(
                         event_id=event_id,
                         session_key=sk,
                         seq=seq,
                         run_id=run_id,
-                        kind=OpenClawEventKind.ASSISTANT_DELTA,
+                        kind=AgentEventKind.ASSISTANT_DELTA,
                         origin="system",
                         text=delta,
                         raw=raw,
@@ -140,24 +140,24 @@ class EventIngestPipeline:
                     phase = str(data.get("phase") or data.get("state") or "")
                     tool_name = str(data.get("name") or data.get("tool") or "")
                     if phase in ("start", "calling"):
-                        return OpenClawEvent(
+                        return AgentEvent(
                             event_id=event_id,
                             session_key=sk,
                             seq=seq,
                             run_id=run_id,
-                            kind=OpenClawEventKind.TOOL_START,
+                            kind=AgentEventKind.TOOL_START,
                             origin="system",
                             tool_name=tool_name,
                             tool_arguments=data.get("arguments") or data.get("args") or data.get("input"),
                             raw=raw,
                         )
                     if phase in ("end", "result", "done"):
-                        return OpenClawEvent(
+                        return AgentEvent(
                             event_id=event_id,
                             session_key=sk,
                             seq=seq,
                             run_id=run_id,
-                            kind=OpenClawEventKind.TOOL_END,
+                            kind=AgentEventKind.TOOL_END,
                             origin="system",
                             tool_name=tool_name,
                             tool_result=data.get("result") or data.get("output") or data.get("meta"),
@@ -165,12 +165,12 @@ class EventIngestPipeline:
                         )
 
                 if stream == "error":
-                    return OpenClawEvent(
+                    return AgentEvent(
                         event_id=event_id,
                         session_key=sk,
                         seq=seq,
                         run_id=run_id,
-                        kind=OpenClawEventKind.ERROR,
+                        kind=AgentEventKind.ERROR,
                         origin="system",
                         text=json.dumps(data, ensure_ascii=False),
                         raw=raw,
@@ -189,12 +189,12 @@ class EventIngestPipeline:
                     text = str(payload.get("text") or payload.get("chunk") or "")
 
                 if state == "final":
-                    return OpenClawEvent(
+                    return AgentEvent(
                         event_id=event_id,
                         session_key=sk,
                         seq=seq,
                         run_id=run_id,
-                        kind=OpenClawEventKind.ASSISTANT_DONE,
+                        kind=AgentEventKind.ASSISTANT_DONE,
                         origin="system",
                         text=text,
                         raw=raw,
@@ -210,12 +210,12 @@ class EventIngestPipeline:
                 return None
 
             # Unknown gateway event -> keep as system note for observability
-            return OpenClawEvent(
+            return AgentEvent(
                 event_id=event_id,
                 session_key=sk,
                 seq=seq,
                 run_id=run_id,
-                kind=OpenClawEventKind.SYSTEM_NOTE,
+                kind=AgentEventKind.SYSTEM_NOTE,
                 origin="system",
                 raw=raw,
             )
@@ -227,11 +227,11 @@ class EventIngestPipeline:
                 logger.debug("Dropping chat.sent matching content filter: %.80s…", text)
                 return None
             event_id = raw.get("event_id") or synthesize_event_id(session_key, "chat.sent", raw, self._next_seq())
-            return OpenClawEvent(
+            return AgentEvent(
                 event_id=event_id,
                 session_key=str(raw.get("session_key") or session_key),
                 run_id=raw.get("run_id"),
-                kind=OpenClawEventKind.USER_MESSAGE,
+                kind=AgentEventKind.USER_MESSAGE,
                 origin="user",
                 text=text or None,
                 raw=raw,
@@ -243,11 +243,11 @@ class EventIngestPipeline:
 
         # fallback unknown frame
         event_id = raw.get("event_id") or synthesize_event_id(session_key, msg_type, raw, self._next_seq())
-        return OpenClawEvent(
+        return AgentEvent(
             event_id=event_id,
             session_key=session_key,
             run_id=raw.get("run_id"),
-            kind=OpenClawEventKind.SYSTEM_NOTE,
+            kind=AgentEventKind.SYSTEM_NOTE,
             origin="system",
             text=str(raw),
             raw=raw,

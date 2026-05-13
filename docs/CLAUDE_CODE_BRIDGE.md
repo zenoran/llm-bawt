@@ -9,12 +9,12 @@ The Claude Code bridge integrates Anthropic's Claude models into llm-bawt using 
                         │  llm-bawt-app (FastAPI)                     │
                         │  AgentBackendClient → ClaudeCodeBackend     │
                         └──────────────┬──────────────────────────────┘
-                                       │ Redis: openclaw:commands
+                                       │ Redis: agent:commands
                                        │ (fields: backend, session_key, message, ...)
                                        ▼
 ┌──────────────────────────────────────────────────────────────────────────┐
 │                        Redis (shared stream)                             │
-│                        openclaw:commands                                 │
+│                        agent:commands                                 │
 │                                                                          │
 │  ┌─────────────────────────┐     ┌─────────────────────────────────────┐ │
 │  │ openclaw-bridge         │     │ claude-code-bridge                  │ │
@@ -32,7 +32,7 @@ The Claude Code bridge integrates Anthropic's Claude models into llm-bawt using 
       (via gateway)                    (OAuth subscription)
 ```
 
-Both bridges publish events to `openclaw:run:{request_id}` in the same `OpenClawEvent` format. The main app consumes them identically.
+Both bridges publish events to `agent:run:{request_id}` in the same `AgentEvent` format. The main app consumes them identically.
 
 ## How It Works
 
@@ -42,7 +42,7 @@ Both bridges publish events to `openclaw:run:{request_id}` in the same `OpenClaw
 4. Bridge calls `claude_agent_sdk.query()` which spawns the Claude Code binary
 5. The binary authenticates via `CLAUDE_CODE_OAUTH_TOKEN` (your Max/Pro subscription)
 6. SDK streams events: text deltas, tool calls, tool results
-7. Bridge translates them to `OpenClawEvent` format and publishes to Redis
+7. Bridge translates them to `AgentEvent` format and publishes to Redis
 8. Main app streams them as SSE to the frontend
 
 ## Authentication

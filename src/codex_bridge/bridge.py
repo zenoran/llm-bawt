@@ -21,9 +21,9 @@ from pathlib import Path
 from typing import Any
 
 import httpx
-from openclaw_bridge.events import OpenClawEvent, OpenClawEventKind, synthesize_event_id
-from openclaw_bridge.publisher import COMMANDS_STREAM, RedisPublisher
-from openclaw_bridge.session_queue import SessionQueue
+from agent_bridge.events import AgentEvent, AgentEventKind, synthesize_event_id
+from agent_bridge.publisher import COMMANDS_STREAM, RedisPublisher
+from agent_bridge.session_queue import SessionQueue
 
 from .transport import CodexTransport, validate_auth_json
 
@@ -149,7 +149,7 @@ class _ModelInfoCache:
 
 class CodexBridge:
     """Reads chat.send commands from Redis, runs them through the Codex
-    SDK, and publishes OpenClawEvent-formatted results back to Redis."""
+    SDK, and publishes AgentEvent-formatted results back to Redis."""
 
     DEFAULT_REQUEST_TIMEOUT = 900
 
@@ -192,7 +192,7 @@ class CodexBridge:
         self._transport = CodexTransport(codex_bin=codex_bin)
         self._model_info = _ModelInfoCache(app_api_url)
         # request_id → frontend user-message UUID, populated in _handle_send
-        # and read by _publish_event so every emitted OpenClawEvent (tool_*,
+        # and read by _publish_event so every emitted AgentEvent (tool_*,
         # assistant_*, etc.) carries the originating message id.  Cleared on
         # publish_run_done.
         self._trigger_message_ids: dict[str, str] = {}
@@ -462,7 +462,7 @@ class CodexBridge:
             if not message:
                 self._publish_event(
                     request_id, session_key, 1,
-                    kind=OpenClawEventKind.ASSISTANT_DONE,
+                    kind=AgentEventKind.ASSISTANT_DONE,
                     text="Session reset. Ready for a new conversation.",
                     model=model,
                 )
@@ -530,7 +530,7 @@ class CodexBridge:
                         seq += 1
                         self._publish_event(
                             request_id, session_key, seq,
-                            kind=OpenClawEventKind.ERROR,
+                            kind=AgentEventKind.ERROR,
                             text=f"Codex OAuth failed — {auth_err}",
                             model=model,
                         )
@@ -639,7 +639,7 @@ class CodexBridge:
                             seq += 1
                             self._publish_event(
                                 request_id, session_key, seq,
-                                kind=OpenClawEventKind.ASSISTANT_DONE,
+                                kind=AgentEventKind.ASSISTANT_DONE,
                                 text="".join(text_parts),
                                 model=actual_model,
                                 token_usage=await self._merge_model_info(
@@ -650,7 +650,7 @@ class CodexBridge:
                             seq += 1
                             self._publish_event(
                                 request_id, session_key, seq,
-                                kind=OpenClawEventKind.ASSISTANT_DONE,
+                                kind=AgentEventKind.ASSISTANT_DONE,
                                 text="".join(text_parts),
                                 model=actual_model,
                             )
@@ -665,7 +665,7 @@ class CodexBridge:
                         try:
                             self._publish_event(
                                 request_id, session_key, seq,
-                                kind=OpenClawEventKind.ASSISTANT_DONE,
+                                kind=AgentEventKind.ASSISTANT_DONE,
                                 text="".join(text_parts),
                                 model=actual_model,
                             )
@@ -692,7 +692,7 @@ class CodexBridge:
                         seq += 1
                         self._publish_event(
                             request_id, session_key, seq,
-                            kind=OpenClawEventKind.ASSISTANT_DONE,
+                            kind=AgentEventKind.ASSISTANT_DONE,
                             text="".join(text_parts),
                             model=actual_model,
                         )
@@ -709,7 +709,7 @@ class CodexBridge:
                             seq += 1
                             self._publish_event(
                                 request_id, session_key, seq,
-                                kind=OpenClawEventKind.ERROR,
+                                kind=AgentEventKind.ERROR,
                                 text="Codex OAuth failed — re-run codex login on echo",
                                 model=model,
                             )
@@ -757,7 +757,7 @@ class CodexBridge:
                 seq += 1
                 self._publish_event(
                     request_id, session_key, seq,
-                    kind=OpenClawEventKind.ERROR,
+                    kind=AgentEventKind.ERROR,
                     text=str(e),
                     model=model,
                 )
@@ -870,7 +870,7 @@ class CodexBridge:
     @staticmethod
     def _extract_token_usage(usage_or_carrier: Any, *, actual_model_or_default: str) -> dict | None:
         """Normalize a Codex ``Usage`` (or carrier with a .usage attr) into
-        the OpenClawEvent token_usage dict.
+        the AgentEvent token_usage dict.
         """
         if usage_or_carrier is None:
             return None
@@ -911,7 +911,7 @@ class CodexBridge:
         usage["max_output_tokens"] = info.get("max_output_tokens")
         return usage
 
-    # ----- TASK-207: ThreadEvent → OpenClawEvent mapping ------------------
+    # ----- TASK-207: ThreadEvent → AgentEvent mapping ------------------
 
     async def _handle_event(
         self,
@@ -971,7 +971,7 @@ class CodexBridge:
             seq += 1
             self._publish_event(
                 request_id, session_key, seq,
-                kind=OpenClawEventKind.ASSISTANT_DONE,
+                kind=AgentEventKind.ASSISTANT_DONE,
                 text=full_text,
                 model=actual_model_ref[0],
                 token_usage=token_usage,
@@ -990,7 +990,7 @@ class CodexBridge:
             seq += 1
             self._publish_event(
                 request_id, session_key, seq,
-                kind=OpenClawEventKind.ERROR,
+                kind=AgentEventKind.ERROR,
                 text=str(err_msg),
                 model=actual_model_ref[0],
             )
@@ -1016,7 +1016,7 @@ class CodexBridge:
                     seq += 1
                     self._publish_event(
                         request_id, session_key, seq,
-                        kind=OpenClawEventKind.ASSISTANT_DELTA,
+                        kind=AgentEventKind.ASSISTANT_DELTA,
                         text=initial,
                     )
                 return seq, False, None
@@ -1045,7 +1045,7 @@ class CodexBridge:
                     seq += 1
                     self._publish_event(
                         request_id, session_key, seq,
-                        kind=OpenClawEventKind.ASSISTANT_DELTA,
+                        kind=AgentEventKind.ASSISTANT_DELTA,
                         text=delta,
                     )
                 return seq, False, None
@@ -1081,7 +1081,7 @@ class CodexBridge:
                         seq += 1
                         self._publish_event(
                             request_id, session_key, seq,
-                            kind=OpenClawEventKind.ASSISTANT_DELTA,
+                            kind=AgentEventKind.ASSISTANT_DELTA,
                             text=delta,
                         )
                 return seq, False, None
@@ -1101,7 +1101,7 @@ class CodexBridge:
             seq += 1
             self._publish_event(
                 request_id, session_key, seq,
-                kind=OpenClawEventKind.ERROR,
+                kind=AgentEventKind.ERROR,
                 text=str(err_msg),
                 model=actual_model_ref[0],
             )
@@ -1181,7 +1181,7 @@ class CodexBridge:
         seq += 1
         self._publish_event(
             request_id, session_key, seq,
-            kind=OpenClawEventKind.TOOL_START,
+            kind=AgentEventKind.TOOL_START,
             tool_name=tool_name,
             tool_arguments=tool_args,
         )
@@ -1217,7 +1217,7 @@ class CodexBridge:
             seq += 1
             self._publish_event(
                 request_id, session_key, seq,
-                kind=OpenClawEventKind.TOOL_START,
+                kind=AgentEventKind.TOOL_START,
                 tool_name="file_change",
                 tool_arguments=args,
             )
@@ -1276,7 +1276,7 @@ class CodexBridge:
             seq += 1
             self._publish_event(
                 request_id, session_key, seq,
-                kind=OpenClawEventKind.TOOL_END,
+                kind=AgentEventKind.TOOL_END,
                 tool_name="shell",
                 tool_result=result[:4000],
             )
@@ -1291,7 +1291,7 @@ class CodexBridge:
                 seq += 1
                 self._publish_event(
                     request_id, session_key, seq,
-                    kind=OpenClawEventKind.TOOL_END,
+                    kind=AgentEventKind.TOOL_END,
                     tool_name="file_change",
                     tool_result=str(status),
                 )
@@ -1302,7 +1302,7 @@ class CodexBridge:
             seq += 1
             self._publish_event(
                 request_id, session_key, seq,
-                kind=OpenClawEventKind.TOOL_END,
+                kind=AgentEventKind.TOOL_END,
                 tool_name="web_search",
                 tool_result=str(results)[:4000],
             )
@@ -1314,7 +1314,7 @@ class CodexBridge:
             seq += 1
             self._publish_event(
                 request_id, session_key, seq,
-                kind=OpenClawEventKind.TOOL_END,
+                kind=AgentEventKind.TOOL_END,
                 tool_name=tool_name,
                 tool_result=str(result)[:4000],
             )
@@ -1326,7 +1326,7 @@ class CodexBridge:
             seq += 1
             self._publish_event(
                 request_id, session_key, seq,
-                kind=OpenClawEventKind.TOOL_END,
+                kind=AgentEventKind.TOOL_END,
                 tool_name=tool_name,
                 tool_result=str(result)[:4000],
             )
@@ -1336,7 +1336,7 @@ class CodexBridge:
             seq += 1
             self._publish_event(
                 request_id, session_key, seq,
-                kind=OpenClawEventKind.TOOL_END,
+                kind=AgentEventKind.TOOL_END,
                 tool_name="image_view",
                 tool_result="[image]",
             )
@@ -1588,7 +1588,7 @@ class CodexBridge:
         session_key: str,
         seq: int,
         *,
-        kind: OpenClawEventKind,
+        kind: AgentEventKind,
         text: str | None = None,
         tool_name: str | None = None,
         tool_arguments: dict | None = None,
@@ -1604,7 +1604,7 @@ class CodexBridge:
             {"text": text, "tool": tool_name, "seq": seq},
             seq,
         )
-        event = OpenClawEvent(
+        event = AgentEvent(
             event_id=event_id,
             session_key=session_key,
             run_id=request_id,

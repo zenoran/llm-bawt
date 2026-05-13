@@ -29,7 +29,7 @@ import signal
 import sys
 from pathlib import Path
 
-from openclaw_bridge.publisher import RedisPublisher
+from agent_bridge.publisher import RedisPublisher
 
 from .bridge import CodexBridge
 from .exec_patch import install as install_exec_patch

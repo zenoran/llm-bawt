@@ -3,8 +3,8 @@ import asyncio
 import logging
 from typing import AsyncIterator
 
-from .openclaw_events import OpenClawEvent
-from .openclaw_store import EventStore
+from .agent_bridge_events import AgentEvent
+from .agent_bridge_store import EventStore
 
 logger = logging.getLogger(__name__)
 
@@ -12,13 +12,13 @@ logger = logging.getLogger(__name__)
 class FanoutHub:
     def __init__(self, store: EventStore) -> None:
         self._store = store
-        self._subscribers: dict[str, list[asyncio.Queue[OpenClawEvent | None]]] = {}
+        self._subscribers: dict[str, list[asyncio.Queue[AgentEvent | None]]] = {}
 
     async def subscribe(
         self, session_key: str, *, since_event_id: int | None = None
-    ) -> AsyncIterator[OpenClawEvent]:
+    ) -> AsyncIterator[AgentEvent]:
         """Subscribe to live events. If since_event_id provided, replays gap first."""
-        queue: asyncio.Queue[OpenClawEvent | None] = asyncio.Queue(maxsize=1000)
+        queue: asyncio.Queue[AgentEvent | None] = asyncio.Queue(maxsize=1000)
 
         if session_key not in self._subscribers:
             self._subscribers[session_key] = []
@@ -46,7 +46,7 @@ class FanoutHub:
                 if not self._subscribers[session_key]:
                     del self._subscribers[session_key]
 
-    def broadcast(self, event: OpenClawEvent) -> None:
+    def broadcast(self, event: AgentEvent) -> None:
         """Push to all subscribers of this session."""
         queues = self._subscribers.get(event.session_key, [])
         for queue in queues:

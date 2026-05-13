@@ -49,7 +49,7 @@ async def chat_abort(request: ChatAbortRequest) -> ChatAbortResponse:
     # Send chat.abort to the gateway if this is an OpenClaw turn
     gateway_aborted = False
     if turn.agent_session_key:
-        from ...agent_backends.openclaw import get_openclaw_subscriber
+        from ...agent_backends.agent_bridge import get_agent_subscriber
         from ...bots import BotManager
 
         # Resolve the bot's agent_backend so the abort RPC can be routed to
@@ -64,7 +64,7 @@ async def chat_abort(request: ChatAbortRequest) -> ChatAbortResponse:
             except Exception:
                 backend_name = None
 
-        subscriber = get_openclaw_subscriber()
+        subscriber = get_agent_subscriber()
         if subscriber:
             params: dict = {"sessionKey": turn.agent_session_key}
             abort_req_id = f"abort_{uuid.uuid4().hex}"
@@ -134,9 +134,9 @@ async def session_reset(request: SessionResetRequest) -> SessionResetResponse:
     else:
         session_key = bc.get("session_key", "")
 
-    from ...agent_backends.openclaw import get_openclaw_subscriber
+    from ...agent_backends.agent_bridge import get_agent_subscriber
 
-    subscriber = get_openclaw_subscriber()
+    subscriber = get_agent_subscriber()
     if not subscriber:
         raise HTTPException(status_code=503, detail="Redis subscriber not available")
 

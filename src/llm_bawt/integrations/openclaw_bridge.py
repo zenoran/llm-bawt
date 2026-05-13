@@ -3,10 +3,10 @@ import asyncio
 import logging
 from typing import Any, Callable
 
-from .openclaw_events import OpenClawEventKind
-from .openclaw_fanout import FanoutHub
+from .agent_bridge_events import AgentEventKind
+from .agent_bridge_fanout import FanoutHub
 from .openclaw_ingest import EventIngestPipeline
-from .openclaw_store import EventStore
+from .agent_bridge_store import EventStore
 from .openclaw_ws import OpenClawWsClient
 
 logger = logging.getLogger(__name__)
@@ -74,7 +74,7 @@ class SessionBridge:
             self._store.update_session_cursor(event.session_key, event.db_id)
 
         # Run state management
-        if event.kind == OpenClawEventKind.RUN_STARTED and event.run_id:
+        if event.kind == AgentEventKind.RUN_STARTED and event.run_id:
             self._store.create_run(event.run_id, event.session_key, event.model, event.origin)
             self._run_buffers[event.run_id] = []
             self._run_tool_calls[event.run_id] = []
@@ -83,22 +83,22 @@ class SessionBridge:
             if event.run_id not in self._api_run_ids and self._history_sink:
                 asyncio.create_task(self._fetch_and_persist_user_message(event.session_key))
 
-        elif event.kind == OpenClawEventKind.ASSISTANT_DELTA and event.run_id:
+        elif event.kind == AgentEventKind.ASSISTANT_DELTA and event.run_id:
             if event.run_id in self._run_buffers:
                 self._run_buffers[event.run_id].append(event.text or "")
 
-        elif event.kind == OpenClawEventKind.TOOL_START and event.run_id:
+        elif event.kind == AgentEventKind.TOOL_START and event.run_id:
             if event.run_id in self._run_tool_calls:
                 self._run_tool_calls[event.run_id].append({
                     "name": event.tool_name,
                     "arguments": event.tool_arguments,
                 })
 
-        elif event.kind == OpenClawEventKind.TOOL_END and event.run_id:
+        elif event.kind == AgentEventKind.TOOL_END and event.run_id:
             if event.run_id in self._run_tool_calls and self._run_tool_calls[event.run_id]:
                 self._run_tool_calls[event.run_id][-1]["result"] = event.tool_result
 
-        elif event.kind == OpenClawEventKind.ASSISTANT_DONE:
+        elif event.kind == AgentEventKind.ASSISTANT_DONE:
             # Persist complete assistant message to chat history
             # Skip if this run was initiated via the API (already persisted by _stream_via_bridge)
             is_api_run = event.run_id and event.run_id in self._api_run_ids
@@ -114,7 +114,7 @@ class SessionBridge:
                     except Exception:
                         logger.exception("Failed to persist assistant message to chat history")
 
-        elif event.kind == OpenClawEventKind.USER_MESSAGE:
+        elif event.kind == AgentEventKind.USER_MESSAGE:
             # Persist async user messages (cron triggers, external sends)
             bot_id = self._resolve_bot_id(event.session_key)
             if self._history_sink and event.text and bot_id:
@@ -123,7 +123,7 @@ class SessionBridge:
                 except Exception:
                     logger.exception("Failed to persist user message to chat history")
 
-        elif event.kind == OpenClawEventKind.RUN_COMPLETED and event.run_id:
+        elif event.kind == AgentEventKind.RUN_COMPLETED and event.run_id:
             full_text = "".join(self._run_buffers.pop(event.run_id, []))
             if not full_text:
                 full_text = self._store.assemble_run_text(event.run_id)

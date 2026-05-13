@@ -108,7 +108,7 @@ class ChatStreamingMixin:
                 log.info("OpenClaw bridge: sent message, run_id=%s", run_id)
                 event_source = bridge._fanout.subscribe(session_key)
 
-            from openclaw_bridge.events import OpenClawEventKind
+            from agent_bridge.events import AgentEventKind
 
             # Track tool call state for OpenAI-compat delta.tool_calls
             _tool_call_index = 0
@@ -116,7 +116,7 @@ class ChatStreamingMixin:
             _last_call_id = ""
 
             async for event in event_source:
-                if event.kind == OpenClawEventKind.ASSISTANT_DELTA:
+                if event.kind == AgentEventKind.ASSISTANT_DELTA:
                     delta = event.text or ""
                     if delta:
                         # If transitioning from tool calls to content, emit finish_reason first
@@ -161,7 +161,7 @@ class ChatStreamingMixin:
                             except Exception:
                                 pass  # non-critical
 
-                elif event.kind == OpenClawEventKind.TOOL_START:
+                elif event.kind == AgentEventKind.TOOL_START:
                     tool_name = event.tool_name or "unknown"
                     tool_args = event.tool_arguments or {}
                     call_id = f"call_{uuid.uuid4().hex[:8]}"
@@ -218,7 +218,7 @@ class ChatStreamingMixin:
                         except Exception:
                             pass
 
-                elif event.kind == OpenClawEventKind.TOOL_END:
+                elif event.kind == AgentEventKind.TOOL_END:
                     tool_result = str(event.tool_result or "")
                     # Recover the call_id from the matching tool_start.
                     # Tool calls can nest (e.g. Agent > Grep > Read), so pop
@@ -248,7 +248,7 @@ class ChatStreamingMixin:
                         except Exception:
                             pass
 
-                elif event.kind == OpenClawEventKind.ASSISTANT_DONE:
+                elif event.kind == AgentEventKind.ASSISTANT_DONE:
                     # ASSISTANT_DONE carries the complete response text.
                     # Yield any portion not already streamed as deltas.
                     done_text = event.text or ""
@@ -282,11 +282,11 @@ class ChatStreamingMixin:
                             }
                             yield f"data: {json.dumps(data)}\n\n"
 
-                elif event.kind == OpenClawEventKind.RUN_COMPLETED:
+                elif event.kind == AgentEventKind.RUN_COMPLETED:
                     if event.run_id == run_id or not run_id:
                         break
 
-                elif event.kind == OpenClawEventKind.ERROR:
+                elif event.kind == AgentEventKind.ERROR:
                     # Surface the error as VISIBLE assistant content (TASK-202).
                     # Previously this only emitted a sidecar service.warning
                     # which the UI does not render — leaving the user with a

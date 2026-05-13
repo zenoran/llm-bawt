@@ -13,7 +13,7 @@ from typing import AsyncIterator
 
 import redis.asyncio as aioredis
 
-from .events import OpenClawEvent
+from .events import AgentEvent
 from .publisher import (
     COMMANDS_STREAM,
     EVENTS_STREAM_PREFIX,
@@ -45,7 +45,7 @@ class RedisSubscriber:
         *,
         run_id: str | None = None,
         timeout_s: float = 300,
-    ) -> AsyncIterator[OpenClawEvent]:
+    ) -> AsyncIterator[AgentEvent]:
         """Stream events for a session from Redis Streams.
 
         If run_id is provided, yields events until RUN_COMPLETED for that run,
@@ -82,7 +82,7 @@ class RedisSubscriber:
                     payload_str = fields.get("payload", "{}")
                     try:
                         data = json.loads(payload_str)
-                        event = OpenClawEvent.from_dict(data)
+                        event = AgentEvent.from_dict(data)
                     except Exception:
                         logger.debug("Failed to parse event from Redis: %s", payload_str[:200])
                         continue
@@ -91,8 +91,8 @@ class RedisSubscriber:
 
                     # If tracking a specific run, stop on completion
                     if run_id and event.run_id == run_id:
-                        from .events import OpenClawEventKind
-                        if event.kind in (OpenClawEventKind.RUN_COMPLETED, OpenClawEventKind.ERROR):
+                        from .events import AgentEventKind
+                        if event.kind in (AgentEventKind.RUN_COMPLETED, AgentEventKind.ERROR):
                             return
 
     async def send_command(
@@ -178,8 +178,8 @@ class RedisSubscriber:
             approximate=True,
         )
 
-        # Wait for result on openclaw:rpc:{request_id}
-        stream_key = f"openclaw:rpc:{request_id}"
+        # Wait for result on agent:rpc:{request_id}
+        stream_key = f"agent:rpc:{request_id}"
         deadline = asyncio.get_event_loop().time() + timeout_s
         while asyncio.get_event_loop().time() < deadline:
             remaining_ms = int((deadline - asyncio.get_event_loop().time()) * 1000)
@@ -200,7 +200,7 @@ class RedisSubscriber:
         request_id: str,
         *,
         timeout_s: float = 600,
-    ) -> AsyncIterator[OpenClawEvent]:
+    ) -> AsyncIterator[AgentEvent]:
         """Subscribe to the per-run response stream published by the bridge.
 
         Yields events until the bridge signals 'done' or inactivity timeout.
@@ -250,7 +250,7 @@ class RedisSubscriber:
                     payload_str = fields.get("payload", "{}")
                     try:
                         data = json.loads(payload_str)
-                        event = OpenClawEvent.from_dict(data)
+                        event = AgentEvent.from_dict(data)
                     except Exception:
                         logger.debug("Failed to parse run event: %s", payload_str[:200])
                         continue
@@ -289,7 +289,7 @@ class RedisSubscriber:
         1. Replay pending (unacked) messages from previous connection
         2. Read new messages as they arrive
 
-        Yields raw event dicts (not OpenClawEvent — unified stream carries
+        Yields raw event dicts (not AgentEvent — unified stream carries
         tool events, OpenClaw events, and application events).
         """
         bot_ids = [bot_id] if isinstance(bot_id, str) else list(bot_id)
@@ -522,7 +522,7 @@ class RedisSubscriber:
         consumer_group: str = "llm-bawt",
         consumer_name: str = "main",
     ) -> None:
-        """Continuously drain the openclaw:history stream and call callback(bot_id, role, content).
+        """Continuously drain the agent:history stream and call callback(bot_id, role, content).
 
         Uses consumer groups so multiple main-app instances can share the load.
         """

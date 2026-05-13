@@ -26,7 +26,7 @@ dependencies = [
     "ipython>=8.0.0",
     # OpenClaw WS bridge
     "websockets>=13.0",
-    # Redis (for OpenClaw bridge fanout)
+    # Redis (shared agent-bridge transport: events, commands, fanout)
     "redis[hiredis]>=5.0.0",
     "anthropic>=0.84.0",
     "claude-agent-sdk>=0.1.56",

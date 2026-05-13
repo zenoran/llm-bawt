@@ -13,12 +13,12 @@ request.
                         │  llm-bawt-app (FastAPI)                     │
                         │  AgentBackendClient → CodexBackend          │
                         └──────────────┬──────────────────────────────┘
-                                       │ Redis: openclaw:commands
+                                       │ Redis: agent:commands
                                        │ (fields: backend, session_key, message, ...)
                                        ▼
 ┌──────────────────────────────────────────────────────────────────────────┐
 │                        Redis (shared stream)                             │
-│                        openclaw:commands                                 │
+│                        agent:commands                                 │
 │                                                                          │
 │  ┌─────────────────────────┐  ┌──────────────────────────┐  ┌──────────┐ │
 │  │ openclaw-bridge         │  │ claude-code-bridge       │  │ codex-   │ │
@@ -36,8 +36,8 @@ request.
       (via gateway)                (OAuth subscription)       (ChatGPT-mode OAuth)
 ```
 
-All three bridges publish events to `openclaw:run:{request_id}` in the
-same `OpenClawEvent` format. The main app consumes them identically.
+All three bridges publish events to `agent:run:{request_id}` in the
+same `AgentEvent` format. The main app consumes them identically.
 
 ## How It Works
 
@@ -50,7 +50,7 @@ same `OpenClawEvent` format. The main app consumes them identically.
    (ChatGPT-mode OAuth — your ChatGPT Plus/Pro/Team subscription)
 6. SDK streams notifications: agentMessage deltas, commandExecution items,
    fileChange items, webSearch, mcpToolCall, etc.
-7. Bridge translates them into `OpenClawEvent`s, mapping Codex item types
+7. Bridge translates them into `AgentEvent`s, mapping Codex item types
    to Claude tool names (Bash / Edit / Write / MultiEdit / WebSearch /
    Grep / WebFetch / Read) so the existing `ClaudeToolCallCard.tsx`
    renders them correctly. (Provider-aware UI mapping is TASK-212.)
@@ -66,7 +66,7 @@ same `OpenClawEvent` format. The main app consumes them identically.
 2. **Single AsyncCodex per container.** Hosts multiple concurrent threads
    (one per session), bounded by `[agents] max_threads` in `~/.codex/config.toml`.
    Per-session ordering is enforced by the shared `SessionQueue` lock in
-   `openclaw_bridge.session_queue`. One bridge container, not many — Docker
+   `agent_bridge.session_queue`. One bridge container, not many — Docker
    `restart: unless-stopped` handles process death.
 3. **Repo-managed local plugins are staged at startup.** The bridge mirrors
    `~/dev/agent-skills/codex/.codex-plugin/marketplace.json` into
@@ -79,8 +79,8 @@ same `OpenClawEvent` format. The main app consumes them identically.
    `AsyncCodex`, and rebuilds it on the next request. Rebuild re-reads
    `auth.json` off disk, so `codex login` on the host self-heals the
    bridge with no `docker restart` needed.
-5. **Reuses openclaw_bridge infrastructure unchanged.** Imports
-   `RedisPublisher`, `OpenClawEvent`, `OpenClawEventKind`,
+5. **Reuses the shared `agent_bridge` transport.** Imports
+   `RedisPublisher`, `AgentEvent`, `AgentEventKind`,
    `synthesize_event_id`, `SessionQueue`, `COMMANDS_STREAM` directly.
    Consumer group is `codex-bridge`; filters on `backend == "codex"`
    and ACKs others.

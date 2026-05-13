@@ -1,8 +1,8 @@
 """Codex agent backend.
 
-Uses the same Redis command/event protocol as the OpenClaw backend, but
-routes to ``codex-bridge`` (OpenAI Codex SDK / ChatGPT-mode OAuth) instead
-of the openclaw-bridge (WebSocket gateway) or claude-code-bridge (Claude
+Uses the shared agent-bridge Redis command/event protocol, but routes
+to ``codex-bridge`` (OpenAI Codex SDK / ChatGPT-mode OAuth) instead of
+the openclaw-bridge (WebSocket gateway) or claude-code-bridge (Claude
 Agent SDK).
 
 Each bot+user pair gets its own Codex thread — the persisted ``session_key``
@@ -12,13 +12,13 @@ bridge after thread/started fires for the first turn.
 
 from __future__ import annotations
 
-from .openclaw import OpenClawBackend
+from .agent_bridge import AgentBridgeBackend
 
 
-class CodexBackend(OpenClawBackend):
+class CodexBackend(AgentBridgeBackend):
     """Agent backend for OpenAI Codex via the codex-bridge.
 
-    Inherits the full Redis command/event protocol from OpenClawBackend.
+    Inherits the full Redis command/event protocol from AgentBridgeBackend.
     Session keys are bot+user scoped so each user gets an independent
     Codex thread for a given bot.
 

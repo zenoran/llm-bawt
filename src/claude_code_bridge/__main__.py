@@ -10,7 +10,7 @@ import os
 import signal
 import sys
 
-from openclaw_bridge.publisher import RedisPublisher
+from agent_bridge.publisher import RedisPublisher
 
 from .bridge import ClaudeCodeBridge
 

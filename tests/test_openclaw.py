@@ -8,12 +8,12 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from llm_bawt.agent_backends.openclaw import (
-    OpenClawBackend,
-    OpenClawToolCall,
+from llm_bawt.agent_backends.openclaw import OpenClawBackend
+from llm_bawt.agent_backends.agent_bridge import (
+    AgentToolCall,
     _friendly_tool_name,
-    set_openclaw_subscriber,
-    get_openclaw_subscriber,
+    set_agent_subscriber,
+    get_agent_subscriber,
 )
 
 
@@ -28,57 +28,57 @@ def test_friendly_tool_name_passthrough():
 
 
 def test_tool_call_display_name():
-    tc = OpenClawToolCall(name="exec", arguments={"command": "curl http://example.com"})
+    tc = AgentToolCall(name="exec", arguments={"command": "curl http://example.com"})
     assert tc.display_name == "curl"
 
 
 def test_subscriber_module_singleton():
-    """Test that set/get_openclaw_subscriber works."""
-    original = get_openclaw_subscriber()
+    """Test that set/get_agent_subscriber works."""
+    original = get_agent_subscriber()
     try:
         mock_sub = MagicMock()
-        set_openclaw_subscriber(mock_sub)
-        assert get_openclaw_subscriber() is mock_sub
+        set_agent_subscriber(mock_sub)
+        assert get_agent_subscriber() is mock_sub
     finally:
-        set_openclaw_subscriber(original)
+        set_agent_subscriber(original)
 
 
 def test_stream_raw_no_subscriber():
     """stream_raw raises when no subscriber is set."""
-    original = get_openclaw_subscriber()
+    original = get_agent_subscriber()
     try:
-        set_openclaw_subscriber(None)
+        set_agent_subscriber(None)
         backend = OpenClawBackend()
         with pytest.raises(RuntimeError, match="subscriber not initialized"):
             list(backend.stream_raw("hello", {}))
     finally:
-        set_openclaw_subscriber(original)
+        set_agent_subscriber(original)
 
 
 def test_health_check_no_subscriber():
     """health_check returns False when no subscriber."""
-    original = get_openclaw_subscriber()
+    original = get_agent_subscriber()
     try:
-        set_openclaw_subscriber(None)
+        set_agent_subscriber(None)
         backend = OpenClawBackend()
         result = asyncio.run(backend.health_check({}))
         assert result is False
     finally:
-        set_openclaw_subscriber(original)
+        set_agent_subscriber(original)
 
 
 def test_health_check_with_subscriber():
     """health_check returns True when subscriber is connected."""
-    original = get_openclaw_subscriber()
+    original = get_agent_subscriber()
     try:
         mock_sub = MagicMock()
         mock_sub.connected = True
-        set_openclaw_subscriber(mock_sub)
+        set_agent_subscriber(mock_sub)
         backend = OpenClawBackend()
         result = asyncio.run(backend.health_check({}))
         assert result is True
     finally:
-        set_openclaw_subscriber(original)
+        set_agent_subscriber(original)
 
 
 def test_resolve_session_key():

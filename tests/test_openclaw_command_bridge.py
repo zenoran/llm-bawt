@@ -4,7 +4,7 @@ import asyncio
 from unittest.mock import AsyncMock, MagicMock
 
 from openclaw_bridge.bridge import SessionBridge
-from openclaw_bridge.events import OpenClawEventKind
+from agent_bridge.events import AgentEventKind
 from openclaw_bridge.ingest import EventIngestPipeline
 
 
@@ -80,7 +80,7 @@ def test_handle_send_command_recovers_reply_from_history_after_empty_stream():
     ]
     recovered = [
         event for event in published_events
-        if getattr(event, "kind", None) == OpenClawEventKind.ASSISTANT_DELTA
+        if getattr(event, "kind", None) == AgentEventKind.ASSISTANT_DELTA
         and getattr(event, "text", None) == "Hey Nick"
     ]
 

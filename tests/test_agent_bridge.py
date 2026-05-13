@@ -1,6 +1,7 @@
-"""Unit tests for OpenClaw Session Bridge components.
+"""Unit tests for shared agent-bridge transport components.
 
-Tests EventIngestPipeline, EventStore, FanoutHub, and SessionBridge.
+Tests EventIngestPipeline (openclaw-flavored), EventStore, FanoutHub,
+and SessionBridge — the parts that all bridge backends rely on.
 """
 
 from __future__ import annotations
@@ -13,9 +14,9 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from llm_bawt.integrations.openclaw_events import (
-    OpenClawEvent,
-    OpenClawEventKind,
+from llm_bawt.integrations.agent_bridge_events import (
+    AgentEvent,
+    AgentEventKind,
     synthesize_event_id,
 )
 from llm_bawt.integrations.openclaw_ingest import EventIngestPipeline
@@ -40,7 +41,7 @@ class TestEventIngestPipeline:
         }
         event = self.pipeline.parse(raw, "main")
         assert event is not None
-        assert event.kind == OpenClawEventKind.ASSISTANT_DELTA
+        assert event.kind == AgentEventKind.ASSISTANT_DELTA
         assert event.text == "Hello "
         assert event.event_id == "evt_001"
         assert event.session_key == "main"
@@ -61,7 +62,7 @@ class TestEventIngestPipeline:
         }
         event = self.pipeline.parse(raw, "main")
         assert event is not None
-        assert event.kind == OpenClawEventKind.TOOL_START
+        assert event.kind == AgentEventKind.TOOL_START
         assert event.tool_name == "exec"
         assert event.tool_arguments == {"command": "ls -la"}
 
@@ -81,7 +82,7 @@ class TestEventIngestPipeline:
         }
         event = self.pipeline.parse(raw, "main")
         assert event is not None
-        assert event.kind == OpenClawEventKind.TOOL_END
+        assert event.kind == AgentEventKind.TOOL_END
         assert event.tool_name == "exec"
         assert event.tool_result == "file1.txt\nfile2.txt"
 
@@ -95,7 +96,7 @@ class TestEventIngestPipeline:
         }
         event = self.pipeline.parse(raw, "main")
         assert event is not None
-        assert event.kind == OpenClawEventKind.RUN_STARTED
+        assert event.kind == AgentEventKind.RUN_STARTED
         assert event.run_id == "run_xyz"
         assert event.model == "gpt-5"
 
@@ -109,7 +110,7 @@ class TestEventIngestPipeline:
         }
         event = self.pipeline.parse(raw, "main")
         assert event is not None
-        assert event.kind == OpenClawEventKind.RUN_COMPLETED
+        assert event.kind == AgentEventKind.RUN_COMPLETED
         assert event.run_id == "run_xyz"
 
     def test_event_ingest_drops_pings(self):
@@ -133,7 +134,7 @@ class TestEventIngestPipeline:
         }
         event = self.pipeline.parse(raw, "main")
         assert event is not None
-        assert event.kind == OpenClawEventKind.SYSTEM_NOTE
+        assert event.kind == AgentEventKind.SYSTEM_NOTE
 
     def test_event_ingest_chat_sent(self):
         raw = {
@@ -144,7 +145,7 @@ class TestEventIngestPipeline:
         }
         event = self.pipeline.parse(raw, "main")
         assert event is not None
-        assert event.kind == OpenClawEventKind.USER_MESSAGE
+        assert event.kind == AgentEventKind.USER_MESSAGE
         assert event.origin == "user"
         assert event.run_id == "run_abc"
 
@@ -158,7 +159,7 @@ class TestEventIngestPipeline:
         }
         event = self.pipeline.parse(raw, "main")
         assert event is not None
-        assert event.kind == OpenClawEventKind.ERROR
+        assert event.kind == AgentEventKind.ERROR
         assert event.text == "something went wrong"
 
     def test_event_ingest_chat_message_user(self):
@@ -171,7 +172,7 @@ class TestEventIngestPipeline:
         }
         event = self.pipeline.parse(raw, "main")
         assert event is not None
-        assert event.kind == OpenClawEventKind.USER_MESSAGE
+        assert event.kind == AgentEventKind.USER_MESSAGE
         assert event.text == "hello"
 
     def test_event_ingest_chat_message_assistant(self):
@@ -184,7 +185,7 @@ class TestEventIngestPipeline:
         }
         event = self.pipeline.parse(raw, "main")
         assert event is not None
-        assert event.kind == OpenClawEventKind.ASSISTANT_DONE
+        assert event.kind == AgentEventKind.ASSISTANT_DONE
         assert event.text == "Hi there!"
 
     def test_event_ingest_seq_preserved(self):
@@ -217,7 +218,7 @@ class TestEventIngestPipeline:
         }
         event = self.pipeline.parse(raw, "main")
         assert event is not None
-        assert event.kind == OpenClawEventKind.TOOL_START
+        assert event.kind == AgentEventKind.TOOL_START
         assert event.tool_arguments == {"query": "test"}
 
     def test_synthesize_event_id_deterministic(self):
@@ -256,16 +257,16 @@ def _get_test_engine():
 def event_store():
     """Create EventStore with fresh tables. Clean up after test."""
     engine = _get_test_engine()
-    from llm_bawt.integrations.openclaw_store import EventStore, create_openclaw_tables
+    from llm_bawt.integrations.agent_bridge_store import EventStore, create_agent_event_tables
     from sqlalchemy import text
 
-    create_openclaw_tables(engine)
+    create_agent_event_tables(engine)
 
     # Clean tables before test
     with engine.connect() as conn:
-        conn.execute(text("DELETE FROM openclaw_events"))
-        conn.execute(text("DELETE FROM openclaw_session_state"))
-        conn.execute(text("DELETE FROM openclaw_runs"))
+        conn.execute(text("DELETE FROM agent_events"))
+        conn.execute(text("DELETE FROM agent_session_state"))
+        conn.execute(text("DELETE FROM agent_runs"))
         conn.commit()
 
     store = EventStore(engine)
@@ -273,21 +274,21 @@ def event_store():
 
     # Clean up after test
     with engine.connect() as conn:
-        conn.execute(text("DELETE FROM openclaw_events"))
-        conn.execute(text("DELETE FROM openclaw_session_state"))
-        conn.execute(text("DELETE FROM openclaw_runs"))
+        conn.execute(text("DELETE FROM agent_events"))
+        conn.execute(text("DELETE FROM agent_session_state"))
+        conn.execute(text("DELETE FROM agent_runs"))
         conn.commit()
 
 
 def _make_event(
     event_id: str = "evt_test",
     session_key: str = "main",
-    kind: OpenClawEventKind = OpenClawEventKind.ASSISTANT_DELTA,
+    kind: AgentEventKind = AgentEventKind.ASSISTANT_DELTA,
     text: str | None = "hello",
     run_id: str | None = "run_001",
     **kwargs,
-) -> OpenClawEvent:
-    return OpenClawEvent(
+) -> AgentEvent:
+    return AgentEvent(
         event_id=event_id,
         session_key=session_key,
         run_id=run_id,
@@ -332,7 +333,7 @@ class TestEventStore:
             event_store.store(_make_event(
                 event_id=f"evt_asm_{i}",
                 run_id="run_assemble",
-                kind=OpenClawEventKind.ASSISTANT_DELTA,
+                kind=AgentEventKind.ASSISTANT_DELTA,
                 text=chunk,
                 seq=i,
             ))
@@ -342,15 +343,15 @@ class TestEventStore:
 
     def test_event_store_kind_filter(self, event_store):
         """get_events with kinds filter returns only matching kinds."""
-        event_store.store(_make_event(event_id="evt_kf1", kind=OpenClawEventKind.ASSISTANT_DELTA))
-        event_store.store(_make_event(event_id="evt_kf2", kind=OpenClawEventKind.RUN_STARTED, text=None))
-        event_store.store(_make_event(event_id="evt_kf3", kind=OpenClawEventKind.ASSISTANT_DELTA))
+        event_store.store(_make_event(event_id="evt_kf1", kind=AgentEventKind.ASSISTANT_DELTA))
+        event_store.store(_make_event(event_id="evt_kf2", kind=AgentEventKind.RUN_STARTED, text=None))
+        event_store.store(_make_event(event_id="evt_kf3", kind=AgentEventKind.ASSISTANT_DELTA))
 
         events = event_store.get_events(
-            "main", kinds=[OpenClawEventKind.ASSISTANT_DELTA]
+            "main", kinds=[AgentEventKind.ASSISTANT_DELTA]
         )
         assert len(events) == 2
-        assert all(e.kind == OpenClawEventKind.ASSISTANT_DELTA for e in events)
+        assert all(e.kind == AgentEventKind.ASSISTANT_DELTA for e in events)
 
     def test_event_store_session_cursor(self, event_store):
         """Session cursor tracks last processed event."""
@@ -371,7 +372,7 @@ class TestEventStore:
             event_store.store(_make_event(
                 event_id=f"evt_lc_{i}",
                 run_id="run_lc",
-                kind=OpenClawEventKind.ASSISTANT_DELTA,
+                kind=AgentEventKind.ASSISTANT_DELTA,
                 text=chunk,
                 seq=i,
             ))
@@ -383,7 +384,7 @@ class TestEventStore:
         from sqlalchemy import text as sql_text
         with event_store._engine.connect() as conn:
             row = conn.execute(
-                sql_text("SELECT status, full_text FROM openclaw_runs WHERE run_id = :rid"),
+                sql_text("SELECT status, full_text FROM agent_runs WHERE run_id = :rid"),
                 {"rid": "run_lc"},
             ).fetchone()
         assert row is not None
@@ -396,7 +397,7 @@ class TestEventStore:
         from sqlalchemy import text as sql_text
         with event_store._engine.connect() as conn:
             row = conn.execute(
-                sql_text("SELECT ws_connected FROM openclaw_session_state WHERE session_key = :sk"),
+                sql_text("SELECT ws_connected FROM agent_session_state WHERE session_key = :sk"),
                 {"sk": "main"},
             ).fetchone()
         assert row is not None
@@ -405,7 +406,7 @@ class TestEventStore:
         event_store.update_session_ws_state("main", False)
         with event_store._engine.connect() as conn:
             row = conn.execute(
-                sql_text("SELECT ws_connected FROM openclaw_session_state WHERE session_key = :sk"),
+                sql_text("SELECT ws_connected FROM agent_session_state WHERE session_key = :sk"),
                 {"sk": "main"},
             ).fetchone()
         assert row[0] is False
@@ -419,7 +420,7 @@ class TestEventStore:
 class TestFanoutHub:
     def test_fanout_live_broadcast(self):
         """Subscriber receives events pushed via broadcast()."""
-        from llm_bawt.integrations.openclaw_fanout import FanoutHub
+        from llm_bawt.integrations.agent_bridge_fanout import FanoutHub
 
         store = MagicMock()
         hub = FanoutHub(store)
@@ -455,7 +456,7 @@ class TestFanoutHub:
 
     def test_fanout_replay_then_live(self):
         """Subscriber with since_event_id gets gap replay then live events."""
-        from llm_bawt.integrations.openclaw_fanout import FanoutHub
+        from llm_bawt.integrations.agent_bridge_fanout import FanoutHub
 
         # Mock store that returns gap events
         store = MagicMock()
@@ -499,7 +500,7 @@ class TestSessionBridge:
     def test_bridge_full_flow(self):
         """Full flow: events arrive → run state tracked → fanout."""
         from llm_bawt.integrations.openclaw_bridge import SessionBridge
-        from llm_bawt.integrations.openclaw_fanout import FanoutHub
+        from llm_bawt.integrations.agent_bridge_fanout import FanoutHub
         from llm_bawt.integrations.openclaw_ingest import EventIngestPipeline
 
         store = MagicMock()
@@ -566,7 +567,7 @@ class TestSessionBridge:
     def test_bridge_background_event_persisted(self):
         """Event with no matching user send still stored in EventStore."""
         from llm_bawt.integrations.openclaw_bridge import SessionBridge
-        from llm_bawt.integrations.openclaw_fanout import FanoutHub
+        from llm_bawt.integrations.agent_bridge_fanout import FanoutHub
         from llm_bawt.integrations.openclaw_ingest import EventIngestPipeline
 
         store = MagicMock()
@@ -596,13 +597,13 @@ class TestSessionBridge:
         # Event was stored
         store.store.assert_called_once()
         stored_event = store.store.call_args[0][0]
-        assert stored_event.kind == OpenClawEventKind.ASSISTANT_DELTA
+        assert stored_event.kind == AgentEventKind.ASSISTANT_DELTA
         assert stored_event.text == "background message"
 
     def test_bridge_duplicate_dropped(self):
         """Duplicate events (store returns False) are not broadcasted."""
         from llm_bawt.integrations.openclaw_bridge import SessionBridge
-        from llm_bawt.integrations.openclaw_fanout import FanoutHub
+        from llm_bawt.integrations.agent_bridge_fanout import FanoutHub
         from llm_bawt.integrations.openclaw_ingest import EventIngestPipeline
 
         store = MagicMock()
@@ -632,7 +633,7 @@ class TestSessionBridge:
     def test_bridge_tool_calls_tracked(self):
         """Tool start/end events are tracked in run state."""
         from llm_bawt.integrations.openclaw_bridge import SessionBridge
-        from llm_bawt.integrations.openclaw_fanout import FanoutHub
+        from llm_bawt.integrations.agent_bridge_fanout import FanoutHub
         from llm_bawt.integrations.openclaw_ingest import EventIngestPipeline
 
         store = MagicMock()

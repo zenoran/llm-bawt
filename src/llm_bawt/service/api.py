@@ -126,15 +126,15 @@ async def lifespan(app):
                     "The bridge requires Redis for command/event transport."
                 )
             else:
-                from openclaw_bridge.subscriber import RedisSubscriber
-                from ..agent_backends.openclaw import set_openclaw_subscriber
+                from agent_bridge.subscriber import RedisSubscriber
+                from ..agent_backends.agent_bridge import set_agent_subscriber
 
                 redis_subscriber = RedisSubscriber(config.REDIS_URL)
                 await redis_subscriber.connect()
                 service._redis_subscriber = redis_subscriber
 
                 # Make subscriber available to OpenClawBackend instances
-                set_openclaw_subscriber(redis_subscriber)
+                set_agent_subscriber(redis_subscriber)
 
                 # DEACTIVATED: passive history drain causes duplicates with
                 # finalize_response().  The active chat.send path persists via
@@ -256,8 +256,8 @@ async def lifespan(app):
                 except (asyncio.CancelledError, Exception):
                     pass
         if redis_subscriber:
-            from ..agent_backends.openclaw import set_openclaw_subscriber
-            set_openclaw_subscriber(None)
+            from ..agent_backends.agent_bridge import set_agent_subscriber
+            set_agent_subscriber(None)
             await redis_subscriber.close()
         if scheduler:
             await scheduler.stop()

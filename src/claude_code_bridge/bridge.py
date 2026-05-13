@@ -22,9 +22,9 @@ from claude_agent_sdk.types import (
     UserMessage,
 )
 
-from openclaw_bridge.events import OpenClawEvent, OpenClawEventKind, synthesize_event_id
-from openclaw_bridge.publisher import COMMANDS_STREAM, RedisPublisher
-from openclaw_bridge.session_queue import SessionQueue
+from agent_bridge.events import AgentEvent, AgentEventKind, synthesize_event_id
+from agent_bridge.publisher import COMMANDS_STREAM, RedisPublisher
+from agent_bridge.session_queue import SessionQueue
 
 logger = logging.getLogger(__name__)
 
@@ -146,7 +146,7 @@ def _is_auth_failure(exc: Exception, stderr_lines: list[str]) -> bool:
 
 class ClaudeCodeBridge:
     """Reads chat.send commands from Redis, runs them through the Claude Agent
-    SDK, and publishes OpenClawEvent-formatted results back to Redis."""
+    SDK, and publishes AgentEvent-formatted results back to Redis."""
 
     # Default timeout for a single query() call (seconds).
     # The CLI's internal API_TIMEOUT_MS is 600s; we cut shorter to fail fast.
@@ -179,7 +179,7 @@ class ClaudeCodeBridge:
         # active tasks for abort support.
         self._session_queue = SessionQueue()
         # request_id → frontend user-message UUID, populated in _handle_send
-        # and read by _publish_event so every emitted OpenClawEvent (tool_*,
+        # and read by _publish_event so every emitted AgentEvent (tool_*,
         # assistant_*, etc.) carries the originating message id.  Cleared on
         # _handle_send finally.
         self._trigger_message_ids: dict[str, str] = {}
@@ -471,7 +471,7 @@ class ClaudeCodeBridge:
                 # Just "/new" with no follow-up — acknowledge and done
                 self._publish_event(
                     request_id, session_key, 1,
-                    kind=OpenClawEventKind.ASSISTANT_DONE,
+                    kind=AgentEventKind.ASSISTANT_DONE,
                     text="Session reset. Ready for a new conversation.",
                     model=model,
                 )
@@ -679,7 +679,7 @@ class ClaudeCodeBridge:
                                             text_parts.append(text)
                                             self._publish_event(
                                                 request_id, session_key, seq,
-                                                kind=OpenClawEventKind.ASSISTANT_DELTA,
+                                                kind=AgentEventKind.ASSISTANT_DELTA,
                                                 text=text,
                                             )
                                     elif delta.get("type") == "input_json_delta":
@@ -717,7 +717,7 @@ class ClaudeCodeBridge:
                                         seq += 1
                                         self._publish_event(
                                             request_id, session_key, seq,
-                                            kind=OpenClawEventKind.TOOL_START,
+                                            kind=AgentEventKind.TOOL_START,
                                             tool_name=block.name,
                                             tool_arguments=block.input if isinstance(block.input, dict) else {},
                                         )
@@ -734,7 +734,7 @@ class ClaudeCodeBridge:
                                             )
                                         self._publish_event(
                                             request_id, session_key, seq,
-                                            kind=OpenClawEventKind.TOOL_END,
+                                            kind=AgentEventKind.TOOL_END,
                                             tool_name=block.tool_use_id or "unknown",
                                             tool_result=str(result_content)[:2000],
                                         )
@@ -811,7 +811,7 @@ class ClaudeCodeBridge:
                                 seq += 1
                                 self._publish_event(
                                     request_id, session_key, seq,
-                                    kind=OpenClawEventKind.ASSISTANT_DONE,
+                                    kind=AgentEventKind.ASSISTANT_DONE,
                                     text=full_text,
                                     model=actual_model,
                                     token_usage=token_usage_payload,
@@ -823,7 +823,7 @@ class ClaudeCodeBridge:
                             seq += 1
                             self._publish_event(
                                 request_id, session_key, seq,
-                                kind=OpenClawEventKind.ASSISTANT_DONE,
+                                kind=AgentEventKind.ASSISTANT_DONE,
                                 text="".join(text_parts),
                                 model=actual_model,
                             )
@@ -841,7 +841,7 @@ class ClaudeCodeBridge:
                         try:
                             self._publish_event(
                                 request_id, session_key, seq,
-                                kind=OpenClawEventKind.ASSISTANT_DONE,
+                                kind=AgentEventKind.ASSISTANT_DONE,
                                 text="".join(text_parts),
                                 model=actual_model,
                             )
@@ -929,7 +929,7 @@ class ClaudeCodeBridge:
                 seq += 1
                 self._publish_event(
                     request_id, session_key, seq,
-                    kind=OpenClawEventKind.ERROR,
+                    kind=AgentEventKind.ERROR,
                     text=str(e),
                 )
                 self._publisher.publish_run_done(request_id)
@@ -1061,7 +1061,7 @@ class ClaudeCodeBridge:
         session_key: str,
         seq: int,
         *,
-        kind: OpenClawEventKind,
+        kind: AgentEventKind,
         text: str | None = None,
         tool_name: str | None = None,
         tool_arguments: dict | None = None,
@@ -1077,7 +1077,7 @@ class ClaudeCodeBridge:
             {"text": text, "tool": tool_name, "seq": seq},
             seq,
         )
-        event = OpenClawEvent(
+        event = AgentEvent(
             event_id=event_id,
             session_key=session_key,
             run_id=request_id,

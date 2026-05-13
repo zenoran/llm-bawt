@@ -5,11 +5,11 @@ import json
 import logging
 from datetime import datetime
 
-from .events import OpenClawEvent, OpenClawEventKind
+from agent_bridge.events import AgentEvent, AgentEventKind
+from agent_bridge.publisher import COMMANDS_STREAM, RedisPublisher
+from agent_bridge.session_queue import SessionQueue
+from agent_bridge.store import EventStore
 from .ingest import EventIngestPipeline
-from .publisher import COMMANDS_STREAM, RedisPublisher
-from .session_queue import SessionQueue
-from .store import EventStore
 from .ws_client import OpenClawWsClient
 
 logger = logging.getLogger(__name__)
@@ -192,7 +192,7 @@ class SessionBridge:
                         # bucket tool activity without turn_id guessing.
                         if trigger_message_id and not event.trigger_message_id:
                             event.trigger_message_id = trigger_message_id
-                        if event.kind == OpenClawEventKind.ASSISTANT_DELTA and event.text:
+                        if event.kind == AgentEventKind.ASSISTANT_DELTA and event.text:
                             saw_assistant_text = True
 
                         # If ASSISTANT_DONE carries inline text but no deltas
@@ -200,18 +200,18 @@ class SessionBridge:
                         # sees the text.  Do NOT fall back to chat history —
                         # that risks replaying a stale response from a prior turn.
                         if (
-                            event.kind == OpenClawEventKind.ASSISTANT_DONE
+                            event.kind == AgentEventKind.ASSISTANT_DONE
                             and not saw_assistant_text
                             and event.text
                         ):
                             saw_assistant_text = True
                             self._publisher.publish_run_event(
                                 request_id,
-                                OpenClawEvent(
+                                AgentEvent(
                                     event_id=f"{event.event_id}:final-text",
                                     session_key=event.session_key,
                                     run_id=event.run_id,
-                                    kind=OpenClawEventKind.ASSISTANT_DELTA,
+                                    kind=AgentEventKind.ASSISTANT_DELTA,
                                     origin=event.origin,
                                     text=event.text,
                                     model=event.model,
@@ -239,11 +239,11 @@ class SessionBridge:
                         )
                         self._publisher.publish_run_event(
                             request_id,
-                            OpenClawEvent(
+                            AgentEvent(
                                 event_id=f"history_{request_id}",
                                 session_key=session_key,
                                 run_id=None,
-                                kind=OpenClawEventKind.ASSISTANT_DELTA,
+                                kind=AgentEventKind.ASSISTANT_DELTA,
                                 origin="bridge",
                                 text=history_text,
                                 trigger_message_id=trigger_message_id,
@@ -256,11 +256,11 @@ class SessionBridge:
             except Exception as e:
                 logger.exception("Send command failed: request_id=%s", request_id)
                 # Publish error event
-                err_event = OpenClawEvent(
+                err_event = AgentEvent(
                     event_id=f"err_{request_id}",
                     session_key=session_key,
                     run_id=None,
-                    kind=OpenClawEventKind.ERROR,
+                    kind=AgentEventKind.ERROR,
                     origin="bridge",
                     text=str(e),
                     trigger_message_id=trigger_message_id,
@@ -473,7 +473,7 @@ class SessionBridge:
         if self._session_queue.is_busy(event.session_key):
             return
 
-        if event.kind == OpenClawEventKind.TOOL_START:
+        if event.kind == AgentEventKind.TOOL_START:
             call_id = f"call_{uuid.uuid4().hex[:8]}"
             self._passive_tool_counters.setdefault(run_id, 0)
             self._passive_tool_counters[run_id] += 1
@@ -498,7 +498,7 @@ class SessionBridge:
                 "ts": ts,
             })
 
-        elif event.kind == OpenClawEventKind.TOOL_END:
+        elif event.kind == AgentEventKind.TOOL_END:
             stack = self._passive_call_id_stacks.get(run_id, [])
             call_id = stack.pop() if stack else f"call_{uuid.uuid4().hex[:8]}"
             iteration = self._passive_tool_counters.get(run_id, 1)
@@ -516,13 +516,13 @@ class SessionBridge:
                 "ts": ts,
             })
 
-        elif event.kind == OpenClawEventKind.ASSISTANT_DONE:
+        elif event.kind == AgentEventKind.ASSISTANT_DONE:
             # Stash token usage so RUN_COMPLETED can attach it to turn_complete.
             # Skipped on the active path (chat_streaming forwards usage there).
             if event.token_usage:
                 self._passive_token_usage[run_id] = event.token_usage
 
-        elif event.kind == OpenClawEventKind.RUN_COMPLETED:
+        elif event.kind == AgentEventKind.RUN_COMPLETED:
             self._passive_tool_counters.pop(run_id, None)
             self._passive_call_id_stacks.pop(run_id, None)
             token_usage = self._passive_token_usage.pop(run_id, None)
@@ -557,33 +557,33 @@ class SessionBridge:
             self._store.update_session_cursor(event.session_key, event.db_id)
 
         # Run state management
-        if event.kind == OpenClawEventKind.RUN_STARTED and event.run_id:
+        if event.kind == AgentEventKind.RUN_STARTED and event.run_id:
             self._store.create_run(event.run_id, event.session_key, event.model, event.origin)
             self._run_buffers[event.run_id] = []
             self._run_tool_calls[event.run_id] = []
 
-        elif event.kind == OpenClawEventKind.ASSISTANT_DELTA and event.run_id:
+        elif event.kind == AgentEventKind.ASSISTANT_DELTA and event.run_id:
             if event.run_id in self._run_buffers:
                 self._run_buffers[event.run_id].append(event.text or "")
 
-        elif event.kind == OpenClawEventKind.TOOL_START and event.run_id:
+        elif event.kind == AgentEventKind.TOOL_START and event.run_id:
             if event.run_id in self._run_tool_calls:
                 self._run_tool_calls[event.run_id].append({
                     "name": event.tool_name,
                     "arguments": event.tool_arguments,
                 })
 
-        elif event.kind == OpenClawEventKind.TOOL_END and event.run_id:
+        elif event.kind == AgentEventKind.TOOL_END and event.run_id:
             if event.run_id in self._run_tool_calls and self._run_tool_calls[event.run_id]:
                 self._run_tool_calls[event.run_id][-1]["result"] = event.tool_result
 
-        elif event.kind == OpenClawEventKind.ASSISTANT_DONE:
+        elif event.kind == AgentEventKind.ASSISTANT_DONE:
             # Publish history-persist command for the main app
             bot_id = self._resolve_bot_id(event.session_key)
             if bot_id and event.text:
                 self._publisher.publish_history(bot_id, "assistant", event.text)
 
-        elif event.kind == OpenClawEventKind.USER_MESSAGE:
+        elif event.kind == AgentEventKind.USER_MESSAGE:
             if event.text and self._ingest.should_drop_content(event.text):
                 logger.debug("Dropping user message matching content filter: %.80s…", event.text)
             else:
@@ -591,7 +591,7 @@ class SessionBridge:
                 if bot_id and event.text:
                     self._publisher.publish_history(bot_id, "user", event.text)
 
-        elif event.kind == OpenClawEventKind.RUN_COMPLETED and event.run_id:
+        elif event.kind == AgentEventKind.RUN_COMPLETED and event.run_id:
             full_text = "".join(self._run_buffers.pop(event.run_id, []))
             if not full_text:
                 full_text = self._store.assemble_run_text(event.run_id)

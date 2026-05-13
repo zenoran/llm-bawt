@@ -1,10 +1,10 @@
 """Redis Streams publisher — replaces the in-memory FanoutHub.
 
 Events are published to a Redis Stream keyed by session:
-    openclaw:events:{session_key}
+    agent:events:{session_key}
 
 History-persist commands are published to:
-    openclaw:history
+    agent:history
 
 Consumers (main app) read via XREAD or consumer groups.
 """
@@ -17,15 +17,15 @@ from typing import Any
 
 import redis
 
-from .events import OpenClawEvent
+from .events import AgentEvent
 
 logger = logging.getLogger(__name__)
 
 # Stream names
-EVENTS_STREAM_PREFIX = "openclaw:events:"
-HISTORY_STREAM = "openclaw:history"
-COMMANDS_STREAM = "openclaw:commands"
-RUN_STREAM_PREFIX = "openclaw:run:"
+EVENTS_STREAM_PREFIX = "agent:events:"
+HISTORY_STREAM = "agent:history"
+COMMANDS_STREAM = "agent:commands"
+RUN_STREAM_PREFIX = "agent:run:"
 # Unified event stream for all bots (native + OpenClaw): events:{bot_id}:{user_id}
 UNIFIED_EVENTS_PREFIX = "events:"
 
@@ -53,12 +53,12 @@ class RedisPublisher:
         except redis.ConnectionError as e:
             logger.error("Redis publisher connect failed: %s", e)
 
-    def _stamp_provider(self, event: OpenClawEvent) -> OpenClawEvent:
+    def _stamp_provider(self, event: AgentEvent) -> AgentEvent:
         if event.provider is None and self._default_provider is not None:
             event.provider = self._default_provider
         return event
 
-    def publish_event(self, event: OpenClawEvent) -> str | None:
+    def publish_event(self, event: AgentEvent) -> str | None:
         """Publish an event to the session's Redis Stream. Returns the stream ID."""
         if not self._connected:
             return None
@@ -100,7 +100,7 @@ class RedisPublisher:
             logger.exception("Failed to publish history command")
             return None
 
-    def publish_run_event(self, request_id: str, event: OpenClawEvent) -> str | None:
+    def publish_run_event(self, request_id: str, event: AgentEvent) -> str | None:
         """Publish an event to a per-run response stream for the requesting client."""
         if not self._connected:
             return None
@@ -124,7 +124,7 @@ class RedisPublisher:
         """Publish an RPC call result to a short-lived response stream."""
         if not self._connected:
             return
-        stream_key = f"openclaw:rpc:{request_id}"
+        stream_key = f"agent:rpc:{request_id}"
         try:
             fields = {"payload": json.dumps(result, ensure_ascii=False, default=str)}
             self._redis.xadd(stream_key, fields, maxlen=10)
