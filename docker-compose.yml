@@ -41,6 +41,15 @@ services:
       # Lives outside ./storage so the optimizer-managed tree can grow
       # independently of legacy video/thumbnail output. Default points at the
       # echo home volume; override via LLM_BAWT_MEDIA_HOST_PATH for local dev.
+      #
+      # One-time host setup if the bind source is an NFS-backed Unraid share:
+      # the share's NFS export uses root_squash (Unraid default), so the
+      # container — which runs as root — gets mapped to nobody on the server
+      # and can't write to a user-owned dir. Fix once on the host:
+      #     chmod 777 /mnt/user/home/echo/llmbawt-media
+      # (chmod persists on disk; the dir contents stay 755, only the parent
+      # is loosened so squashed-root can mkdir blobs/. Blob files end up owned
+      # by nobody:nogroup which is fine — readable by nick for backups.)
       - ${LLM_BAWT_MEDIA_HOST_PATH:-/mnt/user/home/echo/llmbawt-media}:/var/lib/llm-bawt/media
     extra_hosts:
       - "host.docker.internal:host-gateway"

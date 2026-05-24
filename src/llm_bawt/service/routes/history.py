@@ -21,6 +21,39 @@ router = APIRouter()
 log = get_service_logger(__name__)
 
 
+def _fetch_attachments_via_shared_engine(
+    config,
+    bot_id: str,
+    message_ids: list[str],
+) -> dict[str, list[dict]]:
+    """Direct-SQL read of ``{bot}_messages.attachments`` for server-mode.
+
+    The route normally calls into ``PostgreSQLMemoryBackend.get_attachments_for_message_ids``
+    via the embedded short-term manager, but MCP-server-mode deployments
+    have no backend handle. This helper bypasses MCP and reads through
+    the process-wide shared engine instead — same data, one round-trip,
+    no new RPC. Returns the same ``{message_id: [refs]}`` shape.
+    """
+    from sqlalchemy import text
+    from ...media.assets import _build_engine
+    from ...memory.postgresql import _sanitize_table_name
+
+    engine = _build_engine(config)
+    if engine is None:
+        return {mid: [] for mid in message_ids}
+
+    table = f"{_sanitize_table_name(bot_id)}_messages"
+    sql = text(f"SELECT id, attachments FROM {table} WHERE id = ANY(:ids)")
+    result: dict[str, list[dict]] = {mid: [] for mid in message_ids}
+    with engine.connect() as conn:
+        rows = conn.execute(sql, {"ids": list(message_ids)}).mappings().all()
+        for row in rows:
+            refs = row.get("attachments") or []
+            if isinstance(refs, list):
+                result[row["id"]] = list(refs)
+    return result
+
+
 def _hydrate_attachments_for_page(
     service,
     bot_id: str,
@@ -43,24 +76,26 @@ def _hydrate_attachments_for_page(
     if not message_ids:
         return {}
 
-    # The short-term manager wraps a PostgreSQLMemoryBackend in embedded
-    # mode. Server mode (MCP HTTP) lacks the backend handle here — we'd
-    # need to add a new MCP tool to support that; out of scope for
-    # TASK-226 since the deployment is embedded today.
+    # In embedded mode the short-term manager wraps a
+    # PostgreSQLMemoryBackend we can call directly. In MCP-server mode
+    # the manager has no ``_backend`` handle, so we fall back to a thin
+    # direct SQL read against ``{bot}_messages.attachments`` using the
+    # process-wide shared engine — same DB, just bypassing the MCP RPC
+    # layer for this one read-only lookup. Both paths return the same
+    # ``{message_id: [refs]}`` shape so downstream enrichment is unchanged.
     try:
         client = service.get_memory_client(bot_id)
         if not client:
             return {mid: [] for mid in message_ids}
         manager = client.get_short_term_manager()
         backend = getattr(manager, "_backend", None)
-        if backend is None:
-            log.debug(
-                "Short-term manager has no _backend (server mode?); "
-                "skipping attachment hydration"
-            )
-            return {mid: [] for mid in message_ids}
 
-        raw_refs_by_msg = backend.get_attachments_for_message_ids(message_ids)
+        if backend is not None:
+            raw_refs_by_msg = backend.get_attachments_for_message_ids(message_ids)
+        else:
+            raw_refs_by_msg = _fetch_attachments_via_shared_engine(
+                service.config, bot_id, message_ids
+            )
     except Exception as e:
         log.warning("Failed to load attachment refs for history page: %s", e)
         return {mid: [] for mid in message_ids}
