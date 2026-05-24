@@ -19,6 +19,7 @@ class TaskType(Enum):
     PROFILE_MAINTENANCE = "profile_maintenance"
     HISTORY_SUMMARIZATION = "history_summarization"
     MEMORY_EXTRACTION = "memory_extraction"
+    MEDIA_ASSETS_GC = "media_assets_gc"
 
 
 class TaskStatus(Enum):
@@ -227,6 +228,33 @@ def create_history_summarization_task(
             "use_heuristic_fallback": use_heuristic_fallback,
             "max_tokens_per_chunk": max_tokens_per_chunk,
             "model": model,
+        },
+    )
+
+
+def create_media_assets_gc_task(
+    grace_days: int = 7,
+    dry_run: bool = False,
+    bot_id: str = "system",
+    user_id: str = "system",
+    priority: int = -1,
+) -> Task:
+    """Create a media-assets garbage-collection task.
+
+    Scans ``media_assets`` for rows that are either past their ``expires_at``
+    or are older than ``grace_days`` and unreferenced by any
+    ``{bot}_messages.attachments`` JSONB. Each orphan is removed via
+    :meth:`llm_bawt.media.store.MediaStore.delete` so the on-disk blob
+    variants are cleaned up alongside the row.
+    """
+    return Task(
+        task_type=TaskType.MEDIA_ASSETS_GC,
+        bot_id=bot_id,
+        user_id=user_id,
+        priority=priority,
+        payload={
+            "grace_days": grace_days,
+            "dry_run": dry_run,
         },
     )
 

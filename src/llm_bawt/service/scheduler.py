@@ -32,6 +32,7 @@ class JobType(str, Enum):
     MEMORY_DECAY = "memory_decay"
     HISTORY_SUMMARIZATION = "history_summarization"
     MEMORY_EXTRACTION = "memory_extraction"
+    MEDIA_GC = "media_gc"
 
 
 class ScheduledJob(SQLModel, table=True):
@@ -542,6 +543,12 @@ class JobScheduler:
                 if count > 0:
                     return True, f"{count} unprocessed message(s)"
                 return False, "No unprocessed messages"
+
+            if job.job_type == JobType.MEDIA_GC:
+                # Always-on: GC sweep is cheap when there are no orphans
+                # and the worst case is a 24h pile-up at most. Activity
+                # gating would add a separate scan with no real win.
+                return True, None
         except Exception as e:
             logger.debug(
                 "Activity-gate check failed for job %s (%s); falling back to run: %s",
@@ -558,6 +565,7 @@ class JobScheduler:
         from llm_bawt.service.tasks import (
             create_history_summarization_task,
             create_maintenance_task,
+            create_media_assets_gc_task,
             create_memory_extraction_task,
             create_profile_maintenance_task,
         )
@@ -607,6 +615,14 @@ class JobScheduler:
                 user_id=config.get("user_id", "system"),
                 batch_size=config.get("batch_size", 50),
                 model=config.get("model"),
+            )
+        elif job.job_type == JobType.MEDIA_GC:
+            config = self._parse_config_json(job.config_json)
+            return create_media_assets_gc_task(
+                grace_days=int(config.get("grace_days", 7)),
+                dry_run=bool(config.get("dry_run", False)),
+                bot_id=job.bot_id or "system",
+                user_id=config.get("user_id", "system"),
             )
 
         return None
@@ -724,3 +740,43 @@ def init_default_jobs(engine, config) -> None:
             session.add(extraction_job)
             session.commit()
             logger.debug("Created wildcard memory extraction job")
+
+        # TASK-231: nightly media_assets GC. Single global job (bot_id="system"
+        # — it scans the whole table, not per-bot). Runs once a day at 04:00
+        # UTC: we anchor next_run_at to the next 04:00 boundary so the cadence
+        # holds across restarts. interval_minutes=1440 (24h) keeps it daily.
+        existing_media_gc = session.exec(
+            select(ScheduledJob).where(ScheduledJob.job_type == JobType.MEDIA_GC)
+        ).first()
+
+        if not existing_media_gc:
+            now = datetime.now(timezone.utc)
+            # Next 04:00 UTC strictly after `now`.
+            next_run = now.replace(hour=4, minute=0, second=0, microsecond=0)
+            if next_run <= now:
+                next_run = next_run + timedelta(days=1)
+
+            media_gc_job = ScheduledJob(
+                job_type=JobType.MEDIA_GC,
+                bot_id="system",
+                enabled=config.SCHEDULER_ENABLED,
+                interval_minutes=int(
+                    getattr(config, "MEDIA_GC_INTERVAL_MINUTES", 1440),
+                ),
+                next_run_at=next_run,
+                config_json=json.dumps(
+                    {
+                        "user_id": "system",
+                        "grace_days": int(
+                            getattr(config, "MEDIA_GC_GRACE_DAYS", 7),
+                        ),
+                        "dry_run": False,
+                    }
+                ),
+            )
+            session.add(media_gc_job)
+            session.commit()
+            logger.debug(
+                "Created media_assets GC job (nightly @ 04:00 UTC, next: %s)",
+                next_run.isoformat(),
+            )

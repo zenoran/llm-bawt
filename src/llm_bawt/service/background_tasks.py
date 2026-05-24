@@ -43,6 +43,8 @@ class BackgroundTasksMixin:
                 result = await self._process_history_summarization(task)
             elif task.task_type == TaskType.MEMORY_EXTRACTION:
                 result = await self._process_memory_extraction(task)
+            elif task.task_type == TaskType.MEDIA_ASSETS_GC:
+                result = await self._process_media_assets_gc(task)
             else:
                 raise ValueError(f"Unknown task type: {task.task_type}")
 
@@ -724,3 +726,27 @@ class BackgroundTasksMixin:
             "facts_stored": total_stored,
             "extraction_method": extraction_model or "heuristic",
         }
+
+    async def _process_media_assets_gc(self, task: Task) -> dict:
+        """Garbage-collect orphan ``media_assets`` rows + their blobs (TASK-231).
+
+        Delegates to :func:`llm_bawt.service.jobs.media_gc.run_media_gc`.
+        The actual SQL + delete loop is synchronous (Postgres + filesystem
+        ops), so we run it through the executor to keep the event loop
+        free.
+        """
+        from .jobs.media_gc import run_media_gc
+
+        grace_days = int(task.payload.get("grace_days", 7))
+        dry_run = bool(task.payload.get("dry_run", False))
+
+        loop = asyncio.get_event_loop()
+        result = await loop.run_in_executor(
+            None,
+            lambda: run_media_gc(
+                self.config,
+                grace_days=grace_days,
+                dry_run=dry_run,
+            ),
+        )
+        return result
