@@ -144,6 +144,7 @@ def test_post_multipart_upload_happy_path(client: TestClient) -> None:
     # Required fields.
     assert body["asset_id"].startswith("ma_")
     assert body["mime_type"] == "image/webp"
+    assert body["original_mime_type"] == "image/png"
     assert body["kind"] == "image"
     assert body["sha256"] and len(body["sha256"]) == 64
     assert body["size_bytes"] > 0
@@ -410,3 +411,30 @@ def test_delete_requires_entity_id_header(client: TestClient) -> None:
     """No header → 401, even before we try to look up the asset."""
     resp = client.delete("/v1/uploads/ma_anything")
     assert resp.status_code == 401
+
+
+def test_delete_owner_null_asset_allowed_for_any_entity(
+    client: TestClient, media_store: MediaStore
+) -> None:
+    """Tool-generated assets (owner_user_id=None) are deletable by anyone.
+
+    Per TASK-224 spec — agents that generated an image without a human
+    owner need a way to GC their own outputs without knowing a synthetic
+    owner id. Owner-set assets remain strictly owner-only (covered by
+    :func:`test_delete_wrong_owner_returns_403`).
+    """
+    asset = media_store.upload(
+        raw_bytes=_png_bytes(200, 150),
+        original_mime="image/png",
+        source="tool_generated",
+        owner_user_id=None,
+    )
+
+    resp = client.delete(
+        f"/v1/uploads/{asset.id}",
+        headers={"X-Entity-Id": "some-random-agent"},
+    )
+    assert resp.status_code == 204
+
+    follow = client.get(f"/v1/uploads/{asset.id}")
+    assert follow.status_code == 404

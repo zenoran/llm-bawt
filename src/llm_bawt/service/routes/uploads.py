@@ -384,11 +384,13 @@ async def delete_asset(
     if asset is None:
         raise HTTPException(status_code=404, detail=f"Asset {asset_id!r} not found")
 
-    # ``owner_user_id`` is nullable for tool-generated assets that have no
-    # human owner. Those can't be deleted via this owner-scoped endpoint —
-    # the GC sweep handles them. 403 (not 404) so the caller knows the
-    # asset exists but they can't touch it.
-    if asset.owner_user_id is None or asset.owner_user_id != entity_id:
+    # ``owner_user_id`` is nullable for tool-generated assets. Per the
+    # TASK-224 spec, owner-NULL assets are deletable by any authenticated
+    # caller (so an agent that produced an image can clean up after itself
+    # without knowing a synthetic owner id). Owner-set assets require an
+    # exact match — 403 (not 404) so the caller knows the asset exists but
+    # they can't touch it.
+    if asset.owner_user_id is not None and asset.owner_user_id != entity_id:
         raise HTTPException(
             status_code=403,
             detail="X-Entity-Id does not match asset owner",

@@ -18,8 +18,9 @@ Two functions, two shapes:
 - :func:`asset_to_attachment_dict` — the *minimum* envelope every API
   surface ships. Goes into the ``attachments`` array on chat/history rows.
 - :func:`asset_to_upload_response_dict` — superset returned by
-  ``POST /v1/uploads`` only; adds ``sha256`` and ``size_bytes`` so the
-  uploader can dedup client-side and show file size.
+  ``POST /v1/uploads`` only; adds ``sha256``, ``size_bytes``, and
+  ``original_mime_type`` so the uploader can dedup client-side, show file
+  size, and render a "you uploaded a JPEG; we store WebP" hint.
 
 Both forms share the same ``urls`` block so any consumer can use a single
 helper to pick a variant URL.
@@ -59,12 +60,15 @@ def asset_to_attachment_dict(asset: MediaAsset) -> dict:
 def asset_to_upload_response_dict(asset: MediaAsset) -> dict:
     """Shape returned by ``POST /v1/uploads``. Superset of attachment dict.
 
-    Adds ``sha256`` (for client-side dedup checks) and ``size_bytes`` (for
-    file-size display) on top of the canonical attachment envelope.
+    Adds ``sha256`` (for client-side dedup checks), ``size_bytes`` (for
+    file-size display), and ``original_mime_type`` (the pre-normalization
+    MIME the client sent — useful for "you uploaded a JPEG; we store WebP"
+    UX) on top of the canonical attachment envelope.
     """
     base = asset_to_attachment_dict(asset)
     base["sha256"] = asset.sha256
     base["size_bytes"] = asset.size_bytes
+    base["original_mime_type"] = asset.original_mime_type
     return base
 
 
