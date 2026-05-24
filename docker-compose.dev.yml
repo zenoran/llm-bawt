@@ -23,6 +23,8 @@ services:
       # Share host caches to avoid duplicate downloads
       - ${LLM_BAWT_MODEL_CACHE_DIR:-${HOME}/.cache/llm-bawt/models}:/root/.cache/llm-bawt/models
       - ${HF_HOME:-${HOME}/.cache/huggingface}:/root/.cache/huggingface
+      # MediaStore blobs (TASK-223) — mirrors base compose so dev mode has it too.
+      - ${LLM_BAWT_MEDIA_HOST_PATH:-/mnt/user/home/echo/llmbawt-media}:/var/lib/llm-bawt/media
 
     # Restart on reboot and on failure
     restart: unless-stopped

@@ -35,8 +35,13 @@ services:
       - ${LLM_BAWT_MODEL_CACHE_DIR:-${HOME}/.cache/llm-bawt/models}:/root/.cache/llm-bawt/models
       # Mount HuggingFace cache for GGUF models
       - ${HF_HOME:-${HOME}/.cache/huggingface}:/root/.cache/huggingface
-      # Media generation storage (videos, thumbnails)
+      # Media generation storage (videos, thumbnails) — legacy MediaStorage CAS
       - ${MEDIA_STORAGE_PATH:-./storage}:/app/storage
+      # MediaStore blobs (TASK-223): chat upload originals + WebP variants.
+      # Lives outside ./storage so the optimizer-managed tree can grow
+      # independently of legacy video/thumbnail output. Default points at the
+      # echo home volume; override via LLM_BAWT_MEDIA_HOST_PATH for local dev.
+      - ${LLM_BAWT_MEDIA_HOST_PATH:-/mnt/user/home/echo/llmbawt-media}:/var/lib/llm-bawt/media
     extra_hosts:
       - "host.docker.internal:host-gateway"
       - "echo.lan.zenoran.com:${ECHO_LAN_HOST_IP:-10.0.0.101}"

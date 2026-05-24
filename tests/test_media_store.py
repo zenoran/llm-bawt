@@ -1,0 +1,329 @@
+"""Unit tests for :class:`llm_bawt.media.store.MediaStore` (TASK-223).
+
+These tests run with real Pillow operations on synthesized images — we
+trust the library to do the right thing and just check the *contract*
+MediaStore promises (cap, EXIF-free, alpha preserved, dedup, all three
+variants on disk, idempotent delete).
+
+The DB is mocked via a tiny in-memory fake of :class:`MediaAssetStore` so
+the suite stays a pure unit test — Postgres integration is covered by
+TASK-224. ``tmp_path`` keeps every test in its own MEDIA_ROOT so they
+can't trip over each other.
+"""
+
+from __future__ import annotations
+
+import io
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any, Optional
+
+import pytest
+from PIL import Image
+
+from llm_bawt.media.store import (
+    MAX_LONG_EDGE,
+    MediaAssetNotFound,
+    MediaStore,
+    VARIANT_DIRS,
+    VARIANT_MIME,
+)
+
+
+# ---------------------------------------------------------------------------
+# In-memory DB fake
+# ---------------------------------------------------------------------------
+
+
+class FakeMediaAssetStore:
+    """Drop-in stand-in for :class:`MediaAssetStore`.
+
+    Only implements the four methods MediaStore uses: ``get_by_sha256``,
+    ``get_by_id``, ``insert``, ``delete``. Keeps rows in a plain dict so
+    we can assert dedup behavior without spinning up Postgres.
+    """
+
+    def __init__(self) -> None:
+        self.rows: dict[str, dict[str, Any]] = {}
+        self.by_sha: dict[str, str] = {}
+
+    def get_by_sha256(self, sha256: str) -> Optional[dict[str, Any]]:
+        rid = self.by_sha.get(sha256)
+        return dict(self.rows[rid]) if rid else None
+
+    def get_by_id(self, asset_id: str) -> Optional[dict[str, Any]]:
+        row = self.rows.get(asset_id)
+        return dict(row) if row else None
+
+    def insert(self, **kwargs: Any) -> dict[str, Any]:
+        existing = self.get_by_sha256(kwargs["sha256"])
+        if existing is not None:
+            return existing
+        from llm_bawt.media.assets import new_asset_id
+
+        rid = kwargs.pop("asset_id", None) or new_asset_id()
+        row = {
+            "id": rid,
+            "created_at": datetime.now(timezone.utc),
+            **kwargs,
+        }
+        self.rows[rid] = row
+        self.by_sha[row["sha256"]] = rid
+        return dict(row)
+
+    def delete(self, asset_id: str) -> bool:
+        row = self.rows.pop(asset_id, None)
+        if row is None:
+            return False
+        self.by_sha.pop(row["sha256"], None)
+        return True
+
+
+# ---------------------------------------------------------------------------
+# Fixtures
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def store(tmp_path: Path) -> MediaStore:
+    """Build a MediaStore with a tmp_path root + in-memory fake DB."""
+    return MediaStore(root=tmp_path, db=FakeMediaAssetStore())
+
+
+def _png_bytes(width: int, height: int, mode: str = "RGB", color=(128, 64, 200)) -> bytes:
+    """Return a synthesized PNG of the given size + mode."""
+    if mode == "RGBA":
+        color = (*color[:3], 200) if len(color) == 3 else color
+    img = Image.new(mode, (width, height), color)
+    # Draw a checkerboard so the encoder actually has something to compress
+    # (a flat color hits a degenerate WebP that's not representative).
+    pixels = img.load()
+    block = 32
+    for y in range(0, height, block):
+        for x in range(0, width, block):
+            if ((x // block) + (y // block)) % 2 == 0:
+                if mode == "RGBA":
+                    pixels[x, y] = (255, 255, 255, 200)
+                else:
+                    pixels[x, y] = (255, 255, 255)
+    buf = io.BytesIO()
+    img.save(buf, format="PNG")
+    return buf.getvalue()
+
+
+def _jpeg_with_gps_exif() -> bytes:
+    """Synthesize a JPEG that carries a hand-rolled EXIF APP1 segment.
+
+    We don't pull in piexif — instead we hand-build a minimal valid TIFF
+    + EXIF IFD by hand. That keeps the test dep-free. The payload is
+    nonsense to a strict EXIF reader but Pillow happily parses enough of
+    it to populate ``Image.info['exif']``, which is all this test needs:
+    proof that EXIF *was present* before normalization and *is not present*
+    after.
+    """
+    img = Image.new("RGB", (320, 240), (50, 100, 150))
+
+    # Hand-rolled EXIF blob: 'Exif\0\0' header + minimal TIFF + IFD with a
+    # single tag (Artist=0x013B) pointing at an ASCII string. Pillow
+    # exposes this verbatim via Image.info["exif"] so we can check
+    # presence/absence without needing a real EXIF parser.
+    exif_payload = (
+        b"Exif\x00\x00"
+        b"II*\x00"  # little-endian TIFF magic, IFD offset 8
+        b"\x08\x00\x00\x00"
+        b"\x01\x00"  # 1 IFD entry
+        b"\x3B\x01"  # Tag = Artist (0x013B)
+        b"\x02\x00"  # type = ASCII
+        b"\x05\x00\x00\x00"  # count = 5 bytes
+        b"NICK\x00"  # inline value (fits in 4? extended)
+        b"\x00\x00\x00\x00"  # next IFD = 0
+    )
+    buf = io.BytesIO()
+    img.save(buf, format="JPEG", exif=exif_payload, quality=90)
+    return buf.getvalue()
+
+
+# ---------------------------------------------------------------------------
+# Tests
+# ---------------------------------------------------------------------------
+
+
+def test_normalize_4k_png_downscales_to_1568_webp(store: MediaStore) -> None:
+    """A 3840x2160 PNG should normalize to a WebP whose longest edge is
+    capped at 1568px and whose sha256 is different from the raw input."""
+    import hashlib
+
+    raw = _png_bytes(3840, 2160)
+    raw_sha = hashlib.sha256(raw).hexdigest()
+
+    asset = store.upload(
+        raw_bytes=raw,
+        original_mime="image/png",
+        source="chat_upload",
+        owner_user_id="user-1",
+    )
+
+    # Sha changed — proves normalization actually ran.
+    assert asset.sha256 != raw_sha
+    # Mime is WebP regardless of input.
+    assert asset.mime_type == "image/webp"
+    assert asset.original_mime_type == "image/png"
+    # Cap applied: longest edge is exactly MAX_LONG_EDGE (1568), aspect preserved.
+    assert max(asset.width, asset.height) == MAX_LONG_EDGE
+    assert asset.width == 1568  # 3840:2160 -> 16:9 -> width is the long edge
+    assert asset.height == 882  # 1568 * (2160/3840), rounded by PIL
+
+    # Round-trip: decode the stored original and confirm size + format.
+    data, mime = store.read_variant(asset.id, "original")
+    assert mime == "image/webp"
+    decoded = Image.open(io.BytesIO(data))
+    assert decoded.format == "WEBP"
+    assert max(decoded.size) == MAX_LONG_EDGE
+
+
+def test_dedup_same_image_returns_same_asset_id(store: MediaStore) -> None:
+    """Uploading the same bytes twice must yield one DB row + the same id."""
+    raw = _png_bytes(800, 600)
+
+    first = store.upload(raw, "image/png", "chat_upload", owner_user_id="user-1")
+    second = store.upload(raw, "image/png", "chat_upload", owner_user_id="user-2")
+
+    assert first.id == second.id
+    assert first.sha256 == second.sha256
+    # Exactly one row in the fake DB.
+    assert len(store.db.rows) == 1  # type: ignore[union-attr]
+
+
+def test_strips_exif(store: MediaStore) -> None:
+    """A JPEG carrying GPS EXIF must come out with no EXIF segment.
+
+    JPEG carries EXIF in an APP1 segment that starts with 0xFFE1. After
+    normalization to WebP we have an even simpler check: WebP has no
+    APP1 markers at all, and Pillow's reader exposes ``.info`` which
+    should not contain ``"exif"``.
+    """
+    raw = _jpeg_with_gps_exif()
+
+    # Sanity: the source actually has EXIF before we strip it.
+    src = Image.open(io.BytesIO(raw))
+    src.load()
+    assert "exif" in src.info, "fixture broken: source JPEG should have EXIF"
+
+    asset = store.upload(raw, "image/jpeg", "chat_upload", owner_user_id="user-1")
+    data, _ = store.read_variant(asset.id, "original")
+
+    # WebP doesn't use APP1 markers, but Pillow surfaces EXIF (when present)
+    # through ``.info["exif"]``. Either no key or empty bytes is acceptable.
+    out = Image.open(io.BytesIO(data))
+    out.load()
+    assert out.info.get("exif", b"") in (b"", None), (
+        f"EXIF leaked through normalization: {out.info.get('exif')!r}"
+    )
+
+    # And belt-and-suspenders: the raw WebP bytes don't contain the
+    # APP1-style EXIF\0\0 prefix that JPEGs use.
+    assert b"\xff\xe1" not in data, "WebP output contains a JPEG APP1 marker"
+
+
+def test_alpha_preserved(store: MediaStore) -> None:
+    """An RGBA PNG must come out as RGBA (alpha intact)."""
+    raw = _png_bytes(400, 300, mode="RGBA")
+
+    asset = store.upload(raw, "image/png", "chat_upload", owner_user_id="user-1")
+    data, _ = store.read_variant(asset.id, "original")
+
+    decoded = Image.open(io.BytesIO(data))
+    decoded.load()
+    assert decoded.mode == "RGBA", f"expected RGBA, got {decoded.mode}"
+
+
+def test_all_three_variants_exist_on_disk(store: MediaStore, tmp_path: Path) -> None:
+    """After upload, originals/thumb_256/preview_1024 each have a .webp file."""
+    raw = _png_bytes(2000, 1500)
+
+    asset = store.upload(raw, "image/png", "chat_upload", owner_user_id="user-1")
+    sha = asset.sha256
+
+    for subdir in VARIANT_DIRS.values():
+        path = store.root / subdir / sha[:2] / sha[2:4] / f"{sha}.webp"
+        assert path.is_file(), f"missing variant blob: {path}"
+        assert path.stat().st_size > 0
+
+
+def test_read_variant_returns_correct_mime(store: MediaStore) -> None:
+    """All three variants return ``image/webp``."""
+    raw = _png_bytes(1600, 900)
+    asset = store.upload(raw, "image/png", "chat_upload", owner_user_id="user-1")
+
+    for variant in ("original", "thumb", "preview"):
+        data, mime = store.read_variant(asset.id, variant)  # type: ignore[arg-type]
+        assert mime == VARIANT_MIME
+        assert len(data) > 0
+        decoded = Image.open(io.BytesIO(data))
+        assert decoded.format == "WEBP"
+
+
+def test_thumb_and_preview_are_size_bounded(store: MediaStore) -> None:
+    """Derived variants honor their respective caps."""
+    raw = _png_bytes(2400, 1800)
+    asset = store.upload(raw, "image/png", "chat_upload", owner_user_id="user-1")
+
+    thumb_bytes, _ = store.read_variant(asset.id, "thumb")
+    thumb = Image.open(io.BytesIO(thumb_bytes))
+    assert max(thumb.size) <= 256
+
+    preview_bytes, _ = store.read_variant(asset.id, "preview")
+    preview = Image.open(io.BytesIO(preview_bytes))
+    assert max(preview.size) <= 1024
+
+
+def test_delete_removes_blobs_and_row(store: MediaStore) -> None:
+    """``delete`` removes all 3 paths + the DB row; subsequent ``stat`` is None."""
+    raw = _png_bytes(800, 600)
+    asset = store.upload(raw, "image/png", "chat_upload", owner_user_id="user-1")
+
+    # Sanity: everything is there.
+    sha = asset.sha256
+    paths = [
+        store.root / subdir / sha[:2] / sha[2:4] / f"{sha}.webp"
+        for subdir in VARIANT_DIRS.values()
+    ]
+    assert all(p.is_file() for p in paths)
+    assert store.stat(asset.id) is not None
+
+    # Delete.
+    store.delete(asset.id)
+
+    assert all(not p.exists() for p in paths)
+    assert store.stat(asset.id) is None
+
+    # Idempotent: a second delete is a no-op.
+    store.delete(asset.id)  # should not raise
+
+
+def test_read_original_as_data_url_round_trip(store: MediaStore) -> None:
+    """The data URL round-trips back to identical bytes."""
+    import base64
+
+    raw = _png_bytes(640, 480)
+    asset = store.upload(raw, "image/png", "chat_upload", owner_user_id="user-1")
+
+    url = store.read_original_as_data_url(asset.id)
+    assert url.startswith("data:image/webp;base64,")
+
+    blob = base64.b64decode(url.split(",", 1)[1])
+    original_bytes, _ = store.read_variant(asset.id, "original")
+    assert blob == original_bytes
+
+
+def test_unknown_asset_id_raises(store: MediaStore) -> None:
+    """``read_variant`` on a non-existent id raises :class:`MediaAssetNotFound`."""
+    with pytest.raises(MediaAssetNotFound):
+        store.read_variant("ma_does_not_exist", "original")
+
+
+def test_invalid_source_rejected(store: MediaStore) -> None:
+    """Source must be one of the three allowed enum values."""
+    raw = _png_bytes(100, 100)
+    with pytest.raises(ValueError):
+        store.upload(raw, "image/png", "garbage_source", owner_user_id="user-1")
