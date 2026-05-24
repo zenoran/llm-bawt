@@ -34,3 +34,7 @@ services:
   claude-code-bridge:
     volumes:
       - ./src:/app/src
+
+  codex-bridge:
+    volumes:
+      - ./src:/app/src
