@@ -145,6 +145,11 @@ def get_message_table_pg(bot_id: str) -> Table:
         Column("summarized", Boolean, default=False),  # Whether this message is included in a summary
         Column("recalled_history", Boolean, default=False),  # Whether this message was re-inserted via recall tool
         Column("summary_metadata", JSON, nullable=True),  # For role='summary' rows only
+        # TASK-222: chat-message image attachments.
+        # JSONB array of {"asset_id": "ma_...", "kind": "image"} refs. The
+        # actual blobs + metadata live in the `media_assets` table — kept
+        # tiny here so history renders don't fan out per-row by default.
+        Column("attachments", JSON, nullable=False, server_default=text("'[]'::jsonb"), default=list),
         Column("created_at", DateTime, default=_utcnow),
         extend_existing=True
     )
@@ -288,6 +293,10 @@ class PostgreSQLMemoryBackend(MemoryBackend):
                 logger.debug(f"pgvector extension check: {e}")
             
             # Create messages table
+            # TASK-222: `attachments` is a JSONB array of media asset refs
+            # like [{"asset_id": "ma_...", "kind": "image"}, ...]. Default
+            # '[]' so existing rows and producers that don't yet attach
+            # anything stay valid.
             messages_sql = text(f"""
                 CREATE TABLE IF NOT EXISTS {self._messages_table_name} (
                     id VARCHAR(36) PRIMARY KEY,
@@ -298,6 +307,7 @@ class PostgreSQLMemoryBackend(MemoryBackend):
                     processed BOOLEAN DEFAULT FALSE,
                     summarized BOOLEAN DEFAULT FALSE,
                     summary_metadata JSONB,
+                    attachments JSONB NOT NULL DEFAULT '[]'::jsonb,
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 )
             """)
@@ -374,6 +384,15 @@ class PostgreSQLMemoryBackend(MemoryBackend):
                 ADD COLUMN IF NOT EXISTS recalled_history BOOLEAN DEFAULT FALSE
             """)
 
+            # TASK-222: add attachments JSONB column to existing message
+            # tables. Existing rows fill with '[]' via the default; no
+            # explicit backfill needed. Kept as a separate ALTER so it
+            # rolls out independently of other migrations.
+            add_attachments_sql = text(f"""
+                ALTER TABLE {self._messages_table_name}
+                ADD COLUMN IF NOT EXISTS attachments JSONB NOT NULL DEFAULT '[]'::jsonb
+            """)
+
             # Shared sessions table (TASK-183). One row per session across
             # all bots; promotes session_id from a bare UUID to a first-class
             # entity with start/end timestamps and a status.
@@ -425,6 +444,10 @@ class PostgreSQLMemoryBackend(MemoryBackend):
                     pass  # Columns may already exist
                 try:
                     conn.execute(add_recalled_history_sql)
+                except Exception:
+                    pass  # Column may already exist
+                try:
+                    conn.execute(add_attachments_sql)
                 except Exception:
                     pass  # Column may already exist
                 conn.commit()
