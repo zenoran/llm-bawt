@@ -20,6 +20,7 @@ from .turn_logs import router as turn_logs_router
 # /v1/avatar/animations routes were deleted; admin lives at
 # bawthub's /api/avatar/animation-triggers now.
 from .media import router as media_router
+from .uploads import router as uploads_router
 
 all_routers = [
     health_router,
@@ -39,6 +40,7 @@ all_routers = [
     profiles_router,
     llm_router,
     media_router,
+    uploads_router,
 ]
 
 __all__ = ["all_routers"]
