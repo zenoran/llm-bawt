@@ -736,21 +736,26 @@ class MemoryClient:
         session_id: str | None = None,
         timestamp: float | None = None,
         message_id: str | None = None,
+        attachments: list[dict] | None = None,
     ) -> MessageResult:
         """Add a message to conversation history.
-        
+
         Args:
             role: Message role (user/assistant/system).
             content: Message content.
             session_id: Optional session ID.
             message_id: Optional client-supplied message UUID.  When set, used
                 as the persistent ID so frontend/backend share the same key.
-            
+            attachments: TASK-222 — optional tiny JSONB ref list to persist on
+                the message row's ``attachments`` column, e.g.
+                ``[{"asset_id": "ma_xxx", "kind": "image"}]``. ``None`` leaves
+                the column at its default ``[]``.
+
         Returns:
             MessageResult with the stored message.
         """
         self._ensure_initialized()
-        
+
         if self.server_url:
             result = self._call_server("messages_add", {
                 "role": role,
@@ -759,9 +764,10 @@ class MemoryClient:
                 "session_id": session_id,
                 "timestamp": timestamp,
                 "message_id": message_id,
+                "attachments": attachments,
             })
             return MessageResult.from_dict(result)
-        
+
         # Embedded mode
         storage = self._get_storage()
         result = _run_async(
@@ -772,6 +778,7 @@ class MemoryClient:
                 session_id=session_id,
                 timestamp=timestamp,
                 message_id=message_id,
+                attachments=attachments,
             )
         )
         return MessageResult.from_dict(result.to_dict())
@@ -1254,9 +1261,20 @@ class _MCPShortTermManager:
     def __init__(self, memory_client: MemoryClient):
         self._memory_client = memory_client
 
-    def add_message(self, role: str, content: str, timestamp: float | None = None, message_id: str | None = None) -> str:
+    def add_message(
+        self,
+        role: str,
+        content: str,
+        timestamp: float | None = None,
+        message_id: str | None = None,
+        attachments: list[dict] | None = None,
+    ) -> str:
         msg = self._memory_client.add_message(
-            role=role, content=content, timestamp=timestamp, message_id=message_id,
+            role=role,
+            content=content,
+            timestamp=timestamp,
+            message_id=message_id,
+            attachments=attachments,
         )
         return msg.id
 

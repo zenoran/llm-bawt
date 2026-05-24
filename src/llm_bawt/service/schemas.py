@@ -15,12 +15,33 @@ BotKind = Literal["chat", "agent"]
 # =============================================================================
 
 class ChatMessage(BaseModel):
-    """OpenAI-compatible chat message."""
+    """OpenAI-compatible chat message.
+
+    TASK-225: extended with ``attachment_ids`` so callers can attach
+    images by reference to a ``media_assets`` row instead of inlining
+    base64 in the content array. The server resolves each id at the
+    LLM-call boundary via :class:`~llm_bawt.media.store.MediaStore` and
+    persists a tiny ``{asset_id, kind}`` ref on the chat-history row.
+
+    Backwards compatibility: the legacy multimodal shape
+    ``content: [{type:"text"}, {type:"image_url"}]`` keeps working —
+    Claude Code and other OpenAI-multimodal clients still send inline
+    base64 image_url parts, and the server auto-uploads those to
+    MediaStore so they too get a persistent asset_id and show up in
+    history just like new-style uploads.
+    """
     role: Literal["system", "user", "assistant", "function", "tool"]
     # list[dict] before str so Pydantic v2 left-to-right union matching
     # tries the list variant first for OpenAI content-array payloads.
     content: list[dict] | str | None = None
     name: str | None = None
+    # TASK-225: optional list of ``ma_<ulid>`` ids referencing rows in the
+    # ``media_assets`` table. Only meaningful on ``role=="user"`` — other
+    # roles are ignored. Resolved server-side; clients never send base64.
+    attachment_ids: list[str] | None = Field(
+        default=None,
+        description="Optional media_assets ids to attach (resolved server-side).",
+    )
 
 
 class ChatRequestAnimation(BaseModel):
@@ -620,11 +641,20 @@ class HealthResponse(BaseModel):
 
 
 class HistoryMessage(BaseModel):
-    """A message in the conversation history."""
+    """A message in the conversation history.
+
+    ``attachments`` (TASK-226) carries the resolved media-asset envelopes
+    described in :mod:`llm_bawt.media.serializers`. Always present so
+    frontend renderers can iterate unconditionally; an empty list means
+    the row has no media. The list is hydrated by the
+    ``/v1/history`` route only — DB layers strip it from the canonical
+    ``get_messages`` path because LLM-prep code doesn't want it.
+    """
     id: str | None = None
     role: str
     content: str
     timestamp: float
+    attachments: list[dict] = []
 
 
 class HistoryResponse(BaseModel):

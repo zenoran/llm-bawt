@@ -512,15 +512,22 @@ class PostgreSQLMemoryBackend(MemoryBackend):
         content: str,
         timestamp: float,
         session_id: str | None = None,
+        attachments: list[dict] | None = None,
     ) -> None:
         """Add a message to permanent storage.
-        
+
         Messages are NEVER deleted - they form the complete conversation history.
+
+        ``attachments`` (TASK-222): optional tiny JSONB payload written to the
+        ``attachments`` column — a list of ``{"asset_id": "ma_...", "kind":
+        "image"}`` refs. ``None`` is treated as the column default ``[]``.
+        Updates to existing rows leave the column untouched when ``attachments``
+        is ``None`` (don't clobber prior refs on a re-upsert).
         """
         if not content or content.isspace():
             logger.warning(f"Skipping empty content for message ID: {message_id}")
             return
-        
+
         with Session(self.engine) as session:
             try:
                 # Check if exists (upsert)
@@ -528,12 +535,15 @@ class PostgreSQLMemoryBackend(MemoryBackend):
                     self.messages_table.c.id == message_id
                 )
                 existing = session.execute(stmt).first()
-                
+
                 if existing:
+                    values: dict = {"content": content, "timestamp": timestamp}
+                    if attachments is not None:
+                        values["attachments"] = attachments
                     stmt = (
                         update(self.messages_table)
                         .where(self.messages_table.c.id == message_id)
-                        .values(content=content, timestamp=timestamp)
+                        .values(**values)
                     )
                     session.execute(stmt)
                 else:
@@ -543,11 +553,12 @@ class PostgreSQLMemoryBackend(MemoryBackend):
                         content=content,
                         timestamp=timestamp,
                         session_id=session_id,
+                        attachments=attachments if attachments is not None else [],
                         processed=False,
                         created_at=datetime.now(timezone.utc),
                     )
                     session.execute(stmt)
-                
+
                 session.commit()
                 logger.debug(f"Added message {message_id} to {self._messages_table_name}")
             except Exception as e:
@@ -598,7 +609,7 @@ class PostgreSQLMemoryBackend(MemoryBackend):
         """Retrieve messages by their IDs (for context retrieval)."""
         if not message_ids:
             return []
-        
+
         with Session(self.engine) as session:
             stmt = (
                 select(self.messages_table)
@@ -606,7 +617,7 @@ class PostgreSQLMemoryBackend(MemoryBackend):
                 .order_by(self.messages_table.c.timestamp.asc())
             )
             rows = session.execute(stmt).fetchall()
-            
+
             return [
                 {
                     "id": row.id,
@@ -617,6 +628,40 @@ class PostgreSQLMemoryBackend(MemoryBackend):
                 }
                 for row in rows
             ]
+
+    def get_attachments_for_message_ids(self, message_ids: list[str]) -> dict[str, list[dict]]:
+        """Return ``{message_id: attachments_list}`` for the given ids.
+
+        TASK-226 — the canonical ``get_messages`` path drops the
+        ``attachments`` JSONB column because the wider LLM-prep code
+        path doesn't want it. ``/v1/history`` does, so it fetches the
+        column directly via this focused query. Always returns an entry
+        per requested id (missing rows or NULL attachments map to
+        ``[]``) so callers can iterate without defensive checks.
+        """
+        if not message_ids:
+            return {}
+
+        sql = text(
+            f"SELECT id, attachments FROM {self._messages_table_name} "
+            "WHERE id = ANY(:ids)"
+        )
+        result: dict[str, list[dict]] = {mid: [] for mid in message_ids}
+        with self.engine.connect() as conn:
+            rows = conn.execute(sql, {"ids": list(message_ids)}).mappings().all()
+            for row in rows:
+                refs = row.get("attachments") or []
+                if not isinstance(refs, list):
+                    # Defensive: a corrupt JSONB cell shouldn't take the
+                    # whole page down — log via debug and treat as empty.
+                    logger.debug(
+                        "Unexpected attachments shape for msg %s: %r",
+                        row.get("id"),
+                        type(refs).__name__,
+                    )
+                    refs = []
+                result[row["id"]] = list(refs)
+        return result
     
     # =========================================================================
     # Memory Storage (distilled, importance-weighted)
@@ -2163,23 +2208,35 @@ class PostgreSQLShortTermManager:
 
         return self._current_session_id
     
-    def add_message(self, role: str, content: str, timestamp: float | None = None) -> str:
+    def add_message(
+        self,
+        role: str,
+        content: str,
+        timestamp: float | None = None,
+        message_id: str | None = None,
+        attachments: list[dict] | None = None,
+    ) -> str:
         """Add a message to the current session.
-        
+
         Returns the message ID.
+
+        ``message_id`` and ``attachments`` are passed through to the backend
+        so this adapter matches the MCP adapter signature used by
+        ``HistoryManager`` (TASK-222 plumbing).
         """
-        message_id = str(uuid.uuid4())
+        mid = (str(message_id).strip() if message_id else "") or str(uuid.uuid4())
         ts = timestamp or datetime.now(timezone.utc).timestamp()
-        
+
         self._backend.add_message(
-            message_id=message_id,
+            message_id=mid,
             role=role,
             content=content,
             timestamp=ts,
             session_id=self._current_session_id,
+            attachments=attachments,
         )
-        
-        return message_id
+
+        return mid
     
     def get_session_history(self, limit: int = 50) -> list[dict]:
         """Get messages from the current session."""

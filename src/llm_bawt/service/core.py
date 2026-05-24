@@ -340,6 +340,7 @@ class ServiceLLMBawt(BaseLLMBawt):
         prompt: str,
         user_attachments: list[dict] | None = None,
         message_id: str | None = None,
+        attachments: list[dict] | None = None,
     ) -> list[Message]:
         """Prepare messages for query including history and memory context.
 
@@ -350,11 +351,18 @@ class ServiceLLMBawt(BaseLLMBawt):
             user_attachments: Optional list of image attachments in the format
                 [{"mimeType": "image/png", "content": "<base64>"}].
                 When present, the last user message will use a multimodal
-                content array so the LLM can see the images.
+                content array so the LLM can see the images. This is the
+                LLM-call-boundary inline form — it never touches the DB.
             message_id: Optional client-supplied UUID for the persisted user
                 message.  When supplied, it becomes the ID in chat history
                 and matches turn_log.trigger_message_id, enabling clean joins
                 between history rows and tool-call events.
+            attachments: TASK-225 — optional tiny JSONB payload to persist
+                on the user-message row's ``attachments`` column, e.g.
+                ``[{"asset_id": "ma_xxx", "kind": "image"}, ...]``.  The
+                full asset metadata lives in ``media_assets`` and is
+                fetched on read.  Distinct from ``user_attachments``,
+                which carries the bytes for the LLM call.
 
         Returns:
             List of messages ready for LLM query
@@ -363,14 +371,28 @@ class ServiceLLMBawt(BaseLLMBawt):
         # Set HISTORY_RELOAD_TTL_SECONDS=0 to force legacy "reload every request".
         self._refresh_history_if_stale()
 
-        # Add user message to history first
-        self.history_manager.add_message("user", prompt, message_id=message_id)
+        # Add user message to history first (with optional attachment refs).
+        self.history_manager.add_message(
+            "user", prompt, message_id=message_id, attachments=attachments,
+        )
 
         # Build context with system prompt, memory, and history
         messages = self._build_context_messages(prompt)
 
-        # If there are image attachments, convert the last user message to
-        # a multimodal content array so the LLM receives the images.
+        # TASK-225 LLM-boundary inlining: ``user_attachments`` is the
+        # in-memory ``{mimeType, content=naked-b64}`` contract produced by
+        # the chat_streaming user-message resolver.  Both intake paths
+        # converge on the same shape before this point:
+        #
+        #   1. NEW STYLE ``attachment_ids=[...]`` -> MediaStore.read_original
+        #      -> {mimeType, content}.
+        #   2. LEGACY STYLE inline ``image_url`` data URL -> {mimeType,
+        #      content} AND auto-upload to MediaStore (persisted ref is
+        #      passed in via ``attachments`` above).
+        #
+        # This is the ONLY place we materialize base64 in the request — it
+        # is consumed by the LLM client and never written to the DB. The
+        # ``attachments`` kwarg above is what gets persisted.
         if user_attachments:
             for i in range(len(messages) - 1, -1, -1):
                 if messages[i].role == "user":

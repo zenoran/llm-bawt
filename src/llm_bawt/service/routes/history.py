@@ -21,6 +21,71 @@ router = APIRouter()
 log = get_service_logger(__name__)
 
 
+def _hydrate_attachments_for_page(
+    service,
+    bot_id: str,
+    page_messages: list[dict],
+) -> dict[str, list[dict]]:
+    """Resolve per-message attachments for the given page (TASK-226).
+
+    Returns ``{message_id: [resolved_attachment_dicts]}``. Messages with no
+    media map to ``[]`` so callers can index unconditionally. The route
+    drops orphan ``asset_id`` refs silently (already logged inside the
+    serializer) — partial DB deletes never take the whole page down.
+
+    Two DB round-trips per page regardless of message count:
+
+    1. ``SELECT id, attachments FROM {bot}_messages WHERE id = ANY(...)``
+    2. ``SELECT * FROM media_assets WHERE id = ANY(...)`` (only if the
+       page references any assets at all).
+    """
+    message_ids = [str(m.get("id")) for m in page_messages if m.get("id")]
+    if not message_ids:
+        return {}
+
+    # The short-term manager wraps a PostgreSQLMemoryBackend in embedded
+    # mode. Server mode (MCP HTTP) lacks the backend handle here — we'd
+    # need to add a new MCP tool to support that; out of scope for
+    # TASK-226 since the deployment is embedded today.
+    try:
+        client = service.get_memory_client(bot_id)
+        if not client:
+            return {mid: [] for mid in message_ids}
+        manager = client.get_short_term_manager()
+        backend = getattr(manager, "_backend", None)
+        if backend is None:
+            log.debug(
+                "Short-term manager has no _backend (server mode?); "
+                "skipping attachment hydration"
+            )
+            return {mid: [] for mid in message_ids}
+
+        raw_refs_by_msg = backend.get_attachments_for_message_ids(message_ids)
+    except Exception as e:
+        log.warning("Failed to load attachment refs for history page: %s", e)
+        return {mid: [] for mid in message_ids}
+
+    # Run the cross-row enrichment through the canonical serializer so
+    # the shape stays in lockstep with /v1/uploads and the chat-streaming
+    # persistence path (TASK-225). The serializer mutates the wrapper
+    # dicts in place; we use throwaway shells then extract.
+    from ...media.assets import MediaAssetStore
+    from ...media.serializers import enrich_attachments_for_messages
+
+    shells: list[dict] = [
+        {"_mid": mid, "attachments": raw_refs_by_msg.get(mid, [])}
+        for mid in message_ids
+    ]
+    try:
+        asset_store = MediaAssetStore(service.config)
+        enrich_attachments_for_messages(shells, asset_store)
+    except Exception as e:
+        log.warning("Attachment enrichment failed: %s", e)
+        return {mid: [] for mid in message_ids}
+
+    return {s["_mid"]: s.get("attachments") or [] for s in shells}
+
+
 # Hard ceiling for summarization prompts regardless of what the model advertises.
 # Large advertised windows (e.g. 2M) are rarely practical for dense output tasks.
 _MAX_SUMMARIZATION_PROMPT_TOKENS = 512_000
@@ -389,12 +454,18 @@ async def get_history(
         else:
             page_messages = candidate_messages
 
+        # TASK-226: resolve per-page attachments JSONB -> full URL blocks.
+        attachments_by_id = _hydrate_attachments_for_page(
+            service, effective_bot_id, page_messages
+        )
+
         history_messages = [
             HistoryMessage(
                 id=msg.get("id"),
                 role=msg.get("role", ""),
                 content=msg.get("content", ""),
-                timestamp=msg.get("timestamp", 0.0)
+                timestamp=msg.get("timestamp", 0.0),
+                attachments=attachments_by_id.get(str(msg.get("id") or ""), []),
             )
             for msg in page_messages
         ]
@@ -441,17 +512,24 @@ async def search_history(
         # Apply limit
         if limit > 0 and len(matching) > limit:
             matching = matching[-limit:]
-        
+
+        # TASK-226: same shape on search results so the frontend can render
+        # attachments without forking the rendering path per route.
+        attachments_by_id = _hydrate_attachments_for_page(
+            service, effective_bot_id, matching
+        )
+
         history_messages = [
             HistoryMessage(
                 id=msg.get("id"),
                 role=msg.get("role", ""),
                 content=msg.get("content", ""),
-                timestamp=msg.get("timestamp", 0.0)
+                timestamp=msg.get("timestamp", 0.0),
+                attachments=attachments_by_id.get(str(msg.get("id") or ""), []),
             )
             for msg in matching
         ]
-        
+
         return HistorySearchResponse(
             bot_id=effective_bot_id,
             query=query,

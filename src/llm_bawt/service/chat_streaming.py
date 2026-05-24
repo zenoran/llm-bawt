@@ -14,6 +14,10 @@ import uuid
 from typing import Any, AsyncIterator
 
 from ..bots import StreamingEmoteFilter, get_bot
+# TASK-225: MediaStore is used to (a) resolve new-style ``attachment_ids``
+# into inline image bytes for the LLM call and (b) auto-upload legacy
+# inline ``image_url`` base64 so the asset gets a persistent id.
+from ..media import MediaAssetNotFound, get_media_store
 from .chat_stream_worker import consume_stream_chunks, put_queue_item_threadsafe
 from .logging import RequestContext, generate_request_id, get_service_logger
 from .schemas import ChatCompletionRequest
@@ -584,29 +588,124 @@ class ChatStreamingMixin:
             yield "data: [DONE]\n\n"
             return
 
-        # Get the user's prompt (last user message)
+        # Get the user's prompt (last user message).
+        #
+        # TASK-225: attachment handling has two input shapes that converge
+        # on the same in-memory ``user_attachments`` list (the LLM-call
+        # form, ``{mimeType, content=naked-b64}``) and on a tiny
+        # ``attachments_to_persist`` list (the JSONB row form,
+        # ``{asset_id, kind}``):
+        #
+        #   1. NEW STYLE — ``attachment_ids: ["ma_xxx", ...]`` references
+        #      ``media_assets`` rows.  Resolved via
+        #      ``MediaStore.read_original_as_data_url`` (cap-bounded WebP).
+        #
+        #   2. LEGACY STYLE — ``content: [{type:"image_url", image_url:
+        #      {url:"data:..."}}]`` (OpenAI multimodal).  Bytes go to the
+        #      LLM exactly as before.  Additionally the server uploads
+        #      them to MediaStore so legacy clients get persisted
+        #      attachments "for free" — a rolling deploy never regresses
+        #      to "image dropped".
+        #
+        # Only the trailing user message is examined; both shapes can
+        # appear on the same message — order is preserved (legacy inline
+        # parts first, then new-style attachment_ids).
         user_prompt = ""
         user_attachments: list[dict] = []
+        attachments_to_persist: list[dict] = []
+        media_store = get_media_store()
+
         for m in reversed(request.messages):
-            if m.role == "user":
-                if isinstance(m.content, list):
-                    for part in m.content:
-                        if not isinstance(part, dict):
+            if m.role != "user":
+                continue
+
+            # ---- Resolve text + legacy inline images from content shape ----
+            if isinstance(m.content, list):
+                for part in m.content:
+                    if not isinstance(part, dict):
+                        continue
+                    if part.get("type") == "text":
+                        user_prompt += part.get("text", "")
+                    elif part.get("type") == "image_url":
+                        url = (part.get("image_url") or {}).get("url", "")
+                        if not url.startswith("data:"):
                             continue
-                        if part.get("type") == "text":
-                            user_prompt += part.get("text", "")
-                        elif part.get("type") == "image_url":
-                            url = (part.get("image_url") or {}).get("url", "")
-                            if url.startswith("data:"):
-                                try:
-                                    header, data = url.split(",", 1)
-                                    mime = header.split(":")[1].split(";")[0]
-                                    user_attachments.append({"mimeType": mime, "content": data})
-                                except Exception:
-                                    pass
-                else:
-                    user_prompt = m.content or ""
-                break
+                        try:
+                            header, data = url.split(",", 1)
+                            mime = header.split(":")[1].split(";")[0]
+                        except Exception:
+                            continue
+
+                        # Feed the LLM exactly as before — bytes are
+                        # already inline, no point re-reading from disk.
+                        user_attachments.append({"mimeType": mime, "content": data})
+
+                        # Back-compat auto-upload so the inline image
+                        # gets a persistent asset_id.  Failures are
+                        # non-fatal: a degraded MediaStore must not
+                        # break an otherwise-valid chat — the LLM still
+                        # sees the image; we just won't persist a ref.
+                        try:
+                            import base64 as _b64
+
+                            raw_bytes = _b64.b64decode(data, validate=False)
+                            asset = media_store.upload(
+                                raw_bytes=raw_bytes,
+                                original_mime=mime,
+                                source="chat_upload",
+                                owner_user_id=user_id,
+                            )
+                            attachments_to_persist.append(
+                                {"asset_id": asset.id, "kind": "image"}
+                            )
+                        except Exception as e:
+                            log.warning(
+                                "TASK-225: failed to auto-upload legacy inline image: %s",
+                                e,
+                            )
+            else:
+                user_prompt = m.content or ""
+
+            # ---- Resolve new-style attachment_ids ----
+            requested_ids = list(getattr(m, "attachment_ids", None) or [])
+            for asset_id in requested_ids:
+                if not isinstance(asset_id, str) or not asset_id.strip():
+                    continue
+                asset_id = asset_id.strip()
+                try:
+                    data_url = media_store.read_original_as_data_url(asset_id)
+                except MediaAssetNotFound:
+                    log.warning(
+                        "TASK-225: attachment_id not found in media_assets: %s",
+                        asset_id,
+                    )
+                    continue
+                except FileNotFoundError as e:
+                    log.error(
+                        "TASK-225: MediaStore blob missing for asset_id=%s: %s",
+                        asset_id, e,
+                    )
+                    continue
+                except Exception as e:
+                    log.warning(
+                        "TASK-225: MediaStore.read_original failed for asset_id=%s: %s",
+                        asset_id, e,
+                    )
+                    continue
+
+                # The ``user_attachments`` contract is {mimeType, content
+                # = naked-b64} — strip the ``data:<mime>;base64,`` prefix
+                # here.  The prefix is re-added at the LLM boundary
+                # inside :meth:`prepare_messages_for_query`.
+                try:
+                    header, payload = data_url.split(",", 1)
+                    mime = header.split(":")[1].split(";")[0]
+                except Exception:
+                    continue
+                user_attachments.append({"mimeType": mime, "content": payload})
+                attachments_to_persist.append({"asset_id": asset_id, "kind": "image"})
+
+            break
 
         # Extract the user message ID so tool-call events and turn logs are
         # joinable with the frontend's history rendering.  Prefer the explicit
@@ -771,11 +870,17 @@ class ChatStreamingMixin:
                 )
 
                 # Use llm_bawt.prepare_messages_for_query to get full context
-                # (history from DB + memory + system prompt)
+                # (history from DB + memory + system prompt).
+                #
+                # TASK-225: ``attachments`` is the tiny ``{asset_id, kind}``
+                # JSONB payload persisted on the user-message row.  Bytes
+                # for the LLM live on ``user_attachments`` (separate
+                # argument) and never touch the DB.
                 messages = llm_bawt.prepare_messages_for_query(
                     user_prompt,
                     user_attachments=user_attachments or None,
                     message_id=trigger_message_id,
+                    attachments=attachments_to_persist or None,
                 )
 
                 # TASK-215: the "AVATAR ANIMATION: You MUST call trigger_animation"

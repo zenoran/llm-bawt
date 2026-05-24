@@ -226,6 +226,27 @@ class MediaAssetStore:
             row = conn.execute(sql, {"id": asset_id}).mappings().first()
             return dict(row) if row else None
 
+    def get_many(self, asset_ids: list[str]) -> list[dict[str, Any]]:
+        """Batch-fetch rows by id in a single round-trip (TASK-226).
+
+        The ``/v1/history`` enrichment path collects every distinct
+        ``asset_id`` referenced by a page of messages and resolves them
+        in one query — paging fan-out per row would be O(messages) DB
+        hits on a chatty history endpoint.
+
+        Returns the rows in arbitrary order; callers should index by
+        ``id`` if they need stable lookup. Missing ids are silently
+        omitted (the history serializer treats those as orphans).
+        """
+        if not asset_ids:
+            return []
+        # ANY(:ids) lets us send the whole id list as a single SQL array
+        # parameter — works with psycopg2's list-as-array codec.
+        sql = text(f"SELECT * FROM {TABLE_NAME} WHERE id = ANY(:ids)")
+        with self.engine.connect() as conn:
+            rows = conn.execute(sql, {"ids": list(asset_ids)}).mappings().all()
+            return [dict(r) for r in rows]
+
     def get_by_sha256(self, sha256: str) -> dict[str, Any] | None:
         sql = text(f"SELECT * FROM {TABLE_NAME} WHERE sha256 = :sha")
         with self.engine.connect() as conn:

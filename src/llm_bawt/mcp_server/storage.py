@@ -330,12 +330,17 @@ class MemoryStorage:
         session_id: str | None = None,
         timestamp: float | None = None,
         message_id: str | None = None,
+        attachments: list[dict] | None = None,
     ) -> Message:
         """Add a message to conversation history.
 
         ``message_id`` allows the client to supply a stable UUID (e.g. the
         frontend-generated user-message UUID) so downstream joins on
         ``trigger_message_id`` work without remapping.
+
+        ``attachments`` (TASK-222) is the tiny JSONB ref list persisted on the
+        message row's ``attachments`` column. ``None`` leaves the column at
+        its default ``[]``.
         """
         provided = (str(message_id).strip() if message_id else "") or None
         message_id_final = provided or str(uuid.uuid4())
@@ -348,6 +353,7 @@ class MemoryStorage:
             content=content,
             timestamp=ts,
             session_id=session_id,
+            attachments=attachments,
         )
 
         return Message(

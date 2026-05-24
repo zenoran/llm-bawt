@@ -314,6 +314,7 @@ async def add_message(
     session_id: str | None = None,
     timestamp: float | None = None,
     message_id: str | None = None,
+    attachments: list[dict] | None = None,
 ) -> dict:
     """Add a message to conversation history.
 
@@ -323,6 +324,10 @@ async def add_message(
         bot_id: Bot namespace.
         session_id: Optional session grouping.
         message_id: Optional client-supplied UUID for the message.
+        attachments: TASK-222 — optional tiny JSONB ref list persisted on the
+            message row's ``attachments`` column, e.g.
+            ``[{"asset_id": "ma_xxx", "kind": "image"}]``. ``None`` leaves the
+            column at its default ``[]``.
 
     Returns:
         Stored message dict.
@@ -336,6 +341,7 @@ async def add_message(
         session_id=session_id,
         timestamp=timestamp,
         message_id=message_id,
+        attachments=attachments,
     )
     return message.to_dict()
 
