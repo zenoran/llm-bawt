@@ -57,6 +57,17 @@ async def lifespan(app):
     except Exception as e:
         log.warning("Failed to initialise media_generations table: %s", e)
 
+    # TASK-222: ensure media_assets table exists. Separate from
+    # media_generations (different concern — that one tracks long-running
+    # generation jobs; this one is the canonical registry for normalized
+    # chat-upload / tool-output / agent-attachment blobs).
+    try:
+        from ..media.assets import MediaAssetStore
+        _media_asset_store = MediaAssetStore(config)
+        log.info("media_assets table ready")
+    except Exception as e:
+        log.warning("Failed to initialise media_assets table: %s", e)
+
     # TASK-216: warm the sentence-transformer used by the animation
     # classifier (and the memory subsystem) in the background so the first
     # voice response after a restart doesn't pay a ~6s lazy-load. Fire it
