@@ -56,6 +56,20 @@ WITH_CUDA      ?= true                # used by dev-llama
 COMPOSE_BASE   := docker-compose.yml
 COMPOSE_DEV    := docker-compose.dev.yml
 
+# Confirmation guard for targets that destroy running agents in the bridge
+# containers. Targets gated by this macro must be invoked with the phrase
+# shown in the error message; the parameter is intentionally undocumented.
+CONFIRM        ?=
+_AGENT_CONFIRM := yes-destroy-running-agents
+
+define agent_destruction_guard
+	@if [ "$(CONFIRM)" != "$(_AGENT_CONFIRM)" ]; then \
+		printf "$(RED)⚠  This will stop the bridge containers and destroy any running agents.$(NC)\n"; \
+		printf "$(YELLOW)   Re-run with: make $@ CONFIRM=$(_AGENT_CONFIRM)$(NC)\n"; \
+		exit 1; \
+	fi
+endef
+
 # Local servers
 MCP_HOST    ?= 0.0.0.0
 MCP_PORT    ?= 8001
@@ -169,6 +183,7 @@ dev-run: ## [uv] Run llm from .venv (e.g. make dev-run ARGS="--status")
 .PHONY: run up docker-dev down restart rebuild logs docker-status docker-shell docker-exec
 
 run: ## Stop app + bridges, rebuild dev, tail logs
+	$(agent_destruction_guard)
 	docker compose -f $(COMPOSE_BASE) -f $(COMPOSE_DEV) down --remove-orphans --timeout 5 app openclaw-bridge claude-code-bridge
 	docker compose -f $(COMPOSE_BASE) -f $(COMPOSE_DEV) up -d app openclaw-bridge claude-code-bridge
 	docker compose logs -f --tail=50 app openclaw-bridge claude-code-bridge
@@ -184,14 +199,17 @@ docker-dev: ## Docker compose up (dev mode — mounts ./src)
 	@echo "$(GREEN)✓ Dev mode started — src/ mounted live$(NC)"
 
 down: ## Docker compose down
+	$(agent_destruction_guard)
 	docker compose down
 	@echo "$(GREEN)✓ Containers stopped$(NC)"
 
 restart: ## Restart containers
+	$(agent_destruction_guard)
 	docker compose restart
 	@echo "$(GREEN)✓ Containers restarted$(NC)"
 
 rebuild: ## Rebuild and restart containers
+	$(agent_destruction_guard)
 	docker compose down
 	docker compose up -d --build
 	@echo "$(GREEN)✓ Containers rebuilt and started$(NC)"

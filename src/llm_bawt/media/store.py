@@ -317,15 +317,40 @@ class MediaStore:
         # Step 2: dedup hit? Return early before touching disk or
         # generating variants. ``MediaAssetStore.insert`` would do this
         # internally, but we check first to skip the variant-encode work.
+        #
+        # Self-heal: if the row exists but any of its on-disk blobs are
+        # gone (manual cleanup, partial restore, container reset that
+        # wiped the bind-mount), we cannot just return the row — chat
+        # reads would 404.  Re-write the blobs from the bytes we have
+        # in hand right now and then return the existing row, so the
+        # caller's asset_id stays stable across the heal.
         if self.db is not None:
             existing = self.db.get_by_sha256(sha256_hex)
             if existing is not None:
-                logger.debug(
-                    "MediaStore upload dedup hit: sha=%s -> id=%s",
+                blobs_intact = all(
+                    _shard_path(self.root, subdir, sha256_hex).exists()
+                    for subdir in VARIANT_DIRS.values()
+                )
+                if blobs_intact:
+                    logger.debug(
+                        "MediaStore upload dedup hit: sha=%s -> id=%s",
+                        sha256_hex[:12],
+                        existing["id"],
+                    )
+                    return _row_to_asset(existing)
+                logger.warning(
+                    "MediaStore upload dedup hit with missing blobs — self-healing: sha=%s -> id=%s",
                     sha256_hex[:12],
                     existing["id"],
                 )
-                return _row_to_asset(existing)
+                # Fall through to variant encode + idempotent write below.
+                # The DB row stays; insert() would race the existing
+                # sha unique constraint, so we skip it on the heal path.
+                _heal_existing_row = existing
+            else:
+                _heal_existing_row = None
+        else:
+            _heal_existing_row = None
 
         # Step 3: derive variants from the same normalized buffer (NOT
         # re-decoding the WebP we just wrote — that would re-apply lossy
@@ -342,6 +367,13 @@ class MediaStore:
         # Step 5: register in Postgres. ``insert`` is itself dedup-safe —
         # if two callers race on the same bytes, the second one gets the
         # first one's row back instead of an IntegrityError.
+        #
+        # Heal path: we already had a row for this sha but its blobs
+        # were missing; we just rewrote them above.  Skip the insert
+        # (would unique-key race) and return the existing row so the
+        # caller's previously-known asset_id stays stable.
+        if _heal_existing_row is not None:
+            return _row_to_asset(_heal_existing_row)
         if self.db is not None:
             row = self.db.insert(
                 sha256=sha256_hex,
