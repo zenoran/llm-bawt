@@ -446,6 +446,31 @@ class ClaudeCodeBridge:
         # so the frontend can bucket tool activity under the originating user
         # message without falling back to turn_id heuristics.
         trigger_message_id = (fields.get("trigger_message_id") or "").strip() or None
+
+        # Per-bot ClaudeAgentOptions tuning (TASK: bot config -> SDK).
+        # ``effort`` constrains thinking depth; ``max_turns`` caps the
+        # autonomous tool-loop length per dispatch. Both default to None
+        # (SDK default) when the bot doesn't override.
+        _allowed_effort = {"low", "medium", "high", "xhigh", "max"}
+        effort_raw = (fields.get("effort") or "").strip().lower() or None
+        bot_effort = effort_raw if effort_raw in _allowed_effort else None
+        if effort_raw and bot_effort is None:
+            logger.warning(
+                "Ignoring invalid effort=%r for %s (allowed: %s)",
+                effort_raw, bot_slug, sorted(_allowed_effort),
+            )
+        max_turns_raw = (fields.get("max_turns") or "").strip()
+        bot_max_turns: int | None = None
+        if max_turns_raw:
+            try:
+                mt = int(max_turns_raw)
+                bot_max_turns = mt if mt > 0 else None
+            except ValueError:
+                logger.warning(
+                    "Ignoring invalid max_turns=%r for %s (must be positive int)",
+                    max_turns_raw, bot_slug,
+                )
+
         attachments_raw = fields.get("attachments", "")
         attachments: list[dict] = []
         if attachments_raw:
@@ -597,6 +622,8 @@ class ClaudeCodeBridge:
                         stderr=_log_stderr,
                         env=sdk_env,
                         settings=settings_path,
+                        effort=bot_effort,
+                        max_turns=bot_max_turns,
                         mcp_servers=self._mcp_servers if self._mcp_servers else {},
                     )
 

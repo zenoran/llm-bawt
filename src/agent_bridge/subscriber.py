@@ -106,6 +106,8 @@ class RedisSubscriber:
         backend: str | None = None,
         bot_id: str | None = None,
         trigger_message_id: str | None = None,
+        effort: str | None = None,
+        max_turns: int | None = None,
     ) -> None:
         """Publish a chat.send command to the bridge's command stream.
 
@@ -114,6 +116,13 @@ class RedisSubscriber:
         ``tool_start`` / ``tool_end`` event they emit so the frontend can
         bucket activity under the originating user message without relying
         on the brittle ``turn_id`` / ``activeStreamMessageId`` fallback chain.
+
+        ``effort`` and ``max_turns`` (per-bot ClaudeAgentOptions tuning):
+        forwarded as-is to bridges that understand them. Today only
+        claude-code-bridge consumes them — codex/openclaw silently ignore.
+        ``effort`` must be one of {"low","medium","high","xhigh","max"}
+        (validated at the bridge); ``max_turns`` caps the agent loop
+        length per dispatch.
         """
         fields: dict = {
             "action": "chat.send",
@@ -133,6 +142,10 @@ class RedisSubscriber:
             fields["bot_id"] = bot_id
         if trigger_message_id:
             fields["trigger_message_id"] = trigger_message_id
+        if effort:
+            fields["effort"] = effort
+        if max_turns is not None:
+            fields["max_turns"] = str(max_turns)
         await self._redis.xadd(
             COMMANDS_STREAM,
             fields,

@@ -196,6 +196,14 @@ class AgentBridgeBackend(AgentBackend):
                             backend=self.name,
                             bot_id=str(config.get("bot_id") or "").strip() or None,
                             trigger_message_id=trigger_message_id,
+                            effort=(
+                                str(config.get("effort")).strip().lower()
+                                if config.get("effort") else None
+                            ),
+                            max_turns=(
+                                int(config.get("max_turns"))
+                                if config.get("max_turns") is not None else None
+                            ),
                         )
                         logger.info(
                             "%s request via bridge: session=%s request_id=%s",
