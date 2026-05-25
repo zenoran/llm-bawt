@@ -2,6 +2,7 @@
 CLAUDE.md
 AGENTS.md
 .claude/settings.local.json
+.claude/worktrees/
 
 ._*
 __pycache__/
