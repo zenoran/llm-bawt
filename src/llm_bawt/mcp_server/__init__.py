@@ -1,8 +1,10 @@
-"""llm-bawt MCP server.
+"""BawtHub MCP server (formerly named 'llm-bawt-memory').
 
 Exposes memory, messages, fact-extraction, inter-bot, and agent task tools
-via Model Context Protocol (FastMCP). Also provides MemoryClient for unified
-in-process or remote (HTTP JSON-RPC) access to memory operations.
+via Model Context Protocol (FastMCP). The server identity is now ``bawthub``
+to reflect that it serves the broader llm-bawt/BawtHub platform, not just
+memory. Also provides MemoryClient for unified in-process or remote
+(HTTP JSON-RPC) access.
 """
 
 from typing import TYPE_CHECKING

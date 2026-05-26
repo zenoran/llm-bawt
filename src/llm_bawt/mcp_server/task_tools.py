@@ -1,7 +1,7 @@
 """MCP tools for the agent task system.
 
 Registers task/project/step/activity tools on the shared FastMCP server.
-Tools call the unmute REST API internally via httpx — agents see clean
+Tools call the BawtHub REST API internally via httpx — agents see clean
 MCP tool interfaces without needing to think about HTTP.
 
 Imported by server.py to trigger tool registration on startup.

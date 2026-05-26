@@ -494,7 +494,7 @@ class CodexBridge:
                 if system_prompt and bot_slug:
                     system_prompt += (
                         f"\n\n## MCP Tool Context\n"
-                        f"Your bot_id is \"{bot_slug}\". When using llm-bawt-memory MCP tools:\n"
+                        f"Your bot_id is \"{bot_slug}\". When using bawthub MCP tools:\n"
                         f"- Memory/message tools: always pass bot_id=\"{bot_slug}\"\n"
                         f"- Profile tool with entity_type=\"user\": use entity_id=\"nick\" (the user)\n"
                         f"- Profile tool with entity_type=\"bot\": use entity_id=\"{bot_slug}\" (yourself)"

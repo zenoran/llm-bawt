@@ -1,4 +1,4 @@
-"""FastMCP server exposing the llm-bawt MCP toolset.
+"""FastMCP server exposing the BawtHub MCP toolset (formerly 'llm-bawt-memory').
 
 This server exposes grouped tools for memory, messages, conversation
 context, fact extraction, inter-bot messaging, system maintenance, and
@@ -54,7 +54,7 @@ _allowed_hosts = [
 _allowed_origins = [f"http://{h}" for h in _allowed_hosts]
 
 mcp = FastMCP(
-    "llm-bawt",
+    "bawthub",
     json_response=True,
     stateless_http=True,
     transport_security=TransportSecuritySettings(

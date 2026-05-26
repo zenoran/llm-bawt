@@ -2,7 +2,7 @@
 
 A self-hosted AI assistant platform that gives you a single, consistent interface to talk to any LLM — cloud or local — with persistent memory, tool use, web search, and configurable bot personalities. You wire it up once, and every conversation your bots have is enriched with semantic memory that grows and fades naturally over time.
 
-The system exposes an OpenAI-compatible API, so any frontend (web UI, voice interface, CLI) can connect to it. The companion project **[unmute](https://github.com/zenoran/unmute)** provides a real-time voice + chat web UI that connects to llm-bawt as its backend.
+The system exposes an OpenAI-compatible API, so any frontend (web UI, voice interface, CLI) can connect to it. The companion project **[BawtHub](https://github.com/zenoran/unmute)** (the GitHub repo still uses the historical `unmute` name) provides a real-time voice + chat web UI that connects to llm-bawt as its backend.
 
 ## What This System Does
 
@@ -271,14 +271,14 @@ curl http://localhost:8642/health
 
 ### Connecting a Frontend
 
-llm-bawt is designed as a backend. The **[unmute](https://github.com/zenoran/unmute)** project provides a full web UI (Next.js) with:
+llm-bawt is designed as a backend. The **[BawtHub](https://github.com/zenoran/unmute)** project (GitHub repo still uses the historical `unmute` name) provides a full web UI (Next.js) with:
 - Text chat with streaming, markdown rendering, and tool call visibility
 - Real-time voice conversations (STT → LLM → TTS pipeline)
 - Bot personality switching
 - Conversation history browser
 - Home server dashboard
 
-unmute connects to llm-bawt via `UNMUTE_LLM_URL=http://host.docker.internal:8642` and proxies requests through Next.js API routes to the `/v1/*` endpoints.
+BawtHub connects to llm-bawt via `UNMUTE_LLM_URL=http://host.docker.internal:8642` (env var name preserved for backward compatibility) and proxies requests through Next.js API routes to the `/v1/*` endpoints.
 
 ## Architecture
 
@@ -286,7 +286,7 @@ unmute connects to llm-bawt via `UNMUTE_LLM_URL=http://host.docker.internal:8642
 ┌─────────────────────────────────────────────────────────────────────────┐
 │  User Interface                                                         │
 │  ┌─────────────┐  ┌──────────────────────────────────────┐              │
-│  │  CLI (llm)  │  │  unmute Web UI (Next.js, port 80)    │              │
+│  │  CLI (llm)  │  │  BawtHub Web UI (Next.js, port 80)   │              │
 │  └──────┬──────┘  └──────────────────┬───────────────────┘              │
 │         │ local or service mode      │ HTTP proxy                       │
 └─────────┼────────────────────────────┼──────────────────────────────────┘
@@ -295,7 +295,7 @@ unmute connects to llm-bawt via `UNMUTE_LLM_URL=http://host.docker.internal:8642
 │  llm-bawt Service Stack (Docker)                                        │
 │                                                                         │
 │  ┌──────────────────────┐  ┌──────────────────────────────────────────┐ │
-│  │ llm-bawt MCP Server    │  │  LLM Service (FastAPI, port 8642)        │ │
+│  │ BawtHub MCP Server   │  │  LLM Service (FastAPI, port 8642)        │ │
 │  │ (port 8001)          │←→│  OpenAI-compatible API                   │ │
 │  │ Memory read/write    │  │  Streaming SSE, tool calling             │ │
 │  │ Fact extraction      │  │  Bot management, job scheduler           │ │

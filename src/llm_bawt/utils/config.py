@@ -267,7 +267,7 @@ class Config(RuntimeTunables, BaseSettings):
     # --- Agent Task API Settings --- #
     TASK_API_URL: str = Field(
         default="http://echo.lan.zenoran.com",
-        description="Base URL for the unmute agent task API (Set via LLM_BAWT_TASK_API_URL)",
+        description="Base URL for the BawtHub agent task API (Set via LLM_BAWT_TASK_API_URL)",
     )
 
     # --- Web Search Settings --- #

@@ -1,12 +1,13 @@
-# llm-bawt MCP Server
+# BawtHub MCP Server
 
-The **llm-bawt MCP Server** is a [FastMCP](https://github.com/jlouis/fastmcp) HTTP service (port `8001`) that exposes the llm-bawt platform — bot memory, conversation history, fact extraction, inter-bot messaging, and the agent task system — as Model Context Protocol tools.
+The **BawtHub MCP Server** (formerly `llm-bawt-memory`) is a [FastMCP](https://github.com/jlouis/fastmcp) HTTP service (port `8001`) that exposes the llm-bawt platform — bot memory, conversation history, fact extraction, inter-bot messaging, and the agent task system — as Model Context Protocol tools.
 
 It runs in-process inside the `app` container alongside the FastAPI service, but is also reachable from any external MCP client (VSCode, Claude Desktop, custom Node/Python clients).
 
 | Detail | Value |
 |---|---|
-| Server name | `llm-bawt` |
+| Server name | `bawthub` |
+| Client connection key | `bawthub` (tool prefix becomes `mcp__bawthub__*`) |
 | Default endpoint | `http://localhost:8001/mcp` |
 | Transport | `streamable-http` (default) or `stdio` |
 | JSON-RPC | yes — standard MCP |
@@ -115,7 +116,7 @@ Returns:
 
 ### `tasks_*` / `steps_*` / `projects_*` / `activity_*` — Agent Task System
 
-These tools wrap the agent task REST API (`/api/agents/*` on the unmute frontend) so agents can manage work without thinking about HTTP.
+These tools wrap the agent task REST API (`/api/agents/*` on the BawtHub frontend) so agents can manage work without thinking about HTTP.
 
 | Tool | Purpose |
 |---|---|
@@ -325,7 +326,7 @@ bots_send_message(target_bot_id="mira", sender_bot_id="nova",
 | `connection refused` from VSCode | server not listening | `curl http://localhost:8001/health` from the host; `docker compose ps` |
 | `403 Forbidden` | host not in allowlist | add it to `LLM_BAWT_MCP_ALLOWED_HOSTS` and restart `app` |
 | Tools missing in client | client cached old `tools/list` | reload VSCode / restart Claude Desktop |
-| Tool returns `{"error":...,"status":...}` | underlying REST call failed (task tools) | check `LLM_BAWT_TASK_API_URL` and the unmute frontend |
+| Tool returns `{"error":...,"status":...}` | underlying REST call failed (task tools) | check `LLM_BAWT_TASK_API_URL` and the BawtHub frontend |
 | `memory_search` returns nothing | bot has no memories or threshold too high | call `system_stats` to check counts; lower `min_relevance` |
 
 Server logs:
@@ -344,6 +345,7 @@ curl http://localhost:8001/health
 
 ## Notes on the Rebrand
 
-- The MCP server identity is now `llm-bawt` (was `llm-memory`). The internal Python package was renamed `llm_bawt.memory_server` → `llm_bawt.mcp_server` to reflect that it serves more than memory. The console entry point is `llm-mcp-server`.
+- The MCP server identity is now `bawthub` (was `llm-bawt-memory`, originally `llm-memory`). Clients should connect with key name `bawthub` and tools surface under the `mcp__bawthub__*` prefix.
+- The internal Python package is `llm_bawt.mcp_server` (was `llm_bawt.memory_server`) since the server now exposes far more than memory (memory, messages, agent tasks, projects, sessions, bots, profile, activity, etc.). The console entry point is `llm-mcp-server`.
 - Tool **external names** were prefix-grouped (e.g. `store_memory` → `memory_store`). Internal Python function names are unchanged, so embedded callers (`MemoryClient`) continue to work without code changes; only the over-the-wire MCP names were updated and the `MemoryClient`'s server-mode JSON-RPC calls were retargeted to the new names in the same change.
-- If you have external clients that called the old names, update them to the new prefixed names.
+- If you have external clients that called the old names or pointed at the `llm-bawt-memory` server key, update them to `bawthub` / the new prefixed tool names.

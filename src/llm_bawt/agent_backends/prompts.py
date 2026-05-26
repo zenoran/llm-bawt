@@ -1,13 +1,13 @@
 """Agent task system dispatch prompts.
 
 These templates are stored in the prompt registry under the ``agents.*``
-namespace and rendered by the Unmute frontend (or any other dispatcher) when
+namespace and rendered by the BawtHub frontend (or any other dispatcher) when
 sending a task to an agent bot.
 
 Conventions
 -----------
 - Placeholders use single-brace ``{var}`` syntax. Filled by the JS-side
-  ``renderTemplate`` helper in Unmute (and by Python ``str.format`` on the
+  ``renderTemplate`` helper in BawtHub (and by Python ``str.format`` on the
   rare paths that go through llm-bawt directly).
 - Dispatch prompts (``agents.task_spec``, ``agents.task_execution``,
   ``agents.project_plan``, ``agents.review``) tell the agent to act through
