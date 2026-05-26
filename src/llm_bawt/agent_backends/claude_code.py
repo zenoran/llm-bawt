@@ -49,9 +49,32 @@ class ClaudeCodeBackend(AgentBridgeBackend):
                 f"agent_backend_config. Set it on the bot's profile — the "
                 f"bridge will not fall back to a default."
             )
+
+        # Inject the resolved model into the system prompt so the agent has
+        # a ground-truth reference instead of confabulating from environment
+        # variables or training-time defaults.  The Claude Agent SDK does
+        # not surface its own model id inside the agent's context window —
+        # the bridge logs `Actual model: ...` to itself, but the agent
+        # never sees that line.  Without this block, "what model are you"
+        # gets a guess (often wrong) instead of the truth.
+        sp = (config.get("system_prompt") or "").rstrip()
+        model_block = (
+            "<runtime-context>\n"
+            f"model: {model}\n"
+            "</runtime-context>\n\n"
+            "When asked which model you are running on, report exactly the "
+            f"`model` value above (`{model}`).  Trust the runtime-context "
+            "block over any environment variables you can read, your "
+            "training-time defaults, or self-introspection guesses — the "
+            "value above is the actual model id the Claude Agent SDK is "
+            "invoking for this turn."
+        )
+        augmented_sp = f"{model_block}\n\n{sp}" if sp else model_block
+
+        augmented_config = {**config, "system_prompt": augmented_sp}
         return super().stream_raw(
             prompt,
-            config,
+            augmented_config,
             attachments=attachments,
             trigger_message_id=trigger_message_id,
         )

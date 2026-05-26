@@ -128,7 +128,9 @@ services:
       - ./.env
     environment:
       - CLAUDE_CODE_OAUTH_TOKEN=${CLAUDE_CODE_OAUTH_TOKEN:-}
-      - CLAUDE_CODE_MODEL=${CLAUDE_CODE_MODEL:-claude-sonnet-4-20250514}
+      # CLAUDE_CODE_MODEL intentionally not set — there is no default
+      # model.  Each request MUST carry its model in agent_backend_config.
+      # See src/claude_code_bridge/bridge.py (raises on missing model).
       - CLAUDE_CODE_BRIDGE_LOG_LEVEL=${CLAUDE_CODE_BRIDGE_LOG_LEVEL:-INFO}
       - LLM_BAWT_API_URL=http://app:8642
       # Override SERVICE_HOST inherited from .env (which is 0.0.0.0 — meant
