@@ -454,7 +454,9 @@ def cleanup_orphaned_bot_data(config: Config, dry_run: bool = False) -> dict[str
             ).fetchall()
             all_tables = {r[0] for r in table_rows}
 
-            dynamic_suffixes = ("_messages", "_memories", "_forgotten_messages")
+            # Check the longest suffix first so bot_forgotten_messages
+            # does not get misclassified as prefix=bot_forgotten + _messages.
+            dynamic_suffixes = ("_forgotten_messages", "_memories", "_messages")
             for tbl in sorted(all_tables):
                 for suffix in dynamic_suffixes:
                     if tbl.endswith(suffix):
