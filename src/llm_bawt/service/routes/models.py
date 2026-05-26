@@ -46,6 +46,7 @@ def _upstream_lookup(provider: str) -> list[dict]:
         return cached[1]
 
     from ...model_manager import (
+        fetch_anthropic_api_models,
         fetch_codex_models,
         fetch_grok_api_models,
         fetch_openai_api_models,
@@ -67,10 +68,28 @@ def _upstream_lookup(provider: str) -> list[dict]:
                 detail="Grok discovery requires LLM_BAWT_XAI_API_KEY in env",
             )
         ok, models = fetch_grok_api_models(api_key)
+    elif provider in ("anthropic", "claude-code"):
+        # Both alias to the same upstream: Anthropic /v1/models.
+        # The CLAUDE_CODE_OAUTH_TOKEN (subscription) cannot authenticate
+        # the models endpoint — only ANTHROPIC_API_KEY works.
+        api_key = (
+            os.getenv("LLM_BAWT_ANTHROPIC_API_KEY")
+            or os.getenv("ANTHROPIC_API_KEY")
+            or ""
+        )
+        if not api_key:
+            raise HTTPException(
+                status_code=503,
+                detail=(
+                    "Anthropic discovery requires ANTHROPIC_API_KEY in env "
+                    "(the Claude Code OAuth token does not work for /v1/models)."
+                ),
+            )
+        ok, models = fetch_anthropic_api_models()
     else:
         raise HTTPException(
             status_code=400,
-            detail=f"Unknown provider '{provider}'. Use openai, codex, or grok.",
+            detail=f"Unknown provider '{provider}'. Use openai, codex, grok, anthropic, or claude-code.",
         )
 
     if not ok:

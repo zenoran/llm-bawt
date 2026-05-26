@@ -158,7 +158,6 @@ class ClaudeCodeBridge:
         *,
         backend_name: str = "claude-code",
         app_api_url: str = "",
-        default_model: str = "claude-sonnet-4-20250514",
         cwd: str = "/app",
         permission_mode: str = "bypassPermissions",
         add_dirs: list[str] | None = None,
@@ -167,7 +166,6 @@ class ClaudeCodeBridge:
         self._publisher = publisher
         self._backend_name = backend_name
         self._app_api_url = app_api_url
-        self._default_model = default_model
         self._cwd = cwd
         self._permission_mode = permission_mode
         self._add_dirs = add_dirs or []
@@ -341,8 +339,8 @@ class ClaudeCodeBridge:
         self._command_task = asyncio.create_task(self._command_listener())
         self._cleanup_task = asyncio.create_task(self._periodic_cache_cleanup())
         logger.info(
-            "ClaudeCodeBridge started (backend=%s, model=%s)",
-            self._backend_name, self._default_model,
+            "ClaudeCodeBridge started (backend=%s)",
+            self._backend_name,
         )
 
     async def stop(self) -> None:
@@ -441,7 +439,7 @@ class ClaudeCodeBridge:
         bot_slug = (fields.get("bot_id", "") or "").strip() or _bot_slug_from_session_key(session_key)
         message = fields.get("message", "")
         system_prompt = fields.get("system_prompt") or None
-        model = fields.get("model") or self._default_model
+        model = (fields.get("model") or "").strip()
         # Frontend-supplied user-message UUID; stamped on every emitted event
         # so the frontend can bucket tool activity under the originating user
         # message without falling back to turn_id heuristics.
@@ -481,6 +479,24 @@ class ClaudeCodeBridge:
 
         if not request_id or not message:
             logger.warning("Invalid send command: missing request_id or message")
+            await async_redis.xack(COMMANDS_STREAM, "claude-code-bridge", msg_id)
+            return
+
+        if not model:
+            # No silent fallback. The caller MUST pass an explicit model. Surface
+            # the failure both to the log and to the originating chat so the user
+            # immediately sees which bot's config is missing a model.
+            err = (
+                f"Claude Code bridge: missing 'model' field for bot={bot_slug or '?'} "
+                f"session={session_key}. Configure agent_backend_config.model on the bot."
+            )
+            logger.error(err)
+            self._publish_event(
+                request_id, session_key, 1,
+                kind=AgentEventKind.ERROR,
+                text=err,
+            )
+            self._publisher.publish_run_done(request_id)
             await async_redis.xack(COMMANDS_STREAM, "claude-code-bridge", msg_id)
             return
 

@@ -781,6 +781,58 @@ def fetch_codex_models() -> Tuple[bool, List[Dict[str, Any]]]:
     return True, [dict(item) for item in CODEX_MODEL_CATALOG]
 
 
+def fetch_anthropic_api_models() -> Tuple[bool, List[Dict[str, Any]]]:
+    """Fetch Claude model list from the Anthropic API.
+
+    Used to populate the Claude Code bridge's model picker — the bridge
+    has no model fallback, so users need to see a real, live list of SDK
+    IDs to choose from. Requires ``ANTHROPIC_API_KEY`` (the Claude Code
+    subscription OAuth token does NOT authenticate /v1/models).
+    """
+    import os
+    api_key = (
+        os.getenv("LLM_BAWT_ANTHROPIC_API_KEY")
+        or os.getenv("ANTHROPIC_API_KEY")
+        or ""
+    )
+    if not api_key:
+        console.print("[yellow]Anthropic discovery skipped: no ANTHROPIC_API_KEY[/yellow]")
+        return False, []
+
+    try:
+        from anthropic import Anthropic  # lazy import
+    except Exception as e:
+        console.print(f"[bold red]Anthropic SDK import error:[/bold red] {e}")
+        return False, []
+
+    details: List[Dict[str, Any]] = []
+    start = time.time()
+    try:
+        client = Anthropic(api_key=api_key)
+        # SDK exposes models.list() which paginates. Cap at a couple pages
+        # in case Anthropic ever adds many — 100 is plenty for the picker.
+        page = client.models.list(limit=100)
+        for m in getattr(page, "data", []) or []:
+            mid = getattr(m, "id", None)
+            if not mid:
+                continue
+            display = getattr(m, "display_name", "") or ""
+            created_at = getattr(m, "created_at", None)
+            details.append({
+                "id": mid,
+                "description": display,
+                "created": created_at,
+            })
+        console.print(
+            f"⏱️ Anthropic query took {(time.time()-start)*1000:.0f}ms, "
+            f"found {len(details)} models"
+        )
+        return True, details
+    except Exception as e:
+        console.print(f"[bold red]Anthropic API error:[/bold red] {e}")
+        return False, []
+
+
 def list_models(config: Config, service_mode: bool | None = None):
     """CLI wrapper: list models.
 

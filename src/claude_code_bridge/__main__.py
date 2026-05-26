@@ -75,11 +75,17 @@ def main() -> None:
     add_dirs_raw = os.getenv("CLAUDE_CODE_ADD_DIRS", "")
     add_dirs = [d.strip() for d in add_dirs_raw.split(",") if d.strip()]
 
+    if os.getenv("CLAUDE_CODE_MODEL"):
+        logger.warning(
+            "CLAUDE_CODE_MODEL env var is set but ignored: the bridge no longer "
+            "accepts a default model. The model MUST be passed per-request from "
+            "the bot's agent_backend_config.model."
+        )
+
     bridge = ClaudeCodeBridge(
         publisher=publisher,
         backend_name=os.getenv("CLAUDE_CODE_BACKEND_NAME", "claude-code"),
         app_api_url=os.getenv("LLM_BAWT_API_URL", ""),
-        default_model=os.getenv("CLAUDE_CODE_MODEL", "claude-sonnet-4-20250514"),
         cwd=os.getenv("CLAUDE_CODE_CWD", "/app"),
         permission_mode=os.getenv("CLAUDE_CODE_PERMISSION_MODE", "bypassPermissions"),
         add_dirs=add_dirs,
@@ -89,9 +95,8 @@ def main() -> None:
     health_port = int(os.getenv("CLAUDE_CODE_BRIDGE_HEALTH_PORT", "8681"))
 
     logger.info(
-        "Starting Claude Code bridge (backend=%s, model=%s)",
+        "Starting Claude Code bridge (backend=%s)",
         os.getenv("CLAUDE_CODE_BACKEND_NAME", "claude-code"),
-        os.getenv("CLAUDE_CODE_MODEL", "claude-sonnet-4-20250514"),
     )
 
     async def _run() -> None:
