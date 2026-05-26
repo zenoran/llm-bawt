@@ -827,6 +827,23 @@ class ChatStreamingMixin:
             except Exception as pub_err:
                 log.debug("Direct event publish failed: %s", pub_err)
 
+        # Announce turn kickoff to the unified SSE stream BEFORE the worker
+        # thread starts.  Other clients subscribed to this bot (other browser
+        # tabs, the dashboard, CLI tools, scheduled jobs) flip their "bot is
+        # active" indicators on the turn_start event — without it they'd only
+        # find out a turn was running when the first tool_start arrived
+        # (could be many seconds for non-tool turns) or on the next page
+        # refresh via /api/chat/active-bots.  turn_complete (line ~1435)
+        # is the matching teardown event.
+        _publish_event_direct({
+            "_type": "turn_start",
+            "turn_id": turn_log_id,
+            "trigger_message_id": trigger_message_id,
+            "bot_id": bot_id,
+            "user_id": user_id,
+            "ts": time.time(),
+        })
+
         def _stream_to_queue():
             """Run streaming in a thread and push chunks to the async queue."""
             try:
