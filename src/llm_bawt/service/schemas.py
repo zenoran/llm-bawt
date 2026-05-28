@@ -476,6 +476,40 @@ class TurnLogDetail(BaseModel):
     token_usage: dict[str, Any] | None = None
 
 
+class RecentBotTurn(BaseModel):
+    """Compact summary of the most recent turn for one bot.
+
+    Returned by ``GET /v1/turn-logs/recent-by-bot``. Designed for dashboard
+    "last activity per bot" views: enough information to render a tile
+    (who, when, what was said, how many tools fired, did it succeed) without
+    a follow-up fetch.
+    """
+    bot_id: str
+    turn_id: str
+    created_at: datetime
+    model: str | None = None
+    status: str
+    latency_ms: float | None = None
+    user_prompt_preview: str | None = None
+    response_preview: str | None = None
+    response_chars: int = 0
+    response_preview_truncated: bool = False
+    tool_call_count: int = 0
+    token_usage: dict[str, Any] | None = None
+    trigger_message_id: str | None = None
+
+
+class RecentByBotsResponse(BaseModel):
+    """Single response carrying one ``RecentBotTurn`` per bot.
+
+    Sorted by ``created_at`` descending so the most recently active bot is
+    first. Bots in the request's ``bot_ids`` filter that have no turn in the
+    window are simply absent from ``turns`` — the caller can detect "no
+    activity" by checking which slugs are missing.
+    """
+    turns: list[RecentBotTurn]
+
+
 class ToolCallEvent(BaseModel):
     """Tool-call event linked to one trigger history message."""
     turn_id: str

@@ -7,7 +7,15 @@ from sqlalchemy import func
 from sqlmodel import Session, select
 
 from ..dependencies import get_service
-from ..schemas import ToolCallEvent, ToolCallEventsResponse, TurnLogDetail, TurnLogListItem, TurnLogListResponse
+from ..schemas import (
+    RecentBotTurn,
+    RecentByBotsResponse,
+    ToolCallEvent,
+    ToolCallEventsResponse,
+    TurnLogDetail,
+    TurnLogListItem,
+    TurnLogListResponse,
+)
 from ..tool_call_events import extract_trigger_message, message_id_matches, parse_message_filters
 from ..turn_logs import ToolCallRecord, TurnLogStore
 
@@ -108,7 +116,7 @@ def _live_tool_call_counts(store: TurnLogStore, turn_ids: list[str]) -> dict[str
 
 
 @router.get("/v1/turn-logs", response_model=TurnLogListResponse, tags=["Debug"])
-async def list_turn_logs(
+def list_turn_logs(
     bot_id: str | None = Query(None, description="Filter by bot ID"),
     user_id: str | None = Query(None, description="Filter by user ID"),
     model: str | None = Query(None, description="Filter by model alias"),
@@ -201,8 +209,113 @@ async def list_turn_logs(
     )
 
 
+@router.get(
+    "/v1/turn-logs/recent-by-bot",
+    response_model=RecentByBotsResponse,
+    tags=["Debug", "History"],
+)
+def recent_turns_by_bot(
+    user_id: str = Query(..., description="User to scope by (required)"),
+    bot_ids: str | None = Query(
+        None,
+        description=(
+            "Comma-separated bot slugs to restrict to. Omit to return the latest "
+            "turn for every bot this user has talked to in the window."
+        ),
+    ),
+    since_hours: int = Query(
+        168, ge=1, le=168, description="Only consider turns from the recent N hours (max 7d)."
+    ),
+    preview_chars: int = Query(
+        180,
+        ge=20,
+        le=600,
+        description="Trim user_prompt / response_text to this many characters.",
+    ),
+):
+    """Return one "most recent turn" summary per bot in a single round trip.
+
+    Replaces the per-bot dashboard fan-out (one ``/v1/history`` call per bot)
+    with a single ``DISTINCT ON (bot_id)`` query. Useful for "who did I talk
+    to recently, and what about?" UIs where each tile needs:
+
+      - last activity timestamp + latency
+      - last user prompt + assistant response preview
+      - tool call count for the turn (incl. in-flight)
+      - model used + token usage
+
+    Bots in ``bot_ids`` that have no turn in the window are simply absent
+    from the response — callers detect "no activity" by checking which slugs
+    are missing from the returned ``turns`` list.
+    """
+    service = get_service()
+    store = TurnLogStore(service.config, ttl_hours=168)
+    if store.engine is None:
+        raise HTTPException(status_code=503, detail="Turn logs DB unavailable")
+
+    bot_list: list[str] | None = None
+    if bot_ids:
+        bot_list = [b.strip() for b in bot_ids.split(",") if b.strip()]
+        # Empty after parsing → treat as "no filter" instead of "match nothing".
+        if not bot_list:
+            bot_list = None
+
+    rows = store.recent_turns_by_bot(
+        user_id=user_id,
+        bot_ids=bot_list,
+        since_hours=since_hours,
+    )
+
+    # In-flight turns haven't written tool_calls_json yet — fall back to the
+    # live tool_call_records table so the count reflects what's running NOW.
+    turns_needing_live: list[str] = []
+    parsed_tools_by_turn: dict[str, list] = {}
+    for row in rows:
+        parsed = _parse_json(row.tool_calls_json) or []
+        if isinstance(parsed, list) and parsed:
+            parsed_tools_by_turn[row.id] = parsed
+        else:
+            parsed_tools_by_turn[row.id] = []
+            turns_needing_live.append(row.id)
+
+    live_counts = _live_tool_call_counts(store, turns_needing_live)
+
+    items: list[RecentBotTurn] = []
+    for row in rows:
+        finalized_tools = parsed_tools_by_turn.get(row.id, [])
+        tool_call_count = (
+            len(finalized_tools) if finalized_tools else live_counts.get(row.id, 0)
+        )
+        user_prompt = (row.user_prompt or "")[:preview_chars] or None
+        response_text = row.response_text or ""
+        response_preview = response_text[:preview_chars] if response_text else None
+        items.append(
+            RecentBotTurn(
+                bot_id=row.bot_id or "",
+                turn_id=row.id,
+                created_at=row.created_at,
+                model=row.model,
+                status=row.status,
+                latency_ms=row.latency_ms,
+                user_prompt_preview=user_prompt,
+                response_preview=response_preview,
+                response_chars=len(response_text),
+                response_preview_truncated=bool(
+                    response_text and response_preview and len(response_text) > len(response_preview)
+                ),
+                tool_call_count=tool_call_count,
+                token_usage=_parse_token_usage(getattr(row, "token_usage_json", None)),
+                trigger_message_id=getattr(row, "trigger_message_id", None),
+            )
+        )
+
+    # Sort newest-first so the caller doesn't have to.
+    items.sort(key=lambda r: r.created_at, reverse=True)
+    return RecentByBotsResponse(turns=items)
+
+
 @router.get("/v1/turn-logs/{turn_id}", response_model=TurnLogDetail, tags=["Debug"])
-async def get_turn_log(turn_id: str):
+def get_turn_log(turn_id: str):
     """Get one persisted turn log by ID."""
     service = get_service()
     store = TurnLogStore(service.config, ttl_hours=168)
@@ -245,7 +358,7 @@ async def get_turn_log(turn_id: str):
 
 
 @router.get("/v1/tool-calls", response_model=ToolCallEventsResponse, tags=["Debug"])
-async def get_tool_call_events(
+def get_tool_call_events(
     bot_id: str | None = Query(None, description="Filter by bot ID"),
     user_id: str | None = Query(None, description="Filter by user ID"),
     message_id: str | None = Query(None, description="Single message ID to match"),

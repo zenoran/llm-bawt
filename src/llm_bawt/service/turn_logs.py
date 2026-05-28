@@ -400,6 +400,57 @@ class TurnLogStore:
 
         return rows, total_count
 
+    def recent_turns_by_bot(
+        self,
+        *,
+        user_id: str | None,
+        bot_ids: list[str] | None = None,
+        since_hours: int = 168,
+    ) -> list[TurnLog]:
+        """Return the most recent TurnLog per bot_id for a user — one row each.
+
+        Uses Postgres ``DISTINCT ON (bot_id)`` so the entire fan-out is a single
+        index-backed query. Designed for "what's been happening with each bot"
+        dashboard views — replaces the N round-trip per-bot history poll.
+
+        Args:
+            user_id: Scope to a user (lowercased). ``None`` returns the latest
+                turn per bot across all users (admin/global view).
+            bot_ids: Optional whitelist to restrict the result. ``None`` returns
+                all bots the user has talked to in the window.
+            since_hours: Only consider turns from the last N hours (default 7d).
+        """
+        if self.engine is None:
+            return []
+        self._cleanup_expired_if_due()
+
+        since_cutoff = datetime.now(timezone.utc) - timedelta(
+            hours=max(1, int(since_hours))
+        )
+        conditions: list = [
+            TurnLog.bot_id.is_not(None),
+            TurnLog.created_at >= since_cutoff,
+        ]
+        if user_id:
+            conditions.append(TurnLog.user_id == user_id.strip().lower())
+        if bot_ids:
+            normalized = [b.strip().lower() for b in bot_ids if b and b.strip()]
+            if normalized:
+                conditions.append(TurnLog.bot_id.in_(normalized))
+
+        # DISTINCT ON (bot_id) requires bot_id to be the FIRST column in
+        # ORDER BY; the secondary key picks the row to keep per partition.
+        statement = (
+            select(TurnLog)
+            .where(*conditions)
+            .order_by(TurnLog.bot_id, TurnLog.created_at.desc())
+            .distinct(TurnLog.bot_id)
+        )
+
+        with Session(self.engine) as session:
+            rows = session.exec(statement).all()
+        return list(rows)
+
     # ---- Tool call records (event-based persistence) ----
 
     def save_tool_call(
