@@ -49,7 +49,7 @@ def _require_memory_client_for_bot(bot_id: str):
 
 
 @router.get("/v1/memory/stats", response_model=MemoryStatsResponse, tags=["Memory"])
-async def get_memory_stats(
+def get_memory_stats(
     bot_id: str = Depends(get_effective_bot_id),
     client=Depends(require_memory_client),
 ):
@@ -67,7 +67,7 @@ async def get_memory_stats(
 
 
 @router.post("/v1/memory/search", response_model=MemorySearchResponse, tags=["Memory"])
-async def search_memory(request: MemorySearchRequest):
+def search_memory(request: MemorySearchRequest):
     """Search memories."""
     effective_bot_id = request.bot_id or get_effective_bot_id()
 
@@ -124,7 +124,7 @@ async def search_memory(request: MemorySearchRequest):
 
 
 @router.get("/v1/memory", response_model=MemorySearchResponse, tags=["Memory"])
-async def list_memories(
+def list_memories(
     limit: int = Query(20, description="Max results"),
     bot_id: str = Depends(get_effective_bot_id),
     client=Depends(require_memory_client),
@@ -158,7 +158,7 @@ async def list_memories(
 
 
 @router.get("/v1/memory/message", tags=["Memory"])
-async def get_message_by_id(
+def get_message_by_id(
     message_id: str = Query(..., description="Message ID (supports prefix match)"),
     bot_id: str = Depends(get_effective_bot_id),
     client=Depends(require_memory_client),
@@ -175,7 +175,7 @@ async def get_message_by_id(
 
 
 @router.delete("/v1/memory/{memory_id}", response_model=MemoryDeleteResponse, tags=["Memory"])
-async def delete_memory(
+def delete_memory(
     memory_id: str,
     bot_id: str = Depends(get_effective_bot_id),
     client=Depends(require_memory_client),
@@ -198,7 +198,7 @@ async def delete_memory(
 
 
 @router.patch("/v1/memory/{memory_id}", response_model=MemoryItem, tags=["Memory"])
-async def update_memory(
+def update_memory(
     memory_id: str,
     request: MemoryUpdateRequest,
     bot_id: str = Depends(get_effective_bot_id),
@@ -236,7 +236,7 @@ async def update_memory(
 
 
 @router.post("/v1/memory/forget", response_model=MemoryForgetResponse, tags=["Memory"])
-async def forget_messages(
+def forget_messages(
     request: MemoryForgetRequest,
     bot_id: str = Depends(get_effective_bot_id),
     client=Depends(require_memory_client),
@@ -278,7 +278,7 @@ async def forget_messages(
 
 
 @router.post("/v1/memory/restore", response_model=MemoryRestoreResponse, tags=["Memory"])
-async def restore_messages(
+def restore_messages(
     bot_id: str = Depends(get_effective_bot_id),
     client=Depends(require_memory_client),
 ):
@@ -296,7 +296,7 @@ async def restore_messages(
 
 
 @router.get("/v1/memory/preview/recent", response_model=MessagesPreviewResponse, tags=["Memory"])
-async def preview_recent_messages(
+def preview_recent_messages(
     count: int = Query(10, description="Number of recent messages to preview"),
     bot_id: str = Depends(get_effective_bot_id),
     client=Depends(require_memory_client),
@@ -311,7 +311,7 @@ async def preview_recent_messages(
 
 
 @router.get("/v1/memory/preview/minutes", response_model=MessagesPreviewResponse, tags=["Memory"])
-async def preview_messages_since_minutes(
+def preview_messages_since_minutes(
     minutes: int = Query(..., description="Number of minutes to look back"),
     bot_id: str = Depends(get_effective_bot_id),
     client=Depends(require_memory_client),
@@ -326,7 +326,7 @@ async def preview_messages_since_minutes(
 
 
 @router.get("/v1/memory/preview/ignored", response_model=MessagesPreviewResponse, tags=["Memory"])
-async def preview_ignored_messages(
+def preview_ignored_messages(
     bot_id: str = Depends(get_effective_bot_id),
     client=Depends(require_memory_client),
 ):
@@ -340,7 +340,7 @@ async def preview_ignored_messages(
 
 
 @router.post("/v1/memory/regenerate-embeddings", response_model=RegenerateEmbeddingsResponse, tags=["Memory"])
-async def regenerate_embeddings(
+def regenerate_embeddings(
     bot_id: str = Depends(get_effective_bot_id),
     client=Depends(require_memory_client),
 ):
@@ -369,7 +369,7 @@ async def regenerate_embeddings(
 
 
 @router.post("/v1/memory/consolidate", response_model=ConsolidateResponse, tags=["Memory"])
-async def consolidate_memories(
+def consolidate_memories(
     request: ConsolidateRequest,
     bot_id: str = Depends(get_effective_bot_id),
     client=Depends(require_memory_client),

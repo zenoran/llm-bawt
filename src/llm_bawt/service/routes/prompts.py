@@ -57,7 +57,7 @@ def _resolved_to_response(resolved) -> PromptTemplateResponse:
 
 
 @router.get("/v1/prompts", response_model=PromptTemplateListResponse, tags=["Admin"])
-async def list_prompts(
+def list_prompts(
     category: str | None = Query(None, description="Filter by prompt category"),
     scope_type: str = Query("global", description="Resolution scope: global or bot"),
     scope_id: str | None = Query(None, description="Scope ID for bot-scoped resolution"),
@@ -128,7 +128,7 @@ async def list_prompts(
 
 
 @router.post("/v1/prompts/seed-defaults", response_model=PromptTemplateSeedResponse, tags=["Admin"])
-async def seed_prompt_defaults():
+def seed_prompt_defaults():
     """Insert any missing built-in prompt templates into the DB."""
     service = get_service()
     resolver = PromptResolver(service.config)
@@ -140,7 +140,7 @@ async def seed_prompt_defaults():
 
 
 @router.get("/v1/prompts/{key}/versions", response_model=PromptTemplateVersionsResponse, tags=["Admin"])
-async def list_prompt_versions(
+def list_prompt_versions(
     key: str,
     scope_type: str = Query("global", description="Scope type: global or bot"),
     scope_id: str | None = Query(None, description="Scope ID for bot-scoped prompts"),
@@ -175,7 +175,7 @@ async def list_prompt_versions(
 
 
 @router.get("/v1/prompts/{key}", response_model=PromptTemplateResponse, tags=["Admin"])
-async def get_prompt(
+def get_prompt(
     key: str,
     scope_type: str = Query("global", description="Resolution scope: global or bot"),
     scope_id: str | None = Query(None, description="Scope ID for bot-scoped prompts"),
@@ -207,7 +207,7 @@ async def get_prompt(
 
 @router.put("/v1/prompts/{key}", response_model=PromptTemplateResponse, tags=["Admin"])
 @router.patch("/v1/prompts/{key}", response_model=PromptTemplateResponse, tags=["Admin"])
-async def upsert_prompt(key: str, request: PromptTemplateUpsertRequest):
+def upsert_prompt(key: str, request: PromptTemplateUpsertRequest):
     """Create or update one prompt template override."""
     service = get_service()
     resolver = PromptResolver(service.config)
@@ -240,7 +240,7 @@ async def upsert_prompt(key: str, request: PromptTemplateUpsertRequest):
 
 
 @router.post("/v1/prompts/{key}/validate", response_model=PromptTemplateValidateResponse, tags=["Admin"])
-async def validate_prompt(key: str, request: PromptTemplateValidateRequest):
+def validate_prompt(key: str, request: PromptTemplateValidateRequest):
     """Validate a prompt template body and optionally render a preview."""
     service = get_service()
     resolver = PromptResolver(service.config)
@@ -273,7 +273,7 @@ async def validate_prompt(key: str, request: PromptTemplateValidateRequest):
 
 
 @router.post("/v1/prompts/{key}/preview", response_model=PromptTemplateValidateResponse, tags=["Admin"])
-async def preview_prompt(
+def preview_prompt(
     key: str,
     request: PromptTemplateValidateRequest,
     scope_type: str = Query("global", description="Resolution scope: global or bot"),
@@ -330,7 +330,7 @@ async def preview_prompt(
 
 
 @router.post("/v1/prompts/{key}/reset", response_model=PromptTemplateResponse, tags=["Admin"])
-async def reset_prompt(
+def reset_prompt(
     key: str,
     scope_type: str = Query("global", description="Scope type: global or bot"),
     scope_id: str | None = Query(None, description="Scope ID for bot-scoped prompts"),

@@ -140,7 +140,7 @@ def _normalize_model_definition(model_data: dict) -> dict:
     return normalized
 
 @router.get("/v1/models", response_model=ModelsResponse, tags=["OpenAI Compatible"])
-async def list_models():
+def list_models():
     """List available models (OpenAI-compatible)."""
     service = get_service()
     defined = service.config.defined_models.get("models", {})
@@ -157,7 +157,7 @@ async def list_models():
 
 
 @router.get("/v1/models/upstream", tags=["Models"])
-async def list_upstream_models(
+def list_upstream_models(
     provider: str = Query(..., description="Provider catalog: openai | codex | grok"),
 ):
     """List available models from a provider's upstream catalog.
@@ -178,7 +178,7 @@ async def list_upstream_models(
 
 
 @router.get("/v1/models/current", tags=["Models"])
-async def get_current_model():
+def get_current_model():
     """Get the currently active model."""
     service = get_service()
     current = service.model_lifecycle.current_model
@@ -195,7 +195,7 @@ async def get_current_model():
     return {"model": detail}
 
 @router.post("/v1/models/switch", response_model=ModelSwitchResponse, tags=["Models"])
-async def switch_model(request: ModelSwitchRequest):
+def switch_model(request: ModelSwitchRequest):
     """Switch to a different model. Takes effect on the next request."""
     service = get_service()
     previous = service.model_lifecycle.current_model
@@ -211,7 +211,7 @@ async def switch_model(request: ModelSwitchRequest):
 
 
 @router.post("/v1/models/reload", tags=["Models"])
-async def reload_models_catalog():
+def reload_models_catalog():
     """Reload model catalog from DB/YAML and refresh service model availability."""
     service = get_service()
     config = service.config
@@ -278,7 +278,7 @@ def _row_to_response(row) -> ModelDefinitionResponse:
 
 
 @router.get("/v1/models/definitions", response_model=ModelDefinitionListResponse, tags=["Models"])
-async def list_model_definitions():
+def list_model_definitions():
     """List all DB-backed model definitions."""
     store = _get_model_store()
     rows = store.list_all()
@@ -289,7 +289,7 @@ async def list_model_definitions():
 
 
 @router.get("/v1/models/definitions/{alias}", response_model=ModelDefinitionResponse, tags=["Models"])
-async def get_model_definition(alias: str):
+def get_model_definition(alias: str):
     """Get a single model definition by alias."""
     store = _get_model_store()
     row = store.get(alias)
@@ -299,7 +299,7 @@ async def get_model_definition(alias: str):
 
 
 @router.put("/v1/models/definitions/{alias}", response_model=ModelDefinitionResponse, tags=["Models"])
-async def upsert_model_definition(alias: str, request: ModelDefinitionUpsertRequest):
+def upsert_model_definition(alias: str, request: ModelDefinitionUpsertRequest):
     """Create or update a model definition. Triggers model catalog reload."""
     store = _get_model_store()
     model_data: dict = {"type": request.type}
@@ -318,18 +318,18 @@ async def upsert_model_definition(alias: str, request: ModelDefinitionUpsertRequ
 
     row = store.upsert(alias, model_data)
     # Reload catalog so the new model is immediately available
-    await reload_models_catalog()
+    reload_models_catalog()
     return _row_to_response(row)
 
 
 @router.delete("/v1/models/definitions/{alias}", response_model=ModelDefinitionDeleteResponse, tags=["Models"])
-async def delete_model_definition(alias: str):
+def delete_model_definition(alias: str):
     """Delete a model definition by alias. Triggers model catalog reload."""
     store = _get_model_store()
     deleted = store.delete(alias)
     if not deleted:
         raise HTTPException(status_code=404, detail=f"Model alias '{alias}' not found")
-    await reload_models_catalog()
+    reload_models_catalog()
     return ModelDefinitionDeleteResponse(
         success=True,
         alias=alias,
@@ -338,7 +338,7 @@ async def delete_model_definition(alias: str):
 
 
 @router.post("/v1/models/definitions/seed", response_model=ModelDefinitionSeedResponse, tags=["Models"])
-async def seed_model_definitions(request: ModelDefinitionSeedRequest | None = None):
+def seed_model_definitions(request: ModelDefinitionSeedRequest | None = None):
     """Seed DB model definitions from the current YAML config."""
     service = get_service()
     yaml_models = service.config.defined_models.get("models", {})
@@ -355,7 +355,7 @@ async def seed_model_definitions(request: ModelDefinitionSeedRequest | None = No
     else:
         seeded = store.seed_from_yaml(yaml_models)
 
-    await reload_models_catalog()
+    reload_models_catalog()
     return ModelDefinitionSeedResponse(
         seeded=seeded,
         total_yaml=len(yaml_models),
@@ -364,7 +364,7 @@ async def seed_model_definitions(request: ModelDefinitionSeedRequest | None = No
 
 
 @router.get("/v1/bots", response_model=BotsResponse, tags=["System"])
-async def list_bots():
+def list_bots():
     """List available bots configured on the service."""
     service = get_service()
     bot_manager = BotManager(service.config)

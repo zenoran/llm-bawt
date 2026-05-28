@@ -17,7 +17,7 @@ from ..tasks import Task, TaskType
 router = APIRouter()
 
 @router.post("/v1/tasks", response_model=TaskSubmitResponse, tags=["Tasks"])
-async def submit_task(request: TaskSubmitRequest):
+def submit_task(request: TaskSubmitRequest):
     """Submit a background task for processing."""
     service = get_service()
     
@@ -67,7 +67,7 @@ async def get_task_status(
 
 
 @router.get("/v1/tasks", response_model=TaskListResponse, tags=["Tasks"])
-async def list_tasks(
+def list_tasks(
     status: str | None = Query(
         None,
         description="Filter by status: pending, completed, failed, running",

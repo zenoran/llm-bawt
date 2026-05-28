@@ -25,7 +25,7 @@ def _get_scheduler_engine():
 
 
 @router.post("/v1/jobs/{job_type}/trigger", tags=["Jobs"])
-async def trigger_job(job_type: str):
+def trigger_job(job_type: str):
     """Trigger a scheduled job to run immediately.
 
     Sets the job's next_run_at to the past so the scheduler picks it up
@@ -62,7 +62,7 @@ async def trigger_job(job_type: str):
 
 
 @router.get("/v1/jobs", response_model=ScheduledJobsResponse, tags=["Jobs"])
-async def list_scheduled_jobs(
+def list_scheduled_jobs(
     job_type: str | None = Query(None, description="Filter by job type"),
     bot_id: str | None = Query(None, description="Filter by bot ID"),
     enabled: bool | None = Query(None, description="Filter by enabled/disabled"),
@@ -140,7 +140,7 @@ async def list_scheduled_jobs(
 
 
 @router.get("/v1/jobs/runs", response_model=JobRunsResponse, tags=["Jobs"])
-async def list_job_runs(
+def list_job_runs(
     job_id: str | None = Query(None, description="Filter by scheduled job ID"),
     job_type: str | None = Query(None, description="Filter by job type"),
     bot_id: str | None = Query(None, description="Filter by bot ID"),

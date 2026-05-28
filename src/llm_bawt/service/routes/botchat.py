@@ -148,7 +148,7 @@ async def botchat_completions(bot_id: str, user_id: str, request: ChatCompletion
     response_model=ModelsResponse,
     tags=["Bot-Specific OpenAI Compatible"],
 )
-async def botchat_models(bot_id: str, user_id: str):
+def botchat_models(bot_id: str, user_id: str):
     """List available models (OpenAI-compatible) — scoped under the botchat path."""
     service = get_service()
     models = [ModelInfo(id=alias) for alias in service._available_models]

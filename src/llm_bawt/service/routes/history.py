@@ -423,7 +423,7 @@ def _build_summary_callable(service, bot_id: str, user_id: str = "system", model
 
 
 @router.get("/v1/history", response_model=HistoryResponse, tags=["History"])
-async def get_history(
+def get_history(
     bot_id: str = Query(None, description="Bot ID (uses default if not specified)"),
     limit: int = Query(50, description="Maximum number of messages to return"),
     before: str | None = Query(
@@ -520,7 +520,7 @@ async def get_history(
         raise HTTPException(status_code=500, detail=str(e))
 
 @router.post("/v1/history/search", response_model=HistorySearchResponse, tags=["History"])
-async def search_history(
+def search_history(
     query: str = Query(..., description="Search query"),
     bot_id: str = Query(None, description="Bot ID (uses default if not specified)"),
     limit: int = Query(50, description="Maximum number of messages to return"),
@@ -576,7 +576,7 @@ async def search_history(
         raise HTTPException(status_code=500, detail=str(e))
 
 @router.delete("/v1/history", response_model=HistoryClearResponse, tags=["History"])
-async def clear_history(
+def clear_history(
     bot_id: str = Query(None, description="Bot ID (uses default if not specified)"),
 ):
     """Clear conversation history for a bot."""
@@ -641,7 +641,7 @@ def _clear_history_direct(config, bot_id: str) -> bool:
         return False
 
 @router.get("/v1/history/summarize/preview", response_model=SummarizePreviewResponse, tags=["History"])
-async def preview_summarizable_sessions(
+def preview_summarizable_sessions(
     bot_id: str = Query(None, description="Bot ID"),
 ):
     """Preview sessions that would be summarized (dry run)."""
@@ -695,7 +695,7 @@ async def preview_summarizable_sessions(
         raise HTTPException(status_code=500, detail=str(e))
 
 @router.post("/v1/history/summarize", response_model=SummarizeResponse, tags=["History"])
-async def summarize_history(
+def summarize_history(
     bot_id: str = Query(None, description="Bot ID"),
     use_heuristic: bool = Query(False, description="Fall back to heuristic if LLM fails"),
     model: str | None = Query(None, description="Optional model alias override"),
@@ -749,7 +749,7 @@ async def summarize_history(
 
 
 @router.post("/v1/history/summarize/rebuild", response_model=SummarizeResponse, tags=["History"])
-async def rebuild_history_summaries(
+def rebuild_history_summaries(
     bot_id: str = Query(None, description="Bot ID"),
     sessions: int = Query(5, ge=0, le=2000, description="How many recent eligible sessions to rebuild (0 = all eligible)"),
     use_heuristic: bool = Query(False, description="Fall back to heuristic if LLM fails"),
@@ -807,7 +807,7 @@ async def rebuild_history_summaries(
         raise HTTPException(status_code=500, detail=str(e))
 
 @router.get("/v1/history/summaries", response_model=ListSummariesResponse, tags=["History"])
-async def list_summaries(
+def list_summaries(
     bot_id: str = Query(None, description="Bot ID"),
 ):
     """List existing history summaries."""
@@ -846,7 +846,7 @@ async def list_summaries(
         raise HTTPException(status_code=500, detail=str(e))
 
 @router.delete("/v1/history/summary/{summary_id}", response_model=DeleteSummaryResponse, tags=["History"])
-async def delete_summary(
+def delete_summary(
     summary_id: str,
     bot_id: str = Query(None, description="Bot ID"),
 ):

@@ -54,7 +54,7 @@ def _normalize_entity_type(entity_type: str | None) -> str | None:
 
 
 @router.get("/v1/profiles", response_model=ProfileListResponse, tags=["Profiles"])
-async def list_profiles(entity_type: str | None = None):
+def list_profiles(entity_type: str | None = None):
     """List profiles.
 
     - /v1/profiles: list all user + bot profiles
@@ -99,7 +99,7 @@ async def list_profiles(entity_type: str | None = None):
 
 
 @router.get("/v1/profiles/attribute", response_model=ProfileAttributeListResponse, tags=["Profiles"])
-async def list_profile_attributes(
+def list_profile_attributes(
     entity_type: str | None = Query(None, description="Filter by entity type: user or bot"),
     entity_id: str | None = Query(None, description="Filter by entity ID"),
     category: str | None = Query(None, description="Filter by attribute category"),
@@ -167,7 +167,7 @@ async def list_profile_attributes(
 
 
 @router.get("/v1/profiles/lookup", tags=["Profiles"])
-async def lookup_profile_by_email(email: str = Query(..., description="Email address to look up")):
+def lookup_profile_by_email(email: str = Query(..., description="Email address to look up")):
     """Look up a user profile by email address. Returns entity_id mapping."""
     service = get_service()
 
@@ -190,7 +190,7 @@ async def lookup_profile_by_email(email: str = Query(..., description="Email add
 
 
 @router.get("/v1/profiles/{entity_id}", response_model=ProfileDetail, tags=["Profiles"])
-async def get_profile(entity_id: str):
+def get_profile(entity_id: str):
     """Get one profile by ID (auto-detect user vs bot)."""
     service = get_service()
 
@@ -216,7 +216,7 @@ async def get_profile(entity_id: str):
 
 
 @router.get("/v1/profiles/{entity_type}/{entity_id}", response_model=ProfileDetail, tags=["Profiles"])
-async def get_typed_profile(entity_type: str, entity_id: str):
+def get_typed_profile(entity_type: str, entity_id: str):
     """Get one profile by explicit entity type and ID."""
     service = get_service()
 
@@ -238,7 +238,7 @@ async def get_typed_profile(entity_type: str, entity_id: str):
 
 
 @router.patch("/v1/profiles/attribute/{attribute_id}", response_model=UserProfileAttribute, tags=["Profiles"])
-async def update_profile_attribute(attribute_id: int, request: ProfileAttributeUpdateRequest):
+def update_profile_attribute(attribute_id: int, request: ProfileAttributeUpdateRequest):
     """Update a profile attribute by its ID."""
     service = get_service()
 
@@ -266,7 +266,7 @@ async def update_profile_attribute(attribute_id: int, request: ProfileAttributeU
 
 
 @router.patch("/v1/profiles/{entity_type}/{entity_id}", response_model=ProfileDetail, tags=["Profiles"])
-async def update_typed_profile(entity_type: str, entity_id: str, request: ProfileUpdateRequest):
+def update_typed_profile(entity_type: str, entity_id: str, request: ProfileUpdateRequest):
     """Update core profile fields by explicit entity type and ID."""
     service = get_service()
 
@@ -312,7 +312,7 @@ async def update_typed_profile(entity_type: str, entity_id: str, request: Profil
 
 
 @router.post("/v1/profiles/attribute", response_model=UserProfileAttribute, tags=["Profiles"])
-async def upsert_profile_attribute(request: ProfileAttributeUpsertRequest):
+def upsert_profile_attribute(request: ProfileAttributeUpsertRequest):
     """Create or update a profile attribute by entity identity and key."""
     service = get_service()
 
@@ -337,7 +337,7 @@ async def upsert_profile_attribute(request: ProfileAttributeUpsertRequest):
 
 
 @router.delete("/v1/profiles/attribute/{attribute_id}", tags=["Profiles"])
-async def delete_profile_attribute(attribute_id: int):
+def delete_profile_attribute(attribute_id: int):
     """Delete a profile attribute by its ID."""
     service = get_service()
 

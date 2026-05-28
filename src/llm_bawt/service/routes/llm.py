@@ -10,7 +10,7 @@ router = APIRouter()
 log = get_service_logger(__name__)
 
 @router.post("/v1/llm/complete", response_model=RawCompletionResponse, tags=["LLM"])
-async def raw_completion(request: RawCompletionRequest):
+def raw_completion(request: RawCompletionRequest):
     """Raw LLM completion using the currently loaded model.
     
     Use this for utility tasks like:

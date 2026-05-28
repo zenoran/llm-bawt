@@ -11,19 +11,19 @@ router = APIRouter()
 
 
 @router.get("/health", response_model=HealthResponse, tags=["System"])
-async def health_check():
+def health_check():
     """Health check endpoint."""
     return HealthResponse()
 
 
 @router.get("/status", response_model=ServiceStatusResponse, tags=["System"])
-async def get_status():
+def get_status():
     """Get detailed service status."""
     return get_service().get_status()
 
 
 @router.get("/v1/status", response_model=SystemStatusResponse, tags=["System"])
-async def get_system_status():
+def get_system_status():
     """Get full system status (config, service, memory, dependencies)."""
     from llm_bawt.core.status import collect_system_status
 

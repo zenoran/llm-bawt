@@ -409,7 +409,7 @@ async def _persist_bot_profile(
 
 
 @router.get("/v1/settings", response_model=RuntimeSettingsResponse, tags=["System"])
-async def list_runtime_settings(
+def list_runtime_settings(
     scope_type: str = Query("bot", description="global or bot"),
     scope_id: str | None = Query(None, description="bot slug for bot scope"),
 ):
@@ -425,7 +425,7 @@ async def list_runtime_settings(
 
 
 @router.get("/v1/settings/all", response_model=RuntimeSettingsListResponse, tags=["System"])
-async def list_all_runtime_settings(
+def list_all_runtime_settings(
     scope_type: str | None = Query(None, description="Filter by scope type: global or bot"),
     scope_id: str | None = Query(None, description="Filter by scope id ('*' for global)"),
     key: str | None = Query(None, description="Filter by exact key"),
@@ -500,7 +500,7 @@ async def list_all_runtime_settings(
 
 
 @router.put("/v1/settings", tags=["System"])
-async def upsert_runtime_setting(request: RuntimeSettingUpsertRequest):
+def upsert_runtime_setting(request: RuntimeSettingUpsertRequest):
     """Upsert one runtime setting for global or bot scope."""
     service = get_service()
     st, sid = _normalize_scope(request.scope_type, request.scope_id, service._default_bot)
@@ -522,7 +522,7 @@ async def upsert_runtime_setting(request: RuntimeSettingUpsertRequest):
 
 
 @router.delete("/v1/settings", tags=["System"])
-async def delete_runtime_setting(
+def delete_runtime_setting(
     scope_type: str = Query(..., description="global or bot"),
     key: str = Query(..., description="Setting key"),
     scope_id: str | None = Query(None, description="bot slug for bot scope"),
@@ -548,7 +548,7 @@ async def delete_runtime_setting(
 
 
 @router.post("/v1/settings/batch", tags=["System"])
-async def batch_upsert_runtime_settings(request: RuntimeSettingBatchUpsertRequest):
+def batch_upsert_runtime_settings(request: RuntimeSettingBatchUpsertRequest):
     """Batch upsert runtime settings."""
     service = get_service()
     store = get_runtime_settings_store(service.config)
@@ -581,7 +581,7 @@ async def batch_upsert_runtime_settings(request: RuntimeSettingBatchUpsertReques
 
 
 @router.get("/v1/bots/profiles", response_model=BotProfileListResponse, tags=["System"])
-async def list_bot_profiles(
+def list_bot_profiles(
     q: str | None = Query(None, description="Text filter against slug, name, and description"),
     uses_tools: bool | None = Query(None, description="Filter by uses_tools"),
     uses_search: bool | None = Query(None, description="Filter by uses_search"),
@@ -659,7 +659,7 @@ async def create_bot(request: BotCreateRequest):
 
 
 @router.get("/v1/bots/{slug}/profile", response_model=BotProfileResponse, tags=["System"])
-async def get_bot_profile(slug: str):
+def get_bot_profile(slug: str):
     """Get bot personality profile by slug."""
     service = get_service()
     store = get_bot_profile_store(service.config)
@@ -720,7 +720,7 @@ async def patch_bot_profile(slug: str, request: BotProfilePatchRequest):
 
 
 @router.post("/v1/admin/reload-bots", tags=["Admin"])
-async def reload_bots():
+def reload_bots():
     """Force reload bot registry from DB + YAML."""
     service = get_service()
     _reload_bot_registry()
@@ -735,7 +735,7 @@ async def reload_bots():
 
 
 @router.delete("/v1/bots/{slug}/profile", tags=["System"])
-async def delete_bot_profile(
+def delete_bot_profile(
     slug: str,
     purge: bool = Query(False, description="Also purge all bot data (messages, memories, settings, etc.)"),
 ):
@@ -762,7 +762,7 @@ async def delete_bot_profile(
 
 
 @router.post("/v1/bots/{slug}/purge-data", tags=["System"])
-async def purge_bot_data_endpoint(slug: str):
+def purge_bot_data_endpoint(slug: str):
     """Purge all data for a bot (messages, memories, settings, etc.) without deleting the profile."""
     service = get_service()
     normalized_slug = slug.strip().lower()
@@ -775,7 +775,7 @@ async def purge_bot_data_endpoint(slug: str):
 
 
 @router.post("/v1/bots/cleanup-orphans", tags=["System"])
-async def cleanup_orphans(
+def cleanup_orphans(
     dry_run: bool = Query(True, description="Report orphans without deleting (default true)"),
 ):
     """Find and remove data for bot IDs that no longer exist in bot_profiles.

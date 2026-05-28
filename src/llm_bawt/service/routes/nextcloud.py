@@ -70,7 +70,7 @@ async def provision_nextcloud_talk(request: NextcloudProvisionRequest):
         raise HTTPException(status_code=500, detail=str(e))
 
 @router.post("/admin/nextcloud-talk/reload", tags=["Admin"])
-async def reload_nextcloud_bots():
+def reload_nextcloud_bots():
     """Force reload Nextcloud bot configuration from disk."""
     from llm_bawt.integrations.nextcloud.manager import get_nextcloud_manager
     manager = get_nextcloud_manager()
