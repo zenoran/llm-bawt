@@ -41,26 +41,46 @@ def get_embedding_model(model_name: str = "all-MiniLM-L6-v2", verbose: bool = Fa
     try:
         from sentence_transformers import SentenceTransformer
         
-        # Temporarily suppress noisy library loggers
+        # Temporarily suppress noisy library loggers.
+        # httpx + huggingface_hub log every HEAD request HF makes during the
+        # ETag freshness check on load — one HEAD per file in the repo, each
+        # showing the 307 → 200 redirect hop. For an 11-file model that's
+        # ~20 lines of "HTTP Request: HEAD ..." spam every cold start, even
+        # when the model is already cached. Suppress them at the source.
         noisy_loggers = [
             "sentence_transformers",
             "transformers",
-            "transformers.modeling_utils", 
+            "transformers.modeling_utils",
             "torch.distributed",
+            "httpx",
+            "httpcore",
+            "huggingface_hub",
         ]
         old_levels = {}
         for name in noisy_loggers:
             lg = logging.getLogger(name)
             old_levels[name] = lg.level
-            lg.setLevel(logging.ERROR)
-        
+            lg.setLevel(logging.WARNING)
+
         # Show spinner during model load
         start_time = time.perf_counter()
         with console.status(f"[cyan]Loading embedding model[/cyan] [bold]{model_name}[/bold]"):
             with warnings.catch_warnings():
                 warnings.filterwarnings("ignore", message=".*layers were not sharded.*")
                 warnings.filterwarnings("ignore", category=FutureWarning)
-                _model = SentenceTransformer(model_name)
+                # Prefer the cached copy — once the model is on disk we don't
+                # want to round-trip to HF every restart for ETag checks.
+                # Fall back to a network load only if the cache is missing
+                # (first-time install or fresh container without a mount).
+                try:
+                    _model = SentenceTransformer(model_name, local_files_only=True)
+                    logger.debug(f"Loaded {model_name} from local cache (no network)")
+                except Exception as cache_miss:
+                    logger.info(
+                        f"Embedding model {model_name} not cached locally "
+                        f"({cache_miss}); downloading from HuggingFace…"
+                    )
+                    _model = SentenceTransformer(model_name)
                 _model_name = model_name
         
         # Restore log levels
