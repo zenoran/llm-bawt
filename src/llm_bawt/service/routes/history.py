@@ -9,6 +9,8 @@ from ..schemas import (
     HistoryClearResponse,
     HistoryMessage,
     HistoryResponse,
+    HistorySearchAllMessage,
+    HistorySearchAllResponse,
     HistorySearchResponse,
     ListSummariesResponse,
     SummarizableSession,
@@ -574,6 +576,59 @@ def search_history(
     except Exception as e:
         log.error(f"Failed to search history: {e}")
         raise HTTPException(status_code=500, detail=str(e))
+
+@router.post(
+    "/v1/history/search_all",
+    response_model=HistorySearchAllResponse,
+    tags=["History"],
+)
+async def search_all_history(
+    query: str = Query(..., description="Search query (FTS keywords or phrase)"),
+    limit: int = Query(50, description="Maximum total results across all bots"),
+    role_filter: str | None = Query(
+        None,
+        description="Only include messages with this role (user|assistant). System messages are always excluded.",
+    ),
+):
+    """Cross-bot full-text message search.
+
+    Reuses :meth:`llm_bawt.mcp_server.storage.MemoryStorage.search_all_messages`,
+    which performs a single Postgres FTS query via ``UNION ALL`` across every
+    ``{bot}_messages`` table. Returns ranked rows with bot attribution so a
+    global search UI can render "who said this and when" without N+1 fans-out.
+
+    First HTTP-exposed endpoint of the Spotlight Search project's Messages
+    provider.
+    """
+    from llm_bawt.mcp_server.storage import get_storage
+
+    try:
+        storage = get_storage()
+        rows = await storage.search_all_messages(
+            query=query,
+            n_results=limit,
+            role_filter=role_filter,
+        )
+        messages = [
+            HistorySearchAllMessage(
+                id=str(row.get("id", "")),
+                role=str(row.get("role", "")),
+                content=str(row.get("content", "")),
+                timestamp=float(row.get("timestamp", 0.0) or 0.0),
+                bot_id=str(row.get("source", "")),
+                rank=float(row.get("rank", 0.0) or 0.0),
+            )
+            for row in rows
+        ]
+        return HistorySearchAllResponse(
+            query=query,
+            messages=messages,
+            total_count=len(messages),
+        )
+    except Exception as e:
+        log.error(f"Failed cross-bot history search: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
 
 @router.delete("/v1/history", response_model=HistoryClearResponse, tags=["History"])
 def clear_history(

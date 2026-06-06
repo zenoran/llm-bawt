@@ -708,6 +708,37 @@ class HistorySearchResponse(BaseModel):
     total_count: int
 
 
+class HistorySearchAllMessage(BaseModel):
+    """A single hit from a cross-bot full-text message search.
+
+    Mirrors :class:`HistoryMessage` plus the ``bot_id`` source attribution
+    (so the frontend knows which bot's chat to deep-link into) and the FTS
+    ``rank`` score (so the dropdown can re-rank or filter low-confidence
+    matches). Carries no attachments — cross-bot search is content-only by
+    design; the attachment hydration round-trip only fires after the user
+    follows the link into the per-bot chat surface.
+    """
+    id: str
+    role: str
+    content: str
+    timestamp: float
+    bot_id: str
+    rank: float
+
+
+class HistorySearchAllResponse(BaseModel):
+    """Response for cross-bot history search.
+
+    ``messages`` are pre-sorted by FTS rank descending then timestamp
+    descending (most recent breaks ties). ``total_count`` matches the
+    length of the returned list; pagination cursors are not used because
+    the storage layer applies the limit before merging across bots.
+    """
+    query: str
+    messages: list[HistorySearchAllMessage]
+    total_count: int
+
+
 class HistoryClearResponse(BaseModel):
     """Response for clearing history."""
     success: bool
