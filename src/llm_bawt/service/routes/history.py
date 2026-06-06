@@ -490,6 +490,64 @@ def _load_sorted_visible_messages(
     return visible
 
 
+def _load_all_messages_via_sql(
+    service,
+    bot_id: str,
+) -> list[dict] | None:
+    """Direct-SQL read of the entire ``{bot}_messages`` table.
+
+    Bypasses :meth:`PostgreSQLShortTermManager.get_messages`'s
+    summarization filter so deep-link routes (``/v1/history/around``) can
+    locate ANY message that exists in the table — including messages whose
+    content has been folded into a summary and is therefore hidden from
+    the live chat tail. The summarization filter is correct for
+    "build a prompt" / "show the live conversation" but wrong for
+    "land me on this specific message that an upstream surface (Spotlight
+    Search, an external link) already found and referenced."
+
+    Mirrors the data-access pattern that powers
+    ``mcp_server.storage.search_all_messages``, so search hits and
+    deep-link landings see the same set of rows.
+
+    Returns ``None`` on backend unavailability so the caller can surface
+    a 503 with its own message rather than letting the exception bubble.
+    """
+    from sqlalchemy import text
+    from ...media.assets import _build_engine
+    from ...memory.postgresql import _sanitize_table_name
+
+    engine = _build_engine(service.config)
+    if engine is None:
+        return None
+
+    table = f"{_sanitize_table_name(bot_id)}_messages"
+    sql = text(
+        f"""
+        SELECT id, role, content, timestamp
+        FROM {table}
+        WHERE role NOT IN ('system', 'summary')
+        ORDER BY timestamp ASC, id ASC
+        """
+    )
+
+    try:
+        with engine.connect() as conn:
+            rows = conn.execute(sql).mappings().all()
+    except Exception as e:
+        log.warning(f"_load_all_messages_via_sql failed for {bot_id}: {e}")
+        return None
+
+    return [
+        {
+            "id": str(row["id"] or ""),
+            "role": str(row["role"] or ""),
+            "content": str(row["content"] or ""),
+            "timestamp": float(row["timestamp"] or 0.0),
+        }
+        for row in rows
+    ]
+
+
 def _build_history_response(
     service,
     effective_bot_id: str,
@@ -658,7 +716,9 @@ def get_history_around(
     service = get_service()
 
     try:
-        visible_messages = _load_sorted_visible_messages(service, bot_id)
+        visible_messages = _load_all_messages_via_sql(service, bot_id)
+        if visible_messages is None:
+            raise HTTPException(status_code=503, detail="Memory service unavailable")
         target_idx = next(
             (i for i, m in enumerate(visible_messages) if str(m.get("id") or "") == message_id),
             -1,
