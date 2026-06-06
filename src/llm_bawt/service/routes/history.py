@@ -424,6 +424,129 @@ def _build_summary_callable(service, bot_id: str, user_id: str = "system", model
     return summarize_with_loaded_client, summarize_batch_with_loaded_client, max_chunk_tokens
 
 
+def _resolve_cursor(
+    raw: str,
+    visible_messages: list[dict],
+) -> float | None:
+    """Resolve a `before`/`after` cursor to a unix-timestamp cutoff.
+
+    Accepts:
+      1) a numeric unix timestamp (``"1717891234.567"``)
+      2) an ISO-8601 timestamp (``"2026-06-06T14:00:00Z"``)
+      3) a message ID — looked up in ``visible_messages`` for its timestamp
+
+    Returns ``None`` if the raw string is empty after stripping. Raises
+    ``HTTPException(400)`` only for the message-ID branch when the ID
+    isn't found; numeric/ISO failures fall through silently because the
+    caller may have legitimately passed empty/garbage.
+    """
+    from datetime import datetime
+
+    trimmed = raw.strip()
+    if not trimmed:
+        return None
+
+    # 1) Numeric unix timestamp
+    try:
+        return float(trimmed)
+    except ValueError:
+        pass
+
+    # 2) ISO timestamp
+    iso_candidate = trimmed.replace("Z", "+00:00")
+    try:
+        return datetime.fromisoformat(iso_candidate).timestamp()
+    except ValueError:
+        pass
+
+    # 3) Message ID cursor
+    cursor_msg = next(
+        (m for m in visible_messages if str(m.get("id") or "") == trimmed),
+        None,
+    )
+    if cursor_msg is None:
+        raise HTTPException(status_code=400, detail="Invalid cursor")
+    return float(cursor_msg.get("timestamp") or 0.0)
+
+
+def _load_sorted_visible_messages(
+    service,
+    effective_bot_id: str,
+) -> list[dict]:
+    """Pull all visible messages for a bot, sorted chronologically.
+
+    Shared by the per-bot history routes (``/v1/history``,
+    ``/v1/history/around``). Filters out ``system`` / ``summary`` rows
+    so summaries — which have their own surface — don't bleed into chat
+    history paging.
+    """
+    client = service.get_memory_client(effective_bot_id)
+    if not client:
+        raise HTTPException(status_code=503, detail="Memory service unavailable")
+
+    messages = client.get_messages(since_seconds=None)
+    visible = [m for m in messages if m.get("role") not in ("system", "summary")]
+    visible.sort(key=lambda m: (float(m.get("timestamp") or 0.0), str(m.get("id") or "")))
+    return visible
+
+
+def _build_history_response(
+    service,
+    effective_bot_id: str,
+    visible_messages: list[dict],
+    page_messages: list[dict],
+    candidate_count: int | None,
+    *,
+    has_older: bool | None = None,
+    has_newer: bool | None = None,
+    anchor_id: str | None = None,
+) -> HistoryResponse:
+    """Hydrate attachments and assemble a HistoryResponse for a slice.
+
+    Centralises the attachment hydration + boundary-flag work so the three
+    history endpoints (legacy ``/v1/history`` backward, the new ``/v1/history``
+    forward, and ``/v1/history/around``) all produce identically-shaped
+    responses without copy-pasted glue.
+    """
+    attachments_by_id = _hydrate_attachments_for_page(
+        service, effective_bot_id, page_messages
+    )
+    history_messages = [
+        HistoryMessage(
+            id=msg.get("id"),
+            role=msg.get("role", ""),
+            content=msg.get("content", ""),
+            timestamp=msg.get("timestamp", 0.0),
+            attachments=attachments_by_id.get(str(msg.get("id") or ""), []),
+        )
+        for msg in page_messages
+    ]
+
+    oldest_timestamp = history_messages[0].timestamp if history_messages else None
+    newest_timestamp = history_messages[-1].timestamp if history_messages else None
+
+    # If callers passed has_older / has_newer explicitly, trust them. Otherwise
+    # infer from the candidate vs page sizes (legacy single-direction path).
+    resolved_has_older = (
+        has_older
+        if has_older is not None
+        else bool(candidate_count is not None and candidate_count > len(page_messages))
+    )
+    resolved_has_newer = has_newer if has_newer is not None else False
+
+    return HistoryResponse(
+        bot_id=effective_bot_id,
+        messages=history_messages,
+        total_count=len(history_messages),
+        has_more=resolved_has_older,
+        has_older=resolved_has_older,
+        has_newer=resolved_has_newer,
+        oldest_timestamp=oldest_timestamp,
+        newest_timestamp=newest_timestamp,
+        anchor_id=anchor_id,
+    )
+
+
 @router.get("/v1/history", response_model=HistoryResponse, tags=["History"])
 def get_history(
     bot_id: str = Query(None, description="Bot ID (uses default if not specified)"),
@@ -432,93 +555,135 @@ def get_history(
         None,
         description="Cursor for older history pages (ISO timestamp, unix timestamp, or message ID)",
     ),
+    after: str | None = Query(
+        None,
+        description=(
+            "Cursor for forward pagination — returns the OLDEST `limit` messages strictly newer "
+            "than this cursor. Used after a deep-link landing (`/v1/history/around`) when the "
+            "user scrolls down past the loaded window. Mutually exclusive with `before`."
+        ),
+    ),
 ):
-    """Get conversation history for a bot."""
-    from datetime import datetime
+    """Get conversation history for a bot.
+
+    Two-direction pagination:
+
+    - ``?before=<cursor>`` (default direction) — load older messages. Takes
+      the NEWEST ``limit`` messages strictly older than the cursor.
+    - ``?after=<cursor>`` — load newer messages. Takes the OLDEST ``limit``
+      messages strictly newer than the cursor. Used to extend a deep-link
+      window forward as the user scrolls down past it.
+
+    Cursors accept unix timestamps, ISO-8601 strings, or message IDs.
+    Passing both ``before`` and ``after`` is rejected (400).
+    """
+    if before and after:
+        raise HTTPException(
+            status_code=400,
+            detail="`before` and `after` are mutually exclusive",
+        )
 
     service = get_service()
-    
     effective_bot_id = bot_id or service._default_bot
-    
+
     try:
-        # Use memory client to get messages from database
-        client = service.get_memory_client(effective_bot_id)
-        if not client:
-            raise HTTPException(status_code=503, detail="Memory service unavailable")
-        
-        # Get all messages then paginate in-memory (includes both embedded and MCP server modes).
-        messages = client.get_messages(since_seconds=None)
+        visible_messages = _load_sorted_visible_messages(service, effective_bot_id)
 
-        # Filter out system and summary messages and normalize chronological ordering.
-        # Summaries have their own endpoint at /v1/history/summaries.
-        visible_messages = [m for m in messages if m.get("role") not in ("system", "summary")]
-        visible_messages.sort(key=lambda m: (float(m.get("timestamp") or 0.0), str(m.get("id") or "")))
+        before_ts = _resolve_cursor(before, visible_messages) if before else None
+        after_ts = _resolve_cursor(after, visible_messages) if after else None
 
-        # Resolve `before` cursor to timestamp cutoff.
-        before_ts: float | None = None
-        if before:
-            raw = before.strip()
-            if raw:
-                # 1) Numeric unix timestamp
-                try:
-                    before_ts = float(raw)
-                except ValueError:
-                    before_ts = None
-
-                # 2) ISO timestamp
-                if before_ts is None:
-                    iso_candidate = raw.replace("Z", "+00:00")
-                    try:
-                        before_ts = datetime.fromisoformat(iso_candidate).timestamp()
-                    except ValueError:
-                        before_ts = None
-
-                # 3) Message ID cursor
-                if before_ts is None:
-                    cursor_msg = next((m for m in visible_messages if str(m.get("id") or "") == raw), None)
-                    if cursor_msg is None:
-                        raise HTTPException(status_code=400, detail="Invalid 'before' cursor")
-                    before_ts = float(cursor_msg.get("timestamp") or 0.0)
-
-        if before_ts is not None:
-            candidate_messages = [m for m in visible_messages if float(m.get("timestamp") or 0.0) < before_ts]
+        if after_ts is not None:
+            # Forward page: oldest `limit` messages strictly newer than the cursor.
+            candidate_messages = [
+                m for m in visible_messages
+                if float(m.get("timestamp") or 0.0) > after_ts
+            ]
+            page_messages = candidate_messages[:limit] if limit > 0 else candidate_messages
+            # In the forward direction `has_more` semantically means
+            # "more *newer* messages exist beyond the returned page".
+            has_older = False  # forward queries don't tell us about the older side
+            has_newer = bool(candidate_messages and len(candidate_messages) > len(page_messages))
         else:
-            candidate_messages = visible_messages
-
-        # Take newest `limit` from the candidate set, while returning chronological order.
-        if limit > 0 and len(candidate_messages) > limit:
-            page_messages = candidate_messages[-limit:]
-        else:
-            page_messages = candidate_messages
-
-        # TASK-226: resolve per-page attachments JSONB -> full URL blocks.
-        attachments_by_id = _hydrate_attachments_for_page(
-            service, effective_bot_id, page_messages
-        )
-
-        history_messages = [
-            HistoryMessage(
-                id=msg.get("id"),
-                role=msg.get("role", ""),
-                content=msg.get("content", ""),
-                timestamp=msg.get("timestamp", 0.0),
-                attachments=attachments_by_id.get(str(msg.get("id") or ""), []),
+            # Backward page (default): newest `limit` strictly older than the cursor.
+            if before_ts is not None:
+                candidate_messages = [
+                    m for m in visible_messages
+                    if float(m.get("timestamp") or 0.0) < before_ts
+                ]
+            else:
+                candidate_messages = visible_messages
+            page_messages = (
+                candidate_messages[-limit:]
+                if limit > 0 and len(candidate_messages) > limit
+                else candidate_messages
             )
-            for msg in page_messages
-        ]
+            has_older = len(candidate_messages) > len(page_messages)
+            has_newer = False  # legacy direction never reports the newer side
 
-        oldest_timestamp = history_messages[0].timestamp if history_messages else None
-        has_more = len(candidate_messages) > len(page_messages)
-        
-        return HistoryResponse(
-            bot_id=effective_bot_id,
-            messages=history_messages,
-            total_count=len(history_messages),
-            has_more=has_more,
-            oldest_timestamp=oldest_timestamp,
+        return _build_history_response(
+            service,
+            effective_bot_id,
+            visible_messages,
+            page_messages,
+            candidate_count=None,
+            has_older=has_older,
+            has_newer=has_newer,
         )
+    except HTTPException:
+        raise
     except Exception as e:
         log.error(f"Failed to get history: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/v1/history/around", response_model=HistoryResponse, tags=["History"])
+def get_history_around(
+    bot_id: str = Query(..., description="Bot ID"),
+    message_id: str = Query(..., description="Anchor message ID — window is centered on this row"),
+    before: int = Query(30, ge=0, le=200, description="Number of older messages to include"),
+    after: int = Query(10, ge=0, le=200, description="Number of newer messages to include"),
+):
+    """Return a window of messages around an anchor.
+
+    Powers deep-link entry into chat surfaces (``/chat/<bot>?message=<id>``).
+    Returns the anchor row plus ``before`` older + ``after`` newer rows,
+    with ``has_older`` / ``has_newer`` flags so the frontend knows whether
+    further pagination in either direction is possible.
+
+    The returned ``oldest_timestamp`` and ``newest_timestamp`` are valid
+    cursors for ``/v1/history?before=...`` and ``/v1/history?after=...``
+    respectively, so continued scrolling stays on the standard paging
+    surface — no separate "extend window" endpoint needed.
+    """
+    service = get_service()
+
+    try:
+        visible_messages = _load_sorted_visible_messages(service, bot_id)
+        target_idx = next(
+            (i for i, m in enumerate(visible_messages) if str(m.get("id") or "") == message_id),
+            -1,
+        )
+        if target_idx < 0:
+            raise HTTPException(status_code=404, detail=f"Message {message_id!r} not found")
+
+        start = max(0, target_idx - before)
+        end = min(len(visible_messages), target_idx + after + 1)
+        page_messages = visible_messages[start:end]
+
+        return _build_history_response(
+            service,
+            bot_id,
+            visible_messages,
+            page_messages,
+            candidate_count=None,
+            has_older=start > 0,
+            has_newer=end < len(visible_messages),
+            anchor_id=message_id,
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        log.error(f"Failed to load history window around {message_id}: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 @router.post("/v1/history/search", response_model=HistorySearchResponse, tags=["History"])

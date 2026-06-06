@@ -692,12 +692,31 @@ class HistoryMessage(BaseModel):
 
 
 class HistoryResponse(BaseModel):
-    """Response for conversation history."""
+    """Response for conversation history.
+
+    Pagination flags describe the loaded window's boundaries against the
+    bot's full timeline:
+
+    - ``has_more`` / ``has_older``: more messages exist *before* the
+      oldest row returned. The two aliases are kept in sync — ``has_more``
+      pre-dates the deep-link work and is the field every legacy reader
+      checks; ``has_older`` is the explicit name used by the deep-link
+      ``/v1/history/around`` window endpoint and `?after=` forward paging.
+    - ``has_newer``: more messages exist *after* the newest row returned.
+      Newly added for deep-link windows and forward pagination; defaults
+      ``False`` so legacy backward-only pagination behaves unchanged.
+    - ``oldest_timestamp`` / ``newest_timestamp``: window boundaries used
+      by the frontend as cursors for paginating in either direction.
+    """
     bot_id: str
     messages: list[HistoryMessage]
     total_count: int
     has_more: bool = False
+    has_older: bool = False
+    has_newer: bool = False
     oldest_timestamp: float | None = None
+    newest_timestamp: float | None = None
+    anchor_id: str | None = None
 
 
 class HistorySearchResponse(BaseModel):
