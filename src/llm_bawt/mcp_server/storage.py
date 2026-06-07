@@ -815,12 +815,30 @@ class MemoryStorage:
         query: str,
         n_results: int = 10,
         role_filter: str | None = None,
+        sort_by: str = "relevance",
+        since: float | None = None,
+        until: float | None = None,
     ) -> list[dict[str, Any]]:
         """Full-text search across ALL bots' message histories.
 
         Builds a UNION ALL query across every ``*_messages`` table so a single
         question like *"who was working on the stop button?"* returns ranked
         results from all bots in one call.
+
+        Parameters drive the Spotlight modal's facet controls:
+
+        * ``sort_by`` — ``"relevance"`` (default; rank then timestamp) or
+          ``"recent"`` (timestamp only, ignores rank). The Spotlight UI
+          exposes both for cases where the most-relevant doc is two months
+          old and the user actually wants the latest match.
+        * ``since`` / ``until`` — Unix seconds. Inclusive bounds; either can
+          be omitted. Used by the time-range chips (24h / 7d / 30d / all).
+
+        Each returned row also carries a ``total`` field (window COUNT(*)
+        over the unbounded result set) so the UI can render "showing N of M
+        matches" without a second roundtrip. ``total`` is identical on
+        every row; callers can read it from the first row and ignore the
+        rest. Empty result → no rows → caller should treat as ``total=0``.
         """
         from sqlalchemy import text
         from llm_bawt.memory.postgresql import build_fts_query
@@ -832,6 +850,12 @@ class MemoryStorage:
         tables = self._discover_tables("_messages")
         if not tables:
             return []
+
+        # Compose conditional WHERE fragments once. They reference bind
+        # params resolved per-execution below.
+        time_lower = "AND timestamp >= :since" if since is not None else ""
+        time_upper = "AND timestamp <= :until" if until is not None else ""
+        role_clause = "AND role = :role_filter" if role_filter else ""
 
         # Build UNION ALL across all message tables
         sub_selects: list[str] = []
@@ -845,19 +869,37 @@ class MemoryStorage:
                 FROM {table_name}
                 WHERE to_tsvector('english', content) @@ to_tsquery('english', :query)
                   AND role != 'system'
-                  {("AND role = :role_filter" if role_filter else "")}
+                  {role_clause}
+                  {time_lower}
+                  {time_upper}
             )""")
 
         union_sql = "\nUNION ALL\n".join(sub_selects)
+        # ``sort_by="recent"`` ignores rank entirely so the user can search
+        # for a common word and still see the latest hit. Whitelist before
+        # interpolation — sort_by is the only SQL fragment built from a
+        # caller-supplied string, so the comparison is the safety net.
+        order_clause = "ORDER BY timestamp DESC" if sort_by == "recent" else "ORDER BY rank DESC, timestamp DESC"
+        # ``COUNT(*) OVER ()`` is the unbounded-total trick: each row in
+        # the LIMIT slice carries the count of all rows that matched the
+        # WHERE, so the caller knows "you're seeing 10 of 1497" without
+        # a second roundtrip. Postgres has to materialize all matches to
+        # count them — fine for tens of thousands, watch if we ever hit
+        # very common short tokens.
         full_sql = text(f"""
-            {union_sql}
-            ORDER BY rank DESC, timestamp DESC
+            SELECT *, COUNT(*) OVER () AS total
+            FROM ({union_sql}) AS u
+            {order_clause}
             LIMIT :limit
         """)
 
         params: dict[str, Any] = {"query": or_query, "limit": n_results}
         if role_filter:
             params["role_filter"] = role_filter
+        if since is not None:
+            params["since"] = since
+        if until is not None:
+            params["until"] = until
 
         backend = self._get_backend("default")
         try:
@@ -871,6 +913,7 @@ class MemoryStorage:
                         "timestamp": row.timestamp,
                         "source": row.source,
                         "rank": row.rank,
+                        "total": int(row.total),
                     }
                     for row in rows
                 ]
@@ -883,6 +926,9 @@ class MemoryStorage:
         query: str,
         n_results: int = 10,
         role_filter: str | None = None,
+        sort_by: str = "relevance",
+        since: float | None = None,
+        until: float | None = None,
     ) -> list[dict[str, Any]]:
         """Cross-bot substring/fuzzy search via ``pg_trgm``.
 
@@ -917,6 +963,11 @@ class MemoryStorage:
         if not tables:
             return []
 
+        # Optional WHERE fragments. Same pattern as search_all_messages.
+        time_lower = "AND timestamp >= :since" if since is not None else ""
+        time_upper = "AND timestamp <= :until" if until is not None else ""
+        role_clause = "AND role = :role_filter" if role_filter else ""
+
         # Build UNION ALL across all message tables. Each sub-select runs
         # the trigram-indexed ILIKE filter and computes a similarity score
         # for ranking. similarity() is per-row and doesn't use the index,
@@ -931,13 +982,22 @@ class MemoryStorage:
                 FROM {table_name}
                 WHERE content ILIKE :ilike
                   AND role != 'system'
-                  {("AND role = :role_filter" if role_filter else "")}
+                  {role_clause}
+                  {time_lower}
+                  {time_upper}
             )""")
 
         union_sql = "\nUNION ALL\n".join(sub_selects)
+        # ``sort_by="recent"`` ignores similarity — useful for "find the
+        # latest mention of this token" once the user knows the token
+        # itself is common.
+        order_clause = "ORDER BY timestamp DESC" if sort_by == "recent" else "ORDER BY rank DESC, timestamp DESC"
+        # Window COUNT(*) for the unbounded total. See the FTS sibling
+        # for rationale.
         full_sql = text(f"""
-            {union_sql}
-            ORDER BY rank DESC, timestamp DESC
+            SELECT *, COUNT(*) OVER () AS total
+            FROM ({union_sql}) AS u
+            {order_clause}
             LIMIT :limit
         """)
 
@@ -952,6 +1012,10 @@ class MemoryStorage:
         }
         if role_filter:
             params["role_filter"] = role_filter
+        if since is not None:
+            params["since"] = since
+        if until is not None:
+            params["until"] = until
 
         backend = self._get_backend("default")
         try:
@@ -965,6 +1029,7 @@ class MemoryStorage:
                         "timestamp": row.timestamp,
                         "source": row.source,
                         "rank": row.rank,
+                        "total": int(row.total),
                     }
                     for row in rows
                 ]

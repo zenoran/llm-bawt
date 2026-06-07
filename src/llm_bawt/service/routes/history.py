@@ -825,6 +825,24 @@ async def search_all_history(
             "or anything where FTS tokenization would discard signal."
         ),
     ),
+    sort_by: str = Query(
+        "relevance",
+        description=(
+            "Result ordering. 'relevance' (default) sorts by rank (ts_rank "
+            "for FTS, similarity for trgm) then timestamp; lets the densest "
+            "match win even if it's old. 'recent' sorts by timestamp only — "
+            "best when the query is a common token and you want the latest "
+            "hit (e.g. '/new' in a chat history)."
+        ),
+    ),
+    since: float | None = Query(
+        None,
+        description="Lower-bound timestamp (inclusive Unix seconds). Omit for unbounded history.",
+    ),
+    until: float | None = Query(
+        None,
+        description="Upper-bound timestamp (inclusive Unix seconds). Omit for now.",
+    ),
 ):
     """Cross-bot message search.
 
@@ -858,6 +876,9 @@ async def search_all_history(
                 query=query,
                 n_results=limit,
                 role_filter=role_filter,
+                sort_by=sort_by,
+                since=since,
+                until=until,
             )
         else:
             # Default / legacy / explicit "fts" all route to the original
@@ -867,6 +888,9 @@ async def search_all_history(
                 query=query,
                 n_results=limit,
                 role_filter=role_filter,
+                sort_by=sort_by,
+                since=since,
+                until=until,
             )
         messages = [
             HistorySearchAllMessage(
@@ -879,10 +903,15 @@ async def search_all_history(
             )
             for row in rows
         ]
+        # The storage methods now stamp the unbounded total onto every row
+        # via a window COUNT(*). Surface it as `total_count` so the UI can
+        # render "showing N of M". Empty result → 0. Read from the first
+        # row since the value is the same on all rows.
+        unbounded_total = int(rows[0].get("total", 0)) if rows else 0
         return HistorySearchAllResponse(
             query=query,
             messages=messages,
-            total_count=len(messages),
+            total_count=unbounded_total,
         )
     except Exception as e:
         log.error(f"Failed cross-bot history search: {e}")
