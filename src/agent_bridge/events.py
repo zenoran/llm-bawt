@@ -17,6 +17,12 @@ class AgentEventKind(str, Enum):
     RUN_COMPLETED = "run_completed"
     SYSTEM_NOTE = "system_note"
     ERROR = "error"
+    # Emitted whenever a bridge clears its server-side session — via /new
+    # in _handle_send or via the session.reset RPC.  Lets the frontend
+    # clear its visible message buffer deterministically instead of
+    # racing turn_complete timing.  Payload uses raw={"bot_id", "session_key",
+    # "target", "had_session"} so the UI can scope the clear.
+    SESSION_RESET = "session_reset"
 
 
 @dataclass

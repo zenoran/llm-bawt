@@ -151,8 +151,11 @@ async def session_reset(request: SessionResetRequest) -> SessionResetResponse:
         )
     except Exception as e:
         log.warning("session.reset RPC failed for bot %s: %s", request.bot_id, e)
-        # Even if the bridge doesn't handle this RPC, we still return ok
-        # — the bridge may not support it (e.g. openclaw)
+        # Even if the bridge fails to clear gateway-side context, we still
+        # return ok — every bridge (claude-code, codex, openclaw) now
+        # intercepts session.reset and emits a SESSION_RESET unified event
+        # on a best-effort path, so the frontend-visible reset still
+        # happens.  See TASK-249.
 
     log.info("Session reset requested: bot=%s session=%s", request.bot_id, session_key)
     return SessionResetResponse(

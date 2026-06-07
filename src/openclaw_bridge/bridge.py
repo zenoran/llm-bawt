@@ -181,6 +181,56 @@ class SessionBridge:
             request_id, session_key, message,
         )
 
+        # /new resets the session (TASK-249).  OpenClaw has no gateway-side
+        # session-clear RPC, so "clearing" here is a frontend signal —
+        # we try a session.reset WS call best-effort, then emit
+        # SESSION_RESET on the unified SSE stream so the visible buffer
+        # is wiped deterministically.  The confirmation "Session reset…"
+        # is also pushed on the run stream so the originating
+        # /v1/chat/completions request finishes with assistant content,
+        # mirroring the claude-code / codex bridges.
+        if message.lstrip().startswith("/new"):
+            bot_id_for_reset = self._resolve_bot_id(session_key) or session_key
+            cleared = await self._reset_openclaw_session(session_key)
+            logger.info(
+                "Session reset via /new: session=%s bot=%s gateway_cleared=%s",
+                session_key, bot_id_for_reset, cleared,
+            )
+            self._publish_session_reset_unified(
+                bot_id_for_reset, session_key, had_session=cleared,
+            )
+            message = message.lstrip().removeprefix("/new").strip()
+            if not message:
+                self._publisher.publish_run_event(
+                    request_id,
+                    AgentEvent(
+                        event_id=f"{request_id}:session-reset-delta",
+                        session_key=session_key,
+                        run_id=request_id,
+                        kind=AgentEventKind.ASSISTANT_DELTA,
+                        origin="bridge",
+                        text="Session reset. Ready for a new conversation.",
+                        seq=1,
+                        trigger_message_id=trigger_message_id,
+                    ),
+                )
+                self._publisher.publish_run_event(
+                    request_id,
+                    AgentEvent(
+                        event_id=f"{request_id}:session-reset-done",
+                        session_key=session_key,
+                        run_id=request_id,
+                        kind=AgentEventKind.ASSISTANT_DONE,
+                        origin="bridge",
+                        text="Session reset. Ready for a new conversation.",
+                        seq=2,
+                        trigger_message_id=trigger_message_id,
+                    ),
+                )
+                self._publisher.publish_run_done(request_id)
+                await async_redis.xack(COMMANDS_STREAM, "bridge", msg_id)
+                return
+
         async with self._session_queue.lock(session_key):
             try:
                 # Clear any previous cancel signal before starting a new send
@@ -309,6 +359,34 @@ class SessionBridge:
                 if params_session:
                     self._ws_client.cancel_session(params_session)
 
+            # session.reset doesn't exist as a gateway-side RPC.  Intercept
+            # it here so the frontend gets a deterministic SESSION_RESET
+            # unified event instead of an "rpc method not found" error.
+            # See TASK-249.
+            if method == "session.reset":
+                session_key_arg = (params.get("sessionKey") or "").strip()
+                if not session_key_arg:
+                    self._publisher.publish_rpc_result(
+                        request_id, {"ok": False, "error": "missing sessionKey"},
+                    )
+                else:
+                    bot_id_for_reset = (
+                        self._resolve_bot_id(session_key_arg) or session_key_arg
+                    )
+                    cleared = await self._reset_openclaw_session(session_key_arg)
+                    logger.info(
+                        "Session reset via RPC: session=%s bot=%s gateway_cleared=%s",
+                        session_key_arg, bot_id_for_reset, cleared,
+                    )
+                    self._publish_session_reset_unified(
+                        bot_id_for_reset, session_key_arg, had_session=cleared,
+                    )
+                    self._publisher.publish_rpc_result(
+                        request_id,
+                        {"ok": True, "reset": bot_id_for_reset, "had_session": cleared},
+                    )
+                return
+
             res = await self._ws_client._request(method, params)
             payload = res.get("payload", {})
             self._publisher.publish_rpc_result(request_id, {"ok": True, "payload": payload})
@@ -317,6 +395,66 @@ class SessionBridge:
             self._publisher.publish_rpc_result(request_id, {"ok": False, "error": str(e)})
         finally:
             await async_redis.xack(COMMANDS_STREAM, "bridge", msg_id)
+
+    async def _reset_openclaw_session(self, session_key: str) -> bool:
+        """Best-effort: ask the OpenClaw gateway to clear server-side context.
+
+        The gateway has no published session-clear RPC, so we try a few
+        plausible method names and treat any non-error response as success.
+        Failure is non-fatal — the frontend-visible reset still happens via
+        the SESSION_RESET unified event.
+        """
+        if not session_key:
+            return False
+        for method_name in ("session.reset", "chat.reset", "session.clear"):
+            try:
+                await self._ws_client._request(method_name, {"sessionKey": session_key})
+                logger.info(
+                    "OpenClaw gateway cleared session via %s: %s",
+                    method_name, session_key,
+                )
+                return True
+            except Exception as e:
+                logger.debug(
+                    "OpenClaw %s failed for session=%s: %s",
+                    method_name, session_key, e,
+                )
+        logger.info(
+            "OpenClaw gateway has no session-reset RPC — frontend signal only "
+            "for session=%s", session_key,
+        )
+        return False
+
+    def _publish_session_reset_unified(
+        self,
+        bot_id: str,
+        session_key: str,
+        *,
+        had_session: bool = False,
+        user_id: str = "nick",
+    ) -> None:
+        """Publish SESSION_RESET on the unified SSE stream so the frontend
+        can clear its visible message buffer for ``bot_id`` deterministically.
+        See TASK-249.
+        """
+        if not bot_id:
+            return
+        try:
+            self._publisher.publish_unified_event(bot_id, user_id, {
+                "_type": "session_reset",
+                "bot_id": bot_id,
+                "user_id": user_id,
+                "session_key": session_key,
+                "had_session": bool(had_session),
+                "text": "Session reset. Ready for a new conversation.",
+                "provider": "openclaw",
+                "ts": datetime.now().timestamp(),
+            })
+        except Exception:
+            logger.exception(
+                "Failed to publish unified session_reset for bot=%s session=%s",
+                bot_id, session_key,
+            )
 
     async def _wait_for_history_reply(self, session_key: str) -> str | None:
         """Poll chat.history for a fresh assistant reply after empty streams.

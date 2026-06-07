@@ -516,6 +516,12 @@ class ClaudeCodeBridge:
         if message.lstrip().startswith("/new"):
             cleared = await self._clear_session(bot_slug or session_key)
             logger.info("Session reset via /new: %s (had_session=%s)", bot_slug or session_key, cleared)
+            # Publish a deterministic SESSION_RESET unified event so the
+            # frontend can clear its visible buffer without racing
+            # turn_complete timing.  See TASK-249.
+            self._publish_session_reset_unified(
+                bot_slug or session_key, session_key, had_session=cleared,
+            )
             message = message.lstrip().removeprefix("/new").strip()
             if not message:
                 # Just "/new" with no follow-up — acknowledge and done
@@ -1013,6 +1019,12 @@ class ClaudeCodeBridge:
                 if target:
                     cleared = await self._clear_session(target)
                     logger.info("Session reset: %s (had_session=%s)", target, cleared)
+                    # Emit a deterministic SESSION_RESET unified event so any
+                    # active frontend SSE consumer for this bot can clear its
+                    # visible buffer.  See TASK-249.
+                    self._publish_session_reset_unified(
+                        target, session_key or target, had_session=cleared,
+                    )
                     self._publisher.publish_rpc_result(
                         request_id, {"ok": True, "reset": target, "had_session": cleared}
                     )
@@ -1152,3 +1164,37 @@ class ClaudeCodeBridge:
             trigger_message_id=self._trigger_message_ids.get(request_id),
         )
         self._publisher.publish_run_event(request_id, event)
+
+    def _publish_session_reset_unified(
+        self,
+        bot_id: str,
+        session_key: str,
+        *,
+        had_session: bool = False,
+        user_id: str = "nick",
+    ) -> None:
+        """Publish a SESSION_RESET event on the unified SSE stream.
+
+        Deterministic signal for the frontend to clear its visible message
+        buffer for ``bot_id``.  Carries the confirmation text so the UI can
+        render it as a synthetic assistant message in one place instead of
+        racing the HTTP run stream's ASSISTANT_DONE.  See TASK-249.
+        """
+        if not bot_id:
+            return
+        try:
+            self._publisher.publish_unified_event(bot_id, user_id, {
+                "_type": "session_reset",
+                "bot_id": bot_id,
+                "user_id": user_id,
+                "session_key": session_key,
+                "had_session": bool(had_session),
+                "text": "Session reset. Ready for a new conversation.",
+                "provider": self._backend_name,
+                "ts": datetime.now(timezone.utc).timestamp(),
+            })
+        except Exception:
+            logger.exception(
+                "Failed to publish unified session_reset for bot=%s session=%s",
+                bot_id, session_key,
+            )
