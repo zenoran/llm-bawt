@@ -878,6 +878,100 @@ class MemoryStorage:
             logger.error("search_all_messages failed: %s", e)
             return []
 
+    async def search_all_messages_trgm(
+        self,
+        query: str,
+        n_results: int = 10,
+        role_filter: str | None = None,
+    ) -> list[dict[str, Any]]:
+        """Cross-bot substring/fuzzy search via ``pg_trgm``.
+
+        Companion to :meth:`search_all_messages` (which uses Postgres FTS via
+        ``to_tsquery``). FTS is great for natural-language queries — it
+        stems, drops stop-words, and ranks by lexeme density — but it
+        actively breaks on identifiers: ``to_tsquery('english', 'TASK-241')``
+        tokenizes to ``task`` (the digit half is dropped by our tokenizer
+        and the english stemmer doesn't know what to do with ``241`` anyway),
+        so a search for ``TASK-241`` returns every message that ever said
+        the word "task." That's wrong for the case where the user is
+        looking up an ID.
+
+        This method goes the other way: treat ``content`` as a flat
+        character sequence, find substring matches with ``ILIKE``, and rank
+        by trigram similarity. Backed by a per-table
+        ``USING gin (content gin_trgm_ops)`` index so the leading-wildcard
+        ILIKE stays fast. No tokenizer, no stemming, no stop-words —
+        ``TASK-241`` matches the literal substring or it doesn't.
+
+        UI dispatches between the two via the ``mode`` param on the route:
+        ``mode=fts`` (default) keeps prior behaviour; ``mode=trgm`` calls
+        this method. The Spotlight modal exposes the choice as a toggle.
+        """
+        from sqlalchemy import text
+
+        q = (query or "").strip()
+        if not q:
+            return []
+
+        tables = self._discover_tables("_messages")
+        if not tables:
+            return []
+
+        # Build UNION ALL across all message tables. Each sub-select runs
+        # the trigram-indexed ILIKE filter and computes a similarity score
+        # for ranking. similarity() is per-row and doesn't use the index,
+        # but it's cheap and only computed on the rows that already
+        # survived the ILIKE filter.
+        sub_selects: list[str] = []
+        for bot_id, table_name in tables:
+            sub_selects.append(f"""(
+                SELECT id, role, content, timestamp,
+                       '{bot_id}' AS source,
+                       similarity(content, :query) AS rank
+                FROM {table_name}
+                WHERE content ILIKE :ilike
+                  AND role != 'system'
+                  {("AND role = :role_filter" if role_filter else "")}
+            )""")
+
+        union_sql = "\nUNION ALL\n".join(sub_selects)
+        full_sql = text(f"""
+            {union_sql}
+            ORDER BY rank DESC, timestamp DESC
+            LIMIT :limit
+        """)
+
+        # `ilike` carries the wildcarded form used by the WHERE clause.
+        # `query` stays raw so similarity() compares against the user's
+        # literal input — wildcards in the score input would skew the
+        # trigram comparison.
+        params: dict[str, Any] = {
+            "query": q,
+            "ilike": f"%{q}%",
+            "limit": n_results,
+        }
+        if role_filter:
+            params["role_filter"] = role_filter
+
+        backend = self._get_backend("default")
+        try:
+            with backend.engine.connect() as conn:
+                rows = conn.execute(full_sql, params).fetchall()
+                return [
+                    {
+                        "id": row.id,
+                        "role": row.role,
+                        "content": row.content,
+                        "timestamp": row.timestamp,
+                        "source": row.source,
+                        "rank": row.rank,
+                    }
+                    for row in rows
+                ]
+        except Exception as e:
+            logger.error("search_all_messages_trgm failed: %s", e)
+            return []
+
     async def search_all_memories(
         self,
         query: str,

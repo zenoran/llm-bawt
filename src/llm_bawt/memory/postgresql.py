@@ -291,6 +291,18 @@ class PostgreSQLMemoryBackend(MemoryBackend):
                 conn.commit()
             except Exception as e:
                 logger.debug(f"pgvector extension check: {e}")
+
+            # Ensure pg_trgm extension is available — backs the trigram GIN
+            # index on each bot's messages.content (created in
+            # `_create_indexes`). Powers the Spotlight "Exact / substring"
+            # search mode (search_all_messages_trgm) which is the right
+            # path for IDs, file paths, and other tokens the english FTS
+            # config would shred. Idempotent.
+            try:
+                conn.execute(text("CREATE EXTENSION IF NOT EXISTS pg_trgm"))
+                conn.commit()
+            except Exception as e:
+                logger.debug(f"pg_trgm extension check: {e}")
             
             # Create messages table
             # TASK-222: `attachments` is a JSONB array of media asset refs
@@ -466,6 +478,13 @@ class PostgreSQLMemoryBackend(MemoryBackend):
             f"CREATE INDEX IF NOT EXISTS idx_{self._messages_table_name}_timestamp ON {self._messages_table_name}(timestamp)",
             f"CREATE INDEX IF NOT EXISTS idx_{self._messages_table_name}_session ON {self._messages_table_name}(session_id)",
             f"CREATE INDEX IF NOT EXISTS idx_{self._messages_table_name}_processed ON {self._messages_table_name}(processed)",
+            # GIN trigram index on message content. Backs
+            # search_all_messages_trgm — the substring/fuzzy search mode
+            # exposed by /v1/history/search_all?mode=trgm. With this index
+            # an ILIKE '%foo%' against a 50 MB table is sub-10ms; without
+            # it the query falls back to a sequential scan. Index size is
+            # roughly 30–40% of the content column. Idempotent.
+            f"CREATE INDEX IF NOT EXISTS {self._messages_table_name}_content_trgm_idx ON {self._messages_table_name} USING gin (content gin_trgm_ops)",
             f"CREATE INDEX IF NOT EXISTS idx_{self._memories_table_name}_importance ON {self._memories_table_name}(importance)",
             f"CREATE INDEX IF NOT EXISTS idx_{self._memories_table_name}_accessed ON {self._memories_table_name}(last_accessed)",
             f"CREATE INDEX IF NOT EXISTS idx_{self._memories_table_name}_tags_gin ON {self._memories_table_name} USING gin (tags)",

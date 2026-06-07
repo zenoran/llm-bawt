@@ -808,32 +808,66 @@ def search_history(
     tags=["History"],
 )
 async def search_all_history(
-    query: str = Query(..., description="Search query (FTS keywords or phrase)"),
+    query: str = Query(..., description="Search query (FTS keywords or substring/literal)"),
     limit: int = Query(50, description="Maximum total results across all bots"),
     role_filter: str | None = Query(
         None,
         description="Only include messages with this role (user|assistant). System messages are always excluded.",
     ),
+    mode: str = Query(
+        "fts",
+        description=(
+            "Search mode. 'fts' (default) uses Postgres full-text search "
+            "with the english config — stems + drops stop-words + ranks by "
+            "lexeme density. Best for natural-language queries. 'trgm' uses "
+            "the pg_trgm extension for substring/fuzzy matching against the "
+            "literal content — best for IDs, file paths, hyphenated tokens, "
+            "or anything where FTS tokenization would discard signal."
+        ),
+    ),
 ):
-    """Cross-bot full-text message search.
+    """Cross-bot message search.
 
-    Reuses :meth:`llm_bawt.mcp_server.storage.MemoryStorage.search_all_messages`,
-    which performs a single Postgres FTS query via ``UNION ALL`` across every
-    ``{bot}_messages`` table. Returns ranked rows with bot attribution so a
-    global search UI can render "who said this and when" without N+1 fans-out.
+    Two modes share this route:
 
-    First HTTP-exposed endpoint of the Spotlight Search project's Messages
+    * ``mode=fts`` (default) — Postgres FTS via
+      :meth:`llm_bawt.mcp_server.storage.MemoryStorage.search_all_messages`.
+      UNION ALL across every ``{bot}_messages`` table, ranked by
+      ``ts_rank``. Good for concept-level queries; bad for IDs because
+      ``build_fts_query`` strips digits and hyphens before building the
+      tsquery (so ``TASK-241`` becomes ``task``, matching every "task"
+      message ever).
+    * ``mode=trgm`` — pg_trgm substring/fuzzy match via
+      :meth:`MemoryStorage.search_all_messages_trgm`. Same UNION ALL
+      shape but with ``content ILIKE`` filter + ``similarity()`` rank,
+      backed by per-table ``gin_trgm_ops`` GIN indexes. Matches the
+      literal query string verbatim — what the user expects for
+      ``TASK-241`` and friends.
+
+    Returns ranked rows with bot attribution so a global search UI can
+    render "who said this and when" without N+1 fans-out. First
+    HTTP-exposed endpoint of the Spotlight Search project's Messages
     provider.
     """
     from llm_bawt.mcp_server.storage import get_storage
 
     try:
         storage = get_storage()
-        rows = await storage.search_all_messages(
-            query=query,
-            n_results=limit,
-            role_filter=role_filter,
-        )
+        if mode == "trgm":
+            rows = await storage.search_all_messages_trgm(
+                query=query,
+                n_results=limit,
+                role_filter=role_filter,
+            )
+        else:
+            # Default / legacy / explicit "fts" all route to the original
+            # ts_rank-backed search so existing callers (and the MCP
+            # surface, which is FTS-only) keep working unchanged.
+            rows = await storage.search_all_messages(
+                query=query,
+                n_results=limit,
+                role_filter=role_filter,
+            )
         messages = [
             HistorySearchAllMessage(
                 id=str(row.get("id", "")),
