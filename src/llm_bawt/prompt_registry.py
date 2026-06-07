@@ -188,6 +188,15 @@ TTS_OUTPUT_INSTRUCTIONS = (
 )
 
 
+AGENT_VOICE_PREFIX = (
+    "VOICE OUTPUT MODE:\n"
+    "Keep your response to 1 to 3 short sentences for text-to-speech. "
+    "No markdown, no emojis, no asterisks. "
+    "Write out numbers and abbreviations as spoken words. "
+    "Skip preambles like \"sure\" or \"okay\" — just answer."
+)
+
+
 DEFAULT_PROMPT_DEFINITIONS: dict[str, PromptDefinition] = {
     "history.summarization.single": PromptDefinition(
         key="history.summarization.single",
@@ -252,6 +261,25 @@ DEFAULT_PROMPT_DEFINITIONS: dict[str, PromptDefinition] = {
         category="chat",
         required_vars=(),
         loader=lambda: TTS_OUTPUT_INSTRUCTIONS,
+    ),
+    "chat.agent_voice_prefix": PromptDefinition(
+        key="chat.agent_voice_prefix",
+        title="Agent Voice-Mode User Message Prefix",
+        category="chat",
+        required_vars=(),
+        loader=lambda: AGENT_VOICE_PREFIX,
+        metadata={
+            "notes": (
+                "Prepended to user messages sent to agent backends "
+                "(Claude Code, Codex, OpenClaw) ONLY when tts_mode=true. "
+                "Text-mode turns are passed through untouched. Exists because "
+                "agent SDKs lock the system prompt at session start and ignore "
+                "it on resume — so the existing chat.tts_output_instructions "
+                "that ride along in the system prompt never reach the agent "
+                "if the session started in text mode. This per-turn prefix is "
+                "the reliable signal. Leave body empty to disable."
+            ),
+        },
     ),
     "agents.task_spec": PromptDefinition(
         key="agents.task_spec",

@@ -12,6 +12,7 @@ Subclasses override _initialize_client() for their specific client types.
 
 import json
 import logging
+import re
 from abc import ABC, abstractmethod
 from datetime import datetime
 from typing import TYPE_CHECKING, Any
@@ -39,6 +40,15 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 console = Console()
+
+
+# Slash commands (e.g. /new) are app-level signals consumed by the bridges
+# before any agent sees them. Match leading slash + alpha word so we can skip
+# the agent user-prefix wrap, which otherwise breaks the bridge's literal
+# startswith("/new") check. Conservative: only matches /<letter><word-chars>,
+# so a stray URL path-shaped user message is also passed through unwrapped
+# (acceptable — those are rare and the LLM handles them fine without prefix).
+_SLASH_COMMAND_RE = re.compile(r"^\s*/[a-zA-Z][\w-]*\b")
 
 
 class BaseLLMBawt(ABC):
@@ -531,9 +541,34 @@ class BaseLLMBawt(ABC):
             logger.debug(f"Sections: {[s.name for s in builder.enabled_sections]}")
         
         # Agent backends manage their own conversation history —
-        # only include the current user message, skip old history
+        # only include the current user message, skip old history.
+        #
+        # Voice-mode-only user-message prefix: agent SDKs (Claude Code, Codex)
+        # lock the system prompt at session start and ignore it on resume, so
+        # the chat.tts_output_instructions that ride in the system prompt never
+        # reach the agent when a session began in text mode. Stamp a per-turn
+        # prefix on the user message instead — the single implementation point
+        # for every agent backend.
+        #
+        # Strictly voice-only: when tts_mode is false, the message is forwarded
+        # unchanged (zero behavior change vs pre-prefix baseline). Slash
+        # commands (e.g. /new) are also passed through untouched because the
+        # bridges consume them via a literal startswith("/new") check before
+        # the agent ever sees them.
         if self.model_definition.get("type") in ("agent_backend", "claude-code"):
-            messages.append(Message(role="user", content=prompt))
+            user_content = prompt
+            if self._tts_mode and not _SLASH_COMMAND_RE.match(prompt or ""):
+                from ..prompt_registry import get_prompt_resolver
+                resolved = get_prompt_resolver(self.config).resolve("chat.agent_voice_prefix")
+                prefix_body = (resolved.body if resolved else "").strip()
+                if prefix_body:
+                    user_content = f"{prefix_body}\n\n---\n\n{prompt}"
+                    if self.debug:
+                        logger.debug(
+                            f"Agent voice-prefix applied: "
+                            f"prefix_len={len(prefix_body)}, source={resolved.source}"
+                        )
+            messages.append(Message(role="user", content=user_content))
             return messages
 
         # Always include history — two-layer architecture handles context overflow
