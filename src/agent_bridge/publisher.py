@@ -39,7 +39,14 @@ RUN_STREAM_MAXLEN = 5_000
 
 class RedisPublisher:
     def __init__(self, redis_url: str, *, default_provider: str | None = None) -> None:
-        self._redis = redis.Redis.from_url(redis_url, decode_responses=True)
+        # socket_timeout=None: redis-py 8.0 defaults to 5s, which breaks
+        # long/blocking operations. Bound only the initial connect.
+        self._redis = redis.Redis.from_url(
+            redis_url,
+            decode_responses=True,
+            socket_timeout=None,
+            socket_connect_timeout=5,
+        )
         self._connected = False
         # Bridges instantiate one publisher and pass their backend name here
         # ("claude-code", "codex", "openclaw"). Stamps every event at the

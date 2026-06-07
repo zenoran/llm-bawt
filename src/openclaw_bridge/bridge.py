@@ -86,7 +86,16 @@ class SessionBridge:
             host = conn_kwargs.get("host", "localhost")
             port = conn_kwargs.get("port", 6379)
             db = conn_kwargs.get("db", 0)
-            async_redis = aioredis.Redis(host=host, port=port, db=db, decode_responses=True)
+            # socket_timeout=None: redis-py 8.0 defaults to 5s, which races our
+            # blocking XREADGROUP(block=5000) reads. Bound only the connect.
+            async_redis = aioredis.Redis(
+                host=host,
+                port=port,
+                db=db,
+                decode_responses=True,
+                socket_timeout=None,
+                socket_connect_timeout=5,
+            )
             await async_redis.ping()
         except Exception as e:
             logger.error("Command listener: cannot connect to Redis: %s", e)

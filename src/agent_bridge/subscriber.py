@@ -28,7 +28,16 @@ logger = logging.getLogger(__name__)
 
 class RedisSubscriber:
     def __init__(self, redis_url: str) -> None:
-        self._redis = aioredis.from_url(redis_url, decode_responses=True)
+        # socket_timeout=None: redis-py 8.0 changed the default to 5s, which
+        # races our blocking XREADGROUP(block=5000) reads — every idle poll
+        # would raise "Timeout reading from redis". Keep reads unbounded and
+        # bound only the initial connect.
+        self._redis = aioredis.from_url(
+            redis_url,
+            decode_responses=True,
+            socket_timeout=None,
+            socket_connect_timeout=5,
+        )
         self._connected = False
 
     async def connect(self) -> None:
