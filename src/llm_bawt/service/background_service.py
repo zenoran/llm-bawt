@@ -136,7 +136,7 @@ class BackgroundService(
         # Memory client cache keyed by bot_id
         self._memory_clients: dict[tuple[str, str], Any] = {}
         from .turn_logs import TurnLogStore
-        self._turn_log_store = TurnLogStore(config, ttl_hours=168)
+        self._turn_log_store = TurnLogStore(config)
 
         # OpenClaw WS session bridge (set by api.py lifespan if enabled)
         self._session_bridge: Any | None = None

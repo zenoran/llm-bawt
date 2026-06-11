@@ -130,7 +130,7 @@ def list_turn_logs(
 ):
     """List persisted turn logs (24h TTL by default)."""
     service = get_service()
-    store = TurnLogStore(service.config, ttl_hours=168)
+    store = TurnLogStore(service.config)
     if store.engine is None:
         raise HTTPException(status_code=503, detail="Turn logs DB unavailable")
 
@@ -249,7 +249,7 @@ def recent_turns_by_bot(
     are missing from the returned ``turns`` list.
     """
     service = get_service()
-    store = TurnLogStore(service.config, ttl_hours=168)
+    store = TurnLogStore(service.config)
     if store.engine is None:
         raise HTTPException(status_code=503, detail="Turn logs DB unavailable")
 
@@ -318,7 +318,7 @@ def recent_turns_by_bot(
 def get_turn_log(turn_id: str):
     """Get one persisted turn log by ID."""
     service = get_service()
-    store = TurnLogStore(service.config, ttl_hours=168)
+    store = TurnLogStore(service.config)
     if store.engine is None:
         raise HTTPException(status_code=503, detail="Turn logs DB unavailable")
 
@@ -370,7 +370,7 @@ def get_tool_call_events(
 ):
     """List tool-call events keyed by trigger message ID for history annotation."""
     service = get_service()
-    store = TurnLogStore(service.config, ttl_hours=168)
+    store = TurnLogStore(service.config)
     if store.engine is None:
         raise HTTPException(status_code=503, detail="Turn logs DB unavailable")
 

@@ -1,4 +1,4 @@
-"""Persistent turn logs with short TTL for debugging and UI inspection."""
+"""Persistent turn logs for debugging and UI inspection. Retained indefinitely by default."""
 
 from __future__ import annotations
 
@@ -95,9 +95,10 @@ class TurnLogStore:
     _cleanup_interval_seconds: float = 300.0
     _backfill_done: bool = False
 
-    def __init__(self, config: Config, ttl_hours: int = 168):
+    def __init__(self, config: Config, ttl_hours: int | None = None):
         self.config = config
-        self.ttl_hours = max(1, int(ttl_hours))
+        # None disables expiry entirely — turn logs are retained forever.
+        self.ttl_hours = max(1, int(ttl_hours)) if ttl_hours is not None else None
         self.engine = None
         try:
             host = getattr(config, "POSTGRES_HOST", "localhost")
@@ -191,7 +192,7 @@ class TurnLogStore:
             logger.debug("trigger_message_id backfill skipped: %s", e)
 
     def _cleanup_expired_if_due(self, force: bool = False) -> None:
-        if self.engine is None:
+        if self.engine is None or self.ttl_hours is None:
             return
         now = time.time()
         if not force and (now - self.__class__._last_cleanup_at) < self.__class__._cleanup_interval_seconds:
@@ -229,7 +230,7 @@ class TurnLogStore:
         animation: str | None = None,
         token_usage: dict | None = None,
     ) -> None:
-        """Persist one turn entry and enforce short TTL cleanup."""
+        """Persist one turn entry (and run TTL cleanup if a TTL is configured)."""
         if self.engine is None:
             return
 
