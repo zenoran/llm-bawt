@@ -81,11 +81,16 @@ curl -X POST http://localhost:8642/v1/bots -H "Content-Type: application/json" -
   "name": "Claude",
   "system_prompt": "You are Claude, a helpful AI assistant.",
   "agent_backend": "claude-code",
-  "agent_backend_config": {"model": "opus[1m]", "timeout_seconds": 120},
+  "default_model": "opus-4-7",
+  "agent_backend_config": {"timeout_seconds": 120},
   "requires_memory": false,
   "include_summaries": false
 }'
 ```
+
+`default_model` must reference a model catalog entry with `type: claude-code`
+(see `/v1/models/definitions`); the bridge receives that entry's `model_id`
+per request.
 
 ### 4. Reload and test
 
@@ -106,17 +111,20 @@ curl http://localhost:8642/v1/chat/completions \
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `CLAUDE_CODE_OAUTH_TOKEN` | (required) | OAuth token from `claude setup-token` |
-| `CLAUDE_CODE_MODEL` | `claude-sonnet-4-20250514` | Fallback model if bot config doesn't specify one |
+| `CLAUDE_CODE_MODEL` | (ignored) | Deprecated — the model is resolved per-request from the bot's `default_model` catalog entry |
 | `CLAUDE_CODE_CWD` | `/app` | Working directory for Claude Code |
 | `CLAUDE_CODE_ADD_DIRS` | | Optional extra directories to allow tool access to via Claude CLI `--add-dir` |
 | `CLAUDE_CODE_BRIDGE_LOG_LEVEL` | `INFO` | Logging level |
 
 ### Bot Config (`agent_backend_config`)
 
+The model itself is NOT configured here — set the bot's `default_model` to a
+`type: claude-code` catalog entry instead.
+
 | Key | Description |
 |-----|-------------|
-| `model` | Claude model alias: `default`, `opus[1m]`, `sonnet[1m]`, `haiku` |
 | `session_key` | SDK session UUID (auto-managed by bridge — do not set manually) |
+| `session_model` | Model the current SDK session was started with (auto-managed by bridge — used for resume-vs-reset) |
 | `timeout_seconds` | Max wait for response (default: 120) |
 
 ### Available Models
@@ -173,7 +181,8 @@ curl -X PATCH http://localhost:8642/v1/bots/mybot/profile \
   -H "Content-Type: application/json" \
   -d '{
     "agent_backend": "claude-code",
-    "agent_backend_config": {"model": "opus[1m]", "timeout_seconds": 120}
+    "default_model": "opus-4-7",
+    "agent_backend_config": {"timeout_seconds": 120}
   }'
 
 # Reload
@@ -201,5 +210,5 @@ docker compose restart app
 | Session key | Explicit in config (e.g. `agent:byte:main`) | Auto-generated SDK UUID |
 | System prompt | Pushed as SOUL.md file to agent | Passed inline per-request via Redis |
 | History | Managed by gateway | Managed by Claude Code binary |
-| Model selection | Gateway-side | Per-bot via `agent_backend_config.model` |
+| Model selection | Gateway-side | Per-bot via `default_model` (catalog entry of `type: claude-code`) |
 | Tools | Gateway's tool system | Claude Code's built-in tools (Read, Edit, Bash, etc.) |

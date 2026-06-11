@@ -232,6 +232,153 @@ def test_derive_model_alias():
     assert _derive_model_alias("") == "model"
 
 
+# ---------------------------------------------------------------------------
+# settings-route config-time validation (Phase 3)
+# ---------------------------------------------------------------------------
+
+import pytest
+from fastapi import HTTPException
+
+from llm_bawt.service.routes import settings as settings_routes
+
+
+class _FakeConn:
+    def __init__(self, row):
+        self._row = row
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_a):
+        return False
+
+    def execute(self, *_a, **_k):
+        row = self._row
+        return SimpleNamespace(fetchone=lambda: row)
+
+
+class _FakeEngine:
+    def __init__(self, row):
+        self._row = row
+
+    def connect(self):
+        return _FakeConn(self._row)
+
+
+def _patch_catalog_row(monkeypatch, row):
+    """Make _validate_agent_default_model see ``row`` as the catalog lookup."""
+    monkeypatch.setattr(
+        settings_routes, "get_service", lambda: SimpleNamespace(config=None)
+    )
+    monkeypatch.setattr(
+        settings_routes,
+        "get_bot_profile_store",
+        lambda _cfg: SimpleNamespace(engine=_FakeEngine(row)),
+    )
+
+
+def test_normalize_moves_model_to_session_model():
+    payload = {
+        "slug": "loopy",
+        "agent_backend_config": {"model": "claude-sonnet-4", "session_key": "k"},
+    }
+    settings_routes._normalize_agent_backend_config_model("claude-code", payload)
+    config = payload["agent_backend_config"]
+    assert "model" not in config
+    assert config["session_model"] == "claude-sonnet-4"
+    assert config["session_key"] == "k"
+
+
+def test_normalize_drops_empty_model_key():
+    payload = {"slug": "loopy", "agent_backend_config": {"model": ""}}
+    settings_routes._normalize_agent_backend_config_model("claude-code", payload)
+    assert payload["agent_backend_config"] == {}
+
+
+def test_normalize_openclaw_untouched():
+    payload = {"slug": "vex", "agent_backend_config": {"model": "anything"}}
+    settings_routes._normalize_agent_backend_config_model("openclaw", payload)
+    assert payload["agent_backend_config"] == {"model": "anything"}
+
+
+def test_validate_missing_default_model_422():
+    with pytest.raises(HTTPException) as exc:
+        settings_routes._validate_agent_default_model(
+            "claude-code", {"slug": "loopy", "default_model": None}
+        )
+    assert exc.value.status_code == 422
+    assert "default_model" in exc.value.detail
+
+
+def test_validate_unknown_alias_422(monkeypatch):
+    _patch_catalog_row(monkeypatch, None)
+    with pytest.raises(HTTPException) as exc:
+        settings_routes._validate_agent_default_model(
+            "claude-code", {"slug": "loopy", "default_model": "nope"}
+        )
+    assert exc.value.status_code == 422
+    assert "not a known model" in exc.value.detail
+
+
+def test_validate_backend_mismatch_422(monkeypatch):
+    _patch_catalog_row(monkeypatch, ("grok", "grok-4-fast", ""))
+    with pytest.raises(HTTPException) as exc:
+        settings_routes._validate_agent_default_model(
+            "claude-code", {"slug": "loopy", "default_model": "grok-4-fast"}
+        )
+    assert exc.value.status_code == 422
+    assert "not compatible" in exc.value.detail
+
+
+def test_validate_missing_model_id_422(monkeypatch):
+    _patch_catalog_row(monkeypatch, ("claude-code", "", ""))
+    with pytest.raises(HTTPException) as exc:
+        settings_routes._validate_agent_default_model(
+            "claude-code", {"slug": "loopy", "default_model": "opus-4-7"}
+        )
+    assert exc.value.status_code == 422
+    assert "model_id" in exc.value.detail
+
+
+def test_validate_compatible_entry_passes(monkeypatch):
+    _patch_catalog_row(monkeypatch, ("claude-code", "claude-opus-4-7", ""))
+    settings_routes._validate_agent_default_model(
+        "claude-code", {"slug": "loopy", "default_model": "opus-4-7"}
+    )
+
+
+def test_validate_codex_agent_backend_shape_passes(monkeypatch):
+    _patch_catalog_row(monkeypatch, ("agent_backend", "gpt-5.5", "codex"))
+    settings_routes._validate_agent_default_model(
+        "codex", {"slug": "byte", "default_model": "codex-gpt-5-5"}
+    )
+
+
+def test_validate_openclaw_exempt():
+    # No DB patching needed: must return before any lookup.
+    settings_routes._validate_agent_default_model(
+        "openclaw", {"slug": "vex", "default_model": None}
+    )
+
+
+def test_validate_db_lookup_failure_does_not_gate(monkeypatch):
+    class _BrokenEngine:
+        def connect(self):
+            raise RuntimeError("db down")
+
+    monkeypatch.setattr(
+        settings_routes, "get_service", lambda: SimpleNamespace(config=None)
+    )
+    monkeypatch.setattr(
+        settings_routes,
+        "get_bot_profile_store",
+        lambda _cfg: SimpleNamespace(engine=_BrokenEngine()),
+    )
+    settings_routes._validate_agent_default_model(
+        "claude-code", {"slug": "loopy", "default_model": "opus-4-7"}
+    )
+
+
 def test_resolve_chat_bot_unchanged(monkeypatch):
     bot = SimpleNamespace(slug="nova", agent_backend=None, default_model="grok-4-fast")
     _patch_bot_manager(monkeypatch, bot)

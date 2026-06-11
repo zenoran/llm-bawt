@@ -201,7 +201,7 @@ curl -X POST http://localhost:8642/v1/bots \
     "color": "#0ea5e9",
     "bot_type": "agent",
     "agent_backend": "codex",
-    "agent_backend_config": {"model": "gpt-5.4"},
+    "default_model": "codex-gpt-5-5",
     "system_prompt": "You are a coding agent named Codex. Be concise. Use tools to inspect, edit, and run code as needed."
   }'
 ```
@@ -389,8 +389,11 @@ mv ~/.codex/auth.json.bak ~/.codex/auth.json   # or: codex login
 ```bash
 curl -X PATCH http://localhost:8642/v1/bots/codex/profile \
   -H "Content-Type: application/json" \
-  -d '{"agent_backend_config": {"model": "gpt-5.5"}}'
+  -d '{"default_model": "codex-gpt-5-5"}'
+# default_model must point at a catalog entry of type=agent_backend with
+# backend=codex; the bridge receives its model_id per request.
 # Send a chat — bridge logs "Model changed", starts fresh thread
+# (it compares against agent_backend_config.session_model)
 ```
 
 ### 9. Concurrent sessions
