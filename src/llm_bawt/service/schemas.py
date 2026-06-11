@@ -231,6 +231,7 @@ class BotInfo(BaseModel):
     voice_optimized: bool = False
     tts_mode: bool = False
     include_summaries: bool = True
+    include_in_global_search: bool = True
     default_voice: str | None = None
     uses_tools: bool = False
     uses_search: bool = False
@@ -261,6 +262,7 @@ class BotProfileResponse(BaseModel):
     voice_optimized: bool = False
     tts_mode: bool = False
     include_summaries: bool = True
+    include_in_global_search: bool = True
     uses_tools: bool = False
     uses_search: bool = False
     uses_home_assistant: bool = False
@@ -287,6 +289,7 @@ class BotProfileUpsertRequest(BaseModel):
     voice_optimized: bool = False
     tts_mode: bool = False
     include_summaries: bool = True
+    include_in_global_search: bool = True
     uses_tools: bool = False
     uses_search: bool = False
     uses_home_assistant: bool = False
@@ -310,6 +313,7 @@ class BotProfilePatchRequest(BaseModel):
     voice_optimized: bool | None = None
     tts_mode: bool | None = None
     include_summaries: bool | None = None
+    include_in_global_search: bool | None = None
     uses_tools: bool | None = None
     uses_search: bool | None = None
     uses_home_assistant: bool | None = None

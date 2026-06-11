@@ -80,6 +80,7 @@ def _to_profile_response(profile, settings: dict[str, object] | None = None) -> 
         voice_optimized=profile.voice_optimized,
         tts_mode=profile.tts_mode,
         include_summaries=profile.include_summaries,
+        include_in_global_search=profile.include_in_global_search,
         uses_tools=profile.uses_tools,
         uses_search=profile.uses_search,
         uses_home_assistant=profile.uses_home_assistant,
@@ -193,6 +194,7 @@ def _request_to_profile_payload(
         "voice_optimized": request.voice_optimized,
         "tts_mode": request.tts_mode,
         "include_summaries": request.include_summaries,
+        "include_in_global_search": request.include_in_global_search,
         "uses_tools": request.uses_tools,
         "uses_search": request.uses_search,
         "uses_home_assistant": request.uses_home_assistant,
@@ -585,6 +587,7 @@ def list_bot_profiles(
     q: str | None = Query(None, description="Text filter against slug, name, and description"),
     uses_tools: bool | None = Query(None, description="Filter by uses_tools"),
     uses_search: bool | None = Query(None, description="Filter by uses_search"),
+    include_in_global_search: bool | None = Query(None, description="Filter by include_in_global_search"),
     requires_memory: bool | None = Query(None, description="Filter by requires_memory"),
     voice_optimized: bool | None = Query(None, description="Filter by voice_optimized"),
     uses_home_assistant: bool | None = Query(None, description="Filter by uses_home_assistant"),
@@ -618,6 +621,8 @@ def list_bot_profiles(
             continue
         if uses_search is not None and row.uses_search != uses_search:
             continue
+        if include_in_global_search is not None and row.include_in_global_search != include_in_global_search:
+            continue
         if requires_memory is not None and row.requires_memory != requires_memory:
             continue
         if voice_optimized is not None and row.voice_optimized != voice_optimized:
@@ -641,6 +646,7 @@ def list_bot_profiles(
             "q": query_text,
             "uses_tools": uses_tools,
             "uses_search": uses_search,
+            "include_in_global_search": include_in_global_search,
             "requires_memory": requires_memory,
             "voice_optimized": voice_optimized,
             "uses_home_assistant": uses_home_assistant,
@@ -701,6 +707,7 @@ async def patch_bot_profile(slug: str, request: BotProfilePatchRequest):
         "voice_optimized": existing.voice_optimized,
         "tts_mode": existing.tts_mode,
         "include_summaries": existing.include_summaries,
+        "include_in_global_search": existing.include_in_global_search,
         "uses_tools": existing.uses_tools,
         "uses_search": existing.uses_search,
         "uses_home_assistant": existing.uses_home_assistant,

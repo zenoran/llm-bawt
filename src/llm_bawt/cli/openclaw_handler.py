@@ -397,6 +397,7 @@ def handle_add_openclaw(config: Config) -> bool:
         "description": f"OpenClaw agent ({selected_session_key})",
         "system_prompt": bot_system_prompt,
         "requires_memory": True,
+        "include_in_global_search": True,
         "bot_type": "agent",
         "agent_backend": "openclaw",
         "agent_backend_config": {

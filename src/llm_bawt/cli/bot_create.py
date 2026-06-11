@@ -47,6 +47,7 @@ def handle_add_chat_bot(config: Config) -> bool:
         "description": description,
         "system_prompt": system_prompt,
         "requires_memory": requires_memory,
+        "include_in_global_search": True,
         "uses_tools": uses_tools,
         "uses_search": uses_search,
         "uses_home_assistant": uses_home_assistant,

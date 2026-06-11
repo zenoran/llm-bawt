@@ -50,6 +50,7 @@ class Bot:
     voice_optimized: bool = False  # Whether output is optimized for TTS
     tts_mode: bool = False  # Default for tts_mode request flag (TTS formatting instructions)
     include_summaries: bool = True  # Default for include_summaries request flag
+    include_in_global_search: bool = True  # Whether aggregate cross-bot search includes this bot
     default_voice: str | None = None  # Optional default voice identifier for TTS/voice clients
     default_model: str | None = None  # Default model alias for this bot
     uses_tools: bool = False  # Whether this bot can use tools (memory search, etc.)
@@ -197,6 +198,7 @@ def _load_db_bot_overrides() -> dict[str, dict[str, Any]]:
                 "voice_optimized": row.voice_optimized,
                 "tts_mode": row.tts_mode,
                 "include_summaries": row.include_summaries,
+                "include_in_global_search": row.include_in_global_search,
                 "uses_tools": row.uses_tools,
                 "uses_search": row.uses_search,
                 "uses_home_assistant": row.uses_home_assistant,
@@ -295,6 +297,7 @@ def _build_bots_from_data(
             voice_optimized=bot_data.get("voice_optimized", False),
             tts_mode=bot_data.get("tts_mode", False),
             include_summaries=bot_data.get("include_summaries", True),
+            include_in_global_search=bot_data.get("include_in_global_search", True),
             default_voice=bot_data.get("default_voice") or effective_settings.get("default_voice"),
             default_model=bot_data.get("default_model"),
             uses_tools=bot_data.get("uses_tools", False),
@@ -424,6 +427,7 @@ def save_user_bot_config(slug: str, section: str, data: dict) -> None:
             "voice_optimized": source.get("voice_optimized", False),
             "tts_mode": source.get("tts_mode", False),
             "include_summaries": source.get("include_summaries", True),
+            "include_in_global_search": source.get("include_in_global_search", True),
             "default_model": source.get("default_model"),
             "uses_tools": source.get("uses_tools", False),
             "uses_search": source.get("uses_search", False),
@@ -440,6 +444,7 @@ def save_user_bot_config(slug: str, section: str, data: dict) -> None:
             "voice_optimized": profile.voice_optimized,
             "tts_mode": profile.tts_mode,
             "include_summaries": profile.include_summaries,
+            "include_in_global_search": profile.include_in_global_search,
             "default_model": profile.default_model,
             "uses_tools": profile.uses_tools,
             "uses_search": profile.uses_search,
@@ -486,6 +491,7 @@ def remove_user_bot_section(slug: str, section: str) -> bool:
             "voice_optimized": profile.voice_optimized,
             "tts_mode": profile.tts_mode,
             "include_summaries": profile.include_summaries,
+            "include_in_global_search": profile.include_in_global_search,
             "default_model": profile.default_model,
             "uses_tools": profile.uses_tools,
             "uses_search": profile.uses_search,

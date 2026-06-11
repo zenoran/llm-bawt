@@ -780,6 +780,37 @@ class MemoryStorage:
             logger.error("Failed to discover %s tables: %s", suffix, e)
             return []
 
+    def _global_search_excluded_bot_ids(self) -> set[str]:
+        """Return sanitized bot IDs opted out of aggregate search."""
+        try:
+            from llm_bawt.bots import BotManager
+            from llm_bawt.memory.postgresql import _sanitize_table_name
+
+            return {
+                _sanitize_table_name(bot.slug)
+                for bot in BotManager(self.config).list_bots()
+                if getattr(bot, "include_in_global_search", True) is False
+            }
+        except Exception as e:
+            logger.warning("Failed to load global search bot policy: %s", e)
+            return set()
+
+    def _discover_global_search_tables(self, suffix: str) -> list[tuple[str, str]]:
+        """Discover tables that are eligible for aggregate search."""
+        tables = self._discover_tables(suffix)
+        if not tables:
+            return []
+
+        excluded = self._global_search_excluded_bot_ids()
+        if not excluded:
+            return tables
+
+        return [
+            (bot_id, table_name)
+            for bot_id, table_name in tables
+            if bot_id not in excluded
+        ]
+
     async def list_memory_sources(self) -> list[dict[str, Any]]:
         """Discover all available memory sources (bot_ids with memory tables).
 
@@ -789,7 +820,7 @@ class MemoryStorage:
         from sqlalchemy import text
 
         backend = self._get_backend("default")
-        tables = self._discover_tables("_memories")
+        tables = self._discover_global_search_tables("_memories")
         if not tables:
             return []
 
@@ -847,7 +878,7 @@ class MemoryStorage:
         if not or_query:
             return []
 
-        tables = self._discover_tables("_messages")
+        tables = self._discover_global_search_tables("_messages")
         if not tables:
             return []
 
@@ -959,7 +990,7 @@ class MemoryStorage:
         if not q:
             return []
 
-        tables = self._discover_tables("_messages")
+        tables = self._discover_global_search_tables("_messages")
         if not tables:
             return []
 
@@ -1057,7 +1088,7 @@ class MemoryStorage:
         if not query_embedding:
             return []
 
-        tables = self._discover_tables("_memories")
+        tables = self._discover_global_search_tables("_memories")
         if not tables:
             return []
 

@@ -145,6 +145,7 @@ def edit_bot_yaml(config: Config, bot_slug: str) -> bool:
         "voice_optimized": bot.voice_optimized,
         "tts_mode": bot.tts_mode,
         "include_summaries": bot.include_summaries,
+        "include_in_global_search": bot.include_in_global_search,
         "uses_tools": bot.uses_tools,
         "uses_search": bot.uses_search,
         "uses_home_assistant": bot.uses_home_assistant,
@@ -181,7 +182,16 @@ def edit_bot_yaml(config: Config, bot_slug: str) -> bool:
     if "color" in parsed and parsed.get("color") is not None and not isinstance(parsed.get("color"), str):
         console.print("[red]Invalid 'color': expected string or null.[/red]")
         return False
-    required_bool = ("requires_memory", "voice_optimized", "uses_tools", "uses_search", "uses_home_assistant")
+    required_bool = (
+        "requires_memory",
+        "voice_optimized",
+        "tts_mode",
+        "include_summaries",
+        "include_in_global_search",
+        "uses_tools",
+        "uses_search",
+        "uses_home_assistant",
+    )
     for key in required_bool:
         if key in parsed and not isinstance(parsed.get(key), bool):
             console.print(f"[red]Invalid '{key}': expected boolean.[/red]")
@@ -213,6 +223,9 @@ def edit_bot_yaml(config: Config, bot_slug: str) -> bool:
         "system_prompt": out.get("system_prompt", bot.system_prompt),
         "requires_memory": out.get("requires_memory", bot.requires_memory),
         "voice_optimized": out.get("voice_optimized", bot.voice_optimized),
+        "tts_mode": out.get("tts_mode", bot.tts_mode),
+        "include_summaries": out.get("include_summaries", bot.include_summaries),
+        "include_in_global_search": out.get("include_in_global_search", bot.include_in_global_search),
         "uses_tools": out.get("uses_tools", bot.uses_tools),
         "uses_search": out.get("uses_search", bot.uses_search),
         "uses_home_assistant": out.get("uses_home_assistant", bot.uses_home_assistant),

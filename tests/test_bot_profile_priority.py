@@ -42,6 +42,7 @@ def test_db_bot_profile_overrides_yaml(monkeypatch, tmp_path: Path) -> None:
             "system_prompt": "db prompt",
             "requires_memory": False,
             "voice_optimized": True,
+            "include_in_global_search": False,
             "uses_tools": True,
             "uses_search": True,
             "uses_home_assistant": True,
@@ -96,6 +97,7 @@ def test_db_bot_profile_overrides_yaml(monkeypatch, tmp_path: Path) -> None:
     assert nova.description == "from db"
     assert nova.requires_memory is False
     assert nova.voice_optimized is True
+    assert nova.include_in_global_search is False
     assert nova.default_model == "db-model"
     assert nova.bot_type == "chat"
     assert nova.color == "red"  # Keep YAML-presentational metadata.
@@ -106,6 +108,7 @@ def test_db_bot_profile_overrides_yaml(monkeypatch, tmp_path: Path) -> None:
     assert ember is not None
     assert ember.system_prompt == "ember prompt"
     assert ember.bot_type == "chat"
+    assert ember.include_in_global_search is True
     assert ember.settings["temperature"] == 0.55
     assert ember.color == "blue"
 

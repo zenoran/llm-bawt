@@ -63,6 +63,7 @@ class BotProfile(SQLModel, table=True):
     voice_optimized: bool = Field(default=False)
     tts_mode: bool = Field(default=False)
     include_summaries: bool = Field(default=True)
+    include_in_global_search: bool = Field(default=True)
     uses_tools: bool = Field(default=False)
     uses_search: bool = Field(default=False)
     uses_home_assistant: bool = Field(default=False)
@@ -123,6 +124,7 @@ class BotProfileStore:
             "ALTER TABLE bot_profiles ADD COLUMN IF NOT EXISTS agent_backend_config JSONB",
             "ALTER TABLE bot_profiles ADD COLUMN IF NOT EXISTS tts_mode BOOLEAN DEFAULT FALSE",
             "ALTER TABLE bot_profiles ADD COLUMN IF NOT EXISTS include_summaries BOOLEAN DEFAULT TRUE",
+            "ALTER TABLE bot_profiles ADD COLUMN IF NOT EXISTS include_in_global_search BOOLEAN DEFAULT TRUE",
             "ALTER TABLE bot_profiles ADD COLUMN IF NOT EXISTS default_voice VARCHAR(128)",
             "ALTER TABLE bot_profiles ADD COLUMN IF NOT EXISTS avatar VARCHAR(512)",
         ]
@@ -180,6 +182,7 @@ class BotProfileStore:
                     voice_optimized=bool(payload.get("voice_optimized", False)),
                     tts_mode=bool(payload.get("tts_mode", False)),
                     include_summaries=bool(payload.get("include_summaries", True)),
+                    include_in_global_search=bool(payload.get("include_in_global_search", True)),
                     uses_tools=bool(payload.get("uses_tools", False)),
                     uses_search=bool(payload.get("uses_search", False)),
                     uses_home_assistant=bool(payload.get("uses_home_assistant", False)),
@@ -202,6 +205,7 @@ class BotProfileStore:
                 row.voice_optimized = bool(payload.get("voice_optimized", row.voice_optimized))
                 row.tts_mode = bool(payload.get("tts_mode", row.tts_mode))
                 row.include_summaries = bool(payload.get("include_summaries", row.include_summaries))
+                row.include_in_global_search = bool(payload.get("include_in_global_search", row.include_in_global_search))
                 row.uses_tools = bool(payload.get("uses_tools", row.uses_tools))
                 row.uses_search = bool(payload.get("uses_search", row.uses_search))
                 row.uses_home_assistant = bool(payload.get("uses_home_assistant", row.uses_home_assistant))
@@ -268,6 +272,7 @@ class BotProfileStore:
                 "voice_optimized": bot_data.get("voice_optimized", False),
                 "tts_mode": bot_data.get("tts_mode", False),
                 "include_summaries": bot_data.get("include_summaries", True),
+                "include_in_global_search": bot_data.get("include_in_global_search", True),
                 "uses_tools": bot_data.get("uses_tools", False),
                 "uses_search": bot_data.get("uses_search", False),
                 "uses_home_assistant": bot_data.get("uses_home_assistant", False),
