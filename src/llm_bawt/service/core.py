@@ -83,12 +83,18 @@ class ServiceLLMBawt(BaseLLMBawt):
             # per-bot and per-user sessions deterministically.
             self.client._bot_config["bot_id"] = self.bot_id
             self.client._bot_config["user_id"] = self.user_id
+            # Canonical model injection: the bot's default_model is THE model
+            # reference for agent bots.  Resolve it through the catalog and
+            # inject the SDK model_id into the bridge config — this overrides
+            # any legacy ``agent_backend_config.model`` (which is migrated to
+            # ``session_model`` and no longer user-facing).
+            from ..bot_types import agent_backend_for_model_def
             default_alias = getattr(self.bot, "default_model", None)
             if default_alias:
                 model_def = self.config.defined_models.get("models", {}).get(default_alias, {})
                 if (
-                    model_def.get("type") == "agent_backend"
-                    and model_def.get("backend") == getattr(self.bot, "agent_backend", None)
+                    agent_backend_for_model_def(model_def)
+                    == getattr(self.bot, "agent_backend", None)
                     and model_def.get("model_id")
                 ):
                     self.client._bot_config["model"] = model_def["model_id"]
@@ -308,8 +314,17 @@ class ServiceLLMBawt(BaseLLMBawt):
             return client
         
         elif model_type in ("agent_backend", "claude-code"):
+            from ..bot_types import agent_backend_for_model_def
             from ..clients.agent_backend_client import AgentBackendClient
-            backend_name = self.model_definition.get("backend", self.resolved_model_alias)
+            # Derive the backend from the model definition shape.  The alias
+            # fallback only existed for virtual backend-name aliases (e.g.
+            # 'claude-code'); real catalog aliases (e.g. 'opus-4-7') resolve
+            # via agent_backend_for_model_def.
+            backend_name = (
+                self.model_definition.get("backend")
+                or agent_backend_for_model_def(self.model_definition)
+                or self.resolved_model_alias
+            )
             bot_config = {
                 **(self.model_definition.get("bot_config", {}) or {}),
                 "bot_id": self.bot_id,

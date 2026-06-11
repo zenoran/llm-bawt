@@ -8,6 +8,7 @@ from __future__ import annotations
 
 from typing import Any
 
+from ..bot_types import agent_backend_for_model_def
 from ..bots import BotManager
 from .logging import get_service_logger
 
@@ -135,8 +136,20 @@ class InstanceManagerMixin:
         # Resolve default model: bot default → config default → first available
         default_bot = bot_manager.get_bot(self._default_bot) or bot_manager.get_default_bot()
         if default_bot:
-            if default_bot.slug in self._agent_backend_models:
-                self._default_model = self._agent_backend_models[default_bot.slug]
+            backend_name = self._agent_backend_models.get(default_bot.slug)
+            if backend_name:
+                # Agent default bot: prefer its real catalog model when it
+                # resolves to a compatible entry; else the virtual alias.
+                default_alias = default_bot.default_model
+                if (
+                    backend_name != "openclaw"
+                    and default_alias
+                    and default_alias in self._available_models
+                    and agent_backend_for_model_def(models.get(default_alias)) == backend_name
+                ):
+                    self._default_model = default_alias
+                else:
+                    self._default_model = backend_name
             elif default_bot.default_model and default_bot.default_model in self._available_models:
                 self._default_model = default_bot.default_model
         if not self._default_model:
@@ -177,14 +190,36 @@ class InstanceManagerMixin:
         bot_manager = BotManager(self.config)
         bot = bot_manager.get_bot(bot_id) or bot_manager.get_default_bot()
 
-        # 1. Agent-backend bots are locked to their backend model
-        backend_model = self._agent_backend_models.get(bot.slug if bot else bot_id)
-        if backend_model and backend_model in self._available_models:
-            if requested_model and requested_model != backend_model:
+        # 1. Agent-backend bots are locked to their bot-configured model.
+        #    Prefer the REAL catalog alias from bot.default_model (canonical
+        #    model identity — shows the actual model in turn logs / SSE /
+        #    task attribution).  Fall back to the legacy virtual backend
+        #    alias (e.g. 'claude-code') only when default_model is missing
+        #    or incompatible.  Openclaw is exempt: its gateway owns the
+        #    model, so openclaw bots always use the virtual alias.
+        backend_name = self._agent_backend_models.get(bot.slug if bot else bot_id)
+        if backend_name:
+            if requested_model and requested_model != backend_name:
                 warnings.append(
                     f"Bot '{bot_id}' uses agent backend; ignoring requested model '{requested_model}'"
                 )
-            return backend_model, warnings
+            default_alias = getattr(bot, "default_model", None) if bot else None
+            if backend_name != "openclaw":
+                models = self.config.defined_models.get("models", {})
+                if (
+                    default_alias
+                    and default_alias in self._available_models
+                    and agent_backend_for_model_def(models.get(default_alias)) == backend_name
+                ):
+                    return default_alias, warnings
+                log.warning(
+                    "Agent bot '%s' has missing/incompatible default_model=%r for "
+                    "backend '%s'; falling back to virtual alias '%s'. Set the "
+                    "bot's Model to a %s catalog entry.",
+                    bot_id, default_alias, backend_name, backend_name, backend_name,
+                )
+            if backend_name in self._available_models:
+                return backend_name, warnings
 
         # 2. Explicit requested model
         model = requested_model.strip() if requested_model else None
@@ -265,12 +300,21 @@ class InstanceManagerMixin:
 
         cache_key = (model_alias, bot_id, user_id)
 
-        # Check if we need to switch models (different model requested)
+        # Check if we need to switch models (different model requested).
+        # Only unload when the PREVIOUS model holds local resources
+        # (GGUF/vLLM) — mirrors ModelLifecycleManager.register_client.
+        # API clients and agent backends are stateless; unloading them
+        # would needlessly thrash caches now that agent bots resolve to
+        # distinct real aliases (e.g. opus-4-7 vs gpt-5.4-codex).
         current_model = self._model_lifecycle.current_model
         if current_model and current_model != model_alias:
-            log.info(f"🔄 Model: {current_model} → {model_alias}")
-            # Unloading will trigger _on_model_unloaded callback which clears caches
-            self._model_lifecycle.unload_current_model()
+            prev_def = self.config.defined_models.get("models", {}).get(current_model, {})
+            if prev_def.get("type") in ("gguf", "vllm", "llamacpp"):
+                log.info(f"🔄 Model: {current_model} → {model_alias}")
+                # Unloading triggers _on_model_unloaded which clears caches
+                self._model_lifecycle.unload_current_model()
+            else:
+                log.debug(f"Model switch: {current_model} → {model_alias} (no unload needed)")
 
         if cache_key in self._llm_bawt_cache:
             cached = self._llm_bawt_cache[cache_key]
@@ -347,7 +391,7 @@ class InstanceManagerMixin:
 
             # Also cache the client for future reuse by extraction tasks.
             # Skip agent_backend clients — they hold per-bot state.
-            if model_alias not in self._client_cache and model_type != "agent_backend":
+            if model_alias not in self._client_cache and model_type not in ("agent_backend", "claude-code"):
                 self._client_cache[model_alias] = llm_bawt.client
             # Note: BaseLLMBawt.__init__ already registers with lifecycle manager
 
