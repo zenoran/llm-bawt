@@ -739,6 +739,180 @@ def add_attachments_to_messages(backend: Any, dry_run: bool = False) -> dict:
     }
 
 
+def _derive_model_alias(model_id: str) -> str:
+    """Derive a catalog alias from an SDK model id.
+
+    ``claude-opus-4-20250514`` → ``opus-4-20250514``; dots/spaces/slashes
+    become dashes; result is lowercased.
+    """
+    alias = (model_id or "").strip().lower()
+    if alias.startswith("claude-"):
+        alias = alias[len("claude-"):]
+    for ch in (".", " ", "/", ":"):
+        alias = alias.replace(ch, "-")
+    while "--" in alias:
+        alias = alias.replace("--", "-")
+    return alias.strip("-") or "model"
+
+
+def migrate_agent_backend_config_model(backend: Any, dry_run: bool = False) -> dict:
+    """Consolidate ``agent_backend_config.model`` onto ``default_model``.
+
+    ``default_model`` is the single canonical model reference for every
+    bot. The legacy ``agent_backend_config.model`` key (raw SDK model id
+    read by the bridges) is replaced by catalog-driven injection (see
+    ``ServiceLLMBawt._init_bot``).
+
+    For each agent bot still carrying the legacy key:
+      * openclaw (and unknown backends): the key is only RENAMED to
+        ``session_model`` — the openclaw gateway owns its model, and the
+        bridges use the stored value for session resume-vs-reset
+        comparison, so deleting it would reset live SDK sessions.
+      * claude-code / codex:
+          1. find-or-create a ``model_definitions`` entry for the legacy
+             SDK model id (claude-code → ``type='claude-code'`` as required
+             by the ``bot_profiles_check_model_backend`` trigger; codex →
+             ``type='agent_backend'`` + ``extra.backend='codex'``)
+          2. set ``default_model`` to that alias ONLY if the current value
+             doesn't already resolve to a backend-compatible entry (an
+             existing compatible value is user intent — the legacy key was
+             typically stale)
+          3. rename the key to ``session_model``
+
+    Idempotent: the ``agent_backend_config ? 'model'`` filter makes
+    re-runs no-ops.
+    """
+    from sqlalchemy import text
+
+    actions: list[str] = []
+    with backend.engine.connect() as conn:
+        has_tables = conn.execute(text("""
+            SELECT COUNT(*) FROM information_schema.tables
+            WHERE table_name IN ('bot_profiles', 'model_definitions')
+        """)).scalar()
+        if has_tables != 2:
+            return {"skipped": True, "reason": "tables not present"}
+
+        rows = conn.execute(text("""
+            SELECT slug, agent_backend, default_model,
+                   agent_backend_config->>'model' AS legacy_model
+            FROM bot_profiles
+            WHERE agent_backend IS NOT NULL
+              AND agent_backend_config ? 'model'
+        """)).fetchall()
+
+        if not rows:
+            return {"migrated": [], "actions": ["no legacy agent_backend_config.model keys"]}
+
+        def _compatible_alias(alias: str | None, agent_backend: str) -> bool:
+            """Does ``alias`` resolve to an entry compatible with the backend?"""
+            if not alias:
+                return False
+            row = conn.execute(
+                text(
+                    "SELECT type, COALESCE(extra->>'backend','') AS b, model_id "
+                    "FROM model_definitions WHERE alias = :a"
+                ),
+                {"a": alias},
+            ).fetchone()
+            if row is None:
+                return False
+            mtype = (row.type or "").lower()
+            if agent_backend == "claude-code":
+                return mtype == "claude-code" and bool(row.model_id)
+            if agent_backend == "codex":
+                return bool(row.model_id) and (
+                    mtype == "codex"
+                    or (mtype == "agent_backend" and row.b == "codex")
+                    or mtype == "openai"
+                )
+            return False
+
+        def _find_or_create_entry(legacy: str, agent_backend: str) -> str | None:
+            """Return alias of a catalog entry for ``legacy`` model id."""
+            if agent_backend == "claude-code":
+                found = conn.execute(text(
+                    "SELECT alias FROM model_definitions "
+                    "WHERE model_id = :m AND type = 'claude-code' LIMIT 1"
+                ), {"m": legacy}).fetchone()
+            else:  # codex
+                found = conn.execute(text(
+                    "SELECT alias FROM model_definitions WHERE model_id = :m AND ("
+                    "  type = 'codex'"
+                    "  OR (type = 'agent_backend' AND extra->>'backend' = 'codex')"
+                    "  OR type = 'openai'"
+                    ") LIMIT 1"
+                ), {"m": legacy}).fetchone()
+            if found:
+                return found.alias
+
+            base = _derive_model_alias(legacy)
+            alias = base
+            n = 1
+            while conn.execute(
+                text("SELECT 1 FROM model_definitions WHERE alias = :a"),
+                {"a": alias},
+            ).fetchone():
+                n += 1
+                alias = f"{base}-{n}"
+            if dry_run:
+                return alias
+            if agent_backend == "claude-code":
+                conn.execute(text(
+                    "INSERT INTO model_definitions "
+                    "(alias, type, model_id, description, created_at, updated_at) VALUES "
+                    "(:a, 'claude-code', :m, :d, NOW(), NOW())"
+                ), {"a": alias, "m": legacy,
+                    "d": "Auto-created by agent_backend_config.model migration"})
+            else:
+                conn.execute(text(
+                    "INSERT INTO model_definitions "
+                    "(alias, type, model_id, description, extra, created_at, updated_at) VALUES "
+                    "(:a, 'agent_backend', :m, :d, '{\"backend\": \"codex\"}'::jsonb, NOW(), NOW())"
+                ), {"a": alias, "m": legacy,
+                    "d": "Auto-created by agent_backend_config.model migration"})
+            actions.append(f"created model_definitions entry '{alias}' for {legacy}")
+            return alias
+
+        migrated: list[str] = []
+        for r in rows:
+            legacy = (r.legacy_model or "").strip()
+            agent_backend = (r.agent_backend or "").strip().lower()
+
+            if agent_backend in ("claude-code", "codex") and legacy:
+                if _compatible_alias(r.default_model, agent_backend):
+                    actions.append(
+                        f"{r.slug}: kept existing default_model={r.default_model!r}"
+                    )
+                else:
+                    alias = _find_or_create_entry(legacy, agent_backend)
+                    if alias and not dry_run:
+                        conn.execute(text(
+                            "UPDATE bot_profiles SET default_model = :a, "
+                            "updated_at = NOW() WHERE slug = :s"
+                        ), {"a": alias, "s": r.slug})
+                    actions.append(f"{r.slug}: set default_model={alias!r}")
+
+            # Rename model → session_model for ALL backends (bridge
+            # session-resume comparison must survive the migration).
+            if not dry_run:
+                conn.execute(text(
+                    "UPDATE bot_profiles SET agent_backend_config = "
+                    "  (agent_backend_config - 'model') "
+                    "  || jsonb_build_object('session_model', "
+                    "       agent_backend_config->>'model'), "
+                    "  updated_at = NOW() "
+                    "WHERE slug = :s AND agent_backend_config ? 'model'"
+                ), {"s": r.slug})
+            actions.append(f"{r.slug}: renamed agent_backend_config.model → session_model")
+            migrated.append(r.slug)
+
+        if not dry_run:
+            conn.commit()
+
+    return {"migrated": migrated, "actions": actions, "dry_run": dry_run}
+
+
 def run_all_migrations(backend: Any, dry_run: bool = False) -> dict:
     """Run all pending migrations."""
     results = {}
@@ -754,6 +928,9 @@ def run_all_migrations(backend: Any, dry_run: bool = False) -> dict:
 
     logger.debug("Running sessions backfill...")
     results["sessions"] = backfill_sessions(backend, dry_run=dry_run)
+
+    logger.debug("Consolidating agent_backend_config.model onto default_model...")
+    results["agent_config_model"] = migrate_agent_backend_config_model(backend, dry_run=dry_run)
 
     logger.debug("Adding bot/model constraints...")
     results["bot_model_constraints"] = add_bot_model_constraints(backend, dry_run=dry_run)
@@ -781,6 +958,7 @@ def main():
             "backfill_meaning",
             "backfill_sessions",
             "bot_model_constraints",
+            "agent_config_model",
             "media_assets_up",
             "media_assets_down",
             "messages_attachments",
@@ -806,6 +984,8 @@ def main():
         result = backfill_sessions(backend, dry_run=args.dry_run)
     elif args.command == "bot_model_constraints":
         result = add_bot_model_constraints(backend, dry_run=args.dry_run)
+    elif args.command == "agent_config_model":
+        result = migrate_agent_backend_config_model(backend, dry_run=args.dry_run)
     elif args.command == "media_assets_up":
         result = add_media_assets_table(backend, dry_run=args.dry_run)
     elif args.command == "media_assets_down":

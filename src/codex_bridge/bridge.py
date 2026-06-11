@@ -277,7 +277,10 @@ class CodexBridge:
                     if bot.get("slug") == bot_id:
                         bc = bot.get("agent_backend_config") or {}
                         sk = bc.get("session_key")
-                        model = bc.get("model", "")
+                        # session_model = bridge-owned record of which model
+                        # the persisted thread was created with (drives
+                        # resume-vs-reset). "model" is the pre-migration key.
+                        model = bc.get("session_model") or bc.get("model", "")
                         if sk:
                             sk = str(sk).strip()
                             if ":" in sk:
@@ -308,7 +311,11 @@ class CodexBridge:
                         bc = dict(bot.get("agent_backend_config") or {})
                         break
                 bc["session_key"] = thread_id
-                bc["model"] = model
+                # Bridge-owned session metadata. The user-facing model lives
+                # on the bot's default_model (catalog alias); "model" is no
+                # longer accepted in agent_backend_config by the profile API.
+                bc.pop("model", None)
+                bc["session_model"] = model
                 await client.patch(
                     f"{self._app_api_url}/v1/bots/{bot_id}/profile",
                     json={"agent_backend_config": bc},

@@ -1812,8 +1812,27 @@ def _query_agent_backend(prompt: str, bot, plaintext_output: bool):
         console.print(f"[bold red]Agent backend '{bot.agent_backend}' not found.[/bold red]")
         return
 
+    # Canonical model injection (mirrors ServiceLLMBawt._init_bot): resolve
+    # the bot's default_model through the catalog and pass the SDK model_id
+    # to the backend. agent_backend_config.model is migrated away.
+    backend_config = dict(bot.agent_backend_config or {})
     try:
-        response = asyncio.run(backend.chat(prompt, bot.agent_backend_config))
+        from llm_bawt.bot_types import agent_backend_for_model_def
+        from llm_bawt.utils.config import Config
+        _cfg = Config()
+        default_alias = getattr(bot, "default_model", None)
+        if default_alias:
+            model_def = _cfg.defined_models.get("models", {}).get(default_alias, {})
+            if (
+                agent_backend_for_model_def(model_def) == bot.agent_backend
+                and model_def.get("model_id")
+            ):
+                backend_config["model"] = model_def["model_id"]
+    except Exception:
+        pass  # fall through; backend surfaces a clear error if model is required
+
+    try:
+        response = asyncio.run(backend.chat(prompt, backend_config))
     except Exception as e:
         console.print(f"[bold red]Agent backend error:[/bold red] {e}")
         return

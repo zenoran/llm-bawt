@@ -266,7 +266,10 @@ class ClaudeCodeBridge:
                     if bot.get("slug") == bot_id:
                         bc = bot.get("agent_backend_config") or {}
                         sk = bc.get("session_key")
-                        model = bc.get("model", "")
+                        # session_model = bridge-owned record of which model
+                        # the persisted SDK session was created with (drives
+                        # resume-vs-reset). "model" is the pre-migration key.
+                        model = bc.get("session_model") or bc.get("model", "")
                         if sk:
                             sk = str(sk).strip()
                             # Guard against legacy bug where routing keys
@@ -297,7 +300,11 @@ class ClaudeCodeBridge:
                         bc = dict(bot.get("agent_backend_config") or {})
                         break
                 bc["session_key"] = sdk_session_id
-                bc["model"] = model
+                # Bridge-owned session metadata. The user-facing model lives
+                # on the bot's default_model (catalog alias); "model" is no
+                # longer accepted in agent_backend_config by the profile API.
+                bc.pop("model", None)
+                bc["session_model"] = model
 
                 await client.patch(
                     f"{self._app_api_url}/v1/bots/{bot_id}/profile",
@@ -497,7 +504,8 @@ class ClaudeCodeBridge:
             # immediately sees which bot's config is missing a model.
             err = (
                 f"Claude Code bridge: missing 'model' field for bot={bot_slug or '?'} "
-                f"session={session_key}. Configure agent_backend_config.model on the bot."
+                f"session={session_key}. Set the bot's Model (default_model) to a "
+                f"claude-code catalog entry on the bot's profile."
             )
             logger.error(err)
             self._publish_event(

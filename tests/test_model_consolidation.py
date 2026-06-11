@@ -218,6 +218,20 @@ def test_resolve_openclaw_bot_keeps_virtual_alias(monkeypatch):
     assert alias == "openclaw"
 
 
+# ---------------------------------------------------------------------------
+# migration alias derivation
+# ---------------------------------------------------------------------------
+
+def test_derive_model_alias():
+    from llm_bawt.memory.migrations import _derive_model_alias
+
+    assert _derive_model_alias("claude-opus-4-20250514") == "opus-4-20250514"
+    assert _derive_model_alias("claude-sonnet-4-5") == "sonnet-4-5"
+    assert _derive_model_alias("gpt-5.5") == "gpt-5-5"
+    assert _derive_model_alias("GPT-5.5 Codex") == "gpt-5-5-codex"
+    assert _derive_model_alias("") == "model"
+
+
 def test_resolve_chat_bot_unchanged(monkeypatch):
     bot = SimpleNamespace(slug="nova", agent_backend=None, default_model="grok-4-fast")
     _patch_bot_manager(monkeypatch, bot)

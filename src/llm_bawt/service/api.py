@@ -49,6 +49,32 @@ async def lifespan(app):
             config.merge_db_models(db_models)
             log.debug("Loaded %d model definitions from DB", len(db_models))
 
+    # Consolidate legacy agent_backend_config.model onto default_model
+    # (idempotent; cheap existence check before doing any work). Runs after
+    # model seeding so created catalog entries are immediately visible, and
+    # the merged config is refreshed when the migration created entries.
+    if model_store.engine is not None:
+        try:
+            from sqlalchemy import text as _sa_text
+            with model_store.engine.connect() as _conn:
+                _has_legacy = _conn.execute(_sa_text(
+                    "SELECT 1 FROM bot_profiles "
+                    "WHERE agent_backend IS NOT NULL "
+                    "  AND agent_backend_config ? 'model' LIMIT 1"
+                )).fetchone()
+            if _has_legacy:
+                from types import SimpleNamespace
+                from ..memory.migrations import migrate_agent_backend_config_model
+                _result = migrate_agent_backend_config_model(
+                    SimpleNamespace(engine=model_store.engine)
+                )
+                log.info("agent_backend_config.model migration: %s", _result)
+                db_models = model_store.to_config_dict()
+                if db_models:
+                    config.merge_db_models(db_models)
+        except Exception as e:
+            log.warning("agent_backend_config.model migration skipped: %s", e)
+
     # Ensure media_generations table exists
     try:
         from ..media.db import MediaGenerationStore

@@ -78,8 +78,8 @@ def main() -> None:
     if os.getenv("CLAUDE_CODE_MODEL"):
         logger.warning(
             "CLAUDE_CODE_MODEL env var is set but ignored: the bridge no longer "
-            "accepts a default model. The model MUST be passed per-request from "
-            "the bot's agent_backend_config.model."
+            "accepts a default model. The model MUST be passed per-request, "
+            "resolved from the bot's default_model catalog entry."
         )
 
     bridge = ClaudeCodeBridge(
