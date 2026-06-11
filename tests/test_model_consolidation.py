@@ -277,14 +277,16 @@ def _patch_catalog_row(monkeypatch, row):
     )
 
 
-def test_normalize_moves_model_to_session_model():
+def test_normalize_mirrors_model_to_session_model():
     payload = {
         "slug": "loopy",
         "agent_backend_config": {"model": "claude-sonnet-4", "session_key": "k"},
     }
     settings_routes._normalize_agent_backend_config_model("claude-code", payload)
     config = payload["agent_backend_config"]
-    assert "model" not in config
+    # "model" is kept (not popped) so un-restarted bridges still see it for
+    # session resume-vs-reset; new bridge code drops it on first persist.
+    assert config["model"] == "claude-sonnet-4"
     assert config["session_model"] == "claude-sonnet-4"
     assert config["session_key"] == "k"
 

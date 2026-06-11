@@ -239,15 +239,20 @@ def _normalize_agent_backend_config_model(
     agent_backend: str,
     payload: dict[str, object],
 ) -> None:
-    """Strip the legacy ``agent_backend_config.model`` key on save.
+    """Mirror the legacy ``agent_backend_config.model`` key on save.
 
     ``default_model`` is the single canonical model reference; the bridges
     persist their session metadata under ``session_model``. Any ``model``
     key arriving here is either a stale UI payload or an old (pre-rename)
     bridge ``_set_session`` PATCH — in both cases the value is session
-    metadata, so it's MOVED to ``session_model`` rather than rejected.
-    Rejecting would break session persistence for bridges that haven't
-    been restarted onto the renamed key yet.
+    metadata, so it's MIRRORED to ``session_model`` rather than rejected.
+
+    The legacy ``model`` key is deliberately KEPT (not popped): bridges that
+    haven't been restarted onto the renamed key still read it to decide
+    session resume-vs-reset, so stripping it here would reset every agent
+    session on the next turn. New (post-rename) bridge code pops ``model``
+    on its first ``_set_session`` persist, so the key self-cleans once each
+    bridge restarts. Empty/non-string values ARE dropped.
     """
     if agent_backend not in _CATALOG_MODEL_BACKENDS:
         return
@@ -255,14 +260,17 @@ def _normalize_agent_backend_config_model(
     if not isinstance(config, dict) or "model" not in config:
         return
     config = dict(config)
-    legacy = config.pop("model")
+    legacy = config.get("model")
     if isinstance(legacy, str) and legacy.strip():
         config["session_model"] = legacy.strip()
         logger.warning(
-            "bot %s: moved legacy agent_backend_config.model=%r to "
-            "session_model — the bot's model is configured via default_model",
+            "bot %s: mirrored legacy agent_backend_config.model=%r to "
+            "session_model (kept for un-restarted bridges) — the bot's "
+            "model is configured via default_model",
             payload.get("slug"), legacy,
         )
+    else:
+        config.pop("model")
     payload["agent_backend_config"] = config
 
 

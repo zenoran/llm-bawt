@@ -60,7 +60,8 @@ async def lifespan(app):
                 _has_legacy = _conn.execute(_sa_text(
                     "SELECT 1 FROM bot_profiles "
                     "WHERE agent_backend IS NOT NULL "
-                    "  AND agent_backend_config ? 'model' LIMIT 1"
+                    "  AND agent_backend_config ? 'model' "
+                    "  AND NOT (agent_backend_config ? 'session_model') LIMIT 1"
                 )).fetchone()
             if _has_legacy:
                 from types import SimpleNamespace

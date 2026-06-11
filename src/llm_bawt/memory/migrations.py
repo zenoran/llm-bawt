@@ -763,8 +763,9 @@ def migrate_agent_backend_config_model(backend: Any, dry_run: bool = False) -> d
     read by the bridges) is replaced by catalog-driven injection (see
     ``ServiceLLMBawt._init_bot``).
 
-    For each agent bot still carrying the legacy key:
-      * openclaw (and unknown backends): the key is only RENAMED to
+    For each agent bot still carrying the legacy key (and no
+    ``session_model`` yet):
+      * openclaw (and unknown backends): the key is only COPIED to
         ``session_model`` — the openclaw gateway owns its model, and the
         bridges use the stored value for session resume-vs-reset
         comparison, so deleting it would reset live SDK sessions.
@@ -777,10 +778,12 @@ def migrate_agent_backend_config_model(backend: Any, dry_run: bool = False) -> d
              doesn't already resolve to a backend-compatible entry (an
              existing compatible value is user intent — the legacy key was
              typically stale)
-          3. rename the key to ``session_model``
+          3. copy the key to ``session_model`` (the legacy ``model`` key
+             is KEPT so un-restarted bridges keep resuming sessions; new
+             bridge code drops it on its first persist)
 
-    Idempotent: the ``agent_backend_config ? 'model'`` filter makes
-    re-runs no-ops.
+    Idempotent: rows that already carry ``session_model`` are skipped, so
+    re-runs — and the lingering compat ``model`` key — are no-ops.
     """
     from sqlalchemy import text
 
@@ -799,6 +802,7 @@ def migrate_agent_backend_config_model(backend: Any, dry_run: bool = False) -> d
             FROM bot_profiles
             WHERE agent_backend IS NOT NULL
               AND agent_backend_config ? 'model'
+              AND NOT (agent_backend_config ? 'session_model')
         """)).fetchall()
 
         if not rows:
@@ -893,18 +897,22 @@ def migrate_agent_backend_config_model(backend: Any, dry_run: bool = False) -> d
                         ), {"a": alias, "s": r.slug})
                     actions.append(f"{r.slug}: set default_model={alias!r}")
 
-            # Rename model → session_model for ALL backends (bridge
-            # session-resume comparison must survive the migration).
+            # Copy model → session_model for ALL backends (bridge
+            # session-resume comparison must survive the migration). The
+            # legacy "model" key is deliberately KEPT: un-restarted bridges
+            # still read it for resume-vs-reset, and new bridge code pops it
+            # on its first _set_session persist, so it self-cleans.
             if not dry_run:
                 conn.execute(text(
                     "UPDATE bot_profiles SET agent_backend_config = "
-                    "  (agent_backend_config - 'model') "
+                    "  agent_backend_config "
                     "  || jsonb_build_object('session_model', "
                     "       agent_backend_config->>'model'), "
                     "  updated_at = NOW() "
-                    "WHERE slug = :s AND agent_backend_config ? 'model'"
+                    "WHERE slug = :s AND agent_backend_config ? 'model' "
+                    "  AND NOT (agent_backend_config ? 'session_model')"
                 ), {"s": r.slug})
-            actions.append(f"{r.slug}: renamed agent_backend_config.model → session_model")
+            actions.append(f"{r.slug}: copied agent_backend_config.model → session_model")
             migrated.append(r.slug)
 
         if not dry_run:
