@@ -613,7 +613,17 @@ class ChatStreamingMixin:
         user_prompt = ""
         user_attachments: list[dict] = []
         attachments_to_persist: list[dict] = []
-        media_store = get_media_store()
+        # A degraded MediaStore (stale NFS handle, DB outage) must never
+        # kill the chat stream — attachments are dropped for the turn
+        # instead.
+        try:
+            media_store = get_media_store()
+        except Exception as e:
+            media_store = None
+            log.error(
+                "MediaStore unavailable — attachments disabled for this turn: %s",
+                e,
+            )
 
         for m in reversed(request.messages):
             if m.role != "user":
@@ -646,6 +656,8 @@ class ChatStreamingMixin:
                         # break an otherwise-valid chat — the LLM still
                         # sees the image; we just won't persist a ref.
                         try:
+                            if media_store is None:
+                                raise RuntimeError("MediaStore unavailable")
                             import base64 as _b64
 
                             raw_bytes = _b64.b64decode(data, validate=False)
@@ -672,6 +684,12 @@ class ChatStreamingMixin:
                 if not isinstance(asset_id, str) or not asset_id.strip():
                     continue
                 asset_id = asset_id.strip()
+                if media_store is None:
+                    log.error(
+                        "TASK-225: dropping attachment_id %s — MediaStore unavailable",
+                        asset_id,
+                    )
+                    continue
                 try:
                     data_url = media_store.read_original_as_data_url(asset_id)
                 except MediaAssetNotFound:

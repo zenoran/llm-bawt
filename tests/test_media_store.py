@@ -13,7 +13,9 @@ can't trip over each other.
 
 from __future__ import annotations
 
+import errno
 import io
+import os
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
@@ -327,3 +329,189 @@ def test_invalid_source_rejected(store: MediaStore) -> None:
     raw = _png_bytes(100, 100)
     with pytest.raises(ValueError):
         store.upload(raw, "image/png", "garbage_source", owner_user_id="user-1")
+
+
+# ---------------------------------------------------------------------------
+# NFS resilience — ESTALE handling on the bind-mounted media root
+# ---------------------------------------------------------------------------
+#
+# Production mounts MEDIA_ROOT over NFS4 with ``actimeo=600``. The kernel
+# can hand back ``errno 116 ESTALE`` from any of: ``Path.exists`` (via
+# ``stat``), ``mkdir``, ``write_bytes``, ``os.replace``. These tests
+# simulate those failures via ``monkeypatch`` to prove the upload
+# self-heals instead of bubbling a 500 to the chat client.
+
+
+def _make_estale(path: Any = "fake") -> OSError:
+    """Build an :class:`OSError` shaped like a real NFS ESTALE."""
+    return OSError(errno.ESTALE, "Stale file handle", str(path))
+
+
+def test_write_idempotent_retries_on_estale_then_succeeds(
+    store: MediaStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A transient ESTALE on ``Path.exists`` must not fail the upload.
+
+    Models the real failure mode from the production log: NFS attribute
+    cache hands back a stale handle, then a retry (after a fresh
+    parent-dir stat) succeeds. The upload should complete and persist
+    all three blob variants.
+    """
+    import llm_bawt.media.store as store_mod
+
+    # Pretend the very first ``exists()`` call ESTALE-fails, then
+    # subsequent calls behave normally. Drives ``_path_exists_nfs_safe``
+    # into its retry path.
+    real_exists = Path.exists
+    call_count = {"n": 0}
+
+    def fake_exists(self: Path) -> bool:
+        call_count["n"] += 1
+        if call_count["n"] == 1:
+            raise _make_estale(self)
+        return real_exists(self)
+
+    monkeypatch.setattr(Path, "exists", fake_exists)
+    # Make the retry delays instant so the test stays fast.
+    monkeypatch.setattr(store_mod, "_ESTALE_RETRY_DELAYS", (0.0, 0.0, 0.0))
+
+    raw = _png_bytes(400, 300)
+    asset = store.upload(raw, "image/png", "chat_upload", owner_user_id="user-1")
+
+    # Upload completed and all three blob variants made it to disk.
+    for subdir in VARIANT_DIRS.values():
+        shard = (
+            store.root
+            / subdir
+            / asset.sha256[:2]
+            / asset.sha256[2:4]
+            / f"{asset.sha256}.webp"
+        )
+        assert shard.exists(), f"variant {subdir} missing on disk after ESTALE retry"
+
+
+def test_write_idempotent_persistent_estale_on_exists_falls_through_to_write(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """When ``exists`` keeps ESTALE-ing, we must still try the write.
+
+    Content-addressing makes blind re-writes safe — failing the upload
+    is strictly worse than re-writing identical bytes. This test
+    confirms ``_path_exists_nfs_safe`` returns ``None`` after exhausting
+    retries and the write path runs anyway.
+    """
+    import llm_bawt.media.store as store_mod
+
+    monkeypatch.setattr(store_mod, "_ESTALE_RETRY_DELAYS", (0.0, 0.0))
+
+    # Every ``Path.exists`` raises ESTALE — we must not crash.
+    def always_estale(self: Path) -> bool:
+        raise _make_estale(self)
+
+    monkeypatch.setattr(Path, "exists", always_estale)
+
+    target = tmp_path / "shard" / "ab" / "cd" / "deadbeef.webp"
+    # Must not raise — the write path runs because ``exists`` returned None.
+    store_mod._write_idempotent(target, b"hello world")
+    assert target.read_bytes() == b"hello world"
+
+
+def test_write_idempotent_estale_on_write_retries_then_succeeds(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """ESTALE on the actual write (``write_bytes`` / ``os.replace``) retries.
+
+    The whole write sequence is wrapped in the same ESTALE retry budget,
+    so a transient failure during ``write_bytes`` or ``os.replace`` is
+    not user-visible.
+    """
+    import llm_bawt.media.store as store_mod
+
+    monkeypatch.setattr(store_mod, "_ESTALE_RETRY_DELAYS", (0.0, 0.0, 0.0))
+
+    # First call to ``os.replace`` ESTALE-fails; second one succeeds.
+    real_replace = os.replace
+    call_count = {"n": 0}
+
+    def fake_replace(src: Any, dst: Any) -> None:
+        call_count["n"] += 1
+        if call_count["n"] == 1:
+            raise _make_estale(dst)
+        return real_replace(src, dst)
+
+    monkeypatch.setattr(store_mod.os, "replace", fake_replace)
+
+    target = tmp_path / "shard" / "ab" / "cd" / "blob.webp"
+    store_mod._write_idempotent(target, b"payload")
+    assert target.read_bytes() == b"payload"
+    assert call_count["n"] == 2  # one failure + one success
+
+
+def test_write_idempotent_non_estale_oserror_propagates(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Only ESTALE is retried; other errors (EACCES, ENOSPC) must surface.
+
+    Catching everything would hide real bugs. ``_path_exists_nfs_safe``
+    and the write loop both narrow to ``errno.ESTALE``.
+    """
+    import llm_bawt.media.store as store_mod
+
+    def raise_eacces(self: Path) -> bool:
+        raise OSError(errno.EACCES, "Permission denied", str(self))
+
+    monkeypatch.setattr(Path, "exists", raise_eacces)
+
+    target = tmp_path / "shard" / "blob.webp"
+    with pytest.raises(OSError) as ei:
+        store_mod._write_idempotent(target, b"x")
+    assert ei.value.errno == errno.EACCES
+
+
+def test_upload_dedup_check_treats_estale_as_not_intact(
+    store: MediaStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Dedup-check ESTALE must NOT short-circuit the upload to a row whose
+    blobs we couldn't verify — instead it falls through to the heal path
+    that re-writes the blobs. Better to do an extra write than to hand
+    the caller back an asset_id whose disk state is unknowable.
+    """
+    import llm_bawt.media.store as store_mod
+
+    monkeypatch.setattr(store_mod, "_ESTALE_RETRY_DELAYS", (0.0,))
+
+    # Seed the store with an asset.
+    raw = _png_bytes(400, 300)
+    first = store.upload(raw, "image/png", "chat_upload", owner_user_id="user-1")
+
+    # Wipe one of the blobs to force the heal path — but make ``exists``
+    # ESTALE so the heal-check itself can't verify intact-ness.
+    for subdir in VARIANT_DIRS.values():
+        for f in (store.root / subdir).rglob("*.webp"):
+            f.unlink()
+
+    # Make every ``Path.exists`` ESTALE — the dedup-check should treat
+    # the unknown answer as "not intact" and rebuild.
+    def always_estale(self: Path) -> bool:
+        raise _make_estale(self)
+
+    # Selectively ESTALE only during the upload's intact-check window —
+    # but our retry helper exhausts and returns None, so this lets the
+    # write path run, which has its own ESTALE handling.
+    monkeypatch.setattr(Path, "exists", always_estale)
+
+    second = store.upload(raw, "image/png", "chat_upload", owner_user_id="user-2")
+    # Same asset_id preserved (heal path returns the existing row).
+    assert second.id == first.id
+
+    # And the blobs are back on disk after the heal.
+    monkeypatch.undo()
+    for subdir in VARIANT_DIRS.values():
+        shard = (
+            store.root
+            / subdir
+            / first.sha256[:2]
+            / first.sha256[2:4]
+            / f"{first.sha256}.webp"
+        )
+        assert shard.exists(), f"variant {subdir} missing after heal-on-ESTALE"

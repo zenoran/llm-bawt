@@ -50,7 +50,16 @@ services:
       # (chmod persists on disk; the dir contents stay 755, only the parent
       # is loosened so squashed-root can mkdir blobs/. Blob files end up owned
       # by nobody:nogroup which is fine — readable by nick for backups.)
-      - ${LLM_BAWT_MEDIA_HOST_PATH:-/mnt/user/home/echo/llmbawt-media}:/var/lib/llm-bawt/media
+      #
+      # rslave propagation: the source sits under an autofs NFS mount; if the
+      # host ever unmounts/remounts it, the default (rprivate) leaves the
+      # container holding a dead mount and every blob access throws ESTALE
+      # until the container is recreated. rslave lets the host's remount
+      # propagate in. NOTE: the Ubuntu-packaged compose (2.40.3+ds1) silently
+      # drops propagation flags — the real guard on echo is the fstab change
+      # that removed x-systemd.idle-timeout from /mnt/user/home, so the NFS
+      # mount never idle-unmounts in the first place (2026-06-12).
+      - ${LLM_BAWT_MEDIA_HOST_PATH:-/mnt/user/home/echo/llmbawt-media}:/var/lib/llm-bawt/media:rslave
     extra_hosts:
       - "host.docker.internal:host-gateway"
       - "echo.lan.zenoran.com:${ECHO_LAN_HOST_IP:-10.0.0.101}"

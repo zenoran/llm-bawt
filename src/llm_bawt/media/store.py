@@ -74,10 +74,12 @@ write entirely when we already have the asset.
 from __future__ import annotations
 
 import base64
+import errno
 import hashlib
 import io
 import logging
 import os
+import time
 from datetime import datetime
 from pathlib import Path
 from typing import Literal, Optional
@@ -87,6 +89,94 @@ from PIL import Image
 from .assets import MediaAsset, MediaAssetStore, new_asset_id
 
 logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# NFS resilience
+# ---------------------------------------------------------------------------
+#
+# The production deploy bind-mounts MEDIA_ROOT onto an NFS4 share from
+# Unraid (``10.0.0.99:/mnt/user/home``) with ``actimeo=600`` — a 10-minute
+# attribute cache. Any out-of-band change to the underlying object (mover
+# relocating a blob, NFS server restart, autofs idle-remount, another
+# client touching the file) can leave the local NFS client holding a
+# stale file handle. The kernel surfaces that as ``errno 116 ESTALE``.
+#
+# Python's ``pathlib.Path.exists()`` only swallows ``ENOENT`` /
+# ``ENOTDIR``; ESTALE propagates as a raw ``OSError`` and aborts the
+# upload with a 500. Same hazard on ``mkdir`` / ``write_bytes`` /
+# ``os.replace`` against that mount.
+#
+# The blob layout is content-addressed (sha256), so re-writing a blob
+# under its canonical path is *always* safe — there's nothing to
+# corrupt by writing the same content twice. That makes the right
+# strategy "when NFS lies about state, force-flush the parent's attr
+# cache and try again; if it still won't answer cleanly, fall through
+# to a write." Idempotent ops + bounded retries + content-addressing =
+# self-healing through transient NFS faults.
+
+#: Delays between NFS retry attempts. Total budget ~1.55s — long enough
+#: to ride out a normal NFS attribute-cache miss, short enough that a
+#: persistent failure surfaces quickly instead of pinning a request.
+_ESTALE_RETRY_DELAYS = (0.05, 0.1, 0.2, 0.4, 0.8)
+
+
+def _is_estale(e: OSError) -> bool:
+    """True if ``e`` is the NFS stale-file-handle error (``errno 116``)."""
+    return getattr(e, "errno", None) == errno.ESTALE
+
+
+def _flush_parent_attr_cache(path: Path) -> None:
+    """Force the NFS client to re-validate ``path.parent``'s attributes.
+
+    A fresh ``stat()`` invalidates the cached directory cookies, so the
+    next lookup of ``path`` goes back to the NFS server instead of
+    trusting the stale cached handle. Safe to ignore failures here —
+    this is best-effort cache busting, not a correctness operation.
+    """
+    try:
+        path.parent.stat()
+    except OSError:
+        pass
+
+
+def _path_exists_nfs_safe(path: Path) -> Optional[bool]:
+    """``Path.exists()`` that survives NFS ESTALE.
+
+    Returns:
+      - ``True`` / ``False`` for a confident answer (normal stat result).
+      - ``None`` when the filesystem keeps returning ESTALE after the
+        retry budget is exhausted. Callers should treat ``None`` as "I
+        don't know, proceed defensively" — for a content-addressed blob
+        store, that means "write again."
+
+    Any non-ESTALE ``OSError`` propagates immediately (we don't want to
+    paper over EACCES or EIO).
+    """
+    last_err: Optional[OSError] = None
+    for attempt, delay in enumerate(_ESTALE_RETRY_DELAYS, start=1):
+        try:
+            return path.exists()
+        except OSError as e:
+            if not _is_estale(e):
+                raise
+            last_err = e
+            logger.warning(
+                "NFS ESTALE on exists(%s) attempt %d/%d; flushing parent attr cache",
+                path,
+                attempt,
+                len(_ESTALE_RETRY_DELAYS),
+            )
+            _flush_parent_attr_cache(path)
+            time.sleep(delay)
+    logger.error(
+        "NFS ESTALE persisted on exists(%s) after %d retries; treating as 'unknown' "
+        "and letting caller proceed defensively (last error: %s)",
+        path,
+        len(_ESTALE_RETRY_DELAYS),
+        last_err,
+    )
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -237,16 +327,83 @@ def _write_idempotent(path: Path, data: bytes) -> None:
     The blob layout is content-addressed, so an existing file at the same
     path *must* have the same sha256 — we don't re-verify. Saves a write
     and an fsync on the dedup-hit path.
+
+    NFS hardening: ``path.exists()`` can raise ESTALE on a stale NFS
+    handle (see module-level "NFS resilience" block). We use
+    :func:`_path_exists_nfs_safe` which retries on ESTALE and returns
+    ``None`` when it can't get a confident answer. ``None`` is treated
+    as "unknown — write anyway"; content-addressing makes that safe.
+    Each of the four syscalls below (``mkdir``, ``write_bytes``,
+    ``os.replace``, the implicit ``stat`` inside the first check) is
+    wrapped in the same retry budget, because any of them can hit
+    ESTALE on a flaky mount and they're all idempotent for our use.
+
+    The tempfile name embeds the pid + thread id so two concurrent
+    writers targeting the same sha don't clobber each other's
+    in-flight ``.tmp`` mid-write.
     """
-    if path.exists():
+    exists = _path_exists_nfs_safe(path)
+    if exists is True:
         return
-    path.parent.mkdir(parents=True, exist_ok=True)
-    # Write to a sibling tempfile + rename so a crash mid-write never
-    # leaves a half-baked blob at the canonical path. ``os.replace`` is
-    # atomic on POSIX.
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    tmp.write_bytes(data)
-    os.replace(tmp, path)
+    # exists is False (confident miss) or None (NFS wouldn't tell us
+    # cleanly). Either way: write defensively. Content-addressed name
+    # guarantees we can never corrupt anything by writing the same
+    # bytes again.
+
+    import threading
+
+    tmp = path.with_suffix(
+        f"{path.suffix}.tmp.{os.getpid()}.{threading.get_ident()}"
+    )
+
+    def _do_write() -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp.write_bytes(data)
+        # ``os.replace`` is atomic on POSIX. After this, ``path`` is the
+        # canonical content-addressed name; any earlier writer that
+        # raced us either landed on the same bytes (no-op) or got
+        # replaced by ours (same bytes — sha matches by construction).
+        os.replace(tmp, path)
+
+    last_err: Optional[OSError] = None
+    for attempt, delay in enumerate(_ESTALE_RETRY_DELAYS, start=1):
+        try:
+            _do_write()
+            return
+        except OSError as e:
+            if not _is_estale(e):
+                # Best-effort cleanup of the tempfile, then re-raise so
+                # the caller sees the real error (EACCES, ENOSPC, etc.).
+                try:
+                    tmp.unlink(missing_ok=True)
+                except OSError:
+                    pass
+                raise
+            last_err = e
+            logger.warning(
+                "NFS ESTALE on write(%s) attempt %d/%d; flushing parent attr cache",
+                path,
+                attempt,
+                len(_ESTALE_RETRY_DELAYS),
+            )
+            _flush_parent_attr_cache(path)
+            # Clean up any partial tmp from the failed attempt so the
+            # next try gets a clean slate.
+            try:
+                tmp.unlink(missing_ok=True)
+            except OSError:
+                pass
+            time.sleep(delay)
+
+    # Retries exhausted — surface the last ESTALE so the upload route
+    # returns a 5xx and the frontend can retry. We've done everything we
+    # safely can at the filesystem layer.
+    try:
+        tmp.unlink(missing_ok=True)
+    except OSError:
+        pass
+    assert last_err is not None  # loop ran at least once
+    raise last_err
 
 
 def _row_to_asset(row: dict) -> MediaAsset:
@@ -281,7 +438,17 @@ class MediaStore:
             env_root = os.environ.get("LLM_BAWT_MEDIA_ROOT")
             root = Path(env_root) if env_root else DEFAULT_MEDIA_ROOT
         self.root = Path(root)
-        self.root.mkdir(parents=True, exist_ok=True)
+        # Non-fatal: the root lives on an NFS bind mount that can go stale
+        # (ESTALE) when the host autofs remounts under us. A broken media
+        # tree must degrade media features, not prevent the store (and any
+        # request path that constructs it) from existing at all.
+        try:
+            self.root.mkdir(parents=True, exist_ok=True)
+        except OSError as e:
+            logger.error(
+                "MediaStore root unavailable (%s): %s — media disabled until "
+                "the mount recovers or the container restarts", self.root, e,
+            )
         self.db = db
 
     # ------------------------------------------------------------------
@@ -327,8 +494,14 @@ class MediaStore:
         if self.db is not None:
             existing = self.db.get_by_sha256(sha256_hex)
             if existing is not None:
+                # NFS hardening: ``_path_exists_nfs_safe`` returns ``None``
+                # when ESTALE keeps the answer ambiguous. Treat ambiguous
+                # as "not intact" so we take the heal path and rewrite —
+                # safer than returning a row whose blobs we can't verify.
                 blobs_intact = all(
-                    _shard_path(self.root, subdir, sha256_hex).exists()
+                    _path_exists_nfs_safe(
+                        _shard_path(self.root, subdir, sha256_hex)
+                    ) is True
                     for subdir in VARIANT_DIRS.values()
                 )
                 if blobs_intact:
