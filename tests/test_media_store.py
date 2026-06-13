@@ -357,7 +357,7 @@ def test_write_idempotent_retries_on_estale_then_succeeds(
     parent-dir stat) succeeds. The upload should complete and persist
     all three blob variants.
     """
-    import llm_bawt.media.store as store_mod
+    import llm_bawt.media.object_store as store_mod
 
     # Pretend the very first ``exists()`` call ESTALE-fails, then
     # subsequent calls behave normally. Drives ``_path_exists_nfs_safe``
@@ -400,7 +400,7 @@ def test_write_idempotent_persistent_estale_on_exists_falls_through_to_write(
     confirms ``_path_exists_nfs_safe`` returns ``None`` after exhausting
     retries and the write path runs anyway.
     """
-    import llm_bawt.media.store as store_mod
+    import llm_bawt.media.object_store as store_mod
 
     monkeypatch.setattr(store_mod, "_ESTALE_RETRY_DELAYS", (0.0, 0.0))
 
@@ -425,7 +425,7 @@ def test_write_idempotent_estale_on_write_retries_then_succeeds(
     so a transient failure during ``write_bytes`` or ``os.replace`` is
     not user-visible.
     """
-    import llm_bawt.media.store as store_mod
+    import llm_bawt.media.object_store as store_mod
 
     monkeypatch.setattr(store_mod, "_ESTALE_RETRY_DELAYS", (0.0, 0.0, 0.0))
 
@@ -455,7 +455,7 @@ def test_write_idempotent_non_estale_oserror_propagates(
     Catching everything would hide real bugs. ``_path_exists_nfs_safe``
     and the write loop both narrow to ``errno.ESTALE``.
     """
-    import llm_bawt.media.store as store_mod
+    import llm_bawt.media.object_store as store_mod
 
     def raise_eacces(self: Path) -> bool:
         raise OSError(errno.EACCES, "Permission denied", str(self))
@@ -476,7 +476,7 @@ def test_upload_dedup_check_treats_estale_as_not_intact(
     that re-writes the blobs. Better to do an extra write than to hand
     the caller back an asset_id whose disk state is unknowable.
     """
-    import llm_bawt.media.store as store_mod
+    import llm_bawt.media.object_store as store_mod
 
     monkeypatch.setattr(store_mod, "_ESTALE_RETRY_DELAYS", (0.0,))
 

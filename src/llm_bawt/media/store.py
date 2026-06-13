@@ -74,12 +74,10 @@ write entirely when we already have the asset.
 from __future__ import annotations
 
 import base64
-import errno
 import hashlib
 import io
 import logging
 import os
-import time
 from datetime import datetime
 from pathlib import Path
 from typing import Literal, Optional
@@ -88,95 +86,33 @@ from PIL import Image
 
 from .assets import MediaAsset, MediaAssetStore, new_asset_id
 
+# NFS ESTALE helpers + the blob-backend abstraction are canonical in
+# ``object_store``. We re-export the helpers here for back-compat — older
+# call sites (and tests that pre-date TASK-266) reach into
+# ``llm_bawt.media.store`` for them. New code should import directly
+# from ``llm_bawt.media.object_store``.
+#
+# Note: monkeypatching ``store._ESTALE_RETRY_DELAYS`` does NOT change the
+# retry budget seen by ``_write_idempotent`` — that function lives in
+# ``object_store`` and resolves the name in its own module namespace.
+# Tests that need to shorten the retry budget should patch
+# ``object_store._ESTALE_RETRY_DELAYS`` instead.
+from .object_store import (  # noqa: F401  (re-exported for back-compat)
+    BlobBackend,
+    BlobBackendUnavailable,
+    BlobNotFound,
+    FsBlobBackend,
+    S3Config,
+    _ESTALE_RETRY_DELAYS,
+    _flush_parent_attr_cache,
+    _is_estale,
+    _path_exists_nfs_safe,
+    _write_idempotent,
+    get_blob_backend,
+    s3_config_from_env,
+)
+
 logger = logging.getLogger(__name__)
-
-
-# ---------------------------------------------------------------------------
-# NFS resilience
-# ---------------------------------------------------------------------------
-#
-# The production deploy bind-mounts MEDIA_ROOT onto an NFS4 share from
-# Unraid (``10.0.0.99:/mnt/user/home``) with ``actimeo=600`` — a 10-minute
-# attribute cache. Any out-of-band change to the underlying object (mover
-# relocating a blob, NFS server restart, autofs idle-remount, another
-# client touching the file) can leave the local NFS client holding a
-# stale file handle. The kernel surfaces that as ``errno 116 ESTALE``.
-#
-# Python's ``pathlib.Path.exists()`` only swallows ``ENOENT`` /
-# ``ENOTDIR``; ESTALE propagates as a raw ``OSError`` and aborts the
-# upload with a 500. Same hazard on ``mkdir`` / ``write_bytes`` /
-# ``os.replace`` against that mount.
-#
-# The blob layout is content-addressed (sha256), so re-writing a blob
-# under its canonical path is *always* safe — there's nothing to
-# corrupt by writing the same content twice. That makes the right
-# strategy "when NFS lies about state, force-flush the parent's attr
-# cache and try again; if it still won't answer cleanly, fall through
-# to a write." Idempotent ops + bounded retries + content-addressing =
-# self-healing through transient NFS faults.
-
-#: Delays between NFS retry attempts. Total budget ~1.55s — long enough
-#: to ride out a normal NFS attribute-cache miss, short enough that a
-#: persistent failure surfaces quickly instead of pinning a request.
-_ESTALE_RETRY_DELAYS = (0.05, 0.1, 0.2, 0.4, 0.8)
-
-
-def _is_estale(e: OSError) -> bool:
-    """True if ``e`` is the NFS stale-file-handle error (``errno 116``)."""
-    return getattr(e, "errno", None) == errno.ESTALE
-
-
-def _flush_parent_attr_cache(path: Path) -> None:
-    """Force the NFS client to re-validate ``path.parent``'s attributes.
-
-    A fresh ``stat()`` invalidates the cached directory cookies, so the
-    next lookup of ``path`` goes back to the NFS server instead of
-    trusting the stale cached handle. Safe to ignore failures here —
-    this is best-effort cache busting, not a correctness operation.
-    """
-    try:
-        path.parent.stat()
-    except OSError:
-        pass
-
-
-def _path_exists_nfs_safe(path: Path) -> Optional[bool]:
-    """``Path.exists()`` that survives NFS ESTALE.
-
-    Returns:
-      - ``True`` / ``False`` for a confident answer (normal stat result).
-      - ``None`` when the filesystem keeps returning ESTALE after the
-        retry budget is exhausted. Callers should treat ``None`` as "I
-        don't know, proceed defensively" — for a content-addressed blob
-        store, that means "write again."
-
-    Any non-ESTALE ``OSError`` propagates immediately (we don't want to
-    paper over EACCES or EIO).
-    """
-    last_err: Optional[OSError] = None
-    for attempt, delay in enumerate(_ESTALE_RETRY_DELAYS, start=1):
-        try:
-            return path.exists()
-        except OSError as e:
-            if not _is_estale(e):
-                raise
-            last_err = e
-            logger.warning(
-                "NFS ESTALE on exists(%s) attempt %d/%d; flushing parent attr cache",
-                path,
-                attempt,
-                len(_ESTALE_RETRY_DELAYS),
-            )
-            _flush_parent_attr_cache(path)
-            time.sleep(delay)
-    logger.error(
-        "NFS ESTALE persisted on exists(%s) after %d retries; treating as 'unknown' "
-        "and letting caller proceed defensively (last error: %s)",
-        path,
-        len(_ESTALE_RETRY_DELAYS),
-        last_err,
-    )
-    return None
 
 
 # ---------------------------------------------------------------------------
@@ -227,15 +163,6 @@ class MediaAssetNotFound(LookupError):
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
-
-
-def _shard_path(root: Path, variant_subdir: str, sha256_hex: str) -> Path:
-    """Return ``<root>/<variant_subdir>/<aa>/<bb>/<sha256>.webp``.
-
-    The two-level prefix mirrors :class:`MediaStorage` so anyone walking
-    the tree can rely on the same fan-out pattern.
-    """
-    return root / variant_subdir / sha256_hex[:2] / sha256_hex[2:4] / f"{sha256_hex}.webp"
 
 
 def _normalize_to_original(raw_bytes: bytes) -> tuple[bytes, Image.Image, int, int]:
@@ -321,89 +248,19 @@ def _encode_variant(normalized: Image.Image, max_size: tuple[int, int], quality:
     return buf.getvalue()
 
 
-def _write_idempotent(path: Path, data: bytes) -> None:
-    """Write bytes to ``path`` only if not already present.
+def _shard_key(variant_subdir: str, sha256_hex: str) -> str:
+    """Return the blob-backend key for a given variant + sha.
 
-    The blob layout is content-addressed, so an existing file at the same
-    path *must* have the same sha256 — we don't re-verify. Saves a write
-    and an fsync on the dedup-hit path.
+    Backend-agnostic relative path: ``<variant_subdir>/<aa>/<bb>/<sha>.webp``.
+    For the FS backend this joins under ``MediaStore.root``; for S3 the
+    factory prepends a ``blobs/`` prefix so MediaStore + MediaStorage can
+    share one bucket without colliding.
 
-    NFS hardening: ``path.exists()`` can raise ESTALE on a stale NFS
-    handle (see module-level "NFS resilience" block). We use
-    :func:`_path_exists_nfs_safe` which retries on ESTALE and returns
-    ``None`` when it can't get a confident answer. ``None`` is treated
-    as "unknown — write anyway"; content-addressing makes that safe.
-    Each of the four syscalls below (``mkdir``, ``write_bytes``,
-    ``os.replace``, the implicit ``stat`` inside the first check) is
-    wrapped in the same retry budget, because any of them can hit
-    ESTALE on a flaky mount and they're all idempotent for our use.
-
-    The tempfile name embeds the pid + thread id so two concurrent
-    writers targeting the same sha don't clobber each other's
-    in-flight ``.tmp`` mid-write.
+    The two-level shard mirrors :class:`llm_bawt.media.storage.MediaStorage`
+    so anyone walking the tree (or rclone-copying it into Garage) sees the
+    same fan-out everywhere.
     """
-    exists = _path_exists_nfs_safe(path)
-    if exists is True:
-        return
-    # exists is False (confident miss) or None (NFS wouldn't tell us
-    # cleanly). Either way: write defensively. Content-addressed name
-    # guarantees we can never corrupt anything by writing the same
-    # bytes again.
-
-    import threading
-
-    tmp = path.with_suffix(
-        f"{path.suffix}.tmp.{os.getpid()}.{threading.get_ident()}"
-    )
-
-    def _do_write() -> None:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        tmp.write_bytes(data)
-        # ``os.replace`` is atomic on POSIX. After this, ``path`` is the
-        # canonical content-addressed name; any earlier writer that
-        # raced us either landed on the same bytes (no-op) or got
-        # replaced by ours (same bytes — sha matches by construction).
-        os.replace(tmp, path)
-
-    last_err: Optional[OSError] = None
-    for attempt, delay in enumerate(_ESTALE_RETRY_DELAYS, start=1):
-        try:
-            _do_write()
-            return
-        except OSError as e:
-            if not _is_estale(e):
-                # Best-effort cleanup of the tempfile, then re-raise so
-                # the caller sees the real error (EACCES, ENOSPC, etc.).
-                try:
-                    tmp.unlink(missing_ok=True)
-                except OSError:
-                    pass
-                raise
-            last_err = e
-            logger.warning(
-                "NFS ESTALE on write(%s) attempt %d/%d; flushing parent attr cache",
-                path,
-                attempt,
-                len(_ESTALE_RETRY_DELAYS),
-            )
-            _flush_parent_attr_cache(path)
-            # Clean up any partial tmp from the failed attempt so the
-            # next try gets a clean slate.
-            try:
-                tmp.unlink(missing_ok=True)
-            except OSError:
-                pass
-            time.sleep(delay)
-
-    # Retries exhausted — surface the last ESTALE so the upload route
-    # returns a 5xx and the frontend can retry. We've done everything we
-    # safely can at the filesystem layer.
-    try:
-        tmp.unlink(missing_ok=True)
-    except OSError:
-        pass
-    assert last_err is not None  # loop ran at least once
-    raise last_err
+    return f"{variant_subdir}/{sha256_hex[:2]}/{sha256_hex[2:4]}/{sha256_hex}.webp"
 
 
 def _row_to_asset(row: dict) -> MediaAsset:
@@ -422,33 +279,39 @@ def _row_to_asset(row: dict) -> MediaAsset:
 
 
 class MediaStore:
-    """High-level facade over the on-disk blob tree + ``media_assets`` row.
+    """High-level facade over a blob backend + ``media_assets`` row.
 
     Construct once per process via :func:`get_media_store`. The class is
-    cheap to instantiate (no work at ``__init__`` beyond a ``mkdir``), so
-    tests can build their own with a ``tmp_path`` root.
+    cheap to instantiate (no network I/O — S3 clients are built lazily by
+    :class:`S3BlobBackend`), so tests can build their own with a
+    ``tmp_path`` root or a custom backend.
+
+    Backend selection (TASK-266): defaults to ``fs`` rooted at
+    ``LLM_BAWT_MEDIA_ROOT`` (or the legacy ``DEFAULT_MEDIA_ROOT``). Flip
+    to S3/Garage by setting ``LLM_BAWT_STORAGE_BACKEND=s3`` along with
+    the matching ``LLM_BAWT_S3_*`` credentials; the FS root then becomes
+    a fallback source if ``LLM_BAWT_S3_FALLBACK_FS=true`` (cutover only).
     """
 
     def __init__(
         self,
         root: Path | None = None,
         db: MediaAssetStore | None = None,
+        backend: BlobBackend | None = None,
     ):
         if root is None:
             env_root = os.environ.get("LLM_BAWT_MEDIA_ROOT")
             root = Path(env_root) if env_root else DEFAULT_MEDIA_ROOT
         self.root = Path(root)
-        # Non-fatal: the root lives on an NFS bind mount that can go stale
-        # (ESTALE) when the host autofs remounts under us. A broken media
-        # tree must degrade media features, not prevent the store (and any
-        # request path that constructs it) from existing at all.
-        try:
-            self.root.mkdir(parents=True, exist_ok=True)
-        except OSError as e:
-            logger.error(
-                "MediaStore root unavailable (%s): %s — media disabled until "
-                "the mount recovers or the container restarts", self.root, e,
+        if backend is None:
+            # Default backend: env-driven (``fs`` unless STORAGE_BACKEND=s3).
+            # Construction performs no network I/O — boto3 client is lazy.
+            backend = get_blob_backend(
+                "media_store",
+                fs_root=self.root,
+                s3_cfg=s3_config_from_env(),
             )
+        self.backend = backend
         self.db = db
 
     # ------------------------------------------------------------------
@@ -494,14 +357,16 @@ class MediaStore:
         if self.db is not None:
             existing = self.db.get_by_sha256(sha256_hex)
             if existing is not None:
-                # NFS hardening: ``_path_exists_nfs_safe`` returns ``None``
-                # when ESTALE keeps the answer ambiguous. Treat ambiguous
-                # as "not intact" so we take the heal path and rewrite —
-                # safer than returning a row whose blobs we can't verify.
+                # Treat "backend can't confirm" as "not intact" so we
+                # take the heal path and rewrite — safer than returning
+                # a row whose blobs we can't verify. For the FS backend
+                # this covers NFS ESTALE ambiguity; for S3 it covers
+                # transient connection blips (we treat the latter as
+                # "unknown" rather than propagating a 503 here, since
+                # the subsequent put() will surface a real backend error
+                # if Garage is truly down).
                 blobs_intact = all(
-                    _path_exists_nfs_safe(
-                        _shard_path(self.root, subdir, sha256_hex)
-                    ) is True
+                    self._backend_exists_safe(_shard_key(subdir, sha256_hex))
                     for subdir in VARIANT_DIRS.values()
                 )
                 if blobs_intact:
@@ -531,11 +396,13 @@ class MediaStore:
         thumb_bytes = _encode_variant(normalized, THUMB_MAX, THUMB_WEBP_QUALITY)
         preview_bytes = _encode_variant(normalized, PREVIEW_MAX, PREVIEW_WEBP_QUALITY)
 
-        # Step 4: write all three blobs. Same sha256 path for all three
-        # variants — the variant subdir disambiguates.
-        _write_idempotent(_shard_path(self.root, VARIANT_DIRS["original"], sha256_hex), original_bytes)
-        _write_idempotent(_shard_path(self.root, VARIANT_DIRS["thumb"], sha256_hex), thumb_bytes)
-        _write_idempotent(_shard_path(self.root, VARIANT_DIRS["preview"], sha256_hex), preview_bytes)
+        # Step 4: write all three blobs through the backend. Same sha256
+        # path for all three variants — the variant subdir disambiguates.
+        # Backend writes are idempotent for content-addressed keys, so
+        # racing writers can never corrupt anything.
+        self.backend.put(_shard_key(VARIANT_DIRS["original"], sha256_hex), original_bytes, VARIANT_MIME)
+        self.backend.put(_shard_key(VARIANT_DIRS["thumb"], sha256_hex), thumb_bytes, VARIANT_MIME)
+        self.backend.put(_shard_key(VARIANT_DIRS["preview"], sha256_hex), preview_bytes, VARIANT_MIME)
 
         # Step 5: register in Postgres. ``insert`` is itself dedup-safe —
         # if two callers race on the same bytes, the second one gets the
@@ -589,7 +456,10 @@ class MediaStore:
 
         :raises MediaAssetNotFound: if no DB row matches ``asset_id``.
         :raises FileNotFoundError: if the row exists but the blob has been
-            evicted from disk (e.g. volume restored without DB sync).
+            evicted from the backend (e.g. volume restored without DB sync,
+            S3 key deleted out-of-band).
+        :raises BlobBackendUnavailable: if the backend can't be reached
+            at all (network / 5xx). Route handlers should map this to 503.
         :raises ValueError: if ``variant`` is not one of the three known names.
         """
         if variant not in VARIANT_DIRS:
@@ -597,12 +467,17 @@ class MediaStore:
                 f"variant must be one of {list(VARIANT_DIRS)!r}, got {variant!r}"
             )
         row = self._require_row(asset_id)
-        path = _shard_path(self.root, VARIANT_DIRS[variant], row["sha256"])
-        if not path.is_file():
+        key = _shard_key(VARIANT_DIRS[variant], row["sha256"])
+        try:
+            data = self.backend.get(key)
+        except BlobNotFound as e:
+            # Preserve the legacy contract: callers expect FileNotFoundError
+            # for "DB row exists but blob is gone". 404-mapping is the same
+            # on the route side regardless of source.
             raise FileNotFoundError(
-                f"MediaStore blob missing for asset={asset_id} variant={variant} path={path}"
-            )
-        return path.read_bytes(), VARIANT_MIME
+                f"MediaStore blob missing for asset={asset_id} variant={variant} key={key}"
+            ) from e
+        return data, VARIANT_MIME
 
     def read_original_as_data_url(self, asset_id: str) -> str:
         """Return the original variant as a ``data:image/webp;base64,...`` URL.
@@ -631,8 +506,16 @@ class MediaStore:
 
         Order: blobs first, then DB row. If the process dies between the
         two, the next ``upload`` of the same content will overwrite
-        nothing (idempotent write) and re-insert the row — the system
-        self-heals.
+        nothing (idempotent backend put) and re-insert the row — the
+        system self-heals.
+
+        Backend deletes are idempotent: missing keys are not an error.
+        Empty shard-dir cleanup (the ``<aa>/<bb>`` fan-out) lives inside
+        :meth:`FsBlobBackend.delete`; the S3 backend has no equivalent
+        notion of an empty prefix.
+
+        :raises BlobBackendUnavailable: if the backend can't be reached
+            at all. The DB row is left in place so the GC pass can retry.
         """
         if self.db is not None:
             row = self.db.get_by_id(asset_id)
@@ -643,26 +526,31 @@ class MediaStore:
             return
 
         for subdir in VARIANT_DIRS.values():
-            path = _shard_path(self.root, subdir, sha256_hex)
-            try:
-                path.unlink()
-            except FileNotFoundError:
-                pass
-            # Walk up and rmdir empty shard prefixes so we don't leak
-            # thousands of empty <aa>/<bb> directories after GC sweeps.
-            parent = path.parent
-            try:
-                while parent != self.root and parent.is_dir():
-                    parent.rmdir()  # raises if not empty — that's our break
-                    parent = parent.parent
-            except OSError:
-                pass
+            self.backend.delete(_shard_key(subdir, sha256_hex))
 
         self.db.delete(asset_id)
 
     # ------------------------------------------------------------------
     # Internal
     # ------------------------------------------------------------------
+
+    def _backend_exists_safe(self, key: str) -> bool:
+        """Like ``backend.exists(key)`` but swallows backend-unavailable.
+
+        Used by the dedup-heal check: if we can't tell whether a blob is
+        intact, assume it isn't and force a re-write. The subsequent
+        ``put`` will surface the real error if the backend is genuinely
+        down — we just don't want a transient blip to confuse the heal
+        decision into a false "intact" answer.
+        """
+        try:
+            return self.backend.exists(key)
+        except BlobBackendUnavailable as e:
+            logger.warning(
+                "backend exists() unavailable during dedup-heal check for key=%s: %s",
+                key, e,
+            )
+            return False
 
     def _require_row(self, asset_id: str) -> dict:
         if self.db is None:

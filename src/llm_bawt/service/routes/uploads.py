@@ -60,6 +60,7 @@ from ...media import (
     asset_to_upload_response_dict,
     get_media_store,
 )
+from ...media.object_store import BlobBackendUnavailable
 
 logger = logging.getLogger(__name__)
 
@@ -261,6 +262,14 @@ async def upload_asset(
     except ValueError as e:
         # ``source`` not in ALLOWED_SOURCES surfaces here.
         raise HTTPException(status_code=400, detail=str(e))
+    except BlobBackendUnavailable as e:
+        # Garage / S3 unreachable. Chat itself keeps working; the upload
+        # path just refuses cleanly so the frontend can retry.
+        logger.error("MediaStore.upload: storage backend unavailable: %s", e)
+        raise HTTPException(
+            status_code=503,
+            detail="Media storage backend unavailable; try again shortly",
+        )
     except Exception as e:
         logger.exception("MediaStore.upload failed")
         raise HTTPException(status_code=500, detail=f"upload failed: {e}")
@@ -323,6 +332,12 @@ def _serve_variant(
         # perspective; the actionable detail is logged for ops.
         logger.error("Asset %s has DB row but missing blob (variant=%s)", asset_id, variant)
         raise HTTPException(status_code=404, detail=f"Asset {asset_id!r} blob missing")
+    except BlobBackendUnavailable as e:
+        logger.error("upload serve: backend unavailable (asset=%s variant=%s): %s", asset_id, variant, e)
+        raise HTTPException(
+            status_code=503,
+            detail="Media storage backend unavailable; try again shortly",
+        )
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
 
@@ -398,6 +413,12 @@ async def delete_asset(
 
     try:
         store.delete(asset_id)
+    except BlobBackendUnavailable as e:
+        logger.error("MediaStore.delete: backend unavailable for %s: %s", asset_id, e)
+        raise HTTPException(
+            status_code=503,
+            detail="Media storage backend unavailable; try again shortly",
+        )
     except Exception as e:
         logger.exception("MediaStore.delete failed for %s", asset_id)
         raise HTTPException(status_code=500, detail=f"delete failed: {e}")

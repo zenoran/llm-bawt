@@ -17,11 +17,12 @@ import os
 import uuid
 from datetime import datetime, timezone
 
-from fastapi import APIRouter, HTTPException, Query
-from fastapi.responses import FileResponse
+from fastapi import APIRouter, HTTPException, Query, Request
+from fastapi.responses import Response
 
 from ...media.clients.grok_media import GrokMediaClient
 from ...media.db import MediaGenerationStore
+from ...media.object_store import BlobBackendUnavailable
 from ...media.schemas import (
     MediaGenerationListResponse,
     MediaGenerationRequest,
@@ -352,8 +353,19 @@ async def delete_generation(gen_id: str):
 
 
 @router.get("/v1/media/generations/{gen_id}/content")
-async def stream_content(gen_id: str):
-    """Stream the raw media file (video/mp4, image/png, etc.)."""
+async def stream_content(gen_id: str, request: Request):
+    """Serve the raw media file with HTTP Range support.
+
+    Range passthrough (TASK-266): the client's ``Range`` header is
+    forwarded verbatim to the storage backend. Garage / boto3 honors
+    standard ``bytes=…`` ranges, and the FS backend has a matching
+    implementation in :class:`FsBlobBackend`. Both produce a
+    :class:`BlobRange` we map to either HTTP 200 (full body) or 206
+    (partial content) here.
+
+    Backend-down → 503 JSON; missing blob → 404; bad/unsatisfiable
+    range → 416.
+    """
     store = _get_store()
     storage = _get_storage()
 
@@ -365,22 +377,58 @@ async def stream_content(gen_id: str):
     if not file_path:
         raise HTTPException(status_code=404, detail="Media file not yet available (generation may still be in progress)")
 
-    try:
-        abs_path = storage.resolve(file_path)
-    except FileNotFoundError:
-        raise HTTPException(status_code=404, detail="Media file not found on disk")
+    range_header = request.headers.get("range")
 
-    mime_type = row.get("mime_type", "application/octet-stream")
-    return FileResponse(
-        path=str(abs_path),
+    # Pull the (possibly Range-bounded) body via the storage backend.
+    # asyncio.to_thread because the FS backend may issue blocking I/O on
+    # an NFS mount and we don't want to stall the event loop.
+    try:
+        blob_range = await asyncio.to_thread(storage.read_range, file_path, range_header)
+    except FileNotFoundError:
+        raise HTTPException(status_code=404, detail="Media file not found")
+    except ValueError:
+        # Unsatisfiable Range — RFC 7233 says we should also include a
+        # Content-Range: bytes */<size> header, but we don't have the
+        # size to hand here without an extra HEAD. 416 alone is enough
+        # for browsers / video players.
+        raise HTTPException(status_code=416, detail="Requested range not satisfiable")
+    except BlobBackendUnavailable as e:
+        logger.error("media content backend unavailable for %s: %s", gen_id, e)
+        raise HTTPException(
+            status_code=503,
+            detail="Media storage backend unavailable; try again shortly",
+        )
+
+    mime_type = blob_range.content_type or row.get("mime_type", "application/octet-stream")
+
+    if blob_range.partial:
+        headers = {
+            "Content-Range": f"bytes {blob_range.start}-{blob_range.end}/{blob_range.total_size}",
+            "Accept-Ranges": "bytes",
+        }
+        return Response(
+            content=blob_range.data,
+            status_code=206,
+            media_type=mime_type,
+            headers=headers,
+        )
+
+    return Response(
+        content=blob_range.data,
+        status_code=200,
         media_type=mime_type,
-        filename=abs_path.name,
+        headers={"Accept-Ranges": "bytes"},
     )
 
 
 @router.get("/v1/media/generations/{gen_id}/thumbnail")
 async def serve_thumbnail(gen_id: str):
-    """Serve the poster frame / thumbnail image."""
+    """Serve the poster frame / thumbnail image.
+
+    Backend-aware: same error mapping as ``stream_content``
+    (backend down → 503, missing blob → 404). Thumbnails are small
+    enough to serve as a single Response body — no Range needed.
+    """
     store = _get_store()
     storage = _get_storage()
 
@@ -393,12 +441,18 @@ async def serve_thumbnail(gen_id: str):
         raise HTTPException(status_code=404, detail="Thumbnail not available")
 
     try:
-        abs_path = storage.resolve(thumb_path)
+        data = await asyncio.to_thread(storage.read, thumb_path)
     except FileNotFoundError:
-        raise HTTPException(status_code=404, detail="Thumbnail file not found on disk")
+        raise HTTPException(status_code=404, detail="Thumbnail file not found")
+    except BlobBackendUnavailable as e:
+        logger.error("thumbnail backend unavailable for %s: %s", gen_id, e)
+        raise HTTPException(
+            status_code=503,
+            detail="Media storage backend unavailable; try again shortly",
+        )
 
-    return FileResponse(
-        path=str(abs_path),
+    return Response(
+        content=data,
+        status_code=200,
         media_type="image/jpeg",
-        filename=abs_path.name,
     )

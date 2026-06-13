@@ -229,9 +229,22 @@ def run_media_gc(
             "errors": [],
         }
 
+    # Lazy import — keeps the GC module free of an object_store dep at
+    # load time, which matters for the scheduler's import graph.
+    from llm_bawt.media.object_store import BlobBackendUnavailable
+
     deleted_count = 0
     freed_bytes = 0
     errors: list[dict[str, Any]] = []
+    aborted_reason: str | None = None
+
+    # If the storage backend is wedged we'd hammer it for every orphan,
+    # each delete costing the full boto3 timeout. Bail out after three
+    # consecutive backend-unavailable errors and let the next nightly
+    # sweep retry — preserves "never crash the scheduler" without
+    # turning a backend outage into a thousand-line error log.
+    consecutive_unavailable = 0
+    UNAVAILABLE_ABORT_THRESHOLD = 3
 
     for row in orphans:
         asset_id = row["id"]
@@ -240,21 +253,38 @@ def run_media_gc(
             store.delete(asset_id)
             deleted_count += 1
             freed_bytes += size
+            consecutive_unavailable = 0  # any success resets the streak
+        except BlobBackendUnavailable as e:
+            consecutive_unavailable += 1
+            logger.warning(
+                "media_gc: backend unavailable for asset %s (streak=%d): %s",
+                asset_id, consecutive_unavailable, e,
+            )
+            errors.append({"asset_id": asset_id, "error": f"backend unavailable: {e}"})
+            if consecutive_unavailable >= UNAVAILABLE_ABORT_THRESHOLD:
+                aborted_reason = (
+                    f"backend unavailable for {consecutive_unavailable} consecutive "
+                    "deletes — aborting pass, next sweep will retry"
+                )
+                logger.warning("media_gc: %s", aborted_reason)
+                break
         except Exception as e:
+            consecutive_unavailable = 0
             logger.warning(
                 "media_gc: failed to delete asset %s: %s", asset_id, e
             )
             errors.append({"asset_id": asset_id, "error": str(e)})
 
     logger.info(
-        "media_gc: deleted %d/%d orphan(s), freed %d byte(s), errors=%d",
+        "media_gc: deleted %d/%d orphan(s), freed %d byte(s), errors=%d, aborted=%s",
         deleted_count,
         orphan_count,
         freed_bytes,
         len(errors),
+        bool(aborted_reason),
     )
 
-    return {
+    result: dict[str, Any] = {
         "orphan_count": orphan_count,
         "deleted_count": deleted_count,
         "freed_bytes": freed_bytes,
@@ -262,3 +292,6 @@ def run_media_gc(
         "scanned_tables": len(tables),
         "errors": errors,
     }
+    if aborted_reason:
+        result["aborted_reason"] = aborted_reason
+    return result

@@ -35,6 +35,11 @@ dependencies = [
     # WebP encode. Pulled into the base set because the chat upload path is
     # always-on; not behind an optional extra.
     "pillow>=10.0.0",
+    # S3-compatible object storage backend for MediaStore + MediaStorage
+    # (TASK-266). Talks to self-hosted Garage by default. Import is lazy
+    # (see object_store.py), so this dep stays out of the hot path when
+    # LLM_BAWT_STORAGE_BACKEND=fs (the default).
+    "boto3>=1.34.0",
 ]
 
 [project.optional-dependencies]
@@ -45,6 +50,10 @@ dev = [
     "pytest-cov>=5.0.0",
     "pytest-mock>=3.14.0",
     "flask>=3.0.0",
+    # In-memory S3 for TASK-266 object_store unit tests — exercises the
+    # boto3 path without a live Garage. moto 5+ uses the unified
+    # ``@mock_aws`` decorator.
+    "moto[s3]>=5.0.0",
 ]
 memory = [
     "sentence-transformers>=2.2.0",
