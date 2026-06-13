@@ -30,6 +30,95 @@ _BASE_URL = os.getenv(
 _API_PREFIX = "/api/agents"
 _TIMEOUT = 30.0
 
+
+def _count_by_status(items: list[dict]) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for item in items:
+        status = str(item.get("status") or "UNKNOWN")
+        counts[status] = counts.get(status, 0) + 1
+    return counts
+
+
+def _compact_project(project: dict | None) -> dict | None:
+    if not isinstance(project, dict):
+        return None
+    count = project.get("_count")
+    task_count = None
+    if isinstance(count, dict):
+        task_count = count.get("tasks")
+    return {
+        "id": project.get("id"),
+        "name": project.get("name"),
+        "agentBotId": project.get("agentBotId"),
+        "taskCount": task_count,
+    }
+
+
+def _compact_task(task: dict) -> dict:
+    steps = task.get("steps") if isinstance(task.get("steps"), list) else []
+    dependencies = (
+        task.get("dependencies") if isinstance(task.get("dependencies"), list) else []
+    )
+    dependents = task.get("dependents") if isinstance(task.get("dependents"), list) else []
+    description = task.get("description") or ""
+    response = task.get("response") or ""
+    return {
+        "id": task.get("id"),
+        "shortId": task.get("shortId"),
+        "title": task.get("title"),
+        "status": task.get("status"),
+        "priority": task.get("priority"),
+        "planned": task.get("planned"),
+        "project": _compact_project(task.get("project")),
+        "agentBotId": task.get("agentBotId"),
+        "createdAt": task.get("createdAt"),
+        "updatedAt": task.get("updatedAt"),
+        "url": task.get("url"),
+        "descriptionChars": len(str(description)),
+        "responseChars": len(str(response)),
+        "stepCount": len(steps),
+        "stepStatusCounts": _count_by_status(steps),
+        "dependencyCount": len(dependencies),
+        "dependentCount": len(dependents),
+    }
+
+
+def _compact_task_list_payload(payload: Any) -> Any:
+    if not isinstance(payload, dict) or not isinstance(payload.get("tasks"), list):
+        return payload
+    compact = dict(payload)
+    compact["tasks"] = [
+        _compact_task(task) if isinstance(task, dict) else task
+        for task in payload["tasks"]
+    ]
+    return compact
+
+
+def _compact_project_list_payload(payload: Any) -> Any:
+    if not isinstance(payload, list):
+        return payload
+    compact_projects = []
+    for project in payload:
+        if not isinstance(project, dict):
+            compact_projects.append(project)
+            continue
+        task_count = None
+        count = project.get("_count")
+        if isinstance(count, dict):
+            task_count = count.get("tasks")
+        compact_projects.append({
+            "id": project.get("id"),
+            "name": project.get("name"),
+            "descriptionChars": len(str(project.get("description") or "")),
+            "color": project.get("color"),
+            "icon": project.get("icon"),
+            "agentBotId": project.get("agentBotId"),
+            "taskCount": task_count,
+            "createdAt": project.get("createdAt"),
+            "updatedAt": project.get("updatedAt"),
+        })
+    return compact_projects
+
 # ---------------------------------------------------------------------------
 # HTTP client accessor (lazy singleton, mirrors _get_storage pattern)
 # ---------------------------------------------------------------------------
@@ -130,8 +219,8 @@ async def list_tasks(
 
     Returns:
         Dict with "tasks" list and "total" count.
-        Each task includes shortId, title, status, priority, project,
-        steps, and dependencies.
+        Each task is a compact row with title/status metadata and counts.
+        Use tasks_get or tasks_get_context for full descriptions and steps.
     """
     logger.debug("MCP tool invoked: tools/list_tasks status=%s project=%s q=%s", status, project_id, q)
     params: dict[str, str] = {"limit": str(min(limit, 50)), "sort": "updated"}
@@ -142,7 +231,7 @@ async def list_tasks(
     if q:
         params["q"] = q
     try:
-        return await _api_get("/tasks", params=params)
+        return _compact_task_list_payload(await _api_get("/tasks", params=params))
     except httpx.HTTPStatusError as e:
         return {"error": str(e), "status": e.response.status_code}
 
@@ -206,7 +295,7 @@ async def update_task(
         bot_id: Your bot ID for activity attribution.
 
     Returns:
-        Updated task object, or error dict.
+        Compact updated task summary, or error dict. Use tasks_get for full detail.
     """
     logger.debug("MCP tool invoked: tools/update_task id=%s status=%s", task_id, status)
     body: dict[str, Any] = {}
@@ -233,11 +322,19 @@ async def update_task(
         return {"error": "No fields to update"}
 
     try:
-        return await _api_patch(
+        updated = await _api_patch(
             f"/tasks/{task_id}",
             json=body,
             headers=_headers(bot_id),
         )
+        if isinstance(updated, dict):
+            return {
+                "ok": True,
+                "updated": sorted(body.keys()),
+                "task": _compact_task(updated),
+                "detail": "Use tasks_get for full task description, response, steps, and dependencies.",
+            }
+        return updated
     except httpx.HTTPStatusError as e:
         return {"error": str(e), "status": e.response.status_code}
 
@@ -583,12 +680,12 @@ async def list_projects() -> list[dict]:
     Use get_project() for full details including tasks and context.
 
     Returns:
-        List of project objects with id, name, description,
-        color, icon, agentBotId, and _count.tasks.
+        Compact project rows with id, name, agentBotId, taskCount, and metadata.
+        Use projects_get for full context prompt and tasks.
     """
     logger.debug("MCP tool invoked: tools/list_projects")
     try:
-        return await _api_get("/projects")
+        return _compact_project_list_payload(await _api_get("/projects"))
     except httpx.HTTPStatusError as e:
         return {"error": str(e), "status": e.response.status_code}
 
