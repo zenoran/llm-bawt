@@ -191,30 +191,23 @@ def _format_continuation_prompt(
     """
     if result and result.strip():
         return result.strip()
-    # Map header/id -> question text for readable output.
-    qmap: dict[str, str] = {}
-    if isinstance(question_args, dict):
-        for i, q in enumerate(question_args.get("questions", []) or []):
-            if not isinstance(q, dict):
-                continue
-            key = str(q.get("header") or q.get("question") or i)
-            qmap[key] = str(q.get("question") or q.get("header") or key)
+    # Terse + natural: this string is BOTH the agent's continuation input and
+    # the user's visible chat bubble.  The agent already has the question in its
+    # session (it asked it), so a concise "Header: pick" reads naturally in the
+    # transcript and resumes coherently — no "My answer to your question:" frame.
     lines: list[str] = []
     for r in (responses or []):
         picked = ", ".join([s for s in (r.selected or []) if s])
         if r.other:
             picked = f"{picked}, {r.other}" if picked else r.other
-        q_text = qmap.get(r.question_id or "", r.question_id or "")
-        if q_text and picked:
-            lines.append(f"{q_text}: {picked}")
-        elif picked:
-            lines.append(picked)
+        if not picked:
+            continue
+        header = (r.question_id or "").strip()
+        lines.append(f"{header}: {picked}" if header else picked)
     body = "; ".join(lines)
     if free_text and free_text.strip():
-        body = f"{body}\n\n{free_text.strip()}" if body else free_text.strip()
-    if not body:
-        body = "(no answer provided)"
-    return f"My answer to your question: {body}"
+        body = f"{body} — {free_text.strip()}" if body else free_text.strip()
+    return body or "(no answer provided)"
 
 
 @router.post("/v1/chat/questions/{question_id}/answer", tags=["Agent Backends"])
