@@ -1467,6 +1467,23 @@ class ChatStreamingMixin:
                 status = "completed" if full_response_holder[0] else "timeout"
                 if cancelled_holder[0]:
                     status = "cancelled"
+                # Any AskUserQuestion still in "awaiting" at this point
+                # never got an answer — flip them to "abandoned" so the UI
+                # stops rendering an actionable picker on hydration.
+                try:
+                    abandoned = self._pending_question_store.abandon_for_turn(
+                        turn_log_id,
+                    )
+                    if abandoned:
+                        log.info(
+                            "Abandoned %d unanswered question(s) on turn %s",
+                            abandoned, turn_log_id,
+                        )
+                except Exception as _abandon_err:
+                    log.debug(
+                        "abandon_for_turn failed for %s: %s",
+                        turn_log_id, _abandon_err,
+                    )
                 _publish_event_direct({
                     "_type": "turn_complete",
                     "turn_id": turn_log_id,
@@ -1677,17 +1694,39 @@ class ChatStreamingMixin:
 
                 if isinstance(chunk, dict) and chunk.get("event") == "await_tool_result":
                     # Interactive pause from claude-code bridge (AskUserQuestion).
-                    # Emits a sidecar SSE chunk in the same shape as
-                    # service.warning / service.animation so the bawthub UI can
-                    # detect it without disturbing the OpenAI-shaped delta
-                    # stream that other clients depend on.  The UI uses
-                    # session_key + tool_use_id to POST the user's answer back
-                    # to /api/chat/tool-result, which fans out to the bridge.
+                    # Three things happen:
+                    #   1. Persist the question to chat_pending_questions so
+                    #      it survives page refresh / second tab / bridge
+                    #      restart-detection on the answer endpoint.
+                    #   2. Emit a sidecar SSE chunk for the originating stream
+                    #      (shape: object=tool.await_result).
+                    #   3. Publish to the unified event stream so other tabs
+                    #      also pick up the pause without needing to be the
+                    #      originator of the run.
+                    tool_use_id = chunk.get("tool_use_id") or ""
+                    tool_args = chunk.get("arguments") or {}
+                    if tool_use_id:
+                        try:
+                            self._pending_question_store.upsert_awaiting(
+                                tool_use_id=tool_use_id,
+                                bot_id=bot_id,
+                                user_id=user_id,
+                                turn_id=turn_log_id,
+                                arguments=tool_args if isinstance(tool_args, dict) else {"value": tool_args},
+                                tool_name=chunk.get("tool_name") or "AskUserQuestion",
+                                trigger_message_id=trigger_message_id,
+                                session_key=chunk.get("session_key") or None,
+                            )
+                        except Exception as _persist_err:
+                            log.warning(
+                                "Failed to persist pending question tool_use_id=%s: %s",
+                                tool_use_id, _persist_err,
+                            )
                     await_payload = {
                         "object": "tool.await_result",
-                        "tool_use_id": chunk.get("tool_use_id", ""),
+                        "tool_use_id": tool_use_id,
                         "tool_name": chunk.get("tool_name", ""),
-                        "arguments": chunk.get("arguments") or {},
+                        "arguments": tool_args,
                         "session_key": chunk.get("session_key", ""),
                         "provider": chunk.get("provider", ""),
                         "trigger_message_id": chunk.get("trigger_message_id"),
@@ -1695,18 +1734,15 @@ class ChatStreamingMixin:
                         "turn_id": turn_log_id,
                     }
                     yield (f"data: {json.dumps(await_payload)}\n\n")
-                    # Also publish to the unified event stream so other open
-                    # tabs / the dashboard see the pause without needing to
-                    # be the originator of the run.
                     _publish_event_direct({
                         "_type": "tool_await_result",
                         "turn_id": turn_log_id,
                         "trigger_message_id": trigger_message_id,
                         "bot_id": bot_id,
                         "user_id": user_id,
-                        "tool_use_id": chunk.get("tool_use_id", ""),
+                        "tool_use_id": tool_use_id,
                         "tool_name": chunk.get("tool_name", ""),
-                        "arguments": chunk.get("arguments") or {},
+                        "arguments": tool_args,
                         "session_key": chunk.get("session_key", ""),
                         "provider": chunk.get("provider", ""),
                         "ts": time.time(),

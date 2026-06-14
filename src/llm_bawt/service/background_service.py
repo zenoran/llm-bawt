@@ -137,6 +137,11 @@ class BackgroundService(
         self._memory_clients: dict[tuple[str, str], Any] = {}
         from .turn_logs import TurnLogStore
         self._turn_log_store = TurnLogStore(config)
+        # Persistent registry of in-flight AskUserQuestion pauses.  Lets the
+        # chat UI hydrate open pickers on page load / second tab / after a
+        # bridge restart instead of relying solely on the live SSE event.
+        from .chat_pending_questions import PendingQuestionStore
+        self._pending_question_store = PendingQuestionStore(config)
 
         # OpenClaw WS session bridge (set by api.py lifespan if enabled)
         self._session_bridge: Any | None = None

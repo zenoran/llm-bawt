@@ -1,5 +1,7 @@
 """OpenAI-compatible chat completion route."""
 
+import json
+import time
 import uuid
 
 from fastapi import APIRouter, HTTPException
@@ -112,7 +114,20 @@ class ToolResultResponse(BaseModel):
 
 @router.post("/v1/chat/tool-result", tags=["Agent Backends"])
 async def chat_tool_result(request: ToolResultRequest) -> ToolResultResponse:
-    """Deliver a user's AskUserQuestion answer back to the paused SDK turn."""
+    """Deliver a user's AskUserQuestion answer back to the paused SDK turn.
+
+    Sanity checks the pending-question registry first:
+    - 404 if the tool_use_id was never recorded (typo / stale UI / race).
+    - 410 Gone if the row is in a terminal state (already answered, skipped,
+      or marked abandoned because the originating turn ended).
+    - 410 Gone if the originating turn's status is no longer streaming
+      (covers the bridge-restart case — the SDK Future is gone and the
+      command would be a no-op on the bridge side).
+
+    On success: dispatches the Redis command AND flips the registry row to
+    ``answered`` / ``skipped`` so other tabs converge to the post-answer UI
+    even before the bridge's TOOL_END flows back.
+    """
     service = get_service()
     from ...bots import BotManager
     from ...agent_backends.agent_bridge import get_agent_subscriber
@@ -130,6 +145,39 @@ async def chat_tool_result(request: ToolResultRequest) -> ToolResultResponse:
             status_code=400,
             detail=f"Bot '{request.bot_id}' backend '{backend_name}' does not support tool-result",
         )
+
+    # Look up the row before touching Redis so we can fail fast on stale or
+    # abandoned questions.
+    pq_store = getattr(service, "_pending_question_store", None)
+    row = pq_store.get(request.tool_use_id) if pq_store else None
+    if pq_store and row is None:
+        raise HTTPException(
+            status_code=404,
+            detail=f"No pending question recorded for tool_use_id={request.tool_use_id}",
+        )
+    if row is not None and row.status != "awaiting":
+        raise HTTPException(
+            status_code=410,
+            detail=f"Question is no longer awaiting (status={row.status})",
+        )
+    # Cross-check the originating turn — if it's already terminal, the bridge
+    # Future is gone and the SDK won't see this answer.  Mark abandoned and
+    # bail out so the UI doesn't pretend the answer landed.
+    if row is not None:
+        try:
+            turn = service._turn_log_store.get_turn(row.turn_id)
+        except Exception:
+            turn = None
+        if turn is not None and turn.status not in ("streaming", "pending"):
+            if pq_store:
+                pq_store.mark(tool_use_id=request.tool_use_id, status="abandoned")
+            raise HTTPException(
+                status_code=410,
+                detail=(
+                    f"Originating turn {row.turn_id} ended (status={turn.status}); "
+                    "answer cannot be delivered."
+                ),
+            )
 
     # claude-code's session_key is f"{bot_id}:{user_id}" — same as in
     # chat_streaming when it computes oc_session_key.
@@ -151,11 +199,98 @@ async def chat_tool_result(request: ToolResultRequest) -> ToolResultResponse:
         log.exception("send_tool_result failed for tool_use_id=%s", request.tool_use_id)
         raise HTTPException(status_code=502, detail=f"Failed to publish tool_result: {e}") from e
 
+    # Flip the registry row.  We treat the synthetic "(The user skipped this
+    # question…)" sentinel the UI sends on Skip as a distinct status so the
+    # audit trail and any future analytics can tell user-answer apart from
+    # user-decline.  Any other text counts as a real answer.
+    next_status = "answered"
+    if pq_store:
+        sentinel = "(The user skipped this question"
+        if request.result.startswith(sentinel):
+            next_status = "skipped"
+        pq_store.mark(
+            tool_use_id=request.tool_use_id,
+            status=next_status,
+            answer=request.result,
+        )
+
+    # Publish a unified-stream event so every open tab/window converges to
+    # the post-answer UI without waiting for the bridge's TOOL_END to flow
+    # back through Redis.  Best-effort; failures here don't block the user.
+    try:
+        from ...agent_backends.agent_bridge import get_agent_subscriber as _get_sub
+        sub = _get_sub()
+        if sub is not None:
+            await sub._redis.xadd(  # type: ignore[attr-defined]
+                f"events:{request.bot_id}:{request.user_id}",
+                {"payload": json.dumps({
+                    "_type": "tool_await_resolved",
+                    "bot_id": request.bot_id,
+                    "user_id": request.user_id,
+                    "tool_use_id": request.tool_use_id,
+                    "turn_id": row.turn_id if row else None,
+                    "status": next_status,
+                    "answer": request.result,
+                    "ts": time.time(),
+                }, ensure_ascii=False, default=str)},
+                maxlen=5000,
+                approximate=True,
+            )
+    except Exception:
+        log.debug(
+            "failed to publish tool_await_resolved unified event for tool_use_id=%s",
+            request.tool_use_id,
+        )
+
     log.info(
         "chat.tool_result dispatched: bot=%s session=%s tool_use_id=%s",
         request.bot_id, session_key, request.tool_use_id,
     )
     return ToolResultResponse(ok=True, detail="dispatched")
+
+
+class PendingQuestionItem(BaseModel):
+    """Single row of the pending-questions API."""
+    tool_use_id: str
+    tool_name: str
+    bot_id: str
+    user_id: str
+    turn_id: str
+    trigger_message_id: str | None = None
+    session_key: str | None = None
+    arguments: dict
+    status: str
+    answer: str | None = None
+    created_at: str | None = None
+    answered_at: str | None = None
+
+
+class PendingQuestionList(BaseModel):
+    data: list[PendingQuestionItem]
+
+
+@router.get("/v1/chat/pending-questions", tags=["Agent Backends"])
+async def list_pending_questions(
+    bot_id: str | None = None,
+    user_id: str | None = None,
+    limit: int = 50,
+) -> PendingQuestionList:
+    """Return every currently-awaiting AskUserQuestion for a bot/user scope.
+
+    Used by the chat UI on page load to hydrate any open pickers — the
+    inline tool-call card reconciles each row against its activity entry
+    and renders the active picker without waiting for an SSE replay.
+    """
+    service = get_service()
+    pq_store = getattr(service, "_pending_question_store", None)
+    if pq_store is None:
+        return PendingQuestionList(data=[])
+    rows = pq_store.list_awaiting(
+        bot_id=bot_id, user_id=user_id, limit=max(1, min(int(limit or 50), 200)),
+    )
+    return PendingQuestionList(
+        data=[PendingQuestionItem(**pq_store.row_to_dict(r)) for r in rows],
+    )
 
 
 class SessionResetRequest(BaseModel):
