@@ -646,7 +646,21 @@ class ClaudeCodeBridge:
 
                     prompt_input: str | AsyncIterable = _image_prompt()
                 else:
-                    prompt_input = message
+                    # Text-only still must be an AsyncIterable: the can_use_tool
+                    # callback (see ClaudeAgentOptions below) only works in the
+                    # SDK's streaming-input mode. A plain str prompt raises
+                    # "can_use_tool callback requires streaming mode". Wrap the
+                    # message in a single-yield user-message generator, mirroring
+                    # the multimodal branch above.
+                    async def _text_prompt():
+                        yield {
+                            "type": "user",
+                            "message": {"role": "user", "content": message},
+                            "parent_tool_use_id": None,
+                            "session_id": "default",
+                        }
+
+                    prompt_input = _text_prompt()
 
                 auth_retry_attempted = False
                 fresh_session_retry = False
