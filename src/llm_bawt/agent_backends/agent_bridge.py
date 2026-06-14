@@ -301,6 +301,13 @@ class AgentBridgeBackend(AgentBackend):
                                     # so the SSE emitter doesn't have to fall back to
                                     # request-scope state.
                                     "trigger_message_id": event.trigger_message_id,
+                                    # Forward the SDK tool_use id (toolu_…) so the
+                                    # unified tool_start event can stamp it on the
+                                    # live activity card.  AskUserQuestion's inline
+                                    # picker pairs the card to its pending-question
+                                    # row by this id; without it the live card can't
+                                    # match and the picker only appears on reload.
+                                    "tool_use_id": event.tool_use_id,
                                 })
 
                             elif event.kind == AgentEventKind.TOOL_END:

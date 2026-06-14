@@ -1334,6 +1334,13 @@ class ChatStreamingMixin:
                                     'tool': item.get('name', 'unknown'),
                                     'parameters': item.get('arguments', {}),
                                     'call_id': cid,
+                                    # Persist the originating backend so when the
+                                    # turn is recalled from tool_calls_json, the
+                                    # frontend's (provider, tool_name) renderer
+                                    # registry can dispatch to FileChangeBody /
+                                    # BashBody / WebSearchBody. Without this,
+                                    # recall falls back to GenericClaudeBody.
+                                    'provider': item.get('provider'),
                                 })
                                 _publish_event_direct({
                                     "_type": "tool_event",

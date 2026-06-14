@@ -62,6 +62,14 @@ def _normalize_tool_call_details(tool_calls: list[dict] | None) -> list[dict]:
             }
         if item.get("call_id"):
             entry["call_id"] = item["call_id"]
+        # Backend that produced this tool call ("codex", "claude-code",
+        # "openclaw"). Persisted so /v1/tool-calls recall can re-route to
+        # the frontend's provider-aware renderer registry
+        # (FileChangeBody / BashBody / …). Without this, codex turns
+        # rehydrate from the DB without provider and the registry never
+        # matches, falling back to GenericClaudeBody.
+        if item.get("provider"):
+            entry["provider"] = item["provider"]
         normalized.append(entry)
     return normalized
 
