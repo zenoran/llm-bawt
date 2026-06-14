@@ -112,6 +112,10 @@ class BaseLLMBawt(ABC):
         self._ha_mode: bool = False
         self._include_summaries: bool = True
         self._tts_mode: bool = False
+        # When True, prepend chat.agent_user_prefix body to every user message
+        # for agent backends. Independent of tts_mode (which gates the voice
+        # prefix) — both can fire and stack.
+        self._inject_user_prefix: bool = False
 
         if not self.model_definition:
             raise ValueError(f"Could not find model definition for: '{resolved_model_alias}'")
@@ -557,17 +561,51 @@ class BaseLLMBawt(ABC):
         # the agent ever sees them.
         if self.model_definition.get("type") in ("agent_backend", "claude-code"):
             user_content = prompt
-            if self._tts_mode and not _SLASH_COMMAND_RE.match(prompt or ""):
+            # Two independent per-turn prefixes can ride on the user message
+            # because the agent SDK locks the system prompt at session start
+            # and ignores it on resume — anything mode-dependent or session-
+            # configurable has to be stamped per-turn here.
+            #
+            #   - chat.agent_user_prefix  fires whenever _inject_user_prefix is
+            #     True (controlled by the chat composer's "Agent prefix" toggle
+            #     via the inject_user_prefix request flag). Mode-agnostic.
+            #   - chat.agent_voice_prefix fires whenever _tts_mode is True,
+            #     regardless of the user-prefix toggle. Voice-only.
+            #
+            # If both fire, they stack with the user_prefix first (broader
+            # "session-wide" guidance), then voice_prefix (the narrow voice
+            # constraint), then a `---` separator, then the actual user text.
+            # Slash commands (e.g. /new) are passed through untouched because
+            # the bridges parse them with a literal startswith() before the
+            # agent ever sees them.
+            if not _SLASH_COMMAND_RE.match(prompt or ""):
                 from ..prompt_registry import get_prompt_resolver
-                resolved = get_prompt_resolver(self.config).resolve("chat.agent_voice_prefix")
-                prefix_body = (resolved.body if resolved else "").strip()
-                if prefix_body:
-                    user_content = f"{prefix_body}\n\n---\n\n{prompt}"
+                resolver = get_prompt_resolver(self.config)
+                prefix_parts: list[str] = []
+                applied_keys: list[tuple[str, int, str]] = []
+
+                if self._inject_user_prefix:
+                    resolved_user = resolver.resolve("chat.agent_user_prefix")
+                    body_user = (resolved_user.body if resolved_user else "").strip()
+                    if body_user:
+                        prefix_parts.append(body_user)
+                        applied_keys.append(("chat.agent_user_prefix", len(body_user), resolved_user.source))
+
+                if self._tts_mode:
+                    resolved_voice = resolver.resolve("chat.agent_voice_prefix")
+                    body_voice = (resolved_voice.body if resolved_voice else "").strip()
+                    if body_voice:
+                        prefix_parts.append(body_voice)
+                        applied_keys.append(("chat.agent_voice_prefix", len(body_voice), resolved_voice.source))
+
+                if prefix_parts:
+                    combined = "\n\n".join(prefix_parts)
+                    user_content = f"{combined}\n\n---\n\n{prompt}"
                     if self.debug:
-                        logger.debug(
-                            f"Agent voice-prefix applied: "
-                            f"prefix_len={len(prefix_body)}, source={resolved.source}"
+                        applied_repr = ", ".join(
+                            f"{key}(len={n}, src={src})" for key, n, src in applied_keys
                         )
+                        logger.debug(f"Agent user-message prefixes applied: {applied_repr}")
             messages.append(Message(role="user", content=user_content))
             return messages
 

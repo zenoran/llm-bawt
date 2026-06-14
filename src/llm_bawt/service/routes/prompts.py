@@ -2,14 +2,18 @@
 
 from __future__ import annotations
 
+from typing import Any
+
 from fastapi import APIRouter, HTTPException, Query
 
 from ...prompt_registry import PromptResolver, PromptTemplate, extract_placeholders
 from ..dependencies import get_service
 from ..schemas import (
+    PromptTemplateIndexResponse,
     PromptTemplateListResponse,
     PromptTemplateResponse,
     PromptTemplateSeedResponse,
+    PromptTemplateSummary,
     PromptTemplateUpsertRequest,
     PromptTemplateValidateRequest,
     PromptTemplateValidateResponse,
@@ -56,14 +60,34 @@ def _resolved_to_response(resolved) -> PromptTemplateResponse:
     )
 
 
-@router.get("/v1/prompts", response_model=PromptTemplateListResponse, tags=["Admin"])
-def list_prompts(
-    category: str | None = Query(None, description="Filter by prompt category"),
-    scope_type: str = Query("global", description="Resolution scope: global or bot"),
-    scope_id: str | None = Query(None, description="Scope ID for bot-scoped resolution"),
-    include_defaults: bool = Query(True, description="Include code-default prompts in the listing"),
-):
-    """List prompt templates, resolving DB overrides against code defaults."""
+def _response_to_summary(item: PromptTemplateResponse) -> PromptTemplateSummary:
+    """Strip body/placeholders/metadata/required_vars off a full response."""
+    return PromptTemplateSummary(
+        key=item.key,
+        title=item.title,
+        category=item.category,
+        format=item.format,
+        scope_type=item.scope_type,
+        scope_id=item.scope_id,
+        source=item.source,
+        body_length=len(item.body or ""),
+        updated_at=item.updated_at,
+    )
+
+
+def _collect_prompts(
+    *,
+    category: str | None,
+    scope_type: str,
+    scope_id: str | None,
+    include_defaults: bool,
+) -> tuple[list[PromptTemplateResponse], dict[str, Any]]:
+    """Shared resolution path for the list + index endpoints.
+
+    Returns (prompts, filters_echo) so callers can wrap the list in either the
+    full-body response model or the summary-only index model with identical
+    semantics. Pulled out so /v1/prompts and /v1/prompts/index can never drift.
+    """
     service = get_service()
     resolver = PromptResolver(service.config)
 
@@ -72,42 +96,40 @@ def list_prompts(
     normalized_scope_type = scope_type.strip().lower() if scope_type else "global"
     normalized_scope_id = scope_id
 
-    try:
-        if include_defaults:
-            for key, definition in sorted(resolver.definitions().items()):
-                if category and definition.category != category.strip().lower():
-                    continue
-                resolved = resolver.resolve(key, normalized_scope_type, normalized_scope_id)
-                if resolved is None:
-                    continue
-                item = _resolved_to_response(resolved)
-                prompts.append(item)
-                seen_keys.add((item.key, item.scope_type, item.scope_id))
-        rows: list[PromptTemplate] = []
-        if include_defaults:
+    if include_defaults:
+        for key, definition in sorted(resolver.definitions().items()):
+            if category and definition.category != category.strip().lower():
+                continue
+            resolved = resolver.resolve(key, normalized_scope_type, normalized_scope_id)
+            if resolved is None:
+                continue
+            item = _resolved_to_response(resolved)
+            prompts.append(item)
+            seen_keys.add((item.key, item.scope_type, item.scope_id))
+
+    rows: list[PromptTemplate] = []
+    if include_defaults:
+        rows.extend(
+            resolver.store.list_rows(
+                category=category,
+                scope_type="global",
+                scope_id="*",
+            )
+        )
+        if normalized_scope_type == "bot":
             rows.extend(
                 resolver.store.list_rows(
                     category=category,
-                    scope_type="global",
-                    scope_id="*",
+                    scope_type="bot",
+                    scope_id=normalized_scope_id,
                 )
             )
-            if normalized_scope_type == "bot":
-                rows.extend(
-                    resolver.store.list_rows(
-                        category=category,
-                        scope_type="bot",
-                        scope_id=normalized_scope_id,
-                    )
-                )
-        else:
-            rows = resolver.store.list_rows(
-                category=category,
-                scope_type=normalized_scope_type,
-                scope_id=normalized_scope_id,
-            )
-    except ValueError as e:
-        raise HTTPException(status_code=400, detail=str(e))
+    else:
+        rows = resolver.store.list_rows(
+            category=category,
+            scope_type=normalized_scope_type,
+            scope_id=normalized_scope_id,
+        )
 
     for row in rows:
         marker = (row.key, row.scope_type, row.scope_id)
@@ -115,15 +137,75 @@ def list_prompts(
             continue
         prompts.append(_row_to_response(row))
 
+    filters = {
+        "category": category,
+        "scope_type": normalized_scope_type,
+        "scope_id": normalized_scope_id,
+        "include_defaults": include_defaults,
+    }
+    return prompts, filters
+
+
+@router.get("/v1/prompts", response_model=PromptTemplateListResponse, tags=["Admin"])
+def list_prompts(
+    category: str | None = Query(None, description="Filter by prompt category"),
+    scope_type: str = Query("global", description="Resolution scope: global or bot"),
+    scope_id: str | None = Query(None, description="Scope ID for bot-scoped resolution"),
+    include_defaults: bool = Query(True, description="Include code-default prompts in the listing"),
+):
+    """List prompt templates with full bodies. Heavy.
+
+    Returns every prompt's full `body`, `placeholders`, `metadata`, and
+    `required_vars`. For agent or admin-UI enumeration where you only need
+    names + scope + source, use `GET /v1/prompts/index` — same filters,
+    bodies stripped.
+    """
+    try:
+        prompts, filters = _collect_prompts(
+            category=category,
+            scope_type=scope_type,
+            scope_id=scope_id,
+            include_defaults=include_defaults,
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
     return PromptTemplateListResponse(
         prompts=prompts,
         total_count=len(prompts),
-        filters={
-            "category": category,
-            "scope_type": normalized_scope_type,
-            "scope_id": normalized_scope_id,
-            "include_defaults": include_defaults,
-        },
+        filters=filters,
+    )
+
+
+@router.get("/v1/prompts/index", response_model=PromptTemplateIndexResponse, tags=["Admin"])
+def list_prompts_index(
+    category: str | None = Query(None, description="Filter by prompt category"),
+    scope_type: str = Query("global", description="Resolution scope: global or bot"),
+    scope_id: str | None = Query(None, description="Scope ID for bot-scoped resolution"),
+    include_defaults: bool = Query(True, description="Include code-default prompts in the listing"),
+):
+    """List prompt templates by name only — no bodies. Context-safe for agents.
+
+    Mirrors `GET /v1/prompts`'s resolution and filters but returns
+    `PromptTemplateSummary` entries (key, title, category, scope, source,
+    format, body_length, updated_at). Fetch full body for a chosen prompt
+    via `GET /v1/prompts/{key}` once the agent has picked one.
+    """
+    try:
+        prompts, filters = _collect_prompts(
+            category=category,
+            scope_type=scope_type,
+            scope_id=scope_id,
+            include_defaults=include_defaults,
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+    summaries = [_response_to_summary(item) for item in prompts]
+    return PromptTemplateIndexResponse(
+        prompts=summaries,
+        total_count=len(summaries),
+        filters=filters,
     )
 
 

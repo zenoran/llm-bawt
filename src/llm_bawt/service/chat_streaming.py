@@ -879,6 +879,7 @@ class ChatStreamingMixin:
                 else:
                     llm_bawt._include_summaries = request.include_summaries
                 llm_bawt._tts_mode = request.tts_mode or llm_bawt.bot.tts_mode
+                llm_bawt._inject_user_prefix = bool(request.inject_user_prefix)
 
                 # TASK-214: animations now arrive on the request payload from
                 # bawthub (Prisma is the source of truth). llm-bawt no longer

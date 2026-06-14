@@ -282,6 +282,7 @@ class BackgroundService(
                 llm_bawt._ha_mode = request.ha_mode
                 llm_bawt._include_summaries = request.include_summaries
                 llm_bawt._tts_mode = request.tts_mode or llm_bawt.bot.tts_mode
+                llm_bawt._inject_user_prefix = bool(request.inject_user_prefix)
 
                 # Prepare messages with history and memory context
                 prepared_messages = llm_bawt.prepare_messages_for_query(user_prompt)

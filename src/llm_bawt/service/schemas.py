@@ -73,6 +73,7 @@ class ChatCompletionRequest(BaseModel):
     extract_memory: bool = Field(default=True, description="Whether to extract memories from response")
     include_summaries: bool = Field(default=True, description="Whether to inject conversation summary records into context")
     tts_mode: bool = Field(default=False, description="Whether to append TTS output formatting instructions to the system prompt")
+    inject_user_prefix: bool = Field(default=False, description="For agent backends only: prepend chat.agent_user_prefix body to every user message. Survives agent-SDK session resume (unlike system prompt edits). Stacks independently with the voice-mode prefix.")
     client_system_context: str | None = Field(default=None, description="System context extracted from client messages (set by routes, not by callers)", exclude=True)
     ha_mode: bool = Field(default=False, description="HA-mode: cap history, force tool_choice=required on first call (set by routes)", exclude=True)
     user_message_id: str | None = Field(default=None, description="Frontend-generated UUID for the user message (used as trigger_message_id in turn logs)")
@@ -1127,9 +1128,47 @@ class PromptTemplateResponse(BaseModel):
 
 
 class PromptTemplateListResponse(BaseModel):
-    """Response for listing prompt templates."""
+    """Response for listing prompt templates.
+
+    Returns the FULL body for every prompt. For agent-context-safe lookups
+    (just names, scope, source) use PromptTemplateIndexResponse via
+    `GET /v1/prompts/index` — that route omits body/placeholders/metadata.
+    """
 
     prompts: list[PromptTemplateResponse]
+    total_count: int
+    filters: dict[str, Any] = Field(default_factory=dict)
+
+
+class PromptTemplateSummary(BaseModel):
+    """Lightweight prompt-template entry — names and locators, no body.
+
+    Use this when an agent (or a UI) needs to enumerate available prompts to
+    decide which one to fetch in full. `body_length` is the only signal about
+    the body itself — useful for "is this empty" / "is this huge" decisions
+    without paying the context cost of the actual text.
+    """
+
+    key: str
+    title: str
+    category: str
+    format: str = "plain_text"
+    scope_type: str
+    scope_id: str
+    source: str
+    body_length: int = 0
+    updated_at: datetime | None = None
+
+
+class PromptTemplateIndexResponse(BaseModel):
+    """Compact prompt listing — names and metadata only, no bodies.
+
+    Same filters as PromptTemplateListResponse, but each entry is a
+    PromptTemplateSummary. Safe for agents to enumerate without dragging
+    every prompt body into their context window.
+    """
+
+    prompts: list[PromptTemplateSummary]
     total_count: int
     filters: dict[str, Any] = Field(default_factory=dict)
 

@@ -197,6 +197,18 @@ AGENT_VOICE_PREFIX = (
 )
 
 
+# Default body for chat.agent_user_prefix — the always-on, toggle-controlled
+# per-turn prefix for agent backends. Voice-aware body so a single prompt covers
+# both modes; the system prompt that the SDK locks in at session start cannot
+# carry mode-dependent guidance reliably, so we re-state it on every turn.
+AGENT_USER_PREFIX = (
+    "When mode=voice: respond as 1 to 3 short sentences for text-to-speech. "
+    "No markdown, no emojis, no asterisks. Write out numbers and abbreviations "
+    "as spoken words. Skip preambles like 'sure' or 'okay' — just answer.\n"
+    "When mode=text: respond normally, markdown is fine."
+)
+
+
 DEFAULT_PROMPT_DEFINITIONS: dict[str, PromptDefinition] = {
     "history.summarization.single": PromptDefinition(
         key="history.summarization.single",
@@ -278,6 +290,29 @@ DEFAULT_PROMPT_DEFINITIONS: dict[str, PromptDefinition] = {
                 "that ride along in the system prompt never reach the agent "
                 "if the session started in text mode. This per-turn prefix is "
                 "the reliable signal. Leave body empty to disable."
+            ),
+        },
+    ),
+    "chat.agent_user_prefix": PromptDefinition(
+        key="chat.agent_user_prefix",
+        title="Agent Per-Turn User Message Prefix",
+        category="chat",
+        required_vars=(),
+        loader=lambda: AGENT_USER_PREFIX,
+        metadata={
+            "notes": (
+                "Prepended to EVERY user message sent to agent backends "
+                "(Claude Code, Codex, OpenClaw) when the request flag "
+                "inject_user_prefix=true. Independent of tts_mode and of "
+                "chat.agent_voice_prefix — if both are active, they stack. "
+                "Exists for the same reason agent_voice_prefix does (agent "
+                "SDKs lock the system prompt at session start and ignore "
+                "later edits) but isn't gated on voice mode, so it's the "
+                "right place for any always-on per-turn directive (voice "
+                "guidance, identity reminder, output-format constraints "
+                "that must survive session resume). The toggle lives in "
+                "the chat composer's unified popup. Leave body empty to "
+                "disable even when the flag is on."
             ),
         },
     ),
