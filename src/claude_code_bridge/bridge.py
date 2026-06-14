@@ -953,11 +953,22 @@ class ClaudeCodeBridge:
                                     token_usage=token_usage_payload,
                                 )
                                 # Turn complete — release the prompt generator so
-                                # the SDK closes its input stream and this loop ends
-                                # via StopAsyncIteration.  Kept open until now so the
-                                # can_use_tool control channel survived any
-                                # AskUserQuestion pause earlier in the turn.
+                                # the SDK closes its input stream.  Kept open until
+                                # now so the can_use_tool control channel survived
+                                # any AskUserQuestion pause earlier in the turn.
                                 turn_done.set()
+                                # ResultMessage is terminal for this send (one user
+                                # message -> one assistant turn), so stop iterating
+                                # NOW instead of looping back to await a trailing
+                                # StopAsyncIteration. After a deferred
+                                # AskUserQuestion the streaming-input session stays
+                                # alive — heartbeat/stream events keep re-arming the
+                                # per-message timeout — so that await can block
+                                # indefinitely while STILL holding the per-session
+                                # lock, deadlocking the next continuation turn on the
+                                # same session (TASK-269). The `finally` below closes
+                                # the stream and kills the subprocess cleanly.
+                                break
                         if aborted:
                             # Cooperative abort fired — fall straight through to
                             # publish_run_done without retry. We deliberately drop
@@ -1029,6 +1040,13 @@ class ClaudeCodeBridge:
 
                         raise
                     finally:
+                        # Guarantee the prompt generator is released on EVERY exit
+                        # path (StopAsyncIteration, the ResultMessage break above,
+                        # abort, or exception). If it stays parked on
+                        # `await done_event.wait()` the SDK input stream never closes
+                        # and this session's lock can never be reacquired — the
+                        # TASK-269 deadlock. Event.set() is idempotent.
+                        turn_done.set()
                         # Always deregister this iteration's stream so a
                         # subsequent chat.abort doesn't try to aclose() a
                         # generator that's already finished. We pop only if
