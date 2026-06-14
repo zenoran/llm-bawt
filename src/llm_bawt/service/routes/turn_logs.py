@@ -159,6 +159,23 @@ def list_turn_logs(
 
     live_tool_counts = _live_tool_call_counts(store, turns_needing_live_counts)
 
+    # TASK-269: embed the persisted question for turns that ended on one, so the
+    # UI can render a QuestionMessage straight from history hydration.
+    pq_store = getattr(service, "_pending_question_store", None)
+    questions_by_turn: dict[str, dict] = {}
+    if pq_store is not None:
+        for row in rows:
+            if getattr(row, "end_reason", None) != "question":
+                continue
+            qrow = None
+            qid = getattr(row, "question_id", None)
+            if qid:
+                qrow = pq_store.get(qid)
+            if qrow is None:
+                qrow = pq_store.get_by_turn(row.id)
+            if qrow is not None:
+                questions_by_turn[row.id] = pq_store.row_to_dict(qrow)
+
     items = []
     for row in rows:
         tool_calls = parsed_tool_calls_by_turn.get(row.id, [])
@@ -188,6 +205,10 @@ def list_turn_logs(
                 agent_request_id=getattr(row, "agent_request_id", None),
                 trigger_message_id=getattr(row, "trigger_message_id", None),
                 token_usage=_parse_token_usage(getattr(row, "token_usage_json", None)),
+                end_reason=getattr(row, "end_reason", None),
+                question_id=getattr(row, "question_id", None),
+                parent_turn_id=getattr(row, "parent_turn_id", None),
+                question=questions_by_turn.get(row.id),
             )
         )
 
@@ -354,7 +375,27 @@ def get_turn_log(turn_id: str):
         agent_session_key=getattr(row, "agent_session_key", None),
         agent_request_id=getattr(row, "agent_request_id", None),
         token_usage=_parse_token_usage(getattr(row, "token_usage_json", None)),
+        end_reason=getattr(row, "end_reason", None),
+        question_id=getattr(row, "question_id", None),
+        parent_turn_id=getattr(row, "parent_turn_id", None),
+        question=_question_for_turn(service, row),
     )
+
+
+def _question_for_turn(service, row) -> dict | None:
+    """Embedded question dict for a turn that ended on one (TASK-269)."""
+    if getattr(row, "end_reason", None) != "question":
+        return None
+    pq_store = getattr(service, "_pending_question_store", None)
+    if pq_store is None:
+        return None
+    qrow = None
+    qid = getattr(row, "question_id", None)
+    if qid:
+        qrow = pq_store.get(qid)
+    if qrow is None:
+        qrow = pq_store.get_by_turn(row.id)
+    return pq_store.row_to_dict(qrow) if qrow is not None else None
 
 
 @router.get("/v1/tool-calls", response_model=ToolCallEventsResponse, tags=["Debug"])

@@ -163,6 +163,7 @@ class TurnLifecycleMixin:
         agent_session_key: str | None = None,
         agent_request_id: str | None = None,
         trigger_message_id: str | None = None,
+        parent_turn_id: str | None = None,
     ) -> None:
         """Persist one turn record to short-lived DB storage."""
         try:
@@ -187,6 +188,7 @@ class TurnLifecycleMixin:
                 agent_session_key=agent_session_key,
                 agent_request_id=agent_request_id,
                 trigger_message_id=trigger_message_id,
+                parent_turn_id=parent_turn_id,
             )
         except Exception as e:
             log.debug("Failed to persist turn log: %s", e)

@@ -77,6 +77,13 @@ class ChatCompletionRequest(BaseModel):
     client_system_context: str | None = Field(default=None, description="System context extracted from client messages (set by routes, not by callers)", exclude=True)
     ha_mode: bool = Field(default=False, description="HA-mode: cap history, force tool_choice=required on first call (set by routes)", exclude=True)
     user_message_id: str | None = Field(default=None, description="Frontend-generated UUID for the user message (used as trigger_message_id in turn logs)")
+    # TASK-269: continuation-turn linkage.  Set when this turn is answering a
+    # prior deferred AskUserQuestion.  parent_turn_id threads the chain (and
+    # drives cross-tab resolution via turn_start{parent_turn_id}); when
+    # answered_question_id is set, the new turn is recorded as the one that
+    # carried the answer back to the agent.
+    parent_turn_id: str | None = Field(default=None, description="TASK-269: the awaiting turn this continuation answers")
+    answered_question_id: str | None = Field(default=None, description="TASK-269: tool_use_id of the question this continuation answers")
     # TASK-214: animations + avatar visibility now flow on each request.
     # The avatar catalog is owned by the bawthub frontend; llm-bawt is stateless
     # w.r.t. animations. `avatar_visible` is currently informational (consumed
@@ -449,6 +456,14 @@ class TurnLogListItem(BaseModel):
     #         output_tokens, context_window, max_output_tokens, total_cost_usd}.
     # None when the upstream backend doesn't expose usage info.
     token_usage: dict[str, Any] | None = None
+    # TASK-269 turn lifecycle / continuation chain.
+    end_reason: str | None = None
+    question_id: str | None = None
+    parent_turn_id: str | None = None
+    # Embedded question row (chat_pending_questions.row_to_dict) when this turn
+    # ended with end_reason="question" — lets the UI render a QuestionMessage
+    # straight from history hydration without a second fetch.
+    question: dict[str, Any] | None = None
 
 
 class TurnLogListResponse(BaseModel):
@@ -479,6 +494,11 @@ class TurnLogDetail(BaseModel):
     agent_session_key: str | None = None
     agent_request_id: str | None = None
     token_usage: dict[str, Any] | None = None
+    # TASK-269 turn lifecycle / continuation chain.
+    end_reason: str | None = None
+    question_id: str | None = None
+    parent_turn_id: str | None = None
+    question: dict[str, Any] | None = None
 
 
 class RecentBotTurn(BaseModel):

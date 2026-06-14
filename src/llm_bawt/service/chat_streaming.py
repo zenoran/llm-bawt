@@ -768,6 +768,11 @@ class ChatStreamingMixin:
         timing_holder = [0.0, 0.0]  # [start_time, end_time]
         cancelled_holder = [False]  # Track if we were cancelled
         token_usage_holder: list[dict | None] = [None]  # Captures upstream SDK token usage for turn_complete
+        # TASK-269: tool_use_id of an AskUserQuestion the agent deferred this
+        # turn.  Set when an await_tool_result chunk arrives; consumed at turn
+        # completion to mark end_reason="question" + question_id on the turn log
+        # and in the turn_complete event so the UI renders a QuestionMessage.
+        question_id_holder: list[str | None] = [None]
 
         # Capture the event loop before entering the thread
         loop = asyncio.get_running_loop()
@@ -811,6 +816,11 @@ class ChatStreamingMixin:
 
         # Persist turn log immediately so the user's prompt is recorded
         # even if the backend times out or errors before responding.
+        # TASK-269: a continuation turn answering a deferred question carries
+        # the awaiting turn as parent_turn_id (threads the chain + drives
+        # cross-tab resolution via turn_start{parent_turn_id}).
+        parent_turn_id = getattr(request, "parent_turn_id", None)
+        answered_question_id = getattr(request, "answered_question_id", None)
         self._persist_turn_log(
             turn_id=turn_log_id,
             request_id=ctx.request_id,
@@ -826,7 +836,16 @@ class ChatStreamingMixin:
             response_text="",
             agent_session_key=oc_session_key,
             trigger_message_id=trigger_message_id,
+            parent_turn_id=parent_turn_id,
         )
+        # Record which continuation turn carried the answer back to the agent.
+        if answered_question_id:
+            try:
+                self._pending_question_store.set_answered_turn(
+                    answered_question_id, turn_log_id,
+                )
+            except Exception as _link_err:
+                log.debug("set_answered_turn failed for %s: %s", answered_question_id, _link_err)
 
         # Capture Redis subscriber for direct publish from the background
         # thread — ensures tool events (and turn_complete) reach Redis even
@@ -859,6 +878,7 @@ class ChatStreamingMixin:
             "trigger_message_id": trigger_message_id,
             "bot_id": bot_id,
             "user_id": user_id,
+            "parent_turn_id": parent_turn_id,
             "ts": time.time(),
         })
 
@@ -1467,29 +1487,37 @@ class ChatStreamingMixin:
                 status = "completed" if full_response_holder[0] else "timeout"
                 if cancelled_holder[0]:
                     status = "cancelled"
-                # Any AskUserQuestion still in "awaiting" at this point
-                # never got an answer — flip them to "abandoned" so the UI
-                # stops rendering an actionable picker on hydration.
+                # TASK-269: classify why the turn ended.  A deferred
+                # AskUserQuestion ends the turn cleanly with end_reason
+                # "question" — the persisted question stays "awaiting" (NOT
+                # abandoned; the user answers later via a continuation turn).
+                question_id = question_id_holder[0]
+                if question_id:
+                    end_reason = "question"
+                elif cancelled_holder[0]:
+                    end_reason = "aborted"
+                elif status == "timeout":
+                    end_reason = "error"
+                else:
+                    end_reason = "stop"
+                # Stamp the turn log so hydration/turn-log APIs can render a
+                # first-class QuestionMessage for end_reason="question" turns.
                 try:
-                    abandoned = self._pending_question_store.abandon_for_turn(
-                        turn_log_id,
+                    self._turn_log_store.update_turn(
+                        turn_id=turn_log_id,
+                        end_reason=end_reason,
+                        question_id=question_id,
                     )
-                    if abandoned:
-                        log.info(
-                            "Abandoned %d unanswered question(s) on turn %s",
-                            abandoned, turn_log_id,
-                        )
-                except Exception as _abandon_err:
-                    log.debug(
-                        "abandon_for_turn failed for %s: %s",
-                        turn_log_id, _abandon_err,
-                    )
+                except Exception as _er_err:
+                    log.debug("update_turn end_reason failed for %s: %s", turn_log_id, _er_err)
                 _publish_event_direct({
                     "_type": "turn_complete",
                     "turn_id": turn_log_id,
                     "bot_id": bot_id,
                     "user_id": user_id,
                     "status": status,
+                    "end_reason": end_reason,
+                    "question_id": question_id,
                     "animation": animation_holder[0],
                     "token_usage": token_usage_holder[0],
                     "ts": time.time(),
@@ -1693,20 +1721,29 @@ class ChatStreamingMixin:
                     continue
 
                 if isinstance(chunk, dict) and chunk.get("event") == "await_tool_result":
-                    # Interactive pause from claude-code bridge (AskUserQuestion).
-                    # Three things happen:
-                    #   1. Persist the question to chat_pending_questions so
-                    #      it survives page refresh / second tab / bridge
-                    #      restart-detection on the answer endpoint.
-                    #   2. Emit a sidecar SSE chunk for the originating stream
-                    #      (shape: object=tool.await_result).
-                    #   3. Publish to the unified event stream so other tabs
-                    #      also pick up the pause without needing to be the
-                    #      originator of the run.
+                    # TASK-269 — deferred AskUserQuestion from the agent bridge.
+                    # The bridge has already returned a synthetic ack and the
+                    # turn will end cleanly right after this; the question is the
+                    # durable record the user answers later (via a continuation
+                    # turn).  Here we:
+                    #   1. Persist the question to chat_pending_questions (stays
+                    #      "awaiting" indefinitely — no abandon-on-turn-end now).
+                    #   2. Remember its id so turn completion marks the turn
+                    #      end_reason="question" + question_id.
+                    #   3. Emit the originating-stream sidecar chunk + the
+                    #      unified tool_await_result event so every tab renders
+                    #      the question inline.
                     tool_use_id = chunk.get("tool_use_id") or ""
                     tool_args = chunk.get("arguments") or {}
+                    origin_harness = (chunk.get("provider") or "claude") or "claude"
                     if tool_use_id:
+                        question_id_holder[0] = tool_use_id
                         try:
+                            # A turn that re-asks supersedes its earlier pending
+                            # question so only the latest stays answerable.
+                            self._pending_question_store.supersede_awaiting_for_turn(
+                                turn_log_id, keep=tool_use_id,
+                            )
                             self._pending_question_store.upsert_awaiting(
                                 tool_use_id=tool_use_id,
                                 bot_id=bot_id,
@@ -1716,6 +1753,7 @@ class ChatStreamingMixin:
                                 tool_name=chunk.get("tool_name") or "AskUserQuestion",
                                 trigger_message_id=trigger_message_id,
                                 session_key=chunk.get("session_key") or None,
+                                origin_harness=origin_harness,
                             )
                         except Exception as _persist_err:
                             log.warning(

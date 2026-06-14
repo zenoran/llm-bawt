@@ -63,6 +63,20 @@ class TurnLog(SQLModel, table=True):
     # Surfaced on TurnLogListItem / TurnLogDetail so the chat UI's per-bubble
     # usage pill survives reloads and history syncs.
     token_usage_json: str | None = Field(default=None, sa_column=Column(Text, nullable=True))
+    # --- Turn-lifecycle / continuation chain (TASK-269) ---
+    # Why a turn ended.  Default "stop" (normal completion).  When the agent
+    # asked an AskUserQuestion and deferred it, the turn ends cleanly with
+    # end_reason="question" and question_id set to the originating tool_use_id —
+    # the UI renders a first-class QuestionMessage off this instead of holding
+    # the turn open.  Other terminal reasons: "error", "tool_limit", "aborted".
+    end_reason: str | None = Field(default=None, sa_column=Column(String(32), nullable=True))
+    # tool_use_id of the AskUserQuestion this turn ended on (FK-ish into
+    # chat_pending_questions.tool_use_id).  Only set when end_reason="question".
+    question_id: str | None = Field(default=None, index=True, max_length=128)
+    # When this turn is the continuation that answered a prior question, point
+    # back at the awaiting turn.  Lets the UI thread the chain and resolve the
+    # prior QuestionMessage across tabs on turn_start{parent_turn_id}.
+    parent_turn_id: str | None = Field(default=None, index=True, max_length=128)
 
 
 class ToolCallRecord(SQLModel, table=True):
@@ -154,6 +168,24 @@ class TurnLogStore:
                 conn.execute(sa_text(
                     "ALTER TABLE turn_logs ADD COLUMN IF NOT EXISTS token_usage_json TEXT"
                 ))
+                # TASK-269 turn-lifecycle / continuation columns.
+                conn.execute(sa_text(
+                    "ALTER TABLE turn_logs ADD COLUMN IF NOT EXISTS end_reason VARCHAR(32)"
+                ))
+                conn.execute(sa_text(
+                    "ALTER TABLE turn_logs ADD COLUMN IF NOT EXISTS question_id VARCHAR(128)"
+                ))
+                conn.execute(sa_text(
+                    "CREATE INDEX IF NOT EXISTS ix_turn_logs_question_id"
+                    " ON turn_logs (question_id)"
+                ))
+                conn.execute(sa_text(
+                    "ALTER TABLE turn_logs ADD COLUMN IF NOT EXISTS parent_turn_id VARCHAR(128)"
+                ))
+                conn.execute(sa_text(
+                    "CREATE INDEX IF NOT EXISTS ix_turn_logs_parent_turn_id"
+                    " ON turn_logs (parent_turn_id)"
+                ))
                 conn.commit()
             except Exception:
                 pass
@@ -229,6 +261,7 @@ class TurnLogStore:
         agent_request_id: str | None = None,
         animation: str | None = None,
         token_usage: dict | None = None,
+        parent_turn_id: str | None = None,
     ) -> None:
         """Persist one turn entry (and run TTL cleanup if a TTL is configured)."""
         if self.engine is None:
@@ -263,6 +296,7 @@ class TurnLogStore:
                 json.dumps(token_usage, ensure_ascii=False, default=str)
                 if isinstance(token_usage, dict) else None
             ),
+            parent_turn_id=parent_turn_id,
         )
 
         with Session(self.engine) as session:
@@ -283,6 +317,9 @@ class TurnLogStore:
         agent_request_id: str | None = None,
         animation: str | None = None,
         token_usage: dict | None = None,
+        end_reason: str | None = None,
+        question_id: str | None = None,
+        parent_turn_id: str | None = None,
     ) -> None:
         """Update an existing turn log row with new data."""
         if self.engine is None:
@@ -321,6 +358,12 @@ class TurnLogStore:
                     json.dumps(token_usage, ensure_ascii=False, default=str)
                     if isinstance(token_usage, dict) else None
                 )
+            if end_reason is not None:
+                row.end_reason = end_reason
+            if question_id is not None:
+                row.question_id = question_id
+            if parent_turn_id is not None:
+                row.parent_turn_id = parent_turn_id
             session.add(row)
             session.commit()
 

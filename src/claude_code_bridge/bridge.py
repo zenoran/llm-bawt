@@ -155,6 +155,19 @@ class ClaudeCodeBridge:
     # The CLI's internal API_TIMEOUT_MS is 600s; we cut shorter to fail fast.
     DEFAULT_REQUEST_TIMEOUT = 300
 
+    # TASK-269: synthetic tool_result fed back to the model when it calls
+    # AskUserQuestion.  Returned via PermissionResultDeny.message (an ALLOW
+    # would make the SDK actually run the built-in tool, which crashes headless
+    # with "undefined is not an object" — there's no interactive widget here).
+    # The model reads this as the tool's output, acknowledges, and ends its
+    # turn; the user's real answer arrives later as a continuation turn.
+    _DEFERRED_ACK = (
+        "[The question has been delivered to the user, who will answer it in a "
+        "separate later message. Do not wait and do not guess an answer. Briefly "
+        "acknowledge that you've asked, then end your turn — you'll receive the "
+        "user's answer as a new message and can act on it then.]"
+    )
+
     def __init__(
         self,
         publisher: RedisPublisher,
@@ -184,19 +197,11 @@ class ClaudeCodeBridge:
         # assistant_*, etc.) carries the originating message id.  Cleared on
         # _handle_send finally.
         self._trigger_message_ids: dict[str, str] = {}
-        # tool_use_id → Future[str] for SDK calls deferred to the human via
-        # can_use_tool (currently only AskUserQuestion).  The chat.tool_result
-        # Redis command (handled in _command_listener, deliberately *outside*
-        # the per-session lock so it can't deadlock behind the in-flight
-        # chat.send) resolves the matching Future with the user's answer,
-        # which can_use_tool then returns to the SDK as a PermissionResultDeny
-        # message — that's how the model sees the answer in its context.
-        self._pending_questions: dict[str, asyncio.Future[str]] = {}
-        # tool_use_id → metadata captured at can_use_tool time so the
-        # chat.tool_result handler can validate the session ownership and the
-        # outgoing AWAIT_TOOL_RESULT event carries the right context.  Cleared
-        # alongside the Future when the answer arrives or the run aborts.
-        self._pending_question_meta: dict[str, dict] = {}
+        # TASK-269: AskUserQuestion no longer blocks the SDK turn.  can_use_tool
+        # emits an AWAIT_TOOL_RESULT event and returns a synthetic "deferred"
+        # ack immediately, so the turn ends cleanly and the user's answer comes
+        # back as a separate continuation turn (SDK resume + answer message) —
+        # no in-process Future to hold, no chat.tool_result round-trip.
         # Load MCP servers from settings file
         self._mcp_servers = self._load_mcp_servers()
 
@@ -1073,21 +1078,6 @@ class ClaudeCodeBridge:
             finally:
                 # Drop the per-run trigger_message_id mapping so we don't leak.
                 self._trigger_message_ids.pop(request_id, None)
-                # Release any AskUserQuestion futures still pending for this
-                # request_id — the SDK iteration ended (success/error/abort)
-                # so nothing will ever resolve them and the can_use_tool
-                # callback's wait_for would otherwise dangle until the 30-min
-                # ceiling.  Cancelling lets the (already-defunct) callback
-                # unwind immediately.
-                stale_ids = [
-                    tid for tid, meta in self._pending_question_meta.items()
-                    if meta.get("request_id") == request_id
-                ]
-                for tid in stale_ids:
-                    fut = self._pending_questions.pop(tid, None)
-                    self._pending_question_meta.pop(tid, None)
-                    if fut and not fut.done():
-                        fut.cancel()
                 await async_redis.xack(COMMANDS_STREAM, "claude-code-bridge", msg_id)
 
     # ----- Event publishing -----
@@ -1095,58 +1085,24 @@ class ClaudeCodeBridge:
     async def _handle_tool_result(
         self, fields: dict, msg_id: str, async_redis,
     ) -> None:
-        """Resolve a pending AskUserQuestion Future with the user's answer.
+        """Deprecated no-op (TASK-269).
 
-        Fields:
-            session_key: scoping key (validated against pending_question_meta)
-            tool_use_id: SDK-assigned tool_use id (key into _pending_questions)
-            result: the user's chosen answer (string)
-
-        On unknown tool_use_id this is a no-op — possible if the user clicked
-        too late (turn already aborted) or if the bridge restarted. We still
-        ACK so the command doesn't pile up forever.
+        AskUserQuestion no longer blocks on an in-process Future, so there is
+        nothing to resolve here.  The answer now arrives as a brand-new
+        continuation turn (chat.send carrying the user's answer).  We keep this
+        handler only to drain/ACK any stray chat.tool_result commands a stale
+        client might still emit during a deploy window.
         """
+        tool_use_id = (fields.get("tool_use_id") or "").strip()
+        logger.info(
+            "chat.tool_result is deprecated and ignored (tool_use_id=%s) — "
+            "answers are delivered as continuation turns now",
+            tool_use_id,
+        )
         try:
-            tool_use_id = (fields.get("tool_use_id") or "").strip()
-            result = fields.get("result") or ""
-            session_key = (fields.get("session_key") or "").strip()
-            if not tool_use_id:
-                logger.warning("chat.tool_result missing tool_use_id (session=%s)", session_key)
-                return
-            fut = self._pending_questions.get(tool_use_id)
-            meta = self._pending_question_meta.get(tool_use_id, {})
-            if fut is None or fut.done():
-                logger.info(
-                    "chat.tool_result for unknown/resolved tool_use_id=%s (session=%s) — ignored",
-                    tool_use_id, session_key,
-                )
-                return
-            # Cross-check session ownership to avoid one chat answering another
-            # session's question (paranoid; bridge is single-tenant per backend
-            # but the routing key still scopes per (bot, user)).
-            expected_session = meta.get("session_key")
-            if expected_session and session_key and expected_session != session_key:
-                logger.warning(
-                    "chat.tool_result session mismatch: got=%s expected=%s tool_use_id=%s — ignored",
-                    session_key, expected_session, tool_use_id,
-                )
-                return
-            logger.info(
-                "chat.tool_result resolving tool_use_id=%s session=%s len=%d",
-                tool_use_id, session_key, len(result),
-            )
-            try:
-                fut.set_result(result)
-            except asyncio.InvalidStateError:
-                # Future was already resolved between get() and set_result.
-                pass
+            await async_redis.xack(COMMANDS_STREAM, "claude-code-bridge", msg_id)
         except Exception:
-            logger.exception("chat.tool_result handler failed")
-        finally:
-            try:
-                await async_redis.xack(COMMANDS_STREAM, "claude-code-bridge", msg_id)
-            except Exception:
-                pass
+            pass
 
     # ----- SDK can_use_tool callback -----
 
@@ -1172,10 +1128,21 @@ class ClaudeCodeBridge:
     ):
         """Build the per-run can_use_tool callback bound to this turn.
 
-        The callback intercepts ``AskUserQuestion`` (and any MCP-namespaced
-        variant) to emit an AWAIT_TOOL_RESULT event and pause until the app
-        POSTs a chat.tool_result command with the user's answer.  Everything
-        else gets the SDK's default allow.
+        TASK-269 — deferred/continuation model.  AskUserQuestion does NOT
+        block the SDK turn.  We emit an AWAIT_TOOL_RESULT event (the app
+        persists the question and marks the turn end_reason="question") and
+        immediately return a synthetic "deferred" ack via
+        PermissionResultDeny.message.  The model reads that as the tool's
+        output, acknowledges, and ends its turn cleanly — no Future, no
+        wait_for, no 30-minute ceiling, no session lock held open.  The user's
+        real answer arrives later as a brand-new continuation turn.
+
+        Why DENY and not ALLOW: an ALLOW makes the SDK actually execute the
+        built-in AskUserQuestion, which crashes in this headless context
+        ("undefined is not an object (evaluating 'H.map')" — no interactive
+        widget renderer) and sends the model into a retry loop.  A DENY with a
+        message is the clean channel to feed text back as the tool result.
+        Everything else gets the SDK's default allow.
         """
 
         async def can_use_tool(
@@ -1191,25 +1158,17 @@ class ClaudeCodeBridge:
 
             tool_use_id = (ctx.tool_use_id or "").strip()
             if not tool_use_id:
+                # Without a tool_use_id the app can't key a persistent question
+                # row, but we can still defer cleanly so the turn ends instead
+                # of hanging.  The model just won't get a follow-up answer.
                 logger.warning(
-                    "AskUserQuestion intercepted with no tool_use_id — falling back to deny"
+                    "AskUserQuestion intercepted with no tool_use_id — deferring without persistence"
                 )
-                return PermissionResultDeny(
-                    message="(AskUserQuestion could not be routed to the user — missing tool_use_id)",
-                    interrupt=False,
-                )
+                return PermissionResultDeny(message=self._DEFERRED_ACK, interrupt=False)
 
-            loop = asyncio.get_running_loop()
-            fut: asyncio.Future[str] = loop.create_future()
-            self._pending_questions[tool_use_id] = fut
-            self._pending_question_meta[tool_use_id] = {
-                "session_key": session_key,
-                "request_id": request_id,
-                "tool_name": tool_name,
-            }
-
-            # Emit AWAIT_TOOL_RESULT so the app can fan this out as an SSE
-            # ``tool.await_result`` chunk and the UI can render the picker.
+            # Emit AWAIT_TOOL_RESULT so the app persists the question, records
+            # it on the turn (end_reason="question", question_id), and fans it
+            # out to the UI.  Ordered in the same seq as surrounding deltas.
             try:
                 seq_holder[0] += 1
                 self._publish_event(
@@ -1225,34 +1184,13 @@ class ClaudeCodeBridge:
                 )
 
             logger.info(
-                "AskUserQuestion paused: tool_use_id=%s session=%s — awaiting chat.tool_result",
+                "AskUserQuestion deferred: tool_use_id=%s session=%s — turn ends, "
+                "answer arrives as a continuation turn",
                 tool_use_id, session_key,
             )
 
-            try:
-                # Hard upper bound: 30 minutes.  Without a ceiling a stranded
-                # popup (browser closed before answering) would keep the SDK
-                # turn hot and the session lock taken indefinitely.
-                answer = await asyncio.wait_for(fut, timeout=1800)
-            except asyncio.TimeoutError:
-                logger.warning(
-                    "AskUserQuestion timed out waiting for user answer: tool_use_id=%s",
-                    tool_use_id,
-                )
-                answer = "(no answer — the user did not respond within 30 minutes)"
-            except asyncio.CancelledError:
-                # Turn was aborted (chat.abort) — bubble cancellation up.
-                raise
-            finally:
-                self._pending_questions.pop(tool_use_id, None)
-                self._pending_question_meta.pop(tool_use_id, None)
-
-            # PermissionResultDeny.message is fed back to the model as the
-            # reason the tool didn't run, which is the cleanest path to put
-            # arbitrary text into the conversation without touching the SDK
-            # input channel.  The model treats it as the AskUserQuestion
-            # response and continues naturally.
-            return PermissionResultDeny(message=answer, interrupt=False)
+            # Immediate synthetic ack — no await.  The model ends its turn.
+            return PermissionResultDeny(message=self._DEFERRED_ACK, interrupt=False)
 
         return can_use_tool
 

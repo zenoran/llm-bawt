@@ -112,147 +112,200 @@ class ToolResultResponse(BaseModel):
     detail: str | None = None
 
 
-@router.post("/v1/chat/tool-result", tags=["Agent Backends"])
+@router.post("/v1/chat/tool-result", tags=["Agent Backends"], deprecated=True)
 async def chat_tool_result(request: ToolResultRequest) -> ToolResultResponse:
-    """Deliver a user's AskUserQuestion answer back to the paused SDK turn.
+    """DEPRECATED (TASK-269).  Use ``POST /v1/chat/questions/{id}/answer``.
 
-    Sanity checks the pending-question registry first:
-    - 404 if the tool_use_id was never recorded (typo / stale UI / race).
-    - 410 Gone if the row is in a terminal state (already answered, skipped,
-      or marked abandoned because the originating turn ended).
-    - 410 Gone if the originating turn's status is no longer streaming
-      (covers the bridge-restart case — the SDK Future is gone and the
-      command would be a no-op on the bridge side).
-
-    On success: dispatches the Redis command AND flips the registry row to
-    ``answered`` / ``skipped`` so other tabs converge to the post-answer UI
-    even before the bridge's TOOL_END flows back.
+    The blocking pause/resume model is gone: AskUserQuestion no longer holds
+    the SDK turn open, so there is no Future to resolve.  Answers are now
+    recorded canonically and delivered to the agent as a continuation turn.
+    We still record the answer here so a stale client doesn't silently drop
+    it, but the continuation must be dispatched via the new endpoint/flow.
     """
     service = get_service()
-    from ...bots import BotManager
-    from ...agent_backends.agent_bridge import get_agent_subscriber
-
-    bot = BotManager(service.config).get_bot(request.bot_id)
-    if not bot:
-        raise HTTPException(status_code=404, detail=f"Bot '{request.bot_id}' not found")
-
-    backend_name = getattr(bot, "agent_backend", None)
-    if backend_name != "claude-code":
-        # Only claude-code defers AskUserQuestion today.  Other backends would
-        # need their own can_use_tool equivalent (or MCP override) before this
-        # endpoint could mean anything for them.
-        raise HTTPException(
-            status_code=400,
-            detail=f"Bot '{request.bot_id}' backend '{backend_name}' does not support tool-result",
-        )
-
-    # Look up the row before touching Redis so we can fail fast on stale or
-    # abandoned questions.
     pq_store = getattr(service, "_pending_question_store", None)
-    row = pq_store.get(request.tool_use_id) if pq_store else None
-    if pq_store and row is None:
-        raise HTTPException(
-            status_code=404,
-            detail=f"No pending question recorded for tool_use_id={request.tool_use_id}",
-        )
-    if row is not None and row.status != "awaiting":
-        raise HTTPException(
-            status_code=410,
-            detail=f"Question is no longer awaiting (status={row.status})",
-        )
-    # Cross-check the originating turn — if it's already terminal, the bridge
-    # Future is gone and the SDK won't see this answer.  Mark abandoned and
-    # bail out so the UI doesn't pretend the answer landed.
-    if row is not None:
+    if pq_store is not None and request.tool_use_id:
         try:
-            turn = service._turn_log_store.get_turn(row.turn_id)
-        except Exception:
-            turn = None
-        if turn is not None and turn.status not in ("streaming", "pending"):
-            if pq_store:
-                pq_store.mark(tool_use_id=request.tool_use_id, status="abandoned")
-            raise HTTPException(
-                status_code=410,
-                detail=(
-                    f"Originating turn {row.turn_id} ended (status={turn.status}); "
-                    "answer cannot be delivered."
-                ),
+            pq_store.record_answer(
+                tool_use_id=request.tool_use_id, answer=request.result,
             )
+        except Exception:
+            log.debug("deprecated tool-result record_answer failed", exc_info=True)
+    raise HTTPException(
+        status_code=410,
+        detail=(
+            "POST /v1/chat/tool-result is deprecated; the answer was recorded "
+            "but use POST /v1/chat/questions/{question_id}/answer to deliver it "
+            "as a continuation turn."
+        ),
+    )
 
-    # claude-code's session_key is f"{bot_id}:{user_id}" — same as in
-    # chat_streaming when it computes oc_session_key.
-    session_key = f"{request.bot_id}:{request.user_id}"
 
-    subscriber = get_agent_subscriber()
-    if not subscriber:
-        raise HTTPException(status_code=503, detail="Redis subscriber not available")
+# ---------------------------------------------------------------------------
+# TASK-269 — canonical question/answer + continuation
+# ---------------------------------------------------------------------------
+
+class QuestionResponseItem(BaseModel):
+    """One sub-question's answer in the canonical structured form."""
+    question_id: str | None = Field(default=None, description="Sub-question id/header")
+    selected: list[str] = Field(default_factory=list, description="Chosen option labels")
+    other: str | None = Field(default=None, description="Free text for an 'Other' choice")
+
+
+class QuestionAnswerRequest(BaseModel):
+    """Answer to a deferred AskUserQuestion (TASK-269)."""
+    bot_id: str = Field(..., description="Bot the continuation turn should run on")
+    user_id: str = Field("nick", description="User id (scopes routing + events)")
+    responses: list[QuestionResponseItem] | None = Field(
+        default=None, description="Canonical structured answer, one entry per sub-question",
+    )
+    free_text: str | None = Field(default=None, description="Optional extra free text")
+    # Pre-formatted flat answer; if given it wins over `responses` formatting.
+    result: str | None = Field(default=None, description="Pre-formatted answer text")
+
+
+class QuestionAnswerResponse(BaseModel):
+    ok: bool
+    detail: str | None = None
+    question_id: str
+    bot_id: str
+    origin_harness: str = "claude"
+    # The text the client should send as the continuation user message.
+    continuation_prompt: str
+    # The awaiting turn this answers — pass as parent_turn_id on the continuation.
+    parent_turn_id: str | None = None
+    already_answered: bool = False
+
+
+def _format_continuation_prompt(
+    question_args: dict | None,
+    responses: list[QuestionResponseItem] | None,
+    free_text: str | None,
+    result: str | None,
+) -> str:
+    """Render a user's structured answer into a natural continuation message.
+
+    The resumed agent reads this as a normal user message; the spike proved a
+    clearly-framed answer ("My answer to your question: …") lets the model pick
+    up coherently without any transcript surgery (same-bot resume).
+    """
+    if result and result.strip():
+        return result.strip()
+    # Map header/id -> question text for readable output.
+    qmap: dict[str, str] = {}
+    if isinstance(question_args, dict):
+        for i, q in enumerate(question_args.get("questions", []) or []):
+            if not isinstance(q, dict):
+                continue
+            key = str(q.get("header") or q.get("question") or i)
+            qmap[key] = str(q.get("question") or q.get("header") or key)
+    lines: list[str] = []
+    for r in (responses or []):
+        picked = ", ".join([s for s in (r.selected or []) if s])
+        if r.other:
+            picked = f"{picked}, {r.other}" if picked else r.other
+        q_text = qmap.get(r.question_id or "", r.question_id or "")
+        if q_text and picked:
+            lines.append(f"{q_text}: {picked}")
+        elif picked:
+            lines.append(picked)
+    body = "; ".join(lines)
+    if free_text and free_text.strip():
+        body = f"{body}\n\n{free_text.strip()}" if body else free_text.strip()
+    if not body:
+        body = "(no answer provided)"
+    return f"My answer to your question: {body}"
+
+
+@router.post("/v1/chat/questions/{question_id}/answer", tags=["Agent Backends"])
+async def answer_question(question_id: str, request: QuestionAnswerRequest) -> QuestionAnswerResponse:
+    """Record a user's answer to a deferred AskUserQuestion (TASK-269).
+
+    Persists the canonical answer, flips the question to ``answered``, and
+    fans out a ``question_answered`` unified event so every tab converges.
+    Returns the ``continuation_prompt`` + ``parent_turn_id`` the client uses to
+    dispatch the continuation turn (a normal streaming /v1/chat/completions
+    call carrying the answer back to the agent).  Idempotent — a re-POST of an
+    already-answered question returns the recorded answer with
+    ``already_answered=true`` and does not double-record.
+    """
+    service = get_service()
+    pq_store = getattr(service, "_pending_question_store", None)
+    if pq_store is None:
+        raise HTTPException(status_code=503, detail="Question store unavailable")
+
+    row = pq_store.get(question_id)
+    if row is None:
+        raise HTTPException(
+            status_code=404, detail=f"No question recorded for id={question_id}",
+        )
 
     try:
-        await subscriber.send_tool_result(
-            session_key=session_key,
-            tool_use_id=request.tool_use_id,
-            result=request.result,
-            backend=backend_name,
-            request_id=f"toolres_{uuid.uuid4().hex}",
-        )
-    except Exception as e:
-        log.exception("send_tool_result failed for tool_use_id=%s", request.tool_use_id)
-        raise HTTPException(status_code=502, detail=f"Failed to publish tool_result: {e}") from e
+        question_args = json.loads(row.arguments_json) if row.arguments_json else {}
+    except Exception:
+        question_args = {}
 
-    # Flip the registry row.  We treat the synthetic "(The user skipped this
-    # question…)" sentinel the UI sends on Skip as a distinct status so the
-    # audit trail and any future analytics can tell user-answer apart from
-    # user-decline.  Any other text counts as a real answer.
-    next_status = "answered"
-    if pq_store:
-        sentinel = "(The user skipped this question"
-        if request.result.startswith(sentinel):
-            next_status = "skipped"
-        pq_store.mark(
-            tool_use_id=request.tool_use_id,
-            status=next_status,
-            answer=request.result,
+    already = row.status == "answered"
+    if already:
+        prompt = row.answer or _format_continuation_prompt(
+            question_args, request.responses, request.free_text, request.result,
+        )
+        return QuestionAnswerResponse(
+            ok=True, detail="already_answered", question_id=question_id,
+            bot_id=row.bot_id, origin_harness=getattr(row, "origin_harness", "claude"),
+            continuation_prompt=prompt, parent_turn_id=row.turn_id, already_answered=True,
         )
 
-    # Publish a unified-stream event so every open tab/window converges to
-    # the post-answer UI without waiting for the bridge's TOOL_END to flow
-    # back through Redis.  Best-effort; failures here don't block the user.
+    prompt = _format_continuation_prompt(
+        question_args, request.responses, request.free_text, request.result,
+    )
+    responses_json = [r.model_dump() for r in (request.responses or [])]
+    updated = pq_store.record_answer(
+        tool_use_id=question_id,
+        answer=prompt,
+        answer_json=responses_json or None,
+    )
+    if updated is None:
+        raise HTTPException(status_code=404, detail="Question disappeared during answer")
+
+    # Fan out so other tabs flip the QuestionMessage to its answered state.
     try:
-        from ...agent_backends.agent_bridge import get_agent_subscriber as _get_sub
-        sub = _get_sub()
+        from ...agent_backends.agent_bridge import get_agent_subscriber
+        sub = get_agent_subscriber()
         if sub is not None:
             await sub._redis.xadd(  # type: ignore[attr-defined]
                 f"events:{request.bot_id}:{request.user_id}",
                 {"payload": json.dumps({
-                    "_type": "tool_await_resolved",
+                    "_type": "question_answered",
                     "bot_id": request.bot_id,
                     "user_id": request.user_id,
-                    "tool_use_id": request.tool_use_id,
-                    "turn_id": row.turn_id if row else None,
-                    "status": next_status,
-                    "answer": request.result,
+                    "question_id": question_id,
+                    "turn_id": row.turn_id,
+                    "answer": prompt,
                     "ts": time.time(),
                 }, ensure_ascii=False, default=str)},
                 maxlen=5000,
                 approximate=True,
             )
     except Exception:
-        log.debug(
-            "failed to publish tool_await_resolved unified event for tool_use_id=%s",
-            request.tool_use_id,
-        )
+        log.debug("failed to publish question_answered for id=%s", question_id, exc_info=True)
 
     log.info(
-        "chat.tool_result dispatched: bot=%s session=%s tool_use_id=%s",
-        request.bot_id, session_key, request.tool_use_id,
+        "Question answered: id=%s bot=%s parent_turn=%s — client will dispatch continuation",
+        question_id, request.bot_id, row.turn_id,
     )
-    return ToolResultResponse(ok=True, detail="dispatched")
+    return QuestionAnswerResponse(
+        ok=True, detail="recorded", question_id=question_id,
+        bot_id=request.bot_id, origin_harness=getattr(row, "origin_harness", "claude"),
+        continuation_prompt=prompt, parent_turn_id=row.turn_id,
+    )
 
 
 class PendingQuestionItem(BaseModel):
     """Single row of the pending-questions API."""
     tool_use_id: str
     tool_name: str
+    origin_harness: str = "claude"
     bot_id: str
     user_id: str
     turn_id: str
@@ -261,6 +314,8 @@ class PendingQuestionItem(BaseModel):
     arguments: dict
     status: str
     answer: str | None = None
+    answer_json: list | dict | None = None
+    answered_turn_id: str | None = None
     created_at: str | None = None
     answered_at: str | None = None
 

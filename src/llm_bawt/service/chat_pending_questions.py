@@ -1,24 +1,24 @@
-"""Persistent pending-question registry for interactive SDK tool calls.
+"""Canonical question/answer registry for interactive SDK tool calls.
 
-The claude-code bridge pauses on the Claude Agent SDK's built-in
-``AskUserQuestion`` tool by holding an asyncio.Future in-process (see
-``claude_code_bridge.bridge._make_can_use_tool``).  That covers the in-flight
-case, but if the user navigates away and comes back — or if the bridge
-restarts mid-pause — there's no way for the UI to know a question is open.
+TASK-269 — deferred/continuation model.  When an agent calls the built-in
+``AskUserQuestion`` tool, the bridge does NOT block: ``can_use_tool`` returns
+immediately with a synthetic "deferred" ack and the turn ends cleanly.  The
+question is persisted here as the durable, recallable record of the ask.  The
+user answers anytime (any tab, even days later); the answer endpoint records
+it here and the frontend dispatches a *continuation turn* carrying the answer
+back to the agent (same-bot: SDK session resume; cross-bot: history rewrite).
 
-This store mirrors every active pause into Postgres so the UI can hydrate
-on page load (``GET /v1/chat/pending-questions``) and so the answer endpoint
-(``POST /v1/chat/tool-result``) can detect "the bridge forgot about this
-question" via the originating turn's status.
+Because the turn no longer stays open, a question is NOT abandoned when its
+turn ends — it stays ``awaiting`` (== pending) until explicitly answered or
+superseded.
 
 State machine:
 
-    awaiting   ─┬─→  answered    (user picked / typed an answer)
-                ├─→  skipped     (user explicitly declined to answer)
-                └─→  abandoned   (turn ended without an answer — bridge
-                                  restart, turn aborted, model bailed out)
+    awaiting   ─┬─→  answered     (user picked / typed an answer)
+                ├─→  superseded   (a newer question replaced this one)
+                └─→  abandoned    (explicit drop — session reset, etc.)
 
-Rows are kept indefinitely for audit; callers filter by status.
+Rows are kept indefinitely for audit/recall; callers filter by status.
 """
 
 from __future__ import annotations
@@ -53,11 +53,23 @@ class PendingQuestion(SQLModel, table=True):
     trigger_message_id: str | None = Field(default=None, index=True, max_length=128)
     session_key: str | None = Field(default=None, max_length=128)
     tool_name: str = Field(default="AskUserQuestion", max_length=128)
+    # Harness that asked it — "claude", "codex", … .  Drives per-harness answer
+    # serialization on the continuation turn (TASK-269).
+    origin_harness: str = Field(default="claude", max_length=32)
     # Original tool input (the AskUserQuestion `{questions: [...]}` payload).
     # Stored as JSON text so we don't need a JSONB column for portability.
     arguments_json: str = Field(sa_column=Column(Text, nullable=False))
+    # State machine (TASK-269): awaiting → answered | abandoned | superseded.
+    # "awaiting" == pending; a question stays answerable indefinitely (the
+    # turn that asked it ends cleanly via the deferred ack — we no longer
+    # abandon on turn-end).  "superseded" = a newer question replaced it.
     status: str = Field(default="awaiting", index=True, max_length=32)
+    # Human-readable answer text (what gets fed to the continuation turn).
     answer: str | None = Field(default=None, sa_column=Column(Text, nullable=True))
+    # Canonical structured answer: [{question_id, selected: [...], other?}].
+    answer_json: str | None = Field(default=None, sa_column=Column(Text, nullable=True))
+    # The continuation turn that carried this answer back to the agent.
+    answered_turn_id: str | None = Field(default=None, max_length=128)
     answered_at: datetime | None = Field(
         default=None,
         sa_column=Column(DateTime(timezone=True), nullable=True),
@@ -90,12 +102,23 @@ class PendingQuestionStore:
         SQLModel.metadata.create_all(
             self.engine, tables=[PendingQuestion.__table__],
         )
-        # Additive index — safe to re-apply.
+        # Additive index + TASK-269 canonical columns — safe to re-apply.
         with self.engine.connect() as conn:
             try:
                 conn.execute(sa_text(
                     "CREATE INDEX IF NOT EXISTS ix_pending_questions_bot_status_created"
                     " ON chat_pending_questions (bot_id, user_id, status, created_at DESC)"
+                ))
+                conn.execute(sa_text(
+                    "ALTER TABLE chat_pending_questions ADD COLUMN IF NOT EXISTS"
+                    " origin_harness VARCHAR(32) DEFAULT 'claude'"
+                ))
+                conn.execute(sa_text(
+                    "ALTER TABLE chat_pending_questions ADD COLUMN IF NOT EXISTS answer_json TEXT"
+                ))
+                conn.execute(sa_text(
+                    "ALTER TABLE chat_pending_questions ADD COLUMN IF NOT EXISTS"
+                    " answered_turn_id VARCHAR(128)"
                 ))
                 conn.commit()
             except Exception:
@@ -114,6 +137,7 @@ class PendingQuestionStore:
         tool_name: str = "AskUserQuestion",
         trigger_message_id: str | None = None,
         session_key: str | None = None,
+        origin_harness: str = "claude",
     ) -> None:
         """Insert (or no-op-replay) a fresh awaiting question.
 
@@ -139,6 +163,7 @@ class PendingQuestionStore:
                     trigger_message_id=(trigger_message_id or None) or None,
                     session_key=(session_key or None) or None,
                     tool_name=tool_name or "AskUserQuestion",
+                    origin_harness=(origin_harness or "claude").strip() or "claude",
                     arguments_json=json.dumps(
                         arguments if isinstance(arguments, dict) else {"value": arguments},
                         ensure_ascii=False, default=str,
@@ -188,6 +213,127 @@ class PendingQuestionStore:
                 "Failed to mark pending question tool_use_id=%s status=%s",
                 tool_use_id, status,
             )
+            return None
+
+    def record_answer(
+        self,
+        *,
+        tool_use_id: str,
+        answer: str,
+        answer_json: list | dict | None = None,
+        answered_turn_id: str | None = None,
+    ) -> PendingQuestion | None:
+        """Record the user's answer and flip the question to ``answered``.
+
+        Canonical write path for the deferred/continuation model (TASK-269):
+        the answer endpoint persists the answer here, then the frontend
+        dispatches a continuation turn carrying ``answer`` back to the agent.
+        Idempotent — the first answer wins; a re-POST returns the existing row
+        unchanged.  Returns the updated row, or None if the question is missing.
+        """
+        if self.engine is None:
+            return None
+        try:
+            with Session(self.engine) as session:
+                row = session.get(PendingQuestion, tool_use_id)
+                if row is None:
+                    return None
+                if row.status != "awaiting":
+                    # Already answered/abandoned/superseded — first write wins.
+                    return row
+                row.status = "answered"
+                row.answer = answer
+                if answer_json is not None:
+                    row.answer_json = json.dumps(
+                        answer_json, ensure_ascii=False, default=str,
+                    )
+                if answered_turn_id:
+                    row.answered_turn_id = answered_turn_id
+                row.answered_at = datetime.now(timezone.utc)
+                session.add(row)
+                session.commit()
+                session.refresh(row)
+                return row
+        except Exception:
+            logger.exception(
+                "Failed to record answer for tool_use_id=%s", tool_use_id,
+            )
+            return None
+
+    def supersede_awaiting_for_turn(self, turn_id: str, *, keep: str | None = None) -> int:
+        """Mark stale awaiting questions for a turn as ``superseded``.
+
+        Used when a single turn asks more than once (rare) or when a new
+        question for the same turn replaces an earlier unanswered one.  Pass
+        ``keep`` to exempt the current tool_use_id.  Returns rows changed.
+        """
+        if self.engine is None or not turn_id:
+            return 0
+        try:
+            with Session(self.engine) as session:
+                rows = session.exec(
+                    select(PendingQuestion)
+                    .where(PendingQuestion.turn_id == turn_id)
+                    .where(PendingQuestion.status == "awaiting")
+                ).all()
+                count = 0
+                now = datetime.now(timezone.utc)
+                for row in rows:
+                    if keep and row.tool_use_id == keep:
+                        continue
+                    row.status = "superseded"
+                    row.answered_at = now
+                    session.add(row)
+                    count += 1
+                if count:
+                    session.commit()
+                return count
+        except Exception:
+            logger.exception("Failed to supersede questions for turn_id=%s", turn_id)
+            return 0
+
+    def set_answered_turn(self, tool_use_id: str, answered_turn_id: str) -> None:
+        """Link the continuation turn that carried this answer back.
+
+        The answer endpoint records the answer before the continuation turn
+        exists; the continuation turn (which knows answered_question_id) calls
+        this to backfill the link.  Best-effort, idempotent.
+        """
+        if self.engine is None or not tool_use_id or not answered_turn_id:
+            return
+        try:
+            with Session(self.engine) as session:
+                row = session.get(PendingQuestion, tool_use_id)
+                if row is None or row.answered_turn_id:
+                    return
+                row.answered_turn_id = answered_turn_id
+                session.add(row)
+                session.commit()
+        except Exception:
+            logger.exception(
+                "Failed to link answered turn %s for question %s",
+                answered_turn_id, tool_use_id,
+            )
+
+    def get_by_turn(self, turn_id: str) -> PendingQuestion | None:
+        """Return the (most recent) question asked on a turn, any status.
+
+        The UI renders a first-class QuestionMessage off the turn that ended
+        with end_reason="question"; this resolves the turn back to its row.
+        """
+        if self.engine is None or not turn_id:
+            return None
+        try:
+            with Session(self.engine) as session:
+                stmt = (
+                    select(PendingQuestion)
+                    .where(PendingQuestion.turn_id == turn_id)
+                    .order_by(PendingQuestion.created_at.desc())
+                    .limit(1)
+                )
+                return session.exec(stmt).first()
+        except Exception:
+            logger.exception("Failed to fetch question for turn_id=%s", turn_id)
             return None
 
     def abandon_for_turn(self, turn_id: str) -> int:
@@ -276,9 +422,16 @@ class PendingQuestionStore:
             arguments = json.loads(row.arguments_json) if row.arguments_json else {}
         except Exception:
             arguments = {}
+        answer_json = None
+        if getattr(row, "answer_json", None):
+            try:
+                answer_json = json.loads(row.answer_json)
+            except Exception:
+                answer_json = None
         return {
             "tool_use_id": row.tool_use_id,
             "tool_name": row.tool_name,
+            "origin_harness": getattr(row, "origin_harness", "claude"),
             "bot_id": row.bot_id,
             "user_id": row.user_id,
             "turn_id": row.turn_id,
@@ -287,6 +440,8 @@ class PendingQuestionStore:
             "arguments": arguments,
             "status": row.status,
             "answer": row.answer,
+            "answer_json": answer_json,
+            "answered_turn_id": getattr(row, "answered_turn_id", None),
             "created_at": row.created_at.isoformat() if row.created_at else None,
             "answered_at": row.answered_at.isoformat() if row.answered_at else None,
         }
