@@ -411,6 +411,38 @@ class PendingQuestionStore:
             )
             return []
 
+    def list_recent(
+        self,
+        *,
+        bot_id: str | None = None,
+        user_id: str | None = None,
+        limit: int = 100,
+    ) -> list[PendingQuestion]:
+        """Return recent questions for a scope REGARDLESS of status.
+
+        Used by the UI to render resolved (answered/skipped) questions as a
+        read-only record in the transcript — distinguishing a genuinely
+        resolved question from one whose awaiting row simply hasn't been
+        hydrated yet (which must NOT render read-only).
+        """
+        if self.engine is None:
+            return []
+        try:
+            with Session(self.engine) as session:
+                stmt = select(PendingQuestion)
+                if bot_id:
+                    stmt = stmt.where(PendingQuestion.bot_id == bot_id.strip())
+                if user_id:
+                    stmt = stmt.where(PendingQuestion.user_id == user_id.strip())
+                stmt = stmt.order_by(PendingQuestion.created_at.desc()).limit(limit)
+                return list(session.exec(stmt).all())
+        except Exception:
+            logger.exception(
+                "Failed to list recent questions bot=%s user=%s",
+                bot_id, user_id,
+            )
+            return []
+
     @staticmethod
     def row_to_dict(row: PendingQuestion) -> dict:
         """Serialise a row to the wire shape the UI consumes.

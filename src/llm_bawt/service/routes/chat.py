@@ -162,6 +162,11 @@ class QuestionAnswerRequest(BaseModel):
     free_text: str | None = Field(default=None, description="Optional extra free text")
     # Pre-formatted flat answer; if given it wins over `responses` formatting.
     result: str | None = Field(default=None, description="Pre-formatted answer text")
+    # Skip/dismiss: resolve the question WITHOUT sending anything back to the
+    # agent.  Marks it "skipped" (leaves the awaiting set, never reappears on
+    # reload) and returns an empty continuation_prompt so the client dispatches
+    # no continuation turn.
+    dismiss: bool = Field(default=False, description="Dismiss without answering")
 
 
 class QuestionAnswerResponse(BaseModel):
@@ -238,6 +243,30 @@ async def answer_question(question_id: str, request: QuestionAnswerRequest) -> Q
     except Exception:
         question_args = {}
 
+    async def _fanout_resolved(answer_text: str) -> None:
+        """Fan out a question_answered event so every open tab clears its
+        picker (used by both the answer and the dismiss paths)."""
+        try:
+            from ...agent_backends.agent_bridge import get_agent_subscriber
+            sub = get_agent_subscriber()
+            if sub is not None:
+                await sub._redis.xadd(  # type: ignore[attr-defined]
+                    f"events:{request.bot_id}:{request.user_id}",
+                    {"payload": json.dumps({
+                        "_type": "question_answered",
+                        "bot_id": request.bot_id,
+                        "user_id": request.user_id,
+                        "question_id": question_id,
+                        "turn_id": row.turn_id,
+                        "answer": answer_text,
+                        "ts": time.time(),
+                    }, ensure_ascii=False, default=str)},
+                    maxlen=5000,
+                    approximate=True,
+                )
+        except Exception:
+            log.debug("failed to publish question_answered for id=%s", question_id, exc_info=True)
+
     already = row.status == "answered"
     if already:
         prompt = row.answer or _format_continuation_prompt(
@@ -247,6 +276,23 @@ async def answer_question(question_id: str, request: QuestionAnswerRequest) -> Q
             ok=True, detail="already_answered", question_id=question_id,
             bot_id=row.bot_id, origin_harness=getattr(row, "origin_harness", "claude"),
             continuation_prompt=prompt, parent_turn_id=row.turn_id, already_answered=True,
+        )
+
+    if request.dismiss:
+        # Skip = dismiss without resuming the agent.  Resolve the row as
+        # "skipped" (drops it from the awaiting set so it never reappears on
+        # reload), clear every tab's picker, and return an empty continuation
+        # so the client dispatches no turn.
+        pq_store.mark(tool_use_id=question_id, status="skipped")
+        await _fanout_resolved("")
+        log.info(
+            "Question dismissed (skipped): id=%s bot=%s parent_turn=%s — no continuation",
+            question_id, request.bot_id, row.turn_id,
+        )
+        return QuestionAnswerResponse(
+            ok=True, detail="dismissed", question_id=question_id,
+            bot_id=request.bot_id, origin_harness=getattr(row, "origin_harness", "claude"),
+            continuation_prompt="", parent_turn_id=row.turn_id,
         )
 
     prompt = _format_continuation_prompt(
@@ -262,26 +308,7 @@ async def answer_question(question_id: str, request: QuestionAnswerRequest) -> Q
         raise HTTPException(status_code=404, detail="Question disappeared during answer")
 
     # Fan out so other tabs flip the QuestionMessage to its answered state.
-    try:
-        from ...agent_backends.agent_bridge import get_agent_subscriber
-        sub = get_agent_subscriber()
-        if sub is not None:
-            await sub._redis.xadd(  # type: ignore[attr-defined]
-                f"events:{request.bot_id}:{request.user_id}",
-                {"payload": json.dumps({
-                    "_type": "question_answered",
-                    "bot_id": request.bot_id,
-                    "user_id": request.user_id,
-                    "question_id": question_id,
-                    "turn_id": row.turn_id,
-                    "answer": prompt,
-                    "ts": time.time(),
-                }, ensure_ascii=False, default=str)},
-                maxlen=5000,
-                approximate=True,
-            )
-    except Exception:
-        log.debug("failed to publish question_answered for id=%s", question_id, exc_info=True)
+    await _fanout_resolved(prompt)
 
     log.info(
         "Question answered: id=%s bot=%s parent_turn=%s — client will dispatch continuation",
@@ -322,19 +349,27 @@ async def list_pending_questions(
     bot_id: str | None = None,
     user_id: str | None = None,
     limit: int = 50,
+    include_resolved: bool = False,
 ) -> PendingQuestionList:
-    """Return every currently-awaiting AskUserQuestion for a bot/user scope.
+    """Return AskUserQuestion rows for a bot/user scope.
 
-    Used by the chat UI on page load to hydrate any open pickers — the
-    inline tool-call card reconciles each row against its activity entry
-    and renders the active picker without waiting for an SSE replay.
+    By default returns only currently-awaiting questions (used to hydrate any
+    open pickers on page load).  With ``include_resolved=true`` it returns
+    recent questions of ALL statuses so the UI can render resolved
+    (answered/skipped) questions as a read-only record — and, crucially, so it
+    can tell a resolved question apart from one whose awaiting row simply
+    hasn't loaded yet (which must keep showing the live picker, not a stale
+    read-only card).
     """
     service = get_service()
     pq_store = getattr(service, "_pending_question_store", None)
     if pq_store is None:
         return PendingQuestionList(data=[])
-    rows = pq_store.list_awaiting(
-        bot_id=bot_id, user_id=user_id, limit=max(1, min(int(limit or 50), 200)),
+    capped = max(1, min(int(limit or 50), 200))
+    rows = (
+        pq_store.list_recent(bot_id=bot_id, user_id=user_id, limit=capped)
+        if include_resolved
+        else pq_store.list_awaiting(bot_id=bot_id, user_id=user_id, limit=capped)
     )
     return PendingQuestionList(
         data=[PendingQuestionItem(**pq_store.row_to_dict(r)) for r in rows],
