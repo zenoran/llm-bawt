@@ -635,32 +635,38 @@ class ClaudeCodeBridge:
                                 },
                             })
                     logger.info("Multimodal prompt: %d text + %d images", 1, len(attachments))
-
-                    async def _image_prompt():
-                        yield {
-                            "type": "user",
-                            "message": {"role": "user", "content": content},
-                            "parent_tool_use_id": None,
-                            "session_id": "default",
-                        }
-
-                    prompt_input: str | AsyncIterable = _image_prompt()
+                    user_content: str | list[dict] = content
                 else:
-                    # Text-only still must be an AsyncIterable: the can_use_tool
-                    # callback (see ClaudeAgentOptions below) only works in the
-                    # SDK's streaming-input mode. A plain str prompt raises
-                    # "can_use_tool callback requires streaming mode". Wrap the
-                    # message in a single-yield user-message generator, mirroring
-                    # the multimodal branch above.
-                    async def _text_prompt():
+                    user_content = message
+
+                # The prompt MUST be an AsyncIterable: can_use_tool only works in
+                # the SDK's streaming-input mode (a plain str raises "can_use_tool
+                # callback requires streaming mode").
+                #
+                # Critically, the generator must stay OPEN for the whole turn.
+                # Returning right after the single yield closes the subprocess
+                # input stream, which tears down the bidirectional control channel
+                # that can_use_tool (AskUserQuestion) rides on — the pending
+                # permission request then dies with "Tool permission request
+                # failed: Error: Stream closed", and the half-finished turn leaves
+                # a dangling tool_use that makes the resumed session un-replayable
+                # (it wedges every subsequent message on that session).
+                #
+                # So: yield the user message, then block on `done_event` until the
+                # response loop signals the turn is complete (ResultMessage), and
+                # only then return — letting the SDK close input and end the
+                # output stream via StopAsyncIteration cleanly.
+                def _make_prompt_input(done_event: asyncio.Event) -> AsyncIterable:
+                    async def _prompt():
                         yield {
                             "type": "user",
-                            "message": {"role": "user", "content": message},
+                            "message": {"role": "user", "content": user_content},
                             "parent_tool_use_id": None,
                             "session_id": "default",
                         }
+                        await done_event.wait()
 
-                    prompt_input = _text_prompt()
+                    return _prompt()
 
                 auth_retry_attempted = False
                 fresh_session_retry = False
@@ -675,6 +681,13 @@ class ClaudeCodeBridge:
                     # Stale signal from a previous run — clear so this turn can proceed.
                     cancel_event.clear()
                 while True:
+                    # An async generator is single-use and the auth/session retry
+                    # paths below re-enter this loop, so build a fresh prompt +
+                    # completion gate per attempt.  turn_done releases the prompt
+                    # generator (closing SDK input) only once the turn finishes —
+                    # see _make_prompt_input for why it must stay open until then.
+                    turn_done = asyncio.Event()
+                    prompt_input = _make_prompt_input(turn_done)
                     stderr_lines: list[str] = []
 
                     def _log_stderr(line: str) -> None:
@@ -934,6 +947,12 @@ class ClaudeCodeBridge:
                                     model=actual_model,
                                     token_usage=token_usage_payload,
                                 )
+                                # Turn complete — release the prompt generator so
+                                # the SDK closes its input stream and this loop ends
+                                # via StopAsyncIteration.  Kept open until now so the
+                                # can_use_tool control channel survived any
+                                # AskUserQuestion pause earlier in the turn.
+                                turn_done.set()
                         if aborted:
                             # Cooperative abort fired — fall straight through to
                             # publish_run_done without retry. We deliberately drop
