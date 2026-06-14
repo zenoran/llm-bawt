@@ -15,8 +15,11 @@ import httpx
 from claude_agent_sdk import ClaudeAgentOptions, StreamEvent, query
 from claude_agent_sdk.types import (
     AssistantMessage,
+    PermissionResultAllow,
+    PermissionResultDeny,
     ResultMessage,
     SystemMessage,
+    ToolPermissionContext,
     ToolResultBlock,
     ToolUseBlock,
     UserMessage,
@@ -181,6 +184,19 @@ class ClaudeCodeBridge:
         # assistant_*, etc.) carries the originating message id.  Cleared on
         # _handle_send finally.
         self._trigger_message_ids: dict[str, str] = {}
+        # tool_use_id → Future[str] for SDK calls deferred to the human via
+        # can_use_tool (currently only AskUserQuestion).  The chat.tool_result
+        # Redis command (handled in _command_listener, deliberately *outside*
+        # the per-session lock so it can't deadlock behind the in-flight
+        # chat.send) resolves the matching Future with the user's answer,
+        # which can_use_tool then returns to the SDK as a PermissionResultDeny
+        # message — that's how the model sees the answer in its context.
+        self._pending_questions: dict[str, asyncio.Future[str]] = {}
+        # tool_use_id → metadata captured at can_use_tool time so the
+        # chat.tool_result handler can validate the session ownership and the
+        # outgoing AWAIT_TOOL_RESULT event carries the right context.  Cleared
+        # alongside the Future when the answer arrives or the run aborts.
+        self._pending_question_meta: dict[str, dict] = {}
         # Load MCP servers from settings file
         self._mcp_servers = self._load_mcp_servers()
 
@@ -435,6 +451,15 @@ class ClaudeCodeBridge:
                             asyncio.create_task(
                                 self._handle_rpc(fields, msg_id, async_redis)
                             )
+                        elif action == "chat.tool_result":
+                            # Resolves a pending AskUserQuestion Future so the
+                            # paused SDK turn can continue.  Deliberately NOT
+                            # wrapped in the session lock — _handle_send is
+                            # holding that lock while awaiting the Future, so
+                            # taking it here would deadlock the run forever.
+                            asyncio.create_task(
+                                self._handle_tool_result(fields, msg_id, async_redis)
+                            )
                         else:
                             await async_redis.xack(COMMANDS_STREAM, "claude-code-bridge", msg_id)
 
@@ -561,7 +586,6 @@ class ClaudeCodeBridge:
             text_parts: list[str] = []
             current_tool_name: str | None = None
             current_tool_input: str = ""
-            current_tool_id: str | None = None
             actual_model: str = model  # updated from SystemMessage if available
 
             try:
@@ -650,6 +674,18 @@ class ClaudeCodeBridge:
                     if fresh_token:
                         sdk_env["CLAUDE_CODE_OAUTH_TOKEN"] = fresh_token
 
+                    # Pass `seq` to the can_use_tool factory by reference so it
+                    # can keep the AWAIT_TOOL_RESULT event ordered in the same
+                    # sequence as the surrounding ASSISTANT_DELTA / TOOL_START
+                    # events.  Tuple-wrapped in a single-element list so the
+                    # closure can mutate it without rebinding.
+                    seq_holder = [seq]
+                    can_use_tool_cb = self._make_can_use_tool(
+                        request_id=request_id,
+                        session_key=session_key,
+                        seq_holder=seq_holder,
+                    )
+
                     options = ClaudeAgentOptions(
                         model=model,
                         system_prompt=system_prompt if not resume_id else None,
@@ -664,6 +700,7 @@ class ClaudeCodeBridge:
                         effort=bot_effort,
                         max_turns=bot_max_turns,
                         mcp_servers=self._mcp_servers if self._mcp_servers else {},
+                        can_use_tool=can_use_tool_cb,
                     )
 
                     session_persisted = False
@@ -755,20 +792,12 @@ class ClaudeCodeBridge:
                                     block = event.get("content_block", {})
                                     if block.get("type") == "tool_use":
                                         current_tool_name = block.get("name", "unknown")
-                                        current_tool_id = block.get("id", "")
                                         current_tool_input = ""
 
                                 elif event_type == "content_block_stop":
                                     if current_tool_name:
-                                        tool_args = {}
-                                        if current_tool_input:
-                                            try:
-                                                tool_args = json.loads(current_tool_input)
-                                            except json.JSONDecodeError:
-                                                tool_args = {"raw": current_tool_input}
                                         current_tool_name = None
                                         current_tool_input = ""
-                                        current_tool_id = None
 
                             elif isinstance(msg, AssistantMessage):
                                 # Capture per-iteration usage — overwrites on
@@ -786,6 +815,7 @@ class ClaudeCodeBridge:
                                             kind=AgentEventKind.TOOL_START,
                                             tool_name=block.name,
                                             tool_arguments=block.input if isinstance(block.input, dict) else {},
+                                            tool_use_id=getattr(block, "id", None),
                                         )
 
                             elif isinstance(msg, UserMessage):
@@ -801,7 +831,15 @@ class ClaudeCodeBridge:
                                         self._publish_event(
                                             request_id, session_key, seq,
                                             kind=AgentEventKind.TOOL_END,
+                                            # NB: the SDK's ToolResultBlock does
+                                            # not echo the tool *name* — only the
+                                            # tool_use_id linking back to the
+                                            # originating ToolUseBlock.  Surface
+                                            # both: tool_use_id in its proper
+                                            # field, and a placeholder name so
+                                            # legacy consumers still see something.
                                             tool_name=block.tool_use_id or "unknown",
+                                            tool_use_id=block.tool_use_id,
                                             tool_result=str(result_content)[:2000],
                                         )
 
@@ -1002,9 +1040,188 @@ class ClaudeCodeBridge:
             finally:
                 # Drop the per-run trigger_message_id mapping so we don't leak.
                 self._trigger_message_ids.pop(request_id, None)
+                # Release any AskUserQuestion futures still pending for this
+                # request_id — the SDK iteration ended (success/error/abort)
+                # so nothing will ever resolve them and the can_use_tool
+                # callback's wait_for would otherwise dangle until the 30-min
+                # ceiling.  Cancelling lets the (already-defunct) callback
+                # unwind immediately.
+                stale_ids = [
+                    tid for tid, meta in self._pending_question_meta.items()
+                    if meta.get("request_id") == request_id
+                ]
+                for tid in stale_ids:
+                    fut = self._pending_questions.pop(tid, None)
+                    self._pending_question_meta.pop(tid, None)
+                    if fut and not fut.done():
+                        fut.cancel()
                 await async_redis.xack(COMMANDS_STREAM, "claude-code-bridge", msg_id)
 
     # ----- Event publishing -----
+
+    async def _handle_tool_result(
+        self, fields: dict, msg_id: str, async_redis,
+    ) -> None:
+        """Resolve a pending AskUserQuestion Future with the user's answer.
+
+        Fields:
+            session_key: scoping key (validated against pending_question_meta)
+            tool_use_id: SDK-assigned tool_use id (key into _pending_questions)
+            result: the user's chosen answer (string)
+
+        On unknown tool_use_id this is a no-op — possible if the user clicked
+        too late (turn already aborted) or if the bridge restarted. We still
+        ACK so the command doesn't pile up forever.
+        """
+        try:
+            tool_use_id = (fields.get("tool_use_id") or "").strip()
+            result = fields.get("result") or ""
+            session_key = (fields.get("session_key") or "").strip()
+            if not tool_use_id:
+                logger.warning("chat.tool_result missing tool_use_id (session=%s)", session_key)
+                return
+            fut = self._pending_questions.get(tool_use_id)
+            meta = self._pending_question_meta.get(tool_use_id, {})
+            if fut is None or fut.done():
+                logger.info(
+                    "chat.tool_result for unknown/resolved tool_use_id=%s (session=%s) — ignored",
+                    tool_use_id, session_key,
+                )
+                return
+            # Cross-check session ownership to avoid one chat answering another
+            # session's question (paranoid; bridge is single-tenant per backend
+            # but the routing key still scopes per (bot, user)).
+            expected_session = meta.get("session_key")
+            if expected_session and session_key and expected_session != session_key:
+                logger.warning(
+                    "chat.tool_result session mismatch: got=%s expected=%s tool_use_id=%s — ignored",
+                    session_key, expected_session, tool_use_id,
+                )
+                return
+            logger.info(
+                "chat.tool_result resolving tool_use_id=%s session=%s len=%d",
+                tool_use_id, session_key, len(result),
+            )
+            try:
+                fut.set_result(result)
+            except asyncio.InvalidStateError:
+                # Future was already resolved between get() and set_result.
+                pass
+        except Exception:
+            logger.exception("chat.tool_result handler failed")
+        finally:
+            try:
+                await async_redis.xack(COMMANDS_STREAM, "claude-code-bridge", msg_id)
+            except Exception:
+                pass
+
+    # ----- SDK can_use_tool callback -----
+
+    @staticmethod
+    def _is_ask_user_question(tool_name: str) -> bool:
+        """Match AskUserQuestion regardless of MCP namespacing.
+
+        The SDK built-in is just ``AskUserQuestion``, but if it ever shows up
+        prefixed by an MCP server (``mcp__<server>__AskUserQuestion``) we want
+        to intercept that too.
+        """
+        if not tool_name:
+            return False
+        tail = tool_name.rsplit("__", 1)[-1]
+        return tail == "AskUserQuestion"
+
+    def _make_can_use_tool(
+        self,
+        *,
+        request_id: str,
+        session_key: str,
+        seq_holder: list[int],
+    ):
+        """Build the per-run can_use_tool callback bound to this turn.
+
+        The callback intercepts ``AskUserQuestion`` (and any MCP-namespaced
+        variant) to emit an AWAIT_TOOL_RESULT event and pause until the app
+        POSTs a chat.tool_result command with the user's answer.  Everything
+        else gets the SDK's default allow.
+        """
+
+        async def can_use_tool(
+            tool_name: str,
+            tool_input: dict,
+            ctx: ToolPermissionContext,
+        ):
+            if not self._is_ask_user_question(tool_name):
+                # Default-allow for everything else.  permission_mode on the
+                # ClaudeAgentOptions still governs the SDK-side prompt flow;
+                # this callback only short-circuits AskUserQuestion.
+                return PermissionResultAllow()
+
+            tool_use_id = (ctx.tool_use_id or "").strip()
+            if not tool_use_id:
+                logger.warning(
+                    "AskUserQuestion intercepted with no tool_use_id — falling back to deny"
+                )
+                return PermissionResultDeny(
+                    message="(AskUserQuestion could not be routed to the user — missing tool_use_id)",
+                    interrupt=False,
+                )
+
+            loop = asyncio.get_running_loop()
+            fut: asyncio.Future[str] = loop.create_future()
+            self._pending_questions[tool_use_id] = fut
+            self._pending_question_meta[tool_use_id] = {
+                "session_key": session_key,
+                "request_id": request_id,
+                "tool_name": tool_name,
+            }
+
+            # Emit AWAIT_TOOL_RESULT so the app can fan this out as an SSE
+            # ``tool.await_result`` chunk and the UI can render the picker.
+            try:
+                seq_holder[0] += 1
+                self._publish_event(
+                    request_id, session_key, seq_holder[0],
+                    kind=AgentEventKind.AWAIT_TOOL_RESULT,
+                    tool_name=tool_name,
+                    tool_arguments=tool_input if isinstance(tool_input, dict) else {},
+                    tool_use_id=tool_use_id,
+                )
+            except Exception:
+                logger.exception(
+                    "Failed to publish AWAIT_TOOL_RESULT for tool_use_id=%s", tool_use_id,
+                )
+
+            logger.info(
+                "AskUserQuestion paused: tool_use_id=%s session=%s — awaiting chat.tool_result",
+                tool_use_id, session_key,
+            )
+
+            try:
+                # Hard upper bound: 30 minutes.  Without a ceiling a stranded
+                # popup (browser closed before answering) would keep the SDK
+                # turn hot and the session lock taken indefinitely.
+                answer = await asyncio.wait_for(fut, timeout=1800)
+            except asyncio.TimeoutError:
+                logger.warning(
+                    "AskUserQuestion timed out waiting for user answer: tool_use_id=%s",
+                    tool_use_id,
+                )
+                answer = "(no answer — the user did not respond within 30 minutes)"
+            except asyncio.CancelledError:
+                # Turn was aborted (chat.abort) — bubble cancellation up.
+                raise
+            finally:
+                self._pending_questions.pop(tool_use_id, None)
+                self._pending_question_meta.pop(tool_use_id, None)
+
+            # PermissionResultDeny.message is fed back to the model as the
+            # reason the tool didn't run, which is the cleanest path to put
+            # arbitrary text into the conversation without touching the SDK
+            # input channel.  The model treats it as the AskUserQuestion
+            # response and continues naturally.
+            return PermissionResultDeny(message=answer, interrupt=False)
+
+        return can_use_tool
 
     async def _handle_rpc(
         self, fields: dict, msg_id: str, async_redis,
@@ -1140,6 +1357,7 @@ class ClaudeCodeBridge:
         tool_result: str | None = None,
         model: str | None = None,
         token_usage: dict | None = None,
+        tool_use_id: str | None = None,
     ) -> None:
         text = self._shorten_paths(text)
         tool_result = self._shorten_paths(tool_result)
@@ -1170,6 +1388,7 @@ class ClaudeCodeBridge:
             # originating user-message UUID without each call site needing
             # to remember to thread it through.
             trigger_message_id=self._trigger_message_ids.get(request_id),
+            tool_use_id=tool_use_id,
         )
         self._publisher.publish_run_event(request_id, event)
 

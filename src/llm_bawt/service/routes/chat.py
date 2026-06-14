@@ -91,6 +91,73 @@ async def chat_abort(request: ChatAbortRequest) -> ChatAbortResponse:
         turn_id=turn.id,
     )
 
+class ToolResultRequest(BaseModel):
+    """Answer to a paused AskUserQuestion tool call.
+
+    Routed through Redis (chat.tool_result action) to the claude-code bridge,
+    which resolves the pending asyncio.Future keyed by tool_use_id.  The SDK
+    turn resumes immediately on its own — this endpoint does not stream the
+    continuation; the originating SSE connection (or its resume path) does.
+    """
+    bot_id: str = Field(..., description="Bot slug whose paused turn this answers")
+    user_id: str = Field("nick", description="User id (scopes the routing key)")
+    tool_use_id: str = Field(..., description="SDK tool_use id from the AWAIT_TOOL_RESULT event")
+    result: str = Field(..., description="User's answer (label, free text, or JSON-encoded multi-pick)")
+
+
+class ToolResultResponse(BaseModel):
+    ok: bool
+    detail: str | None = None
+
+
+@router.post("/v1/chat/tool-result", tags=["Agent Backends"])
+async def chat_tool_result(request: ToolResultRequest) -> ToolResultResponse:
+    """Deliver a user's AskUserQuestion answer back to the paused SDK turn."""
+    service = get_service()
+    from ...bots import BotManager
+    from ...agent_backends.agent_bridge import get_agent_subscriber
+
+    bot = BotManager(service.config).get_bot(request.bot_id)
+    if not bot:
+        raise HTTPException(status_code=404, detail=f"Bot '{request.bot_id}' not found")
+
+    backend_name = getattr(bot, "agent_backend", None)
+    if backend_name != "claude-code":
+        # Only claude-code defers AskUserQuestion today.  Other backends would
+        # need their own can_use_tool equivalent (or MCP override) before this
+        # endpoint could mean anything for them.
+        raise HTTPException(
+            status_code=400,
+            detail=f"Bot '{request.bot_id}' backend '{backend_name}' does not support tool-result",
+        )
+
+    # claude-code's session_key is f"{bot_id}:{user_id}" — same as in
+    # chat_streaming when it computes oc_session_key.
+    session_key = f"{request.bot_id}:{request.user_id}"
+
+    subscriber = get_agent_subscriber()
+    if not subscriber:
+        raise HTTPException(status_code=503, detail="Redis subscriber not available")
+
+    try:
+        await subscriber.send_tool_result(
+            session_key=session_key,
+            tool_use_id=request.tool_use_id,
+            result=request.result,
+            backend=backend_name,
+            request_id=f"toolres_{uuid.uuid4().hex}",
+        )
+    except Exception as e:
+        log.exception("send_tool_result failed for tool_use_id=%s", request.tool_use_id)
+        raise HTTPException(status_code=502, detail=f"Failed to publish tool_result: {e}") from e
+
+    log.info(
+        "chat.tool_result dispatched: bot=%s session=%s tool_use_id=%s",
+        request.bot_id, session_key, request.tool_use_id,
+    )
+    return ToolResultResponse(ok=True, detail="dispatched")
+
+
 class SessionResetRequest(BaseModel):
     """Request to reset an agent backend session."""
     bot_id: str = Field(..., description="Bot slug to reset session for")

@@ -23,6 +23,15 @@ class AgentEventKind(str, Enum):
     # racing turn_complete timing.  Payload uses raw={"bot_id", "session_key",
     # "target", "had_session"} so the UI can scope the clear.
     SESSION_RESET = "session_reset"
+    # Emitted when a bridge has paused the SDK on an interactive tool call
+    # (currently only the Claude Agent SDK's built-in ``AskUserQuestion``).
+    # The bridge holds an asyncio.Future keyed by ``tool_use_id``; the run
+    # cannot continue until the app POSTs a chat.tool_result Redis command
+    # carrying the user's answer.  Payload uses ``tool_name``,
+    # ``tool_arguments`` (the original tool input — e.g. ``{questions: [...]}``
+    # for AskUserQuestion), and the new ``tool_use_id`` field on AgentEvent
+    # so the UI can echo it back when the user picks an answer.
+    AWAIT_TOOL_RESULT = "await_tool_result"
 
 
 @dataclass
@@ -59,6 +68,12 @@ class AgentEvent:
     # Optional because passive subscription paths (e.g. CLI sessions on
     # the OpenClaw gateway) have no originating frontend message.
     trigger_message_id: str | None = None
+    # SDK-supplied tool_use id for the *specific* tool call this event refers
+    # to.  Stamped on TOOL_START / TOOL_END / AWAIT_TOOL_RESULT events by the
+    # claude-code bridge so the app can pair a user-supplied answer (via the
+    # chat.tool_result Redis command) back to the paused SDK Future.  Other
+    # bridges leave it unset.
+    tool_use_id: str | None = None
 
     def to_dict(self) -> dict:
         """Serialize for Redis/JSON transport."""
@@ -80,6 +95,7 @@ class AgentEvent:
             "token_usage": self.token_usage,
             "provider": self.provider,
             "trigger_message_id": self.trigger_message_id,
+            "tool_use_id": self.tool_use_id,
         }
 
     @classmethod
@@ -108,6 +124,7 @@ class AgentEvent:
             token_usage=data.get("token_usage"),
             provider=data.get("provider"),
             trigger_message_id=data.get("trigger_message_id"),
+            tool_use_id=data.get("tool_use_id"),
         )
 
 

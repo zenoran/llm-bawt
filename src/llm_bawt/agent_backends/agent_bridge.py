@@ -17,7 +17,6 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import os
 import threading
 import time
 import uuid
@@ -25,7 +24,6 @@ from dataclasses import dataclass, field
 from typing import Any, Iterator
 
 from .base import AgentBackend
-from ..shared.output_sanitizer import strip_tool_protocol_leakage
 from ..utils.config import Config
 
 logger = logging.getLogger(__name__)
@@ -165,7 +163,6 @@ class AgentBridgeBackend(AgentBackend):
             # We use a separate thread with its own Redis client to avoid
             # event loop cross-contamination.
             import threading
-            import redis.asyncio as aioredis
 
             def _run_in_thread():
                 async def _worker():
@@ -319,7 +316,27 @@ class AgentBridgeBackend(AgentBackend):
                                         "result": result,
                                         "provider": event.provider,
                                         "trigger_message_id": event.trigger_message_id,
+                                        "tool_use_id": event.tool_use_id,
                                     })
+
+                            elif event.kind == AgentEventKind.AWAIT_TOOL_RESULT:
+                                # Claude-code bridge has paused the SDK on an
+                                # interactive tool call (AskUserQuestion).  The
+                                # frontend renders a picker and POSTs the user's
+                                # answer to /v1/chat/tool-result, which fans out
+                                # a chat.tool_result Redis command back to the
+                                # bridge — that resolves the pending Future and
+                                # the SDK turn continues.  No state to mutate
+                                # here; just forward the event downstream.
+                                result_queue.put({
+                                    "event": "await_tool_result",
+                                    "tool_name": event.tool_name or "",
+                                    "tool_use_id": event.tool_use_id or "",
+                                    "arguments": event.tool_arguments or {},
+                                    "session_key": event.session_key,
+                                    "provider": event.provider,
+                                    "trigger_message_id": event.trigger_message_id,
+                                })
 
                             elif event.kind == AgentEventKind.ERROR:
                                 raise RuntimeError(f"{self.name} error: {event.text}")

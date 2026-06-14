@@ -1046,7 +1046,6 @@ class ChatStreamingMixin:
                                         yield item
                                     elif isinstance(item, dict) and "tool_calls" in item:
                                         tool_calls = item["tool_calls"]
-                                        content = item.get("content", "")
 
                                         if not tool_calls:
                                             # Empty tool_calls list — treat as pure text response.
@@ -1493,7 +1492,6 @@ class ChatStreamingMixin:
             bot = get_bot(bot_id)
             emote_filter = StreamingEmoteFilter() if (bot and bot.voice_optimized) else None
             oc_tool_call_index = 0  # OpenClaw agent backend tool call index
-            oc_last_call_id = ""   # Track last call_id for tool_end matching
             _upstream_model = [None]  # Actual model reported by agent backend
 
             # Send service warnings (e.g. model fallback) before content
@@ -1655,7 +1653,6 @@ class ChatStreamingMixin:
                     }
                     yield (f"data: {json.dumps(data)}\n\n")
                     oc_tool_call_index += 1
-                    oc_last_call_id = tc_id
                     # Tool events already published from background thread
                     continue
 
@@ -1665,7 +1662,6 @@ class ChatStreamingMixin:
                     continue
 
                 if isinstance(chunk, dict) and chunk.get("event") == "tool_result":
-                    tc_result = str(chunk.get("result", ""))
                     if oc_tool_call_index > 0:
                         data = {
                             "id": response_id,
@@ -1676,6 +1672,44 @@ class ChatStreamingMixin:
                         }
                         yield (f"data: {json.dumps(data)}\n\n")
                         oc_tool_call_index = 0
+                    continue
+
+                if isinstance(chunk, dict) and chunk.get("event") == "await_tool_result":
+                    # Interactive pause from claude-code bridge (AskUserQuestion).
+                    # Emits a sidecar SSE chunk in the same shape as
+                    # service.warning / service.animation so the bawthub UI can
+                    # detect it without disturbing the OpenAI-shaped delta
+                    # stream that other clients depend on.  The UI uses
+                    # session_key + tool_use_id to POST the user's answer back
+                    # to /api/chat/tool-result, which fans out to the bridge.
+                    await_payload = {
+                        "object": "tool.await_result",
+                        "tool_use_id": chunk.get("tool_use_id", ""),
+                        "tool_name": chunk.get("tool_name", ""),
+                        "arguments": chunk.get("arguments") or {},
+                        "session_key": chunk.get("session_key", ""),
+                        "provider": chunk.get("provider", ""),
+                        "trigger_message_id": chunk.get("trigger_message_id"),
+                        "bot_id": bot_id,
+                        "turn_id": turn_log_id,
+                    }
+                    yield (f"data: {json.dumps(await_payload)}\n\n")
+                    # Also publish to the unified event stream so other open
+                    # tabs / the dashboard see the pause without needing to
+                    # be the originator of the run.
+                    _publish_event_direct({
+                        "_type": "tool_await_result",
+                        "turn_id": turn_log_id,
+                        "trigger_message_id": trigger_message_id,
+                        "bot_id": bot_id,
+                        "user_id": user_id,
+                        "tool_use_id": chunk.get("tool_use_id", ""),
+                        "tool_name": chunk.get("tool_name", ""),
+                        "arguments": chunk.get("arguments") or {},
+                        "session_key": chunk.get("session_key", ""),
+                        "provider": chunk.get("provider", ""),
+                        "ts": time.time(),
+                    })
                     continue
 
                 if isinstance(chunk, dict) and chunk.get("_type") == "tool_calls_finish":

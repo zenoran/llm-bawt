@@ -166,6 +166,43 @@ class RedisSubscriber:
             request_id, session_key, len(attachments or []),
         )
 
+    async def send_tool_result(
+        self,
+        session_key: str,
+        tool_use_id: str,
+        result: str,
+        *,
+        backend: str | None = None,
+        request_id: str | None = None,
+    ) -> None:
+        """Publish a chat.tool_result command for a deferred SDK tool call.
+
+        Routed by bridges that have pending AWAIT_TOOL_RESULT futures keyed by
+        ``tool_use_id`` (currently only claude-code-bridge for AskUserQuestion).
+        Fire-and-forget — the bridge resolves the future and the run resumes;
+        the next deltas flow through the existing per-run event stream.
+        """
+        fields: dict = {
+            "action": "chat.tool_result",
+            "session_key": session_key,
+            "tool_use_id": tool_use_id,
+            "result": result,
+        }
+        if backend:
+            fields["backend"] = backend
+        if request_id:
+            fields["request_id"] = request_id
+        await self._redis.xadd(
+            COMMANDS_STREAM,
+            fields,
+            maxlen=1000,
+            approximate=True,
+        )
+        logger.info(
+            "Sent chat.tool_result: session=%s tool_use_id=%s len=%d backend=%s",
+            session_key, tool_use_id, len(result or ""), backend or "?",
+        )
+
     async def send_rpc(
         self,
         method: str,
