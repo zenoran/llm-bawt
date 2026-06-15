@@ -150,6 +150,11 @@ services:
       # talk to the API without a flag override.
       - LLM_BAWT_SERVICE_HOST=app
       - REDIS_URL=redis://redis:6379/0
+      # TASK-270: TASK-270 proxy reads ChatGPT subscription OAuth from
+      # ~/.codex/auth.json (the artifact `codex login` produces). Same
+      # bind-mount the codex-bridge uses so a single `codex login` on the
+      # host re-credentials both bridges.
+      - CODEX_AUTH_PATH=/home/bridge/.codex/auth.json
     extra_hosts:
       - "host.docker.internal:host-gateway"
       - "echo.lan.zenoran.com:${ECHO_LAN_HOST_IP:-10.0.0.101}"
@@ -162,6 +167,10 @@ services:
       - ${HOME}/.config/claude-code-bridge/.claude.json:/home/bridge/.claude.json
       - ${HOME}/.ssh:/home/bridge/.ssh:ro
       - ${HOME}/.config/claude-code-bridge/ssh_config:/etc/ssh/ssh_config:ro
+      # TASK-270 proxy reads/refreshes the ChatGPT OAuth bundle here.
+      # RW so the proxy can persist refreshed tokens; same inode as the
+      # codex-bridge mount so both stay in lockstep.
+      - ${HOME}/.codex/auth.json:/home/bridge/.codex/auth.json
       # Shared agent scripts (bw-secret etc.) — live, no rebuild needed
       - ${HOME}/dev/agent-skills/scripts:/opt/agent-skills/bin:ro
     depends_on:
