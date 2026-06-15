@@ -52,6 +52,22 @@ from typing import Any
 logger = logging.getLogger(__name__)
 
 
+def _effort_from_budget(budget: Any) -> str | None:
+    """Map an Anthropic thinking ``budget_tokens`` to a Responses reasoning
+    effort level. Coarse by design — the two scales don't line up exactly."""
+    try:
+        n = int(budget)
+    except (TypeError, ValueError):
+        return None
+    if n <= 0:
+        return None
+    if n <= 4096:
+        return "low"
+    if n <= 16384:
+        return "medium"
+    return "high"
+
+
 def _flatten_system(system: Any) -> str | None:
     """Anthropic ``system`` can be a string or list of content blocks."""
     if system is None:
@@ -260,6 +276,17 @@ def anthropic_to_responses(body: dict, upstream_model: str) -> dict:
             payload["temperature"] = float(body["temperature"])
         except (TypeError, ValueError):
             pass
+
+    # Anthropic extended-thinking → Responses reasoning. When the SDK enables
+    # thinking (driven by the bot's `effort` setting), forward it as a
+    # reasoning effort so the upstream actually reasons. budget_tokens is a
+    # coarse proxy for effort level. Adapters may override/default this.
+    thinking = body.get("thinking")
+    if isinstance(thinking, dict) and thinking.get("type") == "enabled":
+        budget = thinking.get("budget_tokens")
+        effort = _effort_from_budget(budget)
+        if effort:
+            payload["reasoning"] = {"effort": effort}
 
     if body.get("stream"):
         payload["stream"] = True

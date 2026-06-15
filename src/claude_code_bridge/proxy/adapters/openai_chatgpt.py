@@ -56,6 +56,16 @@ _UNSUPPORTED_PARAMS = ("temperature", "top_p", "max_output_tokens")
 # prompt in practice; this fallback covers the rare system-less request.
 _FALLBACK_INSTRUCTIONS = "You are a helpful coding assistant."
 
+# Reasoning effort for gpt-5.x. The codex backend defaults to effort "none"
+# when ``reasoning`` is omitted, which makes a reasoning model behave badly —
+# no chain of thought at all. The codex CLI itself defaults gpt-5.4 to
+# "high" (see ~/.codex/config.toml `model_reasoning_effort`); match that.
+# Override per-deploy with OPENAI_CHATGPT_REASONING_EFFORT. Valid backend
+# values: minimal | low | medium | high.
+DEFAULT_REASONING_EFFORT = "high"
+REASONING_EFFORT_ENV = "OPENAI_CHATGPT_REASONING_EFFORT"
+_VALID_EFFORT = {"minimal", "low", "medium", "high"}
+
 
 def _jwt_exp(token: str) -> float | None:
     """Best-effort decode of a JWT's ``exp`` claim (seconds since epoch).
@@ -263,4 +273,13 @@ class OpenAIChatGPTAdapter(ProviderAdapter):
         responses_body["store"] = False
         if not responses_body.get("instructions"):
             responses_body["instructions"] = _FALLBACK_INSTRUCTIONS
+        # Give the reasoning model an actual reasoning budget. Without this
+        # the backend runs at effort "none" and behaves like a much weaker
+        # model. translate.py may already have set `reasoning` from an
+        # inbound Anthropic `thinking` block — only default when it didn't.
+        if "reasoning" not in responses_body:
+            effort = (os.getenv(REASONING_EFFORT_ENV) or "").strip().lower()
+            if effort not in _VALID_EFFORT:
+                effort = DEFAULT_REASONING_EFFORT
+            responses_body["reasoning"] = {"effort": effort}
         return responses_body
