@@ -13,10 +13,12 @@ OAuth constants (CLIENT_ID, refresh URL, env override) come from
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
 import logging
 import os
 import time
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import ClassVar
@@ -33,11 +35,43 @@ CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann"
 DEFAULT_REFRESH_URL = "https://auth.openai.com/oauth/token"
 REFRESH_URL_ENV = "CODEX_REFRESH_TOKEN_URL_OVERRIDE"
 
-# Responses API base. ChatGPT subscription OAuth tokens authenticate against
-# the standard public API. ``OPENAI_BASE_URL`` matches the codex CLI's env
-# var name so an operator that points codex elsewhere also points the proxy.
-DEFAULT_API_BASE = "https://api.openai.com/v1"
+# Responses API base. ChatGPT *subscription* OAuth tokens do NOT carry the
+# platform ``api.responses.write`` scope, so they 401 against
+# ``api.openai.com/v1/responses``. They DO authenticate against the ChatGPT
+# backend's codex endpoint (the same surface ``codex exec`` uses), which the
+# ``openai`` client reaches by appending ``/responses`` to this base.
+# Verified empirically against a live ``codex login`` bundle (TASK-270).
+# ``OPENAI_BASE_URL`` overrides for operators who proxy elsewhere.
+DEFAULT_API_BASE = "https://chatgpt.com/backend-api/codex"
 API_BASE_ENV = "OPENAI_BASE_URL"
+
+# Params the ChatGPT codex backend rejects with HTTP 400 "Unsupported
+# parameter" even though the standard Responses API accepts them. The Claude
+# Agent SDK always sends ``max_tokens`` (→ ``max_output_tokens``) and may send
+# ``temperature``; both must be dropped for this upstream. (Verified live.)
+_UNSUPPORTED_PARAMS = ("temperature", "top_p", "max_output_tokens")
+
+# The codex backend hard-requires a non-empty ``instructions`` field and
+# ``stream: true``. The Claude SDK populates ``instructions`` from its system
+# prompt in practice; this fallback covers the rare system-less request.
+_FALLBACK_INSTRUCTIONS = "You are a helpful coding assistant."
+
+
+def _jwt_exp(token: str) -> float | None:
+    """Best-effort decode of a JWT's ``exp`` claim (seconds since epoch).
+
+    Returns None if the token isn't a decodable JWT. We only read the
+    unverified payload to schedule refresh — never to make a trust
+    decision, so skipping signature verification is fine here.
+    """
+    try:
+        payload_b64 = token.split(".")[1]
+        payload_b64 += "=" * (-len(payload_b64) % 4)
+        claims = json.loads(base64.urlsafe_b64decode(payload_b64))
+        exp = claims.get("exp")
+        return float(exp) if exp is not None else None
+    except Exception:  # noqa: BLE001 — any malformed token → "unknown expiry"
+        return None
 
 # OAuth bundle location. ``CODEX_AUTH_PATH`` matches the existing codex
 # bridge's env var so a single override moves both.
@@ -64,6 +98,10 @@ class OpenAIChatGPTAdapter(ProviderAdapter):
     def __init__(self, auth_path: Path | None = None) -> None:
         self.auth_path = auth_path or DEFAULT_AUTH_PATH
         self._cached_bundle: dict | None = None
+        self._account_id: str | None = None
+        # Stable per-process session id, mirroring codex CLI telemetry. Not
+        # security-relevant; the chatgpt-account-id header is what authorizes.
+        self._session_id = uuid.uuid4().hex
         # Serializes refresh attempts so a burst of concurrent requests
         # doesn't trigger N parallel refreshes.
         self._refresh_lock = asyncio.Lock()
@@ -84,10 +122,26 @@ class OpenAIChatGPTAdapter(ProviderAdapter):
             ) from e
 
     def _save_bundle(self, bundle: dict) -> None:
-        # tmp + atomic rename so a crash mid-write doesn't brick auth.json.
+        text = json.dumps(bundle, indent=2)
+        # Prefer tmp + atomic rename so a crash mid-write doesn't brick
+        # auth.json. BUT auth.json is typically a *bind-mounted single file*
+        # in the bridge container, and rename() over a bind-mount target
+        # fails with EBUSY ([Errno 16] Device or resource busy). Fall back to
+        # an in-place rewrite, which keeps the bind-mount's shared inode so
+        # the host's ~/.codex/auth.json (and the codex CLI) see the update.
         tmp = self.auth_path.with_suffix(self.auth_path.suffix + ".tmp")
-        tmp.write_text(json.dumps(bundle, indent=2))
-        tmp.replace(self.auth_path)
+        try:
+            tmp.write_text(text)
+            os.replace(tmp, self.auth_path)
+        except OSError:
+            # Clean up the tmp file, then rewrite the bind-mounted target
+            # in place. Not torn-write-atomic, but the only option for a
+            # bind-mounted file and the write is a single small payload.
+            try:
+                tmp.unlink()
+            except OSError:
+                pass
+            self.auth_path.write_text(text)
         # auth.json owns secrets; keep 600 perms even if the codex CLI does
         # the same.
         try:
@@ -97,6 +151,20 @@ class OpenAIChatGPTAdapter(ProviderAdapter):
 
     # ── refresh ───────────────────────────────────────────────────────────
     def _expires_soon(self, bundle: dict) -> bool:
+        """True when the access_token needs refreshing.
+
+        Source of truth is the access_token JWT's own ``exp`` claim —
+        ChatGPT subscription tokens are long-lived (days), so the old
+        ``last_refresh`` + fixed-TTL heuristic forced a needless refresh on
+        every cold start (which rotates the refresh_token — risky if the
+        write-back ever fails). Only fall back to the heuristic when the
+        token can't be decoded.
+        """
+        token = (bundle.get("tokens") or {}).get("access_token") or ""
+        exp = _jwt_exp(token)
+        if exp is not None:
+            return (exp - time.time()) < REFRESH_SAFETY_SECONDS
+
         last_refresh = bundle.get("last_refresh")
         if not last_refresh:
             return True
@@ -143,20 +211,56 @@ class OpenAIChatGPTAdapter(ProviderAdapter):
     # ── ProviderAdapter ───────────────────────────────────────────────────
     async def authorize(self) -> tuple[str, str]:
         async with self._refresh_lock:
-            bundle = self._cached_bundle or self._load_bundle()
+            # Always re-read from disk: the file is tiny and local, and the
+            # codex CLI (or a fresh `codex login`) on the host may have
+            # rotated the tokens since we last looked. Cheaper than serving a
+            # stale token and eating a 401 round-trip.
+            bundle = self._load_bundle()
             if self._expires_soon(bundle):
                 bundle = await self._refresh(bundle)
-            else:
-                # Re-read the file periodically so a fresh `codex login`
-                # on the host is picked up without a daemon restart.
-                self._cached_bundle = bundle
             self._cached_bundle = bundle
 
-        access_token = (bundle.get("tokens") or {}).get("access_token")
+        tokens = bundle.get("tokens") or {}
+        access_token = tokens.get("access_token")
         if not access_token:
             raise RuntimeError(
                 f"ChatGPT OAuth bundle at {self.auth_path} has no access_token "
                 f"after refresh."
             )
+        # The codex backend authorizes per ChatGPT account, not just the
+        # bearer — the account-id header is required (see extra_headers()).
+        self._account_id = tokens.get("account_id")
         base_url = os.getenv(API_BASE_ENV) or DEFAULT_API_BASE
         return access_token, base_url
+
+    # ── upstream quirks (ChatGPT codex backend) ───────────────────────────
+    def extra_headers(self) -> dict[str, str]:
+        """Headers the ChatGPT codex backend requires/expects.
+
+        ``chatgpt-account-id`` is mandatory — without it the backend 401s
+        even with a valid bearer. The others mirror the codex CLI so we look
+        like a known-good client.
+        """
+        headers = {
+            "OpenAI-Beta": "responses=experimental",
+            "originator": "codex_cli_rs",
+            "session_id": self._session_id,
+        }
+        if self._account_id:
+            headers["chatgpt-account-id"] = self._account_id
+        return headers
+
+    def prepare_request(self, responses_body: dict) -> dict:
+        """Adapt the translated Responses body to the codex backend's quirks.
+
+        - strip params it rejects with 400 ``temperature``/``max_output_tokens``
+        - force ``stream``/``store`` (it requires stream=true, store=false)
+        - guarantee a non-empty ``instructions`` (it requires the field)
+        """
+        for key in _UNSUPPORTED_PARAMS:
+            responses_body.pop(key, None)
+        responses_body["stream"] = True
+        responses_body["store"] = False
+        if not responses_body.get("instructions"):
+            responses_body["instructions"] = _FALLBACK_INSTRUCTIONS
+        return responses_body

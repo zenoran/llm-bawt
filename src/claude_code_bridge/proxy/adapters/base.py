@@ -37,6 +37,23 @@ class ProviderAdapter(ABC):
         ``openai`` client.
         """
 
+    def extra_headers(self) -> dict[str, str]:
+        """Per-request headers merged into the upstream HTTP client.
+
+        Default: none. Override for providers that need extra auth/routing
+        headers (e.g. the ChatGPT backend's ``chatgpt-account-id``).
+        """
+        return {}
+
+    def prepare_request(self, responses_body: dict) -> dict:
+        """Last-chance hook to adapt the translated Responses body to an
+        upstream's quirks (strip unsupported params, force defaults, etc.).
+
+        Default: identity. Override only when an upstream rejects standard
+        Responses fields. Mutates and returns the same dict for convenience.
+        """
+        return responses_body
+
     async def call(
         self,
         anthropic_body: dict,
@@ -51,11 +68,13 @@ class ProviderAdapter(ABC):
         from .. import translate
 
         bearer, base_url = await self.authorize()
-        client = AsyncOpenAI(api_key=bearer, base_url=base_url)
+        headers = self.extra_headers() or None
+        client = AsyncOpenAI(api_key=bearer, base_url=base_url, default_headers=headers)
         try:
             responses_body = translate.anthropic_to_responses(
                 anthropic_body, upstream_model
             )
+            responses_body = self.prepare_request(responses_body)
             logger.debug(
                 "Proxy → Responses API model=%s tools=%d input_items=%d",
                 responses_body.get("model"),
