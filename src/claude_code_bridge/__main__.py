@@ -13,6 +13,7 @@ import sys
 from agent_bridge.publisher import RedisPublisher
 
 from .bridge import ClaudeCodeBridge
+from .proxy import ProxyServer
 
 
 async def _health_server(bridge: ClaudeCodeBridge, publisher: RedisPublisher, port: int) -> None:
@@ -63,7 +64,11 @@ def main() -> None:
         logger.error("Cannot connect to Redis at %s", redis_url)
         sys.exit(1)
 
-    # Check for OAuth token (env var or credentials file)
+    # Check for OAuth token (env var or credentials file). The Anthropic
+    # subscription token is still required for the default (api.anthropic.com)
+    # path; the proxy path uses ChatGPT OAuth from ~/.codex/auth.json but
+    # the SDK still needs *some* ANTHROPIC_AUTH_TOKEN to send (the proxy
+    # ignores its value).
     from .bridge import _get_fresh_oauth_token
     if not _get_fresh_oauth_token():
         logger.error(
@@ -94,6 +99,18 @@ def main() -> None:
 
     health_port = int(os.getenv("CLAUDE_CODE_BRIDGE_HEALTH_PORT", "8681"))
 
+    # Anthropic-compatible proxy for non-Anthropic providers (OpenAI ChatGPT
+    # subscription, future Grok/Kimi/etc.). Bound 127.0.0.1 only; ephemeral
+    # port by default. Set CLAUDE_CODE_BRIDGE_PROXY_PORT to pin (e.g. 8691)
+    # if you want to curl-test it.
+    proxy_port = int(os.getenv("CLAUDE_CODE_BRIDGE_PROXY_PORT", "0"))
+    proxy_disabled = os.getenv("CLAUDE_CODE_BRIDGE_PROXY_DISABLED", "").lower() in (
+        "1", "true", "yes",
+    )
+    proxy_server: ProxyServer | None = None
+    if not proxy_disabled:
+        proxy_server = ProxyServer(host="127.0.0.1", port=proxy_port)
+
     logger.info(
         "Starting Claude Code bridge (backend=%s)",
         os.getenv("CLAUDE_CODE_BACKEND_NAME", "claude-code"),
@@ -106,6 +123,14 @@ def main() -> None:
         for sig in (signal.SIGINT, signal.SIGTERM):
             loop.add_signal_handler(sig, shutdown_event.set)
 
+        # Start the proxy first so its base_url is available when the bridge
+        # spawns the SDK subprocess. Start failure is fatal — no point
+        # running a bridge that can't route to its proxy when needed.
+        if proxy_server is not None:
+            await proxy_server.start()
+            bridge.set_proxy_base_url(proxy_server.base_url)
+            logger.info("Anthropic-compat proxy active at %s", proxy_server.base_url)
+
         health_task = asyncio.create_task(
             _health_server(bridge, publisher, health_port)
         )
@@ -117,6 +142,8 @@ def main() -> None:
         bridge_task.cancel()
         health_task.cancel()
         await bridge.stop()
+        if proxy_server is not None:
+            await proxy_server.stop()
 
     try:
         asyncio.run(_run())

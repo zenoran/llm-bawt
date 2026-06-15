@@ -204,6 +204,34 @@ class ClaudeCodeBridge:
         # no in-process Future to hold, no chat.tool_result round-trip.
         # Load MCP servers from settings file
         self._mcp_servers = self._load_mcp_servers()
+        # TASK-270: Anthropic-compat proxy URL set by __main__ after the
+        # ProxyServer binds. None when proxy is disabled. When set and the
+        # request's model starts with a known provider prefix (see
+        # ``proxy.adapters.REGISTRY``), the SDK subprocess is spawned with
+        # ANTHROPIC_BASE_URL pointing here so its outbound /v1/messages
+        # call lands on the proxy instead of api.anthropic.com.
+        self._proxy_base_url: str | None = None
+
+    def set_proxy_base_url(self, url: str) -> None:
+        """Wire up the in-process Anthropic-compat proxy. Called by __main__
+        after ``ProxyServer.start()`` binds its ephemeral port."""
+        self._proxy_base_url = url
+        logger.info("Bridge proxy base_url set: %s", url)
+
+    @staticmethod
+    def _model_provider_prefix(model: str) -> str | None:
+        """Return the provider prefix if ``model`` is a proxy-routed name
+        (``"<provider>/<upstream>"`` where provider is registered), else None."""
+        if not model or "/" not in model:
+            return None
+        provider, _, upstream = model.partition("/")
+        if not provider or not upstream:
+            return None
+        # Local import keeps the proxy subpackage off the bridge's import
+        # graph until needed (it pulls in openai, fastapi, etc.).
+        from .proxy.adapters import REGISTRY
+
+        return provider if provider in REGISTRY else None
 
     def _load_mcp_servers(self) -> dict:
         """Load MCP server configs from ~/.claude/settings.json."""
@@ -700,11 +728,36 @@ class ClaudeCodeBridge:
                         stderr_lines.append(line)
                         logger.warning("CLI stderr: %s", line)
 
-                    # Read fresh token on each request (auto-refresh from credentials file)
-                    fresh_token = _get_fresh_oauth_token(force_refresh=auth_retry_attempted)
+                    # TASK-270: route this turn to the in-process Anthropic-compat
+                    # proxy when the model name carries a known provider prefix
+                    # (e.g. "openai_chatgpt/gpt-5.4"). The proxy reads ChatGPT
+                    # OAuth from ~/.codex/auth.json and forwards to OpenAI's
+                    # Responses API. Otherwise fall through to Anthropic-direct.
+                    use_proxy = (
+                        self._proxy_base_url is not None
+                        and self._model_provider_prefix(model) is not None
+                    )
+
                     sdk_env = {}
-                    if fresh_token:
-                        sdk_env["CLAUDE_CODE_OAUTH_TOKEN"] = fresh_token
+                    if use_proxy:
+                        sdk_env["ANTHROPIC_BASE_URL"] = self._proxy_base_url  # type: ignore[assignment]
+                        # The SDK still requires *some* auth token to send; the
+                        # proxy ignores it. Use a sentinel that obviously isn't
+                        # a real Anthropic key so logs don't confuse anyone.
+                        sdk_env["ANTHROPIC_AUTH_TOKEN"] = "proxy-routed"
+                        # CLAUDE_CODE_OAUTH_TOKEN takes precedence over
+                        # ANTHROPIC_AUTH_TOKEN inside the CLI; clear it so
+                        # the SDK doesn't fall back to api.anthropic.com.
+                        sdk_env["CLAUDE_CODE_OAUTH_TOKEN"] = ""
+                        logger.debug(
+                            "Routing turn through proxy: model=%s base=%s",
+                            model, self._proxy_base_url,
+                        )
+                    else:
+                        # Read fresh token on each request (auto-refresh from credentials file)
+                        fresh_token = _get_fresh_oauth_token(force_refresh=auth_retry_attempted)
+                        if fresh_token:
+                            sdk_env["CLAUDE_CODE_OAUTH_TOKEN"] = fresh_token
 
                     # Pass `seq` to the can_use_tool factory by reference so it
                     # can keep the AWAIT_TOOL_RESULT event ordered in the same
