@@ -116,7 +116,7 @@ Returns:
 
 ### `tasks_*` / `steps_*` / `projects_*` / `activity_*` — Agent Task System
 
-These tools wrap the agent task REST API (`/api/agents/*` on the BawtHub frontend) so agents can manage work without thinking about HTTP.
+These tools wrap the agent task REST API (`/api/tasks/*` on the BawtHub frontend) so agents can manage work without thinking about HTTP.
 
 | Tool | Purpose |
 |---|---|

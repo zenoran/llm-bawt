@@ -374,7 +374,7 @@ and use the MCP tools above.
 
 
 # ---------------------------------------------------------------------------
-# agents.docs — task system reference doc served at /api/agents/docs
+# agents.docs — task system reference doc served at /api/tasks/docs
 # Required vars: origin, task_section
 #
 # Docs intentionally list both MCP tools (preferred) and HTTP endpoints
@@ -443,18 +443,18 @@ Step types: `PLAN`, `READ_FILE`, `EDIT_FILE`, `CREATE_FILE`,
 
 ## HTTP Endpoints (fallback when MCP is unavailable)
 
-- Tasks list/create:        `GET|POST   {origin}/api/agents/tasks`
-- Single task:              `GET|PATCH|DELETE {origin}/api/agents/tasks/<id>`
-- Task dependencies:        `POST|DELETE {origin}/api/agents/tasks/<id>/dependencies`
+- Tasks list/create:        `GET|POST   {origin}/api/tasks/tasks`
+- Single task:              `GET|PATCH|DELETE {origin}/api/tasks/tasks/<id>`
+- Task dependencies:        `POST|DELETE {origin}/api/tasks/tasks/<id>/dependencies`
                              (body: `depId`)
-- Promote task to project:  `POST       {origin}/api/agents/tasks/<id>/promote`
-- Regenerate task plan:     `POST       {origin}/api/agents/tasks/<id>/regenerate`
-- Steps create:             `POST       {origin}/api/agents/tasks/<id>/steps`
-- Single step:              `PATCH|DELETE {origin}/api/agents/tasks/<id>/steps/<stepId>`
-- Projects list/create:     `GET|POST   {origin}/api/agents/projects`
-- Single project:           `GET|PATCH|DELETE {origin}/api/agents/projects/<id>`
-- Project context:          `GET        {origin}/api/agents/projects/<id>/context`
-- Activity feed:            `GET        {origin}/api/agents/activity`
+- Promote task to project:  `POST       {origin}/api/tasks/tasks/<id>/promote`
+- Regenerate task plan:     `POST       {origin}/api/tasks/tasks/<id>/regenerate`
+- Steps create:             `POST       {origin}/api/tasks/tasks/<id>/steps`
+- Single step:              `PATCH|DELETE {origin}/api/tasks/tasks/<id>/steps/<stepId>`
+- Projects list/create:     `GET|POST   {origin}/api/tasks/projects`
+- Single project:           `GET|PATCH|DELETE {origin}/api/tasks/projects/<id>`
+- Project context:          `GET        {origin}/api/tasks/projects/<id>/context`
+- Activity feed:            `GET        {origin}/api/tasks/activity`
 
 ## Working a Task (Execution Mode)
 

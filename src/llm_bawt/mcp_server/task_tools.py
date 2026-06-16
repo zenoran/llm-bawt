@@ -27,7 +27,7 @@ _BASE_URL = os.getenv(
     "LLM_BAWT_TASK_API_URL",
     "http://echo.lan.zenoran.com",
 )
-_API_PREFIX = "/api/agents"
+_API_PREFIX = "/api/tasks"
 _TIMEOUT = 30.0
 
 
