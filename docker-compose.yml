@@ -245,6 +245,81 @@ services:
       retries: 3
       start_period: 15s
 
+  local-model-bridge:
+    # TASK-276: local GPU inference (gguf via llama-cpp + vLLM) runs here,
+    # OUT of the main app process. A CUDA abort() in local inference calls
+    # abort() on the whole process — isolating it here means it can only kill
+    # this bridge, never the app/MCP/agent sessions. Uses the GPU image
+    # (reuses the app Dockerfile + CUDA build args) since it needs llama_cpp /
+    # vllm / torch; the other bridges run the CPU-only llm-bawt-bridge image.
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        WITH_CUDA: ${WITH_CUDA:-true}
+        CUDA_ARCHS: ${CUDA_ARCHS:-120}
+    image: llm-bawt-local-model-bridge
+    container_name: llm-bawt-local-model-bridge
+    command: ["python", "-m", "local_model_bridge"]
+    # GPU + runtime config mirrors the app service exactly (TASK-278 will
+    # remove GPU from the app service; this bridge keeps it).
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    ipc: host  # Required for vLLM multiprocess engine shared memory
+    security_opt:
+      - apparmor:unconfined  # AppArmor not available on this kernel; nvidia-ctk owns daemon.json
+    env_file:
+      - ./.env
+    environment:
+      - LOCAL_MODEL_BACKEND_NAME=${LOCAL_MODEL_BACKEND_NAME:-local}
+      - LOCAL_MODEL_BRIDGE_LOG_LEVEL=${LOCAL_MODEL_BRIDGE_LOG_LEVEL:-INFO}
+      - LOCAL_MODEL_BRIDGE_HEALTH_PORT=8683
+      - LOCAL_MODEL_BRIDGE_REQUEST_TIMEOUT=${LOCAL_MODEL_BRIDGE_REQUEST_TIMEOUT:-1800}
+      # Load all layers onto the GPU by default (matches the app's prior local
+      # inference behavior).
+      - LLAMA_CPP_N_GPU_LAYERS=-1
+      - LLM_BAWT_API_URL=http://app:8642
+      # Override SERVICE_HOST inherited from .env (which is 0.0.0.0 — the app
+      # container's bind address). From inside a bridge the service is reachable
+      # at the compose service name `app`.
+      - LLM_BAWT_SERVICE_HOST=app
+      - REDIS_URL=redis://redis:6379/0
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+      - "echo.lan.zenoran.com:${ECHO_LAN_HOST_IP:-10.0.0.101}"
+      - "echo:${ECHO_LAN_HOST_IP:-10.0.0.101}"
+    volumes:
+      # Mirror the app service's model-related volumes so the bridge resolves
+      # and downloads the same GGUF/HF artifacts.
+      - ${HOME}/.config/llm-bawt:/root/.config/llm-bawt
+      - ./.logs:/app/.logs
+      # Local models
+      - ${MODELS_PATH:-./models}:/app/models
+      # Share host's GGUF model cache to avoid re-downloads
+      - ${LLM_BAWT_MODEL_CACHE_DIR:-${HOME}/.cache/llm-bawt/models}:/root/.cache/llm-bawt/models
+      # HuggingFace cache (HF_HOME) for GGUF / vLLM model downloads
+      - ${HF_HOME:-${HOME}/.cache/huggingface}:/root/.cache/huggingface
+    depends_on:
+      redis:
+        condition: service_healthy
+      app:
+        condition: service_started
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8683/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      # Model loads are slow (GGUF download + CUDA graph compile can take
+      # minutes); give the bridge a generous grace period before the
+      # healthcheck starts failing the container.
+      start_period: 180s
+
   playwright-mcp:
     image: mcp/playwright
     container_name: llm-bawt-playwright-mcp

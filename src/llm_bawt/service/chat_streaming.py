@@ -809,7 +809,20 @@ class ChatStreamingMixin:
         if is_agent_backend:
             bc = getattr(llm_bawt.bot, "agent_backend_config", None) or {}
             backend_name = getattr(llm_bawt.bot, "agent_backend", "")
-            if backend_name in ("claude-code", "codex"):
+            # TASK-276: the "local" backend routes the same way claude-code /
+            # codex do — f"{bot_id}:{user_id}" — so chat.abort RPCs reach the
+            # right active stream on the local-model-bridge.  Fall back to the
+            # client's resolved backend when the bot has no agent_backend set
+            # (local GPU bots are ordinary chat bots whose model_definition was
+            # rewritten to type=agent_backend/backend=local in core.py).
+            client_backend = ""
+            try:
+                client_backend = str(
+                    llm_bawt.client.model_definition.get("backend") or ""
+                ).strip()
+            except Exception:
+                client_backend = ""
+            if backend_name in ("claude-code", "codex") or client_backend == "local":
                 oc_session_key = f"{bot_id}:{user_id}"
             else:
                 oc_session_key = bc.get("session_key")

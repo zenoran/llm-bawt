@@ -14,9 +14,9 @@ from typing import Any
 from rich.json import JSON
 from rich.rule import Rule
 
-from ..clients.base import LLMClient
-from ..models.message import Message
-from ..utils.config import Config
+from llm_bawt.clients.base import LLMClient
+from llm_bawt.models.message import Message
+from llm_bawt.utils.config import Config
 
 # Disable vLLM's multiprocess engine before import — it spawns engine cores in
 # subprocesses via ZMQ/shared memory, which fails in Docker (especially WSL2).
