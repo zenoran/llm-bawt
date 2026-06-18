@@ -19,7 +19,7 @@ from urllib.parse import urlparse
 from ..bots import get_bot, strip_emotes
 from ..utils.config import Config
 from .background_tasks import BackgroundTasksMixin
-from .chat_streaming import ChatStreamingMixin
+from .chat_streaming import ChatStreamingMixin, _LOCAL_GPU_MODEL_TYPES
 from .instance_manager import InstanceManagerMixin
 from .logging import RequestContext, generate_request_id, get_service_logger
 from .schemas import (
@@ -326,10 +326,15 @@ class BackgroundService(
                 return response
 
             try:
-                if model_type in ("openai", "grok", "agent_backend"):
-                    response_text = await loop.run_in_executor(None, _do_query)
-                else:
+                # Only local GPU models serialize on the single-worker executor;
+                # remote APIs (openai/grok/claude-code/agent_backend) use the
+                # default pool. The old allowlist omitted "claude-code", which
+                # serialized all bridge bots on the one GPU thread. See
+                # _LOCAL_GPU_MODEL_TYPES in chat_streaming.py.
+                if model_type in _LOCAL_GPU_MODEL_TYPES:
                     response_text = await loop.run_in_executor(self._llm_executor, _do_query)
+                else:
+                    response_text = await loop.run_in_executor(None, _do_query)
             except Exception as e:
                 elapsed_ms = (time.time() - llm_start_time) * 1000
                 self._update_turn_log(
