@@ -108,6 +108,11 @@ class VLLMClient(LLMClient):
         gpu_memory_utilization = self.model_definition.get("gpu_memory_utilization", 0.85)
         enforce_eager = self.model_definition.get("enforce_eager", True)
         enable_prefix_caching = self.model_definition.get("enable_prefix_caching", True)
+        # Cap concurrent sequences. vLLM defaults to 256, which on large-vocab
+        # models (e.g. Gemma 4 has a 256K vocab) blows up the sampler-warmup
+        # logits buffer and OOMs on a 16GB card. We serve one user at a time, so
+        # a small value is plenty. None => let vLLM pick its default.
+        max_num_seqs = self.model_definition.get("max_num_seqs")
 
         # Build vLLM engine parameters
         engine_params = {
@@ -118,6 +123,8 @@ class VLLMClient(LLMClient):
             "enable_prefix_caching": enable_prefix_caching,
             "trust_remote_code": True,  # Always True for community models
         }
+        if max_num_seqs:
+            engine_params["max_num_seqs"] = int(max_num_seqs)
         
         # Add optional parameters if specified
         # Note: Don't pass quantization parameter - let vLLM auto-detect from model config.

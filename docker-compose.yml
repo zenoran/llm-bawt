@@ -283,6 +283,17 @@ services:
       # Load all layers onto the GPU by default (matches the app's prior local
       # inference behavior).
       - LLAMA_CPP_N_GPU_LAYERS=-1
+      # RTX 5080 / Blackwell sm_120: enable the "full" SM120 feature set so
+      # FlashInfer's GEMM/attention kernels work (the "f" suffix). Without this,
+      # vLLM hits "CUDA error: an illegal memory access" on load. See vLLM
+      # issues #30707 / #35566.
+      - FLASHINFER_CUDA_ARCH_LIST=12.0f
+      # sm_120 has no prebuilt FlashInfer sampling kernel and the runtime image
+      # has no C/CUDA toolchain to JIT-compile one (ninja build fails code=127).
+      # Use vLLM's native Torch sampler instead — no compile needed.
+      - VLLM_USE_FLASHINFER_SAMPLER=0
+      # Reduce CUDA allocator fragmentation on the 16GB card (vLLM warmup OOM).
+      - PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
       - LLM_BAWT_API_URL=http://app:8642
       # Override SERVICE_HOST inherited from .env (which is 0.0.0.0 — the app
       # container's bind address). From inside a bridge the service is reachable
