@@ -535,6 +535,33 @@ class BaseLLMBawt(ABC):
                     position=SectionPosition.CUSTOM,
                 )
 
+        # Response-style instruction derived from keywords in the user's message.
+        # Lets the user shape any bot's answer inline without extra config.
+        if prompt:
+            _p = prompt.lower()
+            _style = None
+            if "tldr" in _p:
+                _style = (
+                    "Answer as a tight TL;DR: lead with the one-line bottom line, "
+                    "then a few short bullets. No preamble, no filler."
+                )
+            elif "eli5" in _p:
+                _style = (
+                    "Explain simply, as if to a smart person outside this field. "
+                    "Plain words, concrete analogies, no jargon."
+                )
+            elif "deep dive" in _p or "deepdive" in _p:
+                _style = (
+                    "Go thorough: cover the mechanism, trade-offs, edge cases, and "
+                    "end with a recommendation. Depth over brevity."
+                )
+            if _style:
+                builder.add_section(
+                    "response_style",
+                    _style,
+                    position=SectionPosition.CUSTOM,
+                )
+
         # Build final system message
         system_content = builder.build()
         if system_content:

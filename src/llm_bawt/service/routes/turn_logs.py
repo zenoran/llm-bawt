@@ -90,6 +90,7 @@ def _live_tool_calls(store: TurnLogStore, turn_id: str) -> list[dict]:
             "started_at": row.started_at,
             "ended_at": row.ended_at,
             "duration_ms": row.duration_ms,
+            "text_offset": row.text_offset,
         })
     return out
 

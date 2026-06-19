@@ -100,6 +100,12 @@ class ToolCallRecord(SQLModel, table=True):
     started_at: float | None = Field(default=None, sa_column=Column(Float, nullable=True))
     ended_at: float | None = Field(default=None, sa_column=Column(Float, nullable=True))
     duration_ms: float | None = Field(default=None, sa_column=Column(Float, nullable=True))
+    # Interleave support: number of assistant text characters streamed BEFORE
+    # this tool fired. Lets the frontend split response_text at tool boundaries
+    # and render a fully interleaved transcript (text → tool → text) that
+    # survives a page reload. Null on legacy rows → frontend falls back to the
+    # old "text bubble + activity row" layout for that turn.
+    text_offset: int | None = Field(default=None, sa_column=Column(Integer, nullable=True))
 
 
 class TurnLogStore:
@@ -185,6 +191,11 @@ class TurnLogStore:
                 conn.execute(sa_text(
                     "CREATE INDEX IF NOT EXISTS ix_turn_logs_parent_turn_id"
                     " ON turn_logs (parent_turn_id)"
+                ))
+                # Interleaved-transcript support: char offset of assistant text
+                # emitted before each tool call (see ToolCallRecord.text_offset).
+                conn.execute(sa_text(
+                    "ALTER TABLE tool_call_records ADD COLUMN IF NOT EXISTS text_offset INTEGER"
                 ))
                 conn.commit()
             except Exception:
@@ -510,6 +521,7 @@ class TurnLogStore:
         iteration: int = 1,
         started_at: float | None = None,
         ended_at: float | None = None,
+        text_offset: int | None = None,
     ) -> None:
         """Persist a single tool call record."""
         if self.engine is None:
@@ -529,6 +541,7 @@ class TurnLogStore:
             started_at=started_at,
             ended_at=ended_at,
             duration_ms=duration_ms,
+            text_offset=text_offset,
         )
         try:
             with Session(self.engine) as session:

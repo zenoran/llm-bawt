@@ -83,11 +83,23 @@ class HistoryManager:
 
     def load_history(self, since_minutes: int | None = None):
         self.messages = []
-        
+
+        # Conversation offset marker (moved forward by the `/new` command).
+        # Raw messages older than the marker are dropped from the live context;
+        # summaries + long-term memory are unaffected. None = no offset set.
+        after_timestamp = self._setting("conversation_offset", None)
+        try:
+            after_timestamp = float(after_timestamp) if after_timestamp is not None else None
+        except (TypeError, ValueError):
+            after_timestamp = None
+
         # Use PostgreSQL backend if available
         if self._db_backend:
             try:
-                self.messages = self._db_backend.get_messages(since_minutes=since_minutes)
+                self.messages = self._db_backend.get_messages(
+                    since_minutes=since_minutes,
+                    after_timestamp=after_timestamp,
+                )
                 logger.debug(f"Loaded {len(self.messages)} messages from PostgreSQL short-term memory")
                 return
             except Exception as e:
@@ -115,6 +127,12 @@ class HistoryManager:
             logger.debug(f"Loading history from {since_minutes} seconds ago ({len(self.messages)} messages)")
             cutoff = time.time() - since_minutes
             self.messages = [msg for msg in self.messages if msg.timestamp >= cutoff]
+        if after_timestamp is not None and self.messages:
+            # Honor the /new conversation offset; always keep summary rows.
+            self.messages = [
+                msg for msg in self.messages
+                if msg.role == "summary" or msg.timestamp >= after_timestamp
+            ]
 
     def save_history(self):
         """Persist message history to the history file."""

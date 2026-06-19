@@ -224,6 +224,7 @@ async def lifespan(app):
                             arguments=event_data.get("arguments"),
                             iteration=event_data.get("iteration", 1),
                             started_at=event_data.get("ts"),
+                            text_offset=event_data.get("text_offset"),
                         )
                     elif event_type == "tool_end":
                         call_id = event_data.get("call_id")
