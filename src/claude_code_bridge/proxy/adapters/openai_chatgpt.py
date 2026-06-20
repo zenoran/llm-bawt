@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import hashlib
 import json
 import logging
 import os
@@ -65,6 +66,28 @@ _FALLBACK_INSTRUCTIONS = "You are a helpful coding assistant."
 DEFAULT_REASONING_EFFORT = "high"
 REASONING_EFFORT_ENV = "OPENAI_CHATGPT_REASONING_EFFORT"
 _VALID_EFFORT = {"minimal", "low", "medium", "high"}
+
+
+def _prompt_cache_key(responses_body: dict) -> str:
+    """Derive a stable per-conversation cache key from the opening prefix.
+
+    The Claude SDK doesn't pass a conversation/thread id through
+    ``/v1/messages``, so for the ChatGPT codex backend we approximate codex
+    CLI's stable thread key by hashing the invariant opening: instructions plus
+    the first user content item. Later history turns are intentionally ignored
+    so the key remains stable across the conversation.
+    """
+    instructions = responses_body.get("instructions") or ""
+    first_user_json = ""
+    for item in responses_body.get("input") or []:
+        if not isinstance(item, dict) or item.get("role") != "user":
+            continue
+        first_user_json = json.dumps(
+            item.get("content") or [], sort_keys=True, separators=(",", ":")
+        )
+        break
+    seed = f"{instructions}\n\n{first_user_json}".encode("utf-8")
+    return hashlib.sha256(seed).hexdigest()
 
 
 def _jwt_exp(token: str) -> float | None:
@@ -273,6 +296,7 @@ class OpenAIChatGPTAdapter(ProviderAdapter):
         responses_body["store"] = False
         if not responses_body.get("instructions"):
             responses_body["instructions"] = _FALLBACK_INSTRUCTIONS
+        responses_body["prompt_cache_key"] = _prompt_cache_key(responses_body)
         # Give the reasoning model an actual reasoning budget. Without this
         # the backend runs at effort "none" and behaves like a much weaker
         # model. translate.py may already have set `reasoning` from an

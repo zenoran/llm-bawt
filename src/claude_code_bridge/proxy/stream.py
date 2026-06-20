@@ -76,7 +76,12 @@ async def responses_to_anthropic_sse(
                 "model": anthropic_model,
                 "stop_reason": None,
                 "stop_sequence": None,
-                "usage": {"input_tokens": 0, "output_tokens": 0},
+                "usage": {
+                    "input_tokens": 0,
+                    "output_tokens": 0,
+                    "cache_creation_input_tokens": 0,
+                    "cache_read_input_tokens": 0,
+                },
             },
         },
     )
@@ -92,6 +97,7 @@ async def responses_to_anthropic_sse(
     stop_reason: str | None = None
     output_tokens = 0
     input_tokens = 0
+    cache_read_input_tokens = 0
 
     try:
         async for event in upstream_stream:
@@ -199,6 +205,12 @@ async def responses_to_anthropic_sse(
                     if usage is not None:
                         output_tokens = getattr(usage, "output_tokens", 0) or output_tokens
                         input_tokens = getattr(usage, "input_tokens", 0) or input_tokens
+                        input_details = getattr(usage, "input_tokens_details", None)
+                        if input_details is not None:
+                            cache_read_input_tokens = (
+                                getattr(input_details, "cached_tokens", 0)
+                                or cache_read_input_tokens
+                            )
                     # Tool-use stop_reason wins over any text-completion code
                     # — Anthropic semantics: if the turn ended because the
                     # model wants to call a tool, that's the only stop_reason
@@ -248,12 +260,18 @@ async def responses_to_anthropic_sse(
         if stop_reason is None:
             stop_reason = "tool_use" if tool_blocks else "end_turn"
 
+        uncached_input_tokens = max((input_tokens or 0) - (cache_read_input_tokens or 0), 0)
         yield _sse(
             "message_delta",
             {
                 "type": "message_delta",
                 "delta": {"stop_reason": stop_reason, "stop_sequence": None},
-                "usage": {"output_tokens": output_tokens or 0},
+                "usage": {
+                    "input_tokens": uncached_input_tokens,
+                    "output_tokens": output_tokens or 0,
+                    "cache_creation_input_tokens": 0,
+                    "cache_read_input_tokens": cache_read_input_tokens or 0,
+                },
             },
         )
         yield _sse(

@@ -21,7 +21,19 @@ Architecture:
   Translated SSE → back to Claude SDK as Anthropic events
 """
 
-from .app import create_app, ProxyServer  # noqa: F401
 from .adapters import REGISTRY, register, lookup  # noqa: F401
 
 __all__ = ["create_app", "ProxyServer", "REGISTRY", "register", "lookup"]
+
+
+def create_app():
+    from .app import create_app as _create_app
+
+    return _create_app()
+
+
+class ProxyServer:
+    def __new__(cls, *args, **kwargs):
+        from .app import ProxyServer as _ProxyServer
+
+        return _ProxyServer(*args, **kwargs)

@@ -47,6 +47,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 from typing import Any
 
 logger = logging.getLogger(__name__)
@@ -85,6 +86,30 @@ def _flatten_system(system: Any) -> str | None:
                     parts.append(text)
         return "\n\n".join(parts) if parts else None
     return None
+
+
+def _split_leading_temporal_context(system_text: str | None) -> tuple[str | None, str | None]:
+    """Move the volatile leading datetime line out of ``instructions``.
+
+    The app injects a first-line ``Current date/time: ...`` system section with
+    minute-level resolution, which busts the Responses API prompt prefix on
+    every turn. Mirror codex CLI: keep ``instructions`` byte-stable and carry
+    the volatile temporal context in the first user input item instead.
+    """
+    if not system_text:
+        return None, None
+    if not system_text.startswith("Current date/time:"):
+        return system_text, None
+    first_line, sep, remainder = system_text.partition("\n")
+    stable = remainder.lstrip("\n") if sep else ""
+    # Coarsen the relocated timestamp to DATE resolution. At minute resolution
+    # it changes every minute, re-busting the input prefix AND the
+    # content-derived prompt_cache_key at each minute boundary — capping cache
+    # hits to ~1-minute windows on long turns. Date resolution keeps the first
+    # input item byte-stable for the whole turn/day so history caches
+    # continuously. Exact time stays available to bots via the `time` tool.
+    temporal = re.sub(r"\s+\d{1,2}:\d{2}\s*(?:AM|PM)\b.*$", "", first_line).rstrip()
+    return stable or None, temporal or None
 
 
 def _user_content_to_responses(content: Any) -> tuple[list[dict], list[dict]]:
@@ -233,8 +258,11 @@ def anthropic_to_responses(body: dict, upstream_model: str) -> dict:
     ``upstream_model`` is the post-prefix model name (e.g. ``gpt-5.4``),
     already split off from the Anthropic ``model`` field by the route.
     """
-    instructions = _flatten_system(body.get("system"))
+    instructions, temporal_prefix = _split_leading_temporal_context(
+        _flatten_system(body.get("system"))
+    )
     input_items: list[dict] = []
+    temporal_prefix_attached = False
 
     for msg in body.get("messages") or []:
         if not isinstance(msg, dict):
@@ -244,6 +272,9 @@ def anthropic_to_responses(body: dict, upstream_model: str) -> dict:
 
         if role == "user":
             parts, tool_results = _user_content_to_responses(content)
+            if temporal_prefix and not temporal_prefix_attached:
+                parts = [{"type": "input_text", "text": temporal_prefix}, *parts]
+                temporal_prefix_attached = True
             if parts:
                 # All parts are input_text/input_image; user content items
                 # take the list directly.
@@ -290,6 +321,15 @@ def anthropic_to_responses(body: dict, upstream_model: str) -> dict:
 
     if body.get("stream"):
         payload["stream"] = True
+
+    if temporal_prefix and not temporal_prefix_attached:
+        input_items.insert(
+            0,
+            {
+                "role": "user",
+                "content": [{"type": "input_text", "text": temporal_prefix}],
+            },
+        )
 
     tools = _tools_to_responses(body.get("tools"))
     if tools:
