@@ -62,6 +62,9 @@ def _normalize_tool_call_details(tool_calls: list[dict] | None) -> list[dict]:
             }
         if item.get("call_id"):
             entry["call_id"] = item["call_id"]
+        # Interleave reconstruction: chars of assistant text before this tool.
+        if item.get("text_offset") is not None:
+            entry["text_offset"] = item["text_offset"]
         # Backend that produced this tool call ("codex", "claude-code",
         # "openclaw"). Persisted so /v1/tool-calls recall can re-route to
         # the frontend's provider-aware renderer registry

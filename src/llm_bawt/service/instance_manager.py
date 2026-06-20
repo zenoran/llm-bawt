@@ -463,6 +463,50 @@ class InstanceManagerMixin:
         model_def = models.get(model_alias, {})
         model_type = model_def.get("type")
 
+        # TASK-276 follow-up: local GPU models (gguf/vllm) run in the standalone
+        # local_model_bridge process now, reached via AgentBackendClient over
+        # Redis — exactly like the chat path (core.py gguf/vllm branch). Before
+        # the bridge existed, background tasks couldn't safely run local CUDA
+        # work off the chat lifecycle, so this factory rejected non-API models;
+        # that quietly no-op'd the background summary/extraction jobs whenever
+        # SUMMARIZATION_MODEL/EXTRACTION_MODEL pointed at a local model (the
+        # default `dolphin-qwen-3b`). Now we route them through the bridge.
+        if model_type in ("gguf", "vllm"):
+            try:
+                from ..clients.agent_backend_client import AgentBackendClient
+
+                bridge_model_definition = {
+                    "type": "agent_backend",
+                    "backend": "local",
+                    # Carry the alias so the bridge resolves the same catalog
+                    # entry via GET /v1/models/definitions/{alias}.
+                    "model_id": model_alias,
+                    "local_model_definition": dict(model_def),
+                }
+                if model_def.get("context_window") is not None:
+                    bridge_model_definition["context_window"] = model_def["context_window"]
+                if model_def.get("max_tokens") is not None:
+                    bridge_model_definition["max_tokens"] = model_def["max_tokens"]
+
+                client = AgentBackendClient(
+                    backend_name="local",
+                    config=self.config,
+                    # Fixed, isolated identity — background work is stateless and
+                    # shared across bots; the model is fixed by model_id above.
+                    bot_config={"bot_id": "background", "user_id": "system"},
+                    model_definition=bridge_model_definition,
+                )
+                self._bg_client = client
+                self._bg_client_model = model_alias
+                log.info("Background client ready: %s (local bridge)", model_alias)
+                return client, model_alias
+            except Exception as e:
+                log.error(
+                    "Failed to create local background client for '%s': %s",
+                    model_alias, e,
+                )
+                return None, None
+
         if model_type not in ("openai", "grok"):
             if preferred:
                 log.warning(

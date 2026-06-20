@@ -99,6 +99,23 @@ class ServiceLLMBawt(BaseLLMBawt):
                 ):
                     self.client._bot_config["model"] = model_def["model_id"]
 
+            # TASK-276: local GPU models are ordinary chat bots whose
+            # model_definition was rewritten to type=agent_backend/backend=local
+            # in _initialize_client.  The routing key the local-model-bridge
+            # needs is the catalog ALIAS (it re-resolves repo_id/filename via
+            # /v1/models).  The block above only fires for true agent bots
+            # (agent_backend set), so set the alias here for the local case —
+            # and forward the nested original definition as a resolution
+            # fallback for the bridge.
+            client_def = getattr(self.client, "model_definition", {}) or {}
+            if str(client_def.get("backend") or "").strip() == "local":
+                self.client._bot_config["model"] = (
+                    client_def.get("model_id") or self.resolved_model_alias
+                )
+                local_def = client_def.get("local_model_definition")
+                if isinstance(local_def, dict):
+                    self.client._bot_config["local_model_definition"] = local_def
+
     def _init_history(self):
         """Ensure history always persists to PostgreSQL, even in local_mode.
 
@@ -242,77 +259,56 @@ class ServiceLLMBawt(BaseLLMBawt):
             slog.model_loaded(self.resolved_model_alias, model_type, load_time_ms)
             return client
         
-        elif model_type == "gguf":
-            if not is_llama_cpp_available():
-                raise ImportError(
-                    "llama-cpp-python is required for GGUF models. "
-                    "Install with: pip install llama-cpp-python"
-                )
-            from ..clients.llama_cpp_client import LlamaCppClient
-            from ..gguf_handler import get_or_download_gguf_model
-            
-            repo_id = self.model_definition.get("repo_id")
-            filename = self.model_definition.get("filename")
-            if not repo_id or not filename:
-                raise ValueError(
-                    f"Missing 'repo_id' or 'filename' in GGUF definition for "
-                    f"'{self.resolved_model_alias}'"
-                )
-            
-            # Download model if needed
-            model_path = get_or_download_gguf_model(repo_id, filename, self.config)
-            if not model_path:
-                raise FileNotFoundError(
-                    f"Could not download GGUF model: {repo_id}/{filename}"
-                )
-            
-            # Check if this GGUF should be run through vLLM instead of llama-cpp
-            backend = self.model_definition.get("backend", "llama-cpp")
-            if backend == "vllm":
-                from ..utils.config import is_vllm_available
-                if not is_vllm_available():
-                    raise ImportError(
-                        "vllm is required for backend: vllm. "
-                        "Install with: pip install vllm"
-                    )
-                from ..clients.vllm_client import VLLMClient
-                
-                client = VLLMClient(
-                    str(model_path),  # Pass local GGUF path to vLLM
-                    config=self.config,
-                    model_definition=self.model_definition,
-                )
-                load_time_ms = (time.perf_counter() - start_time) * 1000
-                slog.model_loaded(self.resolved_model_alias, "gguf-vllm", load_time_ms)
-                return client
-            
-            # Get optional chat_format from model definition (for models like MythoMax)
-            chat_format = self.model_definition.get("chat_format")
-            client = LlamaCppClient(model_path, config=self.config, chat_format=chat_format, model_definition=self.model_definition)
-            load_time_ms = (time.perf_counter() - start_time) * 1000
-            slog.model_loaded(self.resolved_model_alias, model_type, load_time_ms)
-            return client
-        
-        elif model_type == "vllm":
-            from ..utils.config import is_vllm_available
-            if not is_vllm_available():
-                raise ImportError(
-                    "vllm is required for vLLM models. "
-                    "Install with: pip install vllm"
-                )
-            from ..clients.vllm_client import VLLMClient
-            
-            # model_id can be HuggingFace model ID or GGUF path (for backend: vllm)
-            model_id = self.model_definition.get("model_id", self.resolved_model_alias)
-            client = VLLMClient(
-                model_id,
+        elif model_type in ("gguf", "vllm"):
+            # TASK-276: local GPU inference (gguf via llama-cpp + vLLM) no
+            # longer runs in this process.  A CUDA abort() in local inference
+            # used to take down the whole app/MCP/agent session host; it now
+            # runs in the standalone `local_model_bridge` process and talks
+            # over Redis like the codex / claude-code bridges.
+            #
+            # We DON'T construct LlamaCppClient/VLLMClient here anymore — those
+            # modules (and their heavy llama_cpp/vllm/torch deps) live in the
+            # bridge package.  Instead we hand back an AgentBackendClient
+            # routed to the "local" backend.  The TOP-LEVEL type must be
+            # "agent_backend" so the executor/streaming branches treat it as a
+            # remote bridge call (not the in-process _llm_executor path).  The
+            # original local fields are preserved nested under
+            # ``local_model_definition`` so the bridge can still resolve them;
+            # the bridge ALSO re-resolves the alias against /v1/models, so this
+            # is belt-and-suspenders.
+            from ..clients.agent_backend_client import AgentBackendClient
+
+            bot_config = {
+                "bot_id": self.bot_id,
+                "user_id": self.user_id,
+            }
+            bridge_model_definition = {
+                "type": "agent_backend",
+                "backend": "local",
+                # Carry the alias through so the bridge resolves the same
+                # catalog entry the app saw.
+                "model_id": self.resolved_model_alias,
+                # Preserve the original local model fields verbatim for the
+                # bridge (and for any app-side introspection).
+                "local_model_definition": dict(self.model_definition),
+            }
+            # Surface context_window / max_tokens at the top level too so the
+            # base LLMClient's effective_* helpers keep working app-side.
+            if self.model_definition.get("context_window") is not None:
+                bridge_model_definition["context_window"] = self.model_definition["context_window"]
+            if self.model_definition.get("max_tokens") is not None:
+                bridge_model_definition["max_tokens"] = self.model_definition["max_tokens"]
+
+            client = AgentBackendClient(
+                backend_name="local",
                 config=self.config,
-                model_definition=self.model_definition,
+                bot_config=bot_config,
+                model_definition=bridge_model_definition,
             )
             load_time_ms = (time.perf_counter() - start_time) * 1000
-            slog.model_loaded(self.resolved_model_alias, model_type, load_time_ms)
+            slog.model_loaded(self.resolved_model_alias, "agent_backend", load_time_ms)
             return client
-        
+
         elif model_type in ("agent_backend", "claude-code"):
             from ..bot_types import agent_backend_for_model_def
             from ..clients.agent_backend_client import AgentBackendClient

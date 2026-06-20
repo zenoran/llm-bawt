@@ -35,6 +35,41 @@ _LOCAL_GPU_MODEL_TYPES = frozenset({"gguf", "vllm", "llamacpp"})
 class ChatStreamingMixin:
     """Mixin providing streaming chat completions for BackgroundService."""
 
+    def _set_conversation_offset(self, llm_bawt, bot_id: str, ts: float) -> None:
+        """Move the per-bot conversation offset marker to ``ts`` (unix seconds).
+
+        Backs the chat-bot ``/new`` command. Persists the marker in
+        runtime_settings (bot scope), then forces the cached instance to pick
+        it up immediately: invalidates the settings cache (so the new value is
+        read), invalidates the history cache (so the next turn reloads with the
+        offset applied), and trims the in-memory transcript right now so even a
+        sub-TTL follow-up starts clean. Summaries are always retained.
+        """
+        slug = (bot_id or "").strip().lower()
+        try:
+            llm_bawt.settings.store.set_value("bot", slug, "conversation_offset", float(ts))
+            # Resolver caches the whole bot-scope dict for a few seconds; reset
+            # so the freshly written marker is visible on the next resolve().
+            try:
+                llm_bawt.settings._cache_loaded_at = 0.0
+            except Exception:
+                pass
+            inv = getattr(llm_bawt, "invalidate_history_cache", None)
+            if callable(inv):
+                inv()
+            # Immediate effect on the live in-memory transcript.
+            try:
+                hm = llm_bawt.history_manager
+                hm.messages = [
+                    m for m in hm.messages
+                    if getattr(m, "role", "") == "summary" or getattr(m, "timestamp", 0.0) >= float(ts)
+                ]
+            except Exception:
+                pass
+            log.info("Conversation offset moved for bot=%s -> %.3f (/new)", slug, float(ts))
+        except Exception as e:
+            log.error("Failed to set conversation offset for bot=%s: %s", slug, e)
+
     def _is_openclaw_bot(self, model_alias: str) -> bool:
         """Check if this model alias maps to an openclaw agent backend."""
         model_def = self.config.defined_models.get("models", {}).get(model_alias, {})
@@ -790,6 +825,35 @@ class ChatStreamingMixin:
         # request streams independently.  For native models we cancel the
         # previous generation so only the latest request runs.
         is_agent_backend = llm_bawt.client.model_definition.get("type") in ("agent_backend", "claude-code")
+
+        # ---- /new command for CHAT bots --------------------------------
+        # Agent bots already handle /new at the bridge (clears the SDK
+        # session). Chat bots have no such concept, so /new here moves a
+        # per-bot "conversation offset" marker to now: prior raw messages
+        # drop out of the live context, but summaries + long-term memory are
+        # kept (see HistoryManager/get_messages). Nothing is deleted — it's a
+        # pointer move, and the dropped transcript still gets summarized by
+        # the background job and reappears as a summary.
+        if not is_agent_backend:
+            _stripped = (user_prompt or "").lstrip()
+            _low = _stripped.lower()
+            if _low == "/new" or _low.startswith("/new ") or _low.startswith("/new\n"):
+                self._set_conversation_offset(llm_bawt, bot_id, time.time())
+                remainder = _stripped[len("/new"):].strip()
+                if not remainder:
+                    confirm = (
+                        "Fresh start. I've set down the recent back-and-forth — "
+                        "I still keep the longer-term summaries and what I know "
+                        "about you, just not this last thread. What's on your mind?"
+                    )
+                    yield f"data: {json.dumps({'id': response_id, 'object': 'chat.completion.chunk', 'created': created, 'model': model_alias, 'choices': [{'index': 0, 'delta': {'role': 'assistant', 'content': confirm}, 'finish_reason': None}]})}\n\n"
+                    yield f"data: {json.dumps({'id': response_id, 'object': 'chat.completion.chunk', 'created': created, 'model': model_alias, 'choices': [{'index': 0, 'delta': {}, 'finish_reason': 'stop'}]})}\n\n"
+                    yield "data: [DONE]\n\n"
+                    return
+                # `/new <message>`: start fresh, then answer the message in the
+                # clean context.
+                user_prompt = remainder
+
         if is_agent_backend:
             cancel_event = threading.Event()
             done_event = threading.Event()
@@ -816,7 +880,20 @@ class ChatStreamingMixin:
         if is_agent_backend:
             bc = getattr(llm_bawt.bot, "agent_backend_config", None) or {}
             backend_name = getattr(llm_bawt.bot, "agent_backend", "")
-            if backend_name in ("claude-code", "codex"):
+            # TASK-276: the "local" backend routes the same way claude-code /
+            # codex do — f"{bot_id}:{user_id}" — so chat.abort RPCs reach the
+            # right active stream on the local-model-bridge.  Fall back to the
+            # client's resolved backend when the bot has no agent_backend set
+            # (local GPU bots are ordinary chat bots whose model_definition was
+            # rewritten to type=agent_backend/backend=local in core.py).
+            client_backend = ""
+            try:
+                client_backend = str(
+                    llm_bawt.client.model_definition.get("backend") or ""
+                ).strip()
+            except Exception:
+                client_backend = ""
+            if backend_name in ("claude-code", "codex") or client_backend == "local":
                 oc_session_key = f"{bot_id}:{user_id}"
             else:
                 oc_session_key = bc.get("session_key")
@@ -1290,6 +1367,14 @@ class ChatStreamingMixin:
                 def _intercept_tool_events(inner):
                     _saw_tool = False  # Track tool→content transitions
                     _saw_text = False  # Track whether any text has been yielded
+                    # Cumulative count of assistant text chars yielded so far.
+                    # Stamped onto each tool_call as text_offset so the frontend
+                    # can split response_text at tool boundaries and render an
+                    # interleaved transcript (text → tool → text) that survives
+                    # reload. MUST match what consume_stream_chunks accumulates
+                    # into full_response_holder, so count EVERY str yielded
+                    # (including the injected "\n\n" breaks below).
+                    _text_chars = [0]
 
                     for item in inner:
                         # Capture agent_request_id on first yielded item
@@ -1309,6 +1394,7 @@ class ChatStreamingMixin:
                         # stream, ensuring paragraph breaks survive reload.
                         if isinstance(item, str) and item.strip():
                             if _saw_tool and _saw_text:
+                                _text_chars[0] += 2
                                 yield "\n\n"
                             _saw_tool = False
                             _saw_text = True
@@ -1341,6 +1427,9 @@ class ChatStreamingMixin:
                                     'tool': item.get('name', 'unknown'),
                                     'parameters': item.get('arguments', {}),
                                     'call_id': cid,
+                                    # Chars of assistant text before this tool —
+                                    # drives interleaved-transcript reconstruction.
+                                    'text_offset': _text_chars[0],
                                     # Persist the originating backend so when the
                                     # turn is recalled from tool_calls_json, the
                                     # frontend's (provider, tool_name) renderer
@@ -1366,6 +1455,7 @@ class ChatStreamingMixin:
                                     "iteration": 1,
                                     "provider": item.get("provider"),
                                     "ts": time.time(),
+                                    "text_offset": _text_chars[0],
                                 })
                             elif evt == "tool_result":
                                 # Pair tool_result with its in-flight tool_call.
@@ -1405,6 +1495,8 @@ class ChatStreamingMixin:
                                     if _td.get("call_id") == _end_cid:
                                         _td["result"] = str(item.get("result", ""))[:2000]
                                         break
+                        if isinstance(item, str):
+                            _text_chars[0] += len(item)
                         yield item
 
                 # Stream chunks to queue

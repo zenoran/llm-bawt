@@ -78,6 +78,11 @@ FROM nvidia/cuda:12.9.1-runtime-ubuntu24.04 AS runtime
 ENV DEBIAN_FRONTEND=noninteractive
 
 # Install runtime dependencies
+# NOTE: gcc/g++ are required at RUNTIME by Triton/FlashInfer, which JIT-compile
+# CUDA kernels on first use. Gemma 4 on vLLM forces the TRITON_ATTN backend
+# (heterogeneous head dims), so without a C compiler the model fails to load
+# with "Failed to find C compiler". The CUDA toolkit (nvcc/ptxas) comes from the
+# pip nvidia-* wheels; gcc is the missing host compiler.
 RUN apt-get update && apt-get install -y \
     python3 \
     libpq5 \
@@ -85,6 +90,9 @@ RUN apt-get update && apt-get install -y \
     curl \
     openssh-client \
     tzdata \
+    gcc \
+    g++ \
+    python3-dev \
     && rm -rf /var/lib/apt/lists/*
 
 # Install uv

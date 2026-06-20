@@ -9,9 +9,9 @@ from rich.markdown import Markdown
 from rich.rule import Rule
 from rich.json import JSON
 
-from ..clients.base import LLMClient
-from ..utils.config import Config # Keep for type hinting
-from ..models.message import Message
+from llm_bawt.clients.base import LLMClient
+from llm_bawt.utils.config import Config # Keep for type hinting
+from llm_bawt.models.message import Message
 
 try:
     from llama_cpp import Llama
@@ -40,7 +40,7 @@ class LlamaCppClient(LLMClient):
 
     def _load_model(self):
         """Loads the GGUF model, suppressing C++ library stderr."""
-        from ..utils.vram import auto_size_context_window
+        from llm_bawt.utils.vram import auto_size_context_window
 
         if self.config.VERBOSE:
             self.console.print(f"Loading GGUF model: [bold yellow]{self.model_path}[/bold yellow]...")

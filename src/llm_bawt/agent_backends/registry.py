@@ -58,10 +58,12 @@ def _register_builtins() -> None:
     from .openclaw import OpenClawBackend
     from .claude_code import ClaudeCodeBackend
     from .codex import CodexBackend
+    from .local_model import LocalModelBackend
 
     register_backend("openclaw", OpenClawBackend)
     register_backend("claude-code", ClaudeCodeBackend)
     register_backend("codex", CodexBackend)
+    register_backend("local", LocalModelBackend)
 
 
 _register_builtins()
