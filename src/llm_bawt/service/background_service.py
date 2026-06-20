@@ -127,6 +127,17 @@ class BackgroundService(
         from concurrent.futures import ThreadPoolExecutor
         self._llm_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="llm")
 
+        # Bounded pool for background jobs (memory extraction, history
+        # summarization, profile/consolidation maintenance, media GC). Kept
+        # SEPARATE from the default executor so a burst of per-bot background
+        # fan-out can never starve the workers that interactive agent-bridge
+        # relays need — that contention stalled continuation turns by minutes
+        # (TASK-283). NOT _llm_executor: that single thread is only for local
+        # GPU inference (CUDA/llama-cpp isn't thread-safe); routing background
+        # work through it would re-serialize it and reintroduce the TASK-274
+        # chat stall.
+        self._bg_executor = ThreadPoolExecutor(max_workers=4, thread_name_prefix="bg")
+
         # Cancellation support: when a new request comes in, cancel the current one
         # This handles the case where UI sends partial transcriptions that build up
         self._current_generation_cancel: threading.Event | None = None
@@ -486,6 +497,8 @@ class BackgroundService(
         self._shutdown_event.set()
         if self._worker_task:
             self._worker_task.cancel()
+        # Drop in-flight background jobs; don't block shutdown waiting on them.
+        self._bg_executor.shutdown(wait=False, cancel_futures=True)
 
     def get_status(self) -> ServiceStatusResponse:
         """Get service status."""

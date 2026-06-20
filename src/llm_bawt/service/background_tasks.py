@@ -92,7 +92,7 @@ class BackgroundTasksMixin:
 
         loop = asyncio.get_event_loop()
         success = await loop.run_in_executor(
-            None,
+            self._bg_executor,
             lambda: memory_client.update_memory_meaning(
                 memory_id=memory_id,
                 intent=payload.get("intent"),
@@ -119,7 +119,7 @@ class BackgroundTasksMixin:
 
         loop = asyncio.get_event_loop()
         result = await loop.run_in_executor(
-            None,
+            self._bg_executor,
             lambda: memory_client.run_maintenance(
                 run_consolidation=payload.get("run_consolidation", True),
                 run_recurrence_detection=payload.get("run_recurrence_detection", True),
@@ -197,7 +197,7 @@ class BackgroundTasksMixin:
         # it blocks all local-model work and the memory pipeline (caused the caid
         # stall on 2026-06-15). See TASK-274.
         result = await loop.run_in_executor(
-            None,
+            self._bg_executor,
             lambda: service.run(entity_id, entity_type, dry_run)
         )
 
@@ -500,9 +500,9 @@ class BackgroundTasksMixin:
         )
 
         loop = asyncio.get_event_loop()
-        # Remote API call — default pool, not self._llm_executor (TASK-274).
+        # Remote API call — bounded bg pool (TASK-283), not _llm_executor (TASK-274).
         result = await loop.run_in_executor(
-            None,
+            self._bg_executor,
             lambda: summarizer.summarize_eligible_sessions(
                 use_heuristic_fallback=use_heuristic_fallback,
                 max_tokens_per_chunk=max_tokens_per_chunk,
@@ -580,7 +580,7 @@ class BackgroundTasksMixin:
         loop = asyncio.get_event_loop()
 
         unprocessed = await loop.run_in_executor(
-            None,
+            self._bg_executor,
             lambda: backend.get_unprocessed_messages(limit=batch_size),
         )
 
@@ -621,9 +621,9 @@ class BackgroundTasksMixin:
 
         if conversation:
             try:
-                # Remote API call — default pool, not self._llm_executor (TASK-274).
+                # Remote API call — bounded bg pool (TASK-283), not _llm_executor (TASK-274).
                 facts = await loop.run_in_executor(
-                    None,
+                    self._bg_executor,
                     lambda: extraction_service.extract_from_conversation(
                         messages=conversation,
                         use_llm=use_llm and extraction_service.llm_client is not None,
@@ -714,7 +714,7 @@ class BackgroundTasksMixin:
         # Mark messages as processed regardless of extraction outcome
         # so they aren't re-processed on the next run
         await loop.run_in_executor(
-            None,
+            self._bg_executor,
             lambda: backend.mark_messages_processed(message_ids),
         )
 
@@ -749,7 +749,7 @@ class BackgroundTasksMixin:
 
         loop = asyncio.get_event_loop()
         result = await loop.run_in_executor(
-            None,
+            self._bg_executor,
             lambda: run_media_gc(
                 self.config,
                 grace_days=grace_days,
