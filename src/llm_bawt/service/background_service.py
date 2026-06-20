@@ -157,9 +157,17 @@ class BackgroundService(
         # OpenClaw WS session bridge (set by api.py lifespan if enabled)
         self._session_bridge: Any | None = None
 
-        # Background client for summarization/extraction (isolated from chat model lifecycle)
-        self._bg_client: Any | None = None
-        self._bg_client_model: str | None = None
+        # Keyed pool of background-task API clients, one per resolved model
+        # alias (TASK-281). Replaces the old single reassignable _bg_client slot
+        # that thrashed/raced when concurrent background jobs resolved different
+        # models — the loser got a torn-down/None client and silently produced
+        # zero results. Created once per model, thereafter only read. Isolated
+        # from the chat model lifecycle.
+        self._bg_client_cache: dict[str, Any] = {}
+        # Guards create-and-insert into _bg_client_cache. A plain threading.Lock
+        # (NOT the asyncio _cache_lock) because _get_background_client is sync and
+        # runs in the _bg_executor thread pool. Steady-state reads are lock-free.
+        self._bg_client_lock = threading.Lock()
 
         # Session model overrides: when user switches model via tool,
         # remember it for the rest of the session. Keyed by (bot_id, user_id).

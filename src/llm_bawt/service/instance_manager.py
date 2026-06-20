@@ -446,11 +446,8 @@ class InstanceManagerMixin:
             or getattr(self.config, "SUMMARIZATION_MODEL", None)
         )
 
-        # Reuse cached client if same model
-        if self._bg_client is not None and (not preferred or preferred == self._bg_client_model):
-            return self._bg_client, self._bg_client_model
-
-        # Resolve alias
+        # Resolve the alias first so the keyed pool is keyed by the actual
+        # model (TASK-281), not the raw preferred string.
         try:
             model_alias, _ = self._resolve_request_model(
                 preferred, bot_id="nova", local_mode=False,
@@ -458,6 +455,15 @@ class InstanceManagerMixin:
         except Exception as e:
             log.error(f"Failed to resolve background model '{preferred}': {e}")
             return None, None
+
+        # Keyed pool: reuse this model's client if already built. Each resolved
+        # alias gets its own stable, reused client — created once, then only
+        # read — so concurrent background jobs resolving different models no
+        # longer thrash a single slot (TASK-281). Lock-free read; dict.get is
+        # atomic under the GIL.
+        cached = self._bg_client_cache.get(model_alias)
+        if cached is not None:
+            return cached, model_alias
 
         models = self.config.defined_models.get("models", {})
         model_def = models.get(model_alias, {})
@@ -496,8 +502,10 @@ class InstanceManagerMixin:
                     bot_config={"bot_id": "background", "user_id": "system"},
                     model_definition=bridge_model_definition,
                 )
-                self._bg_client = client
-                self._bg_client_model = model_alias
+                # Insert under the lock so two concurrent cold-start callers for
+                # the same model don't double-build; the loser reuses the winner.
+                with self._bg_client_lock:
+                    client = self._bg_client_cache.setdefault(model_alias, client)
                 log.info("Background client ready: %s (local bridge)", model_alias)
                 return client, model_alias
             except Exception as e:
@@ -530,8 +538,8 @@ class InstanceManagerMixin:
                     model=model_id, config=self.config, model_definition=model_def,
                 )
 
-            self._bg_client = client
-            self._bg_client_model = model_alias
+            with self._bg_client_lock:
+                client = self._bg_client_cache.setdefault(model_alias, client)
             log.info("Background client ready: %s (%s)", model_alias, model_type)
             return client, model_alias
 
