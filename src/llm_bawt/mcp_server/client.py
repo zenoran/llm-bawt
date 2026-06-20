@@ -1278,12 +1278,16 @@ class _MCPShortTermManager:
         )
         return msg.id
 
-    def get_messages(self, since_minutes: int | None = None) -> list:
+    def get_messages(
+        self,
+        since_minutes: int | None = None,
+        after_timestamp: float | None = None,
+    ) -> list:
         # NOTE: despite name, since_minutes is seconds for backward compatibility.
         from llm_bawt.models.message import Message
 
         rows = self._memory_client.get_messages(since_seconds=since_minutes)
-        return [
+        messages = [
             Message(
                 role=r.get("role", ""),
                 content=r.get("content", ""),
@@ -1292,6 +1296,17 @@ class _MCPShortTermManager:
             )
             for r in rows
         ]
+        # Honor the /new conversation offset; always keep summary rows so the
+        # gist of dropped raw messages survives (mirrors the PostgreSQL backend
+        # in memory/postgresql.py). Accepting this kwarg is also what stops the
+        # whole load_history() call from throwing TypeError and silently
+        # falling back to an empty file backend.
+        if after_timestamp is not None:
+            messages = [
+                m for m in messages
+                if m.role == "summary" or m.timestamp >= after_timestamp
+            ]
+        return messages
 
     def clear(self) -> bool:
         deleted = self._memory_client.clear_messages()

@@ -114,6 +114,10 @@ sessions_table = Table(
     metadata,
     Column("id", String(36), primary_key=True),
     Column("bot_id", String(64), nullable=False),
+    # TASK-284: raw history is namespaced (bot_id, user_id), so the session —
+    # the thread boundary — must carry the user dimension too. Nullable for
+    # back-compat with legacy rows (migrated to a per-(bot,user) legacy session).
+    Column("user_id", String(64), nullable=True),
     Column("started_at", DateTime, nullable=False, default=_utcnow),
     Column("ended_at", DateTime, nullable=True),
     Column("status", String(16), nullable=False, default="active"),
@@ -412,11 +416,17 @@ class PostgreSQLMemoryBackend(MemoryBackend):
                 CREATE TABLE IF NOT EXISTS sessions (
                     id VARCHAR(36) PRIMARY KEY,
                     bot_id VARCHAR(64) NOT NULL,
+                    user_id VARCHAR(64),
                     started_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
                     ended_at TIMESTAMP,
                     status VARCHAR(16) NOT NULL DEFAULT 'active',
                     session_metadata JSONB
                 )
+            """)
+            # TASK-284: add the user dimension to pre-existing sessions tables.
+            sessions_user_col_sql = text("""
+                ALTER TABLE sessions
+                ADD COLUMN IF NOT EXISTS user_id VARCHAR(64)
             """)
             sessions_idx_sql = text("""
                 CREATE INDEX IF NOT EXISTS idx_sessions_bot_started
@@ -426,6 +436,12 @@ class PostgreSQLMemoryBackend(MemoryBackend):
                 CREATE INDEX IF NOT EXISTS idx_sessions_status
                 ON sessions(status)
             """)
+            # TASK-284: the active-session lookup is keyed (bot_id, user_id) and
+            # filtered to the live thread — index that access path.
+            sessions_active_idx_sql = text("""
+                CREATE INDEX IF NOT EXISTS idx_sessions_bot_user_active
+                ON sessions(bot_id, user_id, status, started_at)
+            """)
 
             try:
                 conn.execute(messages_sql)
@@ -433,8 +449,10 @@ class PostgreSQLMemoryBackend(MemoryBackend):
                 conn.execute(memories_sql)
                 conn.execute(sessions_sql)
                 try:
+                    conn.execute(sessions_user_col_sql)
                     conn.execute(sessions_idx_sql)
                     conn.execute(sessions_status_idx_sql)
+                    conn.execute(sessions_active_idx_sql)
                 except Exception as e:
                     logger.debug(f"sessions index creation: {e}")
                 # Run migrations for existing tables
@@ -2009,9 +2027,12 @@ class PostgreSQLShortTermManager:
     but provides session-scoped access for building context windows.
     """
     
-    def __init__(self, config: Any, bot_id: str = "nova"):
+    def __init__(self, config: Any, bot_id: str = "nova", user_id: str | None = None):
         self.config = config
         self.bot_id = bot_id
+        # TASK-284: sessions are namespaced (bot_id, user_id). May be None for
+        # legacy/back-compat callers that don't carry a user.
+        self.user_id = user_id
         self._backend = PostgreSQLMemoryBackend(config, bot_id)
         self._current_session_id = str(uuid.uuid4())
         # Insert a row into the shared sessions table for this session.
@@ -2025,19 +2046,36 @@ class PostgreSQLShortTermManager:
                 f"Failed to record initial session row for bot {bot_id}: {e}"
             )
 
-    def _insert_session_row(self, session_id: str) -> None:
+    def _insert_session_row(
+        self,
+        session_id: str,
+        user_id: str | None = None,
+        bot_id: str | None = None,
+        session_metadata: dict | None = None,
+    ) -> None:
         """Insert a new row into the shared sessions table.
 
         Uses INSERT ... ON CONFLICT DO NOTHING so reusing an existing UUID
         (rare, but possible in a backfill or test scenario) is a no-op.
+
+        ``user_id`` defaults to this manager's ``self.user_id`` so callers that
+        don't pass it still tag the session with the manager's user (TASK-284).
         """
+        target_user = self.user_id if user_id is None else user_id
+        target_bot = self.bot_id if bot_id is None else bot_id
+        import json as _json
         with self._backend.engine.connect() as conn:
             stmt = text("""
-                INSERT INTO sessions (id, bot_id, started_at, status)
-                VALUES (:id, :bot_id, CURRENT_TIMESTAMP, 'active')
+                INSERT INTO sessions (id, bot_id, user_id, started_at, status, session_metadata)
+                VALUES (:id, :bot_id, :user_id, CURRENT_TIMESTAMP, 'active', CAST(:meta AS JSONB))
                 ON CONFLICT (id) DO NOTHING
             """)
-            conn.execute(stmt, {"id": session_id, "bot_id": self.bot_id})
+            conn.execute(stmt, {
+                "id": session_id,
+                "bot_id": target_bot,
+                "user_id": target_user,
+                "meta": _json.dumps(session_metadata) if session_metadata else None,
+            })
             conn.commit()
 
     def _close_session_row(self, session_id: str) -> None:
@@ -2058,6 +2096,7 @@ class PostgreSQLShortTermManager:
         return {
             "id": row.id,
             "bot_id": row.bot_id,
+            "user_id": getattr(row, "user_id", None),
             "started_at": row.started_at.isoformat() if row.started_at else None,
             "ended_at": row.ended_at.isoformat() if row.ended_at else None,
             "status": row.status,
@@ -2105,7 +2144,7 @@ class PostgreSQLShortTermManager:
         try:
             with self._backend.engine.connect() as conn:
                 stmt = text("""
-                    SELECT id, bot_id, started_at, ended_at, status, session_metadata
+                    SELECT id, bot_id, user_id, started_at, ended_at, status, session_metadata
                     FROM sessions
                     WHERE id = :id
                 """)
@@ -2121,6 +2160,7 @@ class PostgreSQLShortTermManager:
         since: float | str | None = None,
         status: str | None = None,
         limit: int = 50,
+        user_id: str | None = None,
     ) -> list[dict]:
         """List sessions, newest first.
 
@@ -2131,6 +2171,9 @@ class PostgreSQLShortTermManager:
                 Unix timestamp (float/int) or an ISO-8601 string.
             status: Filter by status ('active' or 'completed').
             limit: Max rows to return.
+            user_id: Restrict to this user (TASK-284). Pass ``None`` to leave
+                the user dimension unfiltered (cross-user for this bot); pass a
+                value to scope to one user's threads.
 
         Returns:
             List of session dicts in ``started_at DESC`` order.
@@ -2142,6 +2185,9 @@ class PostgreSQLShortTermManager:
         if target_bot:
             clauses.append("bot_id = :bot_id")
             params["bot_id"] = target_bot
+        if user_id is not None:
+            clauses.append("user_id = :user_id")
+            params["user_id"] = user_id
         if status:
             clauses.append("status = :status")
             params["status"] = status
@@ -2154,7 +2200,7 @@ class PostgreSQLShortTermManager:
 
         where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
         sql = f"""
-            SELECT id, bot_id, started_at, ended_at, status, session_metadata
+            SELECT id, bot_id, user_id, started_at, ended_at, status, session_metadata
             FROM sessions
             {where}
             ORDER BY started_at DESC
@@ -2168,32 +2214,67 @@ class PostgreSQLShortTermManager:
             logger.warning(f"list_sessions failed: {e}")
             return []
 
-    def get_active_session(self, bot_id: str | None = None) -> dict | None:
-        """Return the most-recent active session for a bot, or None.
+    def get_active_session(
+        self, bot_id: str | None = None, user_id: str | None = None
+    ) -> dict | None:
+        """Return the most-recent active session for a (bot, user), or None.
 
         An "active" session has ``status='active'`` and ``ended_at IS NULL``.
         If multiple are active (shouldn't happen but possible after a
         crashed close), returns the most recently started.
+
+        ``user_id`` (TASK-284): when provided, scopes to that user's threads
+        (legacy rows with NULL user_id won't match — that's intentional; they
+        are reconciled by the migration). When ``None``, the user dimension is
+        left unfiltered (legacy bot-only behavior).
         """
         target_bot = self.bot_id if bot_id is None else bot_id
         if not target_bot:
             return None
+        clauses = ["bot_id = :bot_id", "status = 'active'", "ended_at IS NULL"]
+        params: dict = {"bot_id": target_bot}
+        if user_id is not None:
+            clauses.append("user_id = :user_id")
+            params["user_id"] = user_id
+        sql = f"""
+            SELECT id, bot_id, user_id, started_at, ended_at, status, session_metadata
+            FROM sessions
+            WHERE {' AND '.join(clauses)}
+            ORDER BY started_at DESC
+            LIMIT 1
+        """
         try:
             with self._backend.engine.connect() as conn:
-                stmt = text("""
-                    SELECT id, bot_id, started_at, ended_at, status, session_metadata
-                    FROM sessions
-                    WHERE bot_id = :bot_id
-                      AND status = 'active'
-                      AND ended_at IS NULL
-                    ORDER BY started_at DESC
-                    LIMIT 1
-                """)
-                row = conn.execute(stmt, {"bot_id": target_bot}).fetchone()
+                row = conn.execute(text(sql), params).fetchone()
                 return self._row_to_session_dict(row) if row else None
         except Exception as e:
             logger.warning(f"get_active_session({target_bot}) failed: {e}")
             return None
+
+    def get_or_create_active_session(
+        self, bot_id: str | None = None, user_id: str | None = None
+    ) -> str:
+        """Return the live thread's session id for (bot, user), creating one if none.
+
+        TASK-284: this is the single, DB-derived source of truth for "where does
+        the active thread begin" — deliberately NOT held in instance memory. The
+        legacy per-construction ``_current_session_id`` minted a fresh session on
+        every cached-instance build (instances are keyed (model, bot, user) and
+        evicted on profile/settings changes), which is how the sessions table
+        accumulated hundreds of never-closed "active" rows. Resolving from the DB
+        instead means every instance/worker for a (bot, user) converges on the
+        same active thread.
+
+        Returns the active session id; inserts a new active row if none exists.
+        """
+        target_bot = self.bot_id if bot_id is None else bot_id
+        target_user = self.user_id if user_id is None else user_id
+        existing = self.get_active_session(bot_id=target_bot, user_id=target_user)
+        if existing:
+            return existing["id"]
+        new_id = str(uuid.uuid4())
+        self._insert_session_row(new_id, user_id=target_user, bot_id=target_bot)
+        return new_id
 
     @property
     def session_id(self) -> str:
