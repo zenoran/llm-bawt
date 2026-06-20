@@ -620,6 +620,15 @@ class ClaudeCodeBridge:
             current_tool_name: str | None = None
             current_tool_input: str = ""
             actual_model: str = model  # updated from SystemMessage if available
+            # Map tool_use_id -> tool name (the SDK's ToolResultBlock doesn't echo
+            # the name, only the id) so we can recognise a Playwright screenshot
+            # result and persist its image instead of letting the inline base64
+            # ride in the model context forever.
+            tool_names_by_id: dict[str, str] = {}
+            # {asset_id, kind} refs for screenshots persisted to the media store
+            # during this turn; stamped onto the terminal ASSISTANT_DONE event so
+            # the app can attach them to the bot's reply message.
+            turn_screenshot_assets: list[dict] = []
 
             try:
                 # Inject MCP tool context so Claude passes the right identifiers
@@ -722,6 +731,11 @@ class ClaudeCodeBridge:
                     turn_done = asyncio.Event()
                     prompt_input = _make_prompt_input(turn_done)
                     stderr_lines: list[str] = []
+                    # Per-attempt: the auth/session retry paths re-run the turn
+                    # from scratch, so reset screenshot tracking to avoid double-
+                    # counting an earlier attempt's uploads on the final DONE event.
+                    tool_names_by_id.clear()
+                    turn_screenshot_assets.clear()
 
                     def _log_stderr(line: str) -> None:
                         line = line.rstrip()
@@ -786,6 +800,16 @@ class ClaudeCodeBridge:
                         max_turns=bot_max_turns,
                         mcp_servers=self._mcp_servers if self._mcp_servers else {},
                         can_use_tool=can_use_tool_cb,
+                        # The SDK's stdio reader defaults to a 1 MiB JSON buffer
+                        # (claude_agent_sdk subprocess_cli _DEFAULT_MAX_BUFFER_SIZE).
+                        # A single Playwright screenshot or large browser_snapshot
+                        # tool-result blows past that and the reader raises
+                        # SDKJSONDecodeError mid-stream, which the bridge surfaces
+                        # as an ERROR event and the app turns into a hard
+                        # RuntimeError — i.e. the bot's turn silently dies. Raise
+                        # the ceiling so those results flow; screenshots are then
+                        # offloaded to the media store below.
+                        max_buffer_size=32 * 1024 * 1024,
                     )
 
                     session_persisted = False
@@ -895,12 +919,15 @@ class ClaudeCodeBridge:
                                 for block in getattr(msg, "content", []):
                                     if isinstance(block, ToolUseBlock):
                                         seq += 1
+                                        tu_id = getattr(block, "id", None)
+                                        if tu_id:
+                                            tool_names_by_id[tu_id] = block.name
                                         self._publish_event(
                                             request_id, session_key, seq,
                                             kind=AgentEventKind.TOOL_START,
                                             tool_name=block.name,
                                             tool_arguments=block.input if isinstance(block.input, dict) else {},
-                                            tool_use_id=getattr(block, "id", None),
+                                            tool_use_id=tu_id,
                                         )
 
                             elif isinstance(msg, UserMessage):
@@ -908,6 +935,26 @@ class ClaudeCodeBridge:
                                     if isinstance(block, ToolResultBlock):
                                         seq += 1
                                         result_content = block.content or ""
+                                        # Persist Playwright screenshots to the
+                                        # media store and collect a {asset_id,
+                                        # kind} ref so the app can attach them to
+                                        # the bot's reply (browsable per turn).
+                                        # Never let an upload failure break the
+                                        # turn — the inline image still reaches
+                                        # the model regardless.
+                                        if isinstance(result_content, list) and self._is_screenshot_tool(
+                                            tool_names_by_id.get(block.tool_use_id or "")
+                                        ):
+                                            try:
+                                                refs = await self._persist_screenshot_blocks(
+                                                    result_content, session_key, block.tool_use_id,
+                                                )
+                                                turn_screenshot_assets.extend(refs)
+                                            except Exception:
+                                                logger.warning(
+                                                    "Screenshot persist failed (tool_use_id=%s)",
+                                                    block.tool_use_id, exc_info=True,
+                                                )
                                         if isinstance(result_content, list):
                                             result_content = "\n".join(
                                                 b.get("text", "") if isinstance(b, dict) else str(b)
@@ -1004,6 +1051,7 @@ class ClaudeCodeBridge:
                                     text=full_text,
                                     model=actual_model,
                                     token_usage=token_usage_payload,
+                                    attachments=turn_screenshot_assets or None,
                                 )
                                 # Turn complete — release the prompt generator so
                                 # the SDK closes its input stream.  Kept open until
@@ -1386,6 +1434,89 @@ class ClaudeCodeBridge:
                 out[k] = v
         return out
 
+    # ----- Screenshot persistence (Playwright -> media store) -----
+
+    @staticmethod
+    def _is_screenshot_tool(tool_name: str | None) -> bool:
+        """True for the Playwright MCP screenshot tool (namespaced or bare)."""
+        if not tool_name:
+            return False
+        return tool_name.split("__")[-1] == "browser_take_screenshot"
+
+    @staticmethod
+    def _extract_image_block(block: object) -> tuple[str, str] | None:
+        """Pull (base64_data, mime) from a tool-result image content block.
+
+        Handles both the MCP shape ``{type:image, data, mimeType}`` and the
+        Anthropic API shape ``{type:image, source:{data, media_type}}``.
+        """
+        if not isinstance(block, dict) or block.get("type") != "image":
+            return None
+        data = block.get("data")
+        mime = block.get("mimeType") or block.get("mime_type")
+        if not data:
+            src = block.get("source")
+            if isinstance(src, dict):
+                data = src.get("data")
+                mime = mime or src.get("media_type")
+        if not data:
+            return None
+        return data, (mime or "image/png")
+
+    async def _persist_screenshot_blocks(
+        self, content: list, session_key: str, tool_use_id: str | None,
+    ) -> list[dict]:
+        """Upload each image block in a screenshot tool-result to the media
+        store; return ``{asset_id, kind}`` refs. Best-effort — logs and skips
+        anything it can't parse or upload."""
+        refs: list[dict] = []
+        if not self._app_api_url:
+            return refs
+        user_id = session_key.split(":", 1)[1] if ":" in session_key else "nick"
+        for block in content:
+            img = self._extract_image_block(block)
+            if img is None:
+                if isinstance(block, dict) and block.get("type") == "image":
+                    logger.warning(
+                        "Screenshot image block in unrecognised shape (keys=%s)",
+                        list(block.keys()),
+                    )
+                continue
+            data_b64, mime = img
+            asset_id = await self._upload_data_url(
+                f"data:{mime};base64,{data_b64}", user_id, tool_use_id,
+            )
+            if asset_id:
+                refs.append({"asset_id": asset_id, "kind": "image"})
+        return refs
+
+    async def _upload_data_url(
+        self, data_url: str, user_id: str, tool_use_id: str | None,
+    ) -> str | None:
+        """POST a ``data:`` URL to /v1/uploads as an agent attachment; return asset_id."""
+        import httpx
+        try:
+            async with httpx.AsyncClient(timeout=15) as client:
+                resp = await client.post(
+                    f"{self._app_api_url}/v1/uploads",
+                    params={"source": "agent_attachment"},
+                    headers={"X-Entity-Id": user_id},
+                    json={
+                        "data_url": data_url,
+                        "filename": f"screenshot-{tool_use_id or 'shot'}.png",
+                    },
+                )
+                if resp.status_code >= 400:
+                    logger.warning(
+                        "Screenshot upload failed: %s %s",
+                        resp.status_code, resp.text[:200],
+                    )
+                    return None
+                return (resp.json() or {}).get("asset_id")
+        except Exception:
+            logger.warning("Screenshot upload error", exc_info=True)
+            return None
+
     def _publish_event(
         self,
         request_id: str,
@@ -1400,6 +1531,7 @@ class ClaudeCodeBridge:
         model: str | None = None,
         token_usage: dict | None = None,
         tool_use_id: str | None = None,
+        attachments: list[dict] | None = None,
     ) -> None:
         text = self._shorten_paths(text)
         tool_result = self._shorten_paths(tool_result)
@@ -1431,6 +1563,7 @@ class ClaudeCodeBridge:
             # to remember to thread it through.
             trigger_message_id=self._trigger_message_ids.get(request_id),
             tool_use_id=tool_use_id,
+            attachments=attachments,
         )
         self._publisher.publish_run_event(request_id, event)
 

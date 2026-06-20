@@ -496,23 +496,28 @@ class ServiceLLMBawt(BaseLLMBawt):
         self,
         response: str,
         tool_context: str = "",
+        attachments: list[dict] | None = None,
     ):
         """Finalize the response by saving to history.
-        
+
         Called by the service API after receiving the response.
-        
+
         Args:
             response: The assistant's response
             tool_context: Optional tool results to save to history
+            attachments: Optional {asset_id, kind} media refs persisted during
+                the turn (e.g. Playwright screenshots) to attach to the reply.
         """
         # Save tool context first so it appears before the response in history
         if tool_context:
             self.history_manager.add_message(
                 "system", f"[Tool Results]\n{tool_context}"
             )
-        
+
         if response:
-            self.history_manager.add_message("assistant", response)
+            self.history_manager.add_message(
+                "assistant", response, attachments=attachments
+            )
     
     def refine_prompt(self, prompt: str, history: list | None = None) -> str:
         """Refine the user's prompt using context.

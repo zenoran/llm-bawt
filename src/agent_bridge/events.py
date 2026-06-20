@@ -74,6 +74,12 @@ class AgentEvent:
     # chat.tool_result Redis command) back to the paused SDK Future.  Other
     # bridges leave it unset.
     tool_use_id: str | None = None
+    # Media refs ({"asset_id": "ma_...", "kind": "image"}) produced *during*
+    # this turn and already persisted to the media store — e.g. Playwright
+    # screenshots the claude-code bridge offloaded instead of leaving the inline
+    # base64 in the model context.  Stamped on the terminal ASSISTANT_DONE event
+    # so the app can attach them to the bot's reply message (browsable per turn).
+    attachments: list[dict] | None = None
 
     def to_dict(self) -> dict:
         """Serialize for Redis/JSON transport."""
@@ -96,6 +102,7 @@ class AgentEvent:
             "provider": self.provider,
             "trigger_message_id": self.trigger_message_id,
             "tool_use_id": self.tool_use_id,
+            "attachments": self.attachments,
         }
 
     @classmethod
@@ -125,6 +132,7 @@ class AgentEvent:
             provider=data.get("provider"),
             trigger_message_id=data.get("trigger_message_id"),
             tool_use_id=data.get("tool_use_id"),
+            attachments=data.get("attachments"),
         )
 
 

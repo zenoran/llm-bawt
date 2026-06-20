@@ -284,6 +284,7 @@ class TurnLifecycleMixin:
         stream: bool,
         animation: str | None = None,
         token_usage: dict | None = None,
+        attachments: list[dict] | None = None,
     ) -> None:
         """Finalize a turn in one place for both non-streaming and streaming paths."""
         if not response_text:
@@ -319,7 +320,7 @@ class TurnLifecycleMixin:
                     parts.append(f"[{name}]\n{result}")
                 tool_context = "\n\n".join(parts)
 
-        llm_bawt.finalize_response(response_text, tool_context)
+        llm_bawt.finalize_response(response_text, tool_context, attachments=attachments)
 
         self._update_turn_log(
             turn_id=turn_id,

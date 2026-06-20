@@ -810,6 +810,9 @@ class ChatStreamingMixin:
         timing_holder = [0.0, 0.0]  # [start_time, end_time]
         cancelled_holder = [False]  # Track if we were cancelled
         token_usage_holder: list[dict | None] = [None]  # Captures upstream SDK token usage for turn_complete
+        # {asset_id, kind} refs for media the agent backend persisted during the
+        # turn (e.g. Playwright screenshots) — attached to the assistant reply.
+        agent_attachments_holder: list[dict] = []
         # TASK-269: tool_use_id of an AskUserQuestion the agent deferred this
         # turn.  Set when an await_tool_result chunk arrives; consumed at turn
         # completion to mark end_reason="question" + question_id on the turn log
@@ -1413,6 +1416,13 @@ class ChatStreamingMixin:
                                 if isinstance(tu, dict):
                                     token_usage_holder[0] = tu
                                 continue
+                            if evt == "attachments":
+                                refs = item.get("attachments")
+                                if isinstance(refs, list):
+                                    agent_attachments_holder.extend(
+                                        r for r in refs if isinstance(r, dict)
+                                    )
+                                continue
                             if evt in ("tool_call", "tool_result"):
                                 _saw_tool = True
                             if evt == "tool_call":
@@ -1563,6 +1573,7 @@ class ChatStreamingMixin:
                             stream=True,
                             animation=animation_holder[0],
                             token_usage=token_usage_holder[0],
+                            attachments=agent_attachments_holder or None,
                         )
                     else:
                         # No response received — mark as timeout so turn doesn't

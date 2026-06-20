@@ -243,6 +243,15 @@ class AgentBridgeBackend(AgentBackend):
                                         "event": "token_usage",
                                         "token_usage": event.token_usage,
                                     })
+                                # Media the bridge persisted during the turn
+                                # (e.g. Playwright screenshots) — forward the
+                                # {asset_id, kind} refs so the app can attach
+                                # them to this assistant reply.
+                                if event.attachments:
+                                    result_queue.put({
+                                        "event": "attachments",
+                                        "attachments": event.attachments,
+                                    })
                                 # ASSISTANT_DONE carries the complete response
                                 # text.  Yield any portion not already streamed
                                 # as deltas — this is critical for tool-heavy
