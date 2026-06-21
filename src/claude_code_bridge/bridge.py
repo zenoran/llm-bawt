@@ -41,6 +41,56 @@ def _bot_slug_from_session_key(session_key: str) -> str:
     return sk.split(":", 1)[0]
 
 
+def _fmt_tokens(n: int | None) -> str:
+    """Human-format a token count: 67288 -> '67.3k', 1486 -> '1.5k'."""
+    if n is None:
+        return "?"
+    n = int(n)
+    if n < 1000:
+        return str(n)
+    return f"{n / 1000:.1f}k"
+
+
+def _read_latest_compact_metadata(session_id: str | None) -> dict | None:
+    """Return the most recent ``compact_boundary`` metadata for a session.
+
+    The Claude Agent SDK does NOT emit ``compact_boundary`` on the wire — a
+    ``/compact`` turn surfaces only as ``SystemMessage(subtype="status")`` with
+    a ``compact_result`` string ("success"/"failed"); the actual pre/post token
+    counts are written solely to the on-disk transcript. So to report the new
+    resident context size we read it back from the session's ``.jsonl`` (located
+    by ``<session_id>.jsonl`` under ``~/.claude/projects/``) and return the last
+    ``compactMetadata`` dict ({trigger, preTokens, postTokens, durationMs, ...}).
+    Best-effort: returns ``None`` if the file or marker can't be found.
+    """
+    if not session_id:
+        return None
+    try:
+        base = Path.home() / ".claude" / "projects"
+        matches = list(base.glob(f"*/{session_id}.jsonl")) or list(
+            base.glob(f"**/{session_id}.jsonl")
+        )
+        if not matches:
+            return None
+        meta: dict | None = None
+        with open(matches[0], "r") as fh:
+            for line in fh:
+                if "compact_boundary" not in line:
+                    continue
+                try:
+                    entry = json.loads(line)
+                except (ValueError, TypeError):
+                    continue
+                if entry.get("subtype") == "compact_boundary":
+                    cm = entry.get("compactMetadata")
+                    if isinstance(cm, dict):
+                        meta = cm  # keep the LAST boundary in file order
+        return meta
+    except Exception:
+        logger.debug("compact metadata read failed for %s", session_id, exc_info=True)
+        return None
+
+
 _CREDENTIALS_PATH = Path.home() / ".claude" / ".credentials.json"
 _OAUTH_TOKEN_URL = "https://platform.claude.com/v1/oauth/token"
 _OAUTH_CLIENT_ID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e"
@@ -837,6 +887,24 @@ class ClaudeCodeBridge:
                     # AssistantMessage's usage reflects the actual final API
                     # call's view of the context.
                     latest_assistant_usage: dict | None = None
+                    # Some synthetic Anthropic streams (notably the
+                    # Responses-backed ChatGPT proxy) surface final input/cache
+                    # usage only on StreamEvent(message_delta), while the
+                    # AssistantMessage snapshot can remain at message_start's
+                    # zeroed input fields. Track the last stream-level usage as
+                    # a fallback so turn_logs get the real pill numbers.
+                    latest_stream_usage: dict | None = None
+                    # /compact lifecycle tracking for this turn. The SDK reports
+                    # compaction via SystemMessage(subtype="status") — never a
+                    # compact_boundary on the wire — so we watch the status
+                    # payload to (a) give immediate feedback (a /compact can be
+                    # ~50s of otherwise-silent work the UI reads as "hung") and
+                    # (b) report the new resident size, since the /compact
+                    # ResultMessage.usage is all-zeros.
+                    compact_announced = False
+                    compact_status: str | None = None  # None | "success" | "failed"
+                    compact_error_msg: str | None = None
+                    turn_session_id: str | None = resume_id
 
                     msg_stream = None
                     try:
@@ -873,17 +941,50 @@ class ClaudeCodeBridge:
                                     f"No SDK messages for {self._request_timeout}s — CLI may be hung"
                                 )
 
-                            # Capture session_id and actual model from first SystemMessage only
-                            if isinstance(msg, SystemMessage) and not session_persisted:
+                            if isinstance(msg, SystemMessage):
                                 data = getattr(msg, "data", {}) or {}
-                                if data.get("model"):
-                                    actual_model = data["model"]
-                                    logger.info("Actual model: %s", actual_model)
-                                if not resume_id:
-                                    sid = data.get("session_id")
-                                    if sid:
-                                        await self._set_session(bot_slug or session_key, sid, model)
-                                session_persisted = True
+                                # Capture session_id + actual model from the first
+                                # SystemMessage (the init), then persist once.
+                                if not session_persisted:
+                                    if data.get("model"):
+                                        actual_model = data["model"]
+                                        logger.info("Actual model: %s", actual_model)
+                                    if not resume_id:
+                                        sid = data.get("session_id")
+                                        if sid:
+                                            await self._set_session(bot_slug or session_key, sid, model)
+                                    session_persisted = True
+                                # Track the session_id for this turn regardless of
+                                # resume state — used to read the compaction result
+                                # back from the transcript below.
+                                if data.get("session_id"):
+                                    turn_session_id = data["session_id"]
+                                # Compaction lifecycle. A /compact turn emits
+                                # SystemMessage(subtype="status"): first
+                                # status="compacting", then a payload carrying
+                                # compact_result ("success"/"failed") and, on
+                                # failure, compact_error. There is NO
+                                # compact_boundary on the wire. Surface the start
+                                # immediately so the turn doesn't read as "hung",
+                                # and record the outcome for the ResultMessage.
+                                if data.get("status") == "compacting" and not compact_announced:
+                                    compact_announced = True
+                                    seq += 1
+                                    note = "🗜️ Compacting conversation to free up context…"
+                                    text_parts.append(note)
+                                    self._publish_event(
+                                        request_id, session_key, seq,
+                                        kind=AgentEventKind.ASSISTANT_DELTA,
+                                        text=note,
+                                    )
+                                cr = data.get("compact_result")
+                                if cr == "success":
+                                    compact_status = "success"
+                                elif cr == "failed":
+                                    compact_status = "failed"
+                                    compact_error_msg = (
+                                        data.get("compact_error") or "unknown error"
+                                    )
                             msg_type = type(msg).__name__
                             if not isinstance(msg, (StreamEvent, SystemMessage)):
                                 content = getattr(msg, "content", [])
@@ -896,6 +997,10 @@ class ClaudeCodeBridge:
                             if isinstance(msg, StreamEvent):
                                 event = msg.event
                                 event_type = event.get("type", "")
+                                if event_type == "message_delta":
+                                    ev_usage = event.get("usage")
+                                    if isinstance(ev_usage, dict) and ev_usage:
+                                        latest_stream_usage = ev_usage
 
                                 if event_type == "content_block_delta":
                                     delta = event.get("delta", {})
@@ -1016,12 +1121,20 @@ class ClaudeCodeBridge:
                                 # ResultMessage.model_usage is keyed by model id and exposes
                                 # the model's contextWindow + maxOutputTokens.
                                 token_usage_payload: dict | None = None
+                                ctx_window = None
+                                max_output = None
                                 try:
                                     cumulative_usage = getattr(msg, "usage", None) or {}
-                                    # Per-iteration view (preferred) — falls back to the
-                                    # cumulative usage when no AssistantMessage was seen
-                                    # (e.g., single-API-call turns where they're equal anyway).
-                                    iter_usage = latest_assistant_usage or cumulative_usage
+                                    # Per-iteration view (preferred) — falls back first to the
+                                    # last stream-level message_delta usage (needed for some
+                                    # synthetic proxy streams whose AssistantMessage snapshot
+                                    # keeps message_start's zero input fields), then to the
+                                    # cumulative usage when no finer-grained view exists.
+                                    iter_usage = (
+                                        latest_assistant_usage
+                                        or latest_stream_usage
+                                        or cumulative_usage
+                                    )
                                     model_usage = getattr(msg, "model_usage", None) or {}
                                     ctx_window = None
                                     max_output = None
@@ -1038,8 +1151,20 @@ class ClaudeCodeBridge:
                                             ctx_window = mu_entry.get("contextWindow")
                                             max_output = mu_entry.get("maxOutputTokens")
                                     if iter_usage or ctx_window:
+                                        # z.ai reports input_tokens only in message_delta, so the
+                                        # per-iteration AssistantMessage.usage (iter_usage) carries
+                                        # the message_start value (0). Fall back to the cumulative
+                                        # ResultMessage.usage, which via the SDK's last-non-zero merge
+                                        # holds the real final-context input. No-op for Anthropic,
+                                        # where iter_usage.input_tokens is already >0 (its
+                                        # message_delta sends explicit 0s that updateUsage ignores).
+                                        _input_tokens = int(iter_usage.get("input_tokens", 0) or 0)
+                                        if _input_tokens == 0:
+                                            _input_tokens = int(
+                                                cumulative_usage.get("input_tokens", 0) or 0
+                                            )
                                         token_usage_payload = {
-                                            "input_tokens": int(iter_usage.get("input_tokens", 0) or 0),
+                                            "input_tokens": _input_tokens,
                                             "cache_read_tokens": int(
                                                 iter_usage.get("cache_read_input_tokens", 0) or 0
                                             ),
@@ -1056,8 +1181,73 @@ class ClaudeCodeBridge:
                                             "max_output_tokens": max_output,
                                             "total_cost_usd": getattr(msg, "total_cost_usd", None),
                                         }
+                                        if actual_model and str(actual_model).startswith("zai/"):
+                                            logger.debug(
+                                                "zai usage probe: iter_in=%s cum_in=%s out=%s ctx=%s",
+                                                iter_usage.get("input_tokens"),
+                                                cumulative_usage.get("input_tokens"),
+                                                cumulative_usage.get("output_tokens"),
+                                                ctx_window,
+                                            )
                                 except Exception as _usage_err:
                                     logger.debug("Failed to extract token usage: %s", _usage_err)
+
+                                # Compaction outcome. The /compact ResultMessage
+                                # usage is all-zeros and the new resident size lives
+                                # only in the transcript, so on success we read back
+                                # compactMetadata.postTokens to (a) append a human
+                                # summary to the reply and (b) OVERRIDE the usage
+                                # gauge so the UI drops to the post-compaction size
+                                # immediately instead of showing the stale
+                                # pre-compaction number (the "reported context is
+                                # exactly the same" symptom). On failure we explain
+                                # why (e.g. "Not enough messages to compact.") so a
+                                # no-op /compact isn't silent.
+                                if compact_status == "success":
+                                    cm = await asyncio.to_thread(
+                                        _read_latest_compact_metadata, turn_session_id
+                                    )
+                                    pre = (cm or {}).get("preTokens")
+                                    post = (cm or {}).get("postTokens")
+                                    if post is not None:
+                                        freed = (
+                                            f" ({round(100 * (pre - post) / pre)}% freed)"
+                                            if pre
+                                            else ""
+                                        )
+                                        note = (
+                                            f"\n\n✅ Compacted: {_fmt_tokens(pre)} → "
+                                            f"{_fmt_tokens(post)} tokens{freed}."
+                                        )
+                                        token_usage_payload = {
+                                            "input_tokens": int(post),
+                                            "cache_read_tokens": 0,
+                                            "cache_creation_tokens": 0,
+                                            "output_tokens": 0,
+                                            "context_window": ctx_window,
+                                            "max_output_tokens": max_output,
+                                            "total_cost_usd": getattr(msg, "total_cost_usd", None),
+                                        }
+                                    else:
+                                        note = "\n\n✅ Conversation compacted."
+                                    seq += 1
+                                    text_parts.append(note)
+                                    self._publish_event(
+                                        request_id, session_key, seq,
+                                        kind=AgentEventKind.ASSISTANT_DELTA,
+                                        text=note,
+                                    )
+                                    full_text = "".join(text_parts)
+                                elif compact_status == "failed":
+                                    note = f"\n\nℹ️ Nothing to compact — {compact_error_msg}"
+                                    seq += 1
+                                    text_parts.append(note)
+                                    self._publish_event(
+                                        request_id, session_key, seq,
+                                        kind=AgentEventKind.ASSISTANT_DELTA,
+                                        text=note,
+                                    )
+                                    full_text = "".join(text_parts)
 
                                 seq += 1
                                 self._publish_event(
