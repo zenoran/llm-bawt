@@ -23,6 +23,37 @@ from .base import LLMClient
 logger = logging.getLogger(__name__)
 
 
+def _attachments_from_content_parts(
+    content_parts: list[dict[str, Any]] | None,
+) -> list[dict[str, str]]:
+    """Convert a :class:`Message`'s multimodal ``content_parts`` into the
+    agent-backend ``attachments`` contract.
+
+    ``content_parts`` are OpenAI image_url parts
+    (``{"type": "image_url", "image_url": {"url": "data:<mime>;base64,<b64>"}}``,
+    produced by ``prepare_messages_for_query``); the agent bridge wants
+    ``{"mimeType": <mime>, "content": <naked-b64>}``.  Keeping this conversion
+    here lets ``Message.content_parts`` be the single source of truth for
+    images on the agent path — non-image parts and malformed / non-base64
+    data URLs are skipped.
+    """
+    out: list[dict[str, str]] = []
+    for part in content_parts or []:
+        if not isinstance(part, dict) or part.get("type") != "image_url":
+            continue
+        url = (part.get("image_url") or {}).get("url", "")
+        if not isinstance(url, str) or not url.startswith("data:"):
+            continue
+        try:
+            header, payload = url.split(",", 1)
+            mime = header.split(":", 1)[1].split(";", 1)[0]
+        except (IndexError, ValueError):
+            continue
+        if payload:
+            out.append({"mimeType": mime, "content": payload})
+    return out
+
+
 class AgentBackendClient(LLMClient):
     """LLMClient that delegates to an external agent backend.
 
@@ -106,8 +137,10 @@ class AgentBackendClient(LLMClient):
     def stream_raw(self, messages: List[Message], **kwargs: Any) -> Iterator[str | dict[str, Any]]:
         """Stream from backend when supported; fallback to one-shot query."""
         prompt = ""
+        last_user_msg: Message | None = None
         for msg in reversed(messages):
             if msg.role == "user":
+                last_user_msg = msg
                 content = msg.content
                 if isinstance(content, list):
                     prompt = "".join(
@@ -122,7 +155,23 @@ class AgentBackendClient(LLMClient):
             logger.warning("AgentBackendClient.stream_raw() called with no user message")
             return
 
+        # Image attachments. The explicit ``attachments`` kwarg is the fast
+        # path (chat_streaming passes the resolved user_attachments straight
+        # through), but the user Message's ``content_parts`` is the
+        # authoritative carrier: derive attachments from it whenever the kwarg
+        # is absent, so images can't silently vanish if a caller builds a
+        # multimodal Message without also threading the kwarg through. Both
+        # originate from the same user_attachments list, so this never
+        # double-counts — it only recovers the dropped case.
         attachments: list = kwargs.pop("attachments", None) or []
+        if not attachments and last_user_msg is not None:
+            attachments = _attachments_from_content_parts(last_user_msg.content_parts)
+            if attachments:
+                logger.debug(
+                    "stream_raw: recovered %d image attachment(s) from "
+                    "Message.content_parts (no attachments kwarg passed)",
+                    len(attachments),
+                )
         # Frontend-supplied user-message UUID (or "local-user-*" placeholder).
         # Bridges stamp this on every emitted tool event so the frontend can
         # bucket tool activity under the originating user message without
