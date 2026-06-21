@@ -175,12 +175,9 @@ class LocalModelBridge:
                             continue
 
                         if action == "chat.send":
-                            session_key = fields.get("session_key", "")
-                            task = asyncio.create_task(
+                            asyncio.create_task(
                                 self._handle_send(fields, msg_id, async_redis)
                             )
-                            if session_key:
-                                self._session_queue.set_active_task(session_key, task)
                         elif action == "rpc.call":
                             asyncio.create_task(
                                 self._handle_rpc(fields, msg_id, async_redis)
@@ -200,7 +197,6 @@ class LocalModelBridge:
     async def _handle_send(self, fields: dict, msg_id: str, async_redis) -> None:
         request_id = fields.get("request_id", "")
         session_key = fields.get("session_key", "")
-        bot_slug = (fields.get("bot_id", "") or "").strip() or _bot_slug_from_session_key(session_key)
         message = fields.get("message", "")
         system_prompt = fields.get("system_prompt") or None
         model_alias = fields.get("model") or ""
@@ -237,7 +233,7 @@ class LocalModelBridge:
         if trigger_message_id:
             self._trigger_message_ids[request_id] = trigger_message_id
 
-        async with self._session_queue.lock(session_key):
+        async with self._session_queue.active(session_key):
             logger.info(
                 "Handling send: request_id=%s session=%s model=%s system_prompt=%s msg=%.60s...",
                 request_id, session_key, model_alias,

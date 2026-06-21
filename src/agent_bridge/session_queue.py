@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from contextlib import asynccontextmanager
 from typing import Any, AsyncIterator
 
 logger = logging.getLogger(__name__)
@@ -88,8 +89,41 @@ class SessionQueue:
         """
         self._active_tasks[session_key] = task
         task.add_done_callback(
-            lambda _t, sk=session_key: self._active_tasks.pop(sk, None)
+            lambda done, sk=session_key: self.clear_active_task(sk, done)
         )
+
+    def clear_active_task(
+        self, session_key: str, task: asyncio.Task | None = None
+    ) -> bool:
+        """Remove the active task only when it is still *task*.
+
+        A completed task must never remove a newer task registered for the
+        same session. That race made chat.abort report success while leaving
+        the newer bridge subprocess running.
+        """
+        current = self._active_tasks.get(session_key)
+        if current is None or (task is not None and current is not task):
+            return False
+        self._active_tasks.pop(session_key, None)
+        return True
+
+    @asynccontextmanager
+    async def active(self, session_key: str):
+        """Serialize a send and expose only the lock holder to abort.
+
+        Tasks waiting for the session lock are queued, not active. Registering
+        them when they were created allowed a queued send to replace the
+        running send in ``_active_tasks``, so abort cancelled the wrong task.
+        """
+        async with self.lock(session_key):
+            task = asyncio.current_task()
+            if task is not None:
+                self.set_active_task(session_key, task)
+            try:
+                yield
+            finally:
+                if task is not None:
+                    self.clear_active_task(session_key, task)
 
     def cancel_active(self, session_key: str) -> bool:
         """Cancel the active task for *session_key*.

@@ -50,6 +50,7 @@ async def chat_abort(request: ChatAbortRequest) -> ChatAbortResponse:
 
     # Send chat.abort to the gateway if this is an OpenClaw turn
     gateway_aborted = False
+    gateway_detail: str | None = None
     if turn.agent_session_key:
         from ...agent_backends.agent_bridge import get_agent_subscriber
         from ...bots import BotManager
@@ -71,11 +72,12 @@ async def chat_abort(request: ChatAbortRequest) -> ChatAbortResponse:
             params: dict = {"sessionKey": turn.agent_session_key}
             abort_req_id = f"abort_{uuid.uuid4().hex}"
             try:
-                await subscriber.send_rpc(
+                rpc_result = await subscriber.send_rpc(
                     "chat.abort", params, abort_req_id,
                     timeout_s=10, backend=backend_name,
                 )
-                gateway_aborted = True
+                gateway_detail = str(rpc_result.get("detail") or "") or None
+                gateway_aborted = bool(rpc_result.get("ok")) and gateway_detail != "no_active_task"
             except Exception as e:
                 log.warning("chat.abort RPC failed for turn %s: %s", turn.id, e)
 
@@ -89,7 +91,7 @@ async def chat_abort(request: ChatAbortRequest) -> ChatAbortResponse:
 
     return ChatAbortResponse(
         ok=True,
-        detail="aborted",
+        detail=(f"aborted:{gateway_detail}" if gateway_detail else "aborted"),
         turn_id=turn.id,
     )
 

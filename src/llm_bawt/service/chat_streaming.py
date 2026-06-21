@@ -971,6 +971,13 @@ class ChatStreamingMixin:
 
         def _stream_to_queue():
             """Run streaming in a thread and push chunks to the async queue."""
+            def _turn_was_aborted() -> bool:
+                try:
+                    current_turn = self._turn_log_store.get_turn(turn_log_id)
+                    return current_turn is not None and current_turn.status == "aborted"
+                except Exception:
+                    return False
+
             try:
                 # Check if already cancelled before starting
                 if cancel_event.is_set():
@@ -1538,26 +1545,42 @@ class ChatStreamingMixin:
                 timing_holder[1] = time.time()
 
             except Exception as e:
-                if not cancel_event.is_set():
+                externally_aborted = _turn_was_aborted()
+                if externally_aborted:
+                    cancelled_holder[0] = True
+                elif not cancel_event.is_set():
                     put_queue_item_threadsafe(loop, chunk_queue, e)
                 elapsed_ms = (time.time() - timing_holder[0]) * 1000 if timing_holder[0] else None
-                self._update_turn_log(
-                    turn_id=turn_log_id,
-                    status="error",
-                    latency_ms=elapsed_ms,
-                    response_text=full_response_holder[0] or None,
-                    error_text=str(e),
-                )
+                if not externally_aborted:
+                    self._update_turn_log(
+                        turn_id=turn_log_id,
+                        status="error",
+                        latency_ms=elapsed_ms,
+                        response_text=full_response_holder[0] or None,
+                        error_text=str(e),
+                    )
             finally:
                 end_time = timing_holder[1] or time.time()
                 start_time = timing_holder[0] or end_time
                 elapsed_ms = (end_time - start_time) * 1000
+                externally_aborted = _turn_was_aborted()
+                if externally_aborted:
+                    cancelled_holder[0] = True
 
                 # Wrap finalization in try/except so that the sentinel,
                 # turn_complete event, and generation cleanup always fire
                 # even if persistence raises (e.g. database failure).
                 try:
-                    if full_response_holder[0]:
+                    if externally_aborted:
+                        # /v1/chat/abort owns this terminal state. Do not let
+                        # worker cleanup overwrite it as completed/timeout.
+                        self._update_turn_log(
+                            turn_id=turn_log_id,
+                            latency_ms=elapsed_ms,
+                            tool_calls=tool_call_details_holder or None,
+                            end_reason="aborted",
+                        )
+                    elif full_response_holder[0]:
                         self._finalize_turn(
                             llm_bawt=llm_bawt,
                             turn_id=turn_log_id,

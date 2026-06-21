@@ -474,12 +474,9 @@ class ClaudeCodeBridge:
                             continue
 
                         if action == "chat.send":
-                            session_key = fields.get("session_key", "")
-                            task = asyncio.create_task(
+                            asyncio.create_task(
                                 self._handle_send(fields, msg_id, async_redis)
                             )
-                            if session_key:
-                                self._session_queue.set_active_task(session_key, task)
                         elif action == "rpc.call":
                             asyncio.create_task(
                                 self._handle_rpc(fields, msg_id, async_redis)
@@ -607,7 +604,7 @@ class ClaudeCodeBridge:
                 session_key, request_id,
             )
 
-        async with self._session_queue.lock(session_key):
+        async with self._session_queue.active(session_key):
             logger.info(
                 "Handling send: request_id=%s session=%s model=%s system_prompt=%s msg=%.60s...",
                 request_id, session_key, model,
@@ -1360,6 +1357,15 @@ class ClaudeCodeBridge:
                 #   3. Fall back to task.cancel() so a runaway task that didn't
                 #      respect (1) and (2) still gets torn down.
                 self._session_queue.signal_cancel(session_key)
+                # DIAGNOSTIC (abort-not-killing-subprocess): dump the live
+                # registry keys so we can see whether the active stream is
+                # registered under a different key than the abort target.
+                logger.info(
+                    "chat.abort registry probe: target=%r stream_keys=%r task_keys=%r",
+                    session_key,
+                    list(self._session_queue._active_streams.keys()),
+                    list(self._session_queue._active_tasks.keys()),
+                )
                 stream = self._session_queue.pop_active_stream(session_key)
                 stream_closed = False
                 if stream is not None:
