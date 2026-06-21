@@ -784,15 +784,7 @@ class ClaudeCodeBridge:
 
                     options = ClaudeAgentOptions(
                         model=model,
-                        # Pass the system prompt on EVERY turn, including resume.
-                        # `resume=` restores the transcript but NOT the custom
-                        # system prompt — the SDK falls back to its default
-                        # ("You are a Claude agent...") when system_prompt is
-                        # None, so gating this on `not resume_id` made every bot
-                        # silently lose its persona + <runtime-context> model
-                        # block after turn 1 of a long-lived session. The bridge
-                        # already receives the (freshly rebuilt) prompt each turn.
-                        system_prompt=system_prompt,
+                        system_prompt=system_prompt if not resume_id else None,
                         cwd=self._cwd,
                         permission_mode=self._permission_mode,
                         include_partial_messages=True,
