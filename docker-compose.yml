@@ -155,6 +155,9 @@ services:
       # bind-mount the codex-bridge uses so a single `codex login` on the
       # host re-credentials both bridges.
       - CODEX_AUTH_PATH=/home/bridge/.codex/auth.json
+      # Z.AI (Zhipu GLM) — native Anthropic Messages API passthrough.
+      # Powers bots whose model_id is namespaced "zai/<glm-model>".
+      - ZAI_API_KEY=${ZAI_API_KEY:-}
     extra_hosts:
       - "host.docker.internal:host-gateway"
       - "echo.lan.zenoran.com:${ECHO_LAN_HOST_IP:-10.0.0.101}"

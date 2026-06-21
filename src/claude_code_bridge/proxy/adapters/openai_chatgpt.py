@@ -62,10 +62,10 @@ _FALLBACK_INSTRUCTIONS = "You are a helpful coding assistant."
 # no chain of thought at all. The codex CLI itself defaults gpt-5.4 to
 # "high" (see ~/.codex/config.toml `model_reasoning_effort`); match that.
 # Override per-deploy with OPENAI_CHATGPT_REASONING_EFFORT. Valid backend
-# values: minimal | low | medium | high.
+# values for GPT-5.4: none | low | medium | high | xhigh.
 DEFAULT_REASONING_EFFORT = "high"
 REASONING_EFFORT_ENV = "OPENAI_CHATGPT_REASONING_EFFORT"
-_VALID_EFFORT = {"minimal", "low", "medium", "high"}
+_VALID_EFFORT = {"none", "low", "medium", "high", "xhigh"}
 
 
 def _prompt_cache_key(responses_body: dict) -> str:

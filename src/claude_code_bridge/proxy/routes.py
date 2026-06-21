@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import logging
+import time
 
 from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse, StreamingResponse
@@ -94,6 +95,7 @@ async def messages(request: Request) -> JSONResponse | StreamingResponse:
     )
 
     async def _iter():
+        started = time.perf_counter()
         try:
             async for chunk in adapter.call(body, upstream_model):
                 yield chunk
@@ -122,6 +124,13 @@ async def messages(request: Request) -> JSONResponse | StreamingResponse:
             yield (
                 b"event: error\n"
                 b"data: " + json.dumps(err_payload).encode() + b"\n\n"
+            )
+        finally:
+            logger.info(
+                "Proxy /v1/messages completed provider=%s upstream_model=%s elapsed_ms=%.1f",
+                provider,
+                upstream_model,
+                (time.perf_counter() - started) * 1000,
             )
 
     return StreamingResponse(

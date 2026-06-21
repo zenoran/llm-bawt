@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from .base import ProviderAdapter
 from .openai_chatgpt import OpenAIChatGPTAdapter
+from .zai import ZaiAdapter
 
 REGISTRY: dict[str, ProviderAdapter] = {}
 
@@ -24,5 +25,6 @@ def lookup(name: str) -> ProviderAdapter | None:
 # Default registrations. Adding a new provider = create the adapter file,
 # import it here, and register an instance.
 register(OpenAIChatGPTAdapter())
+register(ZaiAdapter())
 
 __all__ = ["ProviderAdapter", "REGISTRY", "register", "lookup"]

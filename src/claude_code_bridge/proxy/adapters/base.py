@@ -75,6 +75,11 @@ class ProviderAdapter(ABC):
                 anthropic_body, upstream_model
             )
             responses_body = self.prepare_request(responses_body)
+            # Prompt-cache divergence diagnostic (no-op unless
+            # PROXY_CACHE_DIAG is set). Runs on the exact post-prepare body.
+            from .. import cache_diag
+
+            cache_diag.record(responses_body)
             logger.debug(
                 "Proxy → Responses API model=%s tools=%d input_items=%d",
                 responses_body.get("model"),
