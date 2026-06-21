@@ -95,6 +95,54 @@ def _live_tool_calls(store: TurnLogStore, turn_id: str) -> list[dict]:
     return out
 
 
+def _enrich_calls_with_timing(calls: list[dict], records: list[ToolCallRecord]) -> None:
+    """Stamp each call with real per-call ``started_at``/``ended_at``/``duration_ms``.
+
+    Sourced from ``tool_call_records``, which are written *incrementally* as
+    tool_start/tool_end events fire (via the Redis event sink) — so their
+    timestamps survive mid-stream reloads and terminated turns, unlike a
+    finalize-time write. Without this every call in a turn inherits the
+    event-level ``created_at`` (the turn start) and the UI renders N cards
+    with one identical timestamp.
+
+    Calls with no matching record (legacy rows, non-agent turns) are left
+    untouched; the frontend then falls back to the event-level created_at.
+    """
+    if not records:
+        return
+
+    by_call_id = {r.call_id: r for r in records if r.call_id}
+    by_iter_name: dict[tuple, list[ToolCallRecord]] = {}
+    for rec in records:
+        by_iter_name.setdefault((rec.iteration or 1, rec.tool_name), []).append(rec)
+    cursors: dict[tuple, int] = {}
+
+    def find(call: dict) -> ToolCallRecord | None:
+        cid = call.get("call_id")
+        if cid and cid in by_call_id:
+            return by_call_id[cid]
+        key = (call.get("iteration", 1), call.get("name") or call.get("tool"))
+        bucket = by_iter_name.get(key)
+        if not bucket:
+            return None
+        i = cursors.get(key, 0)
+        if i < len(bucket):
+            cursors[key] = i + 1
+            return bucket[i]
+        return None
+
+    for call in calls:
+        rec = find(call)
+        if rec is None:
+            continue
+        if rec.started_at is not None:
+            call["started_at"] = rec.started_at
+        if rec.ended_at is not None:
+            call["ended_at"] = rec.ended_at
+        if rec.duration_ms is not None:
+            call["duration_ms"] = rec.duration_ms
+
+
 def _live_tool_call_counts(store: TurnLogStore, turn_ids: list[str]) -> dict[str, int]:
     """Count realtime tool-call rows for multiple turns in one query."""
     if store.engine is None or not turn_ids:
@@ -433,6 +481,25 @@ def get_tool_call_events(
         offset=0,
     )
 
+    # Batch-fetch real per-call timing for every turn in one query so each
+    # tool call can carry its source event timestamp (started_at/ended_at)
+    # instead of all sharing the turn-level created_at.
+    records_by_turn: dict[str, list[ToolCallRecord]] = {}
+    turn_ids = [r.id for r in rows if r.id]
+    if store.engine is not None and turn_ids:
+        try:
+            with Session(store.engine) as session:
+                rec_rows = list(
+                    session.exec(
+                        select(ToolCallRecord).where(ToolCallRecord.turn_id.in_(turn_ids))
+                    ).all()
+                )
+            for rec in rec_rows:
+                if rec.turn_id:
+                    records_by_turn.setdefault(rec.turn_id, []).append(rec)
+        except Exception:
+            pass
+
     events: list[ToolCallEvent] = []
     for row in rows:
         parsed_tools = _parse_json(row.tool_calls_json) or []
@@ -442,6 +509,9 @@ def get_tool_call_events(
             parsed_tools = _live_tool_calls(store, row.id)
         if not parsed_tools:
             continue
+
+        # Attach real per-call timestamps (incremental source records).
+        _enrich_calls_with_timing(parsed_tools, records_by_turn.get(row.id, []))
 
         trigger_id = row.trigger_message_id
         trigger_role = "user"
