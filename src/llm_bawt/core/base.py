@@ -30,7 +30,6 @@ from ..tools import get_tools_prompt, get_tools_list, query_with_tools
 from ..utils.config import Config
 from ..utils.paths import resolve_log_dir
 from ..utils.history import HistoryManager, Message
-from ..utils.temporal import build_temporal_context
 from ..adapters import get_adapter, ModelAdapter
 from .prompt_builder import GLOBAL_SYSTEM_PROMPT, PromptBuilder, SectionPosition
 from .model_lifecycle import ModelLifecycleManager, get_model_lifecycle
@@ -466,15 +465,13 @@ class BaseLLMBawt(ABC):
         # Start with a copy of the prompt builder
         builder = self._prompt_builder.copy()
 
-        # Temporal grounding so relative-time references remain unambiguous.
-        # Agent backends manage their own history — don't reference llm-bawt's
-        is_agent = self.model_definition.get("type") in ("agent_backend", "claude-code")
-        builder.add_section(
-            "temporal_context",
-            build_temporal_context(None if is_agent else self.history_manager.messages),
-            position=SectionPosition.DATETIME,
-        )
-        
+        # NOTE: temporal grounding (build_temporal_context @ SectionPosition.DATETIME)
+        # was removed here (TASK-288). It changed every minute and sat near the TOP
+        # of the system prompt — the cacheable prefix — so it busted the prompt cache
+        # for agent bots on every turn and added per-turn variance for chatbots too.
+        # Relative-time grounding needs a proper redesign off the cacheable prefix
+        # (a separate future task); do NOT re-add it to the system prompt.
+
         # Add tool instructions (skip if tool_format is "none")
         if self.tool_format != "none":
             if self.bot.uses_tools:
@@ -537,29 +534,33 @@ class BaseLLMBawt(ABC):
 
         # Response-style instruction derived from keywords in the user's message.
         # Lets the user shape any bot's answer inline without extra config.
+        #
+        # TASK-288: this is per-turn, user-message-driven variance. It must NOT be
+        # baked into the system prompt — doing so (a) is backwards coupling (the
+        # user's text mutating the system block) and (b) busts the cacheable
+        # system-prompt prefix on agent bots whenever a keyword fires. Compute it
+        # here, then stamp it onto the OUTBOUND COPY of the user message below
+        # (mirroring the agent_user_prefix pattern) so it shapes the answer
+        # without ever landing in stored history/memory or the cached prefix.
+        # Matched on word boundaries so it doesn't trip on substrings inside
+        # unrelated words.
+        response_style: str | None = None
         if prompt:
             _p = prompt.lower()
-            _style = None
-            if "tldr" in _p:
-                _style = (
+            if re.search(r"\btldr\b", _p):
+                response_style = (
                     "Answer as a tight TL;DR: lead with the one-line bottom line, "
                     "then a few short bullets. No preamble, no filler."
                 )
-            elif "eli5" in _p:
-                _style = (
+            elif re.search(r"\beli5\b", _p):
+                response_style = (
                     "Explain simply, as if to a smart person outside this field. "
                     "Plain words, concrete analogies, no jargon."
                 )
-            elif "deep dive" in _p or "deepdive" in _p:
-                _style = (
+            elif re.search(r"\bdeep[ -]?dive\b", _p):
+                response_style = (
                     "Go thorough: cover the mechanism, trade-offs, edge cases, and "
                     "end with a recommendation. Depth over brevity."
-                )
-            if _style:
-                builder.add_section(
-                    "response_style",
-                    _style,
-                    position=SectionPosition.CUSTOM,
                 )
 
         # Build final system message
@@ -574,24 +575,28 @@ class BaseLLMBawt(ABC):
         # Agent backends manage their own conversation history —
         # only include the current user message, skip old history.
         #
-        # Voice-mode-only user-message prefix: agent SDKs (Claude Code, Codex)
-        # lock the system prompt at session start and ignore it on resume, so
-        # the chat.tts_output_instructions that ride in the system prompt never
-        # reach the agent when a session began in text mode. Stamp a per-turn
-        # prefix on the user message instead — the single implementation point
-        # for every agent backend.
+        # Per-turn user-message prefixes: some content is per-turn or mode-
+        # dependent (e.g. the voice tts_output_instructions when a session began
+        # in text mode) and we deliberately keep it OFF the system prompt so the
+        # cacheable system-prompt prefix stays byte-stable across turns
+        # (TASK-288). Such content is stamped on the user message instead — the
+        # single implementation point for every agent backend.
         #
-        # Strictly voice-only: when tts_mode is false, the message is forwarded
-        # unchanged (zero behavior change vs pre-prefix baseline). Slash
-        # commands (e.g. /new) are also passed through untouched because the
+        # NOTE: the agent SDK does NOT lock or drop the system prompt on resume
+        # (that was a long-standing myth, corrected in TASK-288 after reading the
+        # SDK source — systemPrompt is rebuilt and sent on every query() call).
+        # The system prompt now persists every turn via the bridge; user-message
+        # prefixes here are about per-turn variance and cache-stability, not a
+        # workaround for a resume limitation.
+        #
+        # Slash commands (e.g. /new) are passed through untouched because the
         # bridges consume them via a literal startswith("/new") check before
         # the agent ever sees them.
         if self.model_definition.get("type") in ("agent_backend", "claude-code"):
             user_content = prompt
-            # Two independent per-turn prefixes can ride on the user message
-            # because the agent SDK locks the system prompt at session start
-            # and ignores it on resume — anything mode-dependent or session-
-            # configurable has to be stamped per-turn here.
+            # Per-turn prefixes that ride on the user message (kept off the cached
+            # system prefix). Anything mode-dependent or session-configurable is
+            # stamped per-turn here.
             #
             #   - chat.agent_user_prefix  fires whenever _inject_user_prefix is
             #     True (controlled by the chat composer's "Agent prefix" toggle
@@ -624,6 +629,13 @@ class BaseLLMBawt(ABC):
                     if body_voice:
                         prefix_parts.append(body_voice)
                         applied_keys.append(("chat.agent_voice_prefix", len(body_voice), resolved_voice.source))
+
+                # TASK-288: inline response-style (tldr/eli5/deep dive) rides on
+                # the user message, not the system prompt, so it never busts the
+                # cached system-prompt prefix. Last so it's the narrowest framing.
+                if response_style:
+                    prefix_parts.append(response_style)
+                    applied_keys.append(("response_style", len(response_style), "inline-keyword"))
 
                 if prefix_parts:
                     combined = "\n\n".join(prefix_parts)
@@ -681,6 +693,21 @@ class BaseLLMBawt(ABC):
                     # Include tool-result system messages so the LLM sees
                     # evidence that past device actions required real tool calls.
                     messages.append(msg)
+
+        # TASK-288: stamp the inline response-style directive onto the OUTBOUND
+        # COPY of the latest user message. We replace the list entry with a new
+        # Message rather than mutating it in place — the entries are references to
+        # the persisted history objects, so mutating would leak the directive into
+        # stored history/memory.
+        if response_style:
+            for i in range(len(messages) - 1, -1, -1):
+                if messages[i].role == "user":
+                    original = messages[i].content or ""
+                    messages[i] = Message(
+                        role="user",
+                        content=f"{response_style}\n\n---\n\n{original}",
+                    )
+                    break
 
         return messages
 

@@ -563,10 +563,16 @@ class CodexBridge:
                     prompt_input, tmp_image_paths = self._build_prompt_input(
                         message,
                         attachments,
-                        # Inject system prompt only on a fresh thread; on
-                        # resume the codex thread already carries prior
-                        # context and re-injecting would bloat each turn.
-                        system_prompt=None if resume_id else system_prompt,
+                        # TASK-288: inject the system prompt on EVERY turn, resume
+                        # included. Previously gated to fresh threads only, which
+                        # meant the persona decayed to nothing on long-lived codex
+                        # sessions (the steady state, since the thread is resumed
+                        # every turn). The prompt is now byte-stable (temporal +
+                        # response-style moved off it in core/base.py), so re-
+                        # sending keeps persona alive. Codex prepends it to the
+                        # user message rather than a cached system param, so this
+                        # adds the (stable) persona to each turn's input.
+                        system_prompt=system_prompt,
                     )
 
                     aborted = False

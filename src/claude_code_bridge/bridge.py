@@ -784,7 +784,14 @@ class ClaudeCodeBridge:
 
                     options = ClaudeAgentOptions(
                         model=model,
-                        system_prompt=system_prompt if not resume_id else None,
+                        # TASK-288: send the system prompt on EVERY turn, resume
+                        # included. The SDK rebuilds and re-sends systemPrompt on
+                        # every query() (it is NOT locked at session start), and
+                        # the prompt is now byte-stable (temporal + response-style
+                        # moved off it), so re-sending reads the full prefix from
+                        # cache (~10% cost, POC-confirmed) while keeping persona
+                        # alive on resume instead of decaying to the stock default.
+                        system_prompt=system_prompt,
                         cwd=self._cwd,
                         permission_mode=self._permission_mode,
                         include_partial_messages=True,
