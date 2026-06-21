@@ -212,6 +212,15 @@ def _assistant_content_to_responses(content: Any) -> list[dict]:
         btype = block.get("type")
         if btype == "text":
             text_buf.append(block.get("text") or "")
+        elif btype in ("thinking", "redacted_thinking"):
+            # Reasoning we surfaced on the way OUT (stream.py turns Responses
+            # reasoning into Anthropic thinking blocks). On the return trip we
+            # DROP it: the upstream runs store:false / stateless, so reasoning
+            # is reconstructed fresh each turn and must NOT be replayed as input
+            # (OpenAI rejects foreign reasoning items; the signature we minted
+            # is a local sentinel, not a real encrypted_content). See the
+            # TASK-270 stateless note in the skill doc.
+            continue
         elif btype == "tool_use":
             flush_text()
             tool_input = block.get("input") or {}
@@ -317,7 +326,11 @@ def anthropic_to_responses(body: dict, upstream_model: str) -> dict:
         budget = thinking.get("budget_tokens")
         effort = _effort_from_budget(budget)
         if effort:
-            payload["reasoning"] = {"effort": effort}
+            # `summary: auto` makes the upstream stream human-readable reasoning
+            # summary deltas (surfaced as Anthropic thinking blocks). Without it
+            # the model still reasons but emits only an opaque encrypted item,
+            # so the UI sees a signature with no visible thinking text.
+            payload["reasoning"] = {"effort": effort, "summary": "auto"}
 
     if body.get("stream"):
         payload["stream"] = True

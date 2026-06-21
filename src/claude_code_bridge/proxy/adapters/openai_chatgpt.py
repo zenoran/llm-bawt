@@ -306,4 +306,11 @@ class OpenAIChatGPTAdapter(ProviderAdapter):
             if effort not in _VALID_EFFORT:
                 effort = DEFAULT_REASONING_EFFORT
             responses_body["reasoning"] = {"effort": effort}
+        # Request human-readable reasoning summaries so the backend streams
+        # response.reasoning_summary_text.delta events (→ Anthropic thinking
+        # blocks in the UI). Without `summary` the backend returns only the
+        # opaque encrypted reasoning item — a signature but no visible text,
+        # exactly the "reasoning is silent" symptom. Matches codex CLI's
+        # `model_reasoning_summary = auto`.
+        responses_body["reasoning"].setdefault("summary", "auto")
         return responses_body
