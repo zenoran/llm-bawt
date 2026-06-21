@@ -19,11 +19,20 @@ services:
       - apparmor:unconfined  # AppArmor not available on this kernel; nvidia-ctk owns daemon.json
     env_file:
       - ./.env
+    environment:
+      # /v1/usage Claude adapter: a DEDICATED login bundle the app owns and
+      # refreshes itself (mode=owned) so it never goes stale and never touches
+      # your interactive Claude Code (TUI) login. Lives under the already-RW
+      # ~/.config/llm-bawt mount. One-time setup in docs/usage-endpoint.md.
+      - CLAUDE_USAGE_CREDENTIALS_PATH=/root/.config/llm-bawt/claude-usage/.credentials.json
+      - CLAUDE_USAGE_CREDENTIALS_MODE=owned
     ports:
       - "${MCP_PORT:-8001}:8001"
       - "${SERVICE_PORT:-8642}:8642"
     volumes:
-      # Mount host config directory to avoid duplication
+      # Mount host config directory to avoid duplication. The /v1/usage
+      # endpoint's dedicated Claude login bundle lives under this (RW) mount at
+      # claude-usage/.credentials.json — the app refreshes it in place.
       - ${HOME}/.config/llm-bawt:/root/.config/llm-bawt
       # Mount logs directory
       - ./.logs:/app/.logs

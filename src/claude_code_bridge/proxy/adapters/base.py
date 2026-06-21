@@ -88,6 +88,12 @@ class ProviderAdapter(ABC):
             )
             # ``stream=True`` returns an AsyncStream of typed events.
             upstream_stream = await client.responses.create(**responses_body)
+            # Best-effort: stash codex plan-usage from the response headers for
+            # /v1/usage. Synchronous header peek + fire-and-forget Redis write;
+            # never blocks or breaks inference.
+            from .. import usage_capture
+
+            usage_capture.schedule_capture(upstream_stream)
             async for chunk in stream_mod.responses_to_anthropic_sse(
                 upstream_stream,
                 anthropic_model=anthropic_body.get("model", upstream_model),

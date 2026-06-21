@@ -16,6 +16,7 @@ from .settings import router as settings_router
 from .tasks import router as tasks_router
 from .ha_weather import router as ha_weather_router
 from .turn_logs import router as turn_logs_router
+from .usage import router as usage_router
 # TASK-214: avatar_animations CRUD moved to bawthub Prisma.
 # /v1/avatar/animations routes were deleted; admin lives at
 # bawthub's /api/avatar/animation-triggers now.
@@ -32,6 +33,7 @@ all_routers = [
     chat_router,
     tasks_router,
     turn_logs_router,
+    usage_router,
     jobs_router,
     history_router,
     memory_router,
