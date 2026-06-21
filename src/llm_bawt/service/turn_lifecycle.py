@@ -218,6 +218,7 @@ class TurnLifecycleMixin:
         agent_request_id: str | None = None,
         animation: str | None = None,
         token_usage: dict | None = None,
+        end_reason: str | None = None,
     ) -> None:
         """Update an existing turn log row with new data."""
         try:
@@ -238,6 +239,7 @@ class TurnLifecycleMixin:
                 agent_request_id=agent_request_id,
                 animation=animation,
                 token_usage=token_usage,
+                end_reason=end_reason,
             )
         except Exception as e:
             log.debug("Failed to update turn log: %s", e)
@@ -285,8 +287,16 @@ class TurnLifecycleMixin:
         animation: str | None = None,
         token_usage: dict | None = None,
         attachments: list[dict] | None = None,
+        status: str = "ok",
+        end_reason: str | None = None,
     ) -> None:
-        """Finalize a turn in one place for both non-streaming and streaming paths."""
+        """Finalize a turn in one place for both non-streaming and streaming paths.
+
+        ``status``/``end_reason`` default to a normal ``ok`` completion. The abort
+        path passes ``status="aborted"`` so a Stop still COMMITS the partial
+        assistant text to history (instead of discarding the in-progress message)
+        while preserving the aborted terminal state (TASK-286).
+        """
         if not response_text:
             return
 
@@ -324,13 +334,14 @@ class TurnLifecycleMixin:
 
         self._update_turn_log(
             turn_id=turn_id,
-            status="ok",
+            status=status,
             latency_ms=elapsed_ms,
             prepared_messages=prepared_messages,
             response_text=response_text,
             tool_calls=tool_call_details,
             animation=animation,
             token_usage=token_usage,
+            end_reason=end_reason,
         )
 
         if stream:

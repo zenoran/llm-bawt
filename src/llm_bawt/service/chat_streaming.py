@@ -1626,12 +1626,41 @@ class ChatStreamingMixin:
                     if externally_aborted:
                         # /v1/chat/abort owns this terminal state. Do not let
                         # worker cleanup overwrite it as completed/timeout.
-                        self._update_turn_log(
-                            turn_id=turn_log_id,
-                            latency_ms=elapsed_ms,
-                            tool_calls=tool_call_details_holder or None,
-                            end_reason="aborted",
-                        )
+                        #
+                        # TASK-286: a Stop must NOT delete the in-progress reply.
+                        # If any assistant text streamed before the abort, COMMIT
+                        # it to history (so it stays in the chat as a truncated
+                        # turn) — _finalize_turn writes the assistant row +
+                        # response_text. Pass status="aborted" so it keeps the
+                        # aborted terminal state instead of flipping to "ok".
+                        # With no partial text, just stamp the turn log aborted.
+                        if full_response_holder[0]:
+                            self._finalize_turn(
+                                llm_bawt=llm_bawt,
+                                turn_id=turn_log_id,
+                                response_text=full_response_holder[0],
+                                tool_context=tool_context_holder[0],
+                                tool_call_details=tool_call_details_holder,
+                                prepared_messages=messages if "messages" in locals() else [],
+                                user_prompt=user_prompt,
+                                model=model_alias,
+                                bot_id=bot_id,
+                                user_id=user_id,
+                                elapsed_ms=elapsed_ms,
+                                stream=True,
+                                animation=animation_holder[0],
+                                token_usage=token_usage_holder[0],
+                                attachments=agent_attachments_holder or None,
+                                status="aborted",
+                                end_reason="aborted",
+                            )
+                        else:
+                            self._update_turn_log(
+                                turn_id=turn_log_id,
+                                latency_ms=elapsed_ms,
+                                tool_calls=tool_call_details_holder or None,
+                                end_reason="aborted",
+                            )
                     elif full_response_holder[0]:
                         self._finalize_turn(
                             llm_bawt=llm_bawt,
