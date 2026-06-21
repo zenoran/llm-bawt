@@ -450,7 +450,11 @@ class JobScheduler:
                 return True, None
             return False, "No profile attribute changes since last summary build"
 
-    def _has_pending_history_summaries(self, bot_id: str) -> tuple[bool, int]:
+    def _has_pending_history_summaries(
+        self,
+        bot_id: str,
+        job_config: dict | None = None,
+    ) -> tuple[bool, int]:
         """Return whether there are currently eligible unsummarized sessions.
 
         This guards against backlog starvation where no *new* activity happened
@@ -458,20 +462,55 @@ class JobScheduler:
         unsummarized.
         """
         try:
+            from ..bots import BotManager
             from ..memory.summarization import HistorySummarizer
 
             config = self.task_processor.config
-            # Resolve context budget from the bot's default model
-            max_context_tokens = int(getattr(config, "MAX_CONTEXT_TOKENS", 0) or 0)
-            if max_context_tokens <= 0:
-                ctx_window = config.get_model_context_window(None)
-                max_output = getattr(config, "MAX_OUTPUT_TOKENS", 4096)
+            job_config = job_config or {}
+
+            # Match _process_history_summarization exactly.  The old probe used
+            # global settings and the default model while execution used the
+            # bot's runtime settings and resolved background model.  That made
+            # the probe say "pending" and execution immediately return zero.
+            requested_model = (
+                job_config.get("model")
+                or getattr(config, "MAINTENANCE_MODEL", None)
+                or getattr(config, "SUMMARIZATION_MODEL", None)
+            )
+            preferred_model = (
+                requested_model
+                or getattr(config, "EXTRACTION_MODEL", None)
+                or getattr(config, "MAINTENANCE_MODEL", None)
+                or getattr(config, "SUMMARIZATION_MODEL", None)
+            )
+            model_alias = None
+            resolve_model = getattr(self.task_processor, "_resolve_request_model", None)
+            if callable(resolve_model):
+                model_alias, _ = resolve_model(
+                    preferred_model,
+                    bot_id="nova",
+                    local_mode=False,
+                )
+
+            max_context_tokens = 0
+            if model_alias:
+                ctx_window = int(config.get_model_context_window(model_alias) or 0)
+                max_output = int(config.get_model_max_tokens(model_alias) or 4096)
                 if ctx_window > 0:
                     max_context_tokens = ctx_window - max_output
+
+            bot_manager = BotManager(config)
+            bot_obj = bot_manager.get_bot(bot_id) or bot_manager.get_default_bot()
+            resolver = RuntimeSettingsResolver(
+                config=config,
+                bot=bot_obj,
+                bot_id=bot_id,
+            )
 
             summarizer = HistorySummarizer(
                 config,
                 bot_id=bot_id,
+                settings_getter=resolver.resolve,
                 max_context_tokens=max_context_tokens,
             )
             eligible_sessions = summarizer.preview_summarizable_sessions()
@@ -505,7 +544,10 @@ class JobScheduler:
             if job.job_type == JobType.HISTORY_SUMMARIZATION:
                 # Primary gate: if there are eligible unsummarized sessions,
                 # run even without fresh message activity since last_run_at.
-                has_pending, pending_count = self._has_pending_history_summaries(job.bot_id)
+                has_pending, pending_count = self._has_pending_history_summaries(
+                    job.bot_id,
+                    config,
+                )
                 if has_pending:
                     return True, f"{pending_count} pending unsummarized session(s)"
 

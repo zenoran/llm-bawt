@@ -981,11 +981,14 @@ class HistorySummarizer:
         overflow the token budget are candidates for summarization.
         """
         messages = self._get_all_messages()
-        # Only consider raw, non-recalled, unsummarized messages.
+        # Only conversation turns are summarizable.  Internal/system/tool rows
+        # are not shown as messages in the UI and some are omitted from the
+        # summarization prompt entirely; counting them here can make an
+        # apparently empty bot eligible and trigger a useless LLM request.
         regular_messages = [
             m
             for m in messages
-            if m.get("role") != "summary"
+            if m.get("role") in ("user", "assistant")
             and not bool(m.get("recalled_history"))
             and not bool(m.get("summarized"))
         ]

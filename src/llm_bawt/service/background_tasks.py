@@ -483,13 +483,29 @@ class BackgroundTasksMixin:
         bot_obj = bot_manager.get_bot(bot_id) or bot_manager.get_default_bot()
         resolver = RuntimeSettingsResolver(config=self.config, bot=bot_obj, bot_id=bot_id)
 
-        # Compute effective context budget from the resolved model
-        max_context_tokens = 0
-        if model_alias:
-            ctx_window = int(self.config.get_model_context_window(model_alias) or 0)
-            max_output = int(self.config.get_model_max_tokens(model_alias) or 4096)
-            if ctx_window > 0:
-                max_context_tokens = ctx_window - max_output
+        # Trigger budget: how much recent raw conversation to keep verbatim
+        # before older sessions get folded into summaries.  This is the
+        # summarization *trigger*, NOT the chat model's full context window.
+        # Tying it to the model window (128K for grok) pushed the threshold so
+        # high that summaries effectively stopped being generated.  Resolve a
+        # per-bot override first, then the config default.
+        trigger_tokens = int(
+            resolver.resolve(
+                "summarization_trigger_tokens",
+                getattr(self.config, "SUMMARIZATION_TRIGGER_TOKENS", 12000),
+            )
+            or 0
+        )
+        if trigger_tokens > 0:
+            max_context_tokens = trigger_tokens
+        else:
+            # Legacy opt-out: derive the budget from the model context window.
+            max_context_tokens = 0
+            if model_alias:
+                ctx_window = int(self.config.get_model_context_window(model_alias) or 0)
+                max_output = int(self.config.get_model_max_tokens(model_alias) or 4096)
+                if ctx_window > 0:
+                    max_context_tokens = ctx_window - max_output
 
         summarizer = HistorySummarizer(
             self.config,

@@ -9,7 +9,7 @@ import re
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Any, Optional, Protocol, TYPE_CHECKING
+from typing import Optional, Protocol
 
 from .prompts import (
     MEMORY_TAGS,
@@ -18,9 +18,6 @@ from .prompts import (
     get_summary_extraction_prompt,
     estimate_importance,
 )
-
-if TYPE_CHECKING:
-    from ...models.message import Message
 
 logger = logging.getLogger(__name__)
 
@@ -169,7 +166,7 @@ class MemoryExtractionService:
         Returns:
             List of ExtractedFact objects
         """
-        if not summary_text or not summary_text.strip():
+        if not self.summary_has_extractable_content(summary_text):
             return []
 
         if use_llm and self.llm_client:
@@ -183,6 +180,29 @@ class MemoryExtractionService:
         # Heuristic fallback: treat summary as a single user message
         fake_messages = [{"role": "user", "content": summary_text, "id": summary_id}]
         return self._extract_with_heuristics(fake_messages, [summary_id])
+
+    @staticmethod
+    def summary_has_extractable_content(summary_text: str | None) -> bool:
+        """Return whether a structured summary contains any substantive text.
+
+        Summarizers can legitimately return an all-placeholder summary for
+        reset commands, smoke tests, or empty/internal sessions.  Sending that
+        output to a second model can never produce a grounded persistent fact.
+        """
+        if not summary_text or not summary_text.strip():
+            return False
+
+        content = re.sub(
+            r"(?im)^\s*(?:\[historical summary\]|summary:|key details:|intent:|tone:|open loops:)\s*",
+            "",
+            summary_text,
+        )
+        content = re.sub(
+            r"(?i)\b(?:n/?a|none|not applicable|no open loops?)\b[\s,;.!-]*",
+            "",
+            content,
+        )
+        return bool(re.search(r"[A-Za-z0-9]", content))
 
     def _extract_from_summary_with_llm(
         self,

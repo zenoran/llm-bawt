@@ -114,6 +114,7 @@ class RuntimeTunables(BaseModel):
     # --- Summarization (budget-driven) --- #
     SUMMARIZATION_SESSION_GAP_SECONDS: int = Field(default=3600, description="Gap (seconds) between messages that splits history into separate sessions (3600 = 1 hr)")
     SUMMARIZATION_MIN_MESSAGES_PER_SESSION: int = Field(default=2, description="Minimum messages in a session for it to be summarizable")
+    SUMMARIZATION_TRIGGER_TOKENS: int = Field(default=12000, description="How much recent raw conversation to keep verbatim before older sessions are folded into summaries. This is the summarization TRIGGER budget, NOT the chat model's full context window. 0 = fall back to the model's context window (legacy behavior; effectively disables summarization for large-context models).")
     SUMMARIZATION_MAX_IN_CONTEXT: int = Field(default=5, description="Max past session summaries injected into the prompt")
     SUMMARIZATION_COMPACT_CONTEXT: bool = Field(default=True, description="Use shorter summary representations in the prompt to save tokens")
 

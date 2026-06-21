@@ -3,6 +3,7 @@
 import time
 
 from llm_bawt.memory.summarization import (
+    HistorySummarizer,
     Session,
     SUMMARIZATION_PROMPT,
     compress_structured_summary_text,
@@ -56,6 +57,28 @@ def test_find_budget_overflow_sessions_returns_empty_with_zero_budget() -> None:
         max_context_tokens=0,
     )
     assert len(result) == 0
+
+
+def test_preview_ignores_non_conversation_rows() -> None:
+    """Internal rows must not make a bot with no chat turns summarizable."""
+    summarizer = HistorySummarizer.__new__(HistorySummarizer)
+    summarizer.session_gap_seconds = 3600
+    summarizer.max_context_tokens = 100
+    summarizer.protected_recent_turns = 0
+    summarizer.min_messages_per_session = 2
+    summarizer._get_all_messages = lambda: [
+        {
+            "id": f"system-{i}",
+            "role": "system",
+            "content": "internal context " * 100,
+            "timestamp": float(i),
+            "summarized": False,
+            "recalled_history": False,
+        }
+        for i in range(4)
+    ]
+
+    assert summarizer.preview_summarizable_sessions() == []
 
 
 def test_find_budget_overflow_sessions_identifies_overflow() -> None:
