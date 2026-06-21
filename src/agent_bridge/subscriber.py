@@ -549,12 +549,16 @@ class RedisSubscriber:
                             await self._redis.xack(stream_key, consumer_group, msg_id)
                             continue
 
-                        # Only process tool events
-                        if data.get("_type") == "tool_event":
+                        # Persist tool events (tool_start/tool_end) and, for
+                        # agent turns, coalesced assistant text deltas — both
+                        # need a durable path independent of the HTTP connection
+                        # (TASK-286). turn_complete lets the sink release its
+                        # per-turn text buffer.
+                        if data.get("_type") in ("tool_event", "text_delta", "turn_complete"):
                             try:
                                 callback(data)
                             except Exception:
-                                logger.exception("Tool event persistence callback failed")
+                                logger.exception("Event persistence callback failed")
                         await self._redis.xack(stream_key, consumer_group, msg_id)
 
             except asyncio.CancelledError:

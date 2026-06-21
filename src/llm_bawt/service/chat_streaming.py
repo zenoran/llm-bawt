@@ -31,6 +31,15 @@ log = get_service_logger(__name__)
 # pool so multiple bots run concurrently.
 _LOCAL_GPU_MODEL_TYPES = frozenset({"gguf", "vllm", "llamacpp"})
 
+# TASK-286: assistant text deltas are coalesced into chunks of at least this
+# many characters before being published to the unified Redis stream as
+# ``text_delta`` events. The original HTTP body still streams every token to
+# the requesting client; this parallel channel exists only so a refreshed /
+# secondary client can recover (and keep streaming) the response TEXT — not
+# just tool calls. Coalescing keeps the capped Redis stream (MAXLEN 5000,
+# shared per bot+user) from churning on per-token writes.
+_TEXT_DELTA_FLUSH_CHARS = 80
+
 
 class ChatStreamingMixin:
     """Mixin providing streaming chat completions for BackgroundService."""
@@ -1386,6 +1395,38 @@ class ChatStreamingMixin:
                     # (including the injected "\n\n" breaks below).
                     _text_chars = [0]
 
+                    # TASK-286: buffer assistant text and publish it to the
+                    # unified Redis stream as coalesced ``text_delta`` events so
+                    # a refreshed / secondary client recovers (and keeps
+                    # streaming) the response TEXT alongside tool calls. Gated to
+                    # agent backends (claude-code / openclaw) — the only path
+                    # whose text had no durable/resumable channel. Buffer must
+                    # stay in lock-step with ``_text_chars`` so each delta's
+                    # ``text_offset`` (chars emitted before it) is exact.
+                    _text_buf: list[str] = []
+
+                    def _flush_text(min_chars: int = 0):
+                        if not is_agent_backend or not _text_buf:
+                            return
+                        s = "".join(_text_buf)
+                        if len(s) < min_chars:
+                            return
+                        _text_buf.clear()
+                        _publish_event_direct({
+                            "_type": "text_delta",
+                            "turn_id": turn_log_id,
+                            "trigger_message_id": trigger_message_id,
+                            "bot_id": bot_id,
+                            "user_id": user_id,
+                            # Chars of assistant text emitted BEFORE this delta —
+                            # lets the client splice it at the right position and
+                            # dedupe an overlapping/replayed delta regardless of
+                            # arrival order vs the cold-reload partial fetch.
+                            "text_offset": _text_chars[0] - len(s),
+                            "delta": s,
+                            "ts": time.time(),
+                        })
+
                     for item in inner:
                         # Capture agent_request_id on first yielded item
                         if is_agent_backend and not _oc_request_id_captured[0]:
@@ -1405,6 +1446,7 @@ class ChatStreamingMixin:
                         if isinstance(item, str) and item.strip():
                             if _saw_tool and _saw_text:
                                 _text_chars[0] += 2
+                                _text_buf.append("\n\n")
                                 yield "\n\n"
                             _saw_tool = False
                             _saw_text = True
@@ -1432,6 +1474,9 @@ class ChatStreamingMixin:
                                 continue
                             if evt in ("tool_call", "tool_result"):
                                 _saw_tool = True
+                                # Flush buffered text BEFORE the tool event so
+                                # the resume channel preserves text→tool order.
+                                _flush_text()
                             if evt == "tool_call":
                                 _oc_call_index[0] += 1
                                 cid = f"call_{uuid.uuid4().hex[:8]}"
@@ -1514,7 +1559,14 @@ class ChatStreamingMixin:
                                         break
                         if isinstance(item, str):
                             _text_chars[0] += len(item)
+                            _text_buf.append(item)
+                            _flush_text(min_chars=_TEXT_DELTA_FLUSH_CHARS)
                         yield item
+
+                    # Flush trailing buffered text so the tail of the response
+                    # reaches the resume channel even if it never crossed the
+                    # size threshold (e.g. a short final paragraph after a tool).
+                    _flush_text()
 
                 # Stream chunks to queue
                 cancelled_holder[0] = consume_stream_chunks(

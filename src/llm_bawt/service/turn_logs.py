@@ -378,6 +378,32 @@ class TurnLogStore:
             session.add(row)
             session.commit()
 
+    def update_partial_response(self, *, turn_id: str, response_text: str) -> None:
+        """Write in-flight partial assistant text without clobbering a finalized
+        turn (TASK-286).
+
+        Conditional on ``status='streaming'`` so once ``_finalize_turn`` flips
+        the row to ``ok`` (with the cleaned, authoritative text) this becomes a
+        no-op — a late drain write can never overwrite the final response. This
+        is the text analogue of the incremental ``tool_call_records`` writes:
+        it gives a COLD reload (resumeScan → /v1/turn-logs) the partial text
+        that was streamed before a refresh, and survives client disconnect
+        because the drain consumer runs server-side, not in the request thread.
+        """
+        if self.engine is None or not turn_id:
+            return
+        try:
+            with self.engine.begin() as conn:
+                conn.execute(
+                    sa_text(
+                        "UPDATE turn_logs SET response_text = :t"
+                        " WHERE id = :id AND status = 'streaming'"
+                    ),
+                    {"t": response_text, "id": turn_id},
+                )
+        except Exception as e:
+            logger.debug("update_partial_response failed for %s: %s", turn_id, e)
+
     def get_turn(self, turn_id: str) -> TurnLog | None:
         """Get one turn by id."""
         if self.engine is None:

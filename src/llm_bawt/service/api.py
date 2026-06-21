@@ -209,10 +209,39 @@ async def lifespan(app):
                 import asyncio
                 service._group_cleanup_task = asyncio.create_task(_cleanup_stale_groups())
 
-                # Start persistence consumer for tool events → Postgres
+                # Start persistence consumer for tool events → Postgres.
+                # TASK-286: also accumulates assistant text deltas per turn so a
+                # COLD reload (and a turn that completes after the client
+                # disconnects) recovers the response TEXT, not just tool calls.
+                _partial_text: dict[str, str] = {}
+
                 def _tool_event_sink(event_data: dict) -> None:
-                    """Persist tool_start/tool_end events to tool_call_records table."""
+                    """Persist tool_start/tool_end + text_delta events to Postgres."""
                     store = service._turn_log_store
+                    _type = event_data.get("_type")
+                    if _type == "text_delta":
+                        turn_id = event_data.get("turn_id")
+                        if not turn_id:
+                            return
+                        delta = event_data.get("delta", "") or ""
+                        offset = event_data.get("text_offset")
+                        buf = _partial_text.get(turn_id, "")
+                        # Offset-aware splice: contiguous deltas append; an
+                        # overlapping/replayed delta rewrites in place rather
+                        # than duplicating; a gap (offset past the buffer) falls
+                        # back to append (best effort — finalize fixes the rest).
+                        if isinstance(offset, int) and 0 <= offset <= len(buf):
+                            buf = buf[:offset] + delta
+                        else:
+                            buf = buf + delta
+                        _partial_text[turn_id] = buf
+                        store.update_partial_response(turn_id=turn_id, response_text=buf)
+                        return
+                    if _type == "turn_complete":
+                        tid = event_data.get("turn_id")
+                        if tid:
+                            _partial_text.pop(tid, None)
+                        return
                     event_type = event_data.get("event", "")
                     if event_type == "tool_start":
                         store.save_tool_call(
