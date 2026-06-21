@@ -584,6 +584,18 @@ class ChatStreamingMixin:
         Uses llm_bawt's internal history + memory for context.
         Yields Server-Sent Events (SSE) formatted chunks.
         """
+        # Flush an SSE comment IMMEDIATELY so the reverse proxy (Traefik) and
+        # the Next.js /api/chat passthrough see bytes the instant the response
+        # opens, before any of the slow setup below (model resolution, history
+        # build, object-store attachment fetch, and — for agent bots — the
+        # upstream image upload/analysis that delays the first real delta by
+        # several seconds).  Without an early byte, a slow first token can trip
+        # a gateway timeout and surface as a 502 on the client even though the
+        # turn completes server-side.  Comment lines (": ...") are part of the
+        # SSE spec and are ignored by every consumer — browser EventSource and
+        # our own reader (ChatStreamContext skips lines starting with ":").
+        yield ": connected\n\n"
+
         # Create request context for logging
         if request.client_system_context is not None:
             req_path = f"/v1/botchat/{request.bot_id}/{request.user}/chat/completions"
@@ -742,7 +754,15 @@ class ChatStreamingMixin:
                     )
                     continue
                 try:
-                    data_url = media_store.read_original_as_data_url(asset_id)
+                    # Off-load to a thread: read_original_as_data_url is a
+                    # SYNCHRONOUS object-store fetch (Garage/S3) + base64
+                    # encode.  Calling it inline blocked the event loop for the
+                    # whole download — stalling every other in-flight turn and
+                    # padding this turn's time-to-first-byte enough to trip the
+                    # reverse proxy (the image-paste 502).
+                    data_url = await asyncio.to_thread(
+                        media_store.read_original_as_data_url, asset_id
+                    )
                 except MediaAssetNotFound:
                     log.warning(
                         "TASK-225: attachment_id not found in media_assets: %s",
