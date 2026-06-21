@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import time
 
 from fastapi import APIRouter, Request
@@ -17,6 +18,16 @@ from fastapi.responses import JSONResponse, StreamingResponse
 
 from .adapters import lookup
 from .errors import anthropic_error, auth_failed_error
+from .heartbeat import DEFAULT_INTERVAL, with_heartbeat
+
+# Seconds of upstream silence before the proxy injects a keepalive ping.
+# Override with CLAUDE_CODE_BRIDGE_PROXY_PING_INTERVAL (0 disables).
+try:
+    _PING_INTERVAL = float(
+        os.getenv("CLAUDE_CODE_BRIDGE_PROXY_PING_INTERVAL", DEFAULT_INTERVAL)
+    )
+except ValueError:
+    _PING_INTERVAL = DEFAULT_INTERVAL
 
 logger = logging.getLogger(__name__)
 
@@ -97,7 +108,12 @@ async def messages(request: Request) -> JSONResponse | StreamingResponse:
     async def _iter():
         started = time.perf_counter()
         try:
-            async for chunk in adapter.call(body, upstream_model):
+            # Heartbeat-wrap every adapter so neither the OpenAI translate path
+            # nor the Z.AI passthrough can go silent long enough to read as a
+            # dead connection (covers the reasoning-window stall).
+            async for chunk in with_heartbeat(
+                adapter.call(body, upstream_model), interval=_PING_INTERVAL
+            ):
                 yield chunk
         except RuntimeError as e:
             # OAuth / file errors from the adapter surface as RuntimeError;
