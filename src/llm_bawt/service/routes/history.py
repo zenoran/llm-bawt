@@ -490,6 +490,378 @@ def _load_sorted_visible_messages(
     return visible
 
 
+def _filter_messages_by_time_range(
+    messages: list[dict],
+    *,
+    since: float | None = None,
+    until: float | None = None,
+) -> list[dict]:
+    """Apply inclusive timestamp bounds to a sorted message list."""
+    if since is None and until is None:
+        return messages
+
+    filtered: list[dict] = []
+    for msg in messages:
+        ts = float(msg.get("timestamp") or 0.0)
+        if since is not None and ts < since:
+            continue
+        if until is not None and ts > until:
+            continue
+        filtered.append(msg)
+    return filtered
+
+
+def _search_visible_messages(
+    messages: list[dict],
+    query: str,
+) -> list[dict]:
+    """Case-insensitive substring search over visible message content."""
+    query_lower = query.lower()
+    if not query_lower:
+        return messages
+    return [
+        msg for msg in messages
+        if query_lower in str(msg.get("content", "")).lower()
+    ]
+
+
+def _build_history_search_response(
+    service,
+    effective_bot_id: str,
+    query: str,
+    matches: list[dict],
+    page_messages: list[dict],
+    *,
+    has_older: bool,
+) -> HistorySearchResponse:
+    """Hydrate attachments and assemble the paginated search response."""
+    attachments_by_id = _hydrate_attachments_for_page(
+        service, effective_bot_id, page_messages
+    )
+    history_messages = [
+        HistoryMessage(
+            id=msg.get("id"),
+            role=msg.get("role", ""),
+            content=msg.get("content", ""),
+            timestamp=msg.get("timestamp", 0.0),
+            attachments=attachments_by_id.get(str(msg.get("id") or ""), []),
+        )
+        for msg in page_messages
+    ]
+
+    oldest_timestamp = history_messages[0].timestamp if history_messages else None
+    newest_timestamp = history_messages[-1].timestamp if history_messages else None
+
+    return HistorySearchResponse(
+        bot_id=effective_bot_id,
+        query=query,
+        messages=history_messages,
+        total_count=len(matches),
+        has_more=has_older,
+        has_older=has_older,
+        oldest_timestamp=oldest_timestamp,
+        newest_timestamp=newest_timestamp,
+    )
+
+
+def _page_messages_before_cursor(
+    messages: list[dict],
+    *,
+    before_ts: float | None,
+    limit: int,
+) -> tuple[list[dict], bool]:
+    """Return the newest page of messages older than an optional cursor."""
+    candidate_messages = [
+        m for m in messages
+        if before_ts is None or float(m.get("timestamp") or 0.0) < before_ts
+    ]
+    if limit > 0 and len(candidate_messages) > limit:
+        return candidate_messages[-limit:], True
+    return candidate_messages, False
+
+
+def _resolve_cursor_against_messages(
+    before: str | None,
+    messages: list[dict],
+) -> float | None:
+    """Resolve an optional cursor against an already-filtered message set."""
+    if not before:
+        return None
+    return _resolve_cursor(before, messages)
+
+
+def _slice_history_search_matches(
+    matches: list[dict],
+    *,
+    before_ts: float | None,
+    limit: int,
+) -> tuple[list[dict], bool]:
+    """Return a paged history-search slice plus whether older matches remain."""
+    return _page_messages_before_cursor(matches, before_ts=before_ts, limit=limit)
+
+
+def _search_history_messages(
+    service,
+    effective_bot_id: str,
+    query: str,
+    *,
+    limit: int,
+    before: str | None,
+    since: float | None,
+    until: float | None,
+) -> HistorySearchResponse:
+    """Run per-bot history search with time-bounded, cursor-based paging."""
+    visible_messages = _load_sorted_visible_messages(service, effective_bot_id)
+    bounded_messages = _filter_messages_by_time_range(
+        visible_messages,
+        since=since,
+        until=until,
+    )
+    matches = _search_visible_messages(bounded_messages, query)
+    before_ts = _resolve_cursor_against_messages(before, matches)
+    page_messages, has_older = _slice_history_search_matches(
+        matches,
+        before_ts=before_ts,
+        limit=limit,
+    )
+    return _build_history_search_response(
+        service,
+        effective_bot_id,
+        query,
+        matches,
+        page_messages,
+        has_older=has_older,
+    )
+
+
+def _search_history_messages_legacy(
+    service,
+    effective_bot_id: str,
+    query: str,
+    *,
+    limit: int,
+) -> HistorySearchResponse:
+    """Compatibility wrapper for callers expecting the old search behavior."""
+    return _search_history_messages(
+        service,
+        effective_bot_id,
+        query,
+        limit=limit,
+        before=None,
+        since=None,
+        until=None,
+    )
+
+
+def _search_history_time_bounds_description() -> str:
+    """Human-readable docs fragment for time-bounded per-bot history search."""
+    return "Inclusive unix-second timestamp bounds for constraining search results."
+
+
+def _search_history_before_description() -> str:
+    """Human-readable docs fragment for paged per-bot history search."""
+    return "Cursor for older search-result pages (ISO timestamp, unix timestamp, or message ID)."
+
+
+def _search_history_limit_description() -> str:
+    """Human-readable docs fragment for search page size."""
+    return "Maximum number of matching messages to return in this page."
+
+
+def _search_history_query_description() -> str:
+    """Human-readable docs fragment for the per-bot search query."""
+    return "Case-insensitive substring query over visible bot history."
+
+
+def _search_history_bot_description() -> str:
+    """Human-readable docs fragment for per-bot search bot selection."""
+    return "Bot ID (uses default if not specified)."
+
+
+def _search_history_docstring() -> str:
+    """Return the route docstring text for per-bot history search."""
+    return "Search conversation history for a bot with cursor paging and optional time bounds."
+
+
+def _search_history_error_log_message(query: str, error: Exception) -> str:
+    """Format the per-bot history search error log."""
+    return f"Failed to search history for query {query!r}: {error}"
+
+
+def _resolve_search_limit(limit: int) -> int:
+    """Normalize per-bot history search page size."""
+    return max(0, limit)
+
+
+def _resolve_search_bounds(
+    since: float | None,
+    until: float | None,
+) -> tuple[float | None, float | None]:
+    """Validate and normalize per-bot search time bounds."""
+    if since is not None and until is not None and since > until:
+        raise HTTPException(status_code=400, detail="`since` cannot be greater than `until`")
+    return since, until
+
+
+def _resolve_search_query(query: str) -> str:
+    """Validate and normalize the incoming per-bot search query."""
+    trimmed = query.strip()
+    if not trimmed:
+        raise HTTPException(status_code=400, detail="`query` cannot be empty")
+    return trimmed
+
+
+def _resolve_effective_bot_id(service, bot_id: str | None) -> str:
+    """Apply default bot fallback shared by history routes."""
+    return bot_id or service._default_bot
+
+
+def _search_history_route_impl(
+    service,
+    query: str,
+    bot_id: str | None,
+    limit: int,
+    before: str | None,
+    since: float | None,
+    until: float | None,
+) -> HistorySearchResponse:
+    """Shared implementation for the per-bot search route."""
+    effective_bot_id = _resolve_effective_bot_id(service, bot_id)
+    resolved_query = _resolve_search_query(query)
+    resolved_limit = _resolve_search_limit(limit)
+    resolved_since, resolved_until = _resolve_search_bounds(since, until)
+    return _search_history_messages(
+        service,
+        effective_bot_id,
+        resolved_query,
+        limit=resolved_limit,
+        before=before,
+        since=resolved_since,
+        until=resolved_until,
+    )
+
+
+def _handle_history_search_exception(query: str, error: Exception) -> None:
+    """Log and raise a consistent per-bot search failure."""
+    log.error(_search_history_error_log_message(query, error))
+    raise HTTPException(status_code=500, detail=str(error))
+
+
+def _run_history_search_route(
+    query: str,
+    bot_id: str | None,
+    limit: int,
+    before: str | None,
+    since: float | None,
+    until: float | None,
+) -> HistorySearchResponse:
+    """Thin wrapper so the route body stays compact and readable."""
+    service = get_service()
+    return _search_history_route_impl(
+        service,
+        query,
+        bot_id,
+        limit,
+        before,
+        since,
+        until,
+    )
+
+
+def _history_search_route_doc() -> str:
+    """Provide stable docs text without repeating long literals inline."""
+    return _search_history_docstring()
+
+
+def _history_search_limit_query() -> str:
+    """Stable docs helper for per-bot search page size."""
+    return _search_history_limit_description()
+
+
+def _history_search_before_query() -> str:
+    """Stable docs helper for per-bot search paging cursor."""
+    return _search_history_before_description()
+
+
+def _history_search_since_query() -> str:
+    """Stable docs helper for lower time bound."""
+    return _search_history_time_bounds_description()
+
+
+def _history_search_until_query() -> str:
+    """Stable docs helper for upper time bound."""
+    return _search_history_time_bounds_description()
+
+
+def _history_search_bot_query() -> str:
+    """Stable docs helper for bot selection."""
+    return _search_history_bot_description()
+
+
+def _history_search_query_query() -> str:
+    """Stable docs helper for query description."""
+    return _search_history_query_description()
+
+
+def _history_search_route(
+    query: str,
+    bot_id: str | None,
+    limit: int,
+    before: str | None,
+    since: float | None,
+    until: float | None,
+) -> HistorySearchResponse:
+    """Call the actual shared search implementation."""
+    return _run_history_search_route(query, bot_id, limit, before, since, until)
+
+
+def _history_search_legacy(
+    query: str,
+    bot_id: str | None,
+    limit: int,
+) -> HistorySearchResponse:
+    """Legacy hook kept for any future callers needing pre-paging semantics."""
+    service = get_service()
+    effective_bot_id = _resolve_effective_bot_id(service, bot_id)
+    resolved_query = _resolve_search_query(query)
+    resolved_limit = _resolve_search_limit(limit)
+    return _search_history_messages_legacy(
+        service,
+        effective_bot_id,
+        resolved_query,
+        limit=resolved_limit,
+    )
+
+
+def _history_search_route_body(
+    query: str,
+    bot_id: str | None,
+    limit: int,
+    before: str | None,
+    since: float | None,
+    until: float | None,
+) -> HistorySearchResponse:
+    """Route-body indirection so docs/logic stay separated."""
+    return _history_search_route(query, bot_id, limit, before, since, until)
+
+
+def _history_search_route_error(query: str, error: Exception) -> None:
+    """Dedicated error path for the route body."""
+    _handle_history_search_exception(query, error)
+
+
+def _history_search_route_execute(
+    query: str,
+    bot_id: str | None,
+    limit: int,
+    before: str | None,
+    since: float | None,
+    until: float | None,
+) -> HistorySearchResponse:
+    """Route executor shared by POST surface(s)."""
+    return _history_search_route_body(query, bot_id, limit, before, since, until)
+
+
 def _load_all_messages_via_sql(
     service,
     bot_id: str,
@@ -748,59 +1120,73 @@ def get_history_around(
 
 @router.post("/v1/history/search", response_model=HistorySearchResponse, tags=["History"])
 def search_history(
-    query: str = Query(..., description="Search query"),
-    bot_id: str = Query(None, description="Bot ID (uses default if not specified)"),
-    limit: int = Query(50, description="Maximum number of messages to return"),
+    query: str = Query(..., description="Case-insensitive substring query over visible bot history."),
+    bot_id: str = Query(None, description="Bot ID (uses default if not specified)."),
+    limit: int = Query(50, description="Maximum number of matching messages to return in this page."),
+    before: str | None = Query(
+        None,
+        description="Cursor for older search-result pages (ISO timestamp, unix timestamp, or message ID).",
+    ),
+    since: float | None = Query(
+        None,
+        description="Inclusive unix-second lower bound for constraining search results.",
+    ),
+    until: float | None = Query(
+        None,
+        description="Inclusive unix-second upper bound for constraining search results.",
+    ),
 ):
-    """Search conversation history for a bot."""
-    service = get_service()
-    
-    effective_bot_id = bot_id or service._default_bot
-    
+    """Search conversation history for a bot with cursor paging and optional time bounds."""
     try:
-        client = service.get_memory_client(effective_bot_id)
-        if not client:
-            raise HTTPException(status_code=503, detail="Memory service unavailable")
-        
-        # Get all messages and filter by query
-        messages = client.get_messages(since_seconds=None)
-        query_lower = query.lower()
-        
-        matching = [
-            msg for msg in messages
-            if msg.get("role") not in ("system", "summary") and query_lower in msg.get("content", "").lower()
-        ]
-        
-        # Apply limit
-        if limit > 0 and len(matching) > limit:
-            matching = matching[-limit:]
-
-        # TASK-226: same shape on search results so the frontend can render
-        # attachments without forking the rendering path per route.
-        attachments_by_id = _hydrate_attachments_for_page(
-            service, effective_bot_id, matching
-        )
-
-        history_messages = [
-            HistoryMessage(
-                id=msg.get("id"),
-                role=msg.get("role", ""),
-                content=msg.get("content", ""),
-                timestamp=msg.get("timestamp", 0.0),
-                attachments=attachments_by_id.get(str(msg.get("id") or ""), []),
-            )
-            for msg in matching
-        ]
-
-        return HistorySearchResponse(
-            bot_id=effective_bot_id,
+        return _run_history_search_route(
             query=query,
-            messages=history_messages,
-            total_count=len(history_messages)
+            bot_id=bot_id,
+            limit=limit,
+            before=before,
+            since=since,
+            until=until,
         )
+    except HTTPException:
+        raise
     except Exception as e:
-        log.error(f"Failed to search history: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+        _handle_history_search_exception(query, e)
+        raise  # unreachable, keeps type-checkers happy
+
+
+@router.get("/v1/history/search", response_model=HistorySearchResponse, tags=["History"])
+def search_history_get(
+    query: str = Query(..., description="Case-insensitive substring query over visible bot history."),
+    bot_id: str = Query(None, description="Bot ID (uses default if not specified)."),
+    limit: int = Query(50, description="Maximum number of matching messages to return in this page."),
+    before: str | None = Query(
+        None,
+        description="Cursor for older search-result pages (ISO timestamp, unix timestamp, or message ID).",
+    ),
+    since: float | None = Query(
+        None,
+        description="Inclusive unix-second lower bound for constraining search results.",
+    ),
+    until: float | None = Query(
+        None,
+        description="Inclusive unix-second upper bound for constraining search results.",
+    ),
+):
+    """GET variant of per-bot history search for proxy routes that prefer query params."""
+    try:
+        return _run_history_search_route(
+            query=query,
+            bot_id=bot_id,
+            limit=limit,
+            before=before,
+            since=since,
+            until=until,
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        _handle_history_search_exception(query, e)
+        raise  # unreachable, keeps type-checkers happy
+
 
 @router.post(
     "/v1/history/search_all",

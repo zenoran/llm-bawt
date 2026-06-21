@@ -745,11 +745,15 @@ class HistoryResponse(BaseModel):
 
 
 class HistorySearchResponse(BaseModel):
-    """Response for history search."""
+    """Response for per-bot history search."""
     bot_id: str
     query: str
     messages: list[HistoryMessage]
     total_count: int
+    has_more: bool = False
+    has_older: bool = False
+    oldest_timestamp: float | None = None
+    newest_timestamp: float | None = None
 
 
 class HistorySearchAllMessage(BaseModel):
