@@ -782,6 +782,17 @@ class ClaudeCodeBridge:
                         seq_holder=seq_holder,
                     )
 
+                    # TASK-288 observability: log the system_prompt value AS SENT
+                    # to the SDK, paired with resume state. This is the only place
+                    # the resume-gate decision is visible — the earlier "Handling
+                    # send" log prints the pre-gate request value and cannot prove
+                    # whether persona actually reached the agent on a resumed turn.
+                    logger.info(
+                        "SDK call: resume=%s system_prompt_sent=%s",
+                        bool(resume_id),
+                        f"{len(system_prompt)} chars" if system_prompt else "none",
+                    )
+
                     options = ClaudeAgentOptions(
                         model=model,
                         # TASK-288: send the system prompt on EVERY turn, resume

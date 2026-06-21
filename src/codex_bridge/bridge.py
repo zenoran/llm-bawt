@@ -560,6 +560,15 @@ class CodexBridge:
                     # for images get rebuilt too (the inner loop may clear and
                     # rebuild after a recoverable session error).
                     self._cleanup_tmp_files(tmp_image_paths)
+                    # TASK-288 observability: log the system_prompt value AS SENT
+                    # (prepended to the user message by _build_prompt_input),
+                    # paired with resume state — the only place the resume-gate
+                    # decision is visible.
+                    logger.info(
+                        "Codex prompt: resume=%s system_prompt_sent=%s",
+                        bool(resume_id),
+                        f"{len(system_prompt)} chars" if system_prompt else "none",
+                    )
                     prompt_input, tmp_image_paths = self._build_prompt_input(
                         message,
                         attachments,
