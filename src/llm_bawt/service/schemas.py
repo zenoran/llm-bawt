@@ -460,6 +460,9 @@ class TurnLogListItem(BaseModel):
     end_reason: str | None = None
     question_id: str | None = None
     parent_turn_id: str | None = None
+    # Wall-clock completion time. None = turn still in progress (the single
+    # path-agnostic in-flight signal; supersedes the status="streaming" proxy).
+    ended_at: datetime | None = None
     # Embedded question row (chat_pending_questions.row_to_dict) when this turn
     # ended with end_reason="question" — lets the UI render a QuestionMessage
     # straight from history hydration without a second fetch.

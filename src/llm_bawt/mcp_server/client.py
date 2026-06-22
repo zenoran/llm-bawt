@@ -765,6 +765,9 @@ class MemoryClient:
                 "timestamp": timestamp,
                 "message_id": message_id,
                 "attachments": attachments,
+                # TASK-284: carry the user dimension so the server resolves the
+                # active thread per (bot_id, user_id) when session_id is None.
+                "user_id": self.user_id,
             })
             return MessageResult.from_dict(result)
 
@@ -779,6 +782,7 @@ class MemoryClient:
                 timestamp=timestamp,
                 message_id=message_id,
                 attachments=attachments,
+                user_id=self.user_id,
             )
         )
         return MessageResult.from_dict(result.to_dict())

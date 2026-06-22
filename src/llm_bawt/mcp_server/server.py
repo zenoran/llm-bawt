@@ -315,6 +315,7 @@ async def add_message(
     timestamp: float | None = None,
     message_id: str | None = None,
     attachments: list[dict] | None = None,
+    user_id: str | None = None,
 ) -> dict:
     """Add a message to conversation history.
 
@@ -328,6 +329,8 @@ async def add_message(
             message row's ``attachments`` column, e.g.
             ``[{"asset_id": "ma_xxx", "kind": "image"}]``. ``None`` leaves the
             column at its default ``[]``.
+        user_id: TASK-284 — user namespace for resolving the active thread when
+            ``session_id`` is not supplied. Sessions are keyed (bot_id, user_id).
 
     Returns:
         Stored message dict.
@@ -342,6 +345,7 @@ async def add_message(
         timestamp=timestamp,
         message_id=message_id,
         attachments=attachments,
+        user_id=user_id,
     )
     return message.to_dict()
 
@@ -838,6 +842,30 @@ async def _dispatch_bot_message(
         }
 
 
+async def _check_bot_in_turn(target_bot_id: str) -> dict | None:
+    """Return the target bot's active-turn info if it is mid-turn, else None.
+
+    Single source of truth: the service's ``/v1/bots/{id}/in-turn`` endpoint,
+    which reports ``ended_at IS NULL`` and is identical for streaming and
+    non-streaming, local and agent-backend turns.  Returns None on idle OR on
+    any error (fail-open — a status-check failure must never block delivery).
+    """
+    import httpx
+
+    try:
+        async with httpx.AsyncClient() as client:
+            resp = await client.get(
+                f"http://localhost:8642/v1/bots/{target_bot_id}/in-turn",
+                timeout=5.0,
+            )
+            resp.raise_for_status()
+            data = resp.json()
+        return data if data.get("in_turn") else None
+    except Exception as e:
+        logger.warning("in-turn check for %s failed (allowing send): %s", target_bot_id, e)
+        return None
+
+
 @mcp.tool(name="bots_send_message")
 async def send_message_to_bot(
     target_bot_id: str,
@@ -847,6 +875,7 @@ async def send_message_to_bot(
     temperature: float = 0.7,
     fire_and_forget: bool = False,
     timeout_seconds: float = 300.0,
+    force: bool = False,
 ) -> dict:
     """Send a message to another bot.
 
@@ -855,6 +884,12 @@ async def send_message_to_bot(
     kick off the target bot and continue your own work, set
     `fire_and_forget=True` — the call returns immediately and the
     target bot processes the message in the background.
+
+    If the target bot is already mid-turn, the message is NOT sent and a
+    `{success: False, sent: False, in_turn: True}` result is returned —
+    unless `force=True`, in which case it is delivered and handled per the
+    target's backend (local model: cancels/replaces its current turn; agent
+    backend e.g. claude-code/openclaw: runs concurrently).
 
     Args:
         target_bot_id: The bot slug to send the message to.
@@ -869,6 +904,7 @@ async def send_message_to_bot(
             fire-and-forget mode. Defaults to 300s. The previous
             30s default caused duplicate-turn bugs when the target
             bot took longer than that.
+        force: If True, send even when the target bot is mid-turn.
 
     Returns:
         Dict with keys:
@@ -876,13 +912,40 @@ async def send_message_to_bot(
           - 'bot_id' (target), 'sender' (sender_bot_id)
         For waited calls: 'content' (response text), 'response_model'.
         For fire-and-forget: 'dispatched' (True), 'content' empty.
+        When blocked: 'success' False, 'sent' False, 'in_turn' True, plus
+        the active 'turn_id'/'turn_status' so the caller can retry later.
         On timeout: 'error' = 'timeout', 'in_flight' = True, 'warning'
         explaining that the caller MUST NOT retry.
     """
     logger.debug(
-        "MCP tool invoked: send_message_to_bot target=%s sender=%s fire_and_forget=%s",
-        target_bot_id, sender_bot_id, fire_and_forget,
+        "MCP tool invoked: send_message_to_bot target=%s sender=%s fire_and_forget=%s force=%s",
+        target_bot_id, sender_bot_id, fire_and_forget, force,
     )
+
+    # Gate on target turn state unless forced.  Single source of truth is the
+    # service's in-turn endpoint (ended_at IS NULL).
+    forced_while_busy = False
+    if not force:
+        active = await _check_bot_in_turn(target_bot_id)
+        if active is not None:
+            return {
+                "success": False,
+                "sent": False,
+                "in_turn": True,
+                "bot_id": target_bot_id,
+                "sender": sender_bot_id,
+                "content": "",
+                "turn_id": active.get("turn_id"),
+                "turn_status": active.get("status"),
+                "note": (
+                    f"Agent '{target_bot_id}' is in turn — message not sent. "
+                    "Retry when it is idle, or pass force=True to send anyway "
+                    "(handled per its backend: local cancels/replaces the "
+                    "current turn; agent backends run it concurrently)."
+                ),
+            }
+    else:
+        forced_while_busy = (await _check_bot_in_turn(target_bot_id)) is not None
 
     # Add sender context to the message if provided
     formatted_message = message
@@ -932,22 +995,32 @@ async def send_message_to_bot(
         _inflight_bot_sends.add(task)
         task.add_done_callback(_inflight_bot_sends.discard)
 
+        note = (
+            f"Message dispatched to '{target_bot_id}' in the background. "
+            "No response will be returned. The target bot is now processing it server-side."
+        )
+        if forced_while_busy:
+            note += (
+                " NOTE: target was mid-turn and this was force-sent — "
+                "handled per its backend (local cancels/replaces; agent backend runs concurrently)."
+            )
         return {
             "success": True,
             "dispatched": True,
             "fire_and_forget": True,
+            "forced_while_busy": forced_while_busy,
             "content": "",
             "bot_id": target_bot_id,
             "sender": sender_bot_id,
-            "note": (
-                f"Message dispatched to '{target_bot_id}' in the background. "
-                "No response will be returned. The target bot is now processing it server-side."
-            ),
+            "note": note,
         }
 
-    return await _dispatch_bot_message(
+    result = await _dispatch_bot_message(
         payload, target_bot_id, sender_bot_id, timeout_seconds
     )
+    if forced_while_busy and isinstance(result, dict):
+        result["forced_while_busy"] = True
+    return result
 
 
 @mcp.tool(name="bots_list_available")

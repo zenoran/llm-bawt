@@ -331,6 +331,7 @@ class MemoryStorage:
         timestamp: float | None = None,
         message_id: str | None = None,
         attachments: list[dict] | None = None,
+        user_id: str | None = None,
     ) -> Message:
         """Add a message to conversation history.
 
@@ -341,10 +342,32 @@ class MemoryStorage:
         ``attachments`` (TASK-222) is the tiny JSONB ref list persisted on the
         message row's ``attachments`` column. ``None`` leaves the column at
         its default ``[]``.
+
+        ``session_id`` / ``user_id`` (TASK-284): this is the single live write
+        chokepoint for both embedded and server mode, so it owns thread
+        attribution. When the caller doesn't supply ``session_id`` (the normal
+        case), the active thread for ``(bot_id, user_id)`` is resolved from the
+        DB and stamped on the row. Resolution is best-effort: a failure logs and
+        leaves ``session_id`` NULL rather than dropping the message.
         """
         provided = (str(message_id).strip() if message_id else "") or None
         message_id_final = provided or str(uuid.uuid4())
         ts = timestamp if timestamp is not None else time.time()
+
+        # TASK-284: stamp the live thread's session_id on every insert. Resolve
+        # from the sessions table (DB-derived source of truth) so all workers /
+        # cached instances converge on the same active thread per (bot, user).
+        if session_id is None:
+            try:
+                manager = self.get_short_term_manager(bot_id)
+                session_id = manager.get_or_create_active_session(
+                    bot_id=bot_id, user_id=user_id
+                )
+            except Exception as e:
+                logger.warning(
+                    "TASK-284 session resolution failed for bot=%s user=%s: %s",
+                    bot_id, user_id, e,
+                )
 
         backend = self._get_backend(bot_id)
         backend.add_message(

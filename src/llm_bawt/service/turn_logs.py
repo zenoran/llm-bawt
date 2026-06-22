@@ -15,6 +15,25 @@ from ..utils.config import Config, has_database_credentials
 
 logger = logging.getLogger(__name__)
 
+# Terminal turn statuses — a turn in any of these is finished and no longer
+# "in turn".  Non-terminal (in-progress) statuses are "streaming" (streaming
+# path) and "pending" (non-streaming path).  Kept in ONE place so the
+# ended_at stamp in save_turn/update_turn and any "is this bot in turn?"
+# consumer agree on what "done" means.
+TERMINAL_TURN_STATUSES = frozenset(
+    {"ok", "completed", "error", "timeout", "cancelled", "aborted"}
+)
+
+
+def _is_terminal(status: str | None, end_reason: str | None) -> bool:
+    """A turn is terminal once it has a terminal status OR an end_reason set.
+
+    end_reason is only ever written when a turn ends (stop/error/aborted/
+    question/tool_limit), so the streaming finalize path that stamps
+    end_reason without a terminal status (chat_streaming) still counts.
+    """
+    return (status in TERMINAL_TURN_STATUSES) or (end_reason is not None)
+
 
 def _extract_trigger_id(request_payload: dict) -> str | None:
     """Extract the last user message ID from a request payload."""
@@ -77,6 +96,17 @@ class TurnLog(SQLModel, table=True):
     # back at the awaiting turn.  Lets the UI thread the chain and resolve the
     # prior QuestionMessage across tabs on turn_start{parent_turn_id}.
     parent_turn_id: str | None = Field(default=None, index=True, max_length=128)
+    # Wall-clock completion timestamp.  NULL while the turn is in progress;
+    # stamped exactly once on the first terminal transition (see _is_terminal)
+    # in save_turn/update_turn.  This is the single, path-agnostic "is this
+    # turn still running?" signal — `ended_at IS NULL` works identically for
+    # streaming/non-streaming and local/agent-backend turns, unlike the
+    # overloaded `status` string.  Also yields true turn duration and a clean
+    # zombie sweep (NULL + old created_at).
+    ended_at: datetime | None = Field(
+        default=None,
+        sa_column=Column(DateTime(timezone=True), nullable=True, index=True),
+    )
 
 
 class ToolCallRecord(SQLModel, table=True):
@@ -197,6 +227,17 @@ class TurnLogStore:
                 conn.execute(sa_text(
                     "ALTER TABLE tool_call_records ADD COLUMN IF NOT EXISTS text_offset INTEGER"
                 ))
+                # Path-agnostic turn-completion timestamp (NULL = in progress).
+                conn.execute(sa_text(
+                    "ALTER TABLE turn_logs ADD COLUMN IF NOT EXISTS"
+                    " ended_at TIMESTAMPTZ"
+                ))
+                # Partial index makes "is bot X in turn?" a tiny lookup —
+                # only in-flight rows are indexed.
+                conn.execute(sa_text(
+                    "CREATE INDEX IF NOT EXISTS ix_turn_logs_active"
+                    " ON turn_logs (bot_id, created_at) WHERE ended_at IS NULL"
+                ))
                 conn.commit()
             except Exception:
                 pass
@@ -308,6 +349,9 @@ class TurnLogStore:
                 if isinstance(token_usage, dict) else None
             ),
             parent_turn_id=parent_turn_id,
+            # Rare: a turn created already-terminal (e.g. errored before any
+            # processing) should not look perpetually in-flight.
+            ended_at=(datetime.now(timezone.utc) if _is_terminal(status, None) else None),
         )
 
         with Session(self.engine) as session:
@@ -375,6 +419,11 @@ class TurnLogStore:
                 row.question_id = question_id
             if parent_turn_id is not None:
                 row.parent_turn_id = parent_turn_id
+            # Stamp completion exactly once, on the first terminal transition.
+            # Covers every terminal writer (streaming finalize, _finalize_turn,
+            # abort route) since they all funnel through update_turn.
+            if row.ended_at is None and _is_terminal(status, end_reason):
+                row.ended_at = datetime.now(timezone.utc)
             session.add(row)
             session.commit()
 
@@ -412,6 +461,28 @@ class TurnLogStore:
         with Session(self.engine) as session:
             return session.exec(select(TurnLog).where(TurnLog.id == turn_id)).first()
 
+    def active_turn_for_bot(
+        self, bot_id: str, *, within_seconds: int = 1800
+    ) -> TurnLog | None:
+        """Return the bot's most recent in-flight turn, or None if idle.
+
+        In-flight == ``ended_at IS NULL``.  ``within_seconds`` bounds the scan
+        so a crashed/zombie turn (never stamped) stops blocking after a sane
+        window — callers wanting to override that should pass force, not widen
+        the window.  Path-agnostic: matches streaming and non-streaming turns.
+        """
+        if self.engine is None or not bot_id:
+            return None
+        cutoff = datetime.now(timezone.utc) - timedelta(seconds=max(1, within_seconds))
+        with Session(self.engine) as session:
+            return session.exec(
+                select(TurnLog)
+                .where(TurnLog.bot_id == bot_id)
+                .where(TurnLog.ended_at.is_(None))
+                .where(TurnLog.created_at > cutoff)
+                .order_by(TurnLog.created_at.desc())
+            ).first()
+
     def list_turns(
         self,
         *,
@@ -420,6 +491,7 @@ class TurnLogStore:
         model: str | None = None,
         request_id: str | None = None,
         status: str | None = None,
+        active_only: bool = False,
         stream: bool | None = None,
         has_tools: bool | None = None,
         trigger_message_ids: set[str] | None = None,
@@ -453,6 +525,10 @@ class TurnLogStore:
             conditions.append(TurnLog.request_id == request_id.strip())
         if status:
             conditions.append(TurnLog.status == status.strip().lower())
+        if active_only:
+            # In-progress, path-agnostic: streaming AND non-streaming in-flight
+            # turns. Supersedes the old status="streaming" proxy.
+            conditions.append(TurnLog.ended_at.is_(None))
         if stream is not None:
             conditions.append(TurnLog.stream.is_(stream))
         if has_tools is True:

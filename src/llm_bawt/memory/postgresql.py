@@ -2034,17 +2034,39 @@ class PostgreSQLShortTermManager:
         # legacy/back-compat callers that don't carry a user.
         self.user_id = user_id
         self._backend = PostgreSQLMemoryBackend(config, bot_id)
-        self._current_session_id = str(uuid.uuid4())
-        # Insert a row into the shared sessions table for this session.
-        # Best-effort: log and continue if it fails (e.g. very early bring-up
-        # before the sessions table exists). Subsequent new_session() calls
-        # will retry.
-        try:
-            self._insert_session_row(self._current_session_id)
-        except Exception as e:
-            logger.warning(
-                f"Failed to record initial session row for bot {bot_id}: {e}"
-            )
+        # TASK-284: do NOT mint+insert a session row per construction. That was
+        # the leak — these managers are cached/evicted per (model, bot, user),
+        # so eager per-construction insertion accumulated hundreds of
+        # never-closed "active" rows. The active thread is resolved lazily from
+        # the sessions table (the DB-derived single source of truth) on first
+        # use, so every instance/worker for a (bot, user) converges on one row.
+        self._session_id_cache: str | None = None
+
+    @property
+    def _current_session_id(self) -> str:
+        """The live thread's session id, resolved lazily from the DB.
+
+        Resolving on first access (rather than at construction) is what stops
+        the leak: a manager that is built but never writes no longer creates a
+        session row.
+        """
+        if self._session_id_cache is None:
+            try:
+                self._session_id_cache = self.get_or_create_active_session(
+                    bot_id=self.bot_id, user_id=self.user_id
+                )
+            except Exception as e:
+                logger.warning(
+                    f"Failed to resolve active session for bot {self.bot_id}: {e}"
+                )
+                # Fall back to an ephemeral id so writes still get *some*
+                # attribution; it just won't be registry-backed this turn.
+                self._session_id_cache = str(uuid.uuid4())
+        return self._session_id_cache
+
+    @_current_session_id.setter
+    def _current_session_id(self, value: str) -> None:
+        self._session_id_cache = value
 
     def _insert_session_row(
         self,

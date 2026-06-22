@@ -171,6 +171,7 @@ def list_turn_logs(
     model: str | None = Query(None, description="Filter by model alias"),
     request_id: str | None = Query(None, description="Filter by request ID"),
     status: str | None = Query(None, description="Filter by status"),
+    active_only: bool = Query(False, description="Only in-progress turns (ended_at IS NULL), path-agnostic"),
     stream: bool | None = Query(None, description="Filter by streaming mode"),
     has_tools: bool | None = Query(None, description="Filter by presence of tool calls"),
     since_hours: int = Query(168, ge=1, le=168, description="Only include turns from recent N hours"),
@@ -189,6 +190,7 @@ def list_turn_logs(
         model=model,
         request_id=request_id,
         status=status,
+        active_only=active_only,
         stream=stream,
         has_tools=has_tools,
         since_hours=since_hours,
@@ -257,6 +259,7 @@ def list_turn_logs(
                 end_reason=getattr(row, "end_reason", None),
                 question_id=getattr(row, "question_id", None),
                 parent_turn_id=getattr(row, "parent_turn_id", None),
+                ended_at=getattr(row, "ended_at", None),
                 question=questions_by_turn.get(row.id),
             )
         )
@@ -270,6 +273,7 @@ def list_turn_logs(
             "model": model,
             "request_id": request_id,
             "status": status,
+            "active_only": active_only,
             "stream": stream,
             "has_tools": has_tools,
             "since_hours": since_hours,
@@ -382,6 +386,38 @@ def recent_turns_by_bot(
     # Sort newest-first so the caller doesn't have to.
     items.sort(key=lambda r: r.created_at, reverse=True)
     return RecentByBotsResponse(turns=items)
+
+
+@router.get("/v1/bots/{bot_id}/in-turn", tags=["Bots"])
+def bot_in_turn(
+    bot_id: str,
+    within_seconds: int = Query(
+        1800, ge=1, le=86400,
+        description="Only count in-flight turns started within this window (zombie guard).",
+    ),
+):
+    """Report whether a bot is currently in a turn (path-agnostic).
+
+    ``in_turn`` is true iff the bot has a turn-log row with ``ended_at IS NULL``
+    inside the window — the same single source of truth for streaming and
+    non-streaming, local and agent-backend turns.
+    """
+    service = get_service()
+    store = TurnLogStore(service.config)
+    if store.engine is None:
+        raise HTTPException(status_code=503, detail="Turn logs DB unavailable")
+
+    turn = store.active_turn_for_bot(bot_id, within_seconds=within_seconds)
+    if turn is None:
+        return {"bot_id": bot_id, "in_turn": False}
+    return {
+        "bot_id": bot_id,
+        "in_turn": True,
+        "turn_id": turn.id,
+        "status": turn.status,
+        "model": turn.model,
+        "started_at": turn.created_at.isoformat() if turn.created_at else None,
+    }
 
 
 @router.get("/v1/turn-logs/{turn_id}", response_model=TurnLogDetail, tags=["Debug"])
