@@ -354,6 +354,23 @@ class AgentBridgeBackend(AgentBackend):
                                     "trigger_message_id": event.trigger_message_id,
                                 })
 
+                            elif event.kind == AgentEventKind.REASONING_DELTA:
+                                # Model reasoning ("thinking"). Forward as a dict
+                                # item — NOT a str — so downstream text
+                                # accumulation (full_response_holder) never sees
+                                # it and it cannot leak into the saved message.
+                                # Deliberately does not touch text_parts or
+                                # first_delta_at (reasoning is not the answer and
+                                # must not register as first-token latency).
+                                # TASK-301.
+                                reasoning = event.text or ""
+                                if reasoning:
+                                    result_queue.put({
+                                        "event": "reasoning",
+                                        "text": reasoning,
+                                        "provider": event.provider,
+                                    })
+
                             elif event.kind == AgentEventKind.ERROR:
                                 raise RuntimeError(f"{self.name} error: {event.text}")
                     finally:

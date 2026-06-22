@@ -1014,6 +1014,25 @@ class ClaudeCodeBridge:
                                                 kind=AgentEventKind.ASSISTANT_DELTA,
                                                 text=text,
                                             )
+                                    elif delta.get("type") == "thinking_delta":
+                                        # Model reasoning ("thinking"). Surface on
+                                        # the REASONING_DELTA channel for the UI's
+                                        # collapsible lane. Deliberately NOT
+                                        # appended to text_parts — reasoning must
+                                        # never enter the final assistant message
+                                        # body (TASK-301).
+                                        thinking = delta.get("thinking", "")
+                                        if thinking:
+                                            seq += 1
+                                            self._publish_event(
+                                                request_id, session_key, seq,
+                                                kind=AgentEventKind.REASONING_DELTA,
+                                                text=thinking,
+                                            )
+                                    elif delta.get("type") == "signature_delta":
+                                        # Opaque reasoning signature — no display
+                                        # value; drop it.
+                                        pass
                                     elif delta.get("type") == "input_json_delta":
                                         current_tool_input += delta.get("partial_json", "")
 

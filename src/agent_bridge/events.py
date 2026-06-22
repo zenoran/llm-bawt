@@ -32,6 +32,13 @@ class AgentEventKind(str, Enum):
     # for AskUserQuestion), and the new ``tool_use_id`` field on AgentEvent
     # so the UI can echo it back when the user picks an answer.
     AWAIT_TOOL_RESULT = "await_tool_result"
+    # Streamed model reasoning ("thinking") text, surfaced on a separate channel
+    # from ASSISTANT_DELTA so the UI can render a collapsible "Thinking…" lane
+    # without the reasoning ever entering the final assistant message body.
+    # Emitted by the claude-code bridge when the proxy/native SDK yields Anthropic
+    # ``thinking_delta`` frames (TASK-301). ``text`` carries the reasoning chunk.
+    # Additive: consumers that don't know this kind ignore it (see from_dict).
+    REASONING_DELTA = "reasoning_delta"
 
 
 @dataclass
@@ -113,11 +120,20 @@ class AgentEvent:
             ts = datetime.fromisoformat(ts)
         elif ts is None:
             ts = datetime.now(timezone.utc)
+        # Tolerant kind decode: an additive kind emitted by a newer producer must
+        # not crash an older consumer (rolling deploy). Unknown values degrade to
+        # SYSTEM_NOTE — a benign kind every consumer already ignores for display —
+        # instead of raising ValueError (TASK-301).
+        raw_kind = data.get("kind")
+        try:
+            kind = AgentEventKind(raw_kind)
+        except ValueError:
+            kind = AgentEventKind.SYSTEM_NOTE
         return cls(
             event_id=data["event_id"],
             session_key=data["session_key"],
             run_id=data.get("run_id"),
-            kind=AgentEventKind(data["kind"]),
+            kind=kind,
             origin=data.get("origin", "system"),
             text=data.get("text"),
             tool_name=data.get("tool_name"),

@@ -1473,6 +1473,30 @@ class ChatStreamingMixin:
 
                         if isinstance(item, dict):
                             evt = item.get("event")
+                            if evt == "reasoning":
+                                # Model reasoning ("thinking"). Two destinations,
+                                # both dict-only so it NEVER enters
+                                # full_response_holder / the saved message
+                                # (TASK-301):
+                                #   1. unified Redis stream → live cross-tab +
+                                #      cold-reload recovery of the lane.
+                                #   2. yielded downstream → OpenAI-compat SSE as
+                                #      choices[].delta.reasoning_content.
+                                # Orthogonal to the answer transcript: does NOT
+                                # touch _text_chars/_text_buf/_saw_text/_saw_tool.
+                                _rtext = item.get("text", "")
+                                if _rtext:
+                                    _publish_event_direct({
+                                        "_type": "reasoning_delta",
+                                        "turn_id": turn_log_id,
+                                        "trigger_message_id": trigger_message_id,
+                                        "bot_id": bot_id,
+                                        "user_id": user_id,
+                                        "delta": _rtext,
+                                        "ts": time.time(),
+                                    })
+                                    yield {"_type": "reasoning_delta", "delta": _rtext}
+                                continue
                             if evt == "metadata":
                                 if item.get("upstream_model"):
                                     _upstream_model[0] = item["upstream_model"]
@@ -1913,6 +1937,26 @@ class ChatStreamingMixin:
                 if isinstance(chunk, dict) and chunk.get("_type") == "tool_event":
                     # Already published directly from the background thread
                     # via _publish_tool_event_direct — just skip.
+                    continue
+
+                # Model reasoning ("thinking") → OpenAI-compat reasoning lane.
+                # Emitted as choices[].delta.reasoning_content so it lands in a
+                # separate UI channel, never in delta.content / the saved
+                # message. The chunk is a dict, so consume_stream_chunks already
+                # kept it out of full_response_holder (TASK-301).
+                if isinstance(chunk, dict) and chunk.get("_type") == "reasoning_delta":
+                    data = {
+                        "id": response_id,
+                        "object": "chat.completion.chunk",
+                        "created": created,
+                        "model": model_alias,
+                        "choices": [{
+                            "index": 0,
+                            "delta": {"reasoning_content": chunk.get("delta", "")},
+                            "finish_reason": None,
+                        }],
+                    }
+                    yield (f"data: {json.dumps(data)}\n\n")
                     continue
 
                 # OpenClaw agent backend tool events (from openclaw.py queue)
