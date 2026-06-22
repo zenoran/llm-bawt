@@ -32,19 +32,14 @@ class RedisSubscriber:
         # races our blocking XREADGROUP(block=5000) reads — every idle poll
         # would raise "Timeout reading from redis". Keep reads unbounded and
         # bound only the initial connect.
+        # Stash the URL so long-lived holders (e.g. the SSE endpoint) can spin
+        # up their own dedicated client per connection — see openclaw_ws.py.
+        self._redis_url = redis_url
         self._redis = aioredis.from_url(
             redis_url,
             decode_responses=True,
             socket_timeout=None,
             socket_connect_timeout=5,
-            # redis-py 8.0 also dropped the default pool ceiling from effectively
-            # unlimited to max_connections=100. Blocking XREADGROUP reads and
-            # SSE consumers that aren't closed on disconnect strand connections
-            # in the pool; under heavy agent activity 100 is low enough to
-            # exhaust it (MaxConnectionsError), which makes the whole app stop
-            # accepting requests. Give it real headroom until the
-            # strand-on-cancel leak is fixed at the subscriber lifecycle level.
-            max_connections=500,
         )
         self._connected = False
 

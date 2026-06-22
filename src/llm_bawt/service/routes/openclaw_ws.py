@@ -10,6 +10,8 @@ from fastapi import APIRouter, HTTPException, Query
 from fastapi.responses import StreamingResponse
 from typing import List
 
+from agent_bridge.subscriber import RedisSubscriber
+
 from ..dependencies import get_service
 from ..logging import get_service_logger
 
@@ -41,6 +43,12 @@ async def openclaw_ws_bridge(
     if redis_sub is None:
         raise HTTPException(status_code=503, detail="OpenClaw bridge not enabled (no Redis subscriber)")
 
+    # Each SSE connection gets its OWN dedicated Redis client (see
+    # _unified_event_stream / _legacy_event_stream). Hand the stream the URL,
+    # not the shared singleton — the singleton's pool must not absorb stranded
+    # connections from every mobile reconnect.
+    redis_url = redis_sub._redis_url
+
     use_unified = bot_id and user_id and consumer_id
 
     if not use_unified and not session_key:
@@ -52,7 +60,7 @@ async def openclaw_ws_bridge(
     if use_unified:
         # bot_id is a list — pass all of them to subscribe_group
         return StreamingResponse(
-            _unified_event_stream(redis_sub, bot_id, user_id, consumer_id),
+            _unified_event_stream(redis_url, bot_id, user_id, consumer_id),
             media_type="text/event-stream",
             headers={
                 "Cache-Control": "no-cache",
@@ -63,7 +71,7 @@ async def openclaw_ws_bridge(
 
     # Legacy session-based streaming
     return StreamingResponse(
-        _legacy_event_stream(redis_sub, session_key),
+        _legacy_event_stream(redis_url, session_key),
         media_type="text/event-stream",
         headers={
             "Cache-Control": "no-cache",
@@ -73,8 +81,23 @@ async def openclaw_ws_bridge(
     )
 
 
-async def _unified_event_stream(redis_sub, bot_ids: list[str], user_id: str, consumer_id: str):
-    """Durable event stream using Redis consumer groups for one or more bots."""
+async def _unified_event_stream(redis_url: str, bot_ids: list[str], user_id: str, consumer_id: str):
+    """Durable event stream using Redis consumer groups for one or more bots.
+
+    Uses a DEDICATED RedisSubscriber per SSE connection, closed in finally.
+
+    Why per-connection: ``subscribe_group`` issues a blocking XREADGROUP that
+    holds a pool connection. When the client disconnects (mobile lock screen,
+    tab close, network drop), Starlette cancels this task mid-read and redis-py
+    strands that connection in whatever pool it was using. If that were the
+    shared app singleton's pool, every reconnect would leak one connection until
+    the pool exhausted (MaxConnectionsError) — hanging the app and dropping
+    turn_complete events so the UI stays "in turn". A private client per
+    connection confines the strand to this stream, and the finally close()
+    reclaims it. Reconnects clean up instead of building up.
+    """
+    sub = RedisSubscriber(redis_url)
+    await sub.connect()
     yield _sse(
         "hello",
         {
@@ -89,7 +112,7 @@ async def _unified_event_stream(redis_sub, bot_ids: list[str], user_id: str, con
 
     last_ping = asyncio.get_running_loop().time()
     try:
-        async for event_data in redis_sub.subscribe_group(
+        async for event_data in sub.subscribe_group(
             bot_ids, user_id, consumer_id, timeout_s=86400,
         ):
             if event_data is None:
@@ -111,10 +134,18 @@ async def _unified_event_stream(redis_sub, bot_ids: list[str], user_id: str, con
     except Exception as e:
         log.exception("/v1/ws unified stream error")
         yield _sse("error", {"error": str(e)})
+    finally:
+        await sub.close()
 
 
-async def _legacy_event_stream(redis_sub, session_key: str):
-    """Legacy session-based event stream (no resume)."""
+async def _legacy_event_stream(redis_url: str, session_key: str):
+    """Legacy session-based event stream (no resume).
+
+    Dedicated RedisSubscriber per connection, closed in finally — same
+    strand-on-disconnect reasoning as _unified_event_stream.
+    """
+    sub = RedisSubscriber(redis_url)
+    await sub.connect()
     yield _sse(
         "hello",
         {
@@ -127,7 +158,7 @@ async def _legacy_event_stream(redis_sub, session_key: str):
 
     last_ping = asyncio.get_running_loop().time()
     try:
-        async for evt in redis_sub.subscribe(session_key):
+        async for evt in sub.subscribe(session_key):
             payload = {
                 "id": evt.db_id,
                 "event_id": evt.event_id,
@@ -152,3 +183,5 @@ async def _legacy_event_stream(redis_sub, session_key: str):
     except Exception as e:
         log.exception("/v1/ws legacy stream error")
         yield _sse("error", {"error": str(e)})
+    finally:
+        await sub.close()
