@@ -862,6 +862,16 @@ class ClaudeCodeBridge:
                         env=sdk_env,
                         settings=settings_path,
                         effort=bot_effort,
+                        # Opt into summarized reasoning text. On Opus 4.7+ the
+                        # thinking display defaults to "omitted" — the model
+                        # thinks but Anthropic streams empty thinking blocks
+                        # (signature only), so the UI reasoning lane (TASK-301)
+                        # had nothing to render on the Anthropic-direct path.
+                        # "summarized" returns a readable summary as
+                        # thinking_delta text (raw CoT is never exposed on
+                        # Opus). Proxy-routed models synthesize their own
+                        # thinking and are unaffected by this flag.
+                        thinking={"type": "adaptive", "display": "summarized"},
                         max_turns=bot_max_turns,
                         mcp_servers=self._mcp_servers if self._mcp_servers else {},
                         can_use_tool=can_use_tool_cb,
