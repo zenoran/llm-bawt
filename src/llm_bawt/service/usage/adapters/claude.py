@@ -78,15 +78,19 @@ def _parse_reset(value) -> int | None:
     return None
 
 
-def _parse_pct(value) -> float | None:
+def _parse_pct(value, *, allow_fraction: bool = True) -> float | None:
     if value is None:
         return None
     try:
         v = float(value)
     except (TypeError, ValueError):
         return None
-    # Accept either a 0-1 fraction or an already-scaled 0-100 percentage.
-    if 0.0 <= v <= 1.0:
+    # Anthropic's `limits[].percent` is ALREADY a 0-100 number — never rescale
+    # it. Only the legacy top-level `utilization` fallback can be a 0-1 ratio,
+    # and even there the literal value 1 means 1%, not 100%: a weekly window
+    # that just reset reports `percent: 1`, which the old `<= 1.0` rule turned
+    # into 100%. Rescale strictly inside the open interval (0, 1) only.
+    if allow_fraction and 0.0 < v < 1.0:
         return round(v * 100, 1)
     return round(v, 1)
 
@@ -99,7 +103,8 @@ def _from_limit_item(item: dict, idx: int) -> UsageLimit | None:
     carries ``scope.model.display_name``, e.g. "Sonnet").
     """
     kind = (item.get("kind") or "").lower()
-    pct = _parse_pct(item.get("percent"))
+    # `percent` is provider-native 0-100; never treat it as a fraction.
+    pct = _parse_pct(item.get("percent"), allow_fraction=False)
     resets = _parse_reset(item.get("resets_at"))
     if kind == "weekly_scoped":
         model = (((item.get("scope") or {}).get("model") or {}).get("display_name")) or "scoped"

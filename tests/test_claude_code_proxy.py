@@ -213,6 +213,43 @@ def test_openai_chatgpt_usage_adapter_maps_snapshot_to_canonical() -> None:
     assert OpenAIChatGPTUsageAdapter.provider == "openai_chatgpt"
 
 
+def test_claude_usage_percent_not_rescaled_to_fraction() -> None:
+    """Claude `limits[].percent` is provider-native 0-100.
+
+    Regression: a weekly window that just reset reports ``percent: 1`` (1%).
+    The old ``0 <= v <= 1`` heuristic read that as a 0-1 fraction and showed
+    100%. `percent` must never be rescaled; only the legacy top-level
+    `utilization` fallback can be a 0-1 ratio (and even then 1 stays 1).
+    """
+    from llm_bawt.service.usage.adapters.claude import _parse_pct, _from_limit_item
+
+    # The authoritative `percent` path: 0-100, never rescaled.
+    assert _parse_pct(1, allow_fraction=False) == 1.0      # the bug: was 100.0
+    assert _parse_pct(0, allow_fraction=False) == 0.0
+    assert _parse_pct(0.5, allow_fraction=False) == 0.5    # genuine 0.5%
+    assert _parse_pct(50, allow_fraction=False) == 50.0
+    assert _parse_pct(100, allow_fraction=False) == 100.0
+    assert _parse_pct(None, allow_fraction=False) is None
+
+    # The `utilization` fallback keeps ratio rescaling, but the literal 1 is
+    # 1%, not 100% (strict open interval).
+    assert _parse_pct(0.35) == 35.0
+    assert _parse_pct(0.92) == 92.0
+    assert _parse_pct(1) == 1.0
+    assert _parse_pct(0) == 0.0
+
+    # End-to-end: a just-reset weekly window maps to used_pct=1, not 100.
+    weekly = _from_limit_item(
+        {"kind": "weekly_all", "percent": 1, "resets_at": 1782335997,
+         "severity": "normal", "is_active": True},
+        0,
+    )
+    assert weekly is not None
+    assert weekly.id == "weekly_all"
+    assert weekly.used_pct == 1.0
+    assert weekly.resets_at == 1782335997
+
+
 def test_prepare_request_sets_prompt_cache_key_and_preserves_store_false() -> None:
     adapter = OpenAIChatGPTAdapter()
     responses_body = {
