@@ -85,9 +85,34 @@ async def chat_abort(request: ChatAbortRequest) -> ChatAbortResponse:
     store.update_turn(
         turn_id=turn.id,
         status="aborted",
+        end_reason="aborted",
         error_text="Aborted via chat.abort",
     )
     log.info("Marked turn %s as aborted (gateway_aborted=%s)", turn.id, gateway_aborted)
+
+    # Emit turn_complete so live SSE consumers (the bot bar "in progress"
+    # indicator) clear their active state WITHOUT a page reload. The streaming
+    # generator publishes this from its finally block, but turns terminated via
+    # this route (agent backends / codex) never reach that block — so without
+    # this the bot stays lit as "in turn" until hydration on next refresh.
+    redis_sub = getattr(service, "_redis_subscriber", None)
+    if redis_sub is not None and turn.bot_id:
+        try:
+            await redis_sub.publish_tool_event(
+                turn.bot_id,
+                turn.user_id or "nick",
+                {
+                    "_type": "turn_complete",
+                    "turn_id": turn.id,
+                    "bot_id": turn.bot_id,
+                    "user_id": turn.user_id,
+                    "status": "cancelled",
+                    "end_reason": "aborted",
+                    "ts": time.time(),
+                },
+            )
+        except Exception as e:
+            log.debug("turn_complete publish on abort failed for %s: %s", turn.id, e)
 
     return ChatAbortResponse(
         ok=True,

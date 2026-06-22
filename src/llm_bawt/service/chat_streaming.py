@@ -1402,6 +1402,9 @@ class ChatStreamingMixin:
                 _oc_call_stack: list[tuple[str, str]] = []
 
                 _oc_request_id_captured = [False]
+                # Fires once, on the SDK/bridge-CONFIRMED first output of this
+                # turn, to reap any other still-open turns for this bot.
+                _confirmed_start_reaped = [False]
 
                 def _intercept_tool_events(inner):
                     _saw_tool = False  # Track tool→content transitions
@@ -1448,6 +1451,59 @@ class ChatStreamingMixin:
                         })
 
                     for item in inner:
+                        # CONFIRMED turn start. This first item is the backend/
+                        # SDK's first real output (native first chunk, or an
+                        # agent-bridge ASSISTANT_DELTA/tool event) — proof the
+                        # turn is genuinely running, not the optimistic
+                        # save_turn insert or turn_start publish that fire
+                        # before anything is produced. On this confirmed signal,
+                        # reap any OTHER still-open turns for this bot as
+                        # timeouts and clear their UI indicators. Runs once.
+                        if not _confirmed_start_reaped[0]:
+                            _confirmed_start_reaped[0] = True
+                            try:
+                                _reaped = self._turn_log_store.reap_other_open_turns(
+                                    bot_id=bot_id, current_turn_id=turn_log_id,
+                                )
+                                for _rt in _reaped:
+                                    _ruid = _rt.get("user_id") or user_id
+                                    _evt = {
+                                        "_type": "turn_complete",
+                                        "turn_id": _rt["id"],
+                                        "bot_id": bot_id,
+                                        "user_id": _ruid,
+                                        "status": "timeout",
+                                        "end_reason": "timeout",
+                                        "ts": time.time(),
+                                    }
+                                    # Publish to the reaped turn's OWN
+                                    # {bot_id}:{user_id} stream so the right
+                                    # client clears (its user may differ from
+                                    # the current turn's).
+                                    if _redis_sub:
+                                        try:
+                                            asyncio.run_coroutine_threadsafe(
+                                                _redis_sub.publish_tool_event(
+                                                    bot_id, _ruid, _evt,
+                                                ),
+                                                loop,
+                                            )
+                                        except Exception as _pub_err:
+                                            log.debug(
+                                                "reap turn_complete publish failed for %s: %s",
+                                                _rt["id"], _pub_err,
+                                            )
+                                if _reaped:
+                                    log.info(
+                                        "Reaped %d stale open turn(s) for bot %s on confirmed start of %s",
+                                        len(_reaped), bot_id, turn_log_id,
+                                    )
+                            except Exception as _reap_err:
+                                log.debug(
+                                    "confirmed-start reap failed for %s: %s",
+                                    bot_id, _reap_err,
+                                )
+
                         # Capture agent_request_id on first yielded item
                         if is_agent_backend and not _oc_request_id_captured[0]:
                             _oc_request_id_captured[0] = True

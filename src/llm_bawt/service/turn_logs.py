@@ -238,6 +238,19 @@ class TurnLogStore:
                     "CREATE INDEX IF NOT EXISTS ix_turn_logs_active"
                     " ON turn_logs (bot_id, created_at) WHERE ended_at IS NULL"
                 ))
+                # One-time backfill: existing already-finished rows have NULL
+                # ended_at after the column add, which would make every recent
+                # completed turn look in-flight to active_only.  Stamp them from
+                # created_at + latency.  Idempotent (only touches terminal rows
+                # that are still NULL); zombie streaming/pending rows correctly
+                # stay NULL and age out of the scan window.
+                conn.execute(sa_text(
+                    "UPDATE turn_logs SET"
+                    " ended_at = created_at + (COALESCE(latency_ms, 0) * interval '1 millisecond')"
+                    " WHERE ended_at IS NULL"
+                    " AND (status IN ('ok','completed','error','timeout','cancelled','aborted')"
+                    "      OR end_reason IS NOT NULL)"
+                ))
                 conn.commit()
             except Exception:
                 pass
@@ -452,6 +465,52 @@ class TurnLogStore:
                 )
         except Exception as e:
             logger.debug("update_partial_response failed for %s: %s", turn_id, e)
+
+    def reap_other_open_turns(
+        self, *, bot_id: str, current_turn_id: str
+    ) -> list[dict]:
+        """Close every OTHER still-open turn for ``bot_id`` as a timeout.
+
+        The single source of truth for "a turn began" is the SDK/bridge
+        CONFIRMING its first real output (see chat_streaming's confirmed-start
+        hook) — not the optimistic ``save_turn`` insert or ``turn_start``
+        publish, both of which fire before the backend produces anything. When
+        that confirmed signal lands for a new turn, this reaps any prior turn
+        rows for the same bot that are still ``ended_at IS NULL`` (zombies that
+        never terminated — dropped bridge, aborted-without-finalize, server
+        restart mid-turn). They are stamped ``status='timeout'``,
+        ``end_reason='timeout'`` and ``ended_at=now`` atomically.
+
+        At most one turn per bot is ever open afterward, and the system is
+        self-healing: a stuck turn cannot outlive the next confirmed turn.
+
+        Returns the reaped rows as ``[{"id": ..., "user_id": ...}]`` so the
+        caller can emit a ``turn_complete`` per row to clear UI indicators on
+        the correct ``{bot_id}:{user_id}`` stream. Excludes ``current_turn_id``
+        so the turn that triggered the reap is never closed by it.
+        """
+        if self.engine is None or not bot_id or not current_turn_id:
+            return []
+        try:
+            with self.engine.begin() as conn:
+                rows = conn.execute(
+                    sa_text(
+                        "UPDATE turn_logs SET status = 'timeout',"
+                        " end_reason = 'timeout', ended_at = :now"
+                        " WHERE bot_id = :bid AND ended_at IS NULL"
+                        " AND id != :current_id"
+                        " RETURNING id, user_id"
+                    ),
+                    {
+                        "now": datetime.now(timezone.utc),
+                        "bid": bot_id,
+                        "current_id": current_turn_id,
+                    },
+                ).all()
+            return [{"id": r[0], "user_id": r[1]} for r in rows]
+        except Exception as e:
+            logger.debug("reap_other_open_turns failed for %s: %s", bot_id, e)
+            return []
 
     def get_turn(self, turn_id: str) -> TurnLog | None:
         """Get one turn by id."""
