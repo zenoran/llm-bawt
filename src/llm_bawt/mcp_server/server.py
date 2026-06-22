@@ -1168,6 +1168,12 @@ from . import task_tools as _task_tools  # noqa: F401, E402
 from . import media_tools as _media_tools  # noqa: F401, E402
 
 # ---------------------------------------------------------------------------
+# Self-recap tool (agent continuation briefing via Grok)
+# ---------------------------------------------------------------------------
+
+from . import self_tools as _self_tools  # noqa: F401, E402
+
+# ---------------------------------------------------------------------------
 # Run helpers
 # ---------------------------------------------------------------------------
 

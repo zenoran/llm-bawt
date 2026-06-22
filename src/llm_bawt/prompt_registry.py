@@ -179,6 +179,12 @@ def _load_agents_docs() -> str:
     return AGENTS_DOCS_PROMPT
 
 
+def _load_self_recap_system() -> str:
+    from .mcp_server.recap_prompt import RECAP_SYSTEM_PROMPT
+
+    return RECAP_SYSTEM_PROMPT
+
+
 TTS_OUTPUT_INSTRUCTIONS = (
     "VOICE OUTPUT:\n"
     "Your response will be spoken via text-to-speech. Only include words to be spoken. "
@@ -363,6 +369,23 @@ DEFAULT_PROMPT_DEFINITIONS: dict[str, PromptDefinition] = {
         category="agent_execution",
         required_vars=("origin", "task_section"),
         loader=_load_agents_docs,
+    ),
+    "self_recap.system": PromptDefinition(
+        key="self_recap.system",
+        title="Self-Recap Handoff Analyst",
+        category="agent_execution",
+        required_vars=(),
+        loader=_load_self_recap_system,
+        metadata={
+            "notes": (
+                "System prompt for the self_recap MCP tool's HANDOFF ANALYST. "
+                "Sent to Grok with the raw conversation transcript to produce a "
+                "cold-start continuation briefing (itemized TOPIC LOG + pending "
+                "work). No placeholders — the transcript is passed as a separate "
+                "user message, so the body is used verbatim (never .format()-ed). "
+                "Bot-scoped overrides supported via scope_type=bot."
+            ),
+        },
     ),
 }
 

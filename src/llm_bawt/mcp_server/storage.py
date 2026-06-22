@@ -614,13 +614,26 @@ class MemoryStorage:
         bot_id: str = "default",
         since_seconds: int | None = None,
         limit: int | None = None,
+        raw: bool = False,
     ) -> list[dict[str, Any]]:
         """Get messages for building a context window.
 
-        Uses the short-term manager's summary-aware retrieval path so older
-        session summaries are available when raw history falls outside the
-        recent time window.
+        Default path (``raw=False``) uses the short-term manager's
+        summary-aware retrieval, so older session summaries stand in for raw
+        history that has aged out of the recent window. This is the chatbot
+        short-term/long-term memory model — DO NOT change its behaviour.
+
+        When ``raw=True`` the summary-aware path is bypassed and the messages
+        table is queried directly: every real bubble is returned regardless of
+        its ``summarized`` flag, and ``role='summary'`` husks are excluded.
+        Callers like self_recap / self_tail want the actual transcript the user
+        sees in the app, not a summary of a summary.
         """
+        if raw:
+            return self._get_messages_raw(
+                bot_id, since_seconds=since_seconds, limit=limit
+            )
+
         manager = self.get_short_term_manager(bot_id)
 
         try:
@@ -640,6 +653,55 @@ class MemoryStorage:
             ]
         except Exception as e:
             logger.error("Failed to get messages: %s", e)
+            return []
+
+    def _get_messages_raw(
+        self,
+        bot_id: str = "default",
+        since_seconds: int | None = None,
+        limit: int | None = None,
+    ) -> list[dict[str, Any]]:
+        """Direct-table read of real message bubbles.
+
+        Bypasses the summary-aware manager entirely. Returns every row whose
+        role is NOT ``summary`` (so prior recaps/session summaries are excluded)
+        and ignores the ``summarized`` flag (so bubbles already rolled into a
+        summary are still returned). Ordered oldest-first; ``limit`` keeps the
+        most recent N.
+        """
+        from sqlalchemy import text
+
+        backend = self._get_backend(bot_id)
+        clauses = ["role <> 'summary'"]
+        params: dict[str, Any] = {}
+        if since_seconds is not None and since_seconds >= 0:
+            params["cutoff"] = time.time() - since_seconds
+            clauses.append("timestamp >= :cutoff")
+        where = " AND ".join(clauses)
+        sql = f"""
+            SELECT id, role, content, timestamp, session_id
+            FROM {backend._messages_table_name}
+            WHERE {where}
+            ORDER BY timestamp ASC
+        """
+        try:
+            with backend.engine.connect() as conn:
+                rows = conn.execute(text(sql), params).fetchall()
+            out = [
+                {
+                    "id": r.id,
+                    "role": r.role,
+                    "content": r.content,
+                    "timestamp": r.timestamp,
+                    "session_id": r.session_id,
+                }
+                for r in rows
+            ]
+            if limit is not None and limit >= 0:
+                out = out[-limit:]
+            return out
+        except Exception as e:
+            logger.error("Failed to get raw messages: %s", e)
             return []
 
     async def clear_messages(self, bot_id: str = "default") -> int:
@@ -684,6 +746,67 @@ class MemoryStorage:
         except Exception as e:
             logger.error("Failed to remove last message: %s", e)
             return False
+
+    async def store_recap_summary(
+        self,
+        bot_id: str,
+        content: str,
+        window_start: float,
+        window_end: float,
+        message_ids: list[str],
+        model: str,
+    ) -> str | None:
+        """Persist a self-recap as a ``role='summary'`` row.
+
+        Unlike the compaction summarizer (``HistorySummarizer.summarize_session``)
+        this deliberately does NOT mark the source messages ``summarized=TRUE``.
+        A recap is a handoff artifact layered on top of history, not a
+        compaction that should evict raw messages from the live context window.
+        Mirrors the proven INSERT in ``summarization.py`` (json.dumps into the
+        ``summary_metadata`` JSON column, no ``::jsonb`` cast needed).
+        """
+        import json
+
+        from sqlalchemy import text
+
+        backend = self._get_backend(bot_id)
+        summary_id = str(uuid.uuid4())
+        metadata = {
+            "summary_type": "self_recap",
+            "summarization_method": "self-recap",
+            "model": model,
+            "session_start": window_start,
+            "session_end": window_end,
+            "message_ids": message_ids,
+            "message_count": len(message_ids),
+            "created_at": time.time(),
+        }
+        try:
+            with backend.engine.connect() as conn:
+                conn.execute(
+                    text(
+                        f"""
+                        INSERT INTO {backend._messages_table_name}
+                        (id, role, content, timestamp, summary_metadata, created_at)
+                        VALUES (:id, 'summary', :content, :ts, :meta, CURRENT_TIMESTAMP)
+                        """
+                    ),
+                    {
+                        "id": summary_id,
+                        "content": content,
+                        "ts": window_end,
+                        "meta": json.dumps(metadata),
+                    },
+                )
+                conn.commit()
+            logger.info(
+                "Stored self-recap summary %s for bot=%s (%d source messages)",
+                summary_id[:8], bot_id, len(message_ids),
+            )
+            return summary_id
+        except Exception as e:
+            logger.error("Failed to store recap summary: %s", e)
+            return None
 
     # =========================================================================
     # Sessions (shared `sessions` table)
