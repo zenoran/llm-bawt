@@ -973,13 +973,36 @@ class ChatStreamingMixin:
         # if the SSE generator is cancelled (client disconnect / page refresh).
         _redis_sub = getattr(self, "_redis_subscriber", None)
 
+        async def _publish_unified(event_dict):
+            """Single source of truth for publishing to the unified SSE stream.
+
+            Race-free when awaited directly from the async generator (loop
+            thread). Worker-thread callers must NOT call this directly —
+            they go through _publish_event_direct, which marshals onto the
+            loop with run_coroutine_threadsafe.
+            """
+            if not _redis_sub:
+                return
+            try:
+                await _redis_sub.publish_tool_event(bot_id, user_id, event_dict)
+            except Exception as pub_err:
+                log.debug("Unified event publish failed: %s", pub_err)
+
         def _publish_event_direct(event_dict):
-            """Publish an event to Redis from the worker thread."""
+            """Publish to the unified stream FROM THE WORKER THREAD.
+
+            Thin cross-thread wrapper over _publish_unified. ``run_coroutine_
+            threadsafe`` is correct ONLY when called from a thread other than
+            the loop's own — calling it from the loop thread schedules a future
+            that races request teardown and is silently dropped (this was the
+            TASK-305 approval-card/bell/gold-lock bug). Loop-thread callers must
+            ``await _publish_unified(...)`` instead.
+            """
             if not _redis_sub:
                 return
             try:
                 asyncio.run_coroutine_threadsafe(
-                    _redis_sub.publish_tool_event(bot_id, user_id, event_dict),
+                    _publish_unified(event_dict),
                     loop,
                 )
             except Exception as pub_err:
@@ -993,7 +1016,7 @@ class ChatStreamingMixin:
         # (could be many seconds for non-tool turns) or on the next page
         # refresh via /api/chat/active-bots.  turn_complete (line ~1435)
         # is the matching teardown event.
-        _publish_event_direct({
+        await _publish_unified({
             "_type": "turn_start",
             "turn_id": turn_log_id,
             "trigger_message_id": trigger_message_id,
@@ -2137,7 +2160,7 @@ class ChatStreamingMixin:
                         "turn_id": turn_log_id,
                     }
                     yield (f"data: {json.dumps(await_payload)}\n\n")
-                    _publish_event_direct({
+                    await _publish_unified({
                         "_type": "tool_await_result",
                         "turn_id": turn_log_id,
                         "trigger_message_id": trigger_message_id,
@@ -2207,7 +2230,7 @@ class ChatStreamingMixin:
                         "turn_id": turn_log_id,
                     }
                     yield (f"data: {json.dumps(approval_payload)}\n\n")
-                    _publish_event_direct({
+                    await _publish_unified({
                         "_type": "tool_approval_required",
                         "turn_id": turn_log_id,
                         "trigger_message_id": trigger_message_id,
@@ -2233,7 +2256,7 @@ class ChatStreamingMixin:
                     # mark that exact tool card as pre-approved (gold/lock). No HTTP
                     # yield needed: it's a live activity-card flag, and every chat
                     # tab is on the unified stream.
-                    _publish_event_direct({
+                    await _publish_unified({
                         "_type": "tool_preapproved",
                         "turn_id": turn_log_id,
                         "trigger_message_id": trigger_message_id,
