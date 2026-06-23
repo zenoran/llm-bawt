@@ -15,6 +15,7 @@ import httpx
 from claude_agent_sdk import ClaudeAgentOptions, StreamEvent, query
 from claude_agent_sdk.types import (
     AssistantMessage,
+    HookMatcher,
     PermissionResultAllow,
     PermissionResultDeny,
     ResultMessage,
@@ -878,6 +879,20 @@ class ClaudeCodeBridge:
                         session_key=session_key,
                         seq_holder=seq_holder,
                     )
+                    # TASK-292: the approval gate lives in a PreToolUse hook, NOT
+                    # can_use_tool. Under permission_mode="bypassPermissions" (our
+                    # standing config) the SDK auto-approves regular tools and
+                    # never calls can_use_tool for them, so a can_use_tool-based
+                    # gate is dead code. PreToolUse hooks are a separate control
+                    # plane that fires regardless of permission_mode (verified
+                    # live: hook fires + "deny" blocks under bypass). Shares
+                    # seq_holder with can_use_tool — turns are sequential, so no
+                    # concurrent mutation.
+                    pre_tool_use_cb = self._make_pre_tool_use_hook(
+                        request_id=request_id,
+                        session_key=session_key,
+                        seq_holder=seq_holder,
+                    )
 
                     # TASK-288 observability: log the system_prompt value AS SENT
                     # to the SDK, paired with resume state. This is the only place
@@ -922,6 +937,13 @@ class ClaudeCodeBridge:
                         max_turns=bot_max_turns,
                         mcp_servers=self._mcp_servers if self._mcp_servers else {},
                         can_use_tool=can_use_tool_cb,
+                        # TASK-292: matcher=None → fires for every tool. The hook
+                        # (not can_use_tool) is the sole approval gate.
+                        hooks={
+                            "PreToolUse": [
+                                HookMatcher(matcher=None, hooks=[pre_tool_use_cb]),
+                            ],
+                        },
                         # The SDK's stdio reader defaults to a 1 MiB JSON buffer
                         # (claude_agent_sdk subprocess_cli _DEFAULT_MAX_BUFFER_SIZE).
                         # A single Playwright screenshot or large browser_snapshot
@@ -1764,6 +1786,13 @@ class ClaudeCodeBridge:
                 "Tool ALLOWED by prior approval grant: %s %r",
                 tool_name, decision.subject[:80],
             )
+            # TASK-305: mark this re-attempt as pre-approved so the UI can show
+            # the gold/lock affordance on the exact card that ran with prior
+            # authorization. The bridge is the single source of truth for this.
+            self._emit_tool_preapproved(
+                decision, tool_name, (ctx.tool_use_id or "").strip(),
+                request_id, session_key, seq_holder,
+            )
             return PermissionResultAllow()
 
         tool_use_id = (ctx.tool_use_id or "").strip()
@@ -1775,6 +1804,29 @@ class ClaudeCodeBridge:
             )
             return PermissionResultDeny(message=self._APPROVAL_PENDING_ACK, interrupt=False)
 
+        self._emit_approval_required(
+            decision, tool_name, tool_input, tool_use_id,
+            request_id, session_key, seq_holder,
+        )
+        return PermissionResultDeny(message=self._APPROVAL_PENDING_ACK, interrupt=False)
+
+    def _emit_approval_required(
+        self,
+        decision: ApprovalDecision,
+        tool_name: str,
+        tool_input: dict,
+        tool_use_id: str,
+        request_id: str,
+        session_key: str,
+        seq_holder: list[int],
+    ) -> None:
+        """Publish an APPROVAL_REQUIRED event for a gated tool (TASK-292).
+
+        Single source of truth for the approval-request event payload, shared by
+        the can_use_tool gate (_evaluate_tool_gate) and the PreToolUse hook gate
+        (_evaluate_tool_gate_hook). Best-effort: a publish failure is logged,
+        never raised — the caller still ends the turn with the pending-ack.
+        """
         try:
             seq_holder[0] += 1
             self._publish_event(
@@ -1802,7 +1854,139 @@ class ClaudeCodeBridge:
             "Tool gated (approval required): %s tool_use_id=%s policy=%s — turn ends",
             tool_name, tool_use_id, getattr(decision.policy, "id", "?"),
         )
-        return PermissionResultDeny(message=self._APPROVAL_PENDING_ACK, interrupt=False)
+
+    def _emit_tool_preapproved(
+        self,
+        decision: ApprovalDecision,
+        tool_name: str,
+        tool_use_id: str,
+        request_id: str,
+        session_key: str,
+        seq_holder: list[int],
+    ) -> None:
+        """Publish a TOOL_PREAPPROVED event for a re-attempt that consumed a grant.
+
+        Single source of truth for the pre-approved marker (TASK-305), shared by
+        both gate paths (can_use_tool and the PreToolUse hook). The bridge is the
+        only place that knows a tool ran because a one-shot grant was consumed —
+        the client must not re-derive it. Best-effort: a publish failure is
+        logged, never raised — the tool still runs.
+        """
+        if not tool_use_id:
+            return
+        try:
+            seq_holder[0] += 1
+            self._publish_event(
+                request_id, session_key, seq_holder[0],
+                kind=AgentEventKind.TOOL_PREAPPROVED,
+                tool_name=tool_name,
+                tool_use_id=tool_use_id,
+                extra_raw={
+                    "policy_id": getattr(decision.policy, "id", None),
+                    "severity": decision.severity.value,
+                    "grant_key": decision.grant_key,
+                },
+            )
+        except Exception:
+            logger.exception(
+                "Failed to publish TOOL_PREAPPROVED for tool_use_id=%s", tool_use_id,
+            )
+
+    @staticmethod
+    def _hook_deny(reason: str) -> dict:
+        """PreToolUse hook output that blocks a tool with a model-visible reason.
+
+        The reason is surfaced to the model as the tool's failure text (verified
+        live: the model reports the permissionDecisionReason as the block error).
+        """
+        return {
+            "hookSpecificOutput": {
+                "hookEventName": "PreToolUse",
+                "permissionDecision": "deny",
+                "permissionDecisionReason": reason,
+            }
+        }
+
+    async def _evaluate_tool_gate_hook(
+        self,
+        tool_name: str,
+        tool_input: dict,
+        tool_use_id: str,
+        request_id: str,
+        session_key: str,
+        seq_holder: list[int],
+    ) -> dict:
+        """Approval gate as a PreToolUse hook decision (TASK-292).
+
+        The live gate under permission_mode="bypassPermissions": the SDK only
+        consults PreToolUse hooks (never can_use_tool) for regular tools in that
+        mode. Mirrors _evaluate_tool_gate's policy logic but speaks the hook
+        control plane. Returns a hook JSON output dict:
+
+          ALLOW            → {} (no decision; tool proceeds normally)
+          DENY             → "deny" + block reason
+          REQUIRE_APPROVAL → consume a live one-shot grant → {} (allow); else
+                             emit APPROVAL_REQUIRED and "deny" with the
+                             pending-ack reason so the turn ends cleanly and the
+                             user's decision arrives as a continuation turn
+                             (same model as TASK-269 / the can_use_tool gate).
+        """
+        await self._get_policy_bundle()
+
+        # Fail-closed: app unreachable AND operator chose safety → deny all.
+        if self._approval_fail_closed and not self._policy_fetch_ok:
+            logger.warning(
+                "Approval fail-closed: policies unreachable, denying %s", tool_name
+            )
+            return self._hook_deny(
+                "[Tool execution is paused: the approval-policy service is "
+                "unreachable and this bridge is configured fail-closed. "
+                "Acknowledge and end your turn.]"
+            )
+
+        decision = self._decide_approval(tool_name, tool_input)
+
+        if decision.action is PolicyAction.ALLOW:
+            return {}
+
+        if decision.action is PolicyAction.DENY:
+            logger.info(
+                "Tool DENIED by policy %s: %s %r",
+                getattr(decision.policy, "id", "?"), tool_name, decision.subject[:80],
+            )
+            return self._hook_deny(
+                f"[This action is blocked by an approval policy and cannot be "
+                f"run: {decision.subject[:200]}. Do not retry it. Continue "
+                f"without it or explain what you need.]"
+            )
+
+        # ---- require_approval ----
+        if self._consume_grant(decision.grant_key):
+            logger.info(
+                "Tool ALLOWED by prior approval grant: %s %r",
+                tool_name, decision.subject[:80],
+            )
+            # TASK-305: mark this re-attempt as pre-approved (gold/lock card).
+            self._emit_tool_preapproved(
+                decision, tool_name, (tool_use_id or "").strip(),
+                request_id, session_key, seq_holder,
+            )
+            return {}
+
+        tool_use_id = (tool_use_id or "").strip()
+        if not tool_use_id:
+            # No id → app can't key a persistent request; defer cleanly anyway.
+            logger.warning(
+                "Approval-gated %s with no tool_use_id — deferring without persistence",
+                tool_name,
+            )
+            return self._hook_deny(self._APPROVAL_PENDING_ACK)
+
+        self._emit_approval_required(
+            decision, tool_name, tool_input, tool_use_id,
+            request_id, session_key, seq_holder,
+        )
+        return self._hook_deny(self._APPROVAL_PENDING_ACK)
 
     async def _handle_approval_grant(self, fields: dict, msg_id: str, async_redis) -> None:
         """Store a one-shot allow from an approval.grant command, then ACK."""
@@ -1925,11 +2109,12 @@ class ClaudeCodeBridge:
             ctx: ToolPermissionContext,
         ):
             if not self._is_ask_user_question(tool_name):
-                # TASK-292: evaluate approval-gated tool policies for every
-                # non-question tool. Default-allow remains the no-policy case.
-                return await self._evaluate_tool_gate(
-                    tool_name, tool_input, ctx, request_id, session_key, seq_holder,
-                )
+                # TASK-292: the approval gate moved to the PreToolUse hook
+                # (_make_pre_tool_use_hook). Under bypassPermissions the SDK
+                # doesn't call can_use_tool for regular tools anyway, and we want
+                # EXACTLY ONE gate to avoid double-emitting APPROVAL_REQUIRED.
+                # So allow here; the hook is the sole policy enforcement point.
+                return PermissionResultAllow()
 
             tool_use_id = (ctx.tool_use_id or "").strip()
             if not tool_use_id:
@@ -1968,6 +2153,52 @@ class ClaudeCodeBridge:
             return PermissionResultDeny(message=self._DEFERRED_ACK, interrupt=False)
 
         return can_use_tool
+
+    def _make_pre_tool_use_hook(
+        self,
+        *,
+        request_id: str,
+        session_key: str,
+        seq_holder: list[int],
+    ):
+        """Build the per-run PreToolUse hook bound to this turn (TASK-292).
+
+        This is the live approval gate. It fires for every tool regardless of
+        permission_mode (verified live under bypassPermissions). AskUserQuestion
+        is handed back to the SDK (return {}) so its dedicated can_use_tool
+        deferral (TASK-269) keeps owning it — the policy gate must not
+        double-handle the question flow. Everything else goes through the policy
+        engine via _evaluate_tool_gate_hook.
+        """
+
+        async def pre_tool_use(input_data, tool_use_id, context):
+            tool_name = ""
+            try:
+                tool_name = input_data.get("tool_name") or ""
+                if self._is_ask_user_question(tool_name):
+                    return {}
+                tool_input = input_data.get("tool_input")
+                if not isinstance(tool_input, dict):
+                    tool_input = {}
+                tuid = (tool_use_id or input_data.get("tool_use_id") or "")
+                return await self._evaluate_tool_gate_hook(
+                    tool_name, tool_input, tuid,
+                    request_id, session_key, seq_holder,
+                )
+            except Exception:
+                logger.exception(
+                    "PreToolUse approval gate errored for %s", tool_name or "?"
+                )
+                # Match the bundle-fetch posture: fail-closed denies on error,
+                # otherwise fail-open so a gate bug can't wedge every tool.
+                if self._approval_fail_closed:
+                    return self._hook_deny(
+                        "[Approval gate error and bridge is fail-closed; "
+                        "tool blocked. Acknowledge and end your turn.]"
+                    )
+                return {}
+
+        return pre_tool_use
 
     async def _handle_rpc(
         self, fields: dict, msg_id: str, async_redis,

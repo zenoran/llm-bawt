@@ -2161,6 +2161,12 @@ class ChatStreamingMixin:
                     req_id = chunk.get("tool_use_id") or ""
                     tool_args = chunk.get("arguments") or {}
                     store = getattr(self, "_tool_approval_policy_store", None)
+                    log.info(
+                        "DEBUG-292 chat_streaming: approval_required chunk reached "
+                        "req_id=%s store=%s engine=%s",
+                        req_id, store is not None,
+                        getattr(store, "engine", None) is not None,
+                    )
                     if req_id and store is not None and store.engine is not None:
                         approval_id_holder[0] = req_id
                         try:
@@ -2215,6 +2221,28 @@ class ChatStreamingMixin:
                         "severity": chunk.get("severity", "medium"),
                         "policy_id": chunk.get("policy_id"),
                         "session_key": chunk.get("session_key", ""),
+                        "provider": chunk.get("provider", ""),
+                        "ts": time.time(),
+                    })
+                    continue
+
+                if isinstance(chunk, dict) and chunk.get("event") == "tool_preapproved":
+                    # TASK-305 — a previously approval-gated tool was re-attempted
+                    # on this continuation turn and consumed a live one-shot grant.
+                    # Publish to the unified stream so the tab(s) showing this turn
+                    # mark that exact tool card as pre-approved (gold/lock). No HTTP
+                    # yield needed: it's a live activity-card flag, and every chat
+                    # tab is on the unified stream.
+                    _publish_event_direct({
+                        "_type": "tool_preapproved",
+                        "turn_id": turn_log_id,
+                        "trigger_message_id": trigger_message_id,
+                        "bot_id": bot_id,
+                        "user_id": user_id,
+                        "tool_use_id": chunk.get("tool_use_id", ""),
+                        "tool_name": chunk.get("tool_name", ""),
+                        "policy_id": chunk.get("policy_id"),
+                        "severity": chunk.get("severity", "medium"),
                         "provider": chunk.get("provider", ""),
                         "ts": time.time(),
                     })

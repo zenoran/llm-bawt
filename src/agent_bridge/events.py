@@ -49,6 +49,17 @@ class AgentEventKind(str, Enum):
     # tool input), ``tool_use_id`` (the SDK tool_use id), and ``raw`` carries
     # {policy_id, severity, subject, prompt, grant_key, action}.
     APPROVAL_REQUIRED = "approval_required"
+    # Emitted on the *continuation* turn when a previously approval-gated tool is
+    # re-attempted and a live one-shot grant is consumed (TASK-305). The bridge
+    # allows the call and emits this so the UI can mark that specific tool card
+    # as having run with prior authorization (gold/lock affordance). This is the
+    # single source of truth for "this execution was pre-approved" — the client
+    # must never re-derive it (that would duplicate the subject→grant_key hashing
+    # the bridge already owns). Payload: ``tool_use_id`` (the re-attempt's SDK
+    # id, distinct from the original gated call) and ``raw`` carries
+    # {policy_id, grant_key, severity}. Additive: unknown to older consumers,
+    # which degrade it to SYSTEM_NOTE (see from_dict).
+    TOOL_PREAPPROVED = "tool_preapproved"
 
 
 @dataclass

@@ -355,6 +355,11 @@ class AgentBridgeBackend(AgentBackend):
                                 })
 
                             elif event.kind == AgentEventKind.APPROVAL_REQUIRED:
+                                logger.info(
+                                    "DEBUG-292 agent_bridge: APPROVAL_REQUIRED received tool=%s tuid=%s raw_keys=%s",
+                                    event.tool_name, event.tool_use_id,
+                                    list((event.raw or {}).keys()),
+                                )
                                 # TASK-292: an approval-gated tool policy matched.
                                 # The bridge denied the call and ended the turn;
                                 # the app persists a tool_approval_requests row and
@@ -377,6 +382,23 @@ class AgentBridgeBackend(AgentBackend):
                                     "category": meta.get("category"),
                                     "subject": meta.get("subject") or "",
                                     "prompt": meta.get("prompt") or "",
+                                    "grant_key": meta.get("grant_key") or "",
+                                })
+
+                            elif event.kind == AgentEventKind.TOOL_PREAPPROVED:
+                                # TASK-305: a previously gated tool was re-attempted
+                                # on this continuation turn and consumed a live
+                                # one-shot grant. Forward so the UI can mark that
+                                # specific tool card as pre-approved (gold/lock).
+                                meta = event.raw if isinstance(event.raw, dict) else {}
+                                result_queue.put({
+                                    "event": "tool_preapproved",
+                                    "tool_name": event.tool_name or "",
+                                    "tool_use_id": event.tool_use_id or "",
+                                    "provider": event.provider,
+                                    "trigger_message_id": event.trigger_message_id,
+                                    "policy_id": meta.get("policy_id"),
+                                    "severity": meta.get("severity") or "medium",
                                     "grant_key": meta.get("grant_key") or "",
                                 })
 
