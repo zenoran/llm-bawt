@@ -39,6 +39,16 @@ class AgentEventKind(str, Enum):
     # ``thinking_delta`` frames (TASK-301). ``text`` carries the reasoning chunk.
     # Additive: consumers that don't know this kind ignore it (see from_dict).
     REASONING_DELTA = "reasoning_delta"
+    # Emitted when an approval-gated tool policy matched a tool the model tried
+    # to run (TASK-292). The bridge denies the call, emits this, and ends the
+    # turn cleanly (same deferred/continuation model as AWAIT_TOOL_RESULT). The
+    # app persists a tool_approval_requests row, the UI renders an Approve/Deny
+    # card, and on Approve the app sends an approval.grant Redis command back to
+    # the bridge + dispatches a continuation turn so the model re-issues the now
+    # allow-listed call. Payload: ``tool_name``, ``tool_arguments`` (the original
+    # tool input), ``tool_use_id`` (the SDK tool_use id), and ``raw`` carries
+    # {policy_id, severity, subject, prompt, grant_key, action}.
+    APPROVAL_REQUIRED = "approval_required"
 
 
 @dataclass

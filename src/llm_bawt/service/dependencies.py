@@ -137,6 +137,15 @@ def get_prompt_template_store(config: Any):
     )
 
 
+def get_tool_approval_policy_store(config: Any):
+    """Process-wide ``ToolApprovalPolicyStore`` singleton (TASK-290)."""
+    from ..approval_policies import ToolApprovalPolicyStore
+
+    return _get_or_build_store(
+        "tool_approval_policy_store", config, lambda: ToolApprovalPolicyStore(config)
+    )
+
+
 def set_service(service: "BackgroundService | None") -> None:
     """Set the global background service instance."""
     global _service

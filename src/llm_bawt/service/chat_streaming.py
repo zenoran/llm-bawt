@@ -833,6 +833,7 @@ class ChatStreamingMixin:
 
         chunk_queue: asyncio.Queue = asyncio.Queue()
         full_response_holder = [""]  # Use list to allow mutation in nested function
+        reasoning_holder = [""]  # TASK-301: accumulated model reasoning, persisted display-only
         animation_holder = [None]   # Populated by the embedding classifier (TASK-215)
         tool_context_holder = [""]  # Store tool context from native tool calls
         tool_call_details_holder: list[dict] = []
@@ -847,6 +848,10 @@ class ChatStreamingMixin:
         # completion to mark end_reason="question" + question_id on the turn log
         # and in the turn_complete event so the UI renders a QuestionMessage.
         question_id_holder: list[str | None] = [None]
+        # TASK-292: request_id of an approval-gated tool call deferred this turn.
+        # Set when an approval_required chunk arrives; consumed at turn
+        # completion to mark end_reason="approval" so the UI keeps the card.
+        approval_id_holder: list[str | None] = [None]
 
         # Capture the event loop before entering the thread
         loop = asyncio.get_running_loop()
@@ -1542,6 +1547,11 @@ class ChatStreamingMixin:
                                 # touch _text_chars/_text_buf/_saw_text/_saw_tool.
                                 _rtext = item.get("text", "")
                                 if _rtext:
+                                    # TASK-301: accumulate for display-only
+                                    # persistence on the assistant row. Stays out
+                                    # of full_response_holder so it never enters
+                                    # the answer transcript or LLM context.
+                                    reasoning_holder[0] += _rtext
                                     _publish_event_direct({
                                         "_type": "reasoning_delta",
                                         "turn_id": turn_log_id,
@@ -1751,6 +1761,7 @@ class ChatStreamingMixin:
                                 animation=animation_holder[0],
                                 token_usage=token_usage_holder[0],
                                 attachments=agent_attachments_holder or None,
+                                reasoning=reasoning_holder[0] or None,
                                 status="aborted",
                                 end_reason="aborted",
                             )
@@ -1778,6 +1789,7 @@ class ChatStreamingMixin:
                             animation=animation_holder[0],
                             token_usage=token_usage_holder[0],
                             attachments=agent_attachments_holder or None,
+                            reasoning=reasoning_holder[0] or None,
                         )
                     else:
                         # No response received — mark as timeout so turn doesn't
@@ -1813,8 +1825,14 @@ class ChatStreamingMixin:
                 # "question" — the persisted question stays "awaiting" (NOT
                 # abandoned; the user answers later via a continuation turn).
                 question_id = question_id_holder[0]
+                approval_id = approval_id_holder[0]
                 if question_id:
                     end_reason = "question"
+                elif approval_id:
+                    # TASK-292: gated tool awaiting approval — same clean-end
+                    # semantics as a question; the request stays "pending" and
+                    # the user resolves it via a continuation turn.
+                    end_reason = "approval"
                 elif cancelled_holder[0]:
                     end_reason = "aborted"
                 elif status == "timeout":
@@ -1839,6 +1857,7 @@ class ChatStreamingMixin:
                     "status": status,
                     "end_reason": end_reason,
                     "question_id": question_id,
+                    "approval_id": approval_id,
                     "animation": animation_holder[0],
                     "token_usage": token_usage_holder[0],
                     "ts": time.time(),
@@ -2127,6 +2146,74 @@ class ChatStreamingMixin:
                         "tool_use_id": tool_use_id,
                         "tool_name": chunk.get("tool_name", ""),
                         "arguments": tool_args,
+                        "session_key": chunk.get("session_key", ""),
+                        "provider": chunk.get("provider", ""),
+                        "ts": time.time(),
+                    })
+                    continue
+
+                if isinstance(chunk, dict) and chunk.get("event") == "approval_required":
+                    # TASK-292 — an approval-gated tool policy matched. The bridge
+                    # denied the call and is ending the turn cleanly. Persist the
+                    # request (durable audit + lets the UI hydrate the card on
+                    # reload), remember its id so the turn ends end_reason=
+                    # "approval", and fan it out so every tab renders Approve/Deny.
+                    req_id = chunk.get("tool_use_id") or ""
+                    tool_args = chunk.get("arguments") or {}
+                    store = getattr(self, "_tool_approval_policy_store", None)
+                    if req_id and store is not None and store.engine is not None:
+                        approval_id_holder[0] = req_id
+                        try:
+                            store.record_request(
+                                request_id=req_id,
+                                bot_id=bot_id,
+                                user_id=user_id,
+                                turn_id=turn_log_id,
+                                backend=chunk.get("provider") or "claude-code",
+                                tool_name=chunk.get("tool_name") or "",
+                                tool_arguments=tool_args if isinstance(tool_args, dict) else {"value": tool_args},
+                                subject=chunk.get("subject") or "",
+                                grant_key=chunk.get("grant_key") or "",
+                                policy_id=chunk.get("policy_id"),
+                                severity=chunk.get("severity") or "medium",
+                                prompt=chunk.get("prompt") or "",
+                                trigger_message_id=trigger_message_id,
+                                session_key=chunk.get("session_key") or None,
+                            )
+                        except Exception as _persist_err:
+                            log.warning(
+                                "Failed to persist approval request id=%s: %s",
+                                req_id, _persist_err,
+                            )
+                    approval_payload = {
+                        "object": "tool.approval_required",
+                        "request_id": req_id,
+                        "tool_name": chunk.get("tool_name", ""),
+                        "arguments": tool_args,
+                        "subject": chunk.get("subject", ""),
+                        "prompt": chunk.get("prompt", ""),
+                        "severity": chunk.get("severity", "medium"),
+                        "policy_id": chunk.get("policy_id"),
+                        "session_key": chunk.get("session_key", ""),
+                        "provider": chunk.get("provider", ""),
+                        "trigger_message_id": chunk.get("trigger_message_id"),
+                        "bot_id": bot_id,
+                        "turn_id": turn_log_id,
+                    }
+                    yield (f"data: {json.dumps(approval_payload)}\n\n")
+                    _publish_event_direct({
+                        "_type": "tool_approval_required",
+                        "turn_id": turn_log_id,
+                        "trigger_message_id": trigger_message_id,
+                        "bot_id": bot_id,
+                        "user_id": user_id,
+                        "request_id": req_id,
+                        "tool_name": chunk.get("tool_name", ""),
+                        "arguments": tool_args,
+                        "subject": chunk.get("subject", ""),
+                        "prompt": chunk.get("prompt", ""),
+                        "severity": chunk.get("severity", "medium"),
+                        "policy_id": chunk.get("policy_id"),
                         "session_key": chunk.get("session_key", ""),
                         "provider": chunk.get("provider", ""),
                         "ts": time.time(),

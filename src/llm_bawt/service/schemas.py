@@ -717,6 +717,10 @@ class HistoryMessage(BaseModel):
     content: str
     timestamp: float
     attachments: list[dict] = []
+    # TASK-301: persisted model reasoning ("thinking"), hydrated by the
+    # /v1/history route only (display-only; never in LLM context). None when the
+    # row carried no reasoning (user rows, pre-feature assistant rows).
+    reasoning: str | None = None
 
 
 class HistoryResponse(BaseModel):

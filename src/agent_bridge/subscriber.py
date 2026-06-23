@@ -12,6 +12,7 @@ import logging
 from typing import AsyncIterator
 
 import redis.asyncio as aioredis
+from redis.asyncio import BlockingConnectionPool
 
 from .events import AgentEvent
 from .publisher import (
@@ -40,6 +41,35 @@ class RedisSubscriber:
             decode_responses=True,
             socket_timeout=None,
             socket_connect_timeout=5,
+        )
+        # Dedicated, bounded pool for fire-and-forget writes (xadd / publish),
+        # kept SEPARATE from the reader client above. Why a second pool:
+        # ``self._redis`` runs long-lived blocking XREAD/XREADGROUP loops that
+        # each pin a connection for a turn's whole duration. Mixing the
+        # high-frequency, bursty publish path into that same pool let a single
+        # fan-out — e.g. reaping N stale turns at once fires N simultaneous
+        # ``publish_tool_event`` calls — spawn a fresh connection per in-flight
+        # xadd. redis-py's default ConnectionPool never reaps idle connections
+        # AND *raises* MaxConnectionsError (rather than waiting) at its cap
+        # (100 since redis-py 8.0), so each burst ratcheted the open-connection
+        # count up permanently until the app could no longer reach Redis at all
+        # (even /health -> connection refused).
+        #
+        # BlockingConnectionPool WAITS (briefly — an xadd is sub-millisecond)
+        # for a free connection instead of erroring, and the small cap means a
+        # 34-at-once burst reuses ≤16 connections instead of opening 34 that
+        # never close. Lazy: no connections until the first publish, so
+        # reader-only instances (the per-SSE-connection subscribers) cost
+        # nothing here.
+        self._pub_redis = aioredis.Redis(
+            connection_pool=BlockingConnectionPool.from_url(
+                redis_url,
+                decode_responses=True,
+                socket_timeout=None,
+                socket_connect_timeout=5,
+                max_connections=16,
+                timeout=5,
+            )
         )
         self._connected = False
 
@@ -158,7 +188,7 @@ class RedisSubscriber:
             fields["effort"] = effort
         if max_turns is not None:
             fields["max_turns"] = str(max_turns)
-        await self._redis.xadd(
+        await self._pub_redis.xadd(
             COMMANDS_STREAM,
             fields,
             maxlen=1000,
@@ -195,7 +225,7 @@ class RedisSubscriber:
             fields["backend"] = backend
         if request_id:
             fields["request_id"] = request_id
-        await self._redis.xadd(
+        await self._pub_redis.xadd(
             COMMANDS_STREAM,
             fields,
             maxlen=1000,
@@ -205,6 +235,54 @@ class RedisSubscriber:
             "Sent chat.tool_result: session=%s tool_use_id=%s len=%d backend=%s",
             session_key, tool_use_id, len(result or ""), backend or "?",
         )
+
+    async def send_approval_grant(
+        self,
+        *,
+        session_key: str,
+        grant_key: str,
+        backend: str | None = None,
+        ttl_seconds: int = 600,
+        request_id: str | None = None,
+    ) -> None:
+        """Publish an approval.grant command so a bridge allows ONE gated call.
+
+        Sent when a user approves a policy-gated tool (TASK-292). The bridge
+        stores ``grant_key`` in an in-memory grant set (with ``ttl_seconds``
+        expiry); when the model re-issues the identical tool call on the
+        continuation turn the bridge computes the same key, finds the grant,
+        consumes it, and allows the call exactly once. Fire-and-forget.
+        """
+        fields: dict = {
+            "action": "approval.grant",
+            "session_key": session_key,
+            "grant_key": grant_key,
+            "ttl_seconds": str(int(ttl_seconds)),
+        }
+        if backend:
+            fields["backend"] = backend
+        if request_id:
+            fields["request_id"] = request_id
+        await self._pub_redis.xadd(
+            COMMANDS_STREAM, fields, maxlen=1000, approximate=True,
+        )
+        logger.info(
+            "Sent approval.grant: session=%s grant_key=%s backend=%s ttl=%ds",
+            session_key, grant_key[:12], backend or "?", ttl_seconds,
+        )
+
+    async def publish_approval_reload(self) -> None:
+        """Broadcast a policy-bundle reload to every bridge (TASK-291, TASK-293).
+
+        Bridges subscribe to ``approval:policies:reload`` and drop their cached
+        bundle on any message, so an admin edit propagates without a restart
+        and without waiting out the cache TTL.
+        """
+        try:
+            await self._pub_redis.publish("approval:policies:reload", "1")
+            logger.info("Published approval:policies:reload")
+        except Exception:  # noqa: BLE001
+            logger.warning("Failed to publish approval:policies:reload", exc_info=True)
 
     async def send_rpc(
         self,
@@ -233,7 +311,7 @@ class RedisSubscriber:
         if backend:
             fields["backend"] = backend
 
-        await self._redis.xadd(
+        await self._pub_redis.xadd(
             COMMANDS_STREAM,
             fields,
             maxlen=1000,
@@ -449,7 +527,7 @@ class RedisSubscriber:
         stream_key = f"{UNIFIED_EVENTS_PREFIX}{bot_id}:{user_id}"
         try:
             fields = {"payload": json.dumps(event, ensure_ascii=False, default=str)}
-            stream_id = await self._redis.xadd(
+            stream_id = await self._pub_redis.xadd(
                 stream_key,
                 fields,
                 maxlen=UNIFIED_STREAM_MAXLEN,
@@ -634,6 +712,10 @@ class RedisSubscriber:
     async def close(self) -> None:
         try:
             await self._redis.aclose()
+        except Exception:
+            pass
+        try:
+            await self._pub_redis.aclose()
         except Exception:
             pass
 

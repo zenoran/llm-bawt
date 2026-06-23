@@ -25,6 +25,12 @@ from claude_agent_sdk.types import (
     UserMessage,
 )
 
+from agent_bridge.approval import (
+    ApprovalDecision,
+    PolicyAction,
+    PolicyBundle,
+    evaluate as evaluate_policies,
+)
 from agent_bridge.events import AgentEvent, AgentEventKind, synthesize_event_id
 from agent_bridge.publisher import COMMANDS_STREAM, RedisPublisher
 from agent_bridge.session_queue import SessionQueue
@@ -261,6 +267,27 @@ class ClaudeCodeBridge:
         # ANTHROPIC_BASE_URL pointing here so its outbound /v1/messages
         # call lands on the proxy instead of api.anthropic.com.
         self._proxy_base_url: str | None = None
+        # ---- Approval-gated tool policies (TASK-291 / TASK-292) ----
+        # Compiled bundle fetched from the app, TTL-cached. Grants are one-shot
+        # allows keyed by grant_key, populated by approval.grant commands when a
+        # user approves a gated call, consumed when the model re-issues it.
+        self._policy_bundle: PolicyBundle | None = None
+        self._policy_bundle_fetched_at: float = 0.0
+        self._policy_bundle_ttl: float = float(
+            os.getenv("CLAUDE_CODE_APPROVAL_BUNDLE_TTL", "15")
+        )
+        # When the app is unreachable, fail OPEN by default (allow tools) so a
+        # transient app blip never halts every agent. Set 1/true to fail CLOSED
+        # (deny gated tools when policies can't be fetched). Non-gated tools are
+        # unaffected either way — only tools a (cached) policy gates are denied.
+        self._approval_fail_closed: bool = os.getenv(
+            "CLAUDE_CODE_APPROVAL_FAIL_CLOSED", ""
+        ).strip().lower() in ("1", "true", "yes")
+        self._approval_grants: dict[str, float] = {}  # grant_key -> expiry (monotonic)
+        self._approval_reload_task: asyncio.Task | None = None
+        # Tracks whether the last bundle fetch reached the app. Only consulted
+        # when fail-closed is on: a failing fetch then denies all tools.
+        self._policy_fetch_ok: bool = True
 
     def set_proxy_base_url(self, url: str) -> None:
         """Wire up the in-process Anthropic-compat proxy. Called by __main__
@@ -450,7 +477,7 @@ class ClaudeCodeBridge:
         )
 
     async def stop(self) -> None:
-        for task in (self._command_task, self._cleanup_task):
+        for task in (self._command_task, self._cleanup_task, self._approval_reload_task):
             if task:
                 task.cancel()
                 try:
@@ -501,6 +528,14 @@ class ClaudeCodeBridge:
 
         logger.info("Command listener started on %s (group=claude-code-bridge)", COMMANDS_STREAM)
 
+        # TASK-291: subscribe to approval-policy reload broadcasts so admin
+        # edits drop the cached bundle without a restart. Best-effort.
+        if self._approval_reload_task is None or self._approval_reload_task.done():
+            reload_url = f"redis://{host}:{port}/{db}"
+            self._approval_reload_task = asyncio.create_task(
+                self._approval_reload_listener(reload_url)
+            )
+
         while True:
             try:
                 results = await async_redis.xreadgroup(
@@ -539,6 +574,18 @@ class ClaudeCodeBridge:
                             # taking it here would deadlock the run forever.
                             asyncio.create_task(
                                 self._handle_tool_result(fields, msg_id, async_redis)
+                            )
+                        elif action == "approval.grant":
+                            # TASK-292: user approved a gated tool. Store a
+                            # one-shot allow so the re-issued call on the
+                            # continuation turn sails through.
+                            if backend and backend != self._backend_name:
+                                await async_redis.xack(
+                                    COMMANDS_STREAM, "claude-code-bridge", msg_id
+                                )
+                                continue
+                            asyncio.create_task(
+                                self._handle_approval_grant(fields, msg_id, async_redis)
                             )
                         else:
                             await async_redis.xack(COMMANDS_STREAM, "claude-code-bridge", msg_id)
@@ -915,6 +962,22 @@ class ClaudeCodeBridge:
                     compact_status: str | None = None  # None | "success" | "failed"
                     compact_error_msg: str | None = None
                     turn_session_id: str | None = resume_id
+                    # Some providers / SDK paths terminate after an
+                    # AssistantMessage snapshot with text/tool_use content and
+                    # NEVER emit a trailing ResultMessage. If we only finalize
+                    # on ResultMessage, the bridge logs "Send completed" but
+                    # the app receives no ASSISTANT_DONE and the turn is saved
+                    # as an empty timeout. Capture the latest assistant text
+                    # snapshot so we can publish a fallback DONE on clean EOF.
+                    assistant_snapshot_text: str = ""
+                    assistant_done_emitted = False
+                    # Track upstream API retries so we can (a) show live
+                    # status in the UI ("z.ai overloaded, retrying…") and
+                    # (b) include the error in the final DONE when all
+                    # retries are exhausted and the turn ends empty.
+                    api_retry_count = 0
+                    api_last_error: str | None = None
+                    api_retry_surfaced = False  # True once we've pushed a delta
 
                     msg_stream = None
                     try:
@@ -945,7 +1008,7 @@ class ClaudeCodeBridge:
                                     timeout=self._request_timeout,
                                 )
                             except StopAsyncIteration:
-                                break
+                                    break
                             except TimeoutError:
                                 raise TimeoutError(
                                     f"No SDK messages for {self._request_timeout}s — CLI may be hung"
@@ -995,6 +1058,33 @@ class ClaudeCodeBridge:
                                     compact_error_msg = (
                                         data.get("compact_error") or "unknown error"
                                     )
+                                # API retry lifecycle. The SDK CLI retries on
+                                # upstream errors (429, 500, 529, etc.). Surface
+                                # the retry to the UI as a live status delta so
+                                # the user sees feedback instead of a dead bubble.
+                                if data.get("subtype") == "api_retry":
+                                    attempt = data.get("attempt", 0)
+                                    max_retries = data.get("max_retries", 10)
+                                    err_status = data.get("error_status", "?")
+                                    err_text = data.get("error", "unknown")
+                                    api_retry_count = attempt
+                                    api_last_error = f"HTTP {err_status}: {err_text}"
+                                    logger.warning(
+                                        "API retry %d/%d: status=%s error=%s session=%s",
+                                        attempt, max_retries, err_status, err_text, session_key,
+                                    )
+                                    # Push a live status on first retry so the
+                                    # user immediately sees something.
+                                    if not api_retry_surfaced:
+                                        api_retry_surfaced = True
+                                        seq += 1
+                                        note = f"⏳ Upstream unavailable ({err_text}), retrying…"
+                                        text_parts.append(note)
+                                        self._publish_event(
+                                            request_id, session_key, seq,
+                                            kind=AgentEventKind.ASSISTANT_DELTA,
+                                            text=note,
+                                        )
                             msg_type = type(msg).__name__
                             if not isinstance(msg, (StreamEvent, SystemMessage)):
                                 content = getattr(msg, "content", [])
@@ -1065,6 +1155,7 @@ class ClaudeCodeBridge:
                                 am_usage = getattr(msg, "usage", None)
                                 if isinstance(am_usage, dict) and am_usage:
                                     latest_assistant_usage = am_usage
+                                snapshot_parts: list[str] = []
                                 for block in getattr(msg, "content", []):
                                     if isinstance(block, ToolUseBlock):
                                         seq += 1
@@ -1078,6 +1169,19 @@ class ClaudeCodeBridge:
                                             tool_arguments=block.input if isinstance(block.input, dict) else {},
                                             tool_use_id=tu_id,
                                         )
+                                        continue
+                                    btype = getattr(block, "type", None)
+                                    if isinstance(block, dict):
+                                        btype = block.get("type")
+                                    if btype == "text":
+                                        if isinstance(block, dict):
+                                            btext = block.get("text", "")
+                                        else:
+                                            btext = getattr(block, "text", "") or ""
+                                        if btext:
+                                            snapshot_parts.append(str(btext))
+                                if snapshot_parts:
+                                    assistant_snapshot_text = "".join(snapshot_parts)
 
                             elif isinstance(msg, UserMessage):
                                 for block in getattr(msg, "content", []):
@@ -1133,6 +1237,20 @@ class ClaudeCodeBridge:
                                             if isinstance(block, dict) and block.get("type") == "text":
                                                 result_text += block.get("text", "")
                                     full_text = result_text
+                                    if not full_text and assistant_snapshot_text:
+                                        full_text = assistant_snapshot_text
+                                # If no text and retries happened, surface the error
+                                if not full_text and api_retry_count > 0:
+                                    error_note = (
+                                        f"\n\n❌ Upstream error after {api_retry_count} "
+                                        f"retries: {api_last_error or 'unknown'}. "
+                                        f"Try again in a moment."
+                                    )
+                                    if api_retry_surfaced:
+                                        # Already pushed "⏳ retrying" — append the outcome
+                                        full_text = "".join(text_parts) + error_note
+                                    else:
+                                        full_text = error_note.lstrip()
 
                                 # Extract token usage + context window for UI surfacing.
                                 #
@@ -1287,6 +1405,7 @@ class ClaudeCodeBridge:
                                     token_usage=token_usage_payload,
                                     attachments=turn_screenshot_assets or None,
                                 )
+                                assistant_done_emitted = True
                                 # Turn complete — release the prompt generator so
                                 # the SDK closes its input stream.  Kept open until
                                 # now so the can_use_tool control channel survived
@@ -1315,6 +1434,47 @@ class ClaudeCodeBridge:
                                 text="".join(text_parts),
                                 model=actual_model,
                             )
+                            assistant_done_emitted = True
+                        elif not assistant_done_emitted:
+                            # Clean EOF without a ResultMessage. z.ai / GLM via
+                            # the Claude SDK can end a turn after an
+                            # AssistantMessage snapshot only (text and/or tool
+                            # uses already captured above). Publish a fallback
+                            # terminal DONE so the app persists the reply instead
+                            # of timing out with response_chars=0.
+                            full_text = "".join(text_parts)
+                            if assistant_snapshot_text:
+                                if not full_text:
+                                    full_text = assistant_snapshot_text
+                                elif assistant_snapshot_text.startswith(full_text):
+                                    full_text = assistant_snapshot_text
+                            # Surface retry errors when the turn ends empty
+                            if not full_text and api_retry_count > 0:
+                                error_note = (
+                                    f"\n\n❌ Upstream error after {api_retry_count} "
+                                    f"retries: {api_last_error or 'unknown'}. "
+                                    f"Try again in a moment."
+                                )
+                                if api_retry_surfaced:
+                                    full_text = "".join(text_parts) + error_note
+                                else:
+                                    full_text = error_note.lstrip()
+                            # Always publish — even if full_text is empty.
+                            # An empty ASSISTANT_DONE is far better than no
+                            # DONE at all, which causes timeout + vanishing bubble.
+                            seq += 1
+                            self._publish_event(
+                                request_id, session_key, seq,
+                                kind=AgentEventKind.ASSISTANT_DONE,
+                                text=full_text,
+                                model=actual_model,
+                                attachments=turn_screenshot_assets or None,
+                            )
+                            assistant_done_emitted = True
+                            logger.info(
+                                "EOF fallback ASSISTANT_DONE: chars=%d request_id=%s session=%s",
+                                len(full_text), request_id, session_key,
+                            )
                         break
                     except asyncio.CancelledError:
                         # task.cancel() arrived from elsewhere (legacy path /
@@ -1333,6 +1493,7 @@ class ClaudeCodeBridge:
                                 text="".join(text_parts),
                                 model=actual_model,
                             )
+                            assistant_done_emitted = True
                         except Exception:
                             logger.debug("Failed to publish ASSISTANT_DONE on cancel", exc_info=True)
                         try:
@@ -1457,6 +1618,266 @@ class ClaudeCodeBridge:
         except Exception:
             pass
 
+    # ----- Approval-gated tool policies (TASK-291 / TASK-292) -----
+
+    # Synthetic tool result fed back to the model when a call is gated. Mirrors
+    # _DEFERRED_ACK: the turn ends cleanly and the decision returns as a brand
+    # new continuation turn (approve → re-issue; deny → drop it).
+    _APPROVAL_PENDING_ACK = (
+        "[This action requires user approval and has been sent to the user. Do "
+        "NOT retry it now and do not work around it. Briefly acknowledge that "
+        "you've requested approval, then end your turn — you'll receive the "
+        "user's decision as a new message and can act on it then.]"
+    )
+
+    async def _get_policy_bundle(self) -> PolicyBundle:
+        """Return the approval-policy bundle, TTL-cached, fetched from the app.
+
+        Conditional on the cached etag so an unchanged bundle costs one cheap
+        round-trip and no re-parse. On any fetch error the cached bundle is
+        kept; if there's no cache yet, an empty bundle is returned (no policies
+        → default-allow), which is the fail-open posture.
+        """
+        now = time.monotonic()
+        if (
+            self._policy_bundle is not None
+            and (now - self._policy_bundle_fetched_at) < self._policy_bundle_ttl
+        ):
+            return self._policy_bundle
+        if not self._app_api_url:
+            self._policy_bundle = self._policy_bundle or PolicyBundle(version=1, etag="", policies=[])
+            self._policy_bundle_fetched_at = now
+            return self._policy_bundle
+        try:
+            params = {}
+            if self._policy_bundle is not None and self._policy_bundle.etag:
+                params["etag"] = self._policy_bundle.etag
+            async with httpx.AsyncClient(timeout=5) as client:
+                resp = await client.get(
+                    f"{self._app_api_url}/v1/tool-approval-policies/bundle", params=params
+                )
+                resp.raise_for_status()
+                data = resp.json()
+            self._policy_bundle_fetched_at = now
+            self._policy_fetch_ok = True
+            if data.get("unchanged"):
+                return self._policy_bundle  # type: ignore[return-value]
+            self._policy_bundle = PolicyBundle.from_dict(data)
+            logger.debug(
+                "Fetched approval bundle: etag=%s policies=%d",
+                self._policy_bundle.etag, len(self._policy_bundle.policies),
+            )
+            return self._policy_bundle
+        except Exception as e:  # noqa: BLE001
+            # Keep the last-known bundle; only warn occasionally to avoid spam.
+            logger.warning("Approval bundle fetch failed (%s); using cached/empty", e)
+            self._policy_bundle_fetched_at = now  # back off until next TTL
+            self._policy_fetch_ok = False
+            return self._policy_bundle or PolicyBundle(version=1, etag="", policies=[])
+
+    def _grant_approval(self, grant_key: str, ttl_seconds: float) -> None:
+        if not grant_key:
+            return
+        self._approval_grants[grant_key] = time.monotonic() + max(1.0, ttl_seconds)
+        logger.info("Approval grant stored: %s (ttl=%ss)", grant_key[:12], int(ttl_seconds))
+
+    def _consume_grant(self, grant_key: str) -> bool:
+        """Pop a live grant for this key. Prunes expired grants as a side effect."""
+        now = time.monotonic()
+        # prune
+        expired = [k for k, exp in self._approval_grants.items() if exp <= now]
+        for k in expired:
+            self._approval_grants.pop(k, None)
+        exp = self._approval_grants.get(grant_key)
+        if exp is None or exp <= now:
+            return False
+        self._approval_grants.pop(grant_key, None)
+        return True
+
+    def _decide_approval(self, tool_name: str, tool_input: dict) -> ApprovalDecision:
+        """Pure policy decision for the current cached bundle (TASK-292).
+
+        Isolated from the SDK/HTTP glue so it's unit-testable: inject a bundle
+        and grants, assert the action. Does NOT consume grants (the caller does,
+        only when it's actually going to allow).
+        """
+        bundle = self._policy_bundle or PolicyBundle(version=1, etag="", policies=[])
+        return evaluate_policies(
+            bundle.policies, self._backend_name, tool_name,
+            tool_input if isinstance(tool_input, dict) else {},
+        )
+
+    async def _evaluate_tool_gate(
+        self,
+        tool_name: str,
+        tool_input: dict,
+        ctx: ToolPermissionContext,
+        request_id: str,
+        session_key: str,
+        seq_holder: list[int],
+    ):
+        """Permission decision for a non-question tool (TASK-292).
+
+        Returns a PermissionResult. On require_approval (no live grant) emits an
+        APPROVAL_REQUIRED event and returns a deferred deny so the turn ends
+        cleanly — the user's decision arrives as a continuation turn.
+        """
+        await self._get_policy_bundle()
+
+        # Fail-closed: the app is unreachable AND the operator chose safety over
+        # availability → deny every tool until policies can be fetched again.
+        if self._approval_fail_closed and not self._policy_fetch_ok:
+            logger.warning(
+                "Approval fail-closed: policies unreachable, denying %s", tool_name
+            )
+            return PermissionResultDeny(
+                message=(
+                    "[Tool execution is paused: the approval-policy service is "
+                    "unreachable and this bridge is configured fail-closed. "
+                    "Acknowledge and end your turn.]"
+                ),
+                interrupt=False,
+            )
+
+        decision = self._decide_approval(tool_name, tool_input)
+
+        if decision.action is PolicyAction.ALLOW:
+            return PermissionResultAllow()
+
+        if decision.action is PolicyAction.DENY:
+            logger.info(
+                "Tool DENIED by policy %s: %s %r",
+                getattr(decision.policy, "id", "?"), tool_name, decision.subject[:80],
+            )
+            return PermissionResultDeny(
+                message=(
+                    f"[This action is blocked by an approval policy and cannot be "
+                    f"run: {decision.subject[:200]}. Do not retry it. Continue "
+                    f"without it or explain what you need.]"
+                ),
+                interrupt=False,
+            )
+
+        # ---- require_approval ----
+        if self._consume_grant(decision.grant_key):
+            logger.info(
+                "Tool ALLOWED by prior approval grant: %s %r",
+                tool_name, decision.subject[:80],
+            )
+            return PermissionResultAllow()
+
+        tool_use_id = (ctx.tool_use_id or "").strip()
+        if not tool_use_id:
+            # No id → app can't key a persistent request; defer cleanly anyway.
+            logger.warning(
+                "Approval-gated %s with no tool_use_id — deferring without persistence",
+                tool_name,
+            )
+            return PermissionResultDeny(message=self._APPROVAL_PENDING_ACK, interrupt=False)
+
+        try:
+            seq_holder[0] += 1
+            self._publish_event(
+                request_id, session_key, seq_holder[0],
+                kind=AgentEventKind.APPROVAL_REQUIRED,
+                tool_name=tool_name,
+                tool_arguments=tool_input if isinstance(tool_input, dict) else {},
+                tool_use_id=tool_use_id,
+                extra_raw={
+                    "policy_id": getattr(decision.policy, "id", None),
+                    "severity": decision.severity.value,
+                    "category": getattr(decision.policy, "category", None),
+                    "subject": decision.subject,
+                    "prompt": decision.prompt,
+                    "grant_key": decision.grant_key,
+                    "action": decision.action.value,
+                },
+            )
+        except Exception:
+            logger.exception(
+                "Failed to publish APPROVAL_REQUIRED for tool_use_id=%s", tool_use_id,
+            )
+
+        logger.info(
+            "Tool gated (approval required): %s tool_use_id=%s policy=%s — turn ends",
+            tool_name, tool_use_id, getattr(decision.policy, "id", "?"),
+        )
+        return PermissionResultDeny(message=self._APPROVAL_PENDING_ACK, interrupt=False)
+
+    async def _handle_approval_grant(self, fields: dict, msg_id: str, async_redis) -> None:
+        """Store a one-shot allow from an approval.grant command, then ACK."""
+        try:
+            grant_key = (fields.get("grant_key") or "").strip()
+            ttl = float(fields.get("ttl_seconds") or "600")
+            if grant_key:
+                self._grant_approval(grant_key, ttl)
+        except Exception:
+            logger.exception("Failed to handle approval.grant")
+        finally:
+            try:
+                await async_redis.xack(COMMANDS_STREAM, "claude-code-bridge", msg_id)
+            except Exception:
+                pass
+
+    async def _approval_reload_listener(self, redis_url: str) -> None:
+        """Drop the cached bundle on an approval:policies:reload broadcast.
+
+        Best-effort: any failure is logged and retried; it never crashes the
+        bridge. Lets an admin edit take effect without waiting out the TTL.
+        """
+        import redis.asyncio as aioredis
+
+        while True:
+            client = None
+            pubsub = None
+            try:
+                # socket_timeout=None: pubsub.listen() is a long-lived blocking
+                # read; redis-py 8.0's default 5s socket timeout would fire on
+                # every idle interval and spin this loop. Bound only the connect.
+                # (Mirrors _command_listener's XREADGROUP handling.)
+                client = aioredis.from_url(
+                    redis_url,
+                    decode_responses=True,
+                    socket_timeout=None,
+                    socket_connect_timeout=5,
+                    health_check_interval=30,
+                )
+                pubsub = client.pubsub()
+                await pubsub.subscribe("approval:policies:reload")
+                logger.info("Approval reload listener subscribed")
+                async for msg in pubsub.listen():
+                    if msg.get("type") != "message":
+                        continue
+                    self._policy_bundle_fetched_at = 0.0  # force refetch next call
+                    logger.info("Approval bundle cache invalidated by reload broadcast")
+            except asyncio.CancelledError:
+                # Clean shutdown — release the pubsub connection.
+                if pubsub is not None:
+                    try:
+                        await pubsub.aclose()
+                    except Exception:
+                        pass
+                if client is not None:
+                    try:
+                        await client.aclose()
+                    except Exception:
+                        pass
+                raise
+            except Exception:
+                logger.warning("Approval reload listener error; retrying in 5s", exc_info=True)
+                # Close the failed client so retries don't leak connections.
+                if pubsub is not None:
+                    try:
+                        await pubsub.aclose()
+                    except Exception:
+                        pass
+                if client is not None:
+                    try:
+                        await client.aclose()
+                    except Exception:
+                        pass
+                await asyncio.sleep(5)
+
     # ----- SDK can_use_tool callback -----
 
     @staticmethod
@@ -1504,10 +1925,11 @@ class ClaudeCodeBridge:
             ctx: ToolPermissionContext,
         ):
             if not self._is_ask_user_question(tool_name):
-                # Default-allow for everything else.  permission_mode on the
-                # ClaudeAgentOptions still governs the SDK-side prompt flow;
-                # this callback only short-circuits AskUserQuestion.
-                return PermissionResultAllow()
+                # TASK-292: evaluate approval-gated tool policies for every
+                # non-question tool. Default-allow remains the no-policy case.
+                return await self._evaluate_tool_gate(
+                    tool_name, tool_input, ctx, request_id, session_key, seq_holder,
+                )
 
             tool_use_id = (ctx.tool_use_id or "").strip()
             if not tool_use_id:
@@ -1775,6 +2197,7 @@ class ClaudeCodeBridge:
         token_usage: dict | None = None,
         tool_use_id: str | None = None,
         attachments: list[dict] | None = None,
+        extra_raw: dict | None = None,
     ) -> None:
         text = self._shorten_paths(text)
         tool_result = self._shorten_paths(tool_result)
@@ -1797,7 +2220,10 @@ class ClaudeCodeBridge:
             model=model,
             seq=seq,
             timestamp=datetime.now(timezone.utc),
-            raw={},
+            # APPROVAL_REQUIRED stashes policy metadata (policy_id, severity,
+            # subject, prompt, grant_key) in raw so the app can persist the
+            # request row and the UI can render the Approve/Deny card.
+            raw=dict(extra_raw) if extra_raw else {},
             token_usage=token_usage,
             provider=self._backend_name,
             # Inherit from the active run so every event for this request

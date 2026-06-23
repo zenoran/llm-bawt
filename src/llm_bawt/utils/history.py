@@ -365,7 +365,7 @@ class HistoryManager:
             else:
                 return [Message(role="system", content=self.config.SYSTEM_MESSAGE)]
 
-    def add_message(self, role, content, message_id=None, attachments=None):
+    def add_message(self, role, content, message_id=None, attachments=None, reasoning=None):
         """Append a message to history and save.
 
         If ``message_id`` is provided, it is used as the persistent ID so
@@ -390,6 +390,7 @@ class HistoryManager:
                     role, content, message.timestamp,
                     message_id=provided_id,
                     attachments=attachments,
+                    reasoning=reasoning,
                 )
                 if persisted_id:
                     message.db_id = str(persisted_id)

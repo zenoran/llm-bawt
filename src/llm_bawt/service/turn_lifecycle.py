@@ -287,6 +287,7 @@ class TurnLifecycleMixin:
         animation: str | None = None,
         token_usage: dict | None = None,
         attachments: list[dict] | None = None,
+        reasoning: str | None = None,
         status: str = "ok",
         end_reason: str | None = None,
     ) -> None:
@@ -330,7 +331,7 @@ class TurnLifecycleMixin:
                     parts.append(f"[{name}]\n{result}")
                 tool_context = "\n\n".join(parts)
 
-        llm_bawt.finalize_response(response_text, tool_context, attachments=attachments)
+        llm_bawt.finalize_response(response_text, tool_context, attachments=attachments, reasoning=reasoning)
 
         self._update_turn_log(
             turn_id=turn_id,

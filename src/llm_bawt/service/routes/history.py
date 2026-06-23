@@ -123,6 +123,66 @@ def _hydrate_attachments_for_page(
     return {s["_mid"]: s.get("attachments") or [] for s in shells}
 
 
+def _fetch_reasoning_via_shared_engine(
+    config,
+    bot_id: str,
+    message_ids: list[str],
+) -> dict[str, str | None]:
+    """Direct-SQL read of ``{bot}_messages.reasoning`` for server-mode (TASK-301).
+
+    Mirror of ``_fetch_attachments_via_shared_engine`` for the reasoning column —
+    used when the short-term manager has no embedded backend handle. Returns
+    ``{message_id: reasoning_or_None}``.
+    """
+    from sqlalchemy import text
+    from ...media.assets import _build_engine
+    from ...memory.postgresql import _sanitize_table_name
+
+    engine = _build_engine(config)
+    if engine is None:
+        return {mid: None for mid in message_ids}
+
+    table = f"{_sanitize_table_name(bot_id)}_messages"
+    sql = text(f"SELECT id, reasoning FROM {table} WHERE id = ANY(:ids)")
+    result: dict[str, str | None] = {mid: None for mid in message_ids}
+    with engine.connect() as conn:
+        rows = conn.execute(sql, {"ids": list(message_ids)}).mappings().all()
+        for row in rows:
+            result[row["id"]] = row.get("reasoning")
+    return result
+
+
+def _hydrate_reasoning_for_page(
+    service,
+    bot_id: str,
+    page_messages: list[dict],
+) -> dict[str, str | None]:
+    """Resolve per-message reasoning for the given page (TASK-301).
+
+    Returns ``{message_id: reasoning_or_None}``. One focused read of a column
+    the canonical ``get_messages`` path drops so reasoning never re-enters LLM
+    context; the chat UI uses it to restore the collapsed "Thought process" lane
+    on reload. Embedded mode reads via the backend; server mode falls back to the
+    shared engine — same shape either way.
+    """
+    message_ids = [str(m.get("id")) for m in page_messages if m.get("id")]
+    if not message_ids:
+        return {}
+
+    try:
+        client = service.get_memory_client(bot_id)
+        if not client:
+            return {mid: None for mid in message_ids}
+        manager = client.get_short_term_manager()
+        backend = getattr(manager, "_backend", None)
+        if backend is not None:
+            return backend.get_reasoning_for_message_ids(message_ids)
+        return _fetch_reasoning_via_shared_engine(service.config, bot_id, message_ids)
+    except Exception as e:
+        log.warning("Failed to load reasoning for history page: %s", e)
+        return {mid: None for mid in message_ids}
+
+
 # Hard ceiling for summarization prompts regardless of what the model advertises.
 # Large advertised windows (e.g. 2M) are rarely practical for dense output tasks.
 _MAX_SUMMARIZATION_PROMPT_TOKENS = 512_000
@@ -538,6 +598,9 @@ def _build_history_search_response(
     attachments_by_id = _hydrate_attachments_for_page(
         service, effective_bot_id, page_messages
     )
+    reasoning_by_id = _hydrate_reasoning_for_page(
+        service, effective_bot_id, page_messages
+    )
     history_messages = [
         HistoryMessage(
             id=msg.get("id"),
@@ -545,6 +608,7 @@ def _build_history_search_response(
             content=msg.get("content", ""),
             timestamp=msg.get("timestamp", 0.0),
             attachments=attachments_by_id.get(str(msg.get("id") or ""), []),
+            reasoning=reasoning_by_id.get(str(msg.get("id") or "")),
         )
         for msg in page_messages
     ]
@@ -941,6 +1005,9 @@ def _build_history_response(
     attachments_by_id = _hydrate_attachments_for_page(
         service, effective_bot_id, page_messages
     )
+    reasoning_by_id = _hydrate_reasoning_for_page(
+        service, effective_bot_id, page_messages
+    )
     history_messages = [
         HistoryMessage(
             id=msg.get("id"),
@@ -948,6 +1015,7 @@ def _build_history_response(
             content=msg.get("content", ""),
             timestamp=msg.get("timestamp", 0.0),
             attachments=attachments_by_id.get(str(msg.get("id") or ""), []),
+            reasoning=reasoning_by_id.get(str(msg.get("id") or "")),
         )
         for msg in page_messages
     ]

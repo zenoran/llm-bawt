@@ -80,6 +80,7 @@ class ZaiAdapter(ProviderAdapter):
 
         # The SDK sent model="zai/glm-4.6"; Z.AI wants the bare upstream name.
         body = dict(anthropic_body)
+        original_model = body.get("model", upstream_model)  # "zai/glm-5.2"
         body["model"] = upstream_model
         body["stream"] = True  # proxy only supports streaming (routes.py)
 
@@ -111,9 +112,18 @@ class ZaiAdapter(ProviderAdapter):
                 # whether z.ai's automatic context cache is actually hitting.
                 buf = ""
                 usage_logged = False
+                # z.ai echoes the bare upstream model name ("glm-5.2")
+                # in message_start. The SDK CLI validates that the
+                # response model matches what it sent ("zai/glm-5.2").
+                # Rewrite the model field in the raw SSE so the CLI
+                # doesn't reject the response as malformed.
+                bare_model_bytes = f'"model": "{upstream_model}"'.encode()
+                full_model_bytes = f'"model": "{original_model}"'.encode()
                 async for chunk in resp.aiter_raw():
                     if not chunk:
                         continue
+                    if bare_model_bytes in chunk:
+                        chunk = chunk.replace(bare_model_bytes, full_model_bytes)
                     yield chunk
                     if usage_logged:
                         continue

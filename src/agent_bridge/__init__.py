@@ -7,7 +7,32 @@ clients, gateway HTTP, SDK adapters) lives in its own package
 (``openclaw_bridge``, ``codex_bridge``, ``claude_code_bridge``).
 """
 
+from .approval import (
+    ApprovalDecision,
+    ApprovalPolicy,
+    MatcherType,
+    PolicyAction,
+    PolicyBundle,
+    Severity,
+    compute_etag,
+    evaluate,
+    grant_key,
+)
 from .events import AgentEvent, AgentEventKind, synthesize_event_id
 from .session_queue import SessionQueue
 
-__all__ = ["AgentEvent", "AgentEventKind", "SessionQueue", "synthesize_event_id"]
+__all__ = [
+    "AgentEvent",
+    "AgentEventKind",
+    "ApprovalDecision",
+    "ApprovalPolicy",
+    "MatcherType",
+    "PolicyAction",
+    "PolicyBundle",
+    "SessionQueue",
+    "Severity",
+    "compute_etag",
+    "evaluate",
+    "grant_key",
+    "synthesize_event_id",
+]

@@ -497,6 +497,7 @@ class ServiceLLMBawt(BaseLLMBawt):
         response: str,
         tool_context: str = "",
         attachments: list[dict] | None = None,
+        reasoning: str | None = None,
     ):
         """Finalize the response by saving to history.
 
@@ -507,6 +508,9 @@ class ServiceLLMBawt(BaseLLMBawt):
             tool_context: Optional tool results to save to history
             attachments: Optional {asset_id, kind} media refs persisted during
                 the turn (e.g. Playwright screenshots) to attach to the reply.
+            reasoning: Optional model reasoning ("thinking") accumulated during
+                the turn, persisted on the assistant row for display-only
+                replay (TASK-301). Never re-fed into LLM context.
         """
         # Save tool context first so it appears before the response in history
         if tool_context:
@@ -516,7 +520,7 @@ class ServiceLLMBawt(BaseLLMBawt):
 
         if response:
             self.history_manager.add_message(
-                "assistant", response, attachments=attachments
+                "assistant", response, attachments=attachments, reasoning=reasoning
             )
     
     def refine_prompt(self, prompt: str, history: list | None = None) -> str:

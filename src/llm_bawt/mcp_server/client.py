@@ -737,6 +737,7 @@ class MemoryClient:
         timestamp: float | None = None,
         message_id: str | None = None,
         attachments: list[dict] | None = None,
+        reasoning: str | None = None,
     ) -> MessageResult:
         """Add a message to conversation history.
 
@@ -765,6 +766,7 @@ class MemoryClient:
                 "timestamp": timestamp,
                 "message_id": message_id,
                 "attachments": attachments,
+                "reasoning": reasoning,
                 # TASK-284: carry the user dimension so the server resolves the
                 # active thread per (bot_id, user_id) when session_id is None.
                 "user_id": self.user_id,
@@ -782,6 +784,7 @@ class MemoryClient:
                 timestamp=timestamp,
                 message_id=message_id,
                 attachments=attachments,
+                reasoning=reasoning,
                 user_id=self.user_id,
             )
         )
@@ -1272,13 +1275,17 @@ class _MCPShortTermManager:
         timestamp: float | None = None,
         message_id: str | None = None,
         attachments: list[dict] | None = None,
+        reasoning: str | None = None,
     ) -> str:
+        # ``reasoning`` (TASK-301) is forwarded through the MCP write chain so
+        # server-mode deployments persist it too (display-only on the row).
         msg = self._memory_client.add_message(
             role=role,
             content=content,
             timestamp=timestamp,
             message_id=message_id,
             attachments=attachments,
+            reasoning=reasoning,
         )
         return msg.id
 

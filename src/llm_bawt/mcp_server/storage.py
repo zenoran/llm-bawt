@@ -331,6 +331,7 @@ class MemoryStorage:
         timestamp: float | None = None,
         message_id: str | None = None,
         attachments: list[dict] | None = None,
+        reasoning: str | None = None,
         user_id: str | None = None,
     ) -> Message:
         """Add a message to conversation history.
@@ -377,6 +378,7 @@ class MemoryStorage:
             timestamp=ts,
             session_id=session_id,
             attachments=attachments,
+            reasoning=reasoning,
         )
 
         return Message(

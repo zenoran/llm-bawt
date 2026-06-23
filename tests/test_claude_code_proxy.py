@@ -20,6 +20,70 @@ def _sse_payloads(frames: list[bytes]) -> list[dict]:
     return payloads
 
 
+def test_non_streaming_route_buffers_sse_into_message(monkeypatch) -> None:
+    from claude_code_bridge.proxy import routes as proxy_routes
+
+    class FakeAdapter:
+        async def call(self, anthropic_body: dict, upstream_model: str):
+            assert anthropic_body["stream"] is True
+            yield b'event: message_start\ndata: {"type":"message_start","message":{"id":"msg_1","type":"message","role":"assistant","content":[],"model":"zai/glm-5.2","stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":0,"output_tokens":0,"cache_creation_input_tokens":0,"cache_read_input_tokens":0}}}\n\n'
+            yield b'event: content_block_start\ndata: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}\n\n'
+            yield b'event: content_block_delta\ndata: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"hello"}}\n\n'
+            yield b'event: content_block_stop\ndata: {"type":"content_block_stop","index":0}\n\n'
+            yield b'event: message_delta\ndata: {"type":"message_delta","delta":{"stop_reason":"end_turn","stop_sequence":null},"usage":{"input_tokens":12,"output_tokens":1,"cache_creation_input_tokens":0,"cache_read_input_tokens":0}}\n\n'
+            yield b'event: message_stop\ndata: {"type":"message_stop"}\n\n'
+
+    class FakeRequest:
+        async def json(self):
+            return {
+                "model": "zai/glm-5.2",
+                "messages": [{"role": "user", "content": "hi"}],
+                "stream": False,
+            }
+
+    monkeypatch.setattr(proxy_routes, "lookup", lambda provider: FakeAdapter())
+
+    res = __import__("asyncio").run(proxy_routes.messages(FakeRequest()))
+
+    assert res.status_code == 200
+    body = json.loads(res.body)
+    assert body["type"] == "message"
+    assert body["model"] == "zai/glm-5.2"
+    assert body["stop_reason"] == "end_turn"
+    assert body["content"] == [{"type": "text", "text": "hello"}]
+    assert body["usage"] == {
+        "input_tokens": 12,
+        "output_tokens": 1,
+        "cache_creation_input_tokens": 0,
+        "cache_read_input_tokens": 0,
+    }
+
+
+def test_non_streaming_parser_reconstructs_tool_use() -> None:
+    from claude_code_bridge.proxy.routes import _anthropic_sse_to_message
+
+    async def gen():
+        yield b'event: message_start\ndata: {"type":"message_start","message":{"id":"msg_2","type":"message","role":"assistant","content":[],"model":"zai/glm-5.2","stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":0,"output_tokens":0,"cache_creation_input_tokens":0,"cache_read_input_tokens":0}}}\n\n'
+        yield b'event: content_block_start\ndata: {"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"toolu_1","name":"Bash","input":{}}}\n\n'
+        yield b'event: content_block_delta\ndata: {"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{\\"command\\":\\"echo hi\\"}"}}\n\n'
+        yield b'event: content_block_stop\ndata: {"type":"content_block_stop","index":0}\n\n'
+        yield b'event: message_delta\ndata: {"type":"message_delta","delta":{"stop_reason":"tool_use","stop_sequence":null},"usage":{"input_tokens":9,"output_tokens":2,"cache_creation_input_tokens":0,"cache_read_input_tokens":0}}\n\n'
+        yield b'event: message_stop\ndata: {"type":"message_stop"}\n\n'
+
+    message, err = __import__("asyncio").run(
+        _anthropic_sse_to_message(gen(), fallback_model="zai/glm-5.2")
+    )
+
+    assert err is None
+    assert message["stop_reason"] == "tool_use"
+    assert message["content"] == [{
+        "type": "tool_use",
+        "id": "toolu_1",
+        "name": "Bash",
+        "input": {"command": "echo hi"},
+    }]
+
+
 def test_translate_moves_leading_datetime_out_of_instructions() -> None:
     body = {
         "model": "openai_chatgpt/gpt-5.4",

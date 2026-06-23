@@ -49,6 +49,11 @@ async def with_heartbeat(
 
     source_iter = source.__aiter__()
     pending: asyncio.Task | None = asyncio.ensure_future(source_iter.__anext__())
+    # Track whether the last yielded chunk ended at an SSE event boundary
+    # (``\n\n``).  Injecting a ping frame mid-event would corrupt the SSE
+    # parse on the receiving end — e.g. z.ai sometimes delivers a partial
+    # ``data:`` line in one TCP segment and completes it in the next.
+    at_boundary = True
     try:
         while True:
             try:
@@ -56,7 +61,10 @@ async def with_heartbeat(
             except asyncio.TimeoutError:
                 # Upstream quiet — emit a keepalive and keep awaiting the SAME
                 # pending pull (shield kept it alive across the timeout).
-                yield _PING_FRAME
+                # Only inject when we're at an SSE event boundary to avoid
+                # splitting a partial event.
+                if at_boundary:
+                    yield _PING_FRAME
                 continue
             except StopAsyncIteration:
                 pending = None
@@ -65,6 +73,7 @@ async def with_heartbeat(
             # Got a real frame; schedule the next pull and forward this one.
             pending = asyncio.ensure_future(source_iter.__anext__())
             yield chunk
+            at_boundary = chunk.endswith(b"\n\n")
     finally:
         if pending is not None and not pending.done():
             pending.cancel()

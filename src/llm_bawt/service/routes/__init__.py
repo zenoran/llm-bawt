@@ -13,6 +13,7 @@ from .nextcloud import router as nextcloud_router
 from .prompts import router as prompts_router
 from .profiles import router as profiles_router
 from .settings import router as settings_router
+from .approval_policies import router as approval_policies_router
 from .tasks import router as tasks_router
 from .ha_weather import router as ha_weather_router
 from .turn_logs import router as turn_logs_router
@@ -39,6 +40,7 @@ all_routers = [
     memory_router,
     prompts_router,
     settings_router,
+    approval_policies_router,
     profiles_router,
     llm_router,
     media_router,

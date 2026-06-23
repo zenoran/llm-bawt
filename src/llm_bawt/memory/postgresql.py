@@ -154,6 +154,10 @@ def get_message_table_pg(bot_id: str) -> Table:
         # actual blobs + metadata live in the `media_assets` table — kept
         # tiny here so history renders don't fan out per-row by default.
         Column("attachments", JSON, nullable=False, server_default=text("'[]'::jsonb"), default=list),
+        # TASK-301: persisted model reasoning ("thinking") for assistant rows.
+        # Display-only — NEVER read back into LLM context (kept out of the
+        # canonical get_messages path; the /v1/history route hydrates it by id).
+        Column("reasoning", Text, nullable=True),
         Column("created_at", DateTime, default=_utcnow),
         extend_existing=True
     )
@@ -324,10 +328,11 @@ class PostgreSQLMemoryBackend(MemoryBackend):
                     summarized BOOLEAN DEFAULT FALSE,
                     summary_metadata JSONB,
                     attachments JSONB NOT NULL DEFAULT '[]'::jsonb,
+                    reasoning TEXT,
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 )
             """)
-            
+
             # Create forgotten messages table (for soft-deleted messages)
             forgotten_sql = text(f"""
                 CREATE TABLE IF NOT EXISTS {self._forgotten_table_name} (
@@ -409,6 +414,13 @@ class PostgreSQLMemoryBackend(MemoryBackend):
                 ADD COLUMN IF NOT EXISTS attachments JSONB NOT NULL DEFAULT '[]'::jsonb
             """)
 
+            # TASK-301: persist assistant reasoning ("thinking"). Nullable, no
+            # backfill — pre-existing rows stay NULL (no reasoning captured).
+            add_reasoning_sql = text(f"""
+                ALTER TABLE {self._messages_table_name}
+                ADD COLUMN IF NOT EXISTS reasoning TEXT
+            """)
+
             # Shared sessions table (TASK-183). One row per session across
             # all bots; promotes session_id from a bare UUID to a first-class
             # entity with start/end timestamps and a status.
@@ -478,6 +490,10 @@ class PostgreSQLMemoryBackend(MemoryBackend):
                     pass  # Column may already exist
                 try:
                     conn.execute(add_attachments_sql)
+                except Exception:
+                    pass  # Column may already exist
+                try:
+                    conn.execute(add_reasoning_sql)
                 except Exception:
                     pass  # Column may already exist
                 conn.commit()
@@ -550,6 +566,7 @@ class PostgreSQLMemoryBackend(MemoryBackend):
         timestamp: float,
         session_id: str | None = None,
         attachments: list[dict] | None = None,
+        reasoning: str | None = None,
     ) -> None:
         """Add a message to permanent storage.
 
@@ -577,6 +594,8 @@ class PostgreSQLMemoryBackend(MemoryBackend):
                     values: dict = {"content": content, "timestamp": timestamp}
                     if attachments is not None:
                         values["attachments"] = attachments
+                    if reasoning is not None:
+                        values["reasoning"] = reasoning
                     stmt = (
                         update(self.messages_table)
                         .where(self.messages_table.c.id == message_id)
@@ -591,6 +610,7 @@ class PostgreSQLMemoryBackend(MemoryBackend):
                         timestamp=timestamp,
                         session_id=session_id,
                         attachments=attachments if attachments is not None else [],
+                        reasoning=reasoning,
                         processed=False,
                         created_at=datetime.now(timezone.utc),
                     )
@@ -699,7 +719,30 @@ class PostgreSQLMemoryBackend(MemoryBackend):
                     refs = []
                 result[row["id"]] = list(refs)
         return result
-    
+
+    def get_reasoning_for_message_ids(self, message_ids: list[str]) -> dict[str, str | None]:
+        """Return ``{message_id: reasoning}`` for the given ids (TASK-301).
+
+        Like ``get_attachments_for_message_ids``, this is a focused read of a
+        column the canonical ``get_messages`` path deliberately drops (reasoning
+        must never re-enter LLM context). ``/v1/history`` calls it to rehydrate
+        the collapsed "Thought process" lane on reload. Missing rows / NULL map
+        to ``None`` so callers can index unconditionally.
+        """
+        if not message_ids:
+            return {}
+
+        sql = text(
+            f"SELECT id, reasoning FROM {self._messages_table_name} "
+            "WHERE id = ANY(:ids)"
+        )
+        result: dict[str, str | None] = {mid: None for mid in message_ids}
+        with self.engine.connect() as conn:
+            rows = conn.execute(sql, {"ids": list(message_ids)}).mappings().all()
+            for row in rows:
+                result[row["id"]] = row.get("reasoning")
+        return result
+
     # =========================================================================
     # Memory Storage (distilled, importance-weighted)
     # =========================================================================
@@ -2337,14 +2380,15 @@ class PostgreSQLShortTermManager:
         timestamp: float | None = None,
         message_id: str | None = None,
         attachments: list[dict] | None = None,
+        reasoning: str | None = None,
     ) -> str:
         """Add a message to the current session.
 
         Returns the message ID.
 
-        ``message_id`` and ``attachments`` are passed through to the backend
-        so this adapter matches the MCP adapter signature used by
-        ``HistoryManager`` (TASK-222 plumbing).
+        ``message_id``, ``attachments`` and ``reasoning`` are passed through to
+        the backend so this adapter matches the MCP adapter signature used by
+        ``HistoryManager`` (TASK-222 / TASK-301 plumbing).
         """
         mid = (str(message_id).strip() if message_id else "") or str(uuid.uuid4())
         ts = timestamp or datetime.now(timezone.utc).timestamp()
@@ -2356,6 +2400,7 @@ class PostgreSQLShortTermManager:
             timestamp=ts,
             session_id=self._current_session_id,
             attachments=attachments,
+            reasoning=reasoning,
         )
 
         return mid

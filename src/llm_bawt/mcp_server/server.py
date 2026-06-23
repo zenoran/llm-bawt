@@ -315,6 +315,7 @@ async def add_message(
     timestamp: float | None = None,
     message_id: str | None = None,
     attachments: list[dict] | None = None,
+    reasoning: str | None = None,
     user_id: str | None = None,
 ) -> dict:
     """Add a message to conversation history.
@@ -345,6 +346,7 @@ async def add_message(
         timestamp=timestamp,
         message_id=message_id,
         attachments=attachments,
+        reasoning=reasoning,
         user_id=user_id,
     )
     return message.to_dict()

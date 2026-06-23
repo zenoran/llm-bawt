@@ -354,6 +354,32 @@ class AgentBridgeBackend(AgentBackend):
                                     "trigger_message_id": event.trigger_message_id,
                                 })
 
+                            elif event.kind == AgentEventKind.APPROVAL_REQUIRED:
+                                # TASK-292: an approval-gated tool policy matched.
+                                # The bridge denied the call and ended the turn;
+                                # the app persists a tool_approval_requests row and
+                                # surfaces an Approve/Deny card. The user's decision
+                                # comes back via /v1/chat/approvals/{id}/resolve,
+                                # which grants the bridge a one-shot allow and the
+                                # client dispatches a continuation turn. Forward the
+                                # event with its policy metadata (event.raw).
+                                meta = event.raw if isinstance(event.raw, dict) else {}
+                                result_queue.put({
+                                    "event": "approval_required",
+                                    "tool_name": event.tool_name or "",
+                                    "tool_use_id": event.tool_use_id or "",
+                                    "arguments": event.tool_arguments or {},
+                                    "session_key": event.session_key,
+                                    "provider": event.provider,
+                                    "trigger_message_id": event.trigger_message_id,
+                                    "policy_id": meta.get("policy_id"),
+                                    "severity": meta.get("severity") or "medium",
+                                    "category": meta.get("category"),
+                                    "subject": meta.get("subject") or "",
+                                    "prompt": meta.get("prompt") or "",
+                                    "grant_key": meta.get("grant_key") or "",
+                                })
+
                             elif event.kind == AgentEventKind.REASONING_DELTA:
                                 # Model reasoning ("thinking"). Forward as a dict
                                 # item — NOT a str — so downstream text

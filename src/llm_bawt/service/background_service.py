@@ -154,6 +154,12 @@ class BackgroundService(
         from .chat_pending_questions import PendingQuestionStore
         self._pending_question_store = PendingQuestionStore(config)
 
+        # TASK-290: durable registry + audit of approval-gated tool calls. Used
+        # by chat_streaming to persist a request row when the bridge emits
+        # APPROVAL_REQUIRED, and by the resolve endpoint.
+        from ..approval_policies import ToolApprovalPolicyStore
+        self._tool_approval_policy_store = ToolApprovalPolicyStore(config)
+
         # OpenClaw WS session bridge (set by api.py lifespan if enabled)
         self._session_bridge: Any | None = None
 
