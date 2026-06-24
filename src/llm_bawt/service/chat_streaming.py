@@ -1700,11 +1700,19 @@ class ChatStreamingMixin:
                                     "iteration": 1,
                                     "provider": item.get("provider"),
                                     "ts": time.time(),
+                                    # SDK failure flag threaded from the agent bridge
+                                    # tool_result event → persisted by api.py so the
+                                    # red error ring survives reload.
+                                    "is_error": item.get("is_error"),
                                 })
-                                # Update the matching detail entry with result
+                                # Update the matching detail entry with result +
+                                # failure flag so the finalized tool_calls_json
+                                # (read on reload for completed turns) keeps the
+                                # red error ring, not just the live stream.
                                 for _td in reversed(tool_call_details_holder):
                                     if _td.get("call_id") == _end_cid:
                                         _td["result"] = str(item.get("result", ""))[:2000]
+                                        _td["is_error"] = item.get("is_error")
                                         break
                         if isinstance(item, str):
                             _text_chars[0] += len(item)

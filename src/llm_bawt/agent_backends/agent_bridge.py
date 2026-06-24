@@ -333,6 +333,12 @@ class AgentBridgeBackend(AgentBackend):
                                         "provider": event.provider,
                                         "trigger_message_id": event.trigger_message_id,
                                         "tool_use_id": event.tool_use_id,
+                                        # Carry the SDK failure flag (bridge-stamped
+                                        # tool_error) downstream so the published
+                                        # tool_end can persist is_error. Without this
+                                        # the red error ring never lights for agent
+                                        # turns — the flag died here.
+                                        "is_error": event.tool_error,
                                     })
 
                             elif event.kind == AgentEventKind.AWAIT_TOOL_RESULT:
