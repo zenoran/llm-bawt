@@ -262,6 +262,7 @@ async def lifespan(app):
                                 call_id=call_id,
                                 result=event_data.get("result", ""),
                                 ended_at=event_data.get("ts"),
+                                is_error=event_data.get("is_error"),
                             )
                         else:
                             # No call_id — save as complete record
@@ -274,6 +275,7 @@ async def lifespan(app):
                                 result=event_data.get("result", ""),
                                 iteration=event_data.get("iteration", 1),
                                 ended_at=event_data.get("ts"),
+                                is_error=event_data.get("is_error"),
                             )
 
                 service._tool_persist_task = asyncio.create_task(

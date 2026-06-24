@@ -91,6 +91,7 @@ def _live_tool_calls(store: TurnLogStore, turn_id: str) -> list[dict]:
             "ended_at": row.ended_at,
             "duration_ms": row.duration_ms,
             "text_offset": row.text_offset,
+            "is_error": row.is_error,
         })
     return out
 

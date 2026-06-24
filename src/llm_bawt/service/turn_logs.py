@@ -8,7 +8,7 @@ import time
 from datetime import datetime, timedelta, timezone
 from urllib.parse import quote_plus
 
-from sqlalchemy import Column, DateTime, Float, Integer, String, Text, func, text as sa_text
+from sqlalchemy import Boolean, Column, DateTime, Float, Integer, String, Text, func, text as sa_text
 from sqlmodel import Field, SQLModel, Session, create_engine, delete, select
 
 from ..utils.config import Config, has_database_credentials
@@ -136,6 +136,11 @@ class ToolCallRecord(SQLModel, table=True):
     # survives a page reload. Null on legacy rows → frontend falls back to the
     # old "text bubble + activity row" layout for that turn.
     text_offset: int | None = Field(default=None, sa_column=Column(Integer, nullable=True))
+    # Single source of truth for "did this tool call fail?". Set from the SDK's
+    # is_error flag on the live path and persisted here so a reload/reconnect
+    # reads the same truth instead of re-deriving it (e.g. string-sniffing the
+    # result). Null on legacy rows → frontend treats failure as unknown.
+    is_error: bool | None = Field(default=None, sa_column=Column(Boolean, nullable=True))
 
 
 class TurnLogStore:
@@ -226,6 +231,11 @@ class TurnLogStore:
                 # emitted before each tool call (see ToolCallRecord.text_offset).
                 conn.execute(sa_text(
                     "ALTER TABLE tool_call_records ADD COLUMN IF NOT EXISTS text_offset INTEGER"
+                ))
+                # Persisted tool-call failure flag (see ToolCallRecord.is_error)
+                # so the red error ring survives a reload/reconnect.
+                conn.execute(sa_text(
+                    "ALTER TABLE tool_call_records ADD COLUMN IF NOT EXISTS is_error BOOLEAN"
                 ))
                 # Path-agnostic turn-completion timestamp (NULL = in progress).
                 conn.execute(sa_text(
@@ -683,6 +693,7 @@ class TurnLogStore:
         started_at: float | None = None,
         ended_at: float | None = None,
         text_offset: int | None = None,
+        is_error: bool | None = None,
     ) -> None:
         """Persist a single tool call record."""
         if self.engine is None:
@@ -703,6 +714,7 @@ class TurnLogStore:
             ended_at=ended_at,
             duration_ms=duration_ms,
             text_offset=text_offset,
+            is_error=is_error,
         )
         try:
             with Session(self.engine) as session:
@@ -717,6 +729,7 @@ class TurnLogStore:
         call_id: str,
         result: str,
         ended_at: float | None = None,
+        is_error: bool | None = None,
     ) -> None:
         """Update a tool call record with the result (tool_end event)."""
         if self.engine is None or not call_id:
@@ -729,6 +742,8 @@ class TurnLogStore:
                 if row is None:
                     return
                 row.result_text = result
+                if is_error is not None:
+                    row.is_error = is_error
                 if ended_at:
                     row.ended_at = ended_at
                     if row.started_at:
