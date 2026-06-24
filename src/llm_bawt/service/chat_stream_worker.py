@@ -3,8 +3,11 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import threading
 from typing import Any
+
+_log = logging.getLogger(__name__)
 
 
 def append_text_chunk(full_response_holder: list[str], chunk: Any) -> None:
@@ -40,7 +43,14 @@ def consume_stream_chunks(
     cancelled = False
     for chunk in stream_iter:
         append_text_chunk(full_response_holder, chunk)
-        put_queue_item_threadsafe(loop, chunk_queue, chunk)
+        delivered = put_queue_item_threadsafe(loop, chunk_queue, chunk)
+        # DEBUG-292: trace approval chunks through the worker→queue hop
+        if isinstance(chunk, dict) and chunk.get("event") == "approval_required":
+            _log.info(
+                "DEBUG-292 worker: approval_required chunk delivered=%s "
+                "loop_closed=%s cancel=%s",
+                delivered, loop.is_closed(), cancel_event.is_set(),
+            )
         if cancel_event.is_set():
             cancelled = True
     return cancelled

@@ -17,6 +17,32 @@ from .logging import get_service_logger
 
 log = get_service_logger(__name__)
 
+# TASK-306 Section B: a bridge/agent turn that narrates this many or more
+# (stripped) characters while recording ZERO tool calls is flagged as a
+# possible fabricated work-claim. Below this it's treated as a trivial reply.
+_MIN_NARRATION_CHARS_FOR_GUARD = 40
+
+
+def _is_unbacked_work_claim(
+    *,
+    is_bridge_turn: bool,
+    tool_call_details: list[dict] | None,
+    response_text: str | None,
+) -> bool:
+    """TASK-306 Section B: True when a turn looks like a fabricated work-claim.
+
+    A bridge/agent turn that finalized a non-trivial narration while recording
+    ZERO tool calls is claiming work it may not have done. Pure predicate so the
+    guard condition lives in exactly one place and is unit-testable without the
+    full turn-lifecycle mixin. Only flags bridge turns: native-LLM chat replies
+    legitimately produce text with no tools.
+    """
+    if not is_bridge_turn:
+        return False
+    if tool_call_details:
+        return False
+    return len((response_text or "").strip()) >= _MIN_NARRATION_CHARS_FOR_GUARD
+
 
 def _message_to_dict(msg: Any) -> dict[str, Any]:
     """Normalize message objects for JSON logging."""
@@ -62,6 +88,11 @@ def _normalize_tool_call_details(tool_calls: list[dict] | None) -> list[dict]:
             }
         if item.get("call_id"):
             entry["call_id"] = item["call_id"]
+        # Tool failure flag (SDK ToolResultBlock.is_error), threaded so a
+        # recalled turn re-tints failed tool cards red without re-deriving
+        # failure from result text. Only persist when true to keep the blob lean.
+        if item.get("is_error"):
+            entry["is_error"] = True
         # Interleave reconstruction: chars of assistant text before this tool.
         if item.get("text_offset") is not None:
             entry["text_offset"] = item["text_offset"]
@@ -330,6 +361,29 @@ class TurnLifecycleMixin:
                     result = tc.get("result", "")
                     parts.append(f"[{name}]\n{result}")
                 tool_context = "\n\n".join(parts)
+
+        # TASK-306 Section B: turn-integrity guard. A bridge/agent turn that
+        # produced a non-trivial narration but recorded ZERO tool calls is
+        # claiming work it may not have done (the "claims work, no tool_use"
+        # bug). We cannot yet reliably separate a legitimate conversational
+        # reply from a fabricated work-claim without a task-bound signal (not
+        # available in this turn path), so we FLAG (warn) rather than reject —
+        # rejecting on this imperfect predicate would drop legitimate no-tool
+        # replies, which violates the same honesty invariant in reverse.
+        # Escalation to reject is gated on a reliable "claims work" predicate.
+        is_bridge_turn = isinstance(getattr(llm_bawt, "client", None), AgentBackendClient)
+        if _is_unbacked_work_claim(
+            is_bridge_turn=is_bridge_turn,
+            tool_call_details=tool_call_details,
+            response_text=response_text,
+        ):
+            stripped = response_text.strip()
+            log.warning(
+                "TURN-INTEGRITY: bridge turn %s (bot=%s) finalized with "
+                "non-trivial narration (%d chars) but ZERO tool_use — possible "
+                "fabricated work claim. response_head=%r",
+                turn_id, bot_id, len(stripped), stripped[:160],
+            )
 
         llm_bawt.finalize_response(response_text, tool_context, attachments=attachments, reasoning=reasoning)
 

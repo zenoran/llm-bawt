@@ -1248,6 +1248,11 @@ class ClaudeCodeBridge:
                                             tool_name=block.tool_use_id or "unknown",
                                             tool_use_id=block.tool_use_id,
                                             tool_result=str(result_content)[:2000],
+                                            # The SDK marks failed tool runs with
+                                            # is_error on the ToolResultBlock — the
+                                            # single authoritative failure signal.
+                                            # Thread it so the UI can tint the card.
+                                            tool_error=bool(getattr(block, "is_error", False)),
                                         )
 
                             elif isinstance(msg, ResultMessage):
@@ -2424,6 +2429,7 @@ class ClaudeCodeBridge:
         tool_name: str | None = None,
         tool_arguments: dict | None = None,
         tool_result: str | None = None,
+        tool_error: bool | None = None,
         model: str | None = None,
         token_usage: dict | None = None,
         tool_use_id: str | None = None,
@@ -2448,6 +2454,7 @@ class ClaudeCodeBridge:
             tool_name=tool_name,
             tool_arguments=tool_arguments,
             tool_result=tool_result,
+            tool_error=tool_error,
             model=model,
             seq=seq,
             timestamp=datetime.now(timezone.utc),

@@ -39,6 +39,17 @@ from .utils.config import Config, has_database_credentials
 logger = logging.getLogger(__name__)
 
 
+class ApprovalPersistError(RuntimeError):
+    """A tool approval request could not be durably persisted.
+
+    TASK-306 Section A: callers that gate a tool on approval require a
+    *confirmed* commit. This is raised when the row cannot be written (no DB
+    engine, or the insert/commit failed). It must be surfaced honestly to the
+    agent/user — never swallowed — because a swallowed failure means the user
+    never sees the approval and the agent proceeds on a false premise.
+    """
+
+
 def _new_id() -> str:
     return uuid.uuid4().hex
 
@@ -385,10 +396,19 @@ class ToolApprovalPolicyStore:
         prompt: str,
         trigger_message_id: str | None = None,
         session_key: str | None = None,
-    ) -> ToolApprovalRequest | None:
-        """Persist a new pending approval. Idempotent on request_id."""
+    ) -> ToolApprovalRequest:
+        """Persist a new pending approval. Idempotent on request_id.
+
+        Returns the committed (or pre-existing) row. Raises
+        ``ApprovalPersistError`` if the request cannot be durably committed —
+        no DB engine, or the insert/commit failed. TASK-306 Section A: the
+        single caller treats a raise as a hard, agent-visible failure and must
+        NOT swallow it.
+        """
         if self.engine is None:
-            return None
+            raise ApprovalPersistError(
+                f"approval store has no DB engine; cannot persist request {request_id}"
+            )
         try:
             with Session(self.engine) as session:
                 existing = session.get(ToolApprovalRequest, request_id)
@@ -418,9 +438,13 @@ class ToolApprovalPolicyStore:
                 session.commit()
                 session.refresh(row)
                 return row
-        except Exception:  # noqa: BLE001
+        except ApprovalPersistError:
+            raise
+        except Exception as exc:  # noqa: BLE001
             logger.exception("Failed to record approval request id=%s", request_id)
-            return None
+            raise ApprovalPersistError(
+                f"insert failed for approval request {request_id}: {exc}"
+            ) from exc
 
     def get_request(self, request_id: str) -> ToolApprovalRequest | None:
         if self.engine is None:

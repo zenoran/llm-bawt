@@ -13,6 +13,7 @@ import time
 import uuid
 from typing import Any, AsyncIterator
 
+from ..approval_policies import ApprovalPersistError
 from ..bots import StreamingEmoteFilter, get_bot
 # TASK-225: MediaStore is used to (a) resolve new-style ``attachment_ids``
 # into inline image bytes for the LLM call and (b) auto-upload legacy
@@ -39,6 +40,12 @@ _LOCAL_GPU_MODEL_TYPES = frozenset({"gguf", "vllm", "llamacpp"})
 # just tool calls. Coalescing keeps the capped Redis stream (MAXLEN 5000,
 # shared per bot+user) from churning on per-token writes.
 _TEXT_DELTA_FLUSH_CHARS = 80
+# TASK-306 Section A: bounded retry for the confirmed approval-row commit.
+# A gated tool call MUST persist a durable approval row before the turn ends;
+# on transient DB failure we retry a small bounded number of times, then fail
+# closed + informed rather than swallow.
+_APPROVAL_PERSIST_MAX_ATTEMPTS = 3
+_APPROVAL_PERSIST_BACKOFF_S = 0.25
 
 
 class ChatStreamingMixin:
@@ -251,6 +258,7 @@ class ChatStreamingMixin:
                         "tool": tool_name,
                         "parameters": tool_args,
                         "result": "",
+                        "is_error": False,
                         "call_id": call_id,
                     })
                     # Publish tool_start to unified event stream
@@ -275,6 +283,7 @@ class ChatStreamingMixin:
 
                 elif event.kind == AgentEventKind.TOOL_END:
                     tool_result = str(event.tool_result or "")
+                    tool_failed = bool(event.tool_error)
                     # Recover the call_id from the matching tool_start.
                     # Tool calls can nest (e.g. Agent > Grep > Read), so pop
                     # the stack to pair each tool_end with its tool_start.
@@ -282,6 +291,7 @@ class ChatStreamingMixin:
                     if tool_call_details:
                         matched = tool_call_details.pop()
                         matched["result"] = tool_result
+                        matched["is_error"] = tool_failed
                         end_call_id = matched.get("call_id", end_call_id)
                     # Publish tool_end to unified event stream
                     if redis_sub:
@@ -298,6 +308,7 @@ class ChatStreamingMixin:
                                 "iteration": _tool_call_index,
                                 "provider": event.provider,
                                 "result": tool_result[:2000],
+                                "is_error": tool_failed,
                                 "ts": time.time(),
                             })
                         except Exception:
@@ -852,6 +863,11 @@ class ChatStreamingMixin:
         # Set when an approval_required chunk arrives; consumed at turn
         # completion to mark end_reason="approval" so the UI keeps the card.
         approval_id_holder: list[str | None] = [None]
+        # TASK-306 Section A: structured failure when a gated tool's approval
+        # row could NOT be durably committed. When set, the turn ends honestly
+        # (end_reason="approval_persist_failed") and the user is told the gate
+        # did not reach them — never a silent success.
+        approval_persist_failed_holder: list[dict | None] = [None]
 
         # Capture the event loop before entering the thread
         loop = asyncio.get_running_loop()
@@ -1849,6 +1865,7 @@ class ChatStreamingMixin:
                 # abandoned; the user answers later via a continuation turn).
                 question_id = question_id_holder[0]
                 approval_id = approval_id_holder[0]
+                approval_persist_failed = approval_persist_failed_holder[0]
                 if question_id:
                     end_reason = "question"
                 elif approval_id:
@@ -1856,6 +1873,11 @@ class ChatStreamingMixin:
                     # semantics as a question; the request stays "pending" and
                     # the user resolves it via a continuation turn.
                     end_reason = "approval"
+                elif approval_persist_failed:
+                    # TASK-306 Section A: a gated tool required approval but the
+                    # row could not be durably committed. End honestly so the
+                    # turn record reflects that the gate never reached the user.
+                    end_reason = "approval_persist_failed"
                 elif cancelled_holder[0]:
                     end_reason = "aborted"
                 elif status == "timeout":
@@ -1864,11 +1886,18 @@ class ChatStreamingMixin:
                     end_reason = "stop"
                 # Stamp the turn log so hydration/turn-log APIs can render a
                 # first-class QuestionMessage for end_reason="question" turns.
+                # For a persist failure, record the structured reason as
+                # error_text so the agent (on continuation) and history see the
+                # truth instead of a phantom success.
                 try:
                     self._turn_log_store.update_turn(
                         turn_id=turn_log_id,
                         end_reason=end_reason,
                         question_id=question_id,
+                        error_text=(
+                            json.dumps(approval_persist_failed)
+                            if approval_persist_failed else None
+                        ),
                     )
                 except Exception as _er_err:
                     log.debug("update_turn end_reason failed for %s: %s", turn_log_id, _er_err)
@@ -1881,6 +1910,7 @@ class ChatStreamingMixin:
                     "end_reason": end_reason,
                     "question_id": question_id,
                     "approval_id": approval_id,
+                    "approval_persist_failed": approval_persist_failed,
                     "animation": animation_holder[0],
                     "token_usage": token_usage_holder[0],
                     "ts": time.time(),
@@ -1936,6 +1966,15 @@ class ChatStreamingMixin:
                     # Send SSE comment as keepalive to prevent client/proxy timeout
                     yield ": keepalive\n\n"
                     continue
+
+                # DEBUG-292: trace every dict chunk through the async generator
+                if isinstance(chunk, dict) and chunk.get("event") == "approval_required":
+                    log.info(
+                        "DEBUG-292 async_gen: approval_required chunk DEQUEUED "
+                        "bot=%s turn=%s req_id=%s",
+                        bot_id, turn_log_id,
+                        chunk.get("tool_use_id", "?"),
+                    )
 
                 if chunk is None:
                     # Stream complete - flush any buffered content from emote filter
@@ -2190,63 +2229,138 @@ class ChatStreamingMixin:
                         req_id, store is not None,
                         getattr(store, "engine", None) is not None,
                     )
-                    if req_id and store is not None and store.engine is not None:
-                        approval_id_holder[0] = req_id
-                        try:
-                            store.record_request(
-                                request_id=req_id,
-                                bot_id=bot_id,
-                                user_id=user_id,
-                                turn_id=turn_log_id,
-                                backend=chunk.get("provider") or "claude-code",
-                                tool_name=chunk.get("tool_name") or "",
-                                tool_arguments=tool_args if isinstance(tool_args, dict) else {"value": tool_args},
-                                subject=chunk.get("subject") or "",
-                                grant_key=chunk.get("grant_key") or "",
-                                policy_id=chunk.get("policy_id"),
-                                severity=chunk.get("severity") or "medium",
-                                prompt=chunk.get("prompt") or "",
-                                trigger_message_id=trigger_message_id,
-                                session_key=chunk.get("session_key") or None,
-                            )
-                        except Exception as _persist_err:
-                            log.warning(
-                                "Failed to persist approval request id=%s: %s",
-                                req_id, _persist_err,
-                            )
-                    approval_payload = {
-                        "object": "tool.approval_required",
-                        "request_id": req_id,
-                        "tool_name": chunk.get("tool_name", ""),
-                        "arguments": tool_args,
-                        "subject": chunk.get("subject", ""),
-                        "prompt": chunk.get("prompt", ""),
-                        "severity": chunk.get("severity", "medium"),
-                        "policy_id": chunk.get("policy_id"),
-                        "session_key": chunk.get("session_key", ""),
-                        "provider": chunk.get("provider", ""),
-                        "trigger_message_id": chunk.get("trigger_message_id"),
-                        "bot_id": bot_id,
-                        "turn_id": turn_log_id,
-                    }
-                    yield (f"data: {json.dumps(approval_payload)}\n\n")
-                    await _publish_unified({
-                        "_type": "tool_approval_required",
-                        "turn_id": turn_log_id,
-                        "trigger_message_id": trigger_message_id,
-                        "bot_id": bot_id,
-                        "user_id": user_id,
-                        "request_id": req_id,
-                        "tool_name": chunk.get("tool_name", ""),
-                        "arguments": tool_args,
-                        "subject": chunk.get("subject", ""),
-                        "prompt": chunk.get("prompt", ""),
-                        "severity": chunk.get("severity", "medium"),
-                        "policy_id": chunk.get("policy_id"),
-                        "session_key": chunk.get("session_key", ""),
-                        "provider": chunk.get("provider", ""),
-                        "ts": time.time(),
-                    })
+                    # TASK-306 Section A: the approval row is the durable floor.
+                    # Confirm the commit (bounded retry) BEFORE we surface an
+                    # Approve/Deny card. A normal card backed by no persisted row
+                    # would be a lie: a refresh could not hydrate it and resolve
+                    # would 404. So on a confirmed-failed commit we fail closed +
+                    # informed instead of pretending the gate reached the user.
+                    persist_failure: dict | None = None
+                    if req_id and store is not None:
+                        committed = False
+                        last_err: Exception | None = None
+                        for _attempt in range(_APPROVAL_PERSIST_MAX_ATTEMPTS):
+                            try:
+                                store.record_request(
+                                    request_id=req_id,
+                                    bot_id=bot_id,
+                                    user_id=user_id,
+                                    turn_id=turn_log_id,
+                                    backend=chunk.get("provider") or "claude-code",
+                                    tool_name=chunk.get("tool_name") or "",
+                                    tool_arguments=tool_args if isinstance(tool_args, dict) else {"value": tool_args},
+                                    subject=chunk.get("subject") or "",
+                                    grant_key=chunk.get("grant_key") or "",
+                                    policy_id=chunk.get("policy_id"),
+                                    severity=chunk.get("severity") or "medium",
+                                    prompt=chunk.get("prompt") or "",
+                                    trigger_message_id=trigger_message_id,
+                                    session_key=chunk.get("session_key") or None,
+                                )
+                                committed = True
+                                break
+                            except ApprovalPersistError as _persist_err:
+                                last_err = _persist_err
+                                log.warning(
+                                    "approval persist attempt %d/%d failed id=%s: %s",
+                                    _attempt + 1, _APPROVAL_PERSIST_MAX_ATTEMPTS,
+                                    req_id, _persist_err,
+                                )
+                                if _attempt + 1 < _APPROVAL_PERSIST_MAX_ATTEMPTS:
+                                    await asyncio.sleep(_APPROVAL_PERSIST_BACKOFF_S * (_attempt + 1))
+                        if committed:
+                            approval_id_holder[0] = req_id
+                        else:
+                            persist_failure = {
+                                "kind": "side_effect_failed",
+                                "effect": "approval_request_persist",
+                                "request_id": req_id,
+                                "tool_name": chunk.get("tool_name") or "",
+                                "reachable_to_user": False,
+                                "error_class": type(last_err).__name__ if last_err else "ApprovalPersistError",
+                                "detail": str(last_err) if last_err else "unknown",
+                                "attempts": _APPROVAL_PERSIST_MAX_ATTEMPTS,
+                            }
+                    elif req_id and store is None:
+                        # No approval store configured at all — still an honest
+                        # failure, not a silent skip (TASK-306).
+                        persist_failure = {
+                            "kind": "side_effect_failed",
+                            "effect": "approval_request_persist",
+                            "request_id": req_id,
+                            "tool_name": chunk.get("tool_name") or "",
+                            "reachable_to_user": False,
+                            "error_class": "NoApprovalStore",
+                            "detail": "approval policy store is not configured on this service",
+                            "attempts": 0,
+                        }
+
+                    if persist_failure is None:
+                        approval_payload = {
+                            "object": "tool.approval_required",
+                            "request_id": req_id,
+                            "tool_name": chunk.get("tool_name", ""),
+                            "arguments": tool_args,
+                            "subject": chunk.get("subject", ""),
+                            "prompt": chunk.get("prompt", ""),
+                            "severity": chunk.get("severity", "medium"),
+                            "policy_id": chunk.get("policy_id"),
+                            "session_key": chunk.get("session_key", ""),
+                            "provider": chunk.get("provider", ""),
+                            "trigger_message_id": chunk.get("trigger_message_id"),
+                            "bot_id": bot_id,
+                            "turn_id": turn_log_id,
+                        }
+                        yield (f"data: {json.dumps(approval_payload)}\n\n")
+                        await _publish_unified({
+                            "_type": "tool_approval_required",
+                            "turn_id": turn_log_id,
+                            "trigger_message_id": trigger_message_id,
+                            "bot_id": bot_id,
+                            "user_id": user_id,
+                            "request_id": req_id,
+                            "tool_name": chunk.get("tool_name", ""),
+                            "arguments": tool_args,
+                            "subject": chunk.get("subject", ""),
+                            "prompt": chunk.get("prompt", ""),
+                            "severity": chunk.get("severity", "medium"),
+                            "policy_id": chunk.get("policy_id"),
+                            "session_key": chunk.get("session_key", ""),
+                            "provider": chunk.get("provider", ""),
+                            "ts": time.time(),
+                        })
+                    else:
+                        # Fail closed + informed: tell the user the truth instead
+                        # of showing a phantom card or claiming success.
+                        approval_persist_failed_holder[0] = persist_failure
+                        log.error(
+                            "approval persist FAILED id=%s tool=%s — gate will NOT "
+                            "reach user; action did not proceed: %s",
+                            req_id, persist_failure["tool_name"], persist_failure["detail"],
+                        )
+                        fail_payload = {
+                            "object": "tool.approval_persist_failed",
+                            "request_id": req_id,
+                            "tool_name": persist_failure["tool_name"],
+                            "detail": persist_failure["detail"],
+                            "message": (
+                                "An approval was required for this tool but could "
+                                "not be recorded, so it will not reach you. The "
+                                "action did not proceed."
+                            ),
+                        }
+                        yield (f"data: {json.dumps(fail_payload)}\n\n")
+                        await _publish_unified({
+                            "_type": "tool_approval_persist_failed",
+                            "turn_id": turn_log_id,
+                            "trigger_message_id": trigger_message_id,
+                            "bot_id": bot_id,
+                            "user_id": user_id,
+                            "request_id": req_id,
+                            "tool_name": persist_failure["tool_name"],
+                            "detail": persist_failure["detail"],
+                            "ts": time.time(),
+                        })
                     continue
 
                 if isinstance(chunk, dict) and chunk.get("event") == "tool_preapproved":

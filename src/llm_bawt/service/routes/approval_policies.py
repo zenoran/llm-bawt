@@ -8,6 +8,7 @@ a one-shot allow and returns a continuation prompt the client dispatches).
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import time
@@ -64,6 +65,14 @@ class ResolveRequest(BaseModel):
     # 'respond' only: the user's own guidance sent to the agent instead of the
     # canned refusal. Optional — empty falls back to a neutral "not run" note.
     message: str = Field("", description="Custom continuation text for 'respond'")
+    # When True (default), the SERVER dispatches the continuation turn so the bot
+    # is reliably told "approved, run exactly this" regardless of which surface
+    # resolved the request (admin page, API, script — not just the chat card).
+    # A client that dispatches its own continuation must pass False to avoid a
+    # double turn.
+    dispatch_continuation: bool = Field(
+        False, description="Server dispatches the continuation turn (opt-in; the chat card dispatches client-side)",
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -251,10 +260,25 @@ async def resolve_approval(request_id: str, body: ResolveRequest):
         prompt = _respond_prompt(message, subject, row.tool_name)
     else:
         prompt = _continuation_prompt(approved, subject, row.tool_name)
+    # Dispatch the continuation SERVER-SIDE (default) so the bot is reliably
+    # messaged regardless of which surface resolved this. Skipped for cancel
+    # (silent by design) and when the caller opts to dispatch it itself.
+    server_dispatched = False
+    if prompt and body.dispatch_continuation:
+        _spawn_continuation(
+            bot_id=bot_id,
+            user_id=user_id,
+            prompt=prompt,
+            parent_turn_id=row.turn_id,
+            # Only an approve carries a one-shot grant that must settle first.
+            grant_settle_s=0.75 if approved else 0.0,
+        )
+        server_dispatched = True
     log.info(
         "Approval %s: id=%s bot=%s subject=%r — %s",
         new_status, request_id, bot_id, subject[:80],
         "silent cancel (no continuation)" if outcome == "cancel"
+        else "server dispatched continuation" if server_dispatched
         else "client will dispatch continuation",
     )
     return {
@@ -262,6 +286,7 @@ async def resolve_approval(request_id: str, body: ResolveRequest):
         "request_id": request_id, "bot_id": bot_id,
         "continuation_prompt": prompt, "parent_turn_id": row.turn_id,
         "cancelled": outcome == "cancel",
+        "server_dispatched": server_dispatched,
     }
 
 
@@ -276,6 +301,64 @@ def _subscriber():
         return get_agent_subscriber()
     except Exception:  # noqa: BLE001
         return None
+
+
+def _spawn_continuation(
+    *,
+    bot_id: str,
+    user_id: str,
+    prompt: str,
+    parent_turn_id: str | None,
+    grant_settle_s: float = 0.0,
+) -> None:
+    """Dispatch the post-resolution continuation turn SERVER-SIDE.
+
+    This is the fix for the "approving did nothing" gap: the continuation that
+    re-issues the approved call (or tells the agent it was denied) used to
+    depend on the *client* making a second /v1/chat/completions call. Surfaces
+    that only resolve — the admin page, the API, a script — never messaged the
+    bot, so the approved command silently never ran and the grant expired.
+
+    We drive the real streaming pipeline detached (fire-and-forget) so all the
+    normal side effects happen — turn log, persistence, and the unified Redis
+    SSE events the chat UI renders. The HTTP resolve response returns
+    immediately; the turn streams into the chat on its own.
+
+    ``grant_settle_s`` gives the bridge a beat to store the one-shot approval
+    grant (sent on a different Redis stream than chat.send) before the re-issued
+    tool call arrives, so it isn't re-gated by a race.
+    """
+    try:
+        from ..schemas import ChatCompletionRequest, ChatMessage
+
+        service = get_service()
+        req = ChatCompletionRequest(
+            messages=[ChatMessage(role="user", content=prompt)],
+            bot_id=bot_id,
+            user=user_id,
+            stream=True,
+            parent_turn_id=parent_turn_id,
+        )
+
+        async def _drive() -> None:
+            try:
+                if grant_settle_s:
+                    await asyncio.sleep(grant_settle_s)
+                async for _ in service.chat_completion_stream(req):
+                    pass
+            except Exception:  # noqa: BLE001
+                log.exception(
+                    "server-side continuation dispatch failed (bot=%s parent_turn=%s)",
+                    bot_id, parent_turn_id,
+                )
+
+        asyncio.create_task(_drive())
+    except Exception:  # noqa: BLE001
+        # Never let a dispatch failure break the resolve response itself.
+        log.exception(
+            "failed to spawn continuation (bot=%s parent_turn=%s)",
+            bot_id, parent_turn_id,
+        )
 
 
 def _continuation_prompt(approved: bool, subject: str, tool_name: str) -> str:

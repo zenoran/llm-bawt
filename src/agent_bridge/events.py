@@ -73,6 +73,11 @@ class AgentEvent:
     tool_name: str | None = None
     tool_arguments: dict | None = None
     tool_result: Any | None = None
+    # Whether the tool call failed (the SDK's ToolResultBlock.is_error). Stamped
+    # on TOOL_END events so the UI can tint a failed tool card red without
+    # re-deriving failure from the result text (which is unreliable across
+    # providers). None on non-tool events / bridges that don't surface it.
+    tool_error: bool | None = None
     model: str | None = None
     seq: int | None = None
     timestamp: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
@@ -121,6 +126,7 @@ class AgentEvent:
             "tool_name": self.tool_name,
             "tool_arguments": self.tool_arguments,
             "tool_result": self.tool_result,
+            "tool_error": self.tool_error,
             "model": self.model,
             "seq": self.seq,
             "timestamp": self.timestamp.isoformat() if self.timestamp else None,
@@ -160,6 +166,7 @@ class AgentEvent:
             tool_name=data.get("tool_name"),
             tool_arguments=data.get("tool_arguments"),
             tool_result=data.get("tool_result"),
+            tool_error=data.get("tool_error"),
             model=data.get("model"),
             seq=data.get("seq"),
             timestamp=ts,
