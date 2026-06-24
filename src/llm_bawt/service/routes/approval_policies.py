@@ -16,7 +16,12 @@ from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field
 
 from ..dependencies import get_service, get_tool_approval_policy_store
-from ...approval_policies import REQ_APPROVED, REQ_DENIED
+from ...approval_policies import (
+    REQ_APPROVED,
+    REQ_CANCELLED,
+    REQ_DENIED,
+    REQ_RESPONDED,
+)
 
 log = logging.getLogger(__name__)
 router = APIRouter()
@@ -52,10 +57,13 @@ class PolicyUpsert(BaseModel):
 
 
 class ResolveRequest(BaseModel):
-    decision: str = Field(..., description="'approve' or 'deny'")
+    decision: str = Field(..., description="'approve', 'deny', 'cancel', or 'respond'")
     bot_id: str = Field("", description="Bot slug (for tab fanout)")
     user_id: str = Field("nick", description="User id (for tab fanout)")
     resolved_by: str | None = None
+    # 'respond' only: the user's own guidance sent to the agent instead of the
+    # canned refusal. Optional — empty falls back to a neutral "not run" note.
+    message: str = Field("", description="Custom continuation text for 'respond'")
 
 
 # ---------------------------------------------------------------------------
@@ -151,12 +159,17 @@ def list_requests(status: str | None = None, bot_id: str | None = None, limit: i
 
 @router.post("/v1/chat/approvals/{request_id}/resolve", tags=["Approval Policies"])
 async def resolve_approval(request_id: str, body: ResolveRequest):
-    """Approve or deny a pending gated tool call.
+    """Approve, deny, cancel, or respond to a pending gated tool call.
 
     On approve: record it, grant the bridge a one-shot allow keyed by the
     request's grant_key, and return a continuation prompt the client dispatches
     so the model re-issues the now-allowed call. On deny: record it and return a
-    prompt telling the model it was refused. Idempotent on already-resolved.
+    prompt telling the model it was refused. On cancel: record it and return a
+    null continuation — the request is silently dropped without warning the
+    agent (no grant, no token-costing acknowledgement). On respond: the tool is
+    NOT run (no grant), but the user's own ``message`` becomes the continuation
+    instead of the canned refusal — for correcting false-positive gates with
+    bespoke guidance. Idempotent on already-resolved.
     """
     store = _store()
     row = store.get_request(request_id)
@@ -164,17 +177,35 @@ async def resolve_approval(request_id: str, body: ResolveRequest):
         raise HTTPException(status_code=404, detail=f"No approval request id={request_id}")
 
     decision = (body.decision or "").strip().lower()
-    if decision not in ("approve", "approved", "allow", "deny", "denied", "reject"):
-        raise HTTPException(status_code=400, detail="decision must be 'approve' or 'deny'")
-    approved = decision in ("approve", "approved", "allow")
+    if decision in ("approve", "approved", "allow"):
+        outcome = "approve"
+    elif decision in ("deny", "denied", "reject"):
+        outcome = "deny"
+    elif decision in ("cancel", "cancelled", "canceled", "abort", "dismiss"):
+        outcome = "cancel"
+    elif decision in ("respond", "reply", "guide", "message"):
+        outcome = "respond"
+    else:
+        raise HTTPException(
+            status_code=400,
+            detail="decision must be 'approve', 'deny', 'cancel', or 'respond'",
+        )
+    approved = outcome == "approve"
 
     subject = row.subject or ""
     bot_id = body.bot_id or row.bot_id
     user_id = body.user_id or row.user_id
+    message = (body.message or "").strip()
 
     if row.status != "pending":
         # Idempotent replay — return the same continuation the first resolve did.
-        prompt = _continuation_prompt(row.status == REQ_APPROVED, subject, row.tool_name)
+        # Cancelled requests never carried a continuation, so replay returns none.
+        if row.status == REQ_CANCELLED:
+            prompt = None
+        elif row.status == REQ_RESPONDED:
+            prompt = _respond_prompt(message, subject, row.tool_name)
+        else:
+            prompt = _continuation_prompt(row.status == REQ_APPROVED, subject, row.tool_name)
         return {
             "ok": True, "detail": "already_resolved", "status": row.status,
             "request_id": request_id, "bot_id": bot_id,
@@ -182,7 +213,12 @@ async def resolve_approval(request_id: str, body: ResolveRequest):
             "already_resolved": True,
         }
 
-    new_status = REQ_APPROVED if approved else REQ_DENIED
+    new_status = {
+        "approve": REQ_APPROVED,
+        "deny": REQ_DENIED,
+        "cancel": REQ_CANCELLED,
+        "respond": REQ_RESPONDED,
+    }[outcome]
     updated = store.resolve_request(
         request_id, status=new_status, resolved_by=body.resolved_by,
     )
@@ -205,15 +241,27 @@ async def resolve_approval(request_id: str, body: ResolveRequest):
 
     await _fanout_resolved(subscriber, bot_id, user_id, request_id, row.turn_id, new_status)
 
-    prompt = _continuation_prompt(approved, subject, row.tool_name)
+    # Cancel is silent: no continuation turn, so the agent is never told and
+    # spends no tokens acknowledging. Respond sends the user's own guidance.
+    # Approve/deny return the canned prompt the client dispatches to resume
+    # (approve) or close out (deny) the turn.
+    if outcome == "cancel":
+        prompt = None
+    elif outcome == "respond":
+        prompt = _respond_prompt(message, subject, row.tool_name)
+    else:
+        prompt = _continuation_prompt(approved, subject, row.tool_name)
     log.info(
-        "Approval %s: id=%s bot=%s subject=%r — client will dispatch continuation",
+        "Approval %s: id=%s bot=%s subject=%r — %s",
         new_status, request_id, bot_id, subject[:80],
+        "silent cancel (no continuation)" if outcome == "cancel"
+        else "client will dispatch continuation",
     )
     return {
         "ok": True, "detail": new_status, "status": new_status,
         "request_id": request_id, "bot_id": bot_id,
         "continuation_prompt": prompt, "parent_turn_id": row.turn_id,
+        "cancelled": outcome == "cancel",
     }
 
 
@@ -240,6 +288,24 @@ def _continuation_prompt(approved: bool, subject: str, tool_name: str) -> str:
     return (
         f"[The user DENIED the {tool_name} action you requested:\n\n{shown}\n\n"
         f"Do not attempt it again. Continue without it, or explain what you need.]"
+    )
+
+
+def _respond_prompt(message: str, subject: str, tool_name: str) -> str:
+    """Continuation for a 'respond' resolution: the tool is NOT run; the user's
+    own guidance steers the agent. Empty message falls back to a neutral note so
+    the turn still closes cleanly."""
+    shown = subject if len(subject) <= 400 else subject[:397] + "…"
+    msg = (message or "").strip()
+    if msg:
+        return (
+            f"[The user did NOT run the {tool_name} action you requested:\n\n{shown}\n\n"
+            f"They responded with this guidance — follow it and do not re-issue the "
+            f"original call unless it tells you to:\n\n{msg}]"
+        )
+    return (
+        f"[The user reviewed the {tool_name} action you requested and chose not to "
+        f"run it, with no further instruction. Continue without it.]"
     )
 
 

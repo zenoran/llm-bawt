@@ -51,6 +51,14 @@ def _utcnow() -> datetime:
 REQ_PENDING = "pending"
 REQ_APPROVED = "approved"
 REQ_DENIED = "denied"
+# Cancelled = user dismissed the request WITHOUT warning the agent. Unlike
+# `denied` (which dispatches a "you were refused" continuation that costs the
+# agent tokens to acknowledge), cancel is silent: no grant, no continuation.
+REQ_CANCELLED = "cancelled"
+# Responded = user declined to run the tool but sent the agent their own
+# guidance (e.g. correcting a false-positive gate) instead of the canned deny.
+# Like deny: no grant, tool not run — but the continuation is user-authored.
+REQ_RESPONDED = "responded"
 REQ_EXPIRED = "expired"
 REQ_SUPERSEDED = "superseded"
 
