@@ -167,6 +167,7 @@ services:
       # Z.AI (Zhipu GLM) — native Anthropic Messages API passthrough.
       # Powers bots whose model_id is namespaced "zai/<glm-model>".
       - ZAI_API_KEY=${ZAI_API_KEY:-}
+      - ENABLE_TOOL_SEARCH=true
     extra_hosts:
       - "host.docker.internal:host-gateway"
       - "echo.lan.zenoran.com:${ECHO_LAN_HOST_IP:-10.0.0.101}"
