@@ -1042,6 +1042,127 @@ class ChatStreamingMixin:
             "ts": time.time(),
         })
 
+        # ── Durable approval handling (TASK-292/306 race hardening) ──
+        # The approval row + its surfacing MUST NOT depend on the SSE async
+        # generator draining the chunk. A gated tool ends the turn and the
+        # generator is torn down (client disconnect) before it dequeues the
+        # already-delivered approval chunk — so the row never persisted and the
+        # user saw nothing (a silent vacuum). We persist + publish from the
+        # streaming WORKER THREAD (_intercept_tool_events), which runs to
+        # completion regardless of client teardown. Idempotent: record_request
+        # is keyed on tool_use_id and _approval_handled guards the async-gen
+        # path from double-handling.
+        _approval_handled: set[str] = set()
+
+        def _persist_publish_approval(chunk: dict) -> None:
+            """Durably record + surface one approval_required chunk (worker thread).
+
+            Synchronous DB write with bounded retry; on success publishes the
+            live unified ``tool_approval_required`` event, on a confirmed
+            failure publishes ``tool_approval_persist_failed`` so the error
+            reaches the user instead of vanishing.
+            """
+            req_id = chunk.get("tool_use_id") or ""
+            if not req_id or req_id in _approval_handled:
+                return
+            _approval_handled.add(req_id)
+            tool_args = chunk.get("arguments") or {}
+            store = getattr(self, "_tool_approval_policy_store", None)
+
+            persist_failure: dict | None = None
+            if store is not None:
+                committed = False
+                last_err: Exception | None = None
+                for _attempt in range(_APPROVAL_PERSIST_MAX_ATTEMPTS):
+                    try:
+                        store.record_request(
+                            request_id=req_id,
+                            bot_id=bot_id,
+                            user_id=user_id,
+                            turn_id=turn_log_id,
+                            backend=chunk.get("provider") or "claude-code",
+                            tool_name=chunk.get("tool_name") or "",
+                            tool_arguments=tool_args if isinstance(tool_args, dict) else {"value": tool_args},
+                            subject=chunk.get("subject") or "",
+                            grant_key=chunk.get("grant_key") or "",
+                            policy_id=chunk.get("policy_id"),
+                            severity=chunk.get("severity") or "medium",
+                            prompt=chunk.get("prompt") or "",
+                            trigger_message_id=trigger_message_id,
+                            session_key=chunk.get("session_key") or None,
+                        )
+                        committed = True
+                        break
+                    except ApprovalPersistError as _persist_err:
+                        last_err = _persist_err
+                        log.warning(
+                            "approval persist attempt %d/%d failed id=%s: %s",
+                            _attempt + 1, _APPROVAL_PERSIST_MAX_ATTEMPTS,
+                            req_id, _persist_err,
+                        )
+                        if _attempt + 1 < _APPROVAL_PERSIST_MAX_ATTEMPTS:
+                            time.sleep(_APPROVAL_PERSIST_BACKOFF_S * (_attempt + 1))
+                if committed:
+                    approval_id_holder[0] = req_id
+                else:
+                    persist_failure = {
+                        "kind": "side_effect_failed",
+                        "effect": "approval_request_persist",
+                        "request_id": req_id,
+                        "tool_name": chunk.get("tool_name") or "",
+                        "reachable_to_user": False,
+                        "error_class": type(last_err).__name__ if last_err else "ApprovalPersistError",
+                        "detail": str(last_err) if last_err else "unknown",
+                        "attempts": _APPROVAL_PERSIST_MAX_ATTEMPTS,
+                    }
+            else:
+                persist_failure = {
+                    "kind": "side_effect_failed",
+                    "effect": "approval_request_persist",
+                    "request_id": req_id,
+                    "tool_name": chunk.get("tool_name") or "",
+                    "reachable_to_user": False,
+                    "error_class": "NoApprovalStore",
+                    "detail": "approval policy store is not configured on this service",
+                    "attempts": 0,
+                }
+
+            if persist_failure is None:
+                _publish_event_direct({
+                    "_type": "tool_approval_required",
+                    "turn_id": turn_log_id,
+                    "trigger_message_id": trigger_message_id,
+                    "bot_id": bot_id,
+                    "user_id": user_id,
+                    "request_id": req_id,
+                    "tool_name": chunk.get("tool_name", ""),
+                    "arguments": tool_args,
+                    "subject": chunk.get("subject", ""),
+                    "prompt": chunk.get("prompt", ""),
+                    "severity": chunk.get("severity", "medium"),
+                    "policy_id": chunk.get("policy_id"),
+                    "session_key": chunk.get("session_key", ""),
+                    "provider": chunk.get("provider", ""),
+                    "ts": time.time(),
+                })
+            else:
+                approval_persist_failed_holder[0] = persist_failure
+                log.error(
+                    "approval persist FAILED id=%s tool=%s — surfacing failure to user: %s",
+                    req_id, persist_failure["tool_name"], persist_failure["detail"],
+                )
+                _publish_event_direct({
+                    "_type": "tool_approval_persist_failed",
+                    "turn_id": turn_log_id,
+                    "trigger_message_id": trigger_message_id,
+                    "bot_id": bot_id,
+                    "user_id": user_id,
+                    "request_id": req_id,
+                    "tool_name": persist_failure["tool_name"],
+                    "detail": persist_failure["detail"],
+                    "ts": time.time(),
+                })
+
         def _stream_to_queue():
             """Run streaming in a thread and push chunks to the async queue."""
             def _turn_was_aborted() -> bool:
@@ -1573,6 +1694,13 @@ class ChatStreamingMixin:
 
                         if isinstance(item, dict):
                             evt = item.get("event")
+                            if evt == "approval_required":
+                                # Persist + surface durably from this worker
+                                # thread so it survives the async-gen teardown
+                                # that drops the chunk on turn-end (TASK-292/306
+                                # race). Falls through to `yield item`; the
+                                # async-gen branch dedups via _approval_handled.
+                                _persist_publish_approval(item)
                             if evt == "reasoning":
                                 # Model reasoning ("thinking"). Two destinations,
                                 # both dict-only so it NEVER enters
@@ -2229,6 +2357,12 @@ class ChatStreamingMixin:
                     # reload), remember its id so the turn ends end_reason=
                     # "approval", and fan it out so every tab renders Approve/Deny.
                     req_id = chunk.get("tool_use_id") or ""
+                    if req_id and req_id in _approval_handled:
+                        # Already persisted + surfaced by the worker thread
+                        # (_persist_publish_approval) — the reliable path that
+                        # survives turn-end teardown. Skip to avoid a duplicate
+                        # row/event; the worker is authoritative now.
+                        continue
                     tool_args = chunk.get("arguments") or {}
                     store = getattr(self, "_tool_approval_policy_store", None)
                     log.info(
