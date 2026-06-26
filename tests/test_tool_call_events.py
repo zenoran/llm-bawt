@@ -28,6 +28,7 @@ class _DummyBackend:
         timestamp: float | None = None,
         message_id: str | None = None,
         attachments: list[dict] | None = None,
+        reasoning: str | None = None,
     ) -> str:
         return "db-msg-123"
 

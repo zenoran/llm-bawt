@@ -165,6 +165,56 @@ def _live_tool_call_counts(store: TurnLogStore, turn_ids: list[str]) -> dict[str
     return counts
 
 
+_TAIL_MAX = 1500
+_TAIL_MIN = 200
+
+
+def _response_tail(response_text: str) -> str | None:
+    """Extract the bot's final output from a (potentially long) response.
+
+    Strategy (in priority order):
+    1. If the response is short enough, return it whole.
+    2. Find the last markdown heading (## or #) — the final summary section.
+       If the section is too short (< _TAIL_MIN), include the preceding heading
+       section too so the reader gets enough context.
+    3. Fallback: last _TAIL_MAX chars trimmed to the nearest paragraph break.
+    """
+    if not response_text:
+        return None
+    text = response_text.rstrip()
+    if len(text) <= _TAIL_MAX:
+        return text
+
+    # Strategy 2: find the last markdown heading
+    # Search from the end for lines starting with # or ##
+    lines = text.split("\n")
+    last_heading_idx = -1
+    prev_heading_idx = -1
+    for i in range(len(lines) - 1, -1, -1):
+        stripped = lines[i].lstrip()
+        if stripped.startswith("#"):
+            if last_heading_idx == -1:
+                last_heading_idx = i
+            elif prev_heading_idx == -1:
+                prev_heading_idx = i
+                break
+
+    if last_heading_idx >= 0:
+        section = "\n".join(lines[last_heading_idx:]).strip()
+        # If too short, pull in the previous heading section
+        if len(section) < _TAIL_MIN and prev_heading_idx >= 0:
+            section = "\n".join(lines[prev_heading_idx:]).strip()
+        if section and len(section) <= _TAIL_MAX:
+            return section
+
+    # Strategy 3: fallback — last _TAIL_MAX chars, trimmed to paragraph break
+    tail = text[-_TAIL_MAX:]
+    pp = tail.find("\n\n")
+    if 0 < pp < len(tail) - _TAIL_MIN:
+        tail = tail[pp + 2:]
+    return tail
+
+
 @router.get("/v1/turn-logs", response_model=TurnLogListResponse, tags=["Debug"])
 def list_turn_logs(
     bot_id: str | None = Query(None, description="Filter by bot ID"),
@@ -248,6 +298,7 @@ def list_turn_logs(
                 latency_ms=row.latency_ms,
                 user_prompt=row.user_prompt,
                 response_preview=response_preview,
+                response_tail=_response_tail(response_text),
                 response_chars=len(response_text),
                 response_preview_truncated=bool(response_text and len(response_text) > len(response_preview or "")),
                 tool_call_count=tool_call_count,
@@ -374,6 +425,7 @@ def recent_turns_by_bot(
                 latency_ms=row.latency_ms,
                 user_prompt_preview=user_prompt,
                 response_preview=response_preview,
+                response_tail=_response_tail(response_text),
                 response_chars=len(response_text),
                 response_preview_truncated=bool(
                     response_text and response_preview and len(response_text) > len(response_preview)

@@ -12,6 +12,12 @@ class _StubWsClient:
     def __init__(self) -> None:
         self.history_calls = 0
 
+    def clear_session_cancel(self, session_key: str) -> None:
+        # Real ws_client.clear_session_cancel (ws_client.py:668) resets the
+        # per-session cancel event before a send; the bridge calls it at
+        # bridge.py:237. No-op is sufficient for this test.
+        pass
+
     async def send_and_stream(self, session_key: str, text: str, *, attachments=None):
         yield {
             "type": "event",

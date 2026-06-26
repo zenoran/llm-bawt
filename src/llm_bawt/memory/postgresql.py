@@ -1644,11 +1644,26 @@ class PostgreSQLMemoryBackend(MemoryBackend):
                 logger.error(f"Failed to forget messages: {e}")
                 return 0
     
-    def get_message_by_id(self, message_id: str) -> dict | None:
-        """Get a specific message by its ID.
-        
+    def get_message_by_id(
+        self,
+        message_id: str,
+        before: int = 0,
+        after: int = 0,
+    ) -> dict | None:
+        """Get a specific message by its ID, optionally with surrounding context.
+
         Supports both full UUID and prefix matching (first 8 chars).
-        Returns the message dict or None if not found.
+
+        Args:
+            message_id: Full UUID or prefix (min 8 chars).
+            before: Number of messages to include before the match (by timestamp).
+            after: Number of messages to include after the match (by timestamp).
+
+        Returns:
+            If before/after are both 0: a single message dict or None.
+            If either is > 0: a dict with ``message`` (the matched row),
+            ``before`` (list, oldest-first), and ``after`` (list, oldest-first),
+            or None if the target ID wasn't found.
         """
         with self.engine.connect() as conn:
             try:
@@ -1668,19 +1683,59 @@ class PostgreSQLMemoryBackend(MemoryBackend):
                         WHERE id = :id
                     """)
                     row = conn.execute(select_sql, {"id": message_id}).fetchone()
-                
+
                 if not row:
                     return None
-                
+
+                def _row_to_dict(r):
+                    return {
+                        "id": r.id,
+                        "role": r.role,
+                        "content": r.content,
+                        "timestamp": r.timestamp,
+                        "session_id": r.session_id,
+                        "processed": r.processed,
+                        "created_at": str(r.created_at) if r.created_at else None,
+                        "summary_metadata": r.summary_metadata,
+                    }
+
+                # No surrounding context requested — return single dict (back-compat).
+                if before == 0 and after == 0:
+                    return _row_to_dict(row)
+
+                target_ts = row.timestamp
+                target_id = row.id
+                result_before: list[dict] = []
+                result_after: list[dict] = []
+
+                if before > 0:
+                    before_sql = text(f"""
+                        SELECT id, role, content, timestamp, session_id, processed, created_at, summary_metadata
+                        FROM {self._messages_table_name}
+                        WHERE (timestamp < :ts OR (timestamp = :ts AND id < :tid))
+                          AND role != 'system'
+                        ORDER BY timestamp DESC, id DESC
+                        LIMIT :n
+                    """)
+                    before_rows = conn.execute(before_sql, {"ts": target_ts, "tid": target_id, "n": before}).fetchall()
+                    result_before = [_row_to_dict(r) for r in reversed(before_rows)]
+
+                if after > 0:
+                    after_sql = text(f"""
+                        SELECT id, role, content, timestamp, session_id, processed, created_at, summary_metadata
+                        FROM {self._messages_table_name}
+                        WHERE (timestamp > :ts OR (timestamp = :ts AND id > :tid))
+                          AND role != 'system'
+                        ORDER BY timestamp ASC, id ASC
+                        LIMIT :n
+                    """)
+                    after_rows = conn.execute(after_sql, {"ts": target_ts, "tid": target_id, "n": after}).fetchall()
+                    result_after = [_row_to_dict(r) for r in after_rows]
+
                 return {
-                    "id": row.id,
-                    "role": row.role,
-                    "content": row.content,
-                    "timestamp": row.timestamp,
-                    "session_id": row.session_id,
-                    "processed": row.processed,
-                    "created_at": str(row.created_at) if row.created_at else None,
-                    "summary_metadata": row.summary_metadata,
+                    "before": result_before,
+                    "message": _row_to_dict(row),
+                    "after": result_after,
                 }
             except Exception as e:
                 logger.error(f"Failed to get message {message_id}: {e}")

@@ -501,9 +501,12 @@ class MemoryStorage:
         backend = self._get_backend(bot_id)
         return backend.ignore_messages_since_minutes(minutes)
 
-    async def get_message_by_id(self, bot_id: str = "default", message_id: str = "") -> dict | None:
+    async def get_message_by_id(
+        self, bot_id: str = "default", message_id: str = "",
+        before: int = 0, after: int = 0,
+    ) -> dict | None:
         backend = self._get_backend(bot_id)
-        return backend.get_message_by_id(message_id)
+        return backend.get_message_by_id(message_id, before=before, after=after)
 
     async def ignore_message_by_id(self, bot_id: str = "default", message_id: str = "") -> bool:
         backend = self._get_backend(bot_id)
@@ -997,6 +1000,7 @@ class MemoryStorage:
         sort_by: str = "relevance",
         since: float | None = None,
         until: float | None = None,
+        bot_id: str | None = None,
     ) -> list[dict[str, Any]]:
         """Full-text search across ALL bots' message histories.
 
@@ -1012,6 +1016,8 @@ class MemoryStorage:
           old and the user actually wants the latest match.
         * ``since`` / ``until`` — Unix seconds. Inclusive bounds; either can
           be omitted. Used by the time-range chips (24h / 7d / 30d / all).
+        * ``bot_id`` — restrict to a single bot's history.  Omit to search
+          all bots.
 
         Each returned row also carries a ``total`` field (window COUNT(*)
         over the unbounded result set) so the UI can render "showing N of M
@@ -1029,6 +1035,12 @@ class MemoryStorage:
         tables = self._discover_global_search_tables("_messages")
         if not tables:
             return []
+
+        # Filter to a single bot if requested.
+        if bot_id:
+            tables = [(bid, tbl) for bid, tbl in tables if bid == bot_id]
+            if not tables:
+                return []
 
         # Compose conditional WHERE fragments once. They reference bind
         # params resolved per-execution below.
@@ -1221,12 +1233,19 @@ class MemoryStorage:
         query: str,
         n_results: int = 10,
         min_relevance: float = 0.0,
+        since: float | None = None,
+        until: float | None = None,
+        bot_id: str | None = None,
     ) -> list[dict[str, Any]]:
         """Semantic search across ALL bots' memory stores.
 
         Generates one embedding, runs the existing per-bot search (with
         temporal decay, access boost, diversity sampling), then merges and
         ranks across all sources.
+
+        * ``since`` / ``until`` — Unix seconds.  Post-filters results by
+          ``created_at``.  Either can be omitted.
+        * ``bot_id`` — restrict to a single bot's memory store.
         """
         from llm_bawt.memory.embeddings import generate_embedding
 
@@ -1239,6 +1258,12 @@ class MemoryStorage:
         tables = self._discover_global_search_tables("_memories")
         if not tables:
             return []
+
+        # Filter to a single bot if requested.
+        if bot_id:
+            tables = [(bid, tbl) for bid, tbl in tables if bid == bot_id]
+            if not tables:
+                return []
 
         all_results: list[dict[str, Any]] = []
         for bot_id, _table_name in tables:
@@ -1258,6 +1283,34 @@ class MemoryStorage:
                     all_results.append(r)
             except Exception as e:
                 logger.warning("search_all_memories skipped %s: %s", bot_id, e)
+
+        # Time-range post-filter on created_at (ISO string or Unix float).
+        if since is not None or until is not None:
+            def _to_epoch(val: Any) -> float | None:
+                if val is None:
+                    return None
+                if isinstance(val, (int, float)):
+                    return float(val)
+                try:
+                    from datetime import datetime, timezone
+                    return datetime.fromisoformat(str(val)).replace(
+                        tzinfo=timezone.utc,
+                    ).timestamp()
+                except Exception:
+                    return None
+
+            filtered: list[dict[str, Any]] = []
+            for r in all_results:
+                ts = _to_epoch(r.get("created_at"))
+                if ts is None:
+                    filtered.append(r)  # keep if no timestamp
+                    continue
+                if since is not None and ts < since:
+                    continue
+                if until is not None and ts > until:
+                    continue
+                filtered.append(r)
+            all_results = filtered
 
         # Sort by effective_score (from the backend's scoring) then relevance
         all_results.sort(

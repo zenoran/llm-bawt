@@ -209,6 +209,10 @@ async def search_all_messages(
     query: str,
     n_results: int = 10,
     role_filter: str | None = None,
+    since: float | None = None,
+    until: float | None = None,
+    sort_by: str = "relevance",
+    bot_id: str | None = None,
 ) -> list[dict]:
     """Full-text search across ALL bots' message histories at once.
 
@@ -221,6 +225,12 @@ async def search_all_messages(
         n_results: Maximum total results across all bots.
         role_filter: Only include messages with this role (user/assistant).
                      System messages are always excluded.
+        since: Only include messages at or after this Unix timestamp.
+        until: Only include messages at or before this Unix timestamp.
+        sort_by: "relevance" (default; rank then recency) or "recent"
+                 (recency only, ignores rank).
+        bot_id: Restrict search to a single bot's history (e.g. "snark").
+                Omit to search all bots.
 
     Returns:
         List of message dicts with 'source' (bot_id), role, content,
@@ -232,6 +242,10 @@ async def search_all_messages(
         query=query,
         n_results=n_results,
         role_filter=role_filter,
+        since=since,
+        until=until,
+        sort_by=sort_by,
+        bot_id=bot_id,
     )
 
 
@@ -240,6 +254,9 @@ async def search_all_memories(
     query: str,
     n_results: int = 10,
     min_relevance: float = 0.0,
+    since: float | None = None,
+    until: float | None = None,
+    bot_id: str | None = None,
 ) -> list[dict]:
     """Semantic search across ALL bots' memory stores at once.
 
@@ -250,6 +267,10 @@ async def search_all_memories(
         query: Natural language search query.
         n_results: Maximum total results across all bots.
         min_relevance: Minimum similarity threshold 0-1.
+        since: Only include memories created at or after this Unix timestamp.
+        until: Only include memories created at or before this Unix timestamp.
+        bot_id: Restrict search to a single bot's memory store (e.g. "snark").
+                Omit to search all bots.
 
     Returns:
         List of memory dicts with 'source' (bot_id) and relevance scores.
@@ -260,6 +281,9 @@ async def search_all_memories(
         query=query,
         n_results=n_results,
         min_relevance=min_relevance,
+        since=since,
+        until=until,
+        bot_id=bot_id,
     )
 
 
@@ -540,10 +564,30 @@ async def ignore_messages_since_minutes(bot_id: str = "default", minutes: int = 
 
 
 @mcp.tool(name="messages_get_by_id")
-async def get_message_by_id(bot_id: str = "default", message_id: str = "") -> dict | None:
-    """Get a specific message by ID (supports prefix match)."""
+async def get_message_by_id(
+    bot_id: str = "default",
+    message_id: str = "",
+    before: int = 0,
+    after: int = 0,
+) -> dict | None:
+    """Get a specific message by ID (supports prefix match), with optional
+    surrounding conversation context.
+
+    Args:
+        bot_id: Bot whose history to search.
+        message_id: Full UUID or prefix (min 8 chars).
+        before: Number of messages to include before the match (by timestamp).
+        after: Number of messages to include after the match (by timestamp).
+
+    Returns:
+        If before/after are both 0: a single message dict.
+        If either is > 0: {message, before: [...], after: [...]}.
+        None if not found.
+    """
     storage = _get_storage()
-    return await storage.get_message_by_id(bot_id=bot_id, message_id=message_id)
+    return await storage.get_message_by_id(
+        bot_id=bot_id, message_id=message_id, before=before, after=after,
+    )
 
 
 @mcp.tool(name="messages_ignore_by_id")

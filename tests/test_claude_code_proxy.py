@@ -536,10 +536,14 @@ def test_heartbeat_injects_pings_without_extending_stream() -> None:
 
     from claude_code_bridge.proxy.heartbeat import with_heartbeat
 
+    # Frames must be SSE-boundary-terminated (end in \n\n). The production
+    # heartbeat only injects a ping at a frame boundary (heartbeat.py at_boundary
+    # guard, added in proxy-hardening 9ee174c) so it never splits a partially
+    # delivered SSE event. Real frames from _sse() always end in \n\n.
     async def slow():
-        yield b"A"
+        yield b"A\n\n"
         await asyncio.sleep(0.25)
-        yield b"B"
+        yield b"B\n\n"
 
     async def run():
         out = []
@@ -548,8 +552,8 @@ def test_heartbeat_injects_pings_without_extending_stream() -> None:
         return out
 
     out = asyncio.run(run())
-    reals = [c for c in out if c in (b"A", b"B")]
+    reals = [c for c in out if c in (b"A\n\n", b"B\n\n")]
     pings = [c for c in out if b"ping" in c]
-    assert reals == [b"A", b"B"]
+    assert reals == [b"A\n\n", b"B\n\n"]
     assert len(pings) >= 2
-    assert out[-1] == b"B"  # stream ends on a real frame, never a trailing ping
+    assert out[-1] == b"B\n\n"  # stream ends on a real frame, never a trailing ping

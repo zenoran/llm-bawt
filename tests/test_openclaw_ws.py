@@ -1,18 +1,37 @@
-"""Unit tests for OpenClaw WebSocket client."""
+"""Unit tests for OpenClaw WebSocket client.
+
+These tests target the real production handshake: an Ed25519 device-identity
+challenge/connect flow over the websocket.  On connect the client:
+
+  1. ``recv()``s a ``connect.challenge`` frame and requires ``payload.nonce``.
+  2. Sends a ``{"type":"req","method":"connect",...}`` frame carrying a signed
+     device block and an ``auth`` block (the token lives here, NOT in HTTP
+     headers).
+  3. ``recv()``s a ``{"type":"res","id":<same id>,"ok":true,...}`` frame.
+
+After connect, ``_receive_loop`` iterates the same socket.  ``chat.send`` is
+issued via ``_request`` with camelCase params and tracked in
+``_pending_requests`` keyed by req id; the matching ``res`` frame carries
+``payload.runId``.
+"""
 
 from __future__ import annotations
 
 import asyncio
 import json
-from unittest.mock import AsyncMock, MagicMock, patch
-
-import pytest
+from unittest.mock import AsyncMock, patch
 
 from llm_bawt.integrations.openclaw_ws import OpenClawWsClient, OpenClawWsConfig
 
 
 class _FakeWebSocket:
-    """Mock websocket connection for testing."""
+    """Mock websocket connection for testing.
+
+    ``recv()`` and async iteration share a single cursor so frames consumed
+    during the handshake (via ``recv()``) are not re-delivered to the receive
+    loop (via ``async for``).  Once queued frames are exhausted ``recv()``
+    blocks forever like a real idle socket, and async iteration stops.
+    """
 
     def __init__(self, messages: list[str | dict] | None = None):
         self._messages = [
@@ -22,9 +41,34 @@ class _FakeWebSocket:
         self._sent: list[str] = []
         self._closed = False
         self._idx = 0
+        # Signalled whenever a new frame is queued so a blocked recv()/iter
+        # can wake up; lets tests inject frames after the handshake starts.
+        self._has_frame = asyncio.Event()
+        if self._messages:
+            self._has_frame.set()
+
+    def queue(self, message: str | dict) -> None:
+        """Append a frame for later delivery (e.g. a res echoing a sent id)."""
+        self._messages.append(
+            json.dumps(message) if isinstance(message, dict) else message
+        )
+        self._has_frame.set()
 
     async def send(self, data: str) -> None:
         self._sent.append(data)
+
+    async def _next(self) -> str:
+        # Block (like a real idle, still-open socket) until a frame is
+        # available, then advance the shared cursor.
+        while self._idx >= len(self._messages):
+            self._has_frame.clear()
+            await self._has_frame.wait()
+        msg = self._messages[self._idx]
+        self._idx += 1
+        return msg
+
+    async def recv(self) -> str:
+        return await self._next()
 
     async def close(self) -> None:
         self._closed = True
@@ -33,11 +77,7 @@ class _FakeWebSocket:
         return self
 
     async def __anext__(self):
-        if self._idx >= len(self._messages):
-            raise StopAsyncIteration
-        msg = self._messages[self._idx]
-        self._idx += 1
-        return msg
+        return await self._next()
 
 
 def _make_client(**kwargs) -> OpenClawWsClient:
@@ -50,99 +90,162 @@ def _make_client(**kwargs) -> OpenClawWsClient:
     return OpenClawWsClient(config)
 
 
+def _challenge_frame(nonce: str = "test-nonce-123") -> dict:
+    return {"event": "connect.challenge", "payload": {"nonce": nonce}}
+
+
+def _last_sent_connect_id(ws: _FakeWebSocket) -> str:
+    """Read the req id from the connect frame the client just sent."""
+    assert ws._sent, "client sent no frames"
+    req = json.loads(ws._sent[-1])
+    assert req["type"] == "req"
+    assert req["method"] == "connect"
+    return req["id"]
+
+
+async def _serve_handshake(client: OpenClawWsClient, ws: _FakeWebSocket,
+                           res_payload: dict | None = None) -> None:
+    """Drive a full challenge -> connect -> res handshake against ``ws``.
+
+    The client reads the challenge, sends its connect req, then reads the res.
+    Because ``recv()`` blocks once frames are exhausted, we run ``_do_connect``
+    as a task and queue the ``res`` frame (echoing the client's req id) as soon
+    as the connect frame has been sent.
+    """
+    ws._messages.insert(0, json.dumps(_challenge_frame()))
+    ws._has_frame.set()
+
+    connect_task = asyncio.create_task(client._do_connect())
+
+    # Wait until the client has sent its connect req, then queue the matching
+    # res so its second recv() unblocks.
+    for _ in range(200):
+        if ws._sent:
+            break
+        await asyncio.sleep(0.005)
+    req_id = _last_sent_connect_id(ws)
+    ws.queue({
+        "type": "res",
+        "id": req_id,
+        "ok": True,
+        "payload": res_payload or {},
+    })
+
+    await connect_task
+
+
 class TestOpenClawWsClient:
     def test_connect_and_subscribe(self):
-        """WS handshake + subscribe message sent."""
-        ws = _FakeWebSocket([
-            {"type": "subscribed", "session_keys": ["main"]},
-        ])
+        """Challenge -> connect -> res handshake leaves client connected."""
+        ws = _FakeWebSocket()
 
         async def run():
             client = _make_client()
             with patch("openclaw_bridge.ws_client.websockets") as mock_ws:
                 mock_ws.connect = AsyncMock(return_value=ws)
-                await client._do_connect()
+                await _serve_handshake(client, ws)
 
                 assert client.connected
+                # Subscriptions come straight from config (no subscribe frame).
                 assert "main" in client.subscribed_sessions
 
-                # Verify subscribe message was sent
-                assert len(ws._sent) == 1
-                sub_msg = json.loads(ws._sent[0])
-                assert sub_msg["type"] == "subscribe"
-                assert sub_msg["session_keys"] == ["main"]
+                # The client sent a connect req (not a legacy subscribe frame).
+                connect_reqs = [
+                    json.loads(s) for s in ws._sent
+                    if json.loads(s).get("method") == "connect"
+                ]
+                assert len(connect_reqs) == 1
+                req = connect_reqs[0]
+                assert req["type"] == "req"
+                assert req["params"]["minProtocol"] == 3
+                # No subscribe frames are part of the real protocol.
+                assert all(
+                    json.loads(s).get("type") != "subscribe" for s in ws._sent
+                )
 
                 client._closing = True  # prevent reconnect
 
         asyncio.run(run())
 
     def test_auth_header_sent(self):
-        """Bearer token included in WS headers."""
+        """Token is transmitted in the connect req's auth block (not HTTP)."""
 
         async def run():
             client = _make_client(token="my-secret-token")
+            ws = _FakeWebSocket()
             with patch("openclaw_bridge.ws_client.websockets") as mock_ws:
-                mock_ws.connect = AsyncMock(return_value=_FakeWebSocket())
+                mock_ws.connect = AsyncMock(return_value=ws)
+                await _serve_handshake(client, ws)
 
-                await client._do_connect()
+                # Production no longer passes HTTP auth headers.
+                call = mock_ws.connect.call_args
+                assert "additional_headers" not in call.kwargs
 
-                # Check that connect was called with auth headers
-                call_kwargs = mock_ws.connect.call_args
-                headers = call_kwargs.kwargs.get("additional_headers", {})
-                assert headers.get("Authorization") == "Bearer my-secret-token"
+                # The token must travel inside the signed connect req's auth.
+                req = json.loads(ws._sent[-1])
+                assert req["method"] == "connect"
+                assert req["params"]["auth"]["token"] == "my-secret-token"
 
                 client._closing = True
 
         asyncio.run(run())
 
     def test_send_user_message(self):
-        """Message sent as JSON via WS."""
-        # Pre-load a chat.sent response
-        ws = _FakeWebSocket([
-            {"type": "subscribed", "session_keys": ["main"]},
-        ])
+        """chat.send goes through _request with camelCase params + runId res."""
+        ws = _FakeWebSocket()
 
         async def run():
             client = _make_client()
             with patch("openclaw_bridge.ws_client.websockets") as mock_ws:
                 mock_ws.connect = AsyncMock(return_value=ws)
-                await client._do_connect()
+                await _serve_handshake(client, ws)
+                assert client.connected
 
-                # Simulate sending and receiving confirmation
-                async def send_and_confirm():
-                    # Wait for the send to happen, then inject confirmation
-                    await asyncio.sleep(0.05)
-                    # Find the idempotency_key from sent messages
-                    for msg_str in ws._sent:
-                        msg = json.loads(msg_str)
-                        if msg.get("type") == "chat.send":
-                            idem_key = msg.get("idempotency_key", "")
-                            if idem_key and idem_key in client._pending_sends:
-                                fut = client._pending_sends.pop(idem_key)
-                                if not fut.done():
-                                    fut.set_result("run_xyz")
-                                return
+                # Respond to the chat.send req via the _pending_requests flow:
+                # watch for the sent frame, then resolve its future with a res
+                # frame carrying payload.runId.
+                async def confirm():
+                    for _ in range(200):
+                        for msg_str in ws._sent:
+                            msg = json.loads(msg_str)
+                            if msg.get("method") == "chat.send":
+                                req_id = msg["id"]
+                                fut = client._pending_requests.get(req_id)
+                                if fut and not fut.done():
+                                    fut.set_result({
+                                        "type": "res",
+                                        "id": req_id,
+                                        "ok": True,
+                                        "payload": {"runId": "run_xyz"},
+                                    })
+                                    return
+                        await asyncio.sleep(0.005)
 
-                task = asyncio.create_task(send_and_confirm())
+                task = asyncio.create_task(confirm())
                 run_id = await client.send_user_message("main", "hello")
                 await task
 
                 assert run_id == "run_xyz"
 
-                # Verify the sent message format
-                sent_msgs = [json.loads(s) for s in ws._sent if "chat.send" in s]
-                assert len(sent_msgs) == 1
-                assert sent_msgs[0]["type"] == "chat.send"
-                assert sent_msgs[0]["session_key"] == "main"
-                assert sent_msgs[0]["text"] == "hello"
-                assert "idempotency_key" in sent_msgs[0]
+                # Verify the sent chat.send frame shape (camelCase params).
+                send_frames = [
+                    json.loads(s) for s in ws._sent
+                    if json.loads(s).get("method") == "chat.send"
+                ]
+                assert len(send_frames) == 1
+                req = send_frames[0]
+                assert req["type"] == "req"
+                params = req["params"]
+                assert params["sessionKey"] == "main"
+                assert params["message"] == "hello"
+                assert "idempotencyKey" in params
 
                 client._closing = True
 
         asyncio.run(run())
 
     def test_graceful_disconnect(self):
-        """disconnect() sends close frame."""
+        """disconnect() closes the ws and clears connected state."""
         ws = _FakeWebSocket()
 
         async def run():
@@ -153,24 +256,12 @@ class TestOpenClawWsClient:
 
             assert ws._closed
             assert not client.connected
-            assert len(client.subscribed_sessions) == 0
 
         asyncio.run(run())
 
     def test_event_callback_called(self):
-        """Registered callback receives parsed WS messages."""
-        messages = [
-            {"type": "subscribed", "session_keys": ["main"]},
-            {
-                "type": "event",
-                "session_key": "main",
-                "event_id": "evt_1",
-                "event_type": "response.output_text.delta",
-                "data": {"delta": "hi"},
-            },
-        ]
-        ws = _FakeWebSocket(messages)
-
+        """Trailing event frames reach the registered callback via _receive_loop."""
+        ws = _FakeWebSocket()
         received = []
 
         async def run():
@@ -183,9 +274,21 @@ class TestOpenClawWsClient:
 
             with patch("openclaw_bridge.ws_client.websockets") as mock_ws:
                 mock_ws.connect = AsyncMock(return_value=ws)
-                await client._do_connect()
+                await _serve_handshake(client, ws)
+                assert client.connected
 
-                # Wait for receive loop to process messages
+                # Queue an event frame for the receive loop to deliver.
+                ws.queue({
+                    "type": "event",
+                    "event": "agent",
+                    "payload": {
+                        "sessionKey": "main",
+                        "stream": "assistant",
+                        "data": {"delta": "hi"},
+                    },
+                })
+
+                # Let the receive loop pick up the queued event.
                 await asyncio.sleep(0.1)
 
                 client._closing = True
@@ -198,11 +301,10 @@ class TestOpenClawWsClient:
 
         asyncio.run(run())
 
-        # subscribed ack is not forwarded, but the event is
-        assert len(received) >= 1
+        # The trailing event must have been forwarded to the callback.
         event_msgs = [r for r in received if r.get("type") == "event"]
         assert len(event_msgs) == 1
-        assert event_msgs[0]["event_type"] == "response.output_text.delta"
+        assert event_msgs[0]["event"] == "agent"
 
     def test_empty_url_skips_connect(self):
         """No connection attempted when URL is empty."""

@@ -127,7 +127,17 @@ build-backend = "setuptools.build_meta"
 where = ["src"]
 
 [tool.pytest.ini_options]
+# Collection is scoped to tests/ and live-system tests are excluded by default.
+# A bare `pytest` / `pytest tests/` runs ONLY hermetic unit tests — nothing that
+# touches the live service or real bots. Opt in explicitly to run the gated ones:
+#   uv run pytest -m service        # CLI/integration tests vs a running :8642
+#   uv run pytest -m llm_call       # tests that spend real LLM credits
+# Intentional live smoke tools live OUTSIDE tests/ (e.g. scripts/smoke/) so they
+# are never auto-collected — run them by explicit path only.
+testpaths = ["tests"]
+addopts = "-m 'not service and not llm_call and not integration'"
 markers = [
     "service: requires the llm-bawt service running at :8642",
     "llm_call: makes real LLM API calls (slow, uses API credits)",
+    "integration: shells out to real CLI entrypoints / live DB — not hermetic",
 ]

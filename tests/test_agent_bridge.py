@@ -32,12 +32,13 @@ class TestEventIngestPipeline:
         self.pipeline = EventIngestPipeline()
 
     def test_event_ingest_maps_delta(self):
+        # Real gateway schema: event:"agent" + payload.stream:"assistant".
         raw = {
             "type": "event",
             "session_key": "main",
             "event_id": "evt_001",
-            "event_type": "response.output_text.delta",
-            "data": {"delta": "Hello "},
+            "event": "agent",
+            "payload": {"stream": "assistant", "data": {"delta": "Hello "}},
         }
         event = self.pipeline.parse(raw, "main")
         assert event is not None
@@ -47,17 +48,19 @@ class TestEventIngestPipeline:
         assert event.session_key == "main"
 
     def test_event_ingest_maps_tool_start(self):
+        # Real gateway schema: payload.stream:"tool", data.phase:"start".
         raw = {
             "type": "event",
             "session_key": "main",
             "event_id": "evt_002",
-            "event_type": "response.output_item.added",
-            "data": {
-                "item": {
-                    "type": "function_call",
+            "event": "agent",
+            "payload": {
+                "stream": "tool",
+                "data": {
+                    "phase": "start",
                     "name": "exec",
                     "arguments": {"command": "ls -la"},
-                }
+                },
             },
         }
         event = self.pipeline.parse(raw, "main")
@@ -67,17 +70,20 @@ class TestEventIngestPipeline:
         assert event.tool_arguments == {"command": "ls -la"}
 
     def test_event_ingest_maps_tool_end(self):
+        # Real gateway schema: payload.stream:"tool", data.phase:"end",
+        # tool output carried as data.output.
         raw = {
             "type": "event",
             "session_key": "main",
             "event_id": "evt_003",
-            "event_type": "response.output_item.added",
-            "data": {
-                "item": {
-                    "type": "function_call_output",
+            "event": "agent",
+            "payload": {
+                "stream": "tool",
+                "data": {
+                    "phase": "end",
                     "name": "exec",
                     "output": "file1.txt\nfile2.txt",
-                }
+                },
             },
         }
         event = self.pipeline.parse(raw, "main")
@@ -87,26 +93,31 @@ class TestEventIngestPipeline:
         assert event.tool_result == "file1.txt\nfile2.txt"
 
     def test_event_ingest_maps_run_started(self):
+        # Real gateway schema: payload.stream:"lifecycle", data.phase:"start",
+        # run id from payload.runId. Lifecycle frames carry NO model field, so
+        # production leaves event.model as None.
         raw = {
             "type": "event",
             "session_key": "main",
             "event_id": "evt_004",
-            "event_type": "response.created",
-            "data": {"response": {"id": "run_xyz", "model": "gpt-5"}},
+            "event": "agent",
+            "payload": {"stream": "lifecycle", "data": {"phase": "start"}, "runId": "run_xyz"},
         }
         event = self.pipeline.parse(raw, "main")
         assert event is not None
         assert event.kind == AgentEventKind.RUN_STARTED
         assert event.run_id == "run_xyz"
-        assert event.model == "gpt-5"
+        # Lifecycle start carries no model in the real contract.
+        assert event.model is None
 
     def test_event_ingest_maps_run_completed(self):
+        # Real gateway schema: payload.stream:"lifecycle", data.phase:"end".
         raw = {
             "type": "event",
             "session_key": "main",
             "event_id": "evt_005",
-            "event_type": "response.completed",
-            "data": {"response": {"id": "run_xyz", "model": "gpt-5"}},
+            "event": "agent",
+            "payload": {"stream": "lifecycle", "data": {"phase": "end"}, "runId": "run_xyz"},
         }
         event = self.pipeline.parse(raw, "main")
         assert event is not None
@@ -120,17 +131,26 @@ class TestEventIngestPipeline:
             assert event is None, f"Expected None for {msg_type}"
 
     def test_event_ingest_drops_subscribe_acks(self):
+        # CONTRACT: production does NOT drop subscribe acks. "subscribed" is not
+        # in IngestFilterConfig.drop_msg_types ({"ping","pong","heartbeat"}), and
+        # it isn't an "event"/"chat.sent"/"req"/"res" frame, so it falls through
+        # to the unknown-frame fallback -> SYSTEM_NOTE (ingest.py ~line 244).
+        # ALTERNATIVE: add "subscribed" to drop_msg_types so it returns None — a
+        # one-line src change, deferred here because we may not edit production.
         raw = {"type": "subscribed", "session_keys": ["main"]}
         event = self.pipeline.parse(raw, "main")
-        assert event is None
+        assert event is not None
+        assert event.kind == AgentEventKind.SYSTEM_NOTE
 
     def test_event_ingest_unknown_event_passthrough(self):
+        # An "event" frame whose event name is neither "agent" nor "chat" and is
+        # not in drop_event_names falls through to SYSTEM_NOTE (ingest.py ~213).
         raw = {
             "type": "event",
             "session_key": "main",
             "event_id": "evt_006",
-            "event_type": "some.unknown.type",
-            "data": {"foo": "bar"},
+            "event": "some.unknown.type",
+            "payload": {"foo": "bar"},
         }
         event = self.pipeline.parse(raw, "main")
         assert event is not None
@@ -150,38 +170,48 @@ class TestEventIngestPipeline:
         assert event.run_id == "run_abc"
 
     def test_event_ingest_error_event(self):
+        # Real gateway schema: payload.stream:"error". Production sets
+        # text = json.dumps(data), so assert the message via substring rather
+        # than equality to the bare message string.
         raw = {
             "type": "event",
             "session_key": "main",
             "event_id": "evt_err",
-            "event_type": "error",
-            "data": {"message": "something went wrong"},
+            "event": "agent",
+            "payload": {"stream": "error", "data": {"message": "something went wrong"}},
         }
         event = self.pipeline.parse(raw, "main")
         assert event is not None
         assert event.kind == AgentEventKind.ERROR
-        assert event.text == "something went wrong"
+        assert "something went wrong" in event.text
+        assert json.loads(event.text) == {"message": "something went wrong"}
 
     def test_event_ingest_chat_message_user(self):
+        # Real contract: a user message arrives as a top-level "chat.sent" frame
+        # (NOT an event:"chat" frame — those are state-keyed and map to
+        # ASSISTANT_DONE/None by state, never by role). chat.sent -> USER_MESSAGE
+        # with origin "user" (ingest.py ~224).
         raw = {
-            "type": "event",
+            "type": "chat.sent",
             "session_key": "main",
             "event_id": "evt_msg",
-            "event_type": "chat.message",
-            "data": {"role": "user", "content": "hello"},
+            "message": {"role": "user", "content": "hello"},
         }
         event = self.pipeline.parse(raw, "main")
         assert event is not None
         assert event.kind == AgentEventKind.USER_MESSAGE
+        assert event.origin == "user"
         assert event.text == "hello"
 
     def test_event_ingest_chat_message_assistant(self):
+        # Real contract: event:"chat" with state:"final" -> ASSISTANT_DONE,
+        # text extracted from payload.message.content (ingest.py ~191).
         raw = {
             "type": "event",
             "session_key": "main",
             "event_id": "evt_msg2",
-            "event_type": "message",
-            "data": {"role": "assistant", "content": "Hi there!"},
+            "event": "chat",
+            "payload": {"state": "final", "message": {"role": "assistant", "content": "Hi there!"}},
         }
         event = self.pipeline.parse(raw, "main")
         assert event is not None
@@ -189,37 +219,45 @@ class TestEventIngestPipeline:
         assert event.text == "Hi there!"
 
     def test_event_ingest_seq_preserved(self):
+        # seq is read from payload.seq (int) first, falling back to raw.seq.
         raw = {
             "type": "event",
             "session_key": "main",
             "event_id": "evt_seq",
-            "seq": 42,
-            "event_type": "response.output_text.delta",
-            "data": {"delta": "x"},
+            "event": "agent",
+            "payload": {"stream": "assistant", "seq": 42, "data": {"delta": "x"}},
         }
         event = self.pipeline.parse(raw, "main")
         assert event is not None
         assert event.seq == 42
 
-    def test_event_ingest_tool_args_string_parsed(self):
-        """Tool arguments provided as JSON string should be parsed."""
+    def test_event_ingest_tool_args_string_passthrough(self):
+        """CONTRACT: tool `arguments` are passed through VERBATIM.
+
+        Production (ingest.py ~151) does `data.get("arguments")` with no
+        json.loads — so a string arg stays a string; auto-parse is NOT
+        implemented. ALTERNATIVE: json.loads string args in the tool-start
+        branch so consumers always see a dict; deferred (production change).
+        """
         raw = {
             "type": "event",
             "session_key": "main",
             "event_id": "evt_tc",
-            "event_type": "response.output_item.added",
-            "data": {
-                "item": {
-                    "type": "tool_call",
+            "event": "agent",
+            "payload": {
+                "stream": "tool",
+                "data": {
+                    "phase": "start",
                     "name": "search",
                     "arguments": '{"query": "test"}',
-                }
+                },
             },
         }
         event = self.pipeline.parse(raw, "main")
         assert event is not None
         assert event.kind == AgentEventKind.TOOL_START
-        assert event.tool_arguments == {"query": "test"}
+        # Verbatim pass-through: still the raw JSON string, NOT a parsed dict.
+        assert event.tool_arguments == '{"query": "test"}'
 
     def test_synthesize_event_id_deterministic(self):
         id1 = synthesize_event_id("main", "delta", {"text": "hi"}, 1)
@@ -530,32 +568,33 @@ class TestSessionBridge:
         fanout.broadcast = track_broadcast
 
         async def run():
-            # Simulate run lifecycle
+            # Simulate run lifecycle using the real gateway agent schema.
             await bridge._on_raw_event({
                 "type": "event", "session_key": "main", "event_id": "evt_1",
-                "event_type": "response.created",
-                "data": {"response": {"id": "run_1", "model": "gpt-5"}},
+                "event": "agent",
+                "payload": {"stream": "lifecycle", "data": {"phase": "start"}, "runId": "run_1"},
             })
             await bridge._on_raw_event({
                 "type": "event", "session_key": "main", "event_id": "evt_2",
-                "event_type": "response.output_text.delta",
-                "data": {"delta": "Hello "},
+                "event": "agent",
+                "payload": {"stream": "assistant", "runId": "run_1", "data": {"delta": "Hello "}},
             })
             await bridge._on_raw_event({
                 "type": "event", "session_key": "main", "event_id": "evt_3",
-                "event_type": "response.output_text.delta",
-                "data": {"delta": "world"},
+                "event": "agent",
+                "payload": {"stream": "assistant", "runId": "run_1", "data": {"delta": "world"}},
             })
             await bridge._on_raw_event({
                 "type": "event", "session_key": "main", "event_id": "evt_4",
-                "event_type": "response.completed",
-                "data": {"response": {"id": "run_1"}},
+                "event": "agent",
+                "payload": {"stream": "lifecycle", "data": {"phase": "end"}, "runId": "run_1"},
             })
 
         asyncio.run(run())
 
-        # Verify run was created and completed
-        store.create_run.assert_called_once_with("run_1", "main", "gpt-5", "system")
+        # Verify run was created and completed. Lifecycle start carries no model,
+        # so production passes model=None; origin is "system".
+        store.create_run.assert_called_once_with("run_1", "main", None, "system")
         store.complete_run.assert_called_once()
         call_args = store.complete_run.call_args
         assert call_args[0][0] == "run_1"
@@ -588,8 +627,8 @@ class TestSessionBridge:
         async def run():
             await bridge._on_raw_event({
                 "type": "event", "session_key": "main", "event_id": "evt_bg",
-                "event_type": "response.output_text.delta",
-                "data": {"delta": "background message"},
+                "event": "agent",
+                "payload": {"stream": "assistant", "data": {"delta": "background message"}},
             })
 
         asyncio.run(run())
@@ -622,8 +661,8 @@ class TestSessionBridge:
         async def run():
             await bridge._on_raw_event({
                 "type": "event", "session_key": "main", "event_id": "evt_dup",
-                "event_type": "response.output_text.delta",
-                "data": {"delta": "dup"},
+                "event": "agent",
+                "payload": {"stream": "assistant", "data": {"delta": "dup"}},
             })
 
         asyncio.run(run())
@@ -656,28 +695,33 @@ class TestSessionBridge:
             # Run started
             await bridge._on_raw_event({
                 "type": "event", "session_key": "main", "event_id": "evt_t1",
-                "event_type": "response.created",
-                "data": {"response": {"id": "run_tools"}},
+                "event": "agent",
+                "payload": {"stream": "lifecycle", "data": {"phase": "start"}, "runId": "run_tools"},
             })
-            # Tool call
+            # Tool call (start). runId required so the bridge buckets the call
+            # under the active run's tool-call list.
             await bridge._on_raw_event({
                 "type": "event", "session_key": "main", "event_id": "evt_t2",
-                "event_type": "response.output_item.added",
-                "run_id": "run_tools",
-                "data": {"item": {"type": "function_call", "name": "exec", "arguments": {"command": "ls"}}},
+                "event": "agent",
+                "payload": {
+                    "stream": "tool", "runId": "run_tools",
+                    "data": {"phase": "start", "name": "exec", "arguments": {"command": "ls"}},
+                },
             })
-            # Tool result
+            # Tool result (end)
             await bridge._on_raw_event({
                 "type": "event", "session_key": "main", "event_id": "evt_t3",
-                "event_type": "response.output_item.added",
-                "run_id": "run_tools",
-                "data": {"item": {"type": "function_call_output", "name": "exec", "output": "file.txt"}},
+                "event": "agent",
+                "payload": {
+                    "stream": "tool", "runId": "run_tools",
+                    "data": {"phase": "end", "name": "exec", "output": "file.txt"},
+                },
             })
             # Run completed
             await bridge._on_raw_event({
                 "type": "event", "session_key": "main", "event_id": "evt_t4",
-                "event_type": "response.completed",
-                "data": {"response": {"id": "run_tools"}},
+                "event": "agent",
+                "payload": {"stream": "lifecycle", "data": {"phase": "end"}, "runId": "run_tools"},
             })
 
         asyncio.run(run())

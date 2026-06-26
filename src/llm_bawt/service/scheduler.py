@@ -488,16 +488,9 @@ class JobScheduler:
             if callable(resolve_model):
                 model_alias, _ = resolve_model(
                     preferred_model,
-                    bot_id="nova",
+                    bot_id=bot_id,
                     local_mode=False,
                 )
-
-            max_context_tokens = 0
-            if model_alias:
-                ctx_window = int(config.get_model_context_window(model_alias) or 0)
-                max_output = int(config.get_model_max_tokens(model_alias) or 4096)
-                if ctx_window > 0:
-                    max_context_tokens = ctx_window - max_output
 
             bot_manager = BotManager(config)
             bot_obj = bot_manager.get_bot(bot_id) or bot_manager.get_default_bot()
@@ -506,6 +499,29 @@ class JobScheduler:
                 bot=bot_obj,
                 bot_id=bot_id,
             )
+
+            # Budget MUST mirror _process_history_summarization exactly: the
+            # summarization TRIGGER budget (default 12000), NOT the model context
+            # window.  Deriving it from the model window made this probe ~10x more
+            # lenient than execution, so any bot whose unsummarized backlog sat
+            # between the trigger and the model window reported "0 pending" and was
+            # skipped every cycle (backlog starvation).
+            trigger_tokens = int(
+                resolver.resolve(
+                    "summarization_trigger_tokens",
+                    getattr(config, "SUMMARIZATION_TRIGGER_TOKENS", 12000),
+                )
+                or 0
+            )
+            if trigger_tokens > 0:
+                max_context_tokens = trigger_tokens
+            else:
+                max_context_tokens = 0
+                if model_alias:
+                    ctx_window = int(config.get_model_context_window(model_alias) or 0)
+                    max_output = int(config.get_model_max_tokens(model_alias) or 4096)
+                    if ctx_window > 0:
+                        max_context_tokens = ctx_window - max_output
 
             summarizer = HistorySummarizer(
                 config,

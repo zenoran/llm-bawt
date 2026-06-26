@@ -53,7 +53,9 @@ def test_finalize_turn_saves_history() -> None:
         stream=False,
     )
 
-    llm_bawt.finalize_response.assert_called_once_with("hello world", "")
+    llm_bawt.finalize_response.assert_called_once_with(
+        "hello world", "", attachments=None, reasoning=None
+    )
     service._update_turn_log.assert_called_once()
     kwargs = service._update_turn_log.call_args.kwargs
     assert kwargs["turn_id"] == "turn-1"

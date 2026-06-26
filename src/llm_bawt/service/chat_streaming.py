@@ -2351,158 +2351,32 @@ class ChatStreamingMixin:
                     continue
 
                 if isinstance(chunk, dict) and chunk.get("event") == "approval_required":
-                    # TASK-292 — an approval-gated tool policy matched. The bridge
-                    # denied the call and is ending the turn cleanly. Persist the
-                    # request (durable audit + lets the UI hydrate the card on
-                    # reload), remember its id so the turn ends end_reason=
-                    # "approval", and fan it out so every tab renders Approve/Deny.
+                    # TASK-292/306 — approval persistence + surfacing is owned
+                    # ENTIRELY by the streaming worker thread
+                    # (_persist_publish_approval). That path is the single source
+                    # of truth: it commit-confirms the durable row (bounded retry),
+                    # fails closed + informed on a confirmed write failure, and
+                    # publishes the live event — all from a thread that runs to
+                    # completion regardless of client/SSE teardown. By the time an
+                    # approval_required chunk reaches this async generator the
+                    # worker has already handled it, so this branch is a pure
+                    # dedup skip. (Previously this branch carried a second, full
+                    # copy of the persist/retry/emit logic — deleted: duplicated
+                    # persistence is exactly the failure mode TASK-306 set out to
+                    # remove.)
                     req_id = chunk.get("tool_use_id") or ""
-                    if req_id and req_id in _approval_handled:
-                        # Already persisted + surfaced by the worker thread
-                        # (_persist_publish_approval) — the reliable path that
-                        # survives turn-end teardown. Skip to avoid a duplicate
-                        # row/event; the worker is authoritative now.
+                    if not req_id or req_id in _approval_handled:
                         continue
-                    tool_args = chunk.get("arguments") or {}
-                    store = getattr(self, "_tool_approval_policy_store", None)
-                    log.info(
-                        "DEBUG-292 chat_streaming: approval_required chunk reached "
-                        "req_id=%s store=%s engine=%s",
-                        req_id, store is not None,
-                        getattr(store, "engine", None) is not None,
+                    # Reaching here means the chunk bypassed _intercept_tool_events
+                    # (a wiring bug) — the worker is wired unconditionally for every
+                    # backend, so this should never happen. Log loudly rather than
+                    # silently re-implementing persistence a second time.
+                    log.error(
+                        "approval_required reached async-gen UNHANDLED id=%s — "
+                        "worker thread never persisted it; check "
+                        "_intercept_tool_events wiring",
+                        req_id,
                     )
-                    # TASK-306 Section A: the approval row is the durable floor.
-                    # Confirm the commit (bounded retry) BEFORE we surface an
-                    # Approve/Deny card. A normal card backed by no persisted row
-                    # would be a lie: a refresh could not hydrate it and resolve
-                    # would 404. So on a confirmed-failed commit we fail closed +
-                    # informed instead of pretending the gate reached the user.
-                    persist_failure: dict | None = None
-                    if req_id and store is not None:
-                        committed = False
-                        last_err: Exception | None = None
-                        for _attempt in range(_APPROVAL_PERSIST_MAX_ATTEMPTS):
-                            try:
-                                store.record_request(
-                                    request_id=req_id,
-                                    bot_id=bot_id,
-                                    user_id=user_id,
-                                    turn_id=turn_log_id,
-                                    backend=chunk.get("provider") or "claude-code",
-                                    tool_name=chunk.get("tool_name") or "",
-                                    tool_arguments=tool_args if isinstance(tool_args, dict) else {"value": tool_args},
-                                    subject=chunk.get("subject") or "",
-                                    grant_key=chunk.get("grant_key") or "",
-                                    policy_id=chunk.get("policy_id"),
-                                    severity=chunk.get("severity") or "medium",
-                                    prompt=chunk.get("prompt") or "",
-                                    trigger_message_id=trigger_message_id,
-                                    session_key=chunk.get("session_key") or None,
-                                )
-                                committed = True
-                                break
-                            except ApprovalPersistError as _persist_err:
-                                last_err = _persist_err
-                                log.warning(
-                                    "approval persist attempt %d/%d failed id=%s: %s",
-                                    _attempt + 1, _APPROVAL_PERSIST_MAX_ATTEMPTS,
-                                    req_id, _persist_err,
-                                )
-                                if _attempt + 1 < _APPROVAL_PERSIST_MAX_ATTEMPTS:
-                                    await asyncio.sleep(_APPROVAL_PERSIST_BACKOFF_S * (_attempt + 1))
-                        if committed:
-                            approval_id_holder[0] = req_id
-                        else:
-                            persist_failure = {
-                                "kind": "side_effect_failed",
-                                "effect": "approval_request_persist",
-                                "request_id": req_id,
-                                "tool_name": chunk.get("tool_name") or "",
-                                "reachable_to_user": False,
-                                "error_class": type(last_err).__name__ if last_err else "ApprovalPersistError",
-                                "detail": str(last_err) if last_err else "unknown",
-                                "attempts": _APPROVAL_PERSIST_MAX_ATTEMPTS,
-                            }
-                    elif req_id and store is None:
-                        # No approval store configured at all — still an honest
-                        # failure, not a silent skip (TASK-306).
-                        persist_failure = {
-                            "kind": "side_effect_failed",
-                            "effect": "approval_request_persist",
-                            "request_id": req_id,
-                            "tool_name": chunk.get("tool_name") or "",
-                            "reachable_to_user": False,
-                            "error_class": "NoApprovalStore",
-                            "detail": "approval policy store is not configured on this service",
-                            "attempts": 0,
-                        }
-
-                    if persist_failure is None:
-                        approval_payload = {
-                            "object": "tool.approval_required",
-                            "request_id": req_id,
-                            "tool_name": chunk.get("tool_name", ""),
-                            "arguments": tool_args,
-                            "subject": chunk.get("subject", ""),
-                            "prompt": chunk.get("prompt", ""),
-                            "severity": chunk.get("severity", "medium"),
-                            "policy_id": chunk.get("policy_id"),
-                            "session_key": chunk.get("session_key", ""),
-                            "provider": chunk.get("provider", ""),
-                            "trigger_message_id": chunk.get("trigger_message_id"),
-                            "bot_id": bot_id,
-                            "turn_id": turn_log_id,
-                        }
-                        yield (f"data: {json.dumps(approval_payload)}\n\n")
-                        await _publish_unified({
-                            "_type": "tool_approval_required",
-                            "turn_id": turn_log_id,
-                            "trigger_message_id": trigger_message_id,
-                            "bot_id": bot_id,
-                            "user_id": user_id,
-                            "request_id": req_id,
-                            "tool_name": chunk.get("tool_name", ""),
-                            "arguments": tool_args,
-                            "subject": chunk.get("subject", ""),
-                            "prompt": chunk.get("prompt", ""),
-                            "severity": chunk.get("severity", "medium"),
-                            "policy_id": chunk.get("policy_id"),
-                            "session_key": chunk.get("session_key", ""),
-                            "provider": chunk.get("provider", ""),
-                            "ts": time.time(),
-                        })
-                    else:
-                        # Fail closed + informed: tell the user the truth instead
-                        # of showing a phantom card or claiming success.
-                        approval_persist_failed_holder[0] = persist_failure
-                        log.error(
-                            "approval persist FAILED id=%s tool=%s — gate will NOT "
-                            "reach user; action did not proceed: %s",
-                            req_id, persist_failure["tool_name"], persist_failure["detail"],
-                        )
-                        fail_payload = {
-                            "object": "tool.approval_persist_failed",
-                            "request_id": req_id,
-                            "tool_name": persist_failure["tool_name"],
-                            "detail": persist_failure["detail"],
-                            "message": (
-                                "An approval was required for this tool but could "
-                                "not be recorded, so it will not reach you. The "
-                                "action did not proceed."
-                            ),
-                        }
-                        yield (f"data: {json.dumps(fail_payload)}\n\n")
-                        await _publish_unified({
-                            "_type": "tool_approval_persist_failed",
-                            "turn_id": turn_log_id,
-                            "trigger_message_id": trigger_message_id,
-                            "bot_id": bot_id,
-                            "user_id": user_id,
-                            "request_id": req_id,
-                            "tool_name": persist_failure["tool_name"],
-                            "detail": persist_failure["detail"],
-                            "ts": time.time(),
-                        })
                     continue
 
                 if isinstance(chunk, dict) and chunk.get("event") == "tool_preapproved":

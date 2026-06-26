@@ -19,6 +19,14 @@ import urllib.request
 
 import pytest
 
+# Every test in this module shells out to the real installed CLI entrypoints
+# via subprocess, and many reach the live Postgres DB (bot registry, memory
+# stats) or the running service at :8642. None of it is hermetic, so the whole
+# module is marked `integration` and excluded from the default `pytest` run.
+# Run it explicitly with `uv run pytest -m integration`. Per-test `service` /
+# `llm_call` marks still apply for finer slicing.
+pytestmark = pytest.mark.integration
+
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------

@@ -157,6 +157,83 @@ class TestJobActivityGates:
         assert should_run is True
         assert reason == "New conversation activity detected"
 
+    def test_pending_probe_uses_trigger_budget_not_model_window(self, monkeypatch):
+        """Regression: the pending-summary probe must size its eligibility budget
+        from the summarization TRIGGER (default 12000), mirroring
+        _process_history_summarization — NOT the model context window.
+
+        Deriving the budget from the model window made this probe ~10x more
+        lenient than execution, so any bot whose unsummarized backlog sat between
+        the trigger and the window reported "0 pending" and was skipped every
+        cycle (backlog starvation). Also pins the per-bot model resolution to the
+        real bot_id rather than the previously hardcoded "nova".
+        """
+        import llm_bawt.bots as bots_mod
+        import llm_bawt.memory.summarization as summ_mod
+        from llm_bawt.service import scheduler as sched_mod
+
+        captured: dict = {}
+
+        class _Config:
+            MAINTENANCE_MODEL = "grok-4-fast"
+            SUMMARIZATION_MODEL = ""
+            EXTRACTION_MODEL = ""
+            SUMMARIZATION_TRIGGER_TOKENS = 12000
+
+            def get_model_context_window(self, _alias=None):
+                return 128000  # model window — must NOT be used as the budget
+
+            def get_model_max_tokens(self, _alias=None):
+                return 4096
+
+        class _TaskProc:
+            config = _Config()
+
+            def _resolve_request_model(self, _preferred, bot_id=None, local_mode=False):
+                return ("grok-4-fast", None)
+
+        class _Bot:
+            pass
+
+        class _BotManager:
+            def __init__(self, _config):
+                pass
+
+            def get_bot(self, _bot_id):
+                return _Bot()
+
+            def get_default_bot(self):
+                return _Bot()
+
+        class _Resolver:
+            def __init__(self, **_kwargs):
+                pass
+
+            def resolve(self, _key, fallback):
+                return fallback  # summarization_trigger_tokens -> 12000
+
+        class _Summarizer:
+            def __init__(self, _config, bot_id=None, settings_getter=None, max_context_tokens=0):
+                captured["max_context_tokens"] = max_context_tokens
+                captured["bot_id"] = bot_id
+
+            def preview_summarizable_sessions(self):
+                return ["session-a", "session-b"]
+
+        monkeypatch.setattr(bots_mod, "BotManager", _BotManager)
+        monkeypatch.setattr(summ_mod, "HistorySummarizer", _Summarizer)
+        monkeypatch.setattr(sched_mod, "RuntimeSettingsResolver", _Resolver)
+
+        scheduler = JobScheduler(engine=None, task_processor=_TaskProc())
+        has_pending, count = scheduler._has_pending_history_summaries("loopy", {})
+
+        # Budget is the trigger (12000), NOT the model window (128000 - 4096).
+        assert captured["max_context_tokens"] == 12000
+        # Model resolution uses the real bot, not the hardcoded "nova".
+        assert captured["bot_id"] == "loopy"
+        assert has_pending is True
+        assert count == 2
+
     def test_profile_maintenance_skips_without_profile_changes(self):
         scheduler = JobScheduler(engine=None, task_processor=None)
         last_run = datetime.utcnow()
