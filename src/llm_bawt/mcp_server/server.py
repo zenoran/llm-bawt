@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import logging
 import os
+import uuid
 from typing import TYPE_CHECKING
 
 # Suppress noisy MCP library session lifecycle logging
@@ -998,6 +999,11 @@ async def send_message_to_bot(
     if sender_bot_id != "unknown":
         formatted_message = f"Message from bot '{sender_bot_id}': {message}"
 
+    # TASK-303: Generate a stable user-message id so the turn log
+    # and persisted message share the same identity — prevents
+    # duplicate bubbles in the frontend.
+    user_message_id = str(uuid.uuid4())
+
     payload = {
         "messages": [
             {
@@ -1006,6 +1012,7 @@ async def send_message_to_bot(
             }
         ],
         "bot_id": target_bot_id,
+        "user_message_id": user_message_id,
         "max_tokens": max_tokens,
         "temperature": temperature,
         # Don't extract memory from inter-bot conversations by default

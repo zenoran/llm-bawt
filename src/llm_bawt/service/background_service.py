@@ -270,6 +270,11 @@ class BackgroundService(
             cancel_event, done_event = await self._start_generation(bot_id)
         turn_log_id = f"turn-{uuid.uuid4().hex}"
 
+        # TASK-303: Extract or generate a stable user-message id so the
+        # persisted user message and the turn log share the same identity.
+        # This mirrors the streaming path (chat_streaming.py:814).
+        trigger_message_id = getattr(request, "user_message_id", None) or str(uuid.uuid4())
+
         # Persist turn log immediately so the user's prompt is recorded
         # even if the backend times out or errors before responding.
         self._persist_turn_log(
@@ -285,6 +290,7 @@ class BackgroundService(
             user_prompt=user_prompt,
             prepared_messages=[],
             response_text="",
+            trigger_message_id=trigger_message_id,
         )
 
         try:
@@ -308,7 +314,7 @@ class BackgroundService(
                 llm_bawt._inject_user_prefix = bool(request.inject_user_prefix)
 
                 # Prepare messages with history and memory context
-                prepared_messages = llm_bawt.prepare_messages_for_query(user_prompt)
+                prepared_messages = llm_bawt.prepare_messages_for_query(user_prompt, message_id=trigger_message_id)
 
                 # Log what we're sending to the LLM (verbose mode)
                 log.llm_context(prepared_messages)
