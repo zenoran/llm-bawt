@@ -271,7 +271,8 @@ class ServiceLLMBawt(BaseLLMBawt):
             # bridge package.  Instead we hand back an AgentBackendClient
             # routed to the "local" backend.  The TOP-LEVEL type must be
             # "agent_backend" so the executor/streaming branches treat it as a
-            # remote bridge call (not the in-process _llm_executor path).  The
+            # remote bridge call (in-process GPU inference no longer exists; it
+            # moved to local_model_bridge in TASK-276/278).  The
             # original local fields are preserved nested under
             # ``local_model_definition`` so the bridge can still resolve them;
             # the bridge ALSO re-resolves the alias against /v1/models, so this

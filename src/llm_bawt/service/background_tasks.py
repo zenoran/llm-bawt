@@ -191,11 +191,11 @@ class BackgroundTasksMixin:
         service = ProfileMaintenanceService(profile_manager, llm_client)
 
         loop = asyncio.get_event_loop()
-        # Remote API call (grok/openai background client) — run on the default
-        # thread pool, NOT self._llm_executor. That single-thread executor exists
-        # only to serialize local CUDA/llama-cpp work; a slow remote call holding
-        # it blocks all local-model work and the memory pipeline (caused the caid
-        # stall on 2026-06-15). See TASK-274.
+        # Remote API call (grok/openai background client) — run on the bounded
+        # background pool, never on the default pool that interactive turns use,
+        # so a slow remote maintenance call can't starve chat (caused the caid
+        # stall on 2026-06-15). See TASK-274/TASK-283. (Local CUDA/llama-cpp
+        # inference moved out of process to local_model_bridge, TASK-276/278.)
         result = await loop.run_in_executor(
             self._bg_executor,
             lambda: service.run(entity_id, entity_type, dry_run)
@@ -516,7 +516,8 @@ class BackgroundTasksMixin:
         )
 
         loop = asyncio.get_event_loop()
-        # Remote API call — bounded bg pool (TASK-283), not _llm_executor (TASK-274).
+        # Remote API call — bounded bg pool (TASK-283), kept off the default
+        # interactive pool (TASK-274).
         result = await loop.run_in_executor(
             self._bg_executor,
             lambda: summarizer.summarize_eligible_sessions(
@@ -637,7 +638,8 @@ class BackgroundTasksMixin:
 
         if conversation:
             try:
-                # Remote API call — bounded bg pool (TASK-283), not _llm_executor (TASK-274).
+                # Remote API call — bounded bg pool (TASK-283), kept off the
+                # default interactive pool (TASK-274).
                 facts = await loop.run_in_executor(
                     self._bg_executor,
                     lambda: extraction_service.extract_from_conversation(

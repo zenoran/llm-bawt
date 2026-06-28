@@ -19,7 +19,7 @@ from urllib.parse import urlparse
 from ..bots import get_bot, strip_emotes
 from ..utils.config import Config
 from .background_tasks import BackgroundTasksMixin
-from .chat_streaming import ChatStreamingMixin, _LOCAL_GPU_MODEL_TYPES
+from .chat_streaming import ChatStreamingMixin
 from .instance_manager import InstanceManagerMixin
 from .logging import RequestContext, generate_request_id, get_service_logger
 from .schemas import (
@@ -119,23 +119,16 @@ class BackgroundService(
         # when different bot contexts need the same underlying model
         self._client_cache: dict[str, Any] = {}
 
-        # Lock to serialize LLM calls - prevents CUDA crashes from concurrent access
-        # llama-cpp-python is NOT thread-safe for concurrent inference
-        self._llm_lock = asyncio.Lock()
-
-        # Single-threaded executor for LLM calls - ensures only one runs at a time
-        from concurrent.futures import ThreadPoolExecutor
-        self._llm_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="llm")
-
         # Bounded pool for background jobs (memory extraction, history
         # summarization, profile/consolidation maintenance, media GC). Kept
         # SEPARATE from the default executor so a burst of per-bot background
         # fan-out can never starve the workers that interactive agent-bridge
         # relays need — that contention stalled continuation turns by minutes
-        # (TASK-283). NOT _llm_executor: that single thread is only for local
-        # GPU inference (CUDA/llama-cpp isn't thread-safe); routing background
-        # work through it would re-serialize it and reintroduce the TASK-274
-        # chat stall.
+        # (TASK-283). Local GPU inference no longer runs in-process — it moved to
+        # the standalone local_model_bridge (TASK-276/278) — so there is no
+        # single-thread LLM executor here anymore; all chat streams on the
+        # default pool.
+        from concurrent.futures import ThreadPoolExecutor
         self._bg_executor = ThreadPoolExecutor(max_workers=4, thread_name_prefix="bg")
 
         # Cancellation support: when a new request comes in, cancel the current one
@@ -351,15 +344,10 @@ class BackgroundService(
                 return response
 
             try:
-                # Only local GPU models serialize on the single-worker executor;
-                # remote APIs (openai/grok/claude-code/agent_backend) use the
-                # default pool. The old allowlist omitted "claude-code", which
-                # serialized all bridge bots on the one GPU thread. See
-                # _LOCAL_GPU_MODEL_TYPES in chat_streaming.py.
-                if model_type in _LOCAL_GPU_MODEL_TYPES:
-                    response_text = await loop.run_in_executor(self._llm_executor, _do_query)
-                else:
-                    response_text = await loop.run_in_executor(None, _do_query)
+                # In-process GPU inference is gone (local models run in
+                # local_model_bridge, TASK-276/278), so every model now streams
+                # on the default thread pool — no single-worker serialization.
+                response_text = await loop.run_in_executor(None, _do_query)
             except Exception as e:
                 elapsed_ms = (time.time() - llm_start_time) * 1000
                 self._update_turn_log(

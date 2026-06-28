@@ -6,17 +6,13 @@ services:
       args:
         WITH_CUDA: ${WITH_CUDA:-true}
         CUDA_ARCHS: ${CUDA_ARCHS:-120}
-    deploy:
-      resources:
-        reservations:
-          devices:
-            - driver: nvidia
-              count: all
-              capabilities: [gpu]
+    # GPU removed (TASK-278): in-process local inference moved to the
+    # local-model-bridge service, so the app reserves no GPU device, needs no
+    # ipc:host (that existed only for the vLLM multiprocess shared-memory
+    # engine) and drops the nvidia-ctk apparmor opt. The app runs CPU-only.
+    # NOTE: the build still uses the GPU Dockerfile until TASK-278 Wave B
+    # (gated on TASK-277) gives the app its own CPU-only image.
     container_name: llm-bawt-app
-    ipc: host  # Required for vLLM multiprocess engine shared memory
-    security_opt:
-      - apparmor:unconfined  # AppArmor not available on this kernel; nvidia-ctk owns daemon.json
     env_file:
       - ./.env
     environment:
@@ -274,8 +270,8 @@ services:
     image: llm-bawt-local-model-bridge
     container_name: llm-bawt-local-model-bridge
     command: ["python", "-m", "local_model_bridge"]
-    # GPU + runtime config mirrors the app service exactly (TASK-278 will
-    # remove GPU from the app service; this bridge keeps it).
+    # GPU lives here, not on the app: TASK-278 removed the GPU reservation +
+    # ipc:host from the app service; this bridge owns all local inference.
     deploy:
       resources:
         reservations:

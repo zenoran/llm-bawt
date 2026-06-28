@@ -25,13 +25,6 @@ from .schemas import ChatCompletionRequest
 
 log = get_service_logger(__name__)
 
-# Model-definition `type` values that run a local model in-process on the GPU
-# and therefore MUST be serialized on the single-worker `_llm_executor` for
-# CUDA / llama-cpp-python thread safety. Every other type is a remote API
-# (openai/grok/claude-code/agent_backend) and streams on the default thread
-# pool so multiple bots run concurrently.
-_LOCAL_GPU_MODEL_TYPES = frozenset({"gguf", "vllm", "llamacpp"})
-
 # TASK-286: assistant text deltas are coalesced into chunks of at least this
 # many characters before being published to the unified Redis stream as
 # ``text_delta`` events. The original HTTP body still streams every token to
@@ -2078,20 +2071,11 @@ class ChatStreamingMixin:
                 }
                 yield f"data: {json.dumps(warning_data)}\n\n"
 
-            # Only local GPU models (gguf/vllm/llamacpp) keep the single-worker
-            # executor, to avoid CUDA / llama-cpp-python thread-safety issues.
-            # Everything else is a remote API (openai/grok/claude-code/
-            # agent_backend) and streams on the default pool so multiple bots
-            # run concurrently. NOTE: the old allowlist whitelisted remote types
-            # explicitly and omitted "claude-code", so every claude-code bridge
-            # bot was wrongly serialized on the one GPU thread — a long agent
-            # turn (or a slow /new) blocked all other bots. Inverting to a
-            # local-GPU blocklist fixes that and is robust to new remote types.
-            model_type = llm_bawt.client.model_definition.get("type", "")
-            if model_type in _LOCAL_GPU_MODEL_TYPES:
-                loop.run_in_executor(self._llm_executor, _stream_to_queue)
-            else:
-                loop.run_in_executor(None, _stream_to_queue)
+            # In-process GPU inference is gone (local models run in the
+            # standalone local_model_bridge, TASK-276/278), so every model
+            # streams on the default thread pool — multiple bots run
+            # concurrently and nothing is serialized on a single GPU thread.
+            loop.run_in_executor(None, _stream_to_queue)
 
             # Yield SSE chunks (with keepalive to prevent client timeout
             # during slow backends like vLLM first-inference)
