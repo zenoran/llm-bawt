@@ -1,47 +1,24 @@
-"""Regression tests for bot profile precedence and prompt cache invalidation."""
+"""Regression tests for bot profile loading and prompt cache invalidation."""
 
 from __future__ import annotations
 
-from pathlib import Path
 from typing import Any
 
 from llm_bawt import bots as bots_module
 from llm_bawt.service.background_service import BackgroundService
 
 
-def test_db_bot_profile_overrides_yaml(monkeypatch, tmp_path: Path) -> None:
-    """DB bot_profiles should override YAML bot fields and support DB-only bots."""
-    repo_yaml = tmp_path / "repo-bots.yaml"
-    user_yaml = tmp_path / "user-bots.yaml"
-    repo_yaml.write_text("{}", encoding="utf-8")
-    user_yaml.write_text("{}", encoding="utf-8")
-
-    repo_data = {
-        "bot_settings_template": {"temperature": 0.55, "ui_color": "blue"},
-        "bots": {
-            "nova": {
-                "name": "Nova YAML",
-                "description": "from repo",
-                "system_prompt": "repo prompt",
-                "requires_memory": True,
-                "voice_optimized": False,
-                "uses_tools": False,
-                "uses_search": False,
-                "uses_home_assistant": False,
-                "default_model": "repo-model",
-                "color": "red",
-                "settings": {"temperature": 0.8},
-            }
-        },
-    }
-    user_data = {"bots": {"nova": {"description": "from user"}}}
-    db_overrides = {
+def test_db_bot_profiles_load_correctly(monkeypatch) -> None:
+    """Bot profiles should load from DB and build Bot instances correctly."""
+    db_profiles = {
         "nova": {
             "name": "Nova DB",
             "description": "from db",
             "system_prompt": "db prompt",
             "requires_memory": False,
             "voice_optimized": True,
+            "tts_mode": False,
+            "include_summaries": True,
             "include_in_global_search": False,
             "uses_tools": True,
             "uses_search": True,
@@ -55,6 +32,9 @@ def test_db_bot_profile_overrides_yaml(monkeypatch, tmp_path: Path) -> None:
             "system_prompt": "ember prompt",
             "requires_memory": True,
             "voice_optimized": False,
+            "tts_mode": False,
+            "include_summaries": True,
+            "include_in_global_search": True,
             "uses_tools": False,
             "uses_search": False,
             "uses_home_assistant": False,
@@ -67,6 +47,9 @@ def test_db_bot_profile_overrides_yaml(monkeypatch, tmp_path: Path) -> None:
             "system_prompt": "claw prompt",
             "requires_memory": True,
             "voice_optimized": False,
+            "tts_mode": False,
+            "include_summaries": True,
+            "include_in_global_search": True,
             "uses_tools": False,
             "uses_search": False,
             "uses_home_assistant": False,
@@ -77,17 +60,7 @@ def test_db_bot_profile_overrides_yaml(monkeypatch, tmp_path: Path) -> None:
         },
     }
 
-    def fake_load_yaml_file(path: Path) -> dict[str, Any]:
-        if path == repo_yaml:
-            return repo_data
-        if path == user_yaml:
-            return user_data
-        return {}
-
-    monkeypatch.setattr(bots_module, "get_repo_bots_yaml_path", lambda: repo_yaml)
-    monkeypatch.setattr(bots_module, "get_user_bots_yaml_path", lambda: user_yaml)
-    monkeypatch.setattr(bots_module, "_load_yaml_file", fake_load_yaml_file)
-    monkeypatch.setattr(bots_module, "_load_db_bot_overrides", lambda: db_overrides)
+    monkeypatch.setattr(bots_module, "_load_db_bot_profiles", lambda: db_profiles)
 
     bots_module._load_bots_config()
 
@@ -100,8 +73,6 @@ def test_db_bot_profile_overrides_yaml(monkeypatch, tmp_path: Path) -> None:
     assert nova.include_in_global_search is False
     assert nova.default_model == "db-model"
     assert nova.bot_type == "chat"
-    assert nova.color == "red"  # Keep YAML-presentational metadata.
-    assert nova.settings["temperature"] == 0.8  # Keep YAML settings.
     assert bots_module.get_raw_bot_data("nova")["nextcloud"]["bot_id"] == "nc-nova"
 
     ember = bots_module.get_bot("ember")
@@ -109,8 +80,6 @@ def test_db_bot_profile_overrides_yaml(monkeypatch, tmp_path: Path) -> None:
     assert ember.system_prompt == "ember prompt"
     assert ember.bot_type == "chat"
     assert ember.include_in_global_search is True
-    assert ember.settings["temperature"] == 0.55
-    assert ember.color == "blue"
 
     claw = bots_module.get_bot("claw")
     assert claw is not None

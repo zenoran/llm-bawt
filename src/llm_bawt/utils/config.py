@@ -5,7 +5,6 @@ import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-import yaml
 from pydantic import BaseModel, Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from rich.console import Console
@@ -145,8 +144,8 @@ class Config(RuntimeTunables, BaseSettings):
     HISTORY_FILE: str = Field(default=os.path.expanduser("~/.cache/llm-bawt/chat-history"))
     OLLAMA_URL: str = Field(default="http://localhost:11434")
     MODEL_CACHE_DIR: str = Field(default=os.path.expanduser("~/.cache/llm-bawt/models"), description="Directory to cache downloaded GGUF models")
-    MODELS_CONFIG_PATH: str = Field(default=str(DEFAULT_MODELS_YAML), description="Path to the models YAML definition file")
-    DEFAULT_MODEL_ALIAS: Optional[str] = Field(default=None, description="Alias from models.yaml to use if --model is not specified")
+    MODELS_CONFIG_PATH: str = Field(default=str(DEFAULT_MODELS_YAML), description="Legacy path to models YAML (deprecated — models load from DB)")
+    DEFAULT_MODEL_ALIAS: Optional[str] = Field(default=None, description="Default model alias if --model is not specified")
     DEFAULT_BOT: str = Field(default="nova", description="Default bot to use if --bot is not specified")
     DEFAULT_USER: Optional[str] = Field(
         default=None,
@@ -325,7 +324,7 @@ class Config(RuntimeTunables, BaseSettings):
     INTERACTIVE_MODE: bool = Field(default=False, description="Whether the app is in interactive mode (set based on args)")
 
     # --- Nextcloud Talk Bot Settings (legacy single-bot) --- #
-    NEXTCLOUD_BOT_SECRET: Optional[str] = Field(default=None, description="Nextcloud Talk bot secret from occ talk:bot:install (deprecated: use bots.yaml)")
+    NEXTCLOUD_BOT_SECRET: Optional[str] = Field(default=None, description="Nextcloud Talk bot secret from occ talk:bot:install (deprecated: use bot_profiles DB)")
     NEXTCLOUD_URL: str = Field(default="https://nextcloud.example.com", description="Nextcloud instance URL")
 
     # --- Nextcloud Talk Provisioner --- #
@@ -348,43 +347,17 @@ class Config(RuntimeTunables, BaseSettings):
     )
 
     def __init__(self, **values: Any):
-        if 'MODELS_CONFIG_PATH' in values:
-            values['MODELS_CONFIG_PATH'] = str(Path(values['MODELS_CONFIG_PATH']).expanduser().resolve())
-        else:
-            values['MODELS_CONFIG_PATH'] = str(DEFAULT_MODELS_YAML)
-
         super().__init__(**values)
-        self._load_models_config()
-
-    def _load_models_config(self):
-        config_path = Path(self.MODELS_CONFIG_PATH)
-        if not config_path.is_file():
-            logger.debug("Models configuration file not found at %s; using empty model definitions", config_path)
-            self.defined_models = {"models": {}}
-            return
-
-        try:
-            with open(config_path, 'r', encoding='utf-8') as f:
-                loaded_data = yaml.safe_load(f)
-                if loaded_data is None:
-                    loaded_data = {} # Start with empty dict
-            if "models" not in loaded_data or not isinstance(loaded_data.get("models"), dict):
-                console.print(f"[bold red]Warning:[/bold red] Invalid format in {config_path}. Missing or invalid top-level 'models' dictionary. Treating as empty.")
-                self.defined_models = {"models": {}}
-            else:
-                self.defined_models = loaded_data
-                if "models" not in self.defined_models:
-                    self.defined_models["models"] = {}
-
-        except yaml.YAMLError as e:
-            console.print(f"[bold red]Error parsing YAML file {config_path}:[/bold red] {e}")
-            self.defined_models = {"models": {}}
-        except Exception as e:
-            console.print(f"[bold red]Error loading models config {config_path}:[/bold red] {e}")
-            self.defined_models = {"models": {}}
+        # Models are loaded exclusively from the database.
+        # merge_db_models() is called by the service / ModelManager on startup.
+        self.defined_models = {"models": {}}
 
     def merge_db_models(self, db_models: dict[str, Any]) -> None:
-        """Overlay DB model definitions on top of YAML. DB always wins per alias."""
+        """Load model definitions from the database.
+
+        Despite the name (kept for API compatibility), this is now the
+        primary — and only — source for model definitions.
+        """
         if not db_models:
             return
         models = dict(self.defined_models.get("models", {}))
@@ -449,7 +422,7 @@ class Config(RuntimeTunables, BaseSettings):
         """Get the effective context window for a model.
 
         Resolution order:
-        1. Per-model `context_window` in models.yaml
+        1. Per-model `context_window` in model definition
         2. Global LLAMA_CPP_N_CTX (for GGUF) or 128000 (for OpenAI)
         3. Hardcoded default: 32768
 
@@ -458,9 +431,9 @@ class Config(RuntimeTunables, BaseSettings):
         and runs at model load time.
         """
         model_def = self.defined_models.get("models", {}).get(model_alias or "", {})
-        yaml_val = model_def.get("context_window")
-        if yaml_val is not None:
-            return int(yaml_val)
+        def_val = model_def.get("context_window")
+        if def_val is not None:
+            return int(def_val)
         model_type = model_def.get("type", "")
         if model_type in ("openai", "grok", "agent_backend"):
             return 128000
@@ -470,28 +443,28 @@ class Config(RuntimeTunables, BaseSettings):
         """Get the effective max output tokens for a model.
 
         Resolution order:
-        1. Per-model `max_tokens` in models.yaml
+        1. Per-model `max_tokens` in model definition
         2. Global MAX_OUTPUT_TOKENS config
         3. Hardcoded default: 4096
         """
         model_def = self.defined_models.get("models", {}).get(model_alias or "", {})
-        yaml_val = model_def.get("max_tokens")
-        if yaml_val is not None:
-            return int(yaml_val)
+        def_val = model_def.get("max_tokens")
+        if def_val is not None:
+            return int(def_val)
         return self.MAX_OUTPUT_TOKENS or 4096
 
     def get_model_n_gpu_layers(self, model_alias: str | None = None) -> int:
         """Get the effective n_gpu_layers for a model.
 
         Resolution order:
-        1. Per-model `n_gpu_layers` in models.yaml
+        1. Per-model `n_gpu_layers` in model definition
         2. Global LLAMA_CPP_N_GPU_LAYERS config
         3. Hardcoded default: -1 (all layers)
         """
         model_def = self.defined_models.get("models", {}).get(model_alias or "", {})
-        yaml_val = model_def.get("n_gpu_layers")
-        if yaml_val is not None:
-            return int(yaml_val)
+        def_val = model_def.get("n_gpu_layers")
+        if def_val is not None:
+            return int(def_val)
         return self.LLAMA_CPP_N_GPU_LAYERS if self.LLAMA_CPP_N_GPU_LAYERS is not None else -1
 
     def get_tool_format(self, model_alias: str | None = None, model_def: Dict[str, Any] | None = None) -> str:

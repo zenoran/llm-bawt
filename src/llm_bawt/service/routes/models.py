@@ -212,12 +212,12 @@ def switch_model(request: ModelSwitchRequest):
 
 @router.post("/v1/models/reload", tags=["Models"])
 def reload_models_catalog():
-    """Reload model catalog from DB/YAML and refresh service model availability."""
+    """Reload model catalog from DB and refresh service model availability."""
     service = get_service()
     config = service.config
 
-    # Reset from YAML first so aliases removed from DB don't linger in-memory.
-    config._load_models_config()
+    # Reset to empty and reload from DB (sole source of truth).
+    config.defined_models = {"models": {}}
 
     from ..dependencies import get_model_definition_store
 

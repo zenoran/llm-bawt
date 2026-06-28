@@ -31,7 +31,6 @@ from pathlib import Path
 from rich.table import Table
 from rich.panel import Panel
 from typing import Iterator
-import yaml
 
 console = Console()
 
@@ -1192,82 +1191,8 @@ def bootstrap_runtime_settings(config: Config, bot_id: str | None, overwrite: bo
 
 
 def migrate_bots_to_db(config: Config) -> bool:
-    """Migrate merged YAML bot personalities to bot_profiles and settings to runtime_settings via service."""
-    from llm_bawt.bots import (
-        get_repo_bots_yaml_path,
-        get_user_bots_yaml_path,
-        _deep_merge,
-    )
-
-    def _load_yaml(path: Path) -> dict:
-        if not path.exists():
-            return {}
-        try:
-            return yaml.safe_load(path.read_text(encoding="utf-8")) or {}
-        except Exception as e:
-            console.print(f"[yellow]Skipping invalid YAML {path}: {e}[/yellow]")
-            return {}
-
-    repo_data = _load_yaml(get_repo_bots_yaml_path())
-    user_data = _load_yaml(get_user_bots_yaml_path())
-    merged = _deep_merge(repo_data, user_data)
-    bots_data = merged.get("bots", {}) if isinstance(merged, dict) else {}
-
-    if not isinstance(bots_data, dict) or not bots_data:
-        console.print("[yellow]No YAML bots found to migrate.[/yellow]")
-        return True
-
-    client = get_service_client(config)
-    if not client or not client.is_available():
-        console.print("[yellow]Service not available. Start with: llm-service[/yellow]")
-        return False
-
-    migrated_profiles = 0
-    settings_items: list[dict] = []
-
-    for slug, bot_data in bots_data.items():
-        if not isinstance(bot_data, dict):
-            continue
-        normalized_slug = str(slug).strip().lower()
-        if not normalized_slug:
-            continue
-
-        client.upsert_bot_profile(normalized_slug, {
-            "name": bot_data.get("name", normalized_slug.title()),
-            "description": bot_data.get("description", ""),
-            "system_prompt": bot_data.get("system_prompt", "You are a helpful assistant."),
-            "requires_memory": bot_data.get("requires_memory", True),
-            "voice_optimized": bot_data.get("voice_optimized", False),
-            "tts_mode": bot_data.get("tts_mode", False),
-            "include_summaries": bot_data.get("include_summaries", True),
-            "include_in_global_search": bot_data.get("include_in_global_search", True),
-            "uses_tools": bot_data.get("uses_tools", False),
-            "uses_search": bot_data.get("uses_search", False),
-            "uses_home_assistant": bot_data.get("uses_home_assistant", False),
-            "default_model": bot_data.get("default_model"),
-            "nextcloud_config": bot_data.get("nextcloud"),
-        })
-        migrated_profiles += 1
-
-        bot_settings = bot_data.get("settings", {}) or {}
-        if isinstance(bot_settings, dict):
-            for key, value in bot_settings.items():
-                settings_items.append({"scope_type": "bot", "scope_id": normalized_slug, "key": key, "value": value})
-
-    if settings_items:
-        client.batch_set_settings(settings_items)
-
-    console.print(
-        "[green]Bot migration complete.[/green] "
-        f"profiles={migrated_profiles}, bot_settings={len(settings_items)}"
-    )
-
-    try:
-        from llm_bawt.bots import _load_bots_config
-        _load_bots_config()
-    except Exception:
-        pass
-
+    """Migrate YAML bot personalities to DB (deprecated — migration already complete)."""
+    console.print("[green]Bot migration is no longer needed — all config is DB-only.[/green]")
     return True
 
 
@@ -1525,7 +1450,7 @@ def main():
 
                 console.print(f"  [cyan]{field_name}[/cyan]: {current_value_str}")
         
-        console.print(f"\n  [dim]SYSTEM_MESSAGE: (set by bot config in bots.yaml)[/dim]")
+        console.print(f"\n  [dim]SYSTEM_MESSAGE: (set by bot profile in database)[/dim]")
         console.print(f"\n[dim]To set a value: llm --config-set KEY value[/dim]")
         console.print(f"[dim]Or edit: {env_file_path}[/dim]")
         sys.exit(0)

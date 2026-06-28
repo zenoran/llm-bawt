@@ -1,49 +1,25 @@
 """Bot system for llm-bawt.
 
 Bots are AI personalities with their own system prompts and isolated memory.
-Bot definitions are loaded from bots.yaml in this package directory,
-with user overrides from ~/.config/llm-bawt/bots.yaml taking priority.
+Bot definitions are loaded exclusively from the database (bot_profiles table).
 """
 
 import logging
 import re
 from dataclasses import dataclass, field
-from pathlib import Path
 from typing import Any
-
-import yaml
 
 from .bot_types import normalize_bot_type
 
 logger = logging.getLogger(__name__)
 
-# Path to the repo bots.yaml file (in the same directory as this module)
-REPO_BOTS_YAML_PATH = Path(__file__).parent / "bots.yaml"
-
-
-def get_repo_bots_yaml_path() -> Path:
-    """Get the path to repo bots.yaml."""
-    return REPO_BOTS_YAML_PATH
-
-
-def get_user_bots_yaml_path() -> Path:
-    """Get the path to user bots.yaml (~/.config/llm-bawt/bots.yaml)."""
-    from llm_bawt.utils.config import get_default_config_dir
-    return get_default_config_dir() / "bots.yaml"
-
-
-# Backwards compatibility alias
-def get_bots_yaml_path() -> Path:
-    """Get the path to bots.yaml (repo path for backwards compat)."""
-    return REPO_BOTS_YAML_PATH
-
 
 @dataclass
 class Bot:
     """A bot personality with its own system prompt and capabilities."""
-    
-    slug: str  # Unique identifier (e.g., "nova", "spark", "mira")
-    name: str  # Display name (e.g., "Nova", "Spark", "Mira")
+
+    slug: str  # Unique identifier (e.g., "nova", "snark", "mira")
+    name: str  # Display name (e.g., "Nova", "Snark", "Mira")
     description: str  # Short description for --list-bots
     system_prompt: str  # The system message sent to the LLM
     requires_memory: bool = True  # Whether this bot needs database/memory persistence
@@ -62,8 +38,8 @@ class Bot:
     bot_type: str = "chat"  # High-level bot type (chat or agent)
     agent_backend: str | None = None  # External agent backend slug (e.g. "openclaw")
     agent_backend_config: dict[str, Any] = field(default_factory=dict)  # Backend-specific config
-    settings: dict[str, Any] = field(default_factory=dict)  # Effective bot settings (template + overrides)
-    
+    settings: dict[str, Any] = field(default_factory=dict)  # Effective bot settings
+
     def __post_init__(self):
         self.slug = self.slug.lower().strip()
         self.bot_type = normalize_bot_type(self.bot_type, self.agent_backend)
@@ -77,21 +53,59 @@ class ModelSelection:
     source: str  # explicit | bot_default | config_default | none
 
 
-# Global bot registry - populated from YAML on module load
+# Global bot registry — populated from DB on first access
 BUILTIN_BOTS: dict[str, Bot] = {}
-_DEFAULTS_BASE: dict[str, str] = {"standard": "nova", "local": "spark"}
-_DEFAULTS: dict[str, str] = _DEFAULTS_BASE.copy()
+_DEFAULTS: dict[str, str] = {"standard": "nova"}
 _SYSTEM_PROMPTS: dict[str, str] = {}
-_RAW_BOT_DATA: dict[str, dict] = {}  # Raw effective bot data for integrations
-_BOT_SETTINGS_TEMPLATE: dict[str, Any] = {}
-_LAST_REPO_MTIME: float = 0
-_LAST_USER_MTIME: float = 0
+_RAW_BOT_DATA: dict[str, dict] = {}
 _FORCE_RELOAD: bool = False
+_LOADED: bool = False
+
+
+# ── Named system prompts (code constants, not runtime config) ──────────
+_BUILTIN_SYSTEM_PROMPTS: dict[str, str] = {
+    "refine": """\
+You are a Prompt-Refinement Tool that transforms raw user messages into natural, human-like conversational prompts.
+
+You MUST:
+1. Take the user's raw input and convert it into a prompt that will generate natural, casual human responses
+2. Ensure prompts encourage conversational, intimate, and authentic replies - not assistant-like or service-oriented responses
+3. Preserve the core intent of the user's input (e.g., a question asking for an opinion should result in a prompt asking for an opinion, not a command to act)
+4. Clearly reference the core topic or question from the user's raw input within the refined instructions part of the prompt.
+5. Format the output using the exact template below, including the labels:
+   What the user asked: <user's raw input>
+   Refined prompt: <refined instructions>
+
+You MUST NOT:
+1. Create prompts that lead to formal, assistant-like, or overly professional responses
+2. Include phrases like "assist them," "help the user," or any service-oriented language within the refined instructions
+3. Change the fundamental nature of the request (e.g., don't turn a question about preference into a command to perform an action)
+4. Add any text before or after the required output template
+5. Include meta-commentary about the prompt or process
+6. Include example questions or specific suggestions within the refined instructions (e.g., avoid phrases like "such as '...'")
+
+Example:
+Raw user input: "hi"
+INCORRECT response: "Greet the user in a friendly and professional tone, and ask how you can assist them today."
+CORRECT response:
+What the user asked: hi
+Refined prompt: Respond to this greeting as a companion would, with warmth and authenticity. Keep it brief and natural.
+
+Example:
+Raw user input: "tell me about dogs"
+INCORRECT response: "Provide information about dogs in a helpful and informative manner."
+CORRECT response:
+What the user asked: tell me about dogs
+Refined prompt: The user wants to talk about dogs. Share some interesting thoughts about dogs as if chatting with an intimate companion who loves pets. Be conversational and authentic, not like you're giving a formal presentation.
+
+Your entire response MUST follow the specified template: provide the user's raw input and then the refined instructions on how the final LLM should respond.
+""",
+}
 
 
 def _deep_merge(base: dict, override: dict) -> dict:
     """Deep merge override into base, with override taking priority.
-    
+
     For nested dicts, merges recursively. For other types, override wins.
     """
     result = base.copy()
@@ -103,71 +117,31 @@ def _deep_merge(base: dict, override: dict) -> dict:
     return result
 
 
-def _load_yaml_file(yaml_path: Path) -> dict | None:
-    """Load a YAML file and return its contents, or None if not found."""
-    try:
-        if yaml_path.exists():
-            with open(yaml_path, "r", encoding="utf-8") as f:
-                return yaml.safe_load(f) or {}
-    except yaml.YAMLError as e:
-        logger.error(f"Error parsing {yaml_path}: {e}")
-    except Exception as e:
-        logger.error(f"Error reading {yaml_path}: {e}")
-    return None
-
-
 def invalidate_bots_cache() -> None:
-    """Force the next _check_reload() to reload bots from DB + YAML."""
+    """Force the next access to reload bots from DB."""
     global _FORCE_RELOAD
     _FORCE_RELOAD = True
 
 
 def _check_reload() -> bool:
-    """Check if config files have changed and reload if needed.
+    """Reload bots from DB if invalidated or not yet loaded.
 
     Returns True if reload was performed.
     """
-    global _LAST_REPO_MTIME, _LAST_USER_MTIME, _FORCE_RELOAD
+    global _FORCE_RELOAD, _LOADED
 
-    if _FORCE_RELOAD:
+    if _FORCE_RELOAD or not _LOADED:
         _FORCE_RELOAD = False
-        _load_bots_config()
-        return True
-
-    repo_path = get_repo_bots_yaml_path()
-    user_path = get_user_bots_yaml_path()
-
-    repo_mtime = repo_path.stat().st_mtime if repo_path.exists() else 0
-    user_mtime = user_path.stat().st_mtime if user_path.exists() else 0
-
-    if repo_mtime > _LAST_REPO_MTIME or user_mtime > _LAST_USER_MTIME:
         _load_bots_config()
         return True
     return False
 
 
-def _extract_bot_settings_template(merged_data: dict[str, Any]) -> dict[str, Any]:
-    """Extract bot settings template from merged YAML.
+def _load_db_bot_profiles() -> dict[str, dict[str, Any]]:
+    """Load all bot profiles from DB, keyed by slug.
 
-    Preferred key: `bot_settings_template`.
-    Compatibility aliases: `bot_settings_defaults`, `bot_defaults`.
+    Returns an empty dict if the database is unavailable.
     """
-    for key in ("bot_settings_template", "bot_settings_defaults", "bot_defaults"):
-        value = merged_data.get(key)
-        if isinstance(value, dict):
-            return value
-    return {}
-
-
-def _load_db_bot_overrides() -> dict[str, dict[str, Any]]:
-    """Load DB-backed bot profile overrides keyed by slug.
-
-    These values take priority over YAML bot fields when building the active
-    in-memory bot registry.
-    """
-    # TASK-202: this is called repeatedly (every BotManager rebuild). The
-    # store creates a SQLAlchemy engine with its own connection pool; we
-    # ``dispose()`` it after use so we don't accumulate one pool per reload.
     store = None
     try:
         from llm_bawt.runtime_settings import BotProfileStore
@@ -176,20 +150,20 @@ def _load_db_bot_overrides() -> dict[str, dict[str, Any]]:
         config = Config()
 
         if not has_database_credentials(config):
+            logger.warning("No database credentials — cannot load bot profiles")
             return {}
 
         store = BotProfileStore(config)
         if store.engine is None:
+            logger.warning("Bot profiles DB engine unavailable")
             return {}
 
         rows = store.list_all()
-        overrides: dict[str, dict[str, Any]] = {}
+        profiles: dict[str, dict[str, Any]] = {}
         for row in rows:
             slug = (row.slug or "").strip().lower()
             if not slug:
                 continue
-            # Only include non-None fields so DB acts as a sparse override
-            # and doesn't clobber YAML values with NULL.
             entry: dict[str, Any] = {
                 "name": row.name,
                 "description": row.description,
@@ -213,15 +187,17 @@ def _load_db_bot_overrides() -> dict[str, dict[str, Any]]:
                 entry["default_voice"] = row.default_voice
             if row.nextcloud_config is not None:
                 entry["nextcloud"] = row.nextcloud_config
-            entry["bot_type"] = normalize_bot_type(getattr(row, "bot_type", None), row.agent_backend)
+            entry["bot_type"] = normalize_bot_type(
+                getattr(row, "bot_type", None), row.agent_backend,
+            )
             if row.agent_backend is not None:
                 entry["agent_backend"] = row.agent_backend
             if row.agent_backend_config is not None:
                 entry["agent_backend_config"] = row.agent_backend_config
-            overrides[slug] = entry
-        return overrides
+            profiles[slug] = entry
+        return profiles
     except Exception as e:
-        logger.warning(f"Could not load DB bot profile overrides: {e}")
+        logger.warning("Could not load DB bot profiles: %s", e)
         return {}
     finally:
         if store is not None and getattr(store, "engine", None) is not None:
@@ -231,151 +207,66 @@ def _load_db_bot_overrides() -> dict[str, dict[str, Any]]:
                 pass
 
 
-def _load_merged_yaml() -> tuple[dict, Path, Path]:
-    """Load and merge repo + user bots YAML. Returns (merged_data, repo_path, user_path)."""
-    repo_path = get_repo_bots_yaml_path()
-    user_path = get_user_bots_yaml_path()
-    repo_data = _load_yaml_file(repo_path) or {}
-    user_data = _load_yaml_file(user_path) or {}
-    return _deep_merge(repo_data, user_data), repo_path, user_path
+def _load_bots_config() -> None:
+    """Load bot definitions from the database.
 
-
-def _build_bots_from_data(
-    merged_data: dict,
-    *,
-    skip_db: bool = False,
-) -> tuple[dict[str, Bot], dict[str, dict], dict[str, str], dict[str, str]]:
-    """Build bot objects from merged YAML data, optionally overlaying DB profiles.
-
-    Returns (bots, raw_data, system_prompts, defaults).
+    This is the sole source of bot data — no YAML fallback.
     """
-    settings_template = _extract_bot_settings_template(merged_data)
-    merged_bots = merged_data.get("bots", {}) if isinstance(merged_data.get("bots"), dict) else {}
-    effective_bots: dict[str, dict[str, Any]] = {}
-    for slug, bot_data in merged_bots.items():
-        normalized_slug = (slug or "").strip().lower()
-        if not normalized_slug or not isinstance(bot_data, dict):
-            continue
-        effective_bots[normalized_slug] = dict(bot_data)
+    global BUILTIN_BOTS, _DEFAULTS, _SYSTEM_PROMPTS, _RAW_BOT_DATA, _LOADED
 
-    db_count = 0
-    if not skip_db:
-        db_overrides = _load_db_bot_overrides()
-        db_count = len(db_overrides)
-        for slug, db_payload in db_overrides.items():
-            base = effective_bots.get(slug, {})
-            merged_payload = dict(base)
-            merged_payload.update(db_payload)
-            effective_bots[slug] = merged_payload
+    db_profiles = _load_db_bot_profiles()
 
     bots: dict[str, Bot] = {}
     raw_data: dict[str, dict] = {}
 
-    def _build_settings(yaml_bot_data: dict[str, Any] | None = None) -> dict[str, Any]:
-        yaml_settings = {}
-        if isinstance(yaml_bot_data, dict):
-            yaml_settings = yaml_bot_data.get("settings", {}) or {}
-        return _deep_merge(settings_template, yaml_settings)
-
-    for slug, bot_data in effective_bots.items():
-        effective_settings = _build_settings(bot_data)
-        merged_bot_data = dict(bot_data)
+    for slug, data in db_profiles.items():
         resolved_bot_type = normalize_bot_type(
-            bot_data.get("bot_type"),
-            bot_data.get("agent_backend"),
+            data.get("bot_type"),
+            data.get("agent_backend"),
         )
-        merged_bot_data["bot_type"] = resolved_bot_type
-        merged_bot_data["settings"] = effective_settings
-        raw_data[slug] = merged_bot_data
-        bot_color = bot_data.get("color") or effective_settings.get("ui_color")
+        raw_entry = dict(data)
+        raw_entry["bot_type"] = resolved_bot_type
+        raw_data[slug] = raw_entry
+
         bots[slug] = Bot(
             slug=slug,
-            name=bot_data.get("name", slug.title()),
-            description=bot_data.get("description", ""),
-            system_prompt=bot_data.get("system_prompt", "You are a helpful assistant."),
-            requires_memory=bot_data.get("requires_memory", True),
-            voice_optimized=bot_data.get("voice_optimized", False),
-            tts_mode=bot_data.get("tts_mode", False),
-            include_summaries=bot_data.get("include_summaries", True),
-            include_in_global_search=bot_data.get("include_in_global_search", True),
-            default_voice=bot_data.get("default_voice") or effective_settings.get("default_voice"),
-            default_model=bot_data.get("default_model"),
-            uses_tools=bot_data.get("uses_tools", False),
-            uses_search=bot_data.get("uses_search", False),
-            uses_home_assistant=bot_data.get("uses_home_assistant", False),
-            color=bot_color,
-            avatar=bot_data.get("avatar"),
-            nextcloud=bot_data.get("nextcloud"),
+            name=data.get("name", slug.title()),
+            description=data.get("description", ""),
+            system_prompt=data.get("system_prompt", "You are a helpful assistant."),
+            requires_memory=data.get("requires_memory", True),
+            voice_optimized=data.get("voice_optimized", False),
+            tts_mode=data.get("tts_mode", False),
+            include_summaries=data.get("include_summaries", True),
+            include_in_global_search=data.get("include_in_global_search", True),
+            default_voice=data.get("default_voice"),
+            default_model=data.get("default_model"),
+            uses_tools=data.get("uses_tools", False),
+            uses_search=data.get("uses_search", False),
+            uses_home_assistant=data.get("uses_home_assistant", False),
+            color=data.get("color"),
+            avatar=data.get("avatar"),
+            nextcloud=data.get("nextcloud"),
             bot_type=resolved_bot_type,
-            agent_backend=bot_data.get("agent_backend"),
-            agent_backend_config=bot_data.get("agent_backend_config") or {},
-            settings=effective_settings,
+            agent_backend=data.get("agent_backend"),
+            agent_backend_config=data.get("agent_backend_config") or {},
         )
-
-    defaults = dict(_DEFAULTS_BASE)
-    if "defaults" in merged_data:
-        defaults.update(merged_data["defaults"])
-
-    system_prompts: dict[str, str] = {}
-    if "system_prompts" in merged_data:
-        system_prompts.update(merged_data["system_prompts"])
-
-    logger.debug(
-        "Built %d bots (skip_db=%s, db_overrides=%d)", len(bots), skip_db, db_count,
-    )
-    return bots, raw_data, system_prompts, defaults
-
-
-def _load_yaml_only_bots() -> dict[str, Bot]:
-    """Load bots from YAML only — no database access."""
-    merged_data, _, _ = _load_merged_yaml()
-    if not merged_data:
-        return {}
-    bots, _, _, _ = _build_bots_from_data(merged_data, skip_db=True)
-    return bots
-
-
-def _load_bots_config() -> None:
-    """Load bot definitions from YAML (repo + user config).
-
-    When available, DB-backed bot_profiles are loaded as overrides with higher
-    precedence than YAML bot fields.
-    """
-    global BUILTIN_BOTS, _DEFAULTS, _SYSTEM_PROMPTS, _RAW_BOT_DATA, _BOT_SETTINGS_TEMPLATE
-    global _LAST_REPO_MTIME, _LAST_USER_MTIME
-
-    merged_data, repo_path, user_path = _load_merged_yaml()
-
-    _LAST_REPO_MTIME = repo_path.stat().st_mtime if repo_path.exists() else 0
-    _LAST_USER_MTIME = user_path.stat().st_mtime if user_path.exists() else 0
-
-    if not merged_data:
-        logger.warning("No bot configuration found in repo or user config")
-        return
-
-    _BOT_SETTINGS_TEMPLATE = _extract_bot_settings_template(merged_data)
-
-    bots, raw_data, system_prompts, defaults = _build_bots_from_data(merged_data)
 
     BUILTIN_BOTS.clear()
     BUILTIN_BOTS.update(bots)
     _RAW_BOT_DATA.clear()
     _RAW_BOT_DATA.update(raw_data)
     _SYSTEM_PROMPTS.clear()
-    _SYSTEM_PROMPTS.update(system_prompts)
-    _DEFAULTS.clear()
-    _DEFAULTS.update(defaults)
+    _SYSTEM_PROMPTS.update(_BUILTIN_SYSTEM_PROMPTS)
 
-    logger.debug(
-        "Loaded %d bots (repo: %s, user: %s)",
-        len(BUILTIN_BOTS), repo_path.exists(), user_path.exists(),
-    )
+    _LOADED = True
+
+    logger.debug("Loaded %d bots from database", len(bots))
 
 
 def get_raw_bot_data(slug: str) -> dict | None:
     """Get raw bot config data by slug (for integrations).
-    
-    Returns the merged raw YAML data for a bot, including integration-specific
+
+    Returns the DB-sourced data dict for a bot, including integration-specific
     sections like 'nextcloud'.
     """
     _check_reload()
@@ -389,9 +280,19 @@ def get_all_raw_bot_data() -> dict[str, dict]:
 
 
 def get_bot_settings_template() -> dict[str, Any]:
-    """Get the merged bot settings template/defaults."""
-    _check_reload()
-    return _BOT_SETTINGS_TEMPLATE.copy()
+    """Get default bot settings.
+
+    Returns RuntimeTunables class-level defaults. Per-bot and global overrides
+    are resolved at runtime by RuntimeSettingsResolver.
+    """
+    from .utils.config import RuntimeTunables
+
+    defaults: dict[str, Any] = {}
+    for fname in RuntimeTunables.model_fields:
+        field_info = RuntimeTunables.model_fields[fname]
+        if field_info.default is not None:
+            defaults[fname.lower()] = field_info.default
+    return defaults
 
 
 def save_user_bot_config(slug: str, section: str, data: dict) -> None:
@@ -505,12 +406,12 @@ def remove_user_bot_section(slug: str, section: str) -> bool:
 
 
 def get_system_prompt(name: str) -> str | None:
-    """Get a system prompt by name (e.g., 'refine')."""
+    """Get a named system prompt (e.g., 'refine')."""
     _check_reload()
     return _SYSTEM_PROMPTS.get(name)
 
 
-# Initialize bots on module load
+# Initialize bots on module load (loads from DB if available)
 _load_bots_config()
 
 
@@ -519,50 +420,45 @@ class BotManager:
 
     def __init__(self, config: Any = None, local_only: bool = False):
         self.config = config
-        self.local_only = local_only
-        self._local_bots: dict[str, Bot] | None = None
+        # local_only is deprecated — DB is the sole source.
+        # Kept as a parameter for API compatibility but ignored.
         if local_only:
-            self._local_bots = _load_yaml_only_bots()
-        logger.debug(f"BotManager initialized with {len(self._bots)} bots (local_only={local_only})")
+            logger.debug("BotManager local_only=True is deprecated; loading from DB")
+        logger.debug("BotManager initialized with %d bots", len(self._bots))
 
     @property
     def _bots(self) -> dict[str, Bot]:
         """Get bots from global registry, checking for reload."""
-        if self._local_bots is not None:
-            return self._local_bots
         _check_reload()
         return BUILTIN_BOTS
-    
+
     def get_bot(self, slug: str) -> Bot | None:
         """Get a bot by slug.
-        
+
         Args:
             slug: The bot identifier (case-insensitive)
-            
+
         Returns:
             The Bot instance, or None if not found
         """
         return self._bots.get(slug.lower().strip())
-    
+
     def get_default_bot(self, local_mode: bool = False) -> Bot:
         """Get the default bot based on mode.
-        
+
         Args:
-            local_mode: If True, return local default; otherwise return standard default
-            
+            local_mode: Deprecated, ignored.
+
         Returns:
             The default Bot instance
         """
-        if local_mode:
-            default_slug = _DEFAULTS.get("local", "spark")
-        else:
-            # Check config for default bot override
-            if self.config and hasattr(self.config, 'DEFAULT_BOT'):
-                config_default = getattr(self.config, 'DEFAULT_BOT', None)
-                if config_default and config_default in self._bots:
-                    return self._bots[config_default]
-            default_slug = _DEFAULTS.get("standard", "nova")
-        
+        # Check config for default bot override
+        if self.config and hasattr(self.config, "DEFAULT_BOT"):
+            config_default = getattr(self.config, "DEFAULT_BOT", None)
+            if config_default and config_default in self._bots:
+                return self._bots[config_default]
+        default_slug = _DEFAULTS.get("standard", "nova")
+
         bot = self._bots.get(default_slug)
         if not bot:
             # Fallback to first available bot
@@ -579,7 +475,7 @@ class BotManager:
         return bot
 
     def _is_model_alias(self, alias: str) -> bool:
-        """Check if an alias exists in models.yaml."""
+        """Check if an alias exists in model definitions."""
         if not self.config or not hasattr(self.config, "defined_models"):
             return False
         models = getattr(self.config, "defined_models", {}).get("models", {})
@@ -630,10 +526,10 @@ class BotManager:
             return ModelSelection(alias=config_default, source="config_default")
 
         return ModelSelection(alias=None, source="none")
-    
+
     def list_bots(self) -> list[Bot]:
         """List all available bots.
-        
+
         Returns:
             List of all Bot instances, sorted by slug
         """
@@ -643,31 +539,29 @@ class BotManager:
         """Get effective bot settings (template hydrated + bot overrides)."""
         bot = self.get_bot(slug)
         return bot.settings.copy() if bot else {}
-    
+
     def bot_exists(self, slug: str) -> bool:
         """Check if a bot exists.
-        
+
         Args:
             slug: The bot identifier (case-insensitive)
-            
+
         Returns:
             True if the bot exists
         """
         return slug.lower().strip() in self._bots
-    
+
     def get_default_slug(self, local_mode: bool = False) -> str:
-        """Get the default bot slug for the current mode."""
-        if local_mode:
-            return _DEFAULTS.get("local", "spark")
+        """Get the default bot slug."""
         return _DEFAULTS.get("standard", "nova")
 
 
 def get_bot(slug: str) -> Bot | None:
     """Convenience function to get a bot by slug.
-    
+
     Args:
         slug: The bot identifier (case-insensitive)
-        
+
     Returns:
         The Bot instance, or None if not found
     """
@@ -676,10 +570,10 @@ def get_bot(slug: str) -> Bot | None:
 
 def get_bot_system_prompt(slug: str) -> str | None:
     """Get the system prompt for a bot.
-    
+
     Args:
         slug: The bot identifier (case-insensitive)
-        
+
     Returns:
         The system prompt string, or None if bot not found
     """
@@ -689,53 +583,53 @@ def get_bot_system_prompt(slug: str) -> str | None:
 
 def strip_emotes(text: str) -> str:
     """Strip roleplay emotes/actions from text for TTS output.
-    
+
     RP-tuned models often include *action* text despite prompt instructions.
     This function removes them for clean TTS output.
-    
+
     Patterns removed:
     - *action text* (asterisk-wrapped actions)
     - ::action:: (colon-wrapped actions)
     - (action) when on its own line or at sentence boundaries
     - Multiple consecutive whitespace normalized
-    
+
     Args:
         text: The raw LLM response text
-        
+
     Returns:
         Clean text suitable for TTS
     """
     if not text:
         return text
-    
+
     # Remove *action* patterns (asterisk-wrapped)
     # Matches: *smiles warmly*, *pauses*, etc.
     text = re.sub(r'\*[^*]+\*', '', text)
-    
+
     # Remove ::action:: patterns (colon-wrapped, less common)
     text = re.sub(r'::[^:]+::', '', text)
-    
+
     # Remove standalone (action) patterns (parentheses on their own)
     # Only remove if it's the whole line or at sentence boundaries
     # Be careful not to remove legitimate parenthetical content
     text = re.sub(r'^\s*\([^)]+\)\s*$', '', text, flags=re.MULTILINE)
-    
+
     # Normalize multiple spaces/newlines
     text = re.sub(r'[ \t]+', ' ', text)
     text = re.sub(r'\n{3,}', '\n\n', text)
-    
+
     # Strip leading/trailing whitespace
     text = text.strip()
-    
+
     return text
 
 
 class StreamingEmoteFilter:
     """Buffer-based filter for stripping *emotes* from streaming text.
-    
+
     Handles cases where emote markers span chunk boundaries by buffering
     text between asterisks until we know if it's an emote or not.
-    
+
     Usage:
         filter = StreamingEmoteFilter()
         for chunk in stream:
@@ -747,19 +641,19 @@ class StreamingEmoteFilter:
         if final:
             yield final
     """
-    
+
     def __init__(self):
         self.buffer = ""
         self.in_emote = False
-    
+
     def process(self, chunk: str) -> str:
         """Process a chunk and return filtered text.
-        
+
         Returns text that is safe to emit. May buffer text that could
         be part of an emote until we know for sure.
         """
         result = []
-        
+
         for char in chunk:
             if char == '*':
                 if self.in_emote:
@@ -786,12 +680,12 @@ class StreamingEmoteFilter:
             else:
                 # Normal character outside emote
                 result.append(char)
-        
+
         return ''.join(result)
-    
+
     def flush(self) -> str:
         """Flush any remaining buffered content.
-        
+
         Call this when the stream ends to get any remaining text.
         """
         if self.in_emote and self.buffer:

@@ -30,7 +30,7 @@ class AgentBackend(ABC):
         Args:
             prompt: The user's message.
             config: Backend-specific configuration from bot's
-                ``agent_backend_config`` in bots.yaml.
+                ``agent_backend_config`` in bot_profiles DB.
             stream: Whether streaming is requested (reserved for future use).
 
         Returns:

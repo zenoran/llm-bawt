@@ -195,7 +195,8 @@ class ModelManager:
                 console.print(f"[bold green]Successfully processed config: {', '.join(messages)}.[/bold green]")
             else:
                 console.print(f"[green]Config saved to {self.config_path}.[/green]")
-            self.config._load_models_config()
+            # Re-merge DB models so config.defined_models stays in sync
+            self._merge_db_models()
             return True
         except Exception as e:
             console.print(f"[bold red]Error saving configuration to {self.config_path}:[/bold red] {e}")
@@ -374,7 +375,7 @@ class ModelManager:
         if updated_count or added_count:
             save_ok = self.save_config(added=added_count, updated=updated_count)
             if save_ok:
-                self.config._load_models_config()
+                self._merge_db_models()
                 if provider_type == PROVIDER_OLLAMA:
                     self.config.force_ollama_check()
             return save_ok
@@ -923,7 +924,7 @@ def delete_model(alias: str, config: Config, service_client=None) -> bool:
 
     delete_ok = manager.delete_model_alias(alias)
     if delete_ok:
-        config._load_models_config()
+        manager._merge_db_models()
         # Avoid probing Ollama during unrelated operations.
         # Ollama connectivity/model checks happen only when explicitly refreshing Ollama models.
         

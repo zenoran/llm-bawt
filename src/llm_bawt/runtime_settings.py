@@ -1,7 +1,7 @@
 """Runtime settings storage and resolution.
 
 Supports layered runtime tuning with precedence:
-request overrides > bot DB settings > global DB settings > bot.yaml settings > Config fallback.
+request overrides > bot DB settings > global DB settings > Config fallback.
 """
 
 from __future__ import annotations
@@ -669,7 +669,7 @@ class RuntimeSettingsStore:
 
 
 class ModelDefinition(SQLModel, table=True):
-    """DB-backed model definition — mirrors models.yaml but DB takes priority."""
+    """DB-backed model definition — sole source of model configuration."""
 
     __tablename__ = "model_definitions"
 
@@ -711,7 +711,7 @@ class ModelDefinition(SQLModel, table=True):
 
 
 class ModelDefinitionStore:
-    """DB access for model definitions. DB always takes priority over models.yaml."""
+    """DB access for model definitions (sole source of truth)."""
 
     def __init__(self, config: Config):
         self.config = config
@@ -878,10 +878,6 @@ class RuntimeSettingsResolver:
             return self._bot_cache[key]
         if key in self._global_cache:
             return self._global_cache[key]
-
-        bot_settings = getattr(self.bot, "settings", {}) if self.bot else {}
-        if isinstance(bot_settings, dict) and key in bot_settings:
-            return bot_settings[key]
 
         if fallback is not None:
             return fallback

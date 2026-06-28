@@ -30,7 +30,7 @@ class PromptSection:
         position: Sort order (lower = earlier in prompt). Default sections:
             0: user_context (About the User)
             1: bot_traits (Bot's developed personality)
-            2: base_prompt (Bot's system_prompt from bots.yaml)
+            2: base_prompt (Bot's system_prompt from bot_profiles DB)
             3: memory_context (Retrieved memories - non-tool bots)
             4: tools (Tool calling instructions - tool bots)
         metadata: Optional extra data (e.g., source, confidence)

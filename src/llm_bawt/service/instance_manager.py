@@ -179,7 +179,7 @@ class InstanceManagerMixin:
         Priority:
         1. Agent-backend bots are locked to their backend model
         2. Explicit requested model (if available on service)
-        3. Bot's default_model (from bots.yaml / DB)
+        3. Bot's default_model (from bot_profiles DB)
         4. Service default model
         5. First available model (with warning)
 

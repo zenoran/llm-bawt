@@ -1,8 +1,8 @@
 """Nextcloud Talk bot configuration management.
 
-Nextcloud bot configs are stored in the bots.yaml files under the 'nextcloud' key.
-User config (~/.config/llm-bawt/bots.yaml) takes priority over repo config.
-This module uses the centralized bot config loader from llm_bawt.bots.
+Nextcloud bot configs are stored in the bot_profiles DB table under the
+nextcloud_config JSONB column. This module uses the centralized bot config
+loader from llm_bawt.bots.
 """
 
 from dataclasses import dataclass
@@ -18,7 +18,7 @@ from llm_bawt.bots import (
 @dataclass
 class NextcloudBot:
     """Configuration for a single Nextcloud Talk bot."""
-    llm_bawt_bot: str  # The bot ID in bots.yaml
+    llm_bawt_bot: str  # The bot slug in bot_profiles
     nextcloud_bot_id: int
     secret: str
     conversation_token: str
@@ -32,12 +32,9 @@ class NextcloudBot:
 
 class NextcloudBotConfig:
     """Manages Nextcloud bot configuration.
-    
-    Uses the centralized bot config loader which merges:
-    - Repo bots.yaml (defaults)
-    - User bots.yaml (~/.config/llm-bawt/bots.yaml) (overrides)
-    
-    Writes ONLY to user bots.yaml to keep secrets out of repo.
+
+    Uses the centralized bot config loader which reads from the
+    bot_profiles DB table. Config is persisted via BotProfileStore.
     """
 
     def __init__(self, bots_yaml_path=None):
@@ -95,7 +92,7 @@ class NextcloudBotConfig:
     ) -> NextcloudBot:
         """Add Nextcloud config to a bot.
         
-        Saves to ~/.config/llm-bawt/bots.yaml (user config, not repo).
+        Saves to bot_profiles DB table via BotProfileStore.
         """
         nc_data = {
             'bot_id': nextcloud_bot_id,
