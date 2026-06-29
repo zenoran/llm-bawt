@@ -872,7 +872,8 @@ async def _dispatch_bot_message(
                 f"Target bot did not respond within {timeout_seconds:.0f}s. "
                 "The request is likely still being processed server-side. "
                 "DO NOT RETRY — that will cause the target bot to receive the message twice. "
-                "Use fire_and_forget=True for long-running work, or increase timeout_seconds."
+                "For long-running work, omit wait_for_reply (the send is async by default) "
+                "or increase timeout_seconds."
             ),
             "content": "",
             "bot_id": target_bot_id,
@@ -920,17 +921,21 @@ async def send_message_to_bot(
     sender_bot_id: str = "unknown",
     max_tokens: int | None = None,
     temperature: float = 0.7,
-    fire_and_forget: bool = False,
+    fire_and_forget: bool | None = None,
     timeout_seconds: float = 300.0,
     force: bool = False,
+    wait_for_reply: bool = False,
 ) -> dict:
     """Send a message to another bot.
 
-    By default, waits for the target bot's full response (up to
-    `timeout_seconds`). For long-running work where you only need to
-    kick off the target bot and continue your own work, set
-    `fire_and_forget=True` — the call returns immediately and the
-    target bot processes the message in the background.
+    By default this is ASYNC: the message is dispatched and the call returns
+    immediately, while the target bot processes it in the background. This is
+    almost always what you want for a hand-off ("go do X") — you don't block,
+    and there's no timeout to trip over.
+
+    Waiting for a reply is OPT-IN: pass `wait_for_reply=True` only when you
+    actually need the target bot's response text back in the same call (it
+    blocks up to `timeout_seconds`).
 
     If the target bot is already mid-turn, the message is NOT sent and a
     `{success: False, sent: False, in_turn: True}` result is returned —
@@ -944,13 +949,15 @@ async def send_message_to_bot(
         sender_bot_id: The bot slug of the sender (for context).
         max_tokens: Maximum tokens for the response.
         temperature: Temperature for the response generation.
-        fire_and_forget: If True, dispatch the message and return
-            immediately without waiting for the response. Use this
-            when you want the target bot to do work asynchronously.
-        timeout_seconds: How long to wait for a response in non-
-            fire-and-forget mode. Defaults to 300s. The previous
-            30s default caused duplicate-turn bugs when the target
-            bot took longer than that.
+        wait_for_reply: If True, block and return the target bot's full
+            response (up to `timeout_seconds`). Defaults to False — the
+            send is async and returns immediately with `dispatched: True`.
+        fire_and_forget: Deprecated alias kept for backward compatibility.
+            Leave unset to get the async default. If explicitly set, it is
+            honored: `fire_and_forget=True` forces async, and the legacy
+            `fire_and_forget=False` is treated as `wait_for_reply=True`.
+        timeout_seconds: How long to wait for a response when
+            `wait_for_reply=True`. Defaults to 300s.
         force: If True, send even when the target bot is mid-turn.
 
     Returns:
@@ -958,15 +965,25 @@ async def send_message_to_bot(
           - 'success' (bool)
           - 'bot_id' (target), 'sender' (sender_bot_id)
         For waited calls: 'content' (response text), 'response_model'.
-        For fire-and-forget: 'dispatched' (True), 'content' empty.
+        For async sends (the default): 'dispatched' (True), 'content' empty.
         When blocked: 'success' False, 'sent' False, 'in_turn' True, plus
         the active 'turn_id'/'turn_status' so the caller can retry later.
-        On timeout: 'error' = 'timeout', 'in_flight' = True, 'warning'
-        explaining that the caller MUST NOT retry.
+        On timeout (waited calls only): 'error' = 'timeout', 'in_flight'
+        = True, 'warning' explaining that the caller MUST NOT retry.
     """
+    # Resolve the effective mode. Default is async (fire-and-forget); waiting
+    # is opt-in via wait_for_reply. The legacy `fire_and_forget` flag is still
+    # honored when explicitly passed so existing callers don't change behavior.
+    if wait_for_reply:
+        do_wait = True
+    elif fire_and_forget is not None:
+        do_wait = not fire_and_forget  # legacy: fire_and_forget=False meant "wait"
+    else:
+        do_wait = False  # new default: async
+
     logger.debug(
-        "MCP tool invoked: send_message_to_bot target=%s sender=%s fire_and_forget=%s force=%s",
-        target_bot_id, sender_bot_id, fire_and_forget, force,
+        "MCP tool invoked: send_message_to_bot target=%s sender=%s do_wait=%s force=%s",
+        target_bot_id, sender_bot_id, do_wait, force,
     )
 
     # Gate on target turn state unless forced.  Single source of truth is the
@@ -1022,7 +1039,7 @@ async def send_message_to_bot(
         "stream": False,
     }
 
-    if fire_and_forget:
+    if not do_wait:
         import asyncio
 
         # Use a generous timeout for the background task; we don't surface
