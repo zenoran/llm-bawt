@@ -2,16 +2,14 @@ services:
   app:
     build:
       context: .
-      dockerfile: Dockerfile
-      args:
-        WITH_CUDA: ${WITH_CUDA:-true}
-        CUDA_ARCHS: ${CUDA_ARCHS:-120}
+      dockerfile: Dockerfile.app
     # GPU removed (TASK-278): in-process local inference moved to the
     # local-model-bridge service, so the app reserves no GPU device, needs no
     # ipc:host (that existed only for the vLLM multiprocess shared-memory
     # engine) and drops the nvidia-ctk apparmor opt. The app runs CPU-only.
-    # NOTE: the build still uses the GPU Dockerfile until TASK-278 Wave B
-    # (gated on TASK-277) gives the app its own CPU-only image.
+    # Wave B: the app now builds from the dedicated CPU-only Dockerfile.app
+    # (no torch / sentence-transformers / llama-cpp / vllm). local-model-bridge
+    # keeps the GPU `Dockerfile`.
     container_name: llm-bawt-app
     env_file:
       - ./.env
