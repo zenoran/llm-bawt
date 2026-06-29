@@ -40,3 +40,9 @@ services:
   codex-bridge:
     volumes:
       - ./src:/app/src
+
+  # Dev: mount src so the embed server / bridge code (TASK-277) deploys on a
+  # restart without rebuilding the heavy CUDA image.
+  local-model-bridge:
+    volumes:
+      - ./src:/app/src

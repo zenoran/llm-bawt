@@ -8,8 +8,11 @@ Environment:
     LLM_BAWT_API_URL                   — main app base URL for /v1/models calls
     LOCAL_MODEL_BACKEND_NAME           — backend filter on commands stream (default 'local')
     LOCAL_MODEL_BRIDGE_HEALTH_PORT     — TCP port for /health (default 8683)
+    LOCAL_MODEL_BRIDGE_EMBED_PORT      — TCP port for the /embed API (default 8684)
     LOCAL_MODEL_BRIDGE_LOG_LEVEL       — log level (default INFO)
     LOCAL_MODEL_BRIDGE_REQUEST_TIMEOUT — per-call generation timeout, seconds (default 1800)
+    LOCAL_MODEL_EMBED_MODEL            — sentence-transformers model (default all-MiniLM-L6-v2)
+    LOCAL_MODEL_EMBED_DEVICE           — embed model device (default "cpu")
 """
 
 from __future__ import annotations
@@ -86,12 +89,14 @@ def main() -> None:
     )
 
     health_port = int(os.getenv("LOCAL_MODEL_BRIDGE_HEALTH_PORT", "8683"))
+    embed_port = int(os.getenv("LOCAL_MODEL_BRIDGE_EMBED_PORT", "8684"))
 
     logger.info(
-        "Starting local-model bridge (backend=%s, app_api_url=%s, health_port=%d)",
+        "Starting local-model bridge (backend=%s, app_api_url=%s, health_port=%d, embed_port=%d)",
         bridge.backend_name,
         os.getenv("LLM_BAWT_API_URL", ""),
         health_port,
+        embed_port,
     )
 
     async def _run() -> None:
@@ -101,14 +106,21 @@ def main() -> None:
         for sig in (signal.SIGINT, signal.SIGTERM):
             loop.add_signal_handler(sig, shutdown_event.set)
 
+        # Embed API (TASK-277): MiniLM lives here now; the app POSTs to /embed.
+        # Imported lazily so a sentence-transformers/fastapi import error can't
+        # stop the chat bridge from starting.
+        from .embed_server import serve_embed
+
         health_task = asyncio.create_task(_health_server(publisher, health_port))
         bridge_task = asyncio.create_task(bridge.run_forever())
+        embed_task = asyncio.create_task(serve_embed(embed_port))
 
         await shutdown_event.wait()
         logger.info("Shutting down...")
 
         bridge_task.cancel()
         health_task.cancel()
+        embed_task.cancel()
         await bridge.stop()
 
     try:

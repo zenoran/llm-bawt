@@ -22,6 +22,10 @@ services:
       # ~/.config/llm-bawt mount. One-time setup in docs/usage-endpoint.md.
       - CLAUDE_USAGE_CREDENTIALS_PATH=/root/.config/llm-bawt/claude-usage/.credentials.json
       - CLAUDE_USAGE_CREDENTIALS_MODE=owned
+      # TASK-277: memory embeddings now POST to the local-model-bridge /embed
+      # endpoint instead of loading MiniLM in-process. On the compose network
+      # the bridge is reachable by service name; no host port publish needed.
+      - LOCAL_MODEL_EMBED_URL=http://local-model-bridge:8684
     ports:
       - "${MCP_PORT:-8001}:8001"
       - "${SERVICE_PORT:-8642}:8642"
@@ -288,6 +292,11 @@ services:
       - LOCAL_MODEL_BACKEND_NAME=${LOCAL_MODEL_BACKEND_NAME:-local}
       - LOCAL_MODEL_BRIDGE_LOG_LEVEL=${LOCAL_MODEL_BRIDGE_LOG_LEVEL:-INFO}
       - LOCAL_MODEL_BRIDGE_HEALTH_PORT=8683
+      # TASK-277: MiniLM embedding API (the app POSTs here). CPU by default —
+      # MiniLM is tiny and this keeps embeddings off the contended GPU and
+      # independent of NVML/CUDA state.
+      - LOCAL_MODEL_BRIDGE_EMBED_PORT=8684
+      - LOCAL_MODEL_EMBED_DEVICE=${LOCAL_MODEL_EMBED_DEVICE:-cpu}
       - LOCAL_MODEL_BRIDGE_REQUEST_TIMEOUT=${LOCAL_MODEL_BRIDGE_REQUEST_TIMEOUT:-1800}
       # Load all layers onto the GPU by default (matches the app's prior local
       # inference behavior).
