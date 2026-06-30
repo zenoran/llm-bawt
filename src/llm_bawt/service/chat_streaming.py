@@ -1131,6 +1131,7 @@ class ChatStreamingMixin:
                     "tool_name": chunk.get("tool_name", ""),
                     "arguments": tool_args,
                     "subject": chunk.get("subject", ""),
+                    "label": chunk.get("label", ""),
                     "prompt": chunk.get("prompt", ""),
                     "severity": chunk.get("severity", "medium"),
                     "policy_id": chunk.get("policy_id"),

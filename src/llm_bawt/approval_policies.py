@@ -32,6 +32,7 @@ from agent_bridge.approval import (
     PolicyBundle,
     Severity,
     compute_etag,
+    humanize_subject,
 )
 
 from .utils.config import Config, has_database_credentials
@@ -212,6 +213,7 @@ class ToolApprovalRequest(SQLModel, table=True):
             "tool_name": self.tool_name,
             "tool_arguments": args,
             "subject": self.subject,
+            "label": humanize_subject(self.subject or ""),
             "grant_key": self.grant_key,
             "policy_id": self.policy_id,
             "severity": self.severity,

@@ -161,6 +161,106 @@ def _normalize_subject(subject: str) -> str:
     return re.sub(r"\s+", " ", subject).strip()
 
 
+def humanize_subject(subject: str) -> str:
+    """Derive a short, human-readable label from a raw approval subject.
+
+    Strips SSH wrappers, output piping, cd prefixes, and multi-command chains
+    to surface the primary operation — e.g. ``"bawthub › make rebuild-prod"``
+    instead of ``ssh nick@172.18.0.1 "cd /home/nick/dev/bawthub && make
+    rebuild-prod" 2>&1 | tail -20``.
+
+    Pure function — no I/O, no side effects.
+    """
+    if not subject or not subject.strip():
+        return ""
+
+    s = re.sub(r"\s+", " ", subject).strip()
+
+    # ── project detection (from path or container name) ──────────────
+    project = ""
+    for frag, name in (
+        ("dev/bawthub", "bawthub"),
+        ("dev/llm-bawt", "llm-bawt"),
+        ("dev/agent-skills", "agent-skills"),
+    ):
+        if frag in s:
+            project = name
+            break
+    if not project:
+        for frag, name in (
+            ("bawthub-frontend", "bawthub"),
+            ("bawthub-traefik", "bawthub"),
+            ("llm-bawt-app", "llm-bawt"),
+            ("llm-bawt-claude", "llm-bawt"),
+        ):
+            if frag in s:
+                project = name
+                break
+
+    def _label(op: str) -> str:
+        return f"{project} › {op}" if project else op
+
+    # ── make target ──────────────────────────────────────────────────
+    m = re.search(r"\bmake\s+([\w][\w-]*)", s)
+    if m:
+        return _label(f"make {m.group(1)}")
+
+    # ── docker compose <action> [service] ────────────────────────────
+    m = re.search(
+        r"\bdocker(?:\s+|-)?compose\b[^|;&]*?"
+        r"\b(up|down|restart|stop|start|build|logs|ps|config|rm|pull)\b"
+        r"([^|;&]*)",
+        s,
+    )
+    if m:
+        action = m.group(1)
+        rest_tokens = m.group(2).split()
+        service = ""
+        for tok in rest_tokens:
+            bare = tok.strip("\"'")
+            if bare.startswith("-"):
+                continue
+            if re.match(r"^2?>&?\d?$", bare):
+                break
+            if re.match(r"^[\w][\w.-]*$", bare):
+                service = bare
+                break
+        op = f"docker compose {action}" + (f" {service}" if service else "")
+        return _label(op)
+
+    # ── docker <verb> <container> ────────────────────────────────────
+    m = re.search(
+        r"\bdocker\s+(restart|stop|start|kill|rm|run|exec|inspect|logs|images)"
+        r"\s+([\w][\w.-]*)",
+        s,
+    )
+    if m:
+        return _label(f"docker {m.group(1)} {m.group(2)}")
+
+    # ── git ──────────────────────────────────────────────────────────
+    m = re.search(
+        r"\bgit\s+(checkout|switch|push|pull|merge|rebase|reset|commit|add|branch)"
+        r"\b(.*?)(?:\s*[;&|]|\s*$)",
+        s,
+        re.DOTALL,
+    )
+    if m:
+        args = re.sub(r"\s+", " ", m.group(2)).strip()
+        if len(args) > 40:
+            args = args[:37] + "…"
+        op = f"git {m.group(1)}" + (f" {args}" if args else "")
+        return _label(op)
+
+    # ── python scripts ───────────────────────────────────────────────
+    if re.match(r"(?:python3?|\.venv)", s):
+        return _label("python script")
+
+    # ── fallback: truncate ───────────────────────────────────────────
+    if len(s) > 72:
+        return s[:69] + "…"
+    return s
+
+
 def grant_key(backend: str, tool_name: str, subject: str) -> str:
     """Stable hash identifying one approved (backend, tool, command) triple.
 
@@ -278,6 +378,7 @@ class ApprovalDecision:
     severity: Severity = Severity.MEDIUM
     prompt: str = ""
     grant_key: str = ""
+    label: str = ""
 
     @property
     def requires_approval(self) -> bool:
@@ -327,6 +428,7 @@ def evaluate(
             severity=policy.severity,
             prompt=prompt,
             grant_key=grant_key(backend, tool_name, subject),
+            label=humanize_subject(subject),
         )
 
     # No policy matched → default allow. Derive the subject once for the key so
@@ -337,6 +439,7 @@ def evaluate(
         subject=subject,
         policy=None,
         grant_key=grant_key(backend, tool_name, subject),
+        label=humanize_subject(subject),
     )
 
 

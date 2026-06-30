@@ -1845,6 +1845,7 @@ class ClaudeCodeBridge:
                     "severity": decision.severity.value,
                     "category": getattr(decision.policy, "category", None),
                     "subject": decision.subject,
+                    "label": decision.label,
                     "prompt": decision.prompt,
                     "grant_key": decision.grant_key,
                     "action": decision.action.value,
