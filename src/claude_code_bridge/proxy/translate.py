@@ -227,7 +227,15 @@ def _assistant_content_to_responses(content: Any) -> list[dict]:
             items.append({
                 "type": "function_call",
                 "name": block.get("name") or "",
-                "arguments": json.dumps(tool_input) if not isinstance(tool_input, str) else tool_input,
+                # sort_keys + compact separators so replayed history is
+                # byte-stable regardless of SDK dict-key ordering.  Without
+                # this, a key-order shuffle between turns busts the upstream
+                # prompt cache at this input item.
+                "arguments": (
+                    json.dumps(tool_input, sort_keys=True, separators=(",", ":"))
+                    if not isinstance(tool_input, str)
+                    else tool_input
+                ),
                 "call_id": block.get("id") or "",
             })
     flush_text()
@@ -239,6 +247,9 @@ def _tools_to_responses(tools: list[dict] | None) -> list[dict] | None:
 
     Anthropic:  {name, description, input_schema}
     Responses:  {type:"function", name, description, parameters}
+
+    The converted list is sorted by tool name so the cache prefix stays
+    byte-stable even if the Claude SDK reorders tools between turns.
     """
     if not tools:
         return None
@@ -258,7 +269,12 @@ def _tools_to_responses(tools: list[dict] | None) -> list[dict] | None:
         if params is not None:
             item["parameters"] = params
         converted.append(item)
-    return converted or None
+    if not converted:
+        return None
+    # Deterministic ordering: sort by tool name so an SDK-side reorder
+    # doesn't bust the upstream prompt cache.
+    converted.sort(key=lambda t: t.get("name") or "")
+    return converted
 
 
 def anthropic_to_responses(body: dict, upstream_model: str) -> dict:

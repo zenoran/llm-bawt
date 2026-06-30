@@ -557,3 +557,71 @@ def test_heartbeat_injects_pings_without_extending_stream() -> None:
     assert reals == [b"A\n\n", b"B\n\n"]
     assert len(pings) >= 2
     assert out[-1] == b"B\n\n"  # stream ends on a real frame, never a trailing ping
+
+
+# ── prefix canonicalization (TASK-287) ────────────────────────────────────────
+
+def test_translate_function_call_arguments_are_sort_key_canonical() -> None:
+    """Tool-use arguments must be serialized with sort_keys + compact separators
+    so replayed history is byte-stable regardless of SDK dict-key ordering."""
+    body_a = {
+        "model": "openai_chatgpt/gpt-5.4",
+        "system": "test",
+        "messages": [
+            {"role": "user", "content": "go"},
+            {"role": "assistant", "content": [
+                {"type": "tool_use", "id": "tu_1", "name": "Bash",
+                 "input": {"command": "ls", "description": "list", "timeout": 5000}},
+            ]},
+            {"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "tu_1", "content": "ok"},
+            ]},
+        ],
+    }
+    # Same body but with dict keys in different insertion order.
+    body_b = {
+        "model": "openai_chatgpt/gpt-5.4",
+        "system": "test",
+        "messages": [
+            {"role": "user", "content": "go"},
+            {"role": "assistant", "content": [
+                {"type": "tool_use", "id": "tu_1", "name": "Bash",
+                 "input": {"timeout": 5000, "command": "ls", "description": "list"}},
+            ]},
+            {"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "tu_1", "content": "ok"},
+            ]},
+        ],
+    }
+
+    result_a = anthropic_to_responses(body_a, "gpt-5.4")
+    result_b = anthropic_to_responses(body_b, "gpt-5.4")
+
+    fc_a = next(i for i in result_a["input"] if i.get("type") == "function_call")
+    fc_b = next(i for i in result_b["input"] if i.get("type") == "function_call")
+
+    # Must be byte-identical regardless of input key order.
+    assert fc_a["arguments"] == fc_b["arguments"]
+    # Must use compact separators (no spaces after colons/commas).
+    assert " " not in fc_a["arguments"]
+    # Must be sorted.
+    assert fc_a["arguments"] == '{"command":"ls","description":"list","timeout":5000}'
+
+
+def test_translate_tools_array_sorted_by_name() -> None:
+    """Tools must be sorted by name so an SDK-side reorder doesn't bust the
+    upstream prompt cache."""
+    body = {
+        "model": "openai_chatgpt/gpt-5.4",
+        "system": "test",
+        "messages": [{"role": "user", "content": "go"}],
+        "tools": [
+            {"name": "Write", "description": "Write file", "input_schema": {"type": "object"}},
+            {"name": "Bash", "description": "Run bash", "input_schema": {"type": "object"}},
+            {"name": "Read", "description": "Read file", "input_schema": {"type": "object"}},
+        ],
+    }
+
+    result = anthropic_to_responses(body, "gpt-5.4")
+    names = [t["name"] for t in result["tools"]]
+    assert names == ["Bash", "Read", "Write"]
