@@ -24,6 +24,7 @@ from __future__ import annotations
 import logging
 import os
 import uuid
+from datetime import datetime, timezone
 from typing import TYPE_CHECKING
 
 # Suppress noisy MCP library session lifecycle logging
@@ -77,6 +78,56 @@ mcp.settings.log_level = "WARNING"
 def _get_storage():
     from llm_bawt.mcp_server.storage import get_storage
     return get_storage()
+
+
+def _parse_timestamp(value: str | float | int | None) -> float | None:
+    """Convert a flexible date/time input to a Unix timestamp (float).
+
+    Accepts:
+      - None → None
+      - float/int → returned as-is (assumed Unix seconds)
+      - ISO-8601 date string: "2026-06-01" → start of that day UTC
+      - ISO-8601 datetime: "2026-06-01T14:30:00" → that moment UTC
+      - ISO-8601 with tz: "2026-06-01T14:30:00-04:00" → converted to UTC
+
+    Raises ValueError on unparseable strings.
+    """
+    if value is None:
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
+    if not isinstance(value, str):
+        return None
+
+    s = value.strip()
+    if not s:
+        return None
+
+    # Try as a bare number first (Unix seconds passed as a string).
+    try:
+        return float(s)
+    except ValueError:
+        pass
+
+    # Try ISO-8601 datetime formats
+    for fmt in (
+        "%Y-%m-%dT%H:%M:%S%z",
+        "%Y-%m-%dT%H:%M:%S.%f%z",
+        "%Y-%m-%dT%H:%M:%S",
+        "%Y-%m-%dT%H:%M",
+        "%Y-%m-%d %H:%M:%S",
+        "%Y-%m-%d %H:%M",
+        "%Y-%m-%d",
+    ):
+        try:
+            dt = datetime.strptime(s, fmt)
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            return dt.timestamp()
+        except ValueError:
+            continue
+
+    raise ValueError(f"Cannot parse timestamp: {value!r}")
 
 
 # ---------------------------------------------------------------------------
@@ -210,8 +261,8 @@ async def search_all_messages(
     query: str,
     n_results: int = 10,
     role_filter: str | None = None,
-    since: float | None = None,
-    until: float | None = None,
+    since: str | float | None = None,
+    until: str | float | None = None,
     sort_by: str = "relevance",
     bot_id: str | None = None,
 ) -> list[dict]:
@@ -226,8 +277,11 @@ async def search_all_messages(
         n_results: Maximum total results across all bots.
         role_filter: Only include messages with this role (user/assistant).
                      System messages are always excluded.
-        since: Only include messages at or after this Unix timestamp.
-        until: Only include messages at or before this Unix timestamp.
+        since: Only include messages at or after this time.
+              Accepts ISO date ("2026-06-01"), ISO datetime
+              ("2026-06-01T14:30:00"), or Unix timestamp (1782857172.0).
+        until: Only include messages at or before this time.
+              Same formats as ``since``.
         sort_by: "relevance" (default; rank then recency) or "recent"
                  (recency only, ignores rank).
         bot_id: Restrict search to a single bot's history (e.g. "snark").
@@ -243,8 +297,8 @@ async def search_all_messages(
         query=query,
         n_results=n_results,
         role_filter=role_filter,
-        since=since,
-        until=until,
+        since=_parse_timestamp(since),
+        until=_parse_timestamp(until),
         sort_by=sort_by,
         bot_id=bot_id,
     )

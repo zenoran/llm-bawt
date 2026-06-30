@@ -1289,13 +1289,19 @@ async def search_all_history(
             "hit (e.g. '/new' in a chat history)."
         ),
     ),
-    since: float | None = Query(
+    since: str | None = Query(
         None,
-        description="Lower-bound timestamp (inclusive Unix seconds). Omit for unbounded history.",
+        description=(
+            "Lower-bound (inclusive). Accepts ISO date ('2026-06-01'), "
+            "ISO datetime ('2026-06-01T14:30:00'), or Unix seconds (1782857172.0). "
+            "Omit for unbounded history."
+        ),
     ),
-    until: float | None = Query(
+    until: str | None = Query(
         None,
-        description="Upper-bound timestamp (inclusive Unix seconds). Omit for now.",
+        description=(
+            "Upper-bound (inclusive). Same formats as ``since``. Omit for now."
+        ),
     ),
 ):
     """Cross-bot message search.
@@ -1321,7 +1327,14 @@ async def search_all_history(
     HTTP-exposed endpoint of the Spotlight Search project's Messages
     provider.
     """
+    from llm_bawt.mcp_server.server import _parse_timestamp
     from llm_bawt.mcp_server.storage import get_storage
+
+    try:
+        since_ts = _parse_timestamp(since)
+        until_ts = _parse_timestamp(until)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     try:
         storage = get_storage()
@@ -1331,8 +1344,8 @@ async def search_all_history(
                 n_results=limit,
                 role_filter=role_filter,
                 sort_by=sort_by,
-                since=since,
-                until=until,
+                since=since_ts,
+                until=until_ts,
             )
         else:
             # Default / legacy / explicit "fts" all route to the original
@@ -1343,8 +1356,8 @@ async def search_all_history(
                 n_results=limit,
                 role_filter=role_filter,
                 sort_by=sort_by,
-                since=since,
-                until=until,
+                since=since_ts,
+                until=until_ts,
             )
         messages = [
             HistorySearchAllMessage(
