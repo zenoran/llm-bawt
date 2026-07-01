@@ -1,0 +1,102 @@
+# docker-compose.prod.yml — self-contained, CPU-only tenant stack.
+#
+# This is the repaveable "prod" artifact (tasks #2/#3). Unlike docker-compose.yml
+# (dev-flavored: local builds + $HOME bind mounts), this file:
+#   * pulls immutable images from ghcr.io/bawthub/* (no build)
+#   * carries ZERO host bind mounts — all state lives in named volumes + the
+#     in-stack Postgres, so the compute can be repaved without data restore
+#   * bundles its OWN Postgres (pgvector) so a tenant is fully isolated; there
+#     is no shared/external DB
+#
+# Deliberately minimal for instance #1's first boot: postgres + redis + app.
+# Voice (OpenAI STT), agent bridges, crawl4ai/playwright come in later profiles
+# once the app+DB bootstrap path is proven clean.
+#
+# Requires a sibling .env (see the LLM_BAWT_POSTGRES_PASSWORD below).
+
+services:
+  postgres:
+    image: pgvector/pgvector:pg16
+    container_name: bawthub-postgres
+    environment:
+      - POSTGRES_USER=${LLM_BAWT_POSTGRES_USER:-llm_bawt}
+      - POSTGRES_PASSWORD=${LLM_BAWT_POSTGRES_PASSWORD:?set LLM_BAWT_POSTGRES_PASSWORD in .env}
+      - POSTGRES_DB=${LLM_BAWT_POSTGRES_DATABASE:-llm_bawt}
+    volumes:
+      - pg-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${LLM_BAWT_POSTGRES_USER:-llm_bawt}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  redis:
+    image: redis:7-alpine
+    container_name: bawthub-redis
+    command: ["redis-server", "--maxmemory", "128mb", "--maxmemory-policy", "allkeys-lru"]
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+    restart: unless-stopped
+
+  app:
+    image: ghcr.io/bawthub/app:${IMAGE_TAG:-latest}
+    container_name: bawthub-app
+    env_file:
+      - ./.env
+    environment:
+      # Bind the service to all interfaces so the published port is reachable
+      # from outside the container (default is 127.0.0.1 = loopback-only, which
+      # makes the -p publish reset the connection).
+      - LLM_BAWT_SERVICE_HOST=0.0.0.0
+      # Point the app at the in-stack Postgres (reachable by service name).
+      - LLM_BAWT_POSTGRES_HOST=postgres
+      - LLM_BAWT_POSTGRES_PORT=5432
+      - LLM_BAWT_POSTGRES_USER=${LLM_BAWT_POSTGRES_USER:-llm_bawt}
+      - LLM_BAWT_POSTGRES_PASSWORD=${LLM_BAWT_POSTGRES_PASSWORD:?set LLM_BAWT_POSTGRES_PASSWORD in .env}
+      - LLM_BAWT_POSTGRES_DATABASE=${LLM_BAWT_POSTGRES_DATABASE:-llm_bawt}
+      - REDIS_URL=redis://redis:6379/0
+    ports:
+      - "${MCP_PORT:-8001}:8001"
+      - "${SERVICE_PORT:-8642}:8642"
+    volumes:
+      # Named volumes, not host mounts — portable + repaveable.
+      - app-config:/root/.config/llm-bawt
+      - app-storage:/app/storage
+      - app-logs:/app/.logs
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+
+  frontend:
+    image: ghcr.io/bawthub/frontend:${FRONTEND_TAG:-latest}
+    container_name: bawthub-frontend
+    environment:
+      # Server-side calls to the LLM backend go to the in-stack app service.
+      - BAWTHUB_LLM_URL=http://app:8642
+      # Frontend's own Prisma DB — points at the in-stack Postgres for now.
+      - DATABASE_URL=postgresql://${LLM_BAWT_POSTGRES_USER:-llm_bawt}:${LLM_BAWT_POSTGRES_PASSWORD:?set LLM_BAWT_POSTGRES_PASSWORD in .env}@postgres:5432/${LLM_BAWT_POSTGRES_DATABASE:-llm_bawt}
+      - STORAGE_BACKEND=fs
+    ports:
+      - "3000:3000"
+    depends_on:
+      app:
+        condition: service_started
+      postgres:
+        condition: service_healthy
+    restart: unless-stopped
+
+volumes:
+  pg-data:
+  redis-data:
+  app-config:
+  app-storage:
+  app-logs:
