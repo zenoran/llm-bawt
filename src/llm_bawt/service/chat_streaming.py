@@ -310,6 +310,10 @@ class ChatStreamingMixin:
                 elif event.kind == AgentEventKind.ASSISTANT_DONE:
                     # ASSISTANT_DONE carries the complete response text.
                     # Yield any portion not already streamed as deltas.
+                    # Capture token_usage from agent backends (bridge sends it
+                    # on ASSISTANT_DONE, not as a separate token_usage event).
+                    if event.token_usage and isinstance(event.token_usage, dict):
+                        token_usage_holder[0] = event.token_usage
                     done_text = event.text or ""
                     if done_text:
                         accumulated = "".join(full_text_parts)
