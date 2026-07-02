@@ -61,6 +61,17 @@ services:
       - LLM_BAWT_POSTGRES_PASSWORD=${LLM_BAWT_POSTGRES_PASSWORD:?set LLM_BAWT_POSTGRES_PASSWORD in .env}
       - LLM_BAWT_POSTGRES_DATABASE=${LLM_BAWT_POSTGRES_DATABASE:-llm_bawt}
       - REDIS_URL=redis://redis:6379/0
+      # Memory embeddings (TASK-277) POST to this CPU endpoint. Optional for
+      # boot: if unset/unreachable the stack still comes up; only memory/vector
+      # writes degrade until an embed service is present. Default points at an
+      # in-stack CPU embed service (add later — see TASK-346); a tenant may also
+      # point it at any reachable embed endpoint. Embeddings are CPU (MiniLM),
+      # NOT GPU — no GPU needed for a functional tenant.
+      - LOCAL_MODEL_EMBED_URL=${LOCAL_MODEL_EMBED_URL:-http://local-model-bridge:8684}
+      # Storage stays LOCAL: fs backend on the app-storage named volume. Do NOT
+      # point LLM_BAWT_STORAGE_BACKEND=s3 at echo's Garage (10.0.2.38) — that is
+      # a cross-tenant data leak. s3 is only valid against a tenant-OWNED store.
+      - LLM_BAWT_STORAGE_BACKEND=${LLM_BAWT_STORAGE_BACKEND:-fs}
     ports:
       - "${MCP_PORT:-8001}:8001"
       - "${SERVICE_PORT:-8642}:8642"

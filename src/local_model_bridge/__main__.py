@@ -111,17 +111,33 @@ def main() -> None:
         # stop the chat bridge from starting.
         from .embed_server import serve_embed
 
+        # Embed-only mode (shared GPU compute plane, TASK-345): when set, run the
+        # standalone /embed endpoint (+ health) WITHOUT bridge.run_forever(), which
+        # couples to the app/Redis for local inference. This lets one GPU host serve
+        # embeddings to many tenants over HTTP with no app dependency.
+        embed_only = os.getenv("LOCAL_MODEL_BRIDGE_EMBED_ONLY", "").lower() in (
+            "1",
+            "true",
+            "yes",
+        )
+
         health_task = asyncio.create_task(_health_server(publisher, health_port))
-        bridge_task = asyncio.create_task(bridge.run_forever())
+        bridge_task = (
+            None if embed_only else asyncio.create_task(bridge.run_forever())
+        )
         embed_task = asyncio.create_task(serve_embed(embed_port))
+        if embed_only:
+            logger.info("EMBED-ONLY mode: app/Redis inference bridge NOT started")
 
         await shutdown_event.wait()
         logger.info("Shutting down...")
 
-        bridge_task.cancel()
+        if bridge_task is not None:
+            bridge_task.cancel()
         health_task.cancel()
         embed_task.cancel()
-        await bridge.stop()
+        if not embed_only:
+            await bridge.stop()
 
     try:
         asyncio.run(_run())
