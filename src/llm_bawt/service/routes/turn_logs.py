@@ -92,6 +92,9 @@ def _live_tool_calls(store: TurnLogStore, turn_id: str) -> list[dict]:
             "duration_ms": row.duration_ms,
             "text_offset": row.text_offset,
             "is_error": row.is_error,
+            # TASK-344: SDK ids so sub-agent nesting survives reload.
+            "tool_use_id": row.tool_use_id,
+            "parent_tool_use_id": row.parent_tool_use_id,
         })
     return out
 

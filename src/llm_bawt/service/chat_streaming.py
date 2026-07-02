@@ -253,6 +253,11 @@ class ChatStreamingMixin:
                         "result": "",
                         "is_error": False,
                         "call_id": call_id,
+                        # SDK tool_use id + parent id so sub-agent nesting (child
+                        # card under its Agent card) survives reload from
+                        # tool_calls_json, not just live rendering (TASK-344).
+                        "tool_use_id": getattr(event, "tool_use_id", None),
+                        "parent_tool_use_id": getattr(event, "parent_tool_use_id", None),
                     })
                     # Publish tool_start to unified event stream
                     if redis_sub:
@@ -267,6 +272,16 @@ class ChatStreamingMixin:
                                 "tool_name": tool_name,
                                 "arguments": tool_args,
                                 "call_id": call_id,
+                                # SDK tool_use id: stable anchor a sub-agent's
+                                # child cards match their parent_tool_use_id
+                                # against (the Agent card is keyed by this).
+                                # parent_tool_use_id nests this card under its
+                                # spawning Agent card; None for top-level calls.
+                                # Available on the AgentEvent (bridge-stamped) but
+                                # was dropped here before — nesting couldn't
+                                # resolve live for claude-code turns (TASK-344).
+                                "tool_use_id": getattr(event, "tool_use_id", None),
+                                "parent_tool_use_id": getattr(event, "parent_tool_use_id", None),
                                 "iteration": _tool_call_index,
                                 "provider": event.provider,
                                 "ts": time.time(),
@@ -298,6 +313,11 @@ class ChatStreamingMixin:
                                 "user_id": user_id,
                                 "tool_name": event.tool_name or "unknown",
                                 "call_id": end_call_id,
+                                # Same ids as tool_start so a reconnect that only
+                                # sees the tool_end can still place the card under
+                                # its parent Agent (TASK-344).
+                                "tool_use_id": getattr(event, "tool_use_id", None),
+                                "parent_tool_use_id": getattr(event, "parent_tool_use_id", None),
                                 "iteration": _tool_call_index,
                                 "provider": event.provider,
                                 "result": tool_result[:2000],

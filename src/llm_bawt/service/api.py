@@ -275,6 +275,8 @@ async def lifespan(app):
                             iteration=event_data.get("iteration", 1),
                             started_at=event_data.get("ts"),
                             text_offset=event_data.get("text_offset"),
+                            tool_use_id=event_data.get("tool_use_id"),
+                            parent_tool_use_id=event_data.get("parent_tool_use_id"),
                         )
                     elif event_type == "tool_end":
                         call_id = event_data.get("call_id")
@@ -297,6 +299,8 @@ async def lifespan(app):
                                 iteration=event_data.get("iteration", 1),
                                 ended_at=event_data.get("ts"),
                                 is_error=event_data.get("is_error"),
+                                tool_use_id=event_data.get("tool_use_id"),
+                                parent_tool_use_id=event_data.get("parent_tool_use_id"),
                             )
 
                 service._tool_persist_task = asyncio.create_task(

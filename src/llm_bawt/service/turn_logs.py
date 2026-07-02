@@ -146,6 +146,13 @@ class ToolCallRecord(SQLModel, table=True):
     # reads the same truth instead of re-deriving it (e.g. string-sniffing the
     # result). Null on legacy rows → frontend treats failure as unknown.
     is_error: bool | None = Field(default=None, sa_column=Column(Boolean, nullable=True))
+    # TASK-344: SDK tool_use id (toolu_…) and the parent Agent/Workflow call's
+    # tool_use_id when this tool ran inside a sub-agent. Persisted so sub-agent
+    # nesting (child card grouped under its Agent card) survives a reload — the
+    # live SSE carries these ids but the catch-up hydration would otherwise strip
+    # them, un-nesting every child. Null on legacy rows / top-level calls.
+    tool_use_id: str | None = Field(default=None, index=True)
+    parent_tool_use_id: str | None = Field(default=None, index=True)
 
 
 class TurnLogStore:
@@ -245,6 +252,18 @@ class TurnLogStore:
                 # so the red error ring survives a reload/reconnect.
                 conn.execute(sa_text(
                     "ALTER TABLE tool_call_records ADD COLUMN IF NOT EXISTS is_error BOOLEAN"
+                ))
+                # TASK-344: SDK tool_use ids so sub-agent nesting survives reload
+                # (see ToolCallRecord.tool_use_id / parent_tool_use_id).
+                conn.execute(sa_text(
+                    "ALTER TABLE tool_call_records ADD COLUMN IF NOT EXISTS tool_use_id VARCHAR(128)"
+                ))
+                conn.execute(sa_text(
+                    "ALTER TABLE tool_call_records ADD COLUMN IF NOT EXISTS parent_tool_use_id VARCHAR(128)"
+                ))
+                conn.execute(sa_text(
+                    "CREATE INDEX IF NOT EXISTS ix_tool_call_records_parent_tool_use_id"
+                    " ON tool_call_records (parent_tool_use_id)"
                 ))
                 # Path-agnostic turn-completion timestamp (NULL = in progress).
                 conn.execute(sa_text(
@@ -718,6 +737,8 @@ class TurnLogStore:
         ended_at: float | None = None,
         text_offset: int | None = None,
         is_error: bool | None = None,
+        tool_use_id: str | None = None,
+        parent_tool_use_id: str | None = None,
     ) -> None:
         """Persist a single tool call record."""
         if self.engine is None:
@@ -739,6 +760,8 @@ class TurnLogStore:
             duration_ms=duration_ms,
             text_offset=text_offset,
             is_error=is_error,
+            tool_use_id=tool_use_id,
+            parent_tool_use_id=parent_tool_use_id,
         )
         try:
             with Session(self.engine) as session:
