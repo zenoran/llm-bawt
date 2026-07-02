@@ -16,6 +16,7 @@ from claude_agent_sdk import ClaudeAgentOptions, StreamEvent, query
 from claude_agent_sdk.types import (
     AssistantMessage,
     HookMatcher,
+    MirrorErrorMessage,
     PermissionResultAllow,
     PermissionResultDeny,
     ResultMessage,
@@ -1040,6 +1041,22 @@ class ClaudeCodeBridge:
                                     f"No SDK messages for {self._request_timeout}s — CLI may be hung"
                                 )
 
+                            # Session-mirror write failure. MirrorErrorMessage is a
+                            # SystemMessage subclass the SDK emits when its
+                            # SessionStore.append fails — i.e. a turn's frame did not
+                            # get persisted to the on-disk transcript. Left unhandled
+                            # it slips into the generic SystemMessage branch below,
+                            # matches none of its data conditions, and vanishes — so a
+                            # persistence failure that can later wedge resume/replay
+                            # goes completely unsignalled. Surface it as a structured
+                            # warning (operational, not user-facing — no chat bubble).
+                            if isinstance(msg, MirrorErrorMessage):
+                                logger.warning(
+                                    "SDK session-mirror append failed: key=%s error=%s session=%s",
+                                    getattr(msg, "key", None),
+                                    getattr(msg, "error", None),
+                                    session_key,
+                                )
                             if isinstance(msg, SystemMessage):
                                 data = getattr(msg, "data", {}) or {}
                                 # Capture session_id + actual model from the first
@@ -1258,6 +1275,12 @@ class ClaudeCodeBridge:
                                 am_usage = getattr(msg, "usage", None)
                                 if isinstance(am_usage, dict) and am_usage:
                                     latest_assistant_usage = am_usage
+                                # When this AssistantMessage is a sub-agent's inner
+                                # activity, the SDK stamps parent_tool_use_id with the
+                                # spawning Agent/Workflow tool's id. Thread it onto the
+                                # TOOL_START so the UI can nest this tool card under the
+                                # parent Agent card. None for top-level calls (TASK-344).
+                                parent_tuid = getattr(msg, "parent_tool_use_id", None)
                                 snapshot_parts: list[str] = []
                                 for block in getattr(msg, "content", []):
                                     if isinstance(block, ToolUseBlock):
@@ -1271,6 +1294,7 @@ class ClaudeCodeBridge:
                                             tool_name=block.name,
                                             tool_arguments=block.input if isinstance(block.input, dict) else {},
                                             tool_use_id=tu_id,
+                                            parent_tool_use_id=parent_tuid,
                                         )
                                         continue
                                     btype = getattr(block, "type", None)
@@ -1287,6 +1311,11 @@ class ClaudeCodeBridge:
                                     assistant_snapshot_text = "".join(snapshot_parts)
 
                             elif isinstance(msg, UserMessage):
+                                # Mirror of the AssistantMessage path: a sub-agent's
+                                # tool *result* arrives on a UserMessage carrying the
+                                # same parent_tool_use_id, so the TOOL_END nests under
+                                # the same parent Agent card as its TOOL_START.
+                                parent_tuid = getattr(msg, "parent_tool_use_id", None)
                                 for block in getattr(msg, "content", []):
                                     if isinstance(block, ToolResultBlock):
                                         seq += 1
@@ -1328,6 +1357,7 @@ class ClaudeCodeBridge:
                                             # legacy consumers still see something.
                                             tool_name=block.tool_use_id or "unknown",
                                             tool_use_id=block.tool_use_id,
+                                            parent_tool_use_id=parent_tuid,
                                             tool_result=str(result_content)[:2000],
                                             # The SDK marks failed tool runs with
                                             # is_error on the ToolResultBlock — the
@@ -2515,6 +2545,7 @@ class ClaudeCodeBridge:
         model: str | None = None,
         token_usage: dict | None = None,
         tool_use_id: str | None = None,
+        parent_tool_use_id: str | None = None,
         attachments: list[dict] | None = None,
         extra_raw: dict | None = None,
     ) -> None:
@@ -2552,6 +2583,7 @@ class ClaudeCodeBridge:
             # to remember to thread it through.
             trigger_message_id=self._trigger_message_ids.get(request_id),
             tool_use_id=tool_use_id,
+            parent_tool_use_id=parent_tool_use_id,
             attachments=attachments,
         )
         self._publisher.publish_run_event(request_id, event)

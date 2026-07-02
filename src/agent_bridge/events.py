@@ -116,6 +116,16 @@ class AgentEvent:
     # chat.tool_result Redis command) back to the paused SDK Future.  Other
     # bridges leave it unset.
     tool_use_id: str | None = None
+    # SDK-supplied id of the *parent* tool call this event nests under. The
+    # Claude Agent SDK stamps ``parent_tool_use_id`` on the AssistantMessage /
+    # UserMessage / StreamEvent frames it emits for a sub-agent's *inner*
+    # activity — its value is the ``tool_use_id`` of the Agent/Workflow tool
+    # call that spawned the sub-agent. Threading it lets the UI nest a
+    # sub-agent's tool cards (e.g. the Bash it ran) under the parent Agent card
+    # instead of rendering them as flat siblings (TASK-344). ``None`` for
+    # top-level activity — the overwhelming common case — so consumers that
+    # ignore it degrade to the existing flat rendering with no regression.
+    parent_tool_use_id: str | None = None
     # Media refs ({"asset_id": "ma_...", "kind": "image"}) produced *during*
     # this turn and already persisted to the media store — e.g. Playwright
     # screenshots the claude-code bridge offloaded instead of leaving the inline
@@ -145,6 +155,7 @@ class AgentEvent:
             "provider": self.provider,
             "trigger_message_id": self.trigger_message_id,
             "tool_use_id": self.tool_use_id,
+            "parent_tool_use_id": self.parent_tool_use_id,
             "attachments": self.attachments,
         }
 
@@ -185,6 +196,7 @@ class AgentEvent:
             provider=data.get("provider"),
             trigger_message_id=data.get("trigger_message_id"),
             tool_use_id=data.get("tool_use_id"),
+            parent_tool_use_id=data.get("parent_tool_use_id"),
             attachments=data.get("attachments"),
         )
 

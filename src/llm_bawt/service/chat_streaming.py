@@ -1839,6 +1839,12 @@ class ChatStreamingMixin:
                                     # BashBody / WebSearchBody. Without this,
                                     # recall falls back to GenericClaudeBody.
                                     'provider': item.get('provider'),
+                                    # SDK tool_use id + parent id so sub-agent
+                                    # nesting (child card under its Agent card)
+                                    # survives reload from tool_calls_json, not just
+                                    # live rendering (TASK-344).
+                                    'tool_use_id': item.get('tool_use_id'),
+                                    'parent_tool_use_id': item.get('parent_tool_use_id'),
                                 })
                                 _publish_event_direct({
                                     "_type": "tool_event",
@@ -1854,6 +1860,13 @@ class ChatStreamingMixin:
                                     "tool_name": item.get("name", "unknown"),
                                     "arguments": item.get("arguments", {}),
                                     "call_id": cid,
+                                    # SDK tool_use id: the stable anchor a sub-agent's
+                                    # child cards match their parent_tool_use_id against
+                                    # (the Agent card is keyed by this). Was never on
+                                    # the live wire before — without it, nesting can't
+                                    # resolve live (TASK-344).
+                                    "tool_use_id": item.get("tool_use_id"),
+                                    "parent_tool_use_id": item.get("parent_tool_use_id"),
                                     "iteration": 1,
                                     "provider": item.get("provider"),
                                     "ts": time.time(),
@@ -1888,6 +1901,11 @@ class ChatStreamingMixin:
                                     "tool_name": _result_name or "unknown",
                                     "call_id": _end_cid,
                                     "result": str(item.get("result", ""))[:2000],
+                                    # Same ids as tool_start so a reconnect that only
+                                    # sees the tool_end can still place the card under
+                                    # its parent Agent (TASK-344).
+                                    "tool_use_id": item.get("tool_use_id"),
+                                    "parent_tool_use_id": item.get("parent_tool_use_id"),
                                     "iteration": 1,
                                     "provider": item.get("provider"),
                                     "ts": time.time(),

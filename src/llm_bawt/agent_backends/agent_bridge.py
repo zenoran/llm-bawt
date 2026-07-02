@@ -317,6 +317,10 @@ class AgentBridgeBackend(AgentBackend):
                                     # row by this id; without it the live card can't
                                     # match and the picker only appears on reload.
                                     "tool_use_id": event.tool_use_id,
+                                    # Parent Agent/Workflow tool_use_id when this call
+                                    # is a sub-agent's inner activity — lets the UI nest
+                                    # it under the parent card (TASK-344). None otherwise.
+                                    "parent_tool_use_id": event.parent_tool_use_id,
                                 })
 
                             elif event.kind == AgentEventKind.TOOL_END:
@@ -339,6 +343,10 @@ class AgentBridgeBackend(AgentBackend):
                                         # the red error ring never lights for agent
                                         # turns — the flag died here.
                                         "is_error": event.tool_error,
+                                        # Parent Agent/Workflow tool_use_id for nesting
+                                        # sub-agent tool results under the parent card
+                                        # (TASK-344). None for top-level calls.
+                                        "parent_tool_use_id": event.parent_tool_use_id,
                                     })
 
                             elif event.kind == AgentEventKind.AWAIT_TOOL_RESULT:
