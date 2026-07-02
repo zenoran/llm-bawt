@@ -619,8 +619,18 @@ class PostgreSQLMemoryBackend(MemoryBackend):
                 session.commit()
                 logger.debug(f"Added message {message_id} to {self._messages_table_name}")
             except Exception as e:
+                # EPIC TASK-217 / TASK-357: do NOT silently swallow a failed
+                # INSERT. Previously this rolled back + logged + returned None,
+                # while the PostgreSQLShortTermManager adapter (below) returned
+                # the message id REGARDLESS — so the caller got a valid-looking
+                # id for a row that never committed, leaving turn_logs pointing
+                # at an uncommitted (orphan) {bot}_messages row. Roll back, log,
+                # then RE-RAISE so the failure is loud and the caller can abort
+                # the turn instead of recording a ghost reference. The happy
+                # path is byte-identical (commit succeeds -> returns None).
                 session.rollback()
                 logger.error(f"Failed to add message {message_id}: {e}")
+                raise
     
     def get_unprocessed_messages(self, limit: int = 100) -> list[dict]:
         """Get messages that haven't been processed for memory extraction."""
@@ -2448,6 +2458,12 @@ class PostgreSQLShortTermManager:
         mid = (str(message_id).strip() if message_id else "") or str(uuid.uuid4())
         ts = timestamp or datetime.now(timezone.utc).timestamp()
 
+        # EPIC TASK-217 / TASK-357: the backend now RAISES on a failed INSERT
+        # (it no longer swallows + returns None). We deliberately do NOT wrap
+        # this in try/except: the exception propagates so `mid` is returned
+        # ONLY when the row actually committed. Previously this returned `mid`
+        # unconditionally, handing the caller a valid-looking id for a row that
+        # never persisted (the silent-swallow / orphan-turn_logs bug).
         self._backend.add_message(
             message_id=mid,
             role=role,

@@ -385,18 +385,24 @@ class HistoryManager:
 
         # Save to PostgreSQL if available, otherwise file
         if self._db_backend:
-            try:
-                persisted_id = self._db_backend.add_message(
-                    role, content, message.timestamp,
-                    message_id=provided_id,
-                    attachments=attachments,
-                    reasoning=reasoning,
-                )
-                if persisted_id:
-                    message.db_id = str(persisted_id)
-            except Exception as e:
-                logger.warning(f"Failed to save to PostgreSQL: {e}")
-                self.save_history()  # Fall back to file
+            # EPIC TASK-217 / TASK-357: the DB backend now RAISES on a failed
+            # INSERT instead of swallowing it and handing back a valid-looking
+            # id. When the DB is configured, a failed persist must NOT be
+            # silently masked by a file fallback — that is exactly what left a
+            # turn_logs row pointing at an uncommitted (orphan) {bot}_messages
+            # row. Propagate the failure so the turn-orchestration layer marks
+            # the turn as errored (background_service catches this and sets the
+            # turn_log status="error", then re-raises) rather than recording a
+            # ghost reference. Every caller wraps add_message in its own
+            # try/except, so the raise aborts the turn loudly and safely.
+            persisted_id = self._db_backend.add_message(
+                role, content, message.timestamp,
+                message_id=provided_id,
+                attachments=attachments,
+                reasoning=reasoning,
+            )
+            if persisted_id:
+                message.db_id = str(persisted_id)
         else:
             self.save_history()
 

@@ -634,8 +634,10 @@ class RedisSubscriber:
                         # agent turns, coalesced assistant text deltas — both
                         # need a durable path independent of the HTTP connection
                         # (TASK-286). turn_complete lets the sink release its
-                        # per-turn text buffer.
-                        if data.get("_type") in ("tool_event", "text_delta", "turn_complete"):
+                        # per-turn text buffer. reasoning_delta (TASK-360/P4) is
+                        # persisted the same way so a cold reload mid-turn
+                        # recovers already-produced reasoning.
+                        if data.get("_type") in ("tool_event", "text_delta", "reasoning_delta", "turn_complete"):
                             try:
                                 callback(data)
                             except Exception:

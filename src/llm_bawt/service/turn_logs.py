@@ -71,6 +71,11 @@ class TurnLog(SQLModel, table=True):
     user_prompt: str | None = Field(default=None, sa_column=Column(Text, nullable=True))
     request_json: str | None = Field(default=None, sa_column=Column(Text, nullable=True))
     response_text: str | None = Field(default=None, sa_column=Column(Text, nullable=True))
+    # TASK-360 (P4): partial model reasoning ("thinking") flushed DURING the turn
+    # (mirrors response_text incremental persistence from TASK-286) so a mid-turn
+    # cold reload can recover already-produced reasoning instead of losing it until
+    # the final assistant row persists. Nullable; pre-existing rows stay NULL.
+    reasoning: str | None = Field(default=None, sa_column=Column(Text, nullable=True))
     tool_calls_json: str | None = Field(default=None, sa_column=Column(Text, nullable=True))
     error_text: str | None = Field(default=None, sa_column=Column(Text, nullable=True))
     trigger_message_id: str | None = Field(default=None, index=True)
@@ -208,6 +213,10 @@ class TurnLogStore:
                 ))
                 conn.execute(sa_text(
                     "ALTER TABLE turn_logs ADD COLUMN IF NOT EXISTS token_usage_json TEXT"
+                ))
+                # TASK-360 (P4): mid-turn partial reasoning for cold-reload resume.
+                conn.execute(sa_text(
+                    "ALTER TABLE turn_logs ADD COLUMN IF NOT EXISTS reasoning TEXT"
                 ))
                 # TASK-269 turn-lifecycle / continuation columns.
                 conn.execute(sa_text(
@@ -450,9 +459,11 @@ class TurnLogStore:
             session.add(row)
             session.commit()
 
-    def update_partial_response(self, *, turn_id: str, response_text: str) -> None:
-        """Write in-flight partial assistant text without clobbering a finalized
-        turn (TASK-286).
+    def update_partial_response(
+        self, *, turn_id: str, response_text: str, reasoning: str | None = None
+    ) -> None:
+        """Write in-flight partial assistant text (and, TASK-360/P4, partial
+        reasoning) without clobbering a finalized turn (TASK-286).
 
         Conditional on ``status='streaming'`` so once ``_finalize_turn`` flips
         the row to ``ok`` (with the cleaned, authoritative text) this becomes a
@@ -461,18 +472,31 @@ class TurnLogStore:
         it gives a COLD reload (resumeScan → /v1/turn-logs) the partial text
         that was streamed before a refresh, and survives client disconnect
         because the drain consumer runs server-side, not in the request thread.
+
+        ``reasoning`` is flushed the same way so a mid-turn cold reload can
+        recover already-produced thinking; when ``None`` the reasoning column is
+        left untouched.
         """
         if self.engine is None or not turn_id:
             return
         try:
             with self.engine.begin() as conn:
-                conn.execute(
-                    sa_text(
-                        "UPDATE turn_logs SET response_text = :t"
-                        " WHERE id = :id AND status = 'streaming'"
-                    ),
-                    {"t": response_text, "id": turn_id},
-                )
+                if reasoning is not None:
+                    conn.execute(
+                        sa_text(
+                            "UPDATE turn_logs SET response_text = :t, reasoning = :r"
+                            " WHERE id = :id AND status = 'streaming'"
+                        ),
+                        {"t": response_text, "r": reasoning, "id": turn_id},
+                    )
+                else:
+                    conn.execute(
+                        sa_text(
+                            "UPDATE turn_logs SET response_text = :t"
+                            " WHERE id = :id AND status = 'streaming'"
+                        ),
+                        {"t": response_text, "id": turn_id},
+                    )
         except Exception as e:
             logger.debug("update_partial_response failed for %s: %s", turn_id, e)
 

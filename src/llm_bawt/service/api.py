@@ -214,11 +214,31 @@ async def lifespan(app):
                 # COLD reload (and a turn that completes after the client
                 # disconnects) recovers the response TEXT, not just tool calls.
                 _partial_text: dict[str, str] = {}
+                # TASK-360 (P4): accumulate per-turn reasoning ("thinking") the
+                # same way, flushed to turn_logs.reasoning so a COLD reload
+                # mid-turn recovers already-produced reasoning, not just text.
+                _partial_reasoning: dict[str, str] = {}
 
                 def _tool_event_sink(event_data: dict) -> None:
-                    """Persist tool_start/tool_end + text_delta events to Postgres."""
+                    """Persist tool_start/tool_end + text_delta + reasoning_delta events to Postgres."""
                     store = service._turn_log_store
                     _type = event_data.get("_type")
+                    if _type == "reasoning_delta":
+                        turn_id = event_data.get("turn_id")
+                        if not turn_id:
+                            return
+                        delta = event_data.get("delta", "") or ""
+                        rbuf = _partial_reasoning.get(turn_id, "") + delta
+                        _partial_reasoning[turn_id] = rbuf
+                        # Pass the current text buffer too so the write never
+                        # clobbers already-flushed partial text (reasoning
+                        # usually precedes text, so the buffer is often "").
+                        store.update_partial_response(
+                            turn_id=turn_id,
+                            response_text=_partial_text.get(turn_id, ""),
+                            reasoning=rbuf,
+                        )
+                        return
                     if _type == "text_delta":
                         turn_id = event_data.get("turn_id")
                         if not turn_id:
@@ -241,6 +261,7 @@ async def lifespan(app):
                         tid = event_data.get("turn_id")
                         if tid:
                             _partial_text.pop(tid, None)
+                            _partial_reasoning.pop(tid, None)
                         return
                     event_type = event_data.get("event", "")
                     if event_type == "tool_start":

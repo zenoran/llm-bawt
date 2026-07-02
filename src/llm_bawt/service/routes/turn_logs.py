@@ -507,6 +507,7 @@ def get_turn_log(turn_id: str):
         user_prompt=row.user_prompt,
         request=parsed_request,
         response=row.response_text,
+        reasoning=getattr(row, "reasoning", None),
         tool_calls=parsed_tools,
         error_text=row.error_text,
         animation=getattr(row, "animation", None),

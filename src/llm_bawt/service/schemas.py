@@ -492,6 +492,9 @@ class TurnLogDetail(BaseModel):
     user_prompt: str | None = None
     request: Any | None = None
     response: str | None = None
+    # TASK-360 (P4): partial/persisted model reasoning ("thinking") so a cold
+    # reload mid-turn can recover already-produced reasoning.
+    reasoning: str | None = None
     tool_calls: list[dict[str, Any]] = Field(default_factory=list)
     error_text: str | None = None
     animation: str | None = None
