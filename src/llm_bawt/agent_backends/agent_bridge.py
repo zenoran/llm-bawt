@@ -425,6 +425,46 @@ class AgentBridgeBackend(AgentBackend):
                                         "provider": event.provider,
                                     })
 
+                            elif event.kind == AgentEventKind.SUBAGENT_STARTED:
+                                # TASK-344: sub-agent spawned by Agent/Workflow tool.
+                                meta = event.raw if isinstance(event.raw, dict) else {}
+                                result_queue.put({
+                                    "event": "subagent_started",
+                                    "task_id": meta.get("task_id", ""),
+                                    "description": meta.get("description", ""),
+                                    "task_type": meta.get("task_type"),
+                                    "tool_use_id": event.tool_use_id,
+                                    "provider": event.provider,
+                                    "trigger_message_id": event.trigger_message_id,
+                                })
+
+                            elif event.kind == AgentEventKind.SUBAGENT_PROGRESS:
+                                meta = event.raw if isinstance(event.raw, dict) else {}
+                                result_queue.put({
+                                    "event": "subagent_progress",
+                                    "task_id": meta.get("task_id", ""),
+                                    "description": meta.get("description", ""),
+                                    "last_tool_name": event.tool_name,
+                                    "status": meta.get("status"),
+                                    "usage": meta.get("usage"),
+                                    "tool_use_id": event.tool_use_id,
+                                    "provider": event.provider,
+                                    "trigger_message_id": event.trigger_message_id,
+                                })
+
+                            elif event.kind == AgentEventKind.SUBAGENT_DONE:
+                                meta = event.raw if isinstance(event.raw, dict) else {}
+                                result_queue.put({
+                                    "event": "subagent_done",
+                                    "task_id": meta.get("task_id", ""),
+                                    "status": meta.get("status", "completed"),
+                                    "summary": event.text or "",
+                                    "usage": meta.get("usage"),
+                                    "tool_use_id": event.tool_use_id,
+                                    "provider": event.provider,
+                                    "trigger_message_id": event.trigger_message_id,
+                                })
+
                             elif event.kind == AgentEventKind.ERROR:
                                 raise RuntimeError(f"{self.name} error: {event.text}")
                     finally:

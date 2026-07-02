@@ -60,6 +60,15 @@ class AgentEventKind(str, Enum):
     # {policy_id, grant_key, severity}. Additive: unknown to older consumers,
     # which degrade it to SYSTEM_NOTE (see from_dict).
     TOOL_PREAPPROVED = "tool_preapproved"
+    # Sub-agent lifecycle events (TASK-344). Emitted when the Claude Agent SDK
+    # spawns sub-agents via the Agent/Workflow tool. The bridge detects
+    # TaskStartedMessage, TaskProgressMessage, TaskUpdatedMessage, and
+    # TaskNotificationMessage and translates them into these three kinds.
+    # ``raw`` carries {task_id, description, task_type, usage, status, ...};
+    # ``tool_use_id`` links back to the parent Agent tool call in the UI.
+    SUBAGENT_STARTED = "subagent_started"
+    SUBAGENT_PROGRESS = "subagent_progress"
+    SUBAGENT_DONE = "subagent_done"
 
 
 @dataclass

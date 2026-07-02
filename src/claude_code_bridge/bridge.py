@@ -20,6 +20,10 @@ from claude_agent_sdk.types import (
     PermissionResultDeny,
     ResultMessage,
     SystemMessage,
+    TaskNotificationMessage,
+    TaskProgressMessage,
+    TaskStartedMessage,
+    TaskUpdatedMessage,
     ToolPermissionContext,
     ToolResultBlock,
     ToolUseBlock,
@@ -1107,6 +1111,83 @@ class ClaudeCodeBridge:
                                             kind=AgentEventKind.ASSISTANT_DELTA,
                                             text=note,
                                         )
+                                # ── Sub-agent task lifecycle (TASK-344) ──
+                                # The SDK emits TaskStarted/Progress/Updated/
+                                # Notification messages (SystemMessage subclasses)
+                                # when the Agent or Workflow tool spawns sub-agents.
+                                # Detect them and publish structured events so the
+                                # app→frontend pipeline can show live progress.
+                                if isinstance(msg, TaskStartedMessage):
+                                    seq += 1
+                                    logger.info(
+                                        "Sub-agent started: task_id=%s desc=%s tool_use_id=%s",
+                                        msg.task_id, msg.description, msg.tool_use_id,
+                                    )
+                                    self._publish_event(
+                                        request_id, session_key, seq,
+                                        kind=AgentEventKind.SUBAGENT_STARTED,
+                                        tool_use_id=msg.tool_use_id,
+                                        extra_raw={
+                                            "task_id": msg.task_id,
+                                            "description": msg.description or "",
+                                            "task_type": getattr(msg, "task_type", None),
+                                            "uuid": getattr(msg, "uuid", ""),
+                                        },
+                                    )
+                                elif isinstance(msg, TaskProgressMessage):
+                                    seq += 1
+                                    usage = msg.usage if isinstance(msg.usage, dict) else {}
+                                    self._publish_event(
+                                        request_id, session_key, seq,
+                                        kind=AgentEventKind.SUBAGENT_PROGRESS,
+                                        tool_use_id=msg.tool_use_id,
+                                        tool_name=getattr(msg, "last_tool_name", None),
+                                        extra_raw={
+                                            "task_id": msg.task_id,
+                                            "description": msg.description or "",
+                                            "usage": {
+                                                "total_tokens": usage.get("total_tokens", 0),
+                                                "tool_uses": usage.get("tool_uses", 0),
+                                                "duration_ms": usage.get("duration_ms", 0),
+                                            },
+                                        },
+                                    )
+                                elif isinstance(msg, TaskUpdatedMessage):
+                                    # Status updates (running, paused, etc.) —
+                                    # surface as SUBAGENT_PROGRESS with the status.
+                                    if msg.status:
+                                        seq += 1
+                                        self._publish_event(
+                                            request_id, session_key, seq,
+                                            kind=AgentEventKind.SUBAGENT_PROGRESS,
+                                            extra_raw={
+                                                "task_id": msg.task_id,
+                                                "status": msg.status,
+                                            },
+                                        )
+                                elif isinstance(msg, TaskNotificationMessage):
+                                    seq += 1
+                                    usage = msg.usage if isinstance(msg.usage, dict) else {}
+                                    logger.info(
+                                        "Sub-agent done: task_id=%s status=%s tool_use_id=%s",
+                                        msg.task_id, msg.status, msg.tool_use_id,
+                                    )
+                                    self._publish_event(
+                                        request_id, session_key, seq,
+                                        kind=AgentEventKind.SUBAGENT_DONE,
+                                        tool_use_id=msg.tool_use_id,
+                                        text=getattr(msg, "summary", "") or "",
+                                        extra_raw={
+                                            "task_id": msg.task_id,
+                                            "status": msg.status,
+                                            "output_file": getattr(msg, "output_file", ""),
+                                            "usage": {
+                                                "total_tokens": usage.get("total_tokens", 0),
+                                                "tool_uses": usage.get("tool_uses", 0),
+                                                "duration_ms": usage.get("duration_ms", 0),
+                                            } if usage else None,
+                                        },
+                                    )
                             msg_type = type(msg).__name__
                             if not isinstance(msg, (StreamEvent, SystemMessage)):
                                 content = getattr(msg, "content", [])

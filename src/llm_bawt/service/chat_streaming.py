@@ -1029,6 +1029,46 @@ class ChatStreamingMixin:
         # (could be many seconds for non-tool turns) or on the next page
         # refresh via /api/chat/active-bots.  turn_complete (line ~1435)
         # is the matching teardown event.
+        #
+        # TASK-358: the payload also carries the user message itself
+        # (``role``/``content``/``attachments``) so a SECOND window with no
+        # prior bubble for this turn can render the USER BUBBLE live — not
+        # just the "bot is active" rail. ``content`` is already rendered
+        # client-side elsewhere (history + the originating tab's own optimistic
+        # bubble), so this is not new exposure. ``attachments`` is enriched to
+        # the SAME shape /v1/history emits ({asset_id, kind, mime_type, width,
+        # height, urls}) via the canonical serializer, so the client can reuse
+        # ``normalizeHistoryAttachment`` verbatim. Enrichment does a synchronous
+        # media_assets SELECT, so it is offloaded to a thread and only when the
+        # turn actually carries attachments (the common no-attachment path skips
+        # all of it).
+        turn_start_attachments: list[dict] = []
+        if attachments_to_persist:
+            try:
+                from ..media.assets import MediaAssetStore
+                from ..media.serializers import enrich_attachments_for_messages
+
+                def _enrich_turn_start_attachments() -> list[dict]:
+                    shell = [{"attachments": list(attachments_to_persist)}]
+                    enrich_attachments_for_messages(
+                        shell, MediaAssetStore(self.config)
+                    )
+                    return shell[0].get("attachments") or []
+
+                turn_start_attachments = await asyncio.to_thread(
+                    _enrich_turn_start_attachments
+                )
+            except Exception as _att_err:
+                # A degraded MediaStore must never block the turn_start
+                # announcement — fall back to no attachments (text bubble
+                # still renders; images fill in on the receiving tab's next
+                # history load).
+                log.warning(
+                    "TASK-358: turn_start attachment enrichment failed: %s",
+                    _att_err,
+                )
+                turn_start_attachments = []
+
         await _publish_unified({
             "_type": "turn_start",
             "turn_id": turn_log_id,
@@ -1036,6 +1076,9 @@ class ChatStreamingMixin:
             "bot_id": bot_id,
             "user_id": user_id,
             "parent_turn_id": parent_turn_id,
+            "role": "user",
+            "content": user_prompt,
+            "attachments": turn_start_attachments,
             "ts": time.time(),
         })
 
@@ -1746,6 +1789,28 @@ class ChatStreamingMixin:
                                     agent_attachments_holder.extend(
                                         r for r in refs if isinstance(r, dict)
                                     )
+                                continue
+                            if evt in ("subagent_started", "subagent_progress", "subagent_done"):
+                                # TASK-344: sub-agent lifecycle events. Publish
+                                # to unified stream for cross-tab visibility, then
+                                # skip downstream (not part of the text/tool response).
+                                _publish_event_direct({
+                                    "_type": evt,
+                                    "turn_id": turn_log_id,
+                                    "trigger_message_id": item.get("trigger_message_id") or trigger_message_id,
+                                    "bot_id": bot_id,
+                                    "user_id": user_id,
+                                    "task_id": item.get("task_id", ""),
+                                    "description": item.get("description", ""),
+                                    "task_type": item.get("task_type"),
+                                    "status": item.get("status"),
+                                    "summary": item.get("summary"),
+                                    "last_tool_name": item.get("last_tool_name"),
+                                    "usage": item.get("usage"),
+                                    "tool_use_id": item.get("tool_use_id"),
+                                    "provider": item.get("provider"),
+                                    "ts": time.time(),
+                                })
                                 continue
                             if evt in ("tool_call", "tool_result"):
                                 _saw_tool = True
