@@ -50,6 +50,12 @@ try:
 except ValueError:
     _MAX_TRANSCRIPT_CHARS = 600_000
 
+# Base URL of the llm-bawt app API. The MCP server runs in-process inside the
+# app container, so localhost is the app itself. Overridable for tests / alt
+# deployments. (server.py hardcodes this same host in three places — a shared
+# constant would be the right consolidation, tracked separately.)
+_APP_BASE_URL = os.getenv("LLM_BAWT_APP_BASE_URL", "http://localhost:8642").rstrip("/")
+
 
 # The recap system prompt lives in the prompt registry (key 'self_recap.system')
 # so it is editable from the prompts API/UI with version history, exactly like
@@ -319,4 +325,157 @@ async def self_tail(
         "count_returned": used_count,
         "total_available": total_available,
         "truncated": truncated,
+    }
+
+
+async def _fetch_bot_profile(bot_id: str) -> dict:
+    """GET a bot's DB profile via the app API. Raises on non-2xx / transport error."""
+    import httpx
+
+    async with httpx.AsyncClient() as client:
+        resp = await client.get(
+            f"{_APP_BASE_URL}/v1/bots/{bot_id}/profile", timeout=15.0
+        )
+        resp.raise_for_status()
+        return resp.json()
+
+
+@mcp.tool(name="self_system_prompt")
+async def self_system_prompt(
+    bot_id: str = "default",
+    action: str = "view",
+    new_prompt: str | None = None,
+) -> dict:
+    """View or edit YOUR OWN persisted system prompt (the bot persona in the DB).
+
+    This is the ``system_prompt`` stored on your ``bot_profiles`` row — the
+    personality/instructions the platform sends as your system message on every
+    turn (for agent bots it's pushed to the agent as the persona; for chat bots
+    it's the LLM system message). It is the SINGLE source of truth for who you
+    are, and it is the cacheable prefix of your context, so keep it byte-stable
+    between deliberate edits.
+
+    IMPORTANT: this is NOT the ephemeral per-turn harness wrapper (temporal
+    lines, tool lists, user-profile injection). It is the durable persona only.
+
+    Editing writes straight through the same path as the admin UI
+    (``PATCH /v1/bots/{slug}/profile``): the DB row is upserted, the in-memory
+    bot registry is reloaded, per-bot instance caches are invalidated, and for
+    OpenClaw agents the new prompt is pushed to SOUL.md. The change takes effect
+    on your NEXT turn — it does not rewrite the current in-flight context.
+
+    Args:
+        bot_id: The bot whose system prompt to act on. Pass YOUR OWN slug
+            (e.g. "caid"). The literal "default" is rejected for edits to avoid
+            accidentally rewriting the wrong bot.
+        action: "view" (default) to read the current prompt, or "edit" to
+            replace it wholesale with ``new_prompt``.
+        new_prompt: The full replacement system prompt (required for
+            action="edit"). This is a FULL replace, not an append — send the
+            complete desired prompt. The prior prompt is returned in the result
+            (``old_prompt``) so it stays recoverable in your transcript.
+
+    Returns:
+        view: {bot_id, action, system_prompt, length, name, bot_type, updated_at}
+        edit: {bot_id, action, updated, old_prompt, old_length, new_prompt,
+               new_length, name, bot_type, updated_at}
+        On failure: {bot_id, action, error, ...}.
+    """
+    import httpx
+
+    bot_id = (bot_id or "").strip().lower()
+    action = (action or "view").strip().lower()
+    logger.debug("MCP tool invoked: self_system_prompt bot_id=%s action=%s", bot_id, action)
+
+    if not bot_id:
+        return {"bot_id": bot_id, "action": action, "error": "bot_id is required (pass your own slug)."}
+
+    if action not in {"view", "edit"}:
+        return {
+            "bot_id": bot_id,
+            "action": action,
+            "error": f"Unknown action '{action}'. Valid: view, edit.",
+        }
+
+    # ---- VIEW -------------------------------------------------------------
+    if action == "view":
+        try:
+            profile = await _fetch_bot_profile(bot_id)
+        except httpx.HTTPStatusError as e:
+            detail = "not found" if e.response.status_code == 404 else str(e)
+            return {"bot_id": bot_id, "action": action, "error": f"Could not read profile: {detail}"}
+        except Exception as e:
+            return {"bot_id": bot_id, "action": action, "error": f"Profile fetch failed: {e}"}
+
+        prompt = profile.get("system_prompt") or ""
+        return {
+            "bot_id": bot_id,
+            "action": action,
+            "system_prompt": prompt,
+            "length": len(prompt),
+            "name": profile.get("name"),
+            "bot_type": profile.get("bot_type"),
+            "updated_at": profile.get("updated_at"),
+        }
+
+    # ---- EDIT -------------------------------------------------------------
+    if bot_id == "default":
+        return {
+            "bot_id": bot_id,
+            "action": action,
+            "error": "Refusing to edit the 'default' bot — pass your own explicit slug.",
+        }
+    if new_prompt is None or not str(new_prompt).strip():
+        return {
+            "bot_id": bot_id,
+            "action": action,
+            "error": "action='edit' requires a non-empty 'new_prompt' (full replacement text).",
+        }
+
+    # Read the current prompt first so the old value is recoverable in the
+    # transcript and we can report a no-op.
+    try:
+        before = await _fetch_bot_profile(bot_id)
+    except httpx.HTTPStatusError as e:
+        detail = "not found" if e.response.status_code == 404 else str(e)
+        return {"bot_id": bot_id, "action": action, "error": f"Could not read current profile: {detail}"}
+    except Exception as e:
+        return {"bot_id": bot_id, "action": action, "error": f"Profile fetch failed: {e}"}
+
+    old_prompt = before.get("system_prompt") or ""
+
+    # Write through the canonical PATCH path (upsert + registry reload + cache
+    # invalidation + SOUL push all happen server-side — no logic duplicated here).
+    try:
+        async with httpx.AsyncClient() as client:
+            resp = await client.patch(
+                f"{_APP_BASE_URL}/v1/bots/{bot_id}/profile",
+                json={"system_prompt": new_prompt},
+                timeout=30.0,
+            )
+            resp.raise_for_status()
+            after = resp.json()
+    except httpx.HTTPStatusError as e:
+        return {
+            "bot_id": bot_id,
+            "action": action,
+            "error": f"Update rejected ({e.response.status_code}): {e.response.text}",
+            "old_prompt": old_prompt,
+        }
+    except Exception as e:
+        return {"bot_id": bot_id, "action": action, "error": f"Update failed: {e}", "old_prompt": old_prompt}
+
+    updated_prompt = after.get("system_prompt") or ""
+    return {
+        "bot_id": bot_id,
+        "action": action,
+        "updated": updated_prompt != old_prompt,
+        "old_prompt": old_prompt,
+        "old_length": len(old_prompt),
+        "new_prompt": updated_prompt,
+        "new_length": len(updated_prompt),
+        "name": after.get("name"),
+        "bot_type": after.get("bot_type"),
+        "updated_at": after.get("updated_at"),
+        "note": "Takes effect on your next turn; the current in-flight context is unchanged.",
     }
