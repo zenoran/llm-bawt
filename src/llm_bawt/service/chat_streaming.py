@@ -1845,6 +1845,17 @@ class ChatStreamingMixin:
                                 # Inject call_id into the dict so the queue consumer
                                 # uses the same ID as the SSE event (no double-ID).
                                 item["_call_id"] = cid
+                                # Stash the AUTHORITATIVE text_offset (chars of
+                                # assistant text before this tool) onto the same
+                                # dict so the downstream OpenAI-compat emitter can
+                                # put it on the live SSE wire. Without this the
+                                # client recomputes the offset from its own running
+                                # accumulatedContent.length, which drifts from the
+                                # server's _text_chars count and splits bubbles
+                                # mid-sentence live while refresh (which uses this
+                                # same value, persisted below) renders correctly
+                                # (TASK-367).
+                                item["_text_offset"] = _text_chars[0]
                                 tool_call_details_holder.append({
                                     'tool': item.get('name', 'unknown'),
                                     'parameters': item.get('arguments', {}),
@@ -2170,6 +2181,64 @@ class ChatStreamingMixin:
             oc_tool_call_index = 0  # OpenClaw agent backend tool call index
             _upstream_model = [None]  # Actual model reported by agent backend
 
+            # TASK-367: release-at-boundary buffer for agent-backend assistant
+            # text. Holds the still-forming tail of the response so the SSE wire
+            # only ever advances delta.content to a CLEAN boundary (sentence /
+            # clause punctuation, newline, or — as a safety valve — a word
+            # boundary once the tail grows long). A tool card anchors at the
+            # client's running content length; if that length can end mid-word,
+            # the tool slices a half-typed token into its own bubble that only
+            # heals a frame later — the live-only split Nick keeps seeing.
+            # Boundary-gating the wire makes that length always land on a real
+            # boundary, so the split can't form — independent of whether the
+            # authoritative text_offset reached the client. Buffers ONLY the
+            # wire; _text_chars, persisted tool offsets and Redis events are
+            # produced upstream in the worker thread and stay untouched, so the
+            # DB-refresh render is unchanged and the live render converges to it.
+            _content_buf: list[str] = []
+            _CONTENT_MAX_HOLD = 120  # force a word-boundary release past this
+            _HARD_BOUNDARY = frozenset(".!?…\n")       # sentence / hard stops
+            _SOFT_BOUNDARY = frozenset(",;:)]}\"'’”")   # clause / closing punct
+
+            def _content_release_cut(s: str) -> int:
+                """Slice index: release s[:cut], hold s[cut:]. 0 ⇒ hold all."""
+                # Release through the last hard boundary (sentence end / newline).
+                for i in range(len(s) - 1, -1, -1):
+                    if s[i] in _HARD_BOUNDARY:
+                        return i + 1
+                # Else through the last clause-closing punctuation.
+                for i in range(len(s) - 1, -1, -1):
+                    if s[i] in _SOFT_BOUNDARY:
+                        return i + 1
+                # No punctuation yet: keep holding until we've buffered enough
+                # that a long, punctuation-free run (code, URLs, lists) would
+                # stall — then release up to the last whitespace so we never
+                # leave a mid-word tail on the wire.
+                if len(s) >= _CONTENT_MAX_HOLD:
+                    ws = s.rfind(" ")
+                    return ws + 1 if ws > 0 else len(s)
+                return 0
+
+            def _drain_content_buf(flush_all: bool):
+                """SSE line for releasable buffered content, or None. Mutates buf."""
+                if not _content_buf:
+                    return None
+                s = "".join(_content_buf)
+                cut = len(s) if flush_all else _content_release_cut(s)
+                if cut <= 0:
+                    return None
+                _content_buf.clear()
+                if cut < len(s):
+                    _content_buf.append(s[cut:])
+                data = {
+                    "id": response_id,
+                    "object": "chat.completion.chunk",
+                    "created": created,
+                    "model": model_alias,
+                    "choices": [{"index": 0, "delta": {"content": s[:cut]}, "finish_reason": None}],
+                }
+                return f"data: {json.dumps(data)}\n\n"
+
             # Send service warnings (e.g. model fallback) before content
             if model_warnings:
                 warning_data = {
@@ -2205,6 +2274,10 @@ class ChatStreamingMixin:
                     )
 
                 if chunk is None:
+                    # Release the held text tail before closing (TASK-367).
+                    sse = _drain_content_buf(flush_all=True)
+                    if sse:
+                        yield sse
                     # Stream complete - flush any buffered content from emote filter
                     if emote_filter:
                         final_chunk = emote_filter.flush()
@@ -2242,6 +2315,11 @@ class ChatStreamingMixin:
                     # Upstream stream failed; close SSE cleanly so downstream clients
                     # don't see an incomplete chunked read protocol error.
                     log.error("Streaming backend failed: %s", chunk)
+                    # Release the held text tail before the interruption notice
+                    # so no buffered prose is lost on error (TASK-367).
+                    sse = _drain_content_buf(flush_all=True)
+                    if sse:
+                        yield sse
                     warning_data = {
                         "object": "service.warning",
                         "model": model_alias,
@@ -2272,6 +2350,19 @@ class ChatStreamingMixin:
                     yield (f"data: {json.dumps(data)}\n\n")
                     yield ("data: [DONE]\n\n")
                     break
+
+                # Past the None/Exception guards, a dict chunk is an event (tool
+                # call, tool result, reasoning, terminal marker…) — NOT text.
+                # Release the held text tail FIRST so buffered prose always
+                # reaches the client before the event that follows it; this is
+                # what anchors a tool card after its complete lead-in text
+                # instead of mid-word (TASK-367). Guarded to dicts so a normal
+                # str text chunk keeps accumulating in the boundary buffer below
+                # instead of force-flushing every token.
+                if isinstance(chunk, dict):
+                    sse = _drain_content_buf(flush_all=True)
+                    if sse:
+                        yield sse
 
                 # OpenAI-compatible delta.tool_calls streaming
                 if isinstance(chunk, dict) and chunk.get("_type") == "tool_call_delta":
@@ -2347,6 +2438,15 @@ class ChatStreamingMixin:
                                         "name": tc_name,
                                         "arguments": json.dumps(tc_args, ensure_ascii=False) if isinstance(tc_args, dict) else str(tc_args),
                                     },
+                                    # Authoritative char offset (chars of assistant
+                                    # text before this tool), stamped by
+                                    # _intercept_tool_events from the SAME _text_chars
+                                    # counter persisted to tool_calls_json. Lets the
+                                    # client anchor the tool at the byte-identical
+                                    # position it will land on refresh, instead of its
+                                    # own drifting local count (TASK-367). Non-standard
+                                    # field — other OpenAI consumers ignore it.
+                                    "text_offset": chunk.get("_text_offset"),
                                 }],
                             },
                             "finish_reason": None,
@@ -2510,6 +2610,16 @@ class ChatStreamingMixin:
                     if not chunk:
                         # Chunk was filtered out or buffered
                         continue
+
+                # Agent-backend text: hold the forming tail, release only at a
+                # clean boundary (TASK-367). Every dict/terminal handler above
+                # already flushed the buffer, so text→tool order is preserved.
+                if is_agent_backend:
+                    _content_buf.append(chunk)
+                    sse = _drain_content_buf(flush_all=False)
+                    if sse:
+                        yield sse
+                    continue
 
                 # Normal chunk
                 data = {
