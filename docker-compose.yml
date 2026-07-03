@@ -176,7 +176,11 @@ services:
       - ${HOME}/.config/claude-code-bridge:/home/bridge/.claude
       - ${HOME}/dev/agent-skills:/home/bridge/.claude/skills
       - ${HOME}/.config/claude-code-bridge/.claude.json:/home/bridge/.claude.json
-      - ${HOME}/.ssh:/home/bridge/.ssh:ro
+      # Bridge SSH identity. Default = the host operator's ~/.ssh (echo today).
+      # A tenant sets BRIDGE_SSH_DIR to the bootstrap-generated key dir
+      # (deploy/.bridge-ssh) — that dir ships id_ed25519 + a `config` with
+      # accept-new, so this one mount delivers key + client config + host trust.
+      - ${BRIDGE_SSH_DIR:-${HOME}/.ssh}:/home/bridge/.ssh:ro
       - ${HOME}/.config/claude-code-bridge/ssh_config:/etc/ssh/ssh_config:ro
       # TASK-270 proxy reads/refreshes the ChatGPT OAuth bundle here.
       # RW so the proxy can persist refreshed tokens; same inode as the
@@ -236,7 +240,11 @@ services:
       - ${HOME}/.codex/auth.json:/home/bridge/.codex/auth.json
       - ${HOME}/.codex/config.toml:/home/bridge/.codex/config.toml
       - ${HOME}/.codex/sessions:/home/bridge/.codex/sessions
-      - ${HOME}/.ssh:/home/bridge/.ssh:ro
+      # Bridge SSH identity. Default = the host operator's ~/.ssh (echo today).
+      # A tenant sets BRIDGE_SSH_DIR to the bootstrap-generated key dir
+      # (deploy/.bridge-ssh) — that dir ships id_ed25519 + a `config` with
+      # accept-new, so this one mount delivers key + client config + host trust.
+      - ${BRIDGE_SSH_DIR:-${HOME}/.ssh}:/home/bridge/.ssh:ro
       # The openai-codex-sdk wheel ships without the codex Rust binary;
       # bind-mount the host's @openai/codex npm package vendor dir so
       # the SDK's find_codex_path picks up the static-pie musl binary.
