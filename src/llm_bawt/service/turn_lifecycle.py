@@ -88,6 +88,15 @@ def _normalize_tool_call_details(tool_calls: list[dict] | None) -> list[dict]:
             }
         if item.get("call_id"):
             entry["call_id"] = item["call_id"]
+        # SDK tool_use id + parent id. Without these on the persisted blob,
+        # sub-agent nesting (child tool card under its Agent card) works live
+        # via SSE but COLLAPSES on reload: the frontend's cardTuids set is built
+        # from toolUseId, so an empty id makes every child render flat in the
+        # timeline instead of inside its Agent card (TASK-344).
+        if item.get("tool_use_id"):
+            entry["tool_use_id"] = item["tool_use_id"]
+        if item.get("parent_tool_use_id"):
+            entry["parent_tool_use_id"] = item["parent_tool_use_id"]
         # Tool failure flag (SDK ToolResultBlock.is_error), threaded so a
         # recalled turn re-tints failed tool cards red without re-deriving
         # failure from result text. Only persist when true to keep the blob lean.
