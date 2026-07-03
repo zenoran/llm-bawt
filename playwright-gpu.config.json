@@ -1,0 +1,15 @@
+{
+  "//": "GPU Chrome launch flags for playwright-mcp. Mounted read-only and passed via --config. See TASK-368. Without these + the nvidia runtime + NVIDIA_DRIVER_CAPABILITIES=all, headless Chromium falls back to SwiftShader (software WebGL) and OOMs on heavy VRM scenes.",
+  "browser": {
+    "browserName": "chromium",
+    "launchOptions": {
+      "args": [
+        "--ignore-gpu-blocklist",
+        "--enable-gpu-rasterization",
+        "--enable-zero-copy",
+        "--use-angle=vulkan",
+        "--enable-features=Vulkan"
+      ]
+    }
+  }
+}

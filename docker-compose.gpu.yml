@@ -1,0 +1,41 @@
+# Optional GPU override for the playwright-mcp browser (TASK-368).
+#
+# WHY OPTIONAL: the base docker-compose.yml keeps playwright-mcp on the stock
+# CPU-only `mcp/playwright` image so a fully non-GPU tenant runs unchanged. This
+# override is opt-in — a host WITH an NVIDIA GPU chains it into COMPOSE_FILE in
+# its .env, e.g.:
+#   COMPOSE_FILE=docker-compose.yml:docker-compose.dev.yml:docker-compose.gpu.yml
+#
+# WHAT IT DOES: swaps in the derived image (Dockerfile.playwright — stock image
+# + Vulkan/EGL loaders + NVIDIA vendor manifests), grants the GPU via the nvidia
+# runtime, and points Chromium at the ANGLE/Vulkan launch flags. Result: WebGL
+# renders on the real GPU instead of SwiftShader (verify: WEBGL_debug_renderer_info
+# UNMASKED_RENDERER shows the GPU, not "SwiftShader").
+#
+# NOTE: `command:` below fully restates the base command — compose REPLACES
+# command across files (it does not merge), so the token-guard flags must be
+# repeated here alongside the added --config.
+services:
+  playwright-mcp:
+    image: llm-bawt-playwright-gpu
+    build:
+      context: .
+      dockerfile: Dockerfile.playwright
+    command: ["--headless", "--no-sandbox", "--isolated", "--port", "8931", "--host", "0.0.0.0", "--allowed-hosts", "*", "--snapshot-mode", "none", "--viewport-size", "1280x720", "--config", "/etc/playwright-gpu.json"]
+    # GPU via the host NVIDIA runtime. Watch VRAM if the GPU is shared with
+    # other workloads (e.g. a voice pipeline) — a headless Chrome GPU context
+    # needs ~1-2GB.
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=all
+      # `all` includes the `graphics` cap — mandatory for WebGL/Vulkan
+      # rendering. The default `[gpu]` reservation cap only grants compute.
+      - NVIDIA_DRIVER_CAPABILITIES=all
+    volumes:
+      - ./playwright-gpu.config.json:/etc/playwright-gpu.json:ro

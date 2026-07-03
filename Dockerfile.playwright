@@ -1,0 +1,33 @@
+# Derived from mcp/playwright to add GPU render loaders (TASK-368).
+#
+# The stock image ships the Playwright browsers but NOT the vendor-neutral GPU
+# loaders (libvulkan1 / GLVND libEGL). So even when the nvidia-container-toolkit
+# injects the NVIDIA driver .so files at runtime, headless Chromium finds no
+# loader to reach them and falls back to SwiftShader (software WebGL), which
+# OOMs on heavy VRM scenes. We add the loaders + the NVIDIA ICD/EGL vendor
+# manifests so ANGLE (Vulkan or gl-egl) can render on the real RTX 5080.
+#
+# Verify after build: WEBGL_debug_renderer_info UNMASKED_RENDERER must show
+# "RTX 5080", not "SwiftShader".
+FROM mcp/playwright
+
+USER root
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        libvulkan1 \
+        libegl1 \
+        libgles2 \
+        libglvnd0 \
+    && rm -rf /var/lib/apt/lists/*
+
+# NVIDIA vendor manifests. The driver .so files themselves are mounted at
+# runtime by the nvidia-container-toolkit (NVIDIA_DRIVER_CAPABILITIES=all);
+# these JSONs are what tell the Vulkan loader and GLVND where to find them.
+# The toolkit injects the libs but not these manifests, so we bake them in for
+# deterministic rendering.
+RUN mkdir -p /usr/share/vulkan/icd.d /usr/share/glvnd/egl_vendor.d
+COPY docker/nvidia_icd.json    /usr/share/vulkan/icd.d/nvidia_icd.json
+COPY docker/10_nvidia_egl.json /usr/share/glvnd/egl_vendor.d/10_nvidia.json
+
+# Restore the base image's runtime user.
+USER node
