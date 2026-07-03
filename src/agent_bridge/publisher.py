@@ -33,8 +33,18 @@ UNIFIED_EVENTS_PREFIX = "events:"
 STREAM_MAXLEN = 10_000
 # Unified event streams are smaller — tool events + lifecycle only
 UNIFIED_STREAM_MAXLEN = 5_000
-# Run response streams are shorter-lived
-RUN_STREAM_MAXLEN = 5_000
+# Run response streams are shorter-lived. This is a runaway BACKSTOP, not a
+# turn-sizing cap: a single fat agent turn (fan-out sub-agents + long tool
+# loops) can emit thousands of events, and a reconnecting client must be able
+# to replay the whole turn from its head. A 5k count-cap would evict the head
+# of a pathological turn mid-flight (TASK-366). Set generously so real turns
+# are never truncated; abandoned streams are reclaimed by the sliding TTL
+# below and by publish_run_done's shorter expire. The DB (TurnLog +
+# ToolCallRecord) remains the durable backstop for anything beyond this.
+RUN_STREAM_MAXLEN = 100_000
+# Sliding TTL refreshed on every run event so an abandoned/crashed run stream
+# self-cleans even if run_done never fires.
+RUN_STREAM_TTL_SECONDS = 900
 
 
 class RedisPublisher:
@@ -122,6 +132,9 @@ class RedisPublisher:
                 maxlen=RUN_STREAM_MAXLEN,
                 approximate=True,
             )
+            # Sliding TTL: keep a live stream alive while events flow, but let
+            # an abandoned run (client gone, run_done never published) expire.
+            self._redis.expire(stream_key, RUN_STREAM_TTL_SECONDS)
             return stream_id
         except Exception:
             logger.exception("Failed to publish run event to %s", stream_key)
