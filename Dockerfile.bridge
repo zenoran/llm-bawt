@@ -2,30 +2,48 @@
 FROM python:3.12-slim
 
 # Tools grouped by purpose (one group per line):
-#   core:       curl libpq5 openssh-client git ca-certificates
+#   core:       curl libpq5 openssh-client git git-lfs ca-certificates
 #   data:       jq yq
 #   search:     ripgrep fd-find
 #   db clients: postgresql-client redis-tools sqlite3
-#   sys/proc:   procps iproute2 less tree
-#   net debug:  dnsutils iputils-ping netcat-openbsd
+#   sys/proc:   procps iproute2 less tree htop
+#   net debug:  dnsutils iputils-ping netcat-openbsd rsync
 #   archives:   unzip zip xz-utils
-#   build:      make
+#   build:      make shellcheck
+#   editors:    vim
+#   viewers:    bat (installed as batcat on Debian; symlinked to bat below)
 #   python pkg: pipx (used to install editable `llm` CLI for the bridge user)
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    curl libpq5 openssh-client git ca-certificates \
+    curl libpq5 openssh-client git git-lfs ca-certificates \
     jq yq \
     ripgrep fd-find \
     postgresql-client redis-tools sqlite3 \
-    procps iproute2 less tree \
-    dnsutils iputils-ping netcat-openbsd \
+    procps iproute2 less tree htop \
+    dnsutils iputils-ping netcat-openbsd rsync \
     unzip zip xz-utils \
-    make \
+    make shellcheck \
+    vim \
+    bat \
     pipx \
     && rm -rf /var/lib/apt/lists/* \
-    && ln -s "$(which fdfind)" /usr/local/bin/fd
+    && ln -s "$(which fdfind)" /usr/local/bin/fd \
+    && ln -s "$(which batcat)" /usr/local/bin/bat
 
-RUN curl -LsSf https://astral.sh/uv/install.sh | sh
-ENV PATH="/root/.local/bin:$PATH"
+# Install uv to a shared prefix (not /root/.local, which the bridge user
+# can't traverse) so both the build (root) and runtime (bridge) can use it.
+RUN curl -LsSf https://astral.sh/uv/install.sh | env UV_INSTALL_DIR=/usr/local/bin sh
+ENV PATH="/usr/local/bin:$PATH"
+
+# GitHub CLI via the official apt repo (always current; no pinned version to
+# rot). Agents are told to use `gh` for PRs/issues — make it present.
+RUN mkdir -p -m 755 /etc/apt/keyrings \
+    && curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
+       -o /etc/apt/keyrings/githubcli-archive-keyring.gpg \
+    && chmod go+r /etc/apt/keyrings/githubcli-archive-keyring.gpg \
+    && echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" \
+       > /etc/apt/sources.list.d/github-cli.list \
+    && apt-get update && apt-get install -y --no-install-recommends gh \
+    && rm -rf /var/lib/apt/lists/*
 
 # Bitwarden CLI (OSS build — Vaultwarden-friendly). Used by agents to read
 # secrets from vault.ferreri.us at runtime. Server URL is set per-user below
@@ -103,7 +121,8 @@ RUN pipx install --force --editable /app
 # so agent helpers never shadow the project's own binaries.
 ENV PATH="/home/bridge/.local/bin:/app/.venv/bin:$PATH:/opt/agent-skills/bin" \
     PYTHONUNBUFFERED=1 \
-    HOME=/home/bridge
+    HOME=/home/bridge \
+    PYTHONDONTWRITEBYTECODE=1
 
 # Point the Bitwarden CLI at our self-hosted Vaultwarden. Writes to
 # ~/.config/Bitwarden CLI/data.json; baked here so containers start
