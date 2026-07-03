@@ -153,6 +153,18 @@ class ToolCallRecord(SQLModel, table=True):
     # them, un-nesting every child. Null on legacy rows / top-level calls.
     tool_use_id: str | None = Field(default=None, index=True)
     parent_tool_use_id: str | None = Field(default=None, index=True)
+    # TASK-305 (persistence): when this tool call was gated by an approval
+    # policy, the approval request id (== tool_use_id for the gated call).
+    # Populated from the approval_resolved event so history recall knows which
+    # tool calls had approval gates. Null on non-gated calls / legacy rows.
+    approval_request_id: str | None = Field(default=None, index=True)
+    # Terminal status of the approval: "approved", "denied", "cancelled",
+    # "responded". Null until resolved / on non-gated calls.
+    approval_status: str | None = Field(default=None)
+    # True when this tool ran on a continuation turn and consumed a live
+    # approval grant (the re-attempt after user approved). Persisted so the
+    # gold "Approved" badge survives reload.
+    preapproved: bool | None = Field(default=None, sa_column=Column(Boolean, nullable=True))
 
 
 class TurnLogStore:
@@ -264,6 +276,21 @@ class TurnLogStore:
                 conn.execute(sa_text(
                     "CREATE INDEX IF NOT EXISTS ix_tool_call_records_parent_tool_use_id"
                     " ON tool_call_records (parent_tool_use_id)"
+                ))
+                # TASK-305: approval gate persistence — link tool calls to
+                # their approval request so the approval card survives reload.
+                conn.execute(sa_text(
+                    "ALTER TABLE tool_call_records ADD COLUMN IF NOT EXISTS approval_request_id VARCHAR(128)"
+                ))
+                conn.execute(sa_text(
+                    "CREATE INDEX IF NOT EXISTS ix_tool_call_records_approval_request_id"
+                    " ON tool_call_records (approval_request_id)"
+                ))
+                conn.execute(sa_text(
+                    "ALTER TABLE tool_call_records ADD COLUMN IF NOT EXISTS approval_status VARCHAR(24)"
+                ))
+                conn.execute(sa_text(
+                    "ALTER TABLE tool_call_records ADD COLUMN IF NOT EXISTS preapproved BOOLEAN"
                 ))
                 # Path-agnostic turn-completion timestamp (NULL = in progress).
                 conn.execute(sa_text(
@@ -815,3 +842,61 @@ class TurnLogStore:
                 ).all())
         except Exception:
             return []
+
+    def set_approval_status(
+        self,
+        tool_use_id: str,
+        approval_request_id: str,
+        approval_status: str,
+    ) -> bool:
+        """Stamp a tool_call_record with its approval resolution.
+
+        Called when an approval request is resolved (approved/denied/cancelled/
+        responded). The tool_use_id of the gated call == the approval request id,
+        so we match on that. Returns True if a row was updated.
+        """
+        if self.engine is None or not tool_use_id:
+            return False
+        try:
+            with Session(self.engine) as session:
+                stmt = (
+                    sa_text(
+                        "UPDATE tool_call_records"
+                        " SET approval_request_id = :req_id,"
+                        "     approval_status = :status"
+                        " WHERE tool_use_id = :tuid"
+                    )
+                )
+                result = session.execute(stmt, {
+                    "req_id": approval_request_id,
+                    "status": approval_status,
+                    "tuid": tool_use_id,
+                })
+                session.commit()
+                return result.rowcount > 0  # type: ignore[union-attr]
+        except Exception:
+            logger.exception("Failed to set approval status for tool_use_id=%s", tool_use_id)
+            return False
+
+    def set_preapproved(self, tool_use_id: str) -> bool:
+        """Mark a tool_call_record as pre-approved (ran with a live grant).
+
+        Called from the tool_preapproved event handler so the gold "Approved"
+        badge survives a page reload. Returns True if a row was updated.
+        """
+        if self.engine is None or not tool_use_id:
+            return False
+        try:
+            with Session(self.engine) as session:
+                result = session.execute(
+                    sa_text(
+                        "UPDATE tool_call_records SET preapproved = TRUE"
+                        " WHERE tool_use_id = :tuid"
+                    ),
+                    {"tuid": tool_use_id},
+                )
+                session.commit()
+                return result.rowcount > 0  # type: ignore[union-attr]
+        except Exception:
+            logger.exception("Failed to set preapproved for tool_use_id=%s", tool_use_id)
+            return False

@@ -234,6 +234,18 @@ async def resolve_approval(request_id: str, body: ResolveRequest):
     if updated is None:
         raise HTTPException(status_code=404, detail="Request disappeared during resolve")
 
+    # TASK-305: stamp the tool_call_record so the approval card survives reload.
+    try:
+        from ..turn_logs import TurnLogStore
+        turn_log_store = TurnLogStore(get_service().config)
+        turn_log_store.set_approval_status(
+            tool_use_id=request_id,  # approval request id == gated call's tool_use_id
+            approval_request_id=request_id,
+            approval_status=new_status,
+        )
+    except Exception:
+        log.debug("Could not stamp tool_call_record approval status for %s", request_id, exc_info=True)
+
     subscriber = _subscriber()
     if approved and subscriber is not None:
         # Grant the bridge a one-shot allow BEFORE the client dispatches the

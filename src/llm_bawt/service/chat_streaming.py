@@ -2578,19 +2578,27 @@ class ChatStreamingMixin:
                     # mark that exact tool card as pre-approved (gold/lock). No HTTP
                     # yield needed: it's a live activity-card flag, and every chat
                     # tab is on the unified stream.
+                    _preapproved_tuid = chunk.get("tool_use_id", "")
                     await _publish_unified({
                         "_type": "tool_preapproved",
                         "turn_id": turn_log_id,
                         "trigger_message_id": trigger_message_id,
                         "bot_id": bot_id,
                         "user_id": user_id,
-                        "tool_use_id": chunk.get("tool_use_id", ""),
+                        "tool_use_id": _preapproved_tuid,
                         "tool_name": chunk.get("tool_name", ""),
                         "policy_id": chunk.get("policy_id"),
                         "severity": chunk.get("severity", "medium"),
                         "provider": chunk.get("provider", ""),
                         "ts": time.time(),
                     })
+                    # Persist the preapproved flag on the tool_call_record so the
+                    # gold badge survives a page reload (TASK-305 persistence).
+                    if _preapproved_tuid and self._turn_log_store:
+                        try:
+                            self._turn_log_store.set_preapproved(_preapproved_tuid)
+                        except Exception:
+                            pass  # best-effort; live event is the primary surface
                     continue
 
                 if isinstance(chunk, dict) and chunk.get("_type") == "tool_calls_finish":

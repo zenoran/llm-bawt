@@ -86,6 +86,10 @@ def _records_to_calls(records: list[ToolCallRecord]) -> list[dict]:
             # TASK-344: SDK ids so sub-agent nesting survives reload.
             "tool_use_id": row.tool_use_id,
             "parent_tool_use_id": row.parent_tool_use_id,
+            # TASK-305: approval gate data for history-recalled tool cards.
+            "approval_request_id": row.approval_request_id,
+            "approval_status": row.approval_status,
+            "preapproved": row.preapproved,
         })
     return out
 
