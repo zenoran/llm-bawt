@@ -8,7 +8,7 @@ import time
 from datetime import datetime, timedelta, timezone
 from urllib.parse import quote_plus
 
-from sqlalchemy import Boolean, Column, DateTime, Float, Integer, String, Text, func, text as sa_text
+from sqlalchemy import Boolean, Column, DateTime, Float, Integer, String, Text, exists as sa_exists, func, text as sa_text
 from sqlmodel import Field, SQLModel, Session, create_engine, delete, select
 
 from ..utils.config import Config, has_database_credentials
@@ -389,7 +389,8 @@ class TurnLogStore:
             user_prompt=user_prompt,
             request_json=json.dumps(request_payload, ensure_ascii=False, default=str) if request_payload else None,
             response_text=response_text,
-            tool_calls_json=json.dumps(tool_calls or [], ensure_ascii=False, default=str),
+            # TASK-364: tool_calls_json retired — tool_call_records is canonical.
+            # Column left in place (tombstoned) but no longer written or read.
             error_text=error_text,
             trigger_message_id=trigger_message_id,
             agent_session_key=agent_session_key,
@@ -449,8 +450,7 @@ class TurnLogStore:
                     tid = _extract_trigger_id(request_payload)
                     if tid:
                         row.trigger_message_id = tid
-            if tool_calls is not None:
-                row.tool_calls_json = json.dumps(tool_calls, ensure_ascii=False, default=str)
+            # TASK-364: tool_calls_json retired (tombstoned) — no longer written.
             if error_text is not None:
                 row.error_text = error_text
             if agent_session_key is not None:
@@ -643,11 +643,13 @@ class TurnLogStore:
             conditions.append(TurnLog.ended_at.is_(None))
         if stream is not None:
             conditions.append(TurnLog.stream.is_(stream))
-        if has_tools is True:
-            conditions.append(TurnLog.tool_calls_json.is_not(None))
-            conditions.append(TurnLog.tool_calls_json != "[]")
-        elif has_tools is False:
-            conditions.append((TurnLog.tool_calls_json.is_(None)) | (TurnLog.tool_calls_json == "[]"))
+        if has_tools is not None:
+            # TASK-364: presence of tools is derived from the canonical
+            # tool_call_records table (correlated EXISTS), not the retired
+            # tool_calls_json blob — so the filter stays correct once the blob
+            # is no longer written.
+            tool_exists = sa_exists().where(ToolCallRecord.turn_id == TurnLog.id)
+            conditions.append(tool_exists if has_tools else ~tool_exists)
         if trigger_message_ids:
             # Include rows matching the given IDs OR rows with NULL trigger
             # (agent-backend turns that need post-processing via turn_id fallback).

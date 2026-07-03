@@ -47,29 +47,20 @@ def _parse_token_usage(value: str | None) -> dict | None:
     return parsed if isinstance(parsed, dict) else None
 
 
-def _live_tool_calls(store: TurnLogStore, turn_id: str) -> list[dict]:
-    """Read realtime tool-call rows from `tool_call_records` for a turn.
+def _records_to_calls(records: list[ToolCallRecord]) -> list[dict]:
+    """Shape ``tool_call_records`` rows into the frontend tool-card dict list.
 
-    Tool events are persisted incrementally as they fire (via Redis sink),
-    while `turn_logs.tool_calls_json` is only written at turn finalize.
-    During an in-flight stream this is the only source of partial activity.
+    TASK-364: ``ToolCallRecord`` is the single canonical source of tool-call
+    data — written incrementally as tool_start/tool_end fire (via the Redis
+    sink), it survives mid-stream reloads and terminated turns. The former
+    ``turn_logs.tool_calls_json`` blob was a vestigial finalize-time copy and
+    is no longer read. Rows are ordered by ``created_at`` (call order); each
+    dict carries per-call timing and the SDK ids that let reload nest
+    sub-agent children under their parent.
     """
-    if store.engine is None or not turn_id:
-        return []
-    try:
-        with Session(store.engine) as session:
-            rows = list(
-                session.exec(
-                    select(ToolCallRecord)
-                    .where(ToolCallRecord.turn_id == turn_id)
-                    .order_by(ToolCallRecord.created_at)
-                ).all()
-            )
-    except Exception:
-        return []
-
+    ordered = sorted(records, key=lambda r: (r.created_at is None, r.created_at))
     out: list[dict] = []
-    for row in rows:
+    for row in ordered:
         args = _parse_json(row.arguments_json) or {}
         if not isinstance(args, dict):
             args = {"raw": args}
@@ -99,52 +90,26 @@ def _live_tool_calls(store: TurnLogStore, turn_id: str) -> list[dict]:
     return out
 
 
-def _enrich_calls_with_timing(calls: list[dict], records: list[ToolCallRecord]) -> None:
-    """Stamp each call with real per-call ``started_at``/``ended_at``/``duration_ms``.
+def _live_tool_calls(store: TurnLogStore, turn_id: str) -> list[dict]:
+    """Read tool-call rows from `tool_call_records` for a single turn.
 
-    Sourced from ``tool_call_records``, which are written *incrementally* as
-    tool_start/tool_end events fire (via the Redis event sink) — so their
-    timestamps survive mid-stream reloads and terminated turns, unlike a
-    finalize-time write. Without this every call in a turn inherits the
-    event-level ``created_at`` (the turn start) and the UI renders N cards
-    with one identical timestamp.
-
-    Calls with no matching record (legacy rows, non-agent turns) are left
-    untouched; the frontend then falls back to the event-level created_at.
+    TASK-364: this is now the canonical read path for every turn (not just
+    in-flight ones) — the `tool_calls_json` blob is no longer written or read.
     """
-    if not records:
-        return
-
-    by_call_id = {r.call_id: r for r in records if r.call_id}
-    by_iter_name: dict[tuple, list[ToolCallRecord]] = {}
-    for rec in records:
-        by_iter_name.setdefault((rec.iteration or 1, rec.tool_name), []).append(rec)
-    cursors: dict[tuple, int] = {}
-
-    def find(call: dict) -> ToolCallRecord | None:
-        cid = call.get("call_id")
-        if cid and cid in by_call_id:
-            return by_call_id[cid]
-        key = (call.get("iteration", 1), call.get("name") or call.get("tool"))
-        bucket = by_iter_name.get(key)
-        if not bucket:
-            return None
-        i = cursors.get(key, 0)
-        if i < len(bucket):
-            cursors[key] = i + 1
-            return bucket[i]
-        return None
-
-    for call in calls:
-        rec = find(call)
-        if rec is None:
-            continue
-        if rec.started_at is not None:
-            call["started_at"] = rec.started_at
-        if rec.ended_at is not None:
-            call["ended_at"] = rec.ended_at
-        if rec.duration_ms is not None:
-            call["duration_ms"] = rec.duration_ms
+    if store.engine is None or not turn_id:
+        return []
+    try:
+        with Session(store.engine) as session:
+            rows = list(
+                session.exec(
+                    select(ToolCallRecord)
+                    .where(ToolCallRecord.turn_id == turn_id)
+                    .order_by(ToolCallRecord.created_at)
+                ).all()
+            )
+    except Exception:
+        return []
+    return _records_to_calls(rows)
 
 
 def _live_tool_call_counts(store: TurnLogStore, turn_ids: list[str]) -> dict[str, int]:
@@ -252,17 +217,9 @@ def list_turn_logs(
         offset=offset,
     )
 
-    parsed_tool_calls_by_turn: dict[str, list] = {}
-    turns_needing_live_counts: list[str] = []
-    for row in rows:
-        tool_calls = _parse_json(row.tool_calls_json) or []
-        if isinstance(tool_calls, list) and tool_calls:
-            parsed_tool_calls_by_turn[row.id] = tool_calls
-        else:
-            parsed_tool_calls_by_turn[row.id] = []
-            turns_needing_live_counts.append(row.id)
-
-    live_tool_counts = _live_tool_call_counts(store, turns_needing_live_counts)
+    # TASK-364: tool-call counts come solely from tool_call_records (the
+    # canonical store) for every turn — the tool_calls_json blob is retired.
+    live_tool_counts = _live_tool_call_counts(store, [row.id for row in rows])
 
     # TASK-269: embed the persisted question for turns that ended on one, so the
     # UI can render a QuestionMessage straight from history hydration.
@@ -283,8 +240,7 @@ def list_turn_logs(
 
     items = []
     for row in rows:
-        tool_calls = parsed_tool_calls_by_turn.get(row.id, [])
-        tool_call_count = len(tool_calls) if tool_calls else live_tool_counts.get(row.id, 0)
+        tool_call_count = live_tool_counts.get(row.id, 0)
         response_text = row.response_text or ""
         response_preview = response_text[:300] if response_text else None
         items.append(
@@ -395,26 +351,13 @@ def recent_turns_by_bot(
         since_hours=since_hours,
     )
 
-    # In-flight turns haven't written tool_calls_json yet — fall back to the
-    # live tool_call_records table so the count reflects what's running NOW.
-    turns_needing_live: list[str] = []
-    parsed_tools_by_turn: dict[str, list] = {}
-    for row in rows:
-        parsed = _parse_json(row.tool_calls_json) or []
-        if isinstance(parsed, list) and parsed:
-            parsed_tools_by_turn[row.id] = parsed
-        else:
-            parsed_tools_by_turn[row.id] = []
-            turns_needing_live.append(row.id)
-
-    live_counts = _live_tool_call_counts(store, turns_needing_live)
+    # TASK-364: counts come solely from tool_call_records (canonical store)
+    # for every turn — finalized and in-flight alike; the blob is retired.
+    live_counts = _live_tool_call_counts(store, [row.id for row in rows])
 
     items: list[RecentBotTurn] = []
     for row in rows:
-        finalized_tools = parsed_tools_by_turn.get(row.id, [])
-        tool_call_count = (
-            len(finalized_tools) if finalized_tools else live_counts.get(row.id, 0)
-        )
+        tool_call_count = live_counts.get(row.id, 0)
         user_prompt = (row.user_prompt or "")[:preview_chars] or None
         response_text = row.response_text or ""
         response_preview = response_text[:preview_chars] if response_text else None
@@ -489,12 +432,8 @@ def get_turn_log(turn_id: str):
         raise HTTPException(status_code=404, detail="Turn log not found")
 
     parsed_request = _parse_json(row.request_json)
-    parsed_tools = _parse_json(row.tool_calls_json) or []
-    if not isinstance(parsed_tools, list):
-        parsed_tools = [{"raw": parsed_tools}]
-    if not parsed_tools:
-        # Fallback to realtime rows for in-flight turns.
-        parsed_tools = _live_tool_calls(store, row.id)
+    # TASK-364: tool cards render from the canonical tool_call_records rows.
+    parsed_tools = _live_tool_calls(store, row.id)
 
     return TurnLogDetail(
         id=row.id,
@@ -595,16 +534,12 @@ def get_tool_call_events(
 
     events: list[ToolCallEvent] = []
     for row in rows:
-        parsed_tools = _parse_json(row.tool_calls_json) or []
-        if not isinstance(parsed_tools, list) or not parsed_tools:
-            # Fallback to realtime tool_call_records for in-flight turns so
-            # the UI can render tool activity before the turn finalizes.
-            parsed_tools = _live_tool_calls(store, row.id)
+        # TASK-364: tool cards render straight from the canonical
+        # tool_call_records rows (batch-fetched above), which already carry
+        # per-call timing — no blob, no separate timing-enrich pass.
+        parsed_tools = _records_to_calls(records_by_turn.get(row.id, []))
         if not parsed_tools:
             continue
-
-        # Attach real per-call timestamps (incremental source records).
-        _enrich_calls_with_timing(parsed_tools, records_by_turn.get(row.id, []))
 
         trigger_id = row.trigger_message_id
         trigger_role = "user"
