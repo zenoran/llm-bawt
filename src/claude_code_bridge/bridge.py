@@ -853,6 +853,20 @@ class ClaudeCodeBridge:
                     )
 
                     sdk_env = {}
+                    # Force Task/Agent subagents to run SYNCHRONOUSLY. CLI 2.1.x
+                    # backgrounds agents by default: the tool returns immediately,
+                    # the model ends its turn ("agents launched, standing by"),
+                    # and the CLI re-invokes the model via task-notification when
+                    # they finish — emitting a SECOND ResultMessage. This bridge
+                    # is one-send-one-turn: it finalizes on the FIRST ResultMessage
+                    # and disconnect()s the client, which kills the subprocess and
+                    # orphans every still-running subagent, so their results are
+                    # lost and the user sees a dead-end turn. With this flag the
+                    # CLI awaits agent completion in-turn (verified live on
+                    # 2.1.191: flag on → tool_result carries the agent's answer,
+                    # single ResultMessage; flag off → "running in background"
+                    # stub + task-notification + second ResultMessage).
+                    sdk_env["CLAUDE_CODE_DISABLE_BACKGROUND_TASKS"] = "1"
                     if use_proxy:
                         sdk_env["ANTHROPIC_BASE_URL"] = self._proxy_base_url  # type: ignore[assignment]
                         # The SDK still requires *some* auth token to send; the
