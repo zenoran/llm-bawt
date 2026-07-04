@@ -274,6 +274,24 @@ async def self_recap(
     }
 
 
+async def _tail_bubbles(bot_id: str, count: int) -> tuple[list[dict], int]:
+    """Return ``(last `count` real bubbles, total_available)`` for ``bot_id``.
+
+    Shared retrieval behind both ``self_tail`` and ``self_fwd``. ``raw=True``
+    reads the messages table directly so already-summarized bubbles are still
+    visible (the summary-aware manager would hide them) and role='summary' husks
+    are excluded. Filters to real user/assistant bubbles BEFORE slicing the last
+    ``count``, so ``count`` always means N real bubbles.
+    """
+    count = max(1, int(count))
+    from .server import _get_storage
+
+    storage = _get_storage()
+    messages = await storage.get_messages(bot_id=bot_id, raw=True)
+    bubbles = [m for m in messages if (m.get("role") or "").lower() in _RECAP_ROLES]
+    return bubbles[-count:], len(bubbles)
+
+
 @mcp.tool(name="self_tail")
 async def self_tail(
     bot_id: str = "default",
@@ -300,16 +318,7 @@ async def self_tail(
     count = max(1, int(count))
     logger.debug("MCP tool invoked: self_tail bot_id=%s count=%s", bot_id, count)
 
-    from .server import _get_storage
-
-    storage = _get_storage()
-    # raw=True reads the messages table directly so already-summarized bubbles
-    # are still visible (the manager would hide them) and summary husks are
-    # excluded. Filter to real bubbles BEFORE slicing the last `count`.
-    messages = await storage.get_messages(bot_id=bot_id, raw=True)
-    bubbles = [m for m in messages if (m.get("role") or "").lower() in _RECAP_ROLES]
-    total_available = len(bubbles)
-    tail = bubbles[-count:]
+    tail, total_available = await _tail_bubbles(bot_id, count)
 
     transcript, used_count, truncated = _format_transcript(tail)
     return {
@@ -325,6 +334,122 @@ async def self_tail(
         "count_returned": used_count,
         "total_available": total_available,
         "truncated": truncated,
+    }
+
+
+@mcp.tool(name="self_fwd")
+async def self_fwd(
+    sender_bot_id: str = "default",
+    target_bot_id: str = "",
+    count: int = 10,
+    note: str | None = None,
+    force: bool = False,
+    wait_for_reply: bool = False,
+) -> dict:
+    """Forward YOUR last N conversation bubbles to another bot as context.
+
+    Combines ``self_tail`` (grab your most recent ``count`` real bubbles) with
+    ``bots_send_message`` (deliver to another bot) in one hand-off: the target
+    receives your recent transcript as a clearly-delimited FORWARDED CONTEXT
+    block, then processes it like any inbound message. Async by default (the send
+    returns immediately); pass ``wait_for_reply=True`` to block for the reply.
+
+    IMPORTANT: pass YOUR OWN slug as ``sender_bot_id`` — it is the bot whose tail
+    is forwarded and cannot be inferred. The literal "default" is rejected. So
+    "self fwd vex 10" means: sender_bot_id=<your slug>, target_bot_id="vex",
+    count=10.
+
+    Args:
+        sender_bot_id: YOUR slug — the bot whose recent tail is forwarded.
+        target_bot_id: The bot slug to receive the forwarded context.
+        count: How many of your most-recent bubbles to forward (default 10, min 1).
+        note: Optional cover message prepended above the forwarded block.
+        force: If True, deliver even if the target bot is mid-turn.
+        wait_for_reply: If True, block up to the send's timeout and return the
+            target's reply inside ``send_result``. Defaults to async.
+
+    Returns:
+        Dict with: success, sender, target, forwarded (bubbles sent),
+        total_available, truncated, wait_for_reply, and send_result (the nested
+        bots_send_message result — dispatched / in_turn / content). On failure,
+        error.
+    """
+    sender = (sender_bot_id or "").strip().lower()
+    target = (target_bot_id or "").strip().lower()
+    count = max(1, int(count))
+    logger.debug(
+        "MCP tool invoked: self_fwd sender=%s target=%s count=%s wait=%s",
+        sender, target, count, wait_for_reply,
+    )
+
+    if not sender or sender == "default":
+        return {
+            "success": False,
+            "sender": sender,
+            "target": target,
+            "forwarded": 0,
+            "error": "sender_bot_id is required — pass your own slug (not 'default').",
+        }
+    if not target:
+        return {
+            "success": False,
+            "sender": sender,
+            "target": target,
+            "forwarded": 0,
+            "error": "target_bot_id is required.",
+        }
+    if target == sender:
+        return {
+            "success": False,
+            "sender": sender,
+            "target": target,
+            "forwarded": 0,
+            "error": "Cannot forward to yourself.",
+        }
+
+    tail, total = await _tail_bubbles(sender, count)
+    if not tail:
+        return {
+            "success": False,
+            "sender": sender,
+            "target": target,
+            "forwarded": 0,
+            "total_available": total,
+            "error": f"No messages found for '{sender}' to forward.",
+        }
+
+    transcript, used_count, truncated = _format_transcript(tail)
+    block = (
+        f"=== FORWARDED CONTEXT from '{sender}' "
+        f"(last {used_count} message{'s' if used_count != 1 else ''}) ===\n"
+        f"{transcript}\n"
+        "=== END FORWARDED CONTEXT ==="
+    )
+    message = f"{note.strip()}\n\n{block}" if note and note.strip() else block
+
+    # Reuse the full inter-bot send tool (in-turn gating, stable message id,
+    # async fire-and-forget bookkeeping) rather than re-implementing the HTTP
+    # call. Local import mirrors the other `from .server import ...` calls in
+    # this module and avoids a circular import at module load.
+    from .server import send_message_to_bot
+
+    send_result = await send_message_to_bot(
+        target_bot_id=target,
+        message=message,
+        sender_bot_id=sender,
+        force=force,
+        wait_for_reply=wait_for_reply,
+    )
+
+    return {
+        "success": bool(send_result.get("success")),
+        "sender": sender,
+        "target": target,
+        "forwarded": used_count,
+        "total_available": total,
+        "truncated": truncated,
+        "wait_for_reply": wait_for_reply,
+        "send_result": send_result,
     }
 
 
