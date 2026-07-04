@@ -1450,6 +1450,55 @@ def _clear_history_direct(config, bot_id: str) -> bool:
         log.warning("Direct history clear failed for '%s': %s", bot_id, e)
         return False
 
+
+@router.delete("/v1/history/{message_id}", response_model=HistoryClearResponse, tags=["History"])
+def delete_message(
+    message_id: str,
+    bot_id: str = Query(None, description="Bot ID (uses default if not specified)"),
+):
+    """Delete (forget) a single message by its ID.
+
+    Moves the message to the bot's ``*_forgotten_messages`` archive table so it
+    stops appearing in history but stays recoverable. Backs the chat UI delete
+    button (``DELETE /api/chat/history/{id}``); ``message_id`` is the DB UUID the
+    ``GET /v1/history`` response carries, and a leading prefix (>= 8 chars) also
+    matches. Returns 404 when no such message exists for the bot.
+
+    NOTE: single-segment path, so it does not collide with the more specific
+    ``DELETE /v1/history/summary/{summary_id}`` route (two segments) or the
+    no-param ``DELETE /v1/history`` clear-all route.
+    """
+    service = get_service()
+    effective_bot_id = bot_id or service._default_bot
+
+    try:
+        from llm_bawt.memory.postgresql import PostgreSQLMemoryBackend
+        backend = PostgreSQLMemoryBackend(service.config, bot_id=effective_bot_id)
+        forgotten = backend.ignore_message_by_id(message_id)
+
+        if not forgotten:
+            raise HTTPException(
+                status_code=404,
+                detail=f"Message '{message_id}' not found for bot '{effective_bot_id}'",
+            )
+
+        # Evict cached LLMBawt instances so their in-memory history_manager
+        # doesn't keep serving the just-forgotten message on the next turn.
+        stale_keys = [k for k in service._llm_bawt_cache if k[1] == effective_bot_id]
+        for k in stale_keys:
+            del service._llm_bawt_cache[k]
+
+        return HistoryClearResponse(
+            success=True,
+            message=f"Message '{message_id}' deleted for bot '{effective_bot_id}'",
+            deleted_count=1,
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        log.error(f"Failed to delete message {message_id}: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
 @router.get("/v1/history/summarize/preview", response_model=SummarizePreviewResponse, tags=["History"])
 def preview_summarizable_sessions(
     bot_id: str = Query(None, description="Bot ID"),
