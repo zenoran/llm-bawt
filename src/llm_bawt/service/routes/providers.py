@@ -18,7 +18,7 @@ from fastapi.concurrency import run_in_threadpool
 from pydantic import BaseModel
 
 from ..dependencies import get_service
-from ..providers.base import AUTH_DEVICE_OAUTH
+from ..providers.base import AUTH_CLI_OAUTH, AUTH_DEVICE_OAUTH
 from ..providers.github import GitHubAdapter, GitHubConfigError
 from ..providers.registry import all_adapters, get_adapter
 
@@ -29,6 +29,11 @@ router = APIRouter()
 
 class PollRequest(BaseModel):
     device_code: str
+
+
+class CliLoginCompleteRequest(BaseModel):
+    session_id: str
+    code: str
 
 
 class SelectReposRequest(BaseModel):
@@ -88,6 +93,46 @@ async def connect_poll(provider_id: str, body: PollRequest):
     except Exception as e:  # noqa: BLE001
         logger.warning("device flow poll failed for %s: %s", provider_id, e)
         raise HTTPException(status_code=502, detail=f"provider error: {e}")
+    out = {"status": result.status, "detail": result.detail}
+    if result.record is not None:
+        out["connection"] = result.record.public()
+    return out
+
+
+# --- CLI-driven OAuth (e.g. Claude subscription login) ----------------------
+@router.post("/v1/providers/{provider_id}/login/start")
+async def cli_login_start(provider_id: str):
+    """Spawn the provider's login CLI under a PTY and return the authorize URL.
+
+    The live process is held server-side keyed by ``session_id`` until the user
+    submits the pasted code via ``/login/complete``.
+    """
+    adapter = _adapter_or_404(provider_id)
+    if not adapter.supports(AUTH_CLI_OAUTH):
+        raise HTTPException(status_code=400, detail=f"{provider_id} has no cli login")
+    try:
+        start = await run_in_threadpool(adapter.start_cli_login)
+    except Exception as e:  # noqa: BLE001
+        logger.warning("cli login start failed for %s: %s", provider_id, e)
+        raise HTTPException(status_code=502, detail=f"login error: {e}")
+    return {
+        "session_id": start.session_id,
+        "verification_uri": start.verification_uri,
+        "instructions": start.instructions,
+    }
+
+
+@router.post("/v1/providers/{provider_id}/login/complete")
+async def cli_login_complete(provider_id: str, body: CliLoginCompleteRequest):
+    """Submit the pasted code into the live login session; persist on success."""
+    adapter = _adapter_or_404(provider_id)
+    if not adapter.supports(AUTH_CLI_OAUTH):
+        raise HTTPException(status_code=400, detail=f"{provider_id} has no cli login")
+    result = await run_in_threadpool(
+        adapter.complete_cli_login, body.session_id, body.code
+    )
+    if result.status != "connected":
+        raise HTTPException(status_code=400, detail=result.detail or "login failed")
     out = {"status": result.status, "detail": result.detail}
     if result.record is not None:
         out["connection"] = result.record.public()

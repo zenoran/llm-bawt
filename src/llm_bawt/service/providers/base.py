@@ -24,6 +24,10 @@ logger = logging.getLogger(__name__)
 # Auth methods a provider may advertise.
 AUTH_DEVICE_OAUTH = "device_oauth"
 AUTH_API_KEY = "api_key"
+# CLI-driven OAuth: drive a first-party CLI (e.g. `claude setup-token`) under a
+# PTY. Two-step + stateful — the authorize URL carries a per-session PKCE
+# challenge, so the same process must live between start (URL) and complete (code).
+AUTH_CLI_OAUTH = "cli_oauth"
 
 # Connection status values.
 STATUS_CONNECTED = "connected"
@@ -91,6 +95,27 @@ class DevicePollResult:
 class ValidateResult:
     ok: bool
     account: str | None = None
+    detail: str | None = None
+
+
+@dataclass
+class CliLoginStart:
+    """Result of starting a CLI-driven OAuth login.
+
+    ``verification_uri`` is the authorize URL the user opens in a browser;
+    ``session_id`` ties the follow-up code submission back to the live process.
+    """
+
+    session_id: str
+    verification_uri: str
+    instructions: str | None = None
+
+
+@dataclass
+class CliLoginResult:
+    # status: connected | error
+    status: str
+    record: ConnectionRecord | None = None
     detail: str | None = None
 
 
@@ -191,6 +216,13 @@ class ProviderAdapter:
 
     def poll_device_flow(self, device_code: str) -> DevicePollResult:
         raise NotImplementedError(f"{self.id} does not support device oauth")
+
+    # --- cli oauth -----------------------------------------------------------
+    def start_cli_login(self) -> "CliLoginStart":
+        raise NotImplementedError(f"{self.id} does not support cli oauth")
+
+    def complete_cli_login(self, session_id: str, code: str) -> "CliLoginResult":
+        raise NotImplementedError(f"{self.id} does not support cli oauth")
 
     # --- api key -------------------------------------------------------------
     def set_api_key(self, api_key: str) -> ValidateResult:

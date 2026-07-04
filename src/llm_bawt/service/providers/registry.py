@@ -8,11 +8,13 @@ from __future__ import annotations
 
 from ...utils.config import Config
 from .base import ProviderAdapter
+from .claude_sub import ClaudeSubAdapter
 from .github import GitHubAdapter
 
 # Adapter classes keyed by provider id. Extend here as providers are added.
 _ADAPTER_CLASSES: dict[str, type[ProviderAdapter]] = {
     GitHubAdapter.id: GitHubAdapter,
+    ClaudeSubAdapter.id: ClaudeSubAdapter,
 }
 
 
