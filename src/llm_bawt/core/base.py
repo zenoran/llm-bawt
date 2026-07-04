@@ -521,7 +521,15 @@ class BaseLLMBawt(ABC):
                     )
         
         # TTS output instructions (when tts_mode is enabled)
-        if self._tts_mode:
+        # Agent backends (claude-code, codex, openclaw) use a per-turn
+        # user-message prefix instead (chat.agent_voice_prefix, stamped
+        # below) — injecting TTS instructions into both the system prompt
+        # AND the user message double-doses the constraint and cripples
+        # tool chaining by forcing 1-3 sentence responses system-wide.
+        _is_agent_backend = self.model_definition.get("type") in (
+            "agent_backend", "claude-code",
+        )
+        if self._tts_mode and not _is_agent_backend:
             from ..prompt_registry import get_prompt_resolver
             resolved = get_prompt_resolver(self.config).resolve("chat.tts_output_instructions")
             tts_body = resolved.body if resolved else None

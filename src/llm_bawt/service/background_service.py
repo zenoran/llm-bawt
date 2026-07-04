@@ -310,7 +310,15 @@ class BackgroundService(
                 llm_bawt._client_system_context = request.client_system_context
                 llm_bawt._ha_mode = request.ha_mode
                 llm_bawt._include_summaries = request.include_summaries
-                llm_bawt._tts_mode = request.tts_mode or llm_bawt.bot.tts_mode
+                # Agent backends use a per-turn user-message prefix for
+                # voice mode — bot.tts_mode is a chatbot-only default.
+                _is_agent = llm_bawt.client.model_definition.get("type") in (
+                    "agent_backend", "claude-code",
+                )
+                if _is_agent:
+                    llm_bawt._tts_mode = request.tts_mode
+                else:
+                    llm_bawt._tts_mode = request.tts_mode or llm_bawt.bot.tts_mode
                 llm_bawt._inject_user_prefix = bool(request.inject_user_prefix)
 
                 # Prepare messages with history and memory context
