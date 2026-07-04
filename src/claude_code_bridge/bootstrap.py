@@ -70,14 +70,16 @@ def _normalize_mcp_settings(settings: dict) -> dict:
         os.getenv("CLAUDE_CODE_PLAYWRIGHT_MCP_URL") or _DEFAULT_PLAYWRIGHT_MCP_URL
     )
 
+    # "http" is the only URL-based type the Agent SDK/CLI accepts here —
+    # "url" is silently dropped (server never registers).
     mcp_servers["bawthub"] = {
-        "type": "url",
+        "type": "http",
         "url": bawthub_url,
     }
     mcp_servers.setdefault(
         "playwright",
         {
-            "type": "url",
+            "type": "http",
             "url": playwright_url,
         },
     )
