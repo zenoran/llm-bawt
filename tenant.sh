@@ -9,6 +9,9 @@
 #   ./tenant.sh status  [name]          VM state, containers, forward, URL
 #   ./tenant.sh url     [name]          print the click-in URL
 #   ./tenant.sh logs    [name] [svc]    tail stack logs
+#   ./tenant.sh bridge-git-setup [name] [container]  wire agent-bridge git auth
+#                                       to the provider-connect credential helper
+#                                       (run after GitHub is connected in wizard)
 #   ./tenant.sh destroy [name]          DELETE the VM + disk + forward (irreversible)
 #
 # Defaults: name=bawthub-inst1  fwd_port=8830  (forward lives on echo -> VM:3000)
@@ -74,7 +77,13 @@ EOF
   $SSH "bawthub@$IP" "echo \$(gh auth token 2>/dev/null || true) | docker login ghcr.io -u zenoran --password-stdin" 2>/dev/null \
     || echo "  (VM ghcr login skipped — pass a read token if images are private)"
   scp -o StrictHostKeyChecking=no "$COMPOSE" "bawthub@$IP:~/docker-compose.prod.yml" >/dev/null
-  $SSH "bawthub@$IP" "test -f .env || echo LLM_BAWT_POSTGRES_PASSWORD=\$(openssl rand -hex 24) > .env; \
+  # .env: DB password + the provider-credential encryption key. LLM_BAWT_SECRET_KEY
+  # MUST persist across repaves or stored provider credentials (GitHub token, LLM
+  # API keys) become unreadable — so it lives in the VM's .env, generated once.
+  $SSH "bawthub@$IP" "test -f .env || { \
+      echo LLM_BAWT_POSTGRES_PASSWORD=\$(openssl rand -hex 24); \
+      echo LLM_BAWT_SECRET_KEY=\$(python3 -c 'import base64,os;print(base64.urlsafe_b64encode(os.urandom(32)).decode())'); \
+    } > .env; \
     docker compose -f docker-compose.prod.yml pull && docker compose -f docker-compose.prod.yml up -d"
   start_forward "$IP"
   echo "==> DONE  ->  http://${LAN_IP}:${FWD_PORT}"
@@ -86,6 +95,38 @@ start_forward() {
   sudo systemctl reset-failed "$FWD_UNIT" 2>/dev/null || true
   sudo systemd-run --unit="$FWD_UNIT" --collect \
     /usr/bin/socat "TCP-LISTEN:${FWD_PORT},fork,reuseaddr" "TCP:${IP}:3000"
+}
+
+# bridge-git-setup: point a tenant agent-bridge container at the provider-connect
+# git-credential endpoint instead of a hand-made SSH deploy key. After the tenant
+# user connects GitHub in the wizard (device flow → GitHub App installation),
+# git over HTTPS pulls/pushes with auto-refreshing installation tokens minted by
+# the app — zero static secret on disk. Replaces the old deploy/.bridge-ssh gap.
+#   ./tenant.sh bridge-git-setup [name] [bridge_container]
+BRIDGE_CONTAINER_DEFAULT="llm-bawt-claude-code-bridge"
+cmd_bridge_git_setup() {
+  local IP BRIDGE HELPER_B64
+  IP="$(vm_ip)"; BRIDGE="${4:-$BRIDGE_CONTAINER_DEFAULT}"
+  [ -n "$IP" ] || { echo "VM not reachable"; exit 1; }
+  echo "==> installing git credential helper in '$BRIDGE' on $IP"
+  # Install a tiny helper script instead of an inline git config value — avoids
+  # fragile nested quoting through ssh -> docker exec -> container sh. git calls
+  # `git-credential-bawthub get`; it curls the app's internal endpoint, which
+  # mints a fresh GitHub App installation token and returns credential lines.
+  # BRIDGE_GIT_CREDENTIAL_TOKEN (if present in the bridge env) satisfies the
+  # optional X-Bridge-Token guard. base64 keeps the script body quoting-safe.
+  HELPER_B64="$(cat <<'HELPER' | base64 -w0
+#!/bin/sh
+# git-credential-bawthub — provider-connect credential helper (auto-refreshing
+# GitHub App installation tokens). Only answers the 'get' operation.
+[ "$1" = get ] || exit 0
+curl -s -H "X-Bridge-Token: ${BRIDGE_GIT_CREDENTIAL_TOKEN:-}" \
+  http://app:8642/v1/providers/github/git-credential
+HELPER
+)"
+  $SSH "bawthub@$IP" "docker exec '$BRIDGE' sh -c 'echo $HELPER_B64 | base64 -d > /usr/local/bin/git-credential-bawthub && chmod +x /usr/local/bin/git-credential-bawthub && git config --global credential.helper bawthub && git config --global url.\"https://github.com/\".insteadOf git@github.com: && git config --global --list | grep -Ei \"credential.helper|insteadof\"'" \
+    || { echo "  bridge container '$BRIDGE' not running/reachable — run this after the bridge is up + GitHub is connected."; exit 1; }
+  echo "==> done. verify:  docker exec $BRIDGE git ls-remote https://github.com/<owner>/<repo>"
 }
 
 cmd_up()   { local IP; IP="$(vm_ip)"; $SSH "bawthub@$IP" 'docker compose -f docker-compose.prod.yml up -d'; start_forward "$IP"; echo "http://${LAN_IP}:${FWD_PORT}"; }
@@ -111,5 +152,6 @@ cmd_destroy() {
 case "${1:-status}" in
   new) cmd_new ;; up) cmd_up ;; stop) cmd_stop ;; restart) cmd_restart ;;
   status) cmd_status ;; url) cmd_url ;; logs) cmd_logs ;; destroy) cmd_destroy ;;
+  bridge-git-setup) cmd_bridge_git_setup ;;
   *) grep '^#' "$0" | sed 's/^# \{0,1\}//' | head -20 ;;
 esac

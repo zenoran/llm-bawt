@@ -1,0 +1,204 @@
+"""Provider adapter interface + encrypted credential store.
+
+A ``ProviderAdapter`` describes one connectable provider and the auth method(s)
+it supports. The wizard/settings UI drives adapters through the ``/v1/providers``
+API. Credentials persist (encrypted) via :class:`CredentialStore`, which layers
+on top of ``RuntimeSettingsStore`` (global scope) so we reuse the existing
+``runtime_settings`` table instead of adding a new one.
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
+from typing import Any
+
+from ...runtime_settings import RuntimeSettingsStore
+from ...utils.config import Config
+from . import crypto
+
+logger = logging.getLogger(__name__)
+
+# Auth methods a provider may advertise.
+AUTH_DEVICE_OAUTH = "device_oauth"
+AUTH_API_KEY = "api_key"
+
+# Connection status values.
+STATUS_CONNECTED = "connected"
+STATUS_PENDING = "pending"
+STATUS_DISCONNECTED = "disconnected"
+STATUS_ERROR = "error"
+
+_SETTING_PREFIX = "provider_connection:"
+
+
+def _now() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+@dataclass
+class ConnectionRecord:
+    """Persisted state of a provider connection.
+
+    ``secret`` holds sensitive material (tokens/keys) and is encrypted at rest;
+    everything else is stored in cleartext so ``GET /v1/providers`` can report
+    status without decrypting.
+    """
+
+    provider: str
+    status: str = STATUS_DISCONNECTED
+    auth_method: str | None = None
+    account: str | None = None
+    meta: dict[str, Any] = field(default_factory=dict)
+    secret: dict[str, Any] = field(default_factory=dict)
+    connected_at: str | None = None
+    updated_at: str | None = None
+
+    def public(self) -> dict[str, Any]:
+        """Serializable view WITHOUT secrets — safe for API responses."""
+        return {
+            "provider": self.provider,
+            "status": self.status,
+            "auth_method": self.auth_method,
+            "account": self.account,
+            "meta": self.meta,
+            "connected": self.status == STATUS_CONNECTED,
+            "connected_at": self.connected_at,
+            "updated_at": self.updated_at,
+        }
+
+
+@dataclass
+class DeviceFlowStart:
+    user_code: str
+    verification_uri: str
+    device_code: str
+    interval: int = 5
+    expires_in: int = 900
+
+
+@dataclass
+class DevicePollResult:
+    # status: pending | authorized | denied | slow_down | expired | error
+    status: str
+    record: ConnectionRecord | None = None
+    detail: str | None = None
+
+
+@dataclass
+class ValidateResult:
+    ok: bool
+    account: str | None = None
+    detail: str | None = None
+
+
+class CredentialStore:
+    """Encrypted persistence for provider connections (global scope)."""
+
+    def __init__(self, config: Config):
+        self._store = RuntimeSettingsStore(config)
+
+    @property
+    def available(self) -> bool:
+        return self._store.engine is not None
+
+    def _key(self, provider: str) -> str:
+        return f"{_SETTING_PREFIX}{provider}"
+
+    def load(self, provider: str) -> ConnectionRecord | None:
+        if not self.available:
+            return None
+        settings = self._store.get_scope_settings("global", "*")
+        raw = settings.get(self._key(provider))
+        if not isinstance(raw, dict):
+            return None
+        secret: dict[str, Any] = {}
+        enc = raw.get("secret_enc")
+        if enc:
+            try:
+                secret = json.loads(crypto.decrypt(enc))
+            except Exception as e:  # noqa: BLE001
+                logger.warning("Failed to decrypt secret for provider %s: %s", provider, e)
+        return ConnectionRecord(
+            provider=provider,
+            status=raw.get("status", STATUS_DISCONNECTED),
+            auth_method=raw.get("auth_method"),
+            account=raw.get("account"),
+            meta=raw.get("meta") or {},
+            secret=secret,
+            connected_at=raw.get("connected_at"),
+            updated_at=raw.get("updated_at"),
+        )
+
+    def save(self, record: ConnectionRecord) -> None:
+        if not self.available:
+            raise RuntimeError("Runtime settings DB unavailable — cannot persist provider credential")
+        record.updated_at = _now()
+        if record.status == STATUS_CONNECTED and not record.connected_at:
+            record.connected_at = record.updated_at
+        payload: dict[str, Any] = {
+            "status": record.status,
+            "auth_method": record.auth_method,
+            "account": record.account,
+            "meta": record.meta or {},
+            "connected_at": record.connected_at,
+            "updated_at": record.updated_at,
+        }
+        if record.secret:
+            payload["secret_enc"] = crypto.encrypt(json.dumps(record.secret))
+        self._store.set_value("global", "*", self._key(record.provider), payload)
+
+    def delete(self, provider: str) -> bool:
+        if not self.available:
+            return False
+        return self._store.delete_value("global", "*", self._key(provider))
+
+
+class ProviderAdapter:
+    """Base class for a connectable provider.
+
+    Subclasses set ``id``, ``label``, ``auth_methods`` and implement whichever of
+    the auth flows they advertise. Default implementations raise so an
+    unsupported call surfaces clearly rather than silently no-op'ing.
+    """
+
+    id: str = ""
+    label: str = ""
+    auth_methods: tuple[str, ...] = ()
+
+    def __init__(self, config: Config):
+        self.config = config
+        self.store = CredentialStore(config)
+
+    # --- capability introspection -------------------------------------------
+    def supports(self, method: str) -> bool:
+        return method in self.auth_methods
+
+    def descriptor(self) -> dict[str, Any]:
+        rec = self.store.load(self.id)
+        return {
+            "id": self.id,
+            "label": self.label,
+            "auth_methods": list(self.auth_methods),
+            "connection": (rec or ConnectionRecord(provider=self.id)).public(),
+        }
+
+    # --- device oauth --------------------------------------------------------
+    def start_device_flow(self) -> DeviceFlowStart:
+        raise NotImplementedError(f"{self.id} does not support device oauth")
+
+    def poll_device_flow(self, device_code: str) -> DevicePollResult:
+        raise NotImplementedError(f"{self.id} does not support device oauth")
+
+    # --- api key -------------------------------------------------------------
+    def set_api_key(self, api_key: str) -> ValidateResult:
+        raise NotImplementedError(f"{self.id} does not support api key auth")
+
+    # --- shared --------------------------------------------------------------
+    def validate(self, record: ConnectionRecord) -> ValidateResult:
+        raise NotImplementedError
+
+    def disconnect(self) -> bool:
+        return self.store.delete(self.id)

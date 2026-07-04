@@ -41,6 +41,12 @@ dependencies = [
     # (see object_store.py), so this dep stays out of the hot path when
     # LLM_BAWT_STORAGE_BACKEND=fs (the default).
     "boto3>=1.34.0",
+    # Provider-connect credential store (encryption at rest) + GitHub App
+    # installation-token JWT signing (RS256). Imports are lazy in
+    # service/providers/*, so these stay out of the hot path until a provider
+    # is connected.
+    "cryptography>=42.0.0",
+    "pyjwt[crypto]>=2.8.0",
 ]
 
 [project.optional-dependencies]

@@ -12,6 +12,7 @@ from .openclaw_ws import router as openclaw_ws_router
 from .nextcloud import router as nextcloud_router
 from .prompts import router as prompts_router
 from .profiles import router as profiles_router
+from .providers import router as providers_router
 from .settings import router as settings_router
 from .approval_policies import router as approval_policies_router
 from .tasks import router as tasks_router
@@ -39,6 +40,7 @@ all_routers = [
     history_router,
     memory_router,
     prompts_router,
+    providers_router,
     settings_router,
     approval_policies_router,
     profiles_router,
