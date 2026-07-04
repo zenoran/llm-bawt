@@ -1,4 +1,6 @@
-# Lightweight bridge image — no CUDA/GPU, just Python + bridge deps
+# Shared agent-bridge image — no CUDA/GPU, just Python + bridge deps.
+# Built once and run by every harness bridge (openclaw / claude-code / codex);
+# see the `x-agent-bridge-image` anchor in docker-compose.yml.
 FROM python:3.12-slim
 
 # Tools grouped by purpose (one group per line):

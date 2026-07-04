@@ -1,3 +1,18 @@
+# ── Shared agent-bridge image ────────────────────────────────────────────
+# Every harness bridge (openclaw / claude-code / codex) runs the SAME image,
+# built from Dockerfile.agent-bridge. The build + image name live here ONCE and
+# are merged into each bridge service via `<<: *agent-bridge-image`, so:
+#   • the image name is defined in a single place (no drift), and
+#   • `docker compose build|up --build <any-bridge>` actually rebuilds it —
+#     no more "the build is secretly only on openclaw-bridge" footgun.
+# NOTE: local-model-bridge is deliberately NOT part of this — it needs the GPU
+# `Dockerfile` (torch/vllm/llama-cpp), not this slim CPU image.
+x-agent-bridge-image: &agent-bridge-image
+  build:
+    context: .
+    dockerfile: Dockerfile.agent-bridge
+  image: llm-bawt-agent-bridge
+
 services:
   app:
     build:
@@ -94,10 +109,7 @@ services:
       retries: 3
 
   openclaw-bridge:
-    build:
-      context: .
-      dockerfile: Dockerfile.bridge
-    image: llm-bawt-bridge
+    <<: *agent-bridge-image
     container_name: llm-bawt-openclaw-bridge
     command: ["python", "-m", "openclaw_bridge"]
     env_file:
@@ -110,7 +122,7 @@ services:
       # Override SERVICE_HOST inherited from .env (which is 0.0.0.0 — meant
       # for the app container's bind address). From inside a bridge, the
       # service is reachable at the compose service name `app`. This lets
-      # the editable `llm` CLI (installed via uv tool in Dockerfile.bridge)
+      # the editable `llm` CLI (installed via uv tool in Dockerfile.agent-bridge)
       # talk to the API without a flag override.
       - LLM_BAWT_SERVICE_HOST=app
       - REDIS_URL=redis://redis:6379/0
@@ -137,7 +149,7 @@ services:
       start_period: 10s
 
   claude-code-bridge:
-    image: llm-bawt-bridge
+    <<: *agent-bridge-image
     container_name: llm-bawt-claude-code-bridge
     command: ["python", "-m", "claude_code_bridge"]
     env_file:
@@ -153,7 +165,7 @@ services:
       # Override SERVICE_HOST inherited from .env (which is 0.0.0.0 — meant
       # for the app container's bind address). From inside a bridge, the
       # service is reachable at the compose service name `app`. This lets
-      # the editable `llm` CLI (installed via uv tool in Dockerfile.bridge)
+      # the editable `llm` CLI (installed via uv tool in Dockerfile.agent-bridge)
       # talk to the API without a flag override.
       - LLM_BAWT_SERVICE_HOST=app
       - REDIS_URL=redis://redis:6379/0
@@ -206,7 +218,7 @@ services:
       start_period: 15s
 
   codex-bridge:
-    image: llm-bawt-bridge
+    <<: *agent-bridge-image
     container_name: llm-bawt-codex-bridge
     command: ["python", "-m", "codex_bridge"]
     env_file:
@@ -232,7 +244,7 @@ services:
       # Override SERVICE_HOST inherited from .env (which is 0.0.0.0 — meant
       # for the app container's bind address). From inside a bridge, the
       # service is reachable at the compose service name `app`. This lets
-      # the editable `llm` CLI (installed via uv tool in Dockerfile.bridge)
+      # the editable `llm` CLI (installed via uv tool in Dockerfile.agent-bridge)
       # talk to the API without a flag override.
       - LLM_BAWT_SERVICE_HOST=app
       - REDIS_URL=redis://redis:6379/0
@@ -281,7 +293,7 @@ services:
     # abort() on the whole process — isolating it here means it can only kill
     # this bridge, never the app/MCP/agent sessions. Uses the GPU image
     # (reuses the app Dockerfile + CUDA build args) since it needs llama_cpp /
-    # vllm / torch; the other bridges run the CPU-only llm-bawt-bridge image.
+    # vllm / torch; the other bridges run the CPU-only llm-bawt-agent-bridge image.
     build:
       context: .
       dockerfile: Dockerfile
