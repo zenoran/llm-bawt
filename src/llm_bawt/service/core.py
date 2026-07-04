@@ -499,6 +499,7 @@ class ServiceLLMBawt(BaseLLMBawt):
         tool_context: str = "",
         attachments: list[dict] | None = None,
         reasoning: str | None = None,
+        message_id: str | None = None,
     ):
         """Finalize the response by saving to history.
 
@@ -512,6 +513,14 @@ class ServiceLLMBawt(BaseLLMBawt):
             reasoning: Optional model reasoning ("thinking") accumulated during
                 the turn, persisted on the assistant row for display-only
                 replay (TASK-301). Never re-fed into LLM context.
+            message_id: Optional client-supplied UUID for the persisted ASSISTANT
+                row. When set, the live streaming bubble (which the frontend
+                minted this same UUID for) and the reloaded history row share one
+                id, so they upsert-merge into a SINGLE bubble instead of the two
+                that the content-fingerprint dedup used to (partially) reconcile.
+                This closes the assistant-identity gap left open by EPIC TASK-217
+                (see makeMessageId.ts). None → server mints a fresh UUID (legacy
+                / server-originated turns like inter-bot, cron, agent dispatch).
         """
         # Save tool context first so it appears before the response in history
         if tool_context:
@@ -521,7 +530,8 @@ class ServiceLLMBawt(BaseLLMBawt):
 
         if response:
             self.history_manager.add_message(
-                "assistant", response, attachments=attachments, reasoning=reasoning
+                "assistant", response, message_id=message_id,
+                attachments=attachments, reasoning=reasoning
             )
     
     def refine_prompt(self, prompt: str, history: list | None = None) -> str:

@@ -596,7 +596,7 @@ class CodexBridge:
 
                     controller = AbortController()
                     if session_key:
-                        self._session_queue.set_active_stream(session_key, controller)
+                        self._session_queue.set_active_client(session_key, controller)
 
                     try:
                         # Open or resume thread (sync API)
@@ -670,15 +670,18 @@ class CodexBridge:
                                 final_usage,
                                 actual_model_or_default=actual_model,
                             )
+                            token_usage = self._sanitize_context_usage(
+                                await self._merge_model_info(
+                                    token_usage, actual_model,
+                                )
+                            )
                             seq += 1
                             self._publish_event(
                                 request_id, session_key, seq,
                                 kind=AgentEventKind.ASSISTANT_DONE,
                                 text="".join(text_parts),
                                 model=actual_model,
-                                token_usage=await self._merge_model_info(
-                                    token_usage, actual_model,
-                                ),
+                                token_usage=token_usage,
                             )
                         elif aborted:
                             seq += 1
@@ -768,9 +771,9 @@ class CodexBridge:
                         raise
                     finally:
                         if session_key:
-                            current = self._session_queue.get_active_stream(session_key)
+                            current = self._session_queue.get_active_client(session_key)
                             if current is controller:
-                                self._session_queue.pop_active_stream(session_key)
+                                self._session_queue.pop_active_client(session_key)
 
                 self._publisher.publish_run_done(request_id)
                 if aborted:
@@ -945,6 +948,37 @@ class CodexBridge:
         usage["max_output_tokens"] = info.get("max_output_tokens")
         return usage
 
+    @staticmethod
+    def _sanitize_context_usage(usage: dict | None) -> dict | None:
+        """Suppress impossible Codex context counters before they reach the UI."""
+        if not usage:
+            return usage
+        try:
+            ctx = int(usage.get("context_window", 0) or 0)
+            total_in = (
+                int(usage.get("input_tokens", 0) or 0)
+                + int(usage.get("cache_read_tokens", 0) or 0)
+                + int(usage.get("cache_creation_tokens", 0) or 0)
+            )
+        except Exception:
+            return usage
+        if ctx <= 0 or total_in <= 0:
+            return usage
+        # Codex turn.completed usage can accumulate prompt reads across internal
+        # tool iterations. Those totals are not a truthful "context this turn"
+        # measurement and can dwarf the real model window.
+        if total_in <= max(ctx + 4096, int(ctx * 1.05)):
+            return usage
+        sanitized = dict(usage)
+        sanitized["input_tokens"] = 0
+        sanitized["cache_read_tokens"] = 0
+        sanitized["cache_creation_tokens"] = 0
+        logger.info(
+            "Suppressing impossible Codex context usage: total_in=%s ctx=%s",
+            total_in, ctx,
+        )
+        return sanitized
+
     # ----- TASK-207: ThreadEvent → AgentEvent mapping ------------------
 
     async def _handle_event(
@@ -1001,6 +1035,7 @@ class CodexBridge:
                 token_usage = await self._merge_model_info(
                     token_usage, actual_model_ref[0],
                 )
+                token_usage = self._sanitize_context_usage(token_usage)
 
             seq += 1
             self._publish_event(
@@ -1487,7 +1522,7 @@ class CodexBridge:
             elif method == "chat.abort":
                 session_key = params.get("sessionKey", "")
                 self._session_queue.signal_cancel(session_key)
-                controller = self._session_queue.pop_active_stream(session_key)
+                controller = self._session_queue.pop_active_client(session_key)
                 turn_interrupted = False
                 if controller is not None:
                     try:

@@ -14,12 +14,39 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from agent_bridge.session_queue import SessionQueue
 from llm_bawt.integrations.agent_bridge_events import (
     AgentEvent,
     AgentEventKind,
     synthesize_event_id,
 )
 from llm_bawt.integrations.openclaw_ingest import EventIngestPipeline
+
+
+# ---------------------------------------------------------------------------
+# SessionQueue tests
+# ---------------------------------------------------------------------------
+
+
+class TestSessionQueue:
+    def test_active_client_set_get_pop(self):
+        queue = SessionQueue()
+        client = object()
+
+        queue.set_active_client("main", client)
+
+        assert queue.get_active_client("main") is client
+        assert queue.pop_active_client("main") is client
+        assert queue.get_active_client("main") is None
+
+    def test_active_client_pop_is_idempotent(self):
+        queue = SessionQueue()
+        client = object()
+
+        queue.set_active_client("main", client)
+
+        assert queue.pop_active_client("main") is client
+        assert queue.pop_active_client("main") is None
 
 
 # ---------------------------------------------------------------------------

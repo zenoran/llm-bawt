@@ -330,6 +330,7 @@ class TurnLifecycleMixin:
         reasoning: str | None = None,
         status: str = "ok",
         end_reason: str | None = None,
+        assistant_message_id: str | None = None,
     ) -> None:
         """Finalize a turn in one place for both non-streaming and streaming paths.
 
@@ -394,7 +395,7 @@ class TurnLifecycleMixin:
                 turn_id, bot_id, len(stripped), stripped[:160],
             )
 
-        llm_bawt.finalize_response(response_text, tool_context, attachments=attachments, reasoning=reasoning)
+        llm_bawt.finalize_response(response_text, tool_context, attachments=attachments, reasoning=reasoning, message_id=assistant_message_id)
 
         self._update_turn_log(
             turn_id=turn_id,

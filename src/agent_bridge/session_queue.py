@@ -14,7 +14,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from contextlib import asynccontextmanager
-from typing import Any, AsyncIterator
+from typing import Any
 
 logger = logging.getLogger(__name__)
 
@@ -50,16 +50,13 @@ class SessionQueue:
         # messages so an abort takes effect without waiting for the next
         # `await` point to fire CancelledError.
         self._cancel_events: dict[str, asyncio.Event] = {}
-        # The active SDK message stream (an async generator) per session.
-        # Only used by the Claude Code bridge today; the OpenClaw bridge's
-        # cooperative cancel happens via `WSClient.cancel_session` instead.
-        # Tracking it here lets `chat.abort` call `aclose()` on the
-        # generator, which propagates GeneratorExit through the SDK's
-        # `try/finally` and forces the underlying `claude` CLI subprocess
-        # to be SIGTERM/SIGKILL'd.  Without this, `task.cancel()` only
-        # raises `CancelledError` at the next `await` point, which lets
-        # the SDK keep running mid-tool-call indefinitely.
-        self._active_streams: dict[str, AsyncIterator[Any]] = {}
+        # Opaque per-session abort handles.
+        # - Claude Code bridge stores a ClaudeSDKClient and abort calls
+        #   `disconnect()` to tear down the subprocess.
+        # - Codex bridge stores an AbortController and abort calls `.abort()`.
+        # Keep this registry duck-typed so shared agent_bridge code does not
+        # import SDK-specific classes.
+        self._active_clients: dict[str, Any] = {}
 
     # -- Lock management --------------------------------------------------
 
@@ -180,26 +177,21 @@ class SessionQueue:
         """
         self._cancel_events.pop(session_key, None)
 
-    # -- Active SDK stream tracking (for forced subprocess kill) ----------
+    # -- Active client tracking (for forced subprocess kill / interrupt) ---
 
-    def set_active_stream(
-        self, session_key: str, stream: AsyncIterator[Any]
-    ) -> None:
-        """Register the active SDK message stream for *session_key*.
+    def set_active_client(self, session_key: str, client: Any) -> None:
+        """Register the active per-session abort handle for *session_key*.
 
-        The stream is expected to be an async generator (e.g. the one
-        returned by `claude_agent_sdk.query()`). On abort, the bridge
-        will call `aclose()` on this generator to force the underlying
-        subprocess to terminate even mid-tool-call.
+        The handle is bridge-specific: Claude Code stores a
+        ``ClaudeSDKClient`` and abort calls ``disconnect()``; Codex stores
+        an ``AbortController`` and abort calls ``abort()``.
         """
-        self._active_streams[session_key] = stream
+        self._active_clients[session_key] = client
 
-    def pop_active_stream(self, session_key: str) -> AsyncIterator[Any] | None:
-        """Remove and return the active SDK stream for *session_key*."""
-        return self._active_streams.pop(session_key, None)
+    def pop_active_client(self, session_key: str) -> Any | None:
+        """Remove and return the active abort handle for *session_key*."""
+        return self._active_clients.pop(session_key, None)
 
-    def get_active_stream(
-        self, session_key: str
-    ) -> AsyncIterator[Any] | None:
-        """Return the active SDK stream for *session_key* without removing it."""
-        return self._active_streams.get(session_key)
+    def get_active_client(self, session_key: str) -> Any | None:
+        """Return the active abort handle for *session_key* without removing it."""
+        return self._active_clients.get(session_key)

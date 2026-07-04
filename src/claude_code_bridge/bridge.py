@@ -12,7 +12,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 import httpx
-from claude_agent_sdk import ClaudeAgentOptions, StreamEvent, query
+from claude_agent_sdk import ClaudeAgentOptions, ClaudeSDKClient, StreamEvent
 from claude_agent_sdk.types import (
     AssistantMessage,
     HookMatcher,
@@ -1006,17 +1006,21 @@ class ClaudeCodeBridge:
                     api_last_error: str | None = None
                     api_retry_surfaced = False  # True once we've pushed a delta
 
+                    sdk_client = None
                     msg_stream = None
                     try:
-                        msg_stream = query(prompt=prompt_input, options=options).__aiter__()
-                        # Register the live stream so `chat.abort` can call
-                        # `aclose()` on it — that's what actually kills the
-                        # underlying CLI subprocess mid-tool-call. `task.cancel()`
+                        sdk_client = ClaudeSDKClient(options=options)
+                        await sdk_client.connect(prompt_input)
+                        msg_stream = sdk_client.receive_messages()
+                        # Register the live client so `chat.abort` can call
+                        # `disconnect()` on it — that closes the SDK Query and
+                        # drives the subprocess transport through EOF/SIGTERM/
+                        # SIGKILL teardown even mid-tool-call. `task.cancel()`
                         # alone is insufficient because CancelledError only fires
                         # at the next `await`, and the SDK is awaiting on subprocess
                         # output that doesn't arrive until the running tool exits.
                         if session_key:
-                            self._session_queue.set_active_stream(session_key, msg_stream)
+                            self._session_queue.set_active_client(session_key, sdk_client)
                         while True:
                             # Cooperative abort check — runs before every SDK
                             # `__anext__`, so an abort signalled by chat.abort is
@@ -1640,6 +1644,22 @@ class ClaudeCodeBridge:
                             logger.debug("Failed to publish run_done on cancel", exc_info=True)
                         raise
                     except Exception as e:
+                        if cancel_event is not None and cancel_event.is_set():
+                            logger.info(
+                                "Abort teardown surfaced %r; treating as abort: session=%s",
+                                e, session_key,
+                            )
+                            aborted = True
+                            seq += 1
+                            self._publish_event(
+                                request_id, session_key, seq,
+                                kind=AgentEventKind.ASSISTANT_DONE,
+                                text="".join(text_parts),
+                                model=actual_model,
+                            )
+                            assistant_done_emitted = True
+                            break
+
                         # 1) Auth failure → refresh token and retry once
                         if (
                             not auth_retry_attempted
@@ -1681,25 +1701,22 @@ class ClaudeCodeBridge:
                         # and this session's lock can never be reacquired — the
                         # TASK-269 deadlock. Event.set() is idempotent.
                         turn_done.set()
-                        # Always deregister this iteration's stream so a
-                        # subsequent chat.abort doesn't try to aclose() a
-                        # generator that's already finished. We pop only if
-                        # the registry still points at our stream — concurrent
-                        # aborts may have already popped it to call aclose().
-                        if session_key and msg_stream is not None:
-                            current = self._session_queue.get_active_stream(session_key)
-                            if current is msg_stream:
-                                self._session_queue.pop_active_stream(session_key)
-                            # Best-effort close — kills the SDK subprocess if
-                            # it's still running. Bounded so a stuck SIGKILL
-                            # can't wedge the bridge.
+                        # Always deregister this iteration's client so a
+                        # subsequent chat.abort doesn't try to disconnect()
+                        # something that's already finished. We pop only if
+                        # the registry still points at our client — concurrent
+                        # aborts may have already popped it to disconnect().
+                        if session_key and sdk_client is not None:
+                            current = self._session_queue.get_active_client(session_key)
+                            if current is sdk_client:
+                                self._session_queue.pop_active_client(session_key)
                             try:
-                                await asyncio.wait_for(msg_stream.aclose(), timeout=10.0)
+                                await asyncio.wait_for(sdk_client.disconnect(), timeout=20.0)
                             except (asyncio.TimeoutError, asyncio.CancelledError):
                                 pass
                             except Exception:
                                 logger.debug(
-                                    "msg_stream.aclose() raised", exc_info=True,
+                                    "sdk_client.disconnect() raised", exc_info=True,
                                 )
 
                 self._publisher.publish_run_done(request_id)
@@ -2356,11 +2373,12 @@ class ClaudeCodeBridge:
                 # Three-layer abort:
                 #   1. Set the cooperative cancel event so the SDK message loop
                 #      breaks out at the next iteration boundary.
-                #   2. Pop and aclose() the active SDK message stream — this is
-                #      what actually kills the underlying `claude` CLI subprocess
-                #      mid-tool-call. Without (2), `task.cancel()` only raises
-                #      CancelledError at the next `await` point, which can be
-                #      tens of seconds away inside a long Bash/Read tool call.
+                #   2. Pop and disconnect() the active ClaudeSDKClient — this
+                #      closes Query/transport and kills the underlying `claude`
+                #      CLI subprocess mid-tool-call. Without (2), task.cancel()
+                #      only raises CancelledError at the next `await` point,
+                #      which can be tens of seconds away inside a long Bash/Read
+                #      tool call.
                 #   3. Fall back to task.cancel() so a runaway task that didn't
                 #      respect (1) and (2) still gets torn down.
                 self._session_queue.signal_cancel(session_key)
@@ -2370,23 +2388,23 @@ class ClaudeCodeBridge:
                 logger.info(
                     "chat.abort registry probe: target=%r stream_keys=%r task_keys=%r",
                     session_key,
-                    list(self._session_queue._active_streams.keys()),
+                    list(self._session_queue._active_clients.keys()),
                     list(self._session_queue._active_tasks.keys()),
                 )
-                stream = self._session_queue.pop_active_stream(session_key)
-                stream_closed = False
-                if stream is not None:
+                client = self._session_queue.pop_active_client(session_key)
+                client_disconnected = False
+                if client is not None:
                     try:
-                        await asyncio.wait_for(stream.aclose(), timeout=10.0)
-                        stream_closed = True
+                        await asyncio.wait_for(client.disconnect(), timeout=20.0)
+                        client_disconnected = True
                     except asyncio.TimeoutError:
                         logger.warning(
-                            "aclose() timed out for session %s — subprocess may be stuck",
+                            "disconnect() timed out for session %s — subprocess may be stuck",
                             session_key,
                         )
                     except Exception:
                         logger.debug(
-                            "aclose() raised on chat.abort for session %s",
+                            "disconnect() raised on chat.abort for session %s",
                             session_key,
                             exc_info=True,
                         )
@@ -2394,8 +2412,8 @@ class ClaudeCodeBridge:
                 detail_parts: list[str] = []
                 if cancelled:
                     detail_parts.append("task_cancelled")
-                if stream_closed:
-                    detail_parts.append("stream_closed")
+                if client_disconnected:
+                    detail_parts.append("client_disconnected")
                 if not detail_parts:
                     detail_parts.append("no_active_task")
                 logger.info(

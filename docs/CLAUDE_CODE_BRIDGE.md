@@ -1,214 +1,84 @@
 # Claude Code Bridge
 
-The Claude Code bridge integrates Anthropic's Claude models into llm-bawt using the [Claude Agent SDK](https://docs.anthropic.com/en/docs/claude-code/sdk). It runs alongside the OpenClaw bridge and uses the same Redis event protocol — the main app doesn't know which bridge handled a request.
+The Claude Code bridge runs agent-backed bots through the Claude Agent SDK.
+The entrypoint is [src/claude_code_bridge/__main__.py](/home/bridge/dev/llm-bawt/src/claude_code_bridge/__main__.py)
+and the bridge logic is
+[src/claude_code_bridge/bridge.py](/home/bridge/dev/llm-bawt/src/claude_code_bridge/bridge.py).
 
-## Architecture
+## What it does
 
-```
-                        ┌─────────────────────────────────────────────┐
-                        │  llm-bawt-app (FastAPI)                     │
-                        │  AgentBackendClient → ClaudeCodeBackend     │
-                        └──────────────┬──────────────────────────────┘
-                                       │ Redis: agent:commands
-                                       │ (fields: backend, session_key, message, ...)
-                                       ▼
-┌──────────────────────────────────────────────────────────────────────────┐
-│                        Redis (shared stream)                             │
-│                        agent:commands                                 │
-│                                                                          │
-│  ┌─────────────────────────┐     ┌─────────────────────────────────────┐ │
-│  │ openclaw-bridge         │     │ claude-code-bridge                  │ │
-│  │ filters: backend=openclaw│    │ filters: backend=claude-code        │ │
-│  │ consumer group: bridge  │     │ consumer group: claude-code-bridge  │ │
-│  └──────────┬──────────────┘     └──────────┬──────────────────────────┘ │
-└─────────────┼────────────────────────────────┼──────────────────────────┘
-              │                                │
-              ▼                                ▼
-   OpenClaw Gateway (WS)            Claude Code Binary (stdio)
-   on remote host                   bundled in Agent SDK
-              │                                │
-              ▼                                ▼
-      Anthropic API                    Anthropic API
-      (via gateway)                    (OAuth subscription)
-```
+- Consumes Redis `chat.send` commands for bots whose `agent_backend` is `claude-code`.
+- Spawns Claude Agent SDK turns and streams normalized `AgentEvent`s back to the app.
+- Persists per-bot SDK session state in `agent_backend_config.session_key` and
+  `session_model`.
+- Supports `/new` and explicit reset RPCs by clearing the stored SDK session.
+- Enforces approval-gated tool policies in the bridge before tool execution.
+- Can proxy non-Anthropic providers through an Anthropic-compatible local proxy.
 
-Both bridges publish events to `agent:run:{request_id}` in the same `AgentEvent` format. The main app consumes them identically.
+## Model resolution
 
-## How It Works
+The bridge does not have a meaningful global default model. The app resolves the
+bot's `default_model` alias from the model catalog and sends the resulting
+`model_id` with each request.
 
-1. A bot with `agent_backend: "claude-code"` receives a chat request
-2. `ClaudeCodeBackend` sends a `chat.send` command to Redis with `backend: "claude-code"`
-3. The claude-code bridge picks it up (filters by `backend` field)
-4. Bridge calls `claude_agent_sdk.query()` which spawns the Claude Code binary
-5. The binary authenticates via `CLAUDE_CODE_OAUTH_TOKEN` (your Max/Pro subscription)
-6. SDK streams events: text deltas, tool calls, tool results
-7. Bridge translates them to `AgentEvent` format and publishes to Redis
-8. Main app streams them as SSE to the frontend
+Common shapes:
+
+- Plain Anthropic aliases for native Claude use.
+- `openai_chatgpt/<model>` for ChatGPT-subscription routing through the proxy.
+- `zai/<model>` for z.ai / GLM routing through the proxy.
+
+If a bot has `agent_backend="claude-code"` but no valid `default_model`, the
+turn is rejected.
 
 ## Authentication
 
-The bridge uses your Claude subscription (Max/Pro) via OAuth — not API key billing.
+The bridge requires a usable Claude OAuth token for the SDK path. Current lookup
+order:
 
-```bash
-# Generate token (one-time, on host):
-claude setup-token
+1. `~/.claude/.credentials.json` (`claudeAiOauth`, refreshed in place when needed)
+2. `CLAUDE_CODE_OAUTH_TOKEN` as an env fallback
 
-# Or extract from existing login:
-python3 -c "import json; from pathlib import Path; print(json.loads((Path.home()/'.claude'/'.credentials.json').read_text())['claudeAiOauth']['accessToken'])"
-```
+For provider-prefixed proxy models, the bridge also needs `~/.codex/auth.json`
+because the local proxy reads ChatGPT OAuth from that file.
 
-Set `CLAUDE_CODE_OAUTH_TOKEN` in `.env`. The Agent SDK's bundled Claude binary reads this token.
+## Important environment variables
 
-## Setup
+| Variable | Default | Purpose |
+|---|---|---|
+| `CLAUDE_CODE_BRIDGE_LOG_LEVEL` | `INFO` | Bridge logging |
+| `CLAUDE_CODE_BRIDGE_HEALTH_PORT` | `8681` | `/health` TCP listener |
+| `CLAUDE_CODE_REQUEST_TIMEOUT` | `300` | Per-turn timeout |
+| `CLAUDE_CODE_CWD` | `/app` | SDK working directory |
+| `CLAUDE_CODE_PERMISSION_MODE` | `bypassPermissions` | SDK permission mode |
+| `CLAUDE_CODE_ADD_DIRS` | unset | Extra Claude `--add-dir` paths |
+| `CLAUDE_CODE_BACKEND_NAME` | `claude-code` | Redis backend filter |
+| `CLAUDE_CODE_BRIDGE_PROXY_DISABLED` | unset | Disable provider-routing proxy |
+| `CLAUDE_CODE_BRIDGE_PROXY_PORT` | `0` | Pin proxy port instead of ephemeral |
+| `CLAUDE_CODE_APPROVAL_BUNDLE_TTL` | `15` | Approval-policy bundle cache TTL |
+| `CLAUDE_CODE_APPROVAL_FAIL_CLOSED` | unset | Fail closed if policy fetch breaks |
 
-### 1. Add token to `.env`
+## Session behavior
 
-```bash
-CLAUDE_CODE_OAUTH_TOKEN=sk-ant-oat01-...
-```
+- Session IDs are bridge-managed and persisted on the bot profile.
+- Changing the resolved model causes the bridge to drop the old session and
+  start a fresh one.
+- `/new` clears the saved session before the next turn runs.
+- Turns for the same session are serialized by `SessionQueue`.
 
-### 2. Start the bridge
+## Docker compose expectations
 
-```bash
-docker compose up -d claude-code-bridge
-```
+The main compose stack mounts:
 
-### 3. Create a bot
+- `${HOME}/dev` at `/home/bridge/dev`
+- `${HOME}/.config/claude-code-bridge` at `/home/bridge/.claude`
+- `${HOME}/dev/agent-skills` at `/home/bridge/.claude/skills`
+- `${HOME}/.codex/auth.json` at `/home/bridge/.codex/auth.json`
 
-```bash
-curl -X POST http://localhost:8642/v1/bots -H "Content-Type: application/json" -d '{
-  "slug": "claude",
-  "name": "Claude",
-  "system_prompt": "You are Claude, a helpful AI assistant.",
-  "agent_backend": "claude-code",
-  "default_model": "opus-4-7",
-  "agent_backend_config": {"timeout_seconds": 120},
-  "requires_memory": false,
-  "include_summaries": false
-}'
-```
+That is the layout the bridge code expects in production.
 
-`default_model` must reference a model catalog entry with `type: claude-code`
-(see `/v1/models/definitions`); the bridge receives that entry's `model_id`
-per request.
+## Related files
 
-### 4. Reload and test
-
-```bash
-curl -X POST http://localhost:8642/v1/admin/reload-bots
-curl -X POST http://localhost:8642/v1/models/reload
-
-curl http://localhost:8642/v1/chat/completions \
-  -H "Content-Type: application/json" \
-  -d '{"model":"claude","bot_id":"claude","user_id":"nick","stream":true,
-       "messages":[{"role":"user","content":"hello"}]}'
-```
-
-## Configuration
-
-### Environment Variables
-
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `CLAUDE_CODE_OAUTH_TOKEN` | (required) | OAuth token from `claude setup-token` |
-| `CLAUDE_CODE_MODEL` | (ignored) | Deprecated — the model is resolved per-request from the bot's `default_model` catalog entry |
-| `CLAUDE_CODE_CWD` | `/app` | Working directory for Claude Code |
-| `CLAUDE_CODE_ADD_DIRS` | | Optional extra directories to allow tool access to via Claude CLI `--add-dir` |
-| `CLAUDE_CODE_BRIDGE_LOG_LEVEL` | `INFO` | Logging level |
-
-### Bot Config (`agent_backend_config`)
-
-The model itself is NOT configured here — set the bot's `default_model` to a
-`type: claude-code` catalog entry instead.
-
-| Key | Description |
-|-----|-------------|
-| `session_key` | SDK session UUID (auto-managed by bridge — do not set manually) |
-| `session_model` | Model the current SDK session was started with (auto-managed by bridge — used for resume-vs-reset) |
-| `timeout_seconds` | Max wait for response (default: 120) |
-
-### Available Models
-
-| llm-bawt alias | SDK alias | Model |
-|----------------|-----------|-------|
-| `claude-sonnet` | `default` | Claude Sonnet 4.6 |
-| `claude-sonnet-1m` | `sonnet[1m]` | Claude Sonnet 4.6 (1M context) |
-| `claude-opus-1m` | `opus[1m]` | Claude Opus 4.6 (1M context) |
-| `claude-haiku` | `haiku` | Claude Haiku 4.5 |
-
-## Session Management
-
-Each bot maintains a persistent Claude conversation. The SDK session UUID is stored in the bot's `agent_backend_config.session_key` in the database.
-
-- **Conversation persists** across messages — Claude remembers context
-- **Survives restarts** — session UUID is in PostgreSQL, not in-memory
-- **`/new` prefix** resets the session — clears the UUID, next message creates fresh conversation
-- **Model change** — if the bot's model changes, the bridge detects it and starts a new session
-- **API reset** — `POST /v1/chat/session/reset` with `{"bot_id": "claude"}`
-
-## Docker Setup
-
-The bridge runs in a lightweight container (`python:3.12-slim`) shared with the OpenClaw bridge via `Dockerfile.bridge`. No GPU, no CUDA.
-
-### Volumes
-
-| Host Path | Container Path | Purpose |
-|-----------|----------------|---------|
-| `~/dev` | `/home/bridge/dev` | Project files — Claude can read/write code |
-| `~/.config/claude-code-bridge` | `/home/bridge/.claude` | Claude Code config, settings, CLAUDE.md |
-| `~/dev/agent-skills` | `/home/bridge/.claude/skills` | Shared skills repo mounted directly into Claude's skills directory |
-| `~/.ssh` | `/home/bridge/.ssh` (ro) | SSH keys for git/remote access |
-| `~/.config/claude-code-bridge/ssh_config` | `/etc/ssh/ssh_config` (ro) | SSH host config |
-
-### Container Details
-
-- Runs as non-root user `bridge` (required — `bypassPermissions` fails as root)
-- Health check on port 8681: `curl http://localhost:8681/health`
-- Depends on: `redis` (healthy), `app` (started)
-
-## Skills
-
-This deployment exposes shared skills by bind-mounting `~/dev/agent-skills` directly to `/home/bridge/.claude/skills`.
-
-No per-skill symlinks are required for the bridge container. Edit skills on the host at `~/dev/agent-skills/` and the changes are visible immediately inside Claude.
-
-`CLAUDE_CODE_ADD_DIRS` is not part of skill discovery here. If you set it, it is passed through as Claude CLI `--add-dir`, which only grants tool access to additional directories outside the main working tree.
-
-## Switching a Bot from OpenClaw to Claude Code
-
-```bash
-curl -X PATCH http://localhost:8642/v1/bots/mybot/profile \
-  -H "Content-Type: application/json" \
-  -d '{
-    "agent_backend": "claude-code",
-    "default_model": "opus-4-7",
-    "agent_backend_config": {"timeout_seconds": 120}
-  }'
-
-# Reload
-curl -X POST http://localhost:8642/v1/admin/reload-bots
-docker compose restart app
-```
-
-## Key Files
-
-| File | Purpose |
-|------|---------|
-| `src/claude_code_bridge/bridge.py` | Core bridge — Redis listener, SDK event translation, session management |
-| `src/claude_code_bridge/__main__.py` | Entrypoint with health check server |
-| `src/llm_bawt/agent_backends/claude_code.py` | `ClaudeCodeBackend` — registered as `"claude-code"` |
-| `src/llm_bawt/clients/agent_backend_client.py` | Extracts system prompt from messages, passes to backend |
-| `Dockerfile.bridge` | Lightweight shared image for both bridges |
-| `docker-compose.yml` | `claude-code-bridge` service definition |
-
-## Differences from OpenClaw Bridge
-
-| Aspect | OpenClaw | Claude Code |
-|--------|----------|-------------|
-| Upstream | WebSocket to gateway on remote host | Agent SDK spawns local binary |
-| Auth | Ed25519 device identity + gateway token | OAuth subscription token |
-| Session key | Explicit in config (e.g. `agent:byte:main`) | Auto-generated SDK UUID |
-| System prompt | Pushed as SOUL.md file to agent | Passed inline per-request via Redis |
-| History | Managed by gateway | Managed by Claude Code binary |
-| Model selection | Gateway-side | Per-bot via `default_model` (catalog entry of `type: claude-code`) |
-| Tools | Gateway's tool system | Claude Code's built-in tools (Read, Edit, Bash, etc.) |
+- [src/llm_bawt/agent_backends/claude_code.py](/home/bridge/dev/llm-bawt/src/llm_bawt/agent_backends/claude_code.py)
+- [src/claude_code_bridge/proxy/app.py](/home/bridge/dev/llm-bawt/src/claude_code_bridge/proxy/app.py)
+- [docs/approval-policies.md](/home/bridge/dev/llm-bawt/docs/approval-policies.md)
+- [docs/usage-endpoint.md](/home/bridge/dev/llm-bawt/docs/usage-endpoint.md)

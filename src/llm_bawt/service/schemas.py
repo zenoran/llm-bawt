@@ -77,6 +77,7 @@ class ChatCompletionRequest(BaseModel):
     client_system_context: str | None = Field(default=None, description="System context extracted from client messages (set by routes, not by callers)", exclude=True)
     ha_mode: bool = Field(default=False, description="HA-mode: cap history, force tool_choice=required on first call (set by routes)", exclude=True)
     user_message_id: str | None = Field(default=None, description="Frontend-generated UUID for the user message (used as trigger_message_id in turn logs)")
+    assistant_message_id: str | None = Field(default=None, description="Frontend-generated UUID for the ASSISTANT reply row. Persisted as the assistant message id so the live streaming bubble and the reloaded history row share one id (single bubble). None → server mints one. Closes the EPIC TASK-217 assistant-identity gap.")
     # TASK-269: continuation-turn linkage.  Set when this turn is answering a
     # prior deferred AskUserQuestion.  parent_turn_id threads the chain (and
     # drives cross-tab resolution via turn_start{parent_turn_id}); when

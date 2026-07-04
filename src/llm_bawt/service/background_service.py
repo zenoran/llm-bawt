@@ -274,6 +274,10 @@ class BackgroundService(
         # persisted user message and the turn log share the same identity.
         # This mirrors the streaming path (chat_streaming.py:814).
         trigger_message_id = getattr(request, "user_message_id", None) or str(uuid.uuid4())
+        # Canonical assistant-row id (frontend-minted) so live bubble == reloaded
+        # row (single bubble). None on server-originated turns → server mints one.
+        _amid = getattr(request, "assistant_message_id", None)
+        assistant_message_id = _amid.strip() if isinstance(_amid, str) and _amid.strip() else None
 
         # Persist turn log immediately so the user's prompt is recorded
         # even if the backend times out or errors before responding.
@@ -353,6 +357,7 @@ class BackgroundService(
                     user_id=user_id,
                     elapsed_ms=(time.time() - llm_start_time) * 1000,
                     stream=False,
+                    assistant_message_id=assistant_message_id,
                 )
 
                 return response

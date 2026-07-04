@@ -166,6 +166,9 @@ services:
       # Powers bots whose model_id is namespaced "zai/<glm-model>".
       - ZAI_API_KEY=${ZAI_API_KEY:-}
       - ENABLE_TOOL_SEARCH=true
+      - CLAUDE_CODE_SKILLS_PATH=/home/bridge/dev/agent-skills
+      - CLAUDE_CODE_BAWTHUB_MCP_URL=http://app:8001/mcp
+      - CLAUDE_CODE_PLAYWRIGHT_MCP_URL=http://playwright-mcp:8931/mcp
     extra_hosts:
       - "host.docker.internal:host-gateway"
       - "echo.lan.zenoran.com:${ECHO_LAN_HOST_IP:-10.0.0.101}"
@@ -174,7 +177,6 @@ services:
       - ./.logs:/app/.logs
       - ${HOME}/dev:/home/bridge/dev
       - ${HOME}/.config/claude-code-bridge:/home/bridge/.claude
-      - ${HOME}/dev/agent-skills:/home/bridge/.claude/skills
       - ${HOME}/.config/claude-code-bridge/.claude.json:/home/bridge/.claude.json
       # Bridge SSH identity. Default = the host operator's ~/.ssh (echo today,
       # for non-GitHub SSH targets). NOTE: tenant GitHub auth no longer relies on
@@ -221,6 +223,11 @@ services:
       - CODEX_LOCAL_PLUGINS_ENABLED=${CODEX_LOCAL_PLUGINS_ENABLED:-1}
       - CODEX_LOCAL_PLUGINS_SRC=${CODEX_LOCAL_PLUGINS_SRC:-/home/bridge/dev/agent-skills/codex}
       - CODEX_DEV_ROOT=${CODEX_DEV_ROOT:-/home/bridge/dev}
+      # The openai-codex-sdk wheel ships without the codex Rust binary.
+      # The host's @openai/codex npm package provides it, but its layout
+      # (vendor/<triple>/bin/codex) differs from what the SDK expects
+      # (vendor/<triple>/codex/codex). Point CODEX_BIN at the actual path.
+      - CODEX_BIN=/app/.venv/lib/python3.12/site-packages/openai_codex_sdk/vendor/x86_64-unknown-linux-musl/bin/codex
       - LLM_BAWT_API_URL=http://app:8642
       # Override SERVICE_HOST inherited from .env (which is 0.0.0.0 — meant
       # for the app container's bind address). From inside a bridge, the

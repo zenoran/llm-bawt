@@ -12,6 +12,7 @@ import sys
 
 from agent_bridge.publisher import RedisPublisher
 
+from .bootstrap import bootstrap_claude_home
 from .bridge import ClaudeCodeBridge
 from .proxy import ProxyServer
 
@@ -57,6 +58,8 @@ def main() -> None:
     # Suppress noisy httpx request logging
     logging.getLogger("httpx").setLevel(logging.WARNING)
     logger = logging.getLogger("claude_code_bridge")
+
+    bootstrap_claude_home()
 
     redis_url = os.getenv("REDIS_URL", "redis://localhost:6379/0")
     publisher = RedisPublisher(redis_url, default_provider="claude-code")

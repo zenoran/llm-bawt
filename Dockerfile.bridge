@@ -9,9 +9,10 @@ FROM python:3.12-slim
 #   sys/proc:   procps iproute2 less tree htop
 #   net debug:  dnsutils iputils-ping netcat-openbsd rsync
 #   archives:   unzip zip xz-utils
-#   build:      make shellcheck
+#   build:      make shellcheck nodejs npm
 #   editors:    vim
 #   viewers:    bat (installed as batcat on Debian; symlinked to bat below)
+#   package mgr: corepack (enabled below for pnpm)
 #   (uv is installed below via official installer, not apt)
 RUN apt-get update && apt-get install -y --no-install-recommends \
     curl libpq5 openssh-client git git-lfs ca-certificates \
@@ -21,7 +22,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     procps iproute2 less tree htop \
     dnsutils iputils-ping netcat-openbsd rsync \
     unzip zip xz-utils \
-    make shellcheck \
+    make shellcheck nodejs npm \
     vim \
     bat \
     && rm -rf /var/lib/apt/lists/* \
@@ -32,6 +33,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # can't traverse) so both the build (root) and runtime (bridge) can use it.
 RUN curl -LsSf https://astral.sh/uv/install.sh | env UV_INSTALL_DIR=/usr/local/bin sh
 ENV PATH="/usr/local/bin:$PATH"
+
+# Node tooling for frontend repos. `npx` ships with npm; `pnpm` is surfaced
+# through Corepack so agents can use the package manager declared by the repo.
+RUN corepack enable
 
 # GitHub CLI via the official apt repo (always current; no pinned version to
 # rot). Agents are told to use `gh` for PRs/issues — make it present.

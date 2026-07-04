@@ -108,6 +108,7 @@ class ChatStreamingMixin:
         turn_log_id: str,
         llm_bawt: Any,
         trigger_message_id: str | None = None,
+        assistant_message_id: str | None = None,
     ) -> AsyncIterator[str]:
         """Stream an OpenClaw response via the WS SessionBridge."""
         bridge = self._session_bridge
@@ -474,6 +475,7 @@ class ChatStreamingMixin:
                     user_id=user_id,
                     elapsed_ms=elapsed_ms,
                     stream=True,
+                    assistant_message_id=assistant_message_id,
                 )
             else:
                 self._update_turn_log(
@@ -553,6 +555,7 @@ class ChatStreamingMixin:
                         user_id=user_id,
                         elapsed_ms=elapsed_ms,
                         stream=True,
+                        assistant_message_id=assistant_message_id,
                     )
             except Exception as _persist_err:
                 log.warning(
@@ -583,6 +586,7 @@ class ChatStreamingMixin:
                             user_id=user_id,
                             elapsed_ms=elapsed_ms,
                             stream=True,
+                            assistant_message_id=assistant_message_id,
                         )
                     else:
                         self._update_turn_log(
@@ -837,6 +841,14 @@ class ChatStreamingMixin:
                 if isinstance(_mid, str) and _mid.strip():
                     trigger_message_id = _mid.strip()
                     break
+
+        # Frontend-minted UUID for the ASSISTANT reply row. Persisting the
+        # assistant message under this id makes the live streaming bubble and the
+        # reloaded history row share ONE id, so they merge into a single bubble
+        # (closes the EPIC TASK-217 assistant-identity gap). None → history's
+        # add_message mints a server UUID (server-originated turns).
+        _amid = getattr(request, "assistant_message_id", None)
+        assistant_message_id = _amid.strip() if isinstance(_amid, str) and _amid.strip() else None
 
         if not user_prompt:
             warning_data = {
@@ -1093,6 +1105,10 @@ class ChatStreamingMixin:
             "_type": "turn_start",
             "turn_id": turn_log_id,
             "trigger_message_id": trigger_message_id,
+            # Canonical assistant row id (frontend-minted). Lets a non-originating
+            # window key its assistant bubble on the SAME id the reload will carry,
+            # so live→reload is a merge, not a duplicate.
+            "assistant_message_id": assistant_message_id,
             "bot_id": bot_id,
             "user_id": user_id,
             "parent_turn_id": parent_turn_id,
@@ -2063,6 +2079,7 @@ class ChatStreamingMixin:
                                 reasoning=reasoning_holder[0] or None,
                                 status="aborted",
                                 end_reason="aborted",
+                                assistant_message_id=assistant_message_id,
                             )
                         else:
                             self._update_turn_log(
@@ -2089,6 +2106,7 @@ class ChatStreamingMixin:
                             token_usage=token_usage_holder[0],
                             attachments=agent_attachments_holder or None,
                             reasoning=reasoning_holder[0] or None,
+                            assistant_message_id=assistant_message_id,
                         )
                     else:
                         # No response received — mark as timeout so turn doesn't
