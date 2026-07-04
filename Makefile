@@ -3,7 +3,7 @@
 # ─────────────────────────────────────────────────────────────────
 #
 # Workflow:
-#   make install         Editable pipx install — CLI client from local repo
+#   make install         Editable uv tool install — CLI client from local repo
 #   make up / docker-dev Start the service stack in Docker
 #   make dev             Sync local .venv for source development
 #   make test / lint     Run tests and linting (uv-based)
@@ -88,7 +88,7 @@ endif
 # INSTALLATION
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-.PHONY: check-python check-uv check-pipx
+.PHONY: check-python check-uv
 
 check-python: ## Verify Python 3.12+
 	@$(PYTHON) -c "import sys; exit(0 if sys.version_info >= (3,12) else 1)" \
@@ -99,34 +99,30 @@ check-uv: ## Verify uv is installed
 	@$(call CHECK_CMD,uv) || (echo "$(RED)uv not found — install: https://docs.astral.sh/uv/$(NC)" && exit 1)
 	@echo "$(GREEN)✓ uv OK$(NC)"
 
-check-pipx: ## Verify pipx is installed
-	@$(call CHECK_CMD,pipx) || (echo "$(RED)pipx not found — install: $(PYTHON) -m pip install --user pipx$(NC)" && exit 1)
-	@echo "$(GREEN)✓ pipx OK$(NC)"
-
 
 .PHONY: install install-github uninstall
 
-install: check-python check-pipx ## [pipx] Editable install from local repo (recommended)
-	@echo "$(BLUE)Installing llm-bawt via pipx (editable, local repo)...$(NC)"
-	-pipx uninstall llm-bawt 2>$(NULL) || true
-	pipx install --force --editable .
+install: check-python check-uv ## [uv tool] Editable install from local repo (recommended)
+	@echo "$(BLUE)Installing llm-bawt via uv tool (editable, local repo)...$(NC)"
+	-uv tool uninstall llm-bawt 2>$(NULL) || true
+	uv tool install --force --editable .
 	@echo "$(GREEN)✓ llm-bawt installed (editable)$(NC)"
 	@echo "  Run: llm --status"
 	@echo "  Source changes in this repo are reflected immediately"
 	@echo "  Service deps (memory, search, etc.) run in Docker — see: make up"
 
-install-github: check-python check-pipx ## [pipx] Non-editable install from GitHub
-	@echo "$(BLUE)Installing llm-bawt via pipx from GitHub...$(NC)"
-	-pipx uninstall llm-bawt 2>$(NULL) || true
-	pipx install --force "$(REPO)"
+install-github: check-python check-uv ## [uv tool] Non-editable install from GitHub
+	@echo "$(BLUE)Installing llm-bawt via uv tool from GitHub...$(NC)"
+	-uv tool uninstall llm-bawt 2>$(NULL) || true
+	uv tool install --force "$(REPO)"
 	@echo "$(GREEN)✓ llm-bawt installed (GitHub)$(NC)"
 
-# To inject extra packages into the pipx client env (rarely needed):
-#   pipx runpip llm-bawt install <package>
+# To add extra packages into the tool env (rarely needed):
+#   uv tool install --with <package> llm-bawt
 
-uninstall: ## [pipx] Uninstall llm-bawt
+uninstall: ## [uv tool] Uninstall llm-bawt
 	@echo "$(YELLOW)Uninstalling llm-bawt...$(NC)"
-	-pipx uninstall llm-bawt 2>$(NULL) || true
+	-uv tool uninstall llm-bawt 2>$(NULL) || true
 	@echo "$(GREEN)✓ llm-bawt uninstalled$(NC)"
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━

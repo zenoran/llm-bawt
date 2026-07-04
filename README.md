@@ -33,7 +33,7 @@ llm-bawt is the brain behind an AI assistant that:
 | **Docker + Docker Compose** | Containerized deployment (recommended) | Production / service mode |
 | **NVIDIA GPU + CUDA** | Local model inference (GGUF, vLLM) | Running models locally |
 | **Redis** | Event transport for OpenClaw agent bridge | Agent backend integration |
-| **pipx** | Isolated CLI install without Docker | CLI-only usage |
+| **uv** | Isolated CLI install without Docker | CLI-only usage (`uv tool install`) |
 
 ### PostgreSQL Setup
 
@@ -89,18 +89,18 @@ The Docker build is a multi-stage CUDA-enabled image (~12 GB) that compiles llam
 | `llm-bawt-openclaw-bridge` | — | WebSocket bridge for OpenClaw agent backend (optional) |
 | `llm-bawt-claude-code-bridge` | — | Claude Agent SDK bridge for Claude Code (optional) |
 
-### Option B: CLI-Only Install (pipx)
+### Option B: CLI-Only Install (uv tool)
 
 If you just want the `llm` command without running the full service stack. Still requires PostgreSQL for memory features.
 
 ```bash
 # Install from GitHub
-pipx install "git+https://github.com/zenoran/llm-bawt.git"
+uv tool install "git+https://github.com/zenoran/llm-bawt.git"
 
 # Or from a local clone (editable — code changes apply immediately)
 git clone https://github.com/zenoran/llm-bawt.git
 cd llm-bawt
-pipx install --editable .
+uv tool install --editable .
 
 # Verify
 llm --status

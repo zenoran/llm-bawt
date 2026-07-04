@@ -1824,7 +1824,15 @@ def run_app(args: argparse.Namespace, config_obj: Config, resolved_alias: str):
         # Default bot from config
         bot = bot_manager.get_bot(config_obj.DEFAULT_BOT)
         if not bot:
-            bot = bot_manager.get_default_bot()
+            default_slug = (config_obj.DEFAULT_BOT or "").lower().strip()
+            if service_mode and default_slug:
+                # No local bot registry (e.g. remote CLI with no DB creds): keep
+                # the configured slug and let the service resolve the profile,
+                # instead of silently coercing to a generic local "assistant".
+                from llm_bawt.bots import Bot
+                bot = Bot(slug=default_slug, name=config_obj.DEFAULT_BOT, description="", system_prompt="")
+            else:
+                bot = bot_manager.get_default_bot()
         bot_id = bot.slug
     
     # Use config default if --user not specified

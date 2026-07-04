@@ -150,7 +150,10 @@ def _load_db_bot_profiles() -> dict[str, dict[str, Any]]:
         config = Config()
 
         if not has_database_credentials(config):
-            logger.warning("No database credentials — cannot load bot profiles")
+            # Expected for remote/API clients (e.g. the `llm` CLI on a laptop):
+            # bot profiles are resolved server-side via the service API, so the
+            # absence of local DB creds is normal, not a warning condition.
+            logger.debug("No local database credentials — bot profiles will come from the service API if used")
             return {}
 
         store = BotProfileStore(config)

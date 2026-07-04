@@ -277,7 +277,7 @@ fi
 # Uninstall
 if [ "$UNINSTALL" = true ]; then
     echo -e "${YELLOW}Uninstalling llm-bawt...${NC}"
-    pipx uninstall llm-bawt 2>/dev/null || true
+    uv tool uninstall llm-bawt 2>/dev/null || true
     echo -e "${GREEN}✓ llm-bawt uninstalled${NC}"
     exit 0
 fi
@@ -299,16 +299,16 @@ if [ "$PYTHON_MAJOR" -lt 3 ] || ([ "$PYTHON_MAJOR" -eq 3 ] && [ "$PYTHON_MINOR" 
 fi
 echo -e "${GREEN}✓ Python $PYTHON_VERSION${NC}"
 
-# Check/install pipx
-echo -e "${BLUE}Checking pipx...${NC}"
-if ! command -v pipx &> /dev/null; then
-    echo -e "${YELLOW}Installing pipx...${NC}"
-    python3 -m pip install --user pipx
-    python3 -m pipx ensurepath
+# Check/install uv
+echo -e "${BLUE}Checking uv...${NC}"
+if ! command -v uv &> /dev/null; then
+    echo -e "${YELLOW}Installing uv...${NC}"
+    curl -LsSf https://astral.sh/uv/install.sh | sh
     # Source the updated PATH
     export PATH="$HOME/.local/bin:$PATH"
+    export PATH="$HOME/.cargo/bin:$PATH"
 fi
-echo -e "${GREEN}✓ pipx available${NC}"
+echo -e "${GREEN}✓ uv available${NC}"
 
 # Install llm-bawt
 echo -e "${BLUE}Installing llm-bawt...${NC}"
@@ -326,99 +326,82 @@ fi
 # Join extras with commas
 EXTRAS=$(IFS=,; echo "${EXTRAS_LIST[*]}")
 
-# Uninstall first if already installed (clean slate for editable)
-if pipx list | grep -q "llm-bawt"; then
+# Uninstall first if already installed (clean slate)
+if uv tool list 2>/dev/null | grep -q "llm-bawt"; then
     echo -e "${YELLOW}  Removing existing installation...${NC}"
-    pipx uninstall llm-bawt 2>/dev/null || true
+    uv tool uninstall llm-bawt 2>/dev/null || true
 fi
 
-# Build pipx install command
+# Collect --with flags for optional deps that aren't pyproject extras
+WITH_FLAGS=()
+
+if [ "$INSTALL_LLAMA" = true ]; then
+    echo -e "${BLUE}Queuing llama-cpp-python for install...${NC}"
+    if [ "$WITH_CUDA" = true ]; then
+        if command -v nvcc &> /dev/null || [ -d "/usr/local/cuda" ]; then
+            echo -e "${YELLOW}  CUDA detected, building with GPU support...${NC}"
+            CUDA_VERSION=$(nvcc --version 2>/dev/null | grep -oP 'release \K[0-9]+\.[0-9]+' | head -1)
+            if [ -n "$CUDA_VERSION" ]; then
+                echo -e "${YELLOW}  CUDA version: $CUDA_VERSION${NC}"
+            fi
+            # llama-cpp-python with CUDA needs CMAKE_ARGS at install time.
+            # uv tool doesn't support per-package build flags via --with,
+            # so we install it into the tool venv after the main install.
+            LLAMA_CUDA=true
+        else
+            echo -e "${YELLOW}  No CUDA detected, queuing CPU-only version...${NC}"
+            WITH_FLAGS+=(--with llama-cpp-python)
+            LLAMA_CUDA=false
+        fi
+    else
+        echo -e "${YELLOW}  Queuing CPU-only version (--no-cuda)...${NC}"
+        WITH_FLAGS+=(--with llama-cpp-python)
+        LLAMA_CUDA=false
+    fi
+fi
+
+if [ "$INSTALL_HF" = true ]; then
+    echo -e "${BLUE}Queuing HuggingFace dependencies...${NC}"
+    WITH_FLAGS+=(--with transformers --with torch --with huggingface-hub --with accelerate)
+fi
+
+if [ "$INSTALL_VLLM" = true ]; then
+    if command -v nvcc &> /dev/null || [ -d "/usr/local/cuda" ]; then
+        echo -e "${BLUE}Queuing vLLM (GPU detected)...${NC}"
+        WITH_FLAGS+=(--with vllm)
+    else
+        echo -e "${RED}✗ vLLM requires NVIDIA GPU and CUDA. Skipping.${NC}"
+    fi
+fi
+
+# Build uv tool install command
 if [ "$EDITABLE" = true ]; then
     echo -e "${YELLOW}  Installing in editable mode from: $REPO${NC}"
-    
-    # For editable installs, pipx needs the path directly with -e flag
     if [ -n "$EXTRAS" ]; then
         INSTALL_SPEC="${REPO}[${EXTRAS}]"
     else
         INSTALL_SPEC="${REPO}"
     fi
-    
-    pipx install --editable "$INSTALL_SPEC"
+    uv tool install --force --editable "$INSTALL_SPEC" "${WITH_FLAGS[@]}"
 else
     # Non-editable (from git or PyPI)
     if [ -n "$EXTRAS" ]; then
-        if [[ "$REPO" == git+* ]]; then
-            # Git URL - install base then inject extras
-            pipx install --force "$REPO"
-        else
-            INSTALL_SPEC="${REPO}[${EXTRAS}]"
-            pipx install --force "$INSTALL_SPEC"
-        fi
+        INSTALL_SPEC="${REPO}[${EXTRAS}]"
     else
-        pipx install --force "$REPO"
+        INSTALL_SPEC="${REPO}"
     fi
+    uv tool install --force "$INSTALL_SPEC" "${WITH_FLAGS[@]}"
 fi
 echo -e "${GREEN}✓ llm-bawt installed${NC}"
 
-# Install optional dependencies
-if [ "$INSTALL_LLAMA" = true ]; then
-    echo -e "${BLUE}Installing llama-cpp-python...${NC}"
-    
-    if [ "$WITH_CUDA" = true ]; then
-        # Check for CUDA
-        if command -v nvcc &> /dev/null || [ -d "/usr/local/cuda" ]; then
-            echo -e "${YELLOW}  CUDA detected, building with GPU support...${NC}"
-            # Get CUDA version to determine supported architectures
-            # CUDA 12.0 supports up to sm_90 (Hopper), not sm_120 (Blackwell)
-            # Use explicit architectures to avoid "native" detection issues
-            CUDA_VERSION=$(nvcc --version 2>/dev/null | grep -oP 'release \K[0-9]+\.[0-9]+' | head -1)
-            if [ -n "$CUDA_VERSION" ]; then
-                echo -e "${YELLOW}  CUDA version: $CUDA_VERSION${NC}"
-            fi
-            # Build for common modern architectures (Turing through Blackwell)
-            # sm_75=Turing, sm_80=Ampere, sm_86=Ampere, sm_89=Ada, sm_90=Hopper, sm_120=Blackwell
-            CUDA_ARCHS="${CUDA_ARCHS:-75;80;86;89;90;120}" \
-            CMAKE_ARGS="-DGGML_CUDA=on -DCMAKE_CUDA_ARCHITECTURES=${CUDA_ARCHS}" \
-                pipx runpip llm-bawt install llama-cpp-python --force-reinstall --no-cache-dir
-        else
-            echo -e "${YELLOW}  No CUDA detected, installing CPU-only version...${NC}"
-            pipx runpip llm-bawt install llama-cpp-python
-        fi
-    else
-        echo -e "${YELLOW}  Installing CPU-only version (--no-cuda)...${NC}"
-        pipx runpip llm-bawt install llama-cpp-python
-    fi
-    echo -e "${GREEN}✓ llama-cpp-python installed${NC}"
-fi
-
-if [ "$INSTALL_HF" = true ]; then
-    echo -e "${BLUE}Installing HuggingFace dependencies...${NC}"
-    pipx runpip llm-bawt install transformers torch huggingface-hub accelerate
-    echo -e "${GREEN}✓ HuggingFace dependencies installed${NC}"
-fi
-
-if [ "$INSTALL_SERVICE" = true ]; then
-    echo -e "${BLUE}Installing FastAPI service dependencies...${NC}"
-    pipx runpip llm-bawt install fastapi "uvicorn[standard]" httpx
-    echo -e "${GREEN}✓ FastAPI service dependencies installed${NC}"
-fi
-
-if [ "$INSTALL_SEARCH" = true ]; then
-    echo -e "${BLUE}Installing web search dependencies...${NC}"
-    pipx runpip llm-bawt install ddgs tavily-python
-    echo -e "${GREEN}✓ Web search dependencies installed (DuckDuckGo + Tavily)${NC}"
-fi
-
-if [ "$INSTALL_VLLM" = true ]; then
-    echo -e "${BLUE}Installing vLLM...${NC}"
-    if command -v nvcc &> /dev/null || [ -d "/usr/local/cuda" ]; then
-        echo -e "${YELLOW}  GPU detected, installing vLLM with CUDA support...${NC}"
-        pipx runpip llm-bawt install vllm
-        echo -e "${GREEN}✓ vLLM installed${NC}"
-    else
-        echo -e "${RED}✗ vLLM requires NVIDIA GPU and CUDA. Skipping.${NC}"
-        echo -e "${YELLOW}  If you have a GPU, ensure CUDA is installed and in PATH.${NC}"
-    fi
+# Install llama-cpp-python with CUDA into the tool venv (needs CMAKE_ARGS)
+if [ "$INSTALL_LLAMA" = true ] && [ "$LLAMA_CUDA" = true ]; then
+    echo -e "${BLUE}Installing llama-cpp-python with CUDA into tool venv...${NC}"
+    CUDA_ARCHS="${CUDA_ARCHS:-75;80;86;89;90;120}" \
+    CMAKE_ARGS="-DGGML_CUDA=on -DCMAKE_CUDA_ARCHITECTURES=${CUDA_ARCHS}" \
+        uv pip install --python "$(uv tool dir)/llm-bawt/bin/python" \
+        llama-cpp-python --reinstall --no-cache-dir
+    echo -e "${GREEN}✓ llama-cpp-python installed with CUDA${NC}"
 fi
 
 # Verify installation

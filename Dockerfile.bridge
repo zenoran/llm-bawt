@@ -12,7 +12,7 @@ FROM python:3.12-slim
 #   build:      make shellcheck
 #   editors:    vim
 #   viewers:    bat (installed as batcat on Debian; symlinked to bat below)
-#   python pkg: pipx (used to install editable `llm` CLI for the bridge user)
+#   (uv is installed below via official installer, not apt)
 RUN apt-get update && apt-get install -y --no-install-recommends \
     curl libpq5 openssh-client git git-lfs ca-certificates \
     jq yq \
@@ -24,7 +24,6 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     make shellcheck \
     vim \
     bat \
-    pipx \
     && rm -rf /var/lib/apt/lists/* \
     && ln -s "$(which fdfind)" /usr/local/bin/fd \
     && ln -s "$(which batcat)" /usr/local/bin/bat
@@ -75,7 +74,7 @@ COPY pyproject.toml ./
 
 # Copy the full src tree.
 # Previously this only copied the three bridge packages, but the editable
-# `llm` CLI (installed via pipx below) needs `llm_bawt` available too. The
+# `llm` CLI (installed via uv tool below) needs `llm_bawt` available too. The
 # whole src/ is only ~6 MB — not worth the granular COPY complexity.
 COPY src/ ./src/
 
@@ -104,16 +103,14 @@ RUN useradd -m -s /bin/bash bridge && chown -R bridge:bridge /app
 RUN mkdir -p /home/bridge/.codex && chown bridge:bridge /home/bridge/.codex
 USER bridge
 
-# pipx-installed `llm` CLI (editable, full deps).
+# uv tool-installed `llm` CLI (editable, full deps).
 # Mirrors `make install` — gives the bridge user a working `llm` command
-# in an isolated env at ~/.local/share/pipx/venvs/llm-bawt while keeping
+# in an isolated env at ~/.local/share/uv/tools/llm-bawt while keeping
 # /app/.venv lean (bridge runtime deps only). Editable means changes to
 # /app/src (bind-mounted in dev) are picked up without reinstall.
-ENV PIPX_HOME=/home/bridge/.local/share/pipx \
-    PIPX_BIN_DIR=/home/bridge/.local/bin
-RUN pipx install --force --editable /app
+RUN uv tool install --force --editable /app
 
-# /home/bridge/.local/bin first so pipx `llm` shadows the dep-less stub
+# /home/bridge/.local/bin first so uv tool `llm` shadows the dep-less stub
 # in /app/.venv/bin. `python` still resolves to /app/.venv/bin/python,
 # so `python -m openclaw_bridge` etc. continue to use the bridge venv.
 # /opt/agent-skills/bin holds bind-mounted scripts from the agent-skills

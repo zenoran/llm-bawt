@@ -110,7 +110,7 @@ services:
       # Override SERVICE_HOST inherited from .env (which is 0.0.0.0 — meant
       # for the app container's bind address). From inside a bridge, the
       # service is reachable at the compose service name `app`. This lets
-      # the editable `llm` CLI (installed via pipx in Dockerfile.bridge)
+      # the editable `llm` CLI (installed via uv tool in Dockerfile.bridge)
       # talk to the API without a flag override.
       - LLM_BAWT_SERVICE_HOST=app
       - REDIS_URL=redis://redis:6379/0
@@ -153,7 +153,7 @@ services:
       # Override SERVICE_HOST inherited from .env (which is 0.0.0.0 — meant
       # for the app container's bind address). From inside a bridge, the
       # service is reachable at the compose service name `app`. This lets
-      # the editable `llm` CLI (installed via pipx in Dockerfile.bridge)
+      # the editable `llm` CLI (installed via uv tool in Dockerfile.bridge)
       # talk to the API without a flag override.
       - LLM_BAWT_SERVICE_HOST=app
       - REDIS_URL=redis://redis:6379/0
@@ -225,7 +225,7 @@ services:
       # Override SERVICE_HOST inherited from .env (which is 0.0.0.0 — meant
       # for the app container's bind address). From inside a bridge, the
       # service is reachable at the compose service name `app`. This lets
-      # the editable `llm` CLI (installed via pipx in Dockerfile.bridge)
+      # the editable `llm` CLI (installed via uv tool in Dockerfile.bridge)
       # talk to the API without a flag override.
       - LLM_BAWT_SERVICE_HOST=app
       - REDIS_URL=redis://redis:6379/0
