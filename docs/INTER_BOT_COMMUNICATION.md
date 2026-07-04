@@ -2,7 +2,7 @@
 
 Inter-bot messaging lives in the MCP server, mainly through
 `bots_send_message` and `bots_list_available`. The implementation is in
-[src/llm_bawt/mcp_server/server.py](/home/bridge/dev/llm-bawt/src/llm_bawt/mcp_server/server.py).
+[src/llm_bawt/mcp_server/server.py](../src/llm_bawt/mcp_server/server.py).
 
 ## Current behavior
 

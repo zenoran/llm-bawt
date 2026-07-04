@@ -1,9 +1,9 @@
 # Claude Code Bridge
 
 The Claude Code bridge runs agent-backed bots through the Claude Agent SDK.
-The entrypoint is [src/claude_code_bridge/__main__.py](/home/bridge/dev/llm-bawt/src/claude_code_bridge/__main__.py)
+The entrypoint is [src/claude_code_bridge/__main__.py](../src/claude_code_bridge/__main__.py)
 and the bridge logic is
-[src/claude_code_bridge/bridge.py](/home/bridge/dev/llm-bawt/src/claude_code_bridge/bridge.py).
+[src/claude_code_bridge/bridge.py](../src/claude_code_bridge/bridge.py).
 
 ## What it does
 
@@ -78,7 +78,7 @@ That is the layout the bridge code expects in production.
 
 ## Related files
 
-- [src/llm_bawt/agent_backends/claude_code.py](/home/bridge/dev/llm-bawt/src/llm_bawt/agent_backends/claude_code.py)
-- [src/claude_code_bridge/proxy/app.py](/home/bridge/dev/llm-bawt/src/claude_code_bridge/proxy/app.py)
-- [docs/approval-policies.md](/home/bridge/dev/llm-bawt/docs/approval-policies.md)
-- [docs/usage-endpoint.md](/home/bridge/dev/llm-bawt/docs/usage-endpoint.md)
+- [src/llm_bawt/agent_backends/claude_code.py](../src/llm_bawt/agent_backends/claude_code.py)
+- [src/claude_code_bridge/proxy/app.py](../src/claude_code_bridge/proxy/app.py)
+- [docs/approval-policies.md](../docs/approval-policies.md)
+- [docs/usage-endpoint.md](../docs/usage-endpoint.md)

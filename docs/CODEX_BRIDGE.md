@@ -1,9 +1,9 @@
 # Codex Bridge
 
 The Codex bridge runs bots through the OpenAI Codex SDK. The service entrypoint
-is [src/codex_bridge/__main__.py](/home/bridge/dev/llm-bawt/src/codex_bridge/__main__.py)
+is [src/codex_bridge/__main__.py](../src/codex_bridge/__main__.py)
 and the bridge logic is
-[src/codex_bridge/bridge.py](/home/bridge/dev/llm-bawt/src/codex_bridge/bridge.py).
+[src/codex_bridge/bridge.py](../src/codex_bridge/bridge.py).
 
 ## What it does
 
@@ -63,6 +63,6 @@ That matches the bridge's expected runtime layout.
 
 ## Related files
 
-- [src/llm_bawt/agent_backends/codex.py](/home/bridge/dev/llm-bawt/src/llm_bawt/agent_backends/codex.py)
-- [src/codex_bridge/local_plugins.py](/home/bridge/dev/llm-bawt/src/codex_bridge/local_plugins.py)
-- [src/codex_bridge/transport.py](/home/bridge/dev/llm-bawt/src/codex_bridge/transport.py)
+- [src/llm_bawt/agent_backends/codex.py](../src/llm_bawt/agent_backends/codex.py)
+- [src/codex_bridge/local_plugins.py](../src/codex_bridge/local_plugins.py)
+- [src/codex_bridge/transport.py](../src/codex_bridge/transport.py)

@@ -1,9 +1,9 @@
 # Background Scheduler
 
 `llm-bawt` runs a DB-backed scheduler inside the FastAPI service process. The
-implementation lives in [src/llm_bawt/service/scheduler.py](/home/bridge/dev/llm-bawt/src/llm_bawt/service/scheduler.py)
+implementation lives in [src/llm_bawt/service/scheduler.py](../src/llm_bawt/service/scheduler.py)
 and the API surface is in
-[src/llm_bawt/service/routes/jobs.py](/home/bridge/dev/llm-bawt/src/llm_bawt/service/routes/jobs.py).
+[src/llm_bawt/service/routes/jobs.py](../src/llm_bawt/service/routes/jobs.py).
 
 ## How it works
 
@@ -53,7 +53,7 @@ curl -s 'http://localhost:8642/v1/jobs/runs?job_type=media_gc&include_result=tru
 
 ## Relevant config
 
-Defined in [src/llm_bawt/utils/config.py](/home/bridge/dev/llm-bawt/src/llm_bawt/utils/config.py):
+Defined in [src/llm_bawt/utils/config.py](../src/llm_bawt/utils/config.py):
 
 - `SCHEDULER_ENABLED`
 - `SCHEDULER_CHECK_INTERVAL_SECONDS`

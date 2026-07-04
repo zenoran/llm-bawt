@@ -2,9 +2,9 @@
 
 `GET /v1/usage` exposes a provider-pluggable view of subscription or plan
 usage. The route is in
-[src/llm_bawt/service/routes/usage.py](/home/bridge/dev/llm-bawt/src/llm_bawt/service/routes/usage.py)
+[src/llm_bawt/service/routes/usage.py](../src/llm_bawt/service/routes/usage.py)
 and the adapter registry is in
-[src/llm_bawt/service/usage/](/home/bridge/dev/llm-bawt/src/llm_bawt/service/usage).
+[src/llm_bawt/service/usage/](../src/llm_bawt/service/usage).
 
 ## API
 
@@ -42,7 +42,7 @@ Claude usage is separate from Claude inference.
   `user:profile` scope.
 
 Credential handling is implemented in
-[src/llm_bawt/service/usage/claude_oauth.py](/home/bridge/dev/llm-bawt/src/llm_bawt/service/usage/claude_oauth.py).
+[src/llm_bawt/service/usage/claude_oauth.py](../src/llm_bawt/service/usage/claude_oauth.py).
 
 ### Modes
 

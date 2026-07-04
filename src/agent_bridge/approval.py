@@ -166,7 +166,7 @@ def humanize_subject(subject: str) -> str:
 
     Strips SSH wrappers, output piping, cd prefixes, and multi-command chains
     to surface the primary operation — e.g. ``"bawthub › make rebuild-prod"``
-    instead of ``ssh nick@172.18.0.1 "cd /home/nick/dev/bawthub && make
+    instead of ``ssh user@host "cd ~/dev/bawthub && make
     rebuild-prod" 2>&1 | tail -20``.
 
     Pure function — no I/O, no side effects.

@@ -2,9 +2,9 @@
 
 Approval policies are stored in the app and enforced in the Claude Code bridge.
 The storage and API live in
-[src/llm_bawt/approval_policies.py](/home/bridge/dev/llm-bawt/src/llm_bawt/approval_policies.py)
+[src/llm_bawt/approval_policies.py](../src/llm_bawt/approval_policies.py)
 and
-[src/llm_bawt/service/routes/approval_policies.py](/home/bridge/dev/llm-bawt/src/llm_bawt/service/routes/approval_policies.py).
+[src/llm_bawt/service/routes/approval_policies.py](../src/llm_bawt/service/routes/approval_policies.py).
 
 ## Current scope
 

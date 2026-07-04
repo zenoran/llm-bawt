@@ -1,11 +1,11 @@
 # BawtHub MCP Server
 
 The MCP server is implemented in
-[src/llm_bawt/mcp_server/server.py](/home/bridge/dev/llm-bawt/src/llm_bawt/mcp_server/server.py),
+[src/llm_bawt/mcp_server/server.py](../src/llm_bawt/mcp_server/server.py),
 with task tools in
-[src/llm_bawt/mcp_server/task_tools.py](/home/bridge/dev/llm-bawt/src/llm_bawt/mcp_server/task_tools.py)
+[src/llm_bawt/mcp_server/task_tools.py](../src/llm_bawt/mcp_server/task_tools.py)
 and self-handoff tools in
-[src/llm_bawt/mcp_server/self_tools.py](/home/bridge/dev/llm-bawt/src/llm_bawt/mcp_server/self_tools.py).
+[src/llm_bawt/mcp_server/self_tools.py](../src/llm_bawt/mcp_server/self_tools.py).
 
 The server name is `bawthub`.
 
@@ -57,5 +57,5 @@ internally.
 
 ## Related docs
 
-- [docs/INTER_BOT_COMMUNICATION.md](/home/bridge/dev/llm-bawt/docs/INTER_BOT_COMMUNICATION.md)
-- [docs/BACKGROUND_SCHEDULER.md](/home/bridge/dev/llm-bawt/docs/BACKGROUND_SCHEDULER.md)
+- [docs/INTER_BOT_COMMUNICATION.md](../docs/INTER_BOT_COMMUNICATION.md)
+- [docs/BACKGROUND_SCHEDULER.md](../docs/BACKGROUND_SCHEDULER.md)
