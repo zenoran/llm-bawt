@@ -212,4 +212,4 @@ The important design choice is that the thread does not live in the client. Bawt
 
 ## License
 
-MIT
+Elastic License 2.0 — see [LICENSE](LICENSE).
