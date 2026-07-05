@@ -11,8 +11,6 @@ import uuid
 
 class TaskType(Enum):
     """Types of tasks the background service can handle."""
-    CONTEXT_COMPACTION = "context_compaction"
-    EMBEDDING_GENERATION = "embedding_generation"
     MEMORY_CONSOLIDATION = "memory_consolidation"
     MEANING_UPDATE = "meaning_update"
     MEMORY_MAINTENANCE = "memory_maintenance"
@@ -96,39 +94,6 @@ class TaskResult:
 
 
 # Task factory functions for common operations
-def create_compaction_task(
-    messages: list[dict],
-    target_token_count: int,
-    bot_id: str = "nova",
-) -> Task:
-    """Create a context compaction task."""
-    return Task(
-        task_type=TaskType.CONTEXT_COMPACTION,
-        payload={
-            "messages": messages,
-            "target_token_count": target_token_count,
-        },
-        bot_id=bot_id,
-        priority=1,  # Higher priority - needed for next query
-    )
-
-
-def create_embedding_task(
-    texts: list[str],
-    memory_ids: list[str],
-    bot_id: str = "nova",
-) -> Task:
-    """Create an embedding generation task."""
-    return Task(
-        task_type=TaskType.EMBEDDING_GENERATION,
-        payload={
-            "texts": texts,
-            "memory_ids": memory_ids,
-        },
-        bot_id=bot_id,
-    )
-
-
 def create_meaning_update_task(
     memory_id: str,
     intent: str | None = None,

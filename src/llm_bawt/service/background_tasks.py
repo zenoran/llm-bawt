@@ -29,11 +29,7 @@ class BackgroundTasksMixin:
         log.debug(f"Processing task {task.task_id[:8]} ({task_type_str})")
 
         try:
-            if task.task_type == TaskType.CONTEXT_COMPACTION:
-                result = await self._process_compaction(task)
-            elif task.task_type == TaskType.EMBEDDING_GENERATION:
-                result = await self._process_embeddings(task)
-            elif task.task_type == TaskType.MEANING_UPDATE:
+            if task.task_type == TaskType.MEANING_UPDATE:
                 result = await self._process_meaning_update(task)
             elif task.task_type == TaskType.MEMORY_MAINTENANCE:
                 result = await self._process_maintenance(task)
@@ -67,16 +63,6 @@ class BackgroundTasksMixin:
                 error=str(e),
                 processing_time_ms=elapsed_ms,
             )
-
-    async def _process_compaction(self, task: Task) -> dict:
-        """Process a context compaction task."""
-        # TODO: Implement with summarization model
-        return {"compacted": False, "reason": "Not yet implemented"}
-
-    async def _process_embeddings(self, task: Task) -> dict:
-        """Process an embedding generation task."""
-        # TODO: Implement with embedding model
-        return {"embeddings_generated": 0, "reason": "Not yet implemented"}
 
     async def _process_meaning_update(self, task: Task) -> dict:
         """Process a meaning update task (via MCP tools)."""
