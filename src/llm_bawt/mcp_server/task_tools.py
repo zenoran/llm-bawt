@@ -280,10 +280,15 @@ async def update_task(
 
     IMPORTANT: Set status to REVIEW when done - only humans mark COMPLETED.
 
+    BUG status is human-locked: you may SET a task to BUG (to flag a defect for
+    the user), but you CANNOT move a task OUT of BUG — the server rejects such
+    transitions from agents. Only a human can clear BUG status.
+
     Args:
         task_id: Task UUID or shortId (e.g. "TASK-42").
         status: New status (QUEUED, PLANNING, REFINED, IN_PROGRESS,
-                REVIEW, COMPLETED, FAILED, CANCELLED).
+                REVIEW, COMPLETED, FAILED, BUG, CANCELLED). You may set BUG
+                but cannot transition a task out of BUG (human-only).
         response: Summary text - your final answer / work output.
         model_id: Model identifier (e.g. "claude-opus-4-6").
         title: Updated task title.

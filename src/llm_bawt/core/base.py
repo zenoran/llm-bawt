@@ -540,6 +540,24 @@ class BaseLLMBawt(ABC):
                     position=SectionPosition.CUSTOM,
                 )
 
+        # Agent global prompt (opt-in per bot). Agent backends only — chat bots
+        # never see it. Gated on the `agent_global_prompt_enabled` runtime
+        # setting. Rides the cacheable system-prompt prefix (byte-stable across
+        # turns unless the DB body changes). Bot-scoped resolve falls back to the
+        # global default; an empty body injects nothing even when the flag is on.
+        if _is_agent_backend and bool(self._resolve_setting("agent_global_prompt_enabled", False)):
+            from ..prompt_registry import get_prompt_resolver
+            resolved = get_prompt_resolver(self.config).resolve(
+                "agents.global_prompt", scope_type="bot", scope_id=self.bot_id
+            )
+            agent_global_body = resolved.body if resolved else None
+            if agent_global_body:
+                builder.add_section(
+                    "agent_global_prompt",
+                    agent_global_body,
+                    position=SectionPosition.GLOBAL_INSTRUCTIONS,
+                )
+
         # Response-style instruction derived from keywords in the user's message.
         # Lets the user shape any bot's answer inline without extra config.
         #

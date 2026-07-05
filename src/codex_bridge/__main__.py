@@ -18,6 +18,7 @@ Environment:
     CODEX_LOCAL_PLUGINS_ENABLED     — stage repo-managed local plugins into ~/.agents + ~/plugins
     CODEX_LOCAL_PLUGINS_SRC         — source mapping root (default /home/bridge/dev/agent-skills/codex)
     CODEX_DEV_ROOT                  — dev root used to resolve repo-managed skills (default /home/bridge/dev)
+    CODEX_BAWTHUB_MCP_URL           — BawtHub MCP endpoint for Codex tools (default http://app:8001/mcp)
 """
 
 from __future__ import annotations
@@ -46,7 +47,9 @@ async def _health_server(publisher: RedisPublisher, port: int) -> None:
     bridges look identical.
     """
 
-    async def handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+    async def handle(
+        reader: asyncio.StreamReader, writer: asyncio.StreamWriter
+    ) -> None:
         try:
             await reader.readline()
             redis_ok = publisher.connected

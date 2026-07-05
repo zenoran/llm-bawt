@@ -12,6 +12,7 @@ from pathlib import Path
 # semantic versions for local plugins, so we always write into a fixed
 # token. Changing this string forces a re-stage on next start.
 _PLUGIN_CACHE_VERSION = "v1"
+_DEFAULT_BAWTHUB_MCP_URL = "http://app:8001/mcp"
 
 
 def _remove_path(path: Path) -> None:
@@ -133,21 +134,25 @@ def _ensure_config_toml_entries(
 
     marketplace_header = f"[marketplaces.{marketplace_name}]"
     if marketplace_header not in existing:
-        additions.extend([
-            "",
-            marketplace_header,
-            'source_type = "local"',
-            f'source = "{marketplace_source}"',
-        ])
+        additions.extend(
+            [
+                "",
+                marketplace_header,
+                'source_type = "local"',
+                f'source = "{marketplace_source}"',
+            ]
+        )
 
     for plugin_name in plugin_names:
         plugin_header = f'[plugins."{plugin_name}@{marketplace_name}"]'
         if plugin_header not in existing:
-            additions.extend([
-                "",
-                plugin_header,
-                "enabled = true",
-            ])
+            additions.extend(
+                [
+                    "",
+                    plugin_header,
+                    "enabled = true",
+                ]
+            )
 
     if not additions:
         return
@@ -169,6 +174,91 @@ def _ensure_config_toml_entries(
         config_path,
         marketplace_name,
         plugin_names,
+    )
+
+
+def _upsert_mcp_server_config(
+    *,
+    config_path: Path,
+    name: str,
+    url: str,
+    logger: logging.Logger,
+) -> None:
+    """Ensure ``[mcp_servers.<name>]`` exists with the requested URL.
+
+    Keep this as line-oriented surgery rather than TOML round-tripping so
+    operator-authored Codex settings stay formatted exactly as written.
+    """
+    try:
+        existing = config_path.read_text() if config_path.exists() else ""
+    except OSError as exc:
+        logger.warning("Could not read %s: %s", config_path, exc)
+        return
+
+    header = f"[mcp_servers.{name}]"
+    url_line = f'url = "{url}"'
+
+    if header not in existing:
+        new_text = existing
+        if new_text and not new_text.endswith("\n"):
+            new_text += "\n"
+        new_text += f"\n{header}\n{url_line}\n"
+    else:
+        lines = existing.splitlines()
+        start = next(
+            (idx for idx, line in enumerate(lines) if line.strip() == header), None
+        )
+        if start is None:
+            return
+
+        end = len(lines)
+        for idx in range(start + 1, len(lines)):
+            stripped = lines[idx].strip()
+            if stripped.startswith("[") and stripped.endswith("]"):
+                end = idx
+                break
+
+        url_idx = next(
+            (
+                idx
+                for idx in range(start + 1, end)
+                if lines[idx].strip().startswith("url")
+                and lines[idx].split("=", 1)[0].strip() == "url"
+            ),
+            None,
+        )
+        if url_idx is not None:
+            if lines[url_idx].strip() == url_line:
+                return
+            lines[url_idx] = url_line
+        else:
+            lines.insert(start + 1, url_line)
+
+        new_text = "\n".join(lines)
+        if existing.endswith("\n") or not new_text:
+            new_text += "\n"
+
+    try:
+        config_path.parent.mkdir(parents=True, exist_ok=True)
+        config_path.write_text(new_text)
+    except OSError as exc:
+        logger.warning("Could not update %s: %s", config_path, exc)
+        return
+
+    logger.info("Updated %s: MCP server %s -> %s", config_path, name, url)
+
+
+def ensure_bawthub_mcp_config(
+    *,
+    logger: logging.Logger,
+    codex_home: Path,
+) -> None:
+    url = os.getenv("CODEX_BAWTHUB_MCP_URL", _DEFAULT_BAWTHUB_MCP_URL)
+    _upsert_mcp_server_config(
+        config_path=codex_home / "config.toml",
+        name="bawthub",
+        url=url,
+        logger=logger,
     )
 
 
@@ -206,7 +296,10 @@ def install_repo_local_plugins(
     """
 
     if os.getenv("CODEX_LOCAL_PLUGINS_ENABLED", "1").lower() in {"0", "false", "no"}:
-        logger.info("Skipping local Codex plugin install: CODEX_LOCAL_PLUGINS_ENABLED=false")
+        logger.info(
+            "Skipping local Codex plugin install: CODEX_LOCAL_PLUGINS_ENABLED=false"
+        )
+        ensure_bawthub_mcp_config(logger=logger, codex_home=codex_home)
         return
 
     home = home or Path.home()
@@ -222,6 +315,7 @@ def install_repo_local_plugins(
             "No repo-managed Codex plugin mapping found at %s; local plugin staging skipped",
             source_root,
         )
+        ensure_bawthub_mcp_config(logger=logger, codex_home=codex_home)
         return
 
     marketplace_data = _read_json(source_marketplace, logger=logger) or {}
@@ -231,6 +325,7 @@ def install_repo_local_plugins(
             "marketplace.json at %s is missing a 'name' field; cannot register marketplace",
             source_marketplace,
         )
+        ensure_bawthub_mcp_config(logger=logger, codex_home=codex_home)
         return
 
     # Home-local layout: a marketplace.json symlink + per-plugin scaffold
@@ -250,7 +345,9 @@ def install_repo_local_plugins(
     cache_marketplace_root.mkdir(parents=True, exist_ok=True)
 
     installed_plugins: list[str] = []
-    for source_plugin_dir in sorted(p for p in source_plugins_dir.iterdir() if p.is_dir()):
+    for source_plugin_dir in sorted(
+        p for p in source_plugins_dir.iterdir() if p.is_dir()
+    ):
         # ---- home-local scaffold (kept for tooling compatibility) ----
         target_plugin_dir = home_plugins_dir / source_plugin_dir.name
         _remove_path(target_plugin_dir)
@@ -285,13 +382,14 @@ def install_repo_local_plugins(
                 skill_targets[source_skill_entry.name] = target
 
         # ---- cache-local layout (what Codex actually loads) ----
-        plugin_manifest = _read_json(
-            source_plugin_dir / ".codex-plugin" / "plugin.json", logger=logger
-        ) or {}
-        plugin_name = plugin_manifest.get("name") or source_plugin_dir.name
-        plugin_cache_root = (
-            cache_marketplace_root / plugin_name / _PLUGIN_CACHE_VERSION
+        plugin_manifest = (
+            _read_json(
+                source_plugin_dir / ".codex-plugin" / "plugin.json", logger=logger
+            )
+            or {}
         )
+        plugin_name = plugin_manifest.get("name") or source_plugin_dir.name
+        plugin_cache_root = cache_marketplace_root / plugin_name / _PLUGIN_CACHE_VERSION
         _populate_plugin_cache(
             plugin_cache_root=plugin_cache_root,
             source_plugin_dir=source_plugin_dir,
@@ -305,6 +403,7 @@ def install_repo_local_plugins(
             "No plugins discovered under %s; nothing to register in config.toml",
             source_plugins_dir,
         )
+        ensure_bawthub_mcp_config(logger=logger, codex_home=codex_home)
         return
 
     _ensure_config_toml_entries(
@@ -322,3 +421,5 @@ def install_repo_local_plugins(
         marketplace_name,
         ", ".join(installed_plugins),
     )
+
+    ensure_bawthub_mcp_config(logger=logger, codex_home=codex_home)

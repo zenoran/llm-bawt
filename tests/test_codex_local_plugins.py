@@ -35,8 +35,12 @@ def _build_fixture(tmp_path: Path) -> tuple[Path, Path, Path, Path, Path, Path]:
         source_root / "plugins" / "agent-skills" / ".codex-plugin" / "plugin.json",
         '{"name":"agent-skills"}\n',
     )
-    (source_root / "plugins" / "agent-skills" / "skills" / "repo-skill").mkdir(parents=True)
-    (source_root / "plugins" / "agent-skills" / "skills" / "system-skill").mkdir(parents=True)
+    (source_root / "plugins" / "agent-skills" / "skills" / "repo-skill").mkdir(
+        parents=True
+    )
+    (source_root / "plugins" / "agent-skills" / "skills" / "system-skill").mkdir(
+        parents=True
+    )
 
     return home, dev_root, codex_home, source_root, repo_skill, system_skill
 
@@ -64,7 +68,10 @@ def test_install_repo_local_plugins_stages_marketplace_and_skill_links(
     staged_system_skill = home / "plugins" / "agent-skills" / "skills" / "system-skill"
 
     assert staged_marketplace.is_symlink()
-    assert staged_marketplace.resolve() == source_root / ".codex-plugin" / "marketplace.json"
+    assert (
+        staged_marketplace.resolve()
+        == source_root / ".codex-plugin" / "marketplace.json"
+    )
 
     assert staged_plugin_meta_dir.is_symlink()
     assert staged_plugin_meta_dir.resolve() == (
@@ -120,7 +127,10 @@ def test_install_repo_local_plugins_writes_config_toml_entries(
 
     # Pre-existing config that the staging code must not clobber.
     config_toml = codex_home / "config.toml"
-    _write(config_toml, 'model = "gpt-5.4"\n\n[plugins."github@openai-curated"]\nenabled = true\n')
+    _write(
+        config_toml,
+        'model = "gpt-5.4"\n\n[plugins."github@openai-curated"]\nenabled = true\n',
+    )
 
     install_repo_local_plugins(
         logger=logging.getLogger("test.codex_local_plugins"),
@@ -137,6 +147,8 @@ def test_install_repo_local_plugins_writes_config_toml_entries(
     assert 'source_type = "local"' in contents
     assert f'source = "{home}"' in contents
     assert '[plugins."agent-skills@local-agent-skills"]' in contents
+    assert "[mcp_servers.bawthub]" in contents
+    assert 'url = "http://app:8001/mcp"' in contents
 
 
 def test_install_repo_local_plugins_is_idempotent(monkeypatch, tmp_path: Path):
@@ -166,3 +178,49 @@ def test_install_repo_local_plugins_is_idempotent(monkeypatch, tmp_path: Path):
     assert first == second
     assert second.count("[marketplaces.local-agent-skills]") == 1
     assert second.count('[plugins."agent-skills@local-agent-skills"]') == 1
+    assert second.count("[mcp_servers.bawthub]") == 1
+
+
+def test_install_repo_local_plugins_updates_existing_bawthub_mcp_url(
+    monkeypatch, tmp_path: Path
+):
+    home, dev_root, codex_home, source_root, _, _ = _build_fixture(tmp_path)
+
+    monkeypatch.setenv("CODEX_DEV_ROOT", str(dev_root))
+    monkeypatch.setenv("CODEX_LOCAL_PLUGINS_SRC", str(source_root))
+    monkeypatch.setenv("CODEX_BAWTHUB_MCP_URL", "http://bridge-app:8001/mcp")
+
+    config_toml = codex_home / "config.toml"
+    _write(
+        config_toml,
+        'model = "gpt-5.4"\n\n[mcp_servers.bawthub]\nurl = "http://127.0.0.1:8001/mcp"\n\n[mcp_servers.openaiDeveloperDocs]\nurl = "https://developers.openai.com/mcp"\n',
+    )
+
+    install_repo_local_plugins(
+        logger=logging.getLogger("test.codex_local_plugins"),
+        codex_home=codex_home,
+        home=home,
+    )
+
+    contents = config_toml.read_text()
+    assert contents.count("[mcp_servers.bawthub]") == 1
+    assert 'url = "http://bridge-app:8001/mcp"' in contents
+    assert "127.0.0.1:8001" not in contents
+    assert "[mcp_servers.openaiDeveloperDocs]" in contents
+
+
+def test_install_repo_local_plugins_adds_bawthub_mcp_when_plugins_disabled(
+    monkeypatch, tmp_path: Path
+):
+    _, _, codex_home, _, _, _ = _build_fixture(tmp_path)
+    monkeypatch.setenv("CODEX_LOCAL_PLUGINS_ENABLED", "0")
+
+    install_repo_local_plugins(
+        logger=logging.getLogger("test.codex_local_plugins"),
+        codex_home=codex_home,
+        home=tmp_path / "home",
+    )
+
+    contents = (codex_home / "config.toml").read_text()
+    assert "[mcp_servers.bawthub]" in contents
+    assert 'url = "http://app:8001/mcp"' in contents

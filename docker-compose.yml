@@ -235,6 +235,7 @@ services:
       - CODEX_LOCAL_PLUGINS_ENABLED=${CODEX_LOCAL_PLUGINS_ENABLED:-1}
       - CODEX_LOCAL_PLUGINS_SRC=${CODEX_LOCAL_PLUGINS_SRC:-/home/bridge/dev/agent-skills/codex}
       - CODEX_DEV_ROOT=${CODEX_DEV_ROOT:-/home/bridge/dev}
+      - CODEX_BAWTHUB_MCP_URL=${CODEX_BAWTHUB_MCP_URL:-http://app:8001/mcp}
       # The openai-codex-sdk wheel ships without the codex Rust binary.
       # The host's @openai/codex npm package provides it, but its layout
       # (vendor/<triple>/bin/codex) differs from what the SDK expects

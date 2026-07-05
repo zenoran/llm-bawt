@@ -128,6 +128,9 @@ class RuntimeTunables(BaseModel):
     TEMPERATURE: float = Field(default=0.8, description="Sampling temperature (0.0 = deterministic, higher = more creative)")
     TOP_P: float = Field(default=0.95, description="Nucleus sampling cutoff. Lower = less random.")
 
+    # --- Agent Behavior --- #
+    AGENT_GLOBAL_PROMPT_ENABLED: bool = Field(default=False, description="For agent backends (Claude Code, Codex, OpenClaw): inject the shared 'agents.global_prompt' dynamic prompt into the system prompt (steers planning to the BawtHub task system instead of harness plan mode). Opt-in per bot.")
+
 
 # Map of runtime settings key -> RuntimeTunables field name (trivial: just uppercase)
 def runtime_key_to_config(key: str) -> str:

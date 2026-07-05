@@ -215,6 +215,29 @@ AGENT_USER_PREFIX = (
 )
 
 
+# Default body for agents.global_prompt — a shared, opt-in system-prompt block
+# for AGENT backends (Claude Code, Codex, OpenClaw). Gated per-bot by the
+# `agent_global_prompt_enabled` runtime setting. Rides the cacheable system-prompt
+# prefix (byte-stable across turns unless the DB body changes).
+AGENT_GLOBAL_PROMPT = (
+    "TASK SELF-MANAGEMENT:\n"
+    "Manage your own work through the BawtHub agent task system so it stays "
+    "observable to the user — the SDK harness has no other channel to show what "
+    "you are doing, planning, or how far along you are.\n\n"
+    "- For any non-trivial or multi-step work, invoke the `agent-system` skill "
+    "and create a task with its steps up front (tasks_create / steps_add).\n"
+    "- Drive the steps as you work: mark each RUNNING when you start it and "
+    "COMPLETED / FAILED with a short output when you finish it (steps_update). "
+    "This is how the user watches progress in real time.\n"
+    "- Your SDK session can reset between turns. Before continuing work, reload "
+    "state with tasks_get_context(task_id) so you never lose the plan or redo "
+    "finished steps.\n"
+    "- A task in BUG status is locked for human review. Do not try to move it "
+    "out of BUG — the system will reject it. Leave it as-is and continue with "
+    "other work."
+)
+
+
 DEFAULT_PROMPT_DEFINITIONS: dict[str, PromptDefinition] = {
     "history.summarization.single": PromptDefinition(
         key="history.summarization.single",
@@ -319,6 +342,25 @@ DEFAULT_PROMPT_DEFINITIONS: dict[str, PromptDefinition] = {
                 "that must survive session resume). The toggle lives in "
                 "the chat composer's unified popup. Leave body empty to "
                 "disable even when the flag is on."
+            ),
+        },
+    ),
+    "agents.global_prompt": PromptDefinition(
+        key="agents.global_prompt",
+        title="Agent Global System Prompt",
+        category="agent_execution",
+        required_vars=(),
+        loader=lambda: AGENT_GLOBAL_PROMPT,
+        metadata={
+            "notes": (
+                "Shared system-prompt block for AGENT backends (Claude Code, "
+                "Codex, OpenClaw). Injected ONLY when the per-bot runtime setting "
+                "`agent_global_prompt_enabled` is true. Added to the cacheable "
+                "system-prompt prefix (agent-only; chat bots never see it). "
+                "Default body steers planning away from harness plan mode and "
+                "toward the BawtHub task system for observability. Supports "
+                "per-bot overrides via scope_type=bot; leave body empty to "
+                "inject nothing even when the flag is on."
             ),
         },
     ),
