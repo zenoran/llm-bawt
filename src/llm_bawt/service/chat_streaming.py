@@ -19,6 +19,7 @@ from ..bots import StreamingEmoteFilter, get_bot
 # into inline image bytes for the LLM call and (b) auto-upload legacy
 # inline ``image_url`` base64 so the asset gets a persistent id.
 from ..media import MediaAssetNotFound, get_media_store
+from ..media.serializers import build_agent_image_manifest
 from .chat_stream_worker import consume_stream_chunks, put_queue_item_threadsafe
 from .logging import RequestContext, generate_request_id, get_service_logger
 from .schemas import ChatCompletionRequest
@@ -1309,11 +1310,39 @@ class ChatStreamingMixin:
                 # JSONB payload persisted on the user-message row.  Bytes
                 # for the LLM live on ``user_attachments`` (separate
                 # argument) and never touch the DB.
+                # TASK-391: agent backends can *see* attached images inline but
+                # their shell/tools can't fetch blob: URLs. Build a curlable
+                # "Attached Images" manifest and hand it to the agent ONLY, via
+                # context_suffix — it rides the outbound user message (like the
+                # per-turn agent prefixes) and is NEVER persisted. The durable
+                # record of what was attached is the tiny {asset_id, kind} refs
+                # on the message row (``attachments`` below); the manifest is
+                # just a per-turn, absolute-URL rendering of those same handles
+                # so a sibling-container tool can curl them. user_prompt stays
+                # clean in history + turn log; non-agent chat is unaffected.
+                agent_context_suffix = None
+                if is_agent_backend and attachments_to_persist and media_store is not None:
+                    try:
+                        manifest = build_agent_image_manifest(
+                            attachments_to_persist,
+                            media_store.db,
+                            origin=getattr(self.config, "AGENT_ORIGIN", "") or "",
+                        )
+                    except Exception as _manifest_err:
+                        manifest = ""
+                        log.warning(
+                            "TASK-391: failed to build attachment manifest: %s",
+                            _manifest_err,
+                        )
+                    if manifest:
+                        agent_context_suffix = manifest
+
                 messages = llm_bawt.prepare_messages_for_query(
                     user_prompt,
                     user_attachments=user_attachments or None,
                     message_id=trigger_message_id,
                     attachments=attachments_to_persist or None,
+                    context_suffix=agent_context_suffix,
                 )
 
                 # TASK-215: the "AVATAR ANIMATION: You MUST call trigger_animation"

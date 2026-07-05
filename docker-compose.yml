@@ -39,6 +39,10 @@ services:
       # endpoint instead of loading MiniLM in-process. On the compose network
       # the bridge is reachable by service name; no host port publish needed.
       - LOCAL_MODEL_EMBED_URL=http://local-model-bridge:8684
+      # TASK-391: origin agent backends use to build curlable /v1/uploads URLs
+      # in the "Attached Images" prompt manifest. Same in-network address the
+      # bridges already use for LLM_BAWT_API_URL.
+      - LLM_BAWT_AGENT_ORIGIN=http://app:8642
     ports:
       - "${MCP_PORT:-8001}:8001"
       - "${SERVICE_PORT:-8642}:8642"

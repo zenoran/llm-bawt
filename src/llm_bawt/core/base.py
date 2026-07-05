@@ -458,8 +458,14 @@ class BaseLLMBawt(ABC):
             self.history_manager.remove_last_message_if_partial("assistant")
             return ""
     
-    def _build_context_messages(self, prompt: str) -> list[Message]:
-        """Build messages list with system prompt, memory context, and history."""
+    def _build_context_messages(self, prompt: str, context_suffix: str | None = None) -> list[Message]:
+        """Build messages list with system prompt, memory context, and history.
+
+        ``context_suffix`` (TASK-391) is per-turn text appended to the OUTBOUND
+        user message only — it is model-visible but never persisted (the caller
+        already stored the clean ``prompt``). Used for the agent attachment
+        manifest; see ``prepare_messages_for_query``.
+        """
         messages = []
         
         # Start with a copy of the prompt builder
@@ -671,6 +677,11 @@ class BaseLLMBawt(ABC):
                             f"{key}(len={n}, src={src})" for key, n, src in applied_keys
                         )
                         logger.debug(f"Agent user-message prefixes applied: {applied_repr}")
+            # TASK-391: per-turn attachment manifest — appended to the outbound
+            # user message only (model-visible, never persisted). Kept AFTER the
+            # user text so the manifest reads as trailing context.
+            if context_suffix:
+                user_content = f"{user_content}\n\n{context_suffix}"
             messages.append(Message(role="user", content=user_content))
             return messages
 

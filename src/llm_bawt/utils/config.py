@@ -235,6 +235,15 @@ class Config(RuntimeTunables, BaseSettings):
     USE_SERVICE: bool = Field(default=False, description="Route queries through the background service by default (same as --service flag)")
     SERVICE_HOST: str = Field(default="127.0.0.1", description="Host for the background service to bind to")
     SERVICE_PORT: int = Field(default=8642, description="Port for the background service to listen on")
+    AGENT_ORIGIN: str = Field(
+        default="",
+        description=(
+            "Absolute base URL that agent backends use to fetch chat-upload "
+            "assets, e.g. http://app:8642. Used to build curlable /v1/uploads "
+            "URLs in the agent-visible 'Attached Images' manifest (TASK-391). "
+            "Empty = emit relative /v1/uploads paths. Set via LLM_BAWT_AGENT_ORIGIN."
+        ),
+    )
 
     # --- xAI (Grok) Settings --- #
     XAI_API_KEY: str = Field(default="", description="xAI API key for Grok models (get from x.ai)")

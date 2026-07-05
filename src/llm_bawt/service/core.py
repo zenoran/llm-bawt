@@ -353,6 +353,7 @@ class ServiceLLMBawt(BaseLLMBawt):
         user_attachments: list[dict] | None = None,
         message_id: str | None = None,
         attachments: list[dict] | None = None,
+        context_suffix: str | None = None,
     ) -> list[Message]:
         """Prepare messages for query including history and memory context.
 
@@ -375,6 +376,11 @@ class ServiceLLMBawt(BaseLLMBawt):
                 full asset metadata lives in ``media_assets`` and is
                 fetched on read.  Distinct from ``user_attachments``,
                 which carries the bytes for the LLM call.
+            context_suffix: TASK-391 — optional per-turn text appended to the
+                OUTBOUND user message only (rides the model-visible message
+                like the agent prefixes). NEVER persisted: ``prompt`` above is
+                what lands in history. Used to hand the agent a curlable
+                attachment manifest without polluting the stored message.
 
         Returns:
             List of messages ready for LLM query
@@ -388,8 +394,10 @@ class ServiceLLMBawt(BaseLLMBawt):
             "user", prompt, message_id=message_id, attachments=attachments,
         )
 
-        # Build context with system prompt, memory, and history
-        messages = self._build_context_messages(prompt)
+        # Build context with system prompt, memory, and history. context_suffix
+        # (e.g. the TASK-391 attachment manifest) rides the OUTBOUND user
+        # message only — the clean ``prompt`` was already persisted above.
+        messages = self._build_context_messages(prompt, context_suffix=context_suffix)
 
         # TASK-225 LLM-boundary inlining: ``user_attachments`` is the
         # in-memory ``{mimeType, content=naked-b64}`` contract produced by

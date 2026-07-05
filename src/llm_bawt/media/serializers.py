@@ -95,6 +95,129 @@ def asset_row_to_attachment_dict(row: dict[str, Any]) -> dict:
     }
 
 
+def _abs_url(path: str, origin: str) -> str:
+    """Prefix a relative ``/v1/uploads/...`` path with ``origin``.
+
+    Empty ``origin`` returns the path unchanged so callers degrade to
+    relative URLs (still meaningful to same-origin consumers).
+    """
+    if not origin:
+        return path
+    return f"{origin.rstrip('/')}{path}"
+
+
+def _fmt_size(size_bytes: Any) -> str | None:
+    """Human-readable byte size (``124.3 KB``), or ``None`` if unknown."""
+    try:
+        n = int(size_bytes)
+    except (TypeError, ValueError):
+        return None
+    if n < 1024:
+        return f"{n} B"
+    if n < 1024 * 1024:
+        return f"{n / 1024:.1f} KB"
+    return f"{n / (1024 * 1024):.1f} MB"
+
+
+def build_agent_image_manifest(
+    refs: Iterable[dict[str, Any]],
+    asset_store,
+    origin: str = "",
+) -> str:
+    """Render a plain-text 'Attached Images' manifest for agent backends.
+
+    TASK-391 — when a chat turn carrying image attachments is dispatched
+    to an agent backend (Claude Code / Codex / OpenClaw), the model can
+    *see* the image bytes inline, but its shell/tools cannot fetch the
+    same asset (blob: URLs are browser-local). This helper turns the tiny
+    persisted refs ``[{"asset_id": "ma_xxx", "kind": "image"}, ...]`` into
+    a curlable manifest that gets appended to the agent-visible prompt.
+
+    Each ref is resolved against ``asset_store`` (``get_many``/``get_by_id``
+    -> ``media_assets`` row) and rendered with its ``mime_type``,
+    dimensions, size, and absolute variant URLs. URLs are absolutized with
+    ``origin`` (e.g. ``http://app:8642``) so a tool running in a sibling
+    container can curl them; an empty ``origin`` emits relative
+    ``/v1/uploads/...`` paths unchanged.
+
+    Returns ``""`` when ``refs`` is empty or nothing resolves — callers
+    should skip injection on an empty string.
+
+    Args:
+        refs: Iterable of ``{"asset_id", "kind"}`` dicts (order preserved,
+            duplicates collapsed).
+        asset_store: Anything exposing ``get_by_id(asset_id) -> dict | None``
+            and optionally ``get_many(ids) -> list[dict]`` (preferred —
+            single round-trip).
+        origin: Absolute base URL for curlable links, or "" for relative.
+    """
+    ids: list[str] = []
+    seen: set[str] = set()
+    for ref in refs or []:
+        if not isinstance(ref, dict):
+            continue
+        aid = ref.get("asset_id")
+        if aid and aid not in seen:
+            seen.add(aid)
+            ids.append(aid)
+    if not ids:
+        return ""
+
+    rows: dict[str, dict[str, Any]] = {}
+    getter_many = getattr(asset_store, "get_many", None)
+    if callable(getter_many):
+        try:
+            for r in getter_many(ids) or []:
+                if r and r.get("id"):
+                    rows[r["id"]] = r
+        except Exception as e:
+            logger.warning("build_agent_image_manifest: get_many failed: %s", e)
+    if not rows:
+        for aid in ids:
+            try:
+                r = asset_store.get_by_id(aid)
+            except Exception as e:
+                logger.warning(
+                    "build_agent_image_manifest: get_by_id(%s) failed: %s", aid, e
+                )
+                r = None
+            if r:
+                rows[aid] = r
+
+    lines: list[str] = []
+    n = 0
+    for aid in ids:
+        row = rows.get(aid)
+        if not row:
+            continue
+        n += 1
+        att = asset_row_to_attachment_dict(row)
+        urls = att["urls"]
+        meta_bits = [
+            f"asset_id={att['asset_id']}",
+            f"type={att.get('mime_type') or 'image'}",
+        ]
+        if att.get("width") and att.get("height"):
+            meta_bits.append(f"{att['width']}x{att['height']}")
+        size = _fmt_size(row.get("size_bytes"))
+        if size:
+            meta_bits.append(size)
+        lines.append(f"{n}. " + "  ".join(meta_bits))
+        lines.append(f"   original: {_abs_url(urls['original'], origin)}")
+        lines.append(f"   preview:  {_abs_url(urls['preview'], origin)}")
+        lines.append(f"   thumb:    {_abs_url(urls['thumb'], origin)}")
+
+    if not lines:
+        return ""
+
+    header = (
+        f"[Attached Images] The user attached {n} image(s) to this message. "
+        "You can see them inline; your tools can fetch the same assets by "
+        "curling these URLs (HTTP GET, no auth on the internal network):"
+    )
+    return header + "\n" + "\n".join(lines)
+
+
 def enrich_attachments_for_messages(
     messages: Iterable[dict[str, Any]],
     asset_store,
