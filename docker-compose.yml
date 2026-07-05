@@ -185,6 +185,7 @@ services:
       - CLAUDE_CODE_SKILLS_PATH=/home/bridge/dev/agent-skills
       - CLAUDE_CODE_BAWTHUB_MCP_URL=http://app:8001/mcp
       - CLAUDE_CODE_PLAYWRIGHT_MCP_URL=http://playwright-mcp:8931/mcp
+      - CLAUDE_CODE_CRAWL4AI_MCP_URL=http://crawl4ai:11235/mcp/sse
     extra_hosts:
       - "host.docker.internal:host-gateway"
       - "echo.lan.zenoran.com:${ECHO_LAN_HOST_IP:-10.0.0.101}"
@@ -240,6 +241,7 @@ services:
       - CODEX_LOCAL_PLUGINS_SRC=${CODEX_LOCAL_PLUGINS_SRC:-/home/bridge/dev/agent-skills/codex}
       - CODEX_DEV_ROOT=${CODEX_DEV_ROOT:-/home/bridge/dev}
       - CODEX_BAWTHUB_MCP_URL=${CODEX_BAWTHUB_MCP_URL:-http://app:8001/mcp}
+      - CODEX_CRAWL4AI_MCP_URL=${CODEX_CRAWL4AI_MCP_URL:-http://crawl4ai:11235/mcp/sse}
       # The openai-codex-sdk wheel ships without the codex Rust binary.
       # The host's @openai/codex npm package provides it, but its layout
       # (vendor/<triple>/bin/codex) differs from what the SDK expects

@@ -13,6 +13,7 @@ from pathlib import Path
 # token. Changing this string forces a re-stage on next start.
 _PLUGIN_CACHE_VERSION = "v1"
 _DEFAULT_BAWTHUB_MCP_URL = "http://app:8001/mcp"
+_DEFAULT_CRAWL4AI_MCP_URL = "http://crawl4ai:11235/mcp/sse"
 
 
 def _remove_path(path: Path) -> None:
@@ -183,11 +184,18 @@ def _upsert_mcp_server_config(
     name: str,
     url: str,
     logger: logging.Logger,
+    extra_lines: list[str] | None = None,
 ) -> None:
     """Ensure ``[mcp_servers.<name>]`` exists with the requested URL.
 
     Keep this as line-oriented surgery rather than TOML round-tripping so
     operator-authored Codex settings stay formatted exactly as written.
+
+    Args:
+        extra_lines: Additional TOML lines to include after the url line
+            (e.g. ``['headers = { Authorization = "Bearer tok" }']``).
+            Only written when the section is first created; existing
+            sections only have their ``url`` updated.
     """
     try:
         existing = config_path.read_text() if config_path.exists() else ""
@@ -202,7 +210,10 @@ def _upsert_mcp_server_config(
         new_text = existing
         if new_text and not new_text.endswith("\n"):
             new_text += "\n"
-        new_text += f"\n{header}\n{url_line}\n"
+        block = f"\n{header}\n{url_line}\n"
+        if extra_lines:
+            block += "\n".join(extra_lines) + "\n"
+        new_text += block
     else:
         lines = existing.splitlines()
         start = next(
@@ -262,6 +273,26 @@ def ensure_bawthub_mcp_config(
     )
 
 
+def ensure_crawl4ai_mcp_config(
+    *,
+    logger: logging.Logger,
+    codex_home: Path,
+) -> None:
+    """Register the Crawl4AI native MCP server in Codex config."""
+    url = os.getenv("CODEX_CRAWL4AI_MCP_URL", _DEFAULT_CRAWL4AI_MCP_URL)
+    token = os.getenv("CRAWL4AI_API_TOKEN", "")
+    extra: list[str] = []
+    if token:
+        extra.append(f'headers = {{ Authorization = "Bearer {token}" }}')
+    _upsert_mcp_server_config(
+        config_path=codex_home / "config.toml",
+        name="crawl4ai",
+        url=url,
+        logger=logger,
+        extra_lines=extra or None,
+    )
+
+
 def install_repo_local_plugins(
     *,
     logger: logging.Logger,
@@ -300,6 +331,7 @@ def install_repo_local_plugins(
             "Skipping local Codex plugin install: CODEX_LOCAL_PLUGINS_ENABLED=false"
         )
         ensure_bawthub_mcp_config(logger=logger, codex_home=codex_home)
+        ensure_crawl4ai_mcp_config(logger=logger, codex_home=codex_home)
         return
 
     home = home or Path.home()
@@ -316,6 +348,7 @@ def install_repo_local_plugins(
             source_root,
         )
         ensure_bawthub_mcp_config(logger=logger, codex_home=codex_home)
+        ensure_crawl4ai_mcp_config(logger=logger, codex_home=codex_home)
         return
 
     marketplace_data = _read_json(source_marketplace, logger=logger) or {}
@@ -326,6 +359,7 @@ def install_repo_local_plugins(
             source_marketplace,
         )
         ensure_bawthub_mcp_config(logger=logger, codex_home=codex_home)
+        ensure_crawl4ai_mcp_config(logger=logger, codex_home=codex_home)
         return
 
     # Home-local layout: a marketplace.json symlink + per-plugin scaffold
@@ -404,6 +438,7 @@ def install_repo_local_plugins(
             source_plugins_dir,
         )
         ensure_bawthub_mcp_config(logger=logger, codex_home=codex_home)
+        ensure_crawl4ai_mcp_config(logger=logger, codex_home=codex_home)
         return
 
     _ensure_config_toml_entries(
@@ -423,3 +458,4 @@ def install_repo_local_plugins(
     )
 
     ensure_bawthub_mcp_config(logger=logger, codex_home=codex_home)
+    ensure_crawl4ai_mcp_config(logger=logger, codex_home=codex_home)

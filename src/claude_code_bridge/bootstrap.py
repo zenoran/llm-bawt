@@ -16,6 +16,7 @@ logger = logging.getLogger(__name__)
 _DEFAULT_SKILLS_PATH = "/home/bridge/dev/agent-skills"
 _DEFAULT_BAWTHUB_MCP_URL = "http://app:8001/mcp"
 _DEFAULT_PLAYWRIGHT_MCP_URL = "http://playwright-mcp:8931/mcp"
+_DEFAULT_CRAWL4AI_MCP_URL = "http://crawl4ai:11235/mcp/sse"
 
 
 def _write_json_if_changed(path: Path, payload: dict) -> bool:
@@ -69,6 +70,10 @@ def _normalize_mcp_settings(settings: dict) -> dict:
     playwright_url = (
         os.getenv("CLAUDE_CODE_PLAYWRIGHT_MCP_URL") or _DEFAULT_PLAYWRIGHT_MCP_URL
     )
+    crawl4ai_url = (
+        os.getenv("CLAUDE_CODE_CRAWL4AI_MCP_URL") or _DEFAULT_CRAWL4AI_MCP_URL
+    )
+    crawl4ai_token = os.getenv("CRAWL4AI_API_TOKEN", "")
 
     # "http" is the only URL-based type the Agent SDK/CLI accepts here —
     # "url" is silently dropped (server never registers).
@@ -83,6 +88,17 @@ def _normalize_mcp_settings(settings: dict) -> dict:
             "url": playwright_url,
         },
     )
+
+    # Crawl4AI exposes its native MCP server over SSE transport.
+    crawl4ai_config: dict = {
+        "type": "sse",
+        "url": crawl4ai_url,
+    }
+    if crawl4ai_token:
+        crawl4ai_config["headers"] = {
+            "Authorization": f"Bearer {crawl4ai_token}",
+        }
+    mcp_servers["crawl4ai"] = crawl4ai_config
 
     normalized = dict(settings)
     normalized["mcpServers"] = mcp_servers
