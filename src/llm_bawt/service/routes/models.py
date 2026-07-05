@@ -386,6 +386,7 @@ def list_bots():
             default_model=bot.default_model,
             color=bot.color,
             avatar=bot.avatar,
+            avatar_render=getattr(bot, "avatar_render", None),
             bot_type=bot.bot_type,
             agent_backend=bot.agent_backend,
             agent_backend_config=bot.agent_backend_config or {},

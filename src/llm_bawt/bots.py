@@ -34,6 +34,7 @@ class Bot:
     uses_home_assistant: bool = False  # Whether this bot can control Home Assistant via MCP
     color: str | None = None  # Optional Rich color name for CLI panel styling
     avatar: str | None = None  # Optional emoji or image URL for bot avatar
+    avatar_render: str | None = None  # Self-hosted data: URL render of avatar (no CDN at runtime)
     nextcloud: dict | None = None  # Nextcloud integration config (bot_id, secret, etc.)
     bot_type: str = "chat"  # High-level bot type (chat or agent)
     agent_backend: str | None = None  # External agent backend slug (e.g. "openclaw")
@@ -186,6 +187,8 @@ def _load_db_bot_profiles() -> dict[str, dict[str, Any]]:
                 entry["color"] = row.color
             if row.avatar is not None:
                 entry["avatar"] = row.avatar
+            if getattr(row, "avatar_render", None):
+                entry["avatar_render"] = row.avatar_render
             if row.default_voice is not None:
                 entry["default_voice"] = row.default_voice
             if row.nextcloud_config is not None:
@@ -248,6 +251,7 @@ def _load_bots_config() -> None:
             uses_home_assistant=data.get("uses_home_assistant", False),
             color=data.get("color"),
             avatar=data.get("avatar"),
+            avatar_render=data.get("avatar_render"),
             nextcloud=data.get("nextcloud"),
             bot_type=resolved_bot_type,
             agent_backend=data.get("agent_backend"),

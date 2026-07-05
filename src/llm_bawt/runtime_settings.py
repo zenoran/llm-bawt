@@ -70,6 +70,12 @@ class BotProfile(SQLModel, table=True):
     default_model: str | None = Field(default=None, sa_column=Column(String(255), nullable=True))
     color: str | None = Field(default=None, sa_column=Column(String(64), nullable=True))
     avatar: str | None = Field(default=None, sa_column=Column(String(512), nullable=True))
+    # Self-hosted, ready-to-embed render of ``avatar`` as a ``data:`` URL
+    # (Twemoji SVG for emoji, normalized small WebP for images). Resolved
+    # ONCE at write time so the chat UI never fetches an avatar from an
+    # external CDN at runtime. NULL => frontend renders the native emoji
+    # glyph (still zero external hosts).
+    avatar_render: str | None = Field(default=None, sa_column=Column(Text, nullable=True))
     default_voice: str | None = Field(default=None, sa_column=Column(String(128), nullable=True))
     nextcloud_config: dict[str, Any] | None = Field(default=None, sa_column=Column(JSONB, nullable=True))
     bot_type: str | None = Field(default=None, sa_column=Column(String(32), nullable=True))
@@ -127,6 +133,7 @@ class BotProfileStore:
             "ALTER TABLE bot_profiles ADD COLUMN IF NOT EXISTS include_in_global_search BOOLEAN DEFAULT TRUE",
             "ALTER TABLE bot_profiles ADD COLUMN IF NOT EXISTS default_voice VARCHAR(128)",
             "ALTER TABLE bot_profiles ADD COLUMN IF NOT EXISTS avatar VARCHAR(512)",
+            "ALTER TABLE bot_profiles ADD COLUMN IF NOT EXISTS avatar_render TEXT",
         ]
         try:
             with self.engine.connect() as conn:
@@ -189,6 +196,7 @@ class BotProfileStore:
                     default_model=payload.get("default_model"),
                     color=payload.get("color"),
                     avatar=payload.get("avatar"),
+                    avatar_render=payload.get("avatar_render"),
                     default_voice=payload.get("default_voice"),
                     nextcloud_config=payload.get("nextcloud_config"),
                     bot_type=normalize_bot_type(payload.get("bot_type"), payload_agent_backend),
@@ -215,6 +223,8 @@ class BotProfileStore:
                     row.color = payload["color"]
                 if "avatar" in payload:
                     row.avatar = payload.get("avatar")
+                if "avatar_render" in payload:
+                    row.avatar_render = payload.get("avatar_render")
                 if payload.get("default_voice") is not None:
                     row.default_voice = payload["default_voice"]
                 if payload.get("nextcloud_config") is not None:

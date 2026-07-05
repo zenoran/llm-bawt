@@ -90,6 +90,7 @@ def _to_profile_response(profile, settings: dict[str, object] | None = None) -> 
         default_model=profile.default_model,
         color=profile.color,
         avatar=profile.avatar,
+        avatar_render=getattr(profile, "avatar_render", None),
         default_voice=profile.default_voice,
         nextcloud_config=profile.nextcloud_config,
         bot_type=normalize_bot_type(getattr(profile, "bot_type", None), profile.agent_backend),
@@ -412,6 +413,28 @@ async def _persist_bot_profile(
         raise HTTPException(status_code=409, detail=f"Bot '{slug}' already exists")
 
     _validate_profile_payload(payload)
+
+    # Resolve the avatar to a self-hosted ``data:`` URL at write time so the
+    # chat UI never fetches an avatar from a CDN at runtime. Only recompute
+    # when the avatar actually changed (or was never rendered) — avoids a
+    # redundant network fetch on every unrelated profile edit.
+    if "avatar" in payload:
+        import asyncio
+
+        from ...media.avatar import resolve_avatar_render
+
+        new_avatar = payload.get("avatar")
+        existing = store.get(slug)
+        needs_render = (
+            existing is None
+            or existing.avatar != new_avatar
+            or not getattr(existing, "avatar_render", None)
+        )
+        if needs_render:
+            payload["avatar_render"] = await asyncio.to_thread(
+                resolve_avatar_render,
+                new_avatar if isinstance(new_avatar, str) else None,
+            )
 
     try:
         profile = store.upsert(payload)

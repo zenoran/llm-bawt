@@ -248,6 +248,7 @@ class BotInfo(BaseModel):
     default_model: str | None = None
     color: str | None = None
     avatar: str | None = None
+    avatar_render: str | None = None
     bot_type: BotKind = "chat"
     agent_backend: str | None = None
     agent_backend_config: dict[str, Any] = Field(default_factory=dict)
@@ -278,6 +279,9 @@ class BotProfileResponse(BaseModel):
     default_model: str | None = None
     color: str | None = None
     avatar: str | None = None
+    # Server-derived, self-hosted render of ``avatar`` as a data: URL
+    # (Twemoji SVG for emoji, small WebP for images). Read-only for clients.
+    avatar_render: str | None = None
     default_voice: str | None = None
     nextcloud_config: dict[str, Any] | None = None
     bot_type: BotKind = "chat"
