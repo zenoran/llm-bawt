@@ -161,7 +161,10 @@ def _format_tool_preview(primary_key: str | None, primary_value: str | None) -> 
 
     value = " ".join(primary_value.split())
     if value.startswith("/home/"):
-        value = value.replace("/home/nick/", "~/", 1)
+        # Shorten any "/home/<user>/" prefix to "~/" for a tidy preview.
+        parts = value.split("/", 3)
+        if len(parts) == 4:  # ["", "home", "<user>", "<rest>"]
+            value = "~/" + parts[3]
 
     if primary_key in {"file_path", "path"}:
         return _truncate_middle(value, 88)

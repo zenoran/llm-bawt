@@ -9,8 +9,8 @@ from dataclasses import dataclass, field
 @dataclass
 class BridgeConfig:
     # OpenClaw Gateway
-    gateway_url: str = ""  # HTTP base URL (e.g. http://10.0.0.97:18789)
-    ws_url: str = ""       # WS URL (e.g. ws://10.0.0.97:18789/v1/ws)
+    gateway_url: str = ""  # HTTP base URL (e.g. http://gateway-host:18789)
+    ws_url: str = ""       # WS URL (e.g. ws://gateway-host:18789/v1/ws)
     ws_token: str = ""     # Bearer token for both HTTP and WS auth
     reconnect_max_delay: int = 60
 

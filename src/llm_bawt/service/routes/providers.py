@@ -71,7 +71,7 @@ async def connect_start(provider_id: str):
         raise HTTPException(status_code=503, detail=str(e))
     except Exception as e:  # noqa: BLE001
         logger.warning("device flow start failed for %s: %s", provider_id, e)
-        raise HTTPException(status_code=502, detail=f"provider error: {e}")
+        raise HTTPException(status_code=502, detail="provider error")
     return {
         "user_code": start.user_code,
         "verification_uri": start.verification_uri,
@@ -92,7 +92,7 @@ async def connect_poll(provider_id: str, body: PollRequest):
         raise HTTPException(status_code=503, detail=str(e))
     except Exception as e:  # noqa: BLE001
         logger.warning("device flow poll failed for %s: %s", provider_id, e)
-        raise HTTPException(status_code=502, detail=f"provider error: {e}")
+        raise HTTPException(status_code=502, detail="provider error")
     out = {"status": result.status, "detail": result.detail}
     if result.record is not None:
         out["connection"] = result.record.public()
@@ -114,7 +114,7 @@ async def cli_login_start(provider_id: str):
         start = await run_in_threadpool(adapter.start_cli_login)
     except Exception as e:  # noqa: BLE001
         logger.warning("cli login start failed for %s: %s", provider_id, e)
-        raise HTTPException(status_code=502, detail=f"login error: {e}")
+        raise HTTPException(status_code=502, detail="login error")
     return {
         "session_id": start.session_id,
         "verification_uri": start.verification_uri,
@@ -176,8 +176,9 @@ async def github_git_credential(request: Request):
     """Internal: mint a fresh installation token in git-credential format.
 
     The tenant bridge configures ``credential.helper`` to curl this endpoint.
-    App :8642 is not published in the prod tenant (only frontend :3000 is), so
-    this is reachable only on the internal docker network. If
+    Reachable only within the deployment's internal network: the app talks to
+    other services by compose service name, and only the frontend (:3000) is
+    forwarded to the LAN — the app port is not routed to the internet. If
     ``BRIDGE_GIT_CREDENTIAL_TOKEN`` is set, we additionally require it via the
     ``X-Bridge-Token`` header for defense in depth.
     """
@@ -195,7 +196,7 @@ async def github_git_credential(request: Request):
         raise HTTPException(status_code=503, detail=str(e))
     except Exception as e:  # noqa: BLE001
         logger.warning("git-credential mint failed: %s", e)
-        raise HTTPException(status_code=502, detail=str(e))
+        raise HTTPException(status_code=502, detail="git-credential mint failed")
 
     # git credential helper protocol: key=value lines on stdout.
     body = f"username=x-access-token\npassword={token}\n"

@@ -247,7 +247,7 @@ class Config(RuntimeTunables, BaseSettings):
     )
     OPENCLAW_WS_URL: str = Field(
         default="",
-        description="OpenClaw gateway WebSocket URL (e.g. ws://10.0.0.97:18789/v1/ws). Empty = bridge disabled.",
+        description="OpenClaw gateway WebSocket URL (e.g. ws://gateway-host:18789/v1/ws). Empty = bridge disabled.",
     )
     REDIS_URL: str = Field(
         default="",

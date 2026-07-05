@@ -7,11 +7,11 @@ interface.
 
 Configuration is read from env vars:
 
-    LLM_BAWT_SONARR_URL       e.g. http://10.0.2.18:8989
+    LLM_BAWT_SONARR_URL       e.g. http://sonarr-host:8989
     LLM_BAWT_SONARR_API_KEY
-    LLM_BAWT_RADARR_URL       e.g. http://10.0.2.17:7878
+    LLM_BAWT_RADARR_URL       e.g. http://radarr-host:7878
     LLM_BAWT_RADARR_API_KEY
-    LLM_BAWT_SABNZBD_URL      e.g. http://10.0.2.19:8080
+    LLM_BAWT_SABNZBD_URL      e.g. http://sabnzbd-host:8080
     LLM_BAWT_SABNZBD_API_KEY
 
 Each client is a lazy singleton; the first ``get_*_client()`` call
