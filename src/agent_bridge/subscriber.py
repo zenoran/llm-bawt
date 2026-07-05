@@ -538,6 +538,132 @@ class RedisSubscriber:
             logger.exception("Failed to publish tool event to %s", stream_key)
             return None
 
+    async def latest_activity(
+        self,
+        bot_id: str,
+        user_id: str,
+        *,
+        batch_size: int = 500,
+        hard_cap: int = UNIFIED_STREAM_MAXLEN,
+    ) -> dict | None:
+        """Reconstruct the latest turn snapshot for a bot from the unified event
+        stream — read-only and REALTIME (reflects an in-flight turn as it
+        streams, unlike the turn-log DB which only lands at turn end).
+
+        Returns the last user prompt, the streamed assistant text (full text +
+        the current/last "bubble" — the segment since the most recent tool
+        boundary), the turn id, and whether the turn is still streaming. Returns
+        None if the stream has no turn we can anchor on.
+
+        AGENT BOTS ONLY: chat bots don't emit ``text_delta`` into the stream, so
+        their assistant text can't be reconstructed here — callers must not use
+        this for chat bots.
+
+        Pagination walks the stream newest→oldest in batches until it finds the
+        anchoring ``turn_start`` or hits ``hard_cap`` (the stream's own maxlen),
+        so a very long turn can't silently fall out of a fixed window.
+        """
+        stream_key = f"{UNIFIED_EVENTS_PREFIX}{bot_id}:{user_id}"
+        events: list[dict] = []
+        max_id = "+"
+        scanned = 0
+        found_start = False
+        try:
+            while scanned < hard_cap and not found_start:
+                batch = await self._pub_redis.xrevrange(
+                    stream_key, max_id, "-", count=batch_size
+                )
+                if not batch:
+                    break
+                for _id, fields in batch:
+                    payload = fields.get("payload")
+                    if not payload:
+                        continue
+                    try:
+                        ev = json.loads(payload)
+                    except Exception:
+                        continue
+                    events.append(ev)
+                    if ev.get("_type") == "turn_start":
+                        found_start = True
+                scanned += len(batch)
+                # Exclusive range for the next page (Redis 6.2+ "(" prefix).
+                max_id = f"({batch[-1][0]}"
+        except Exception:
+            logger.exception("latest_activity read failed for %s", stream_key)
+            return None
+
+        if not events:
+            return None
+
+        # events are newest-first. The most recent turn_start anchors "the last
+        # turn"; everything sharing its turn_id belongs to it.
+        turn_start = next(
+            (e for e in events if e.get("_type") == "turn_start"), None
+        )
+        if turn_start is None:
+            return None
+        turn_id = turn_start.get("turn_id")
+
+        completed = any(
+            e.get("_type") == "turn_complete" and e.get("turn_id") == turn_id
+            for e in events
+        )
+
+        # Reconstruct assistant text: splice each text_delta at its text_offset
+        # (the char count before that delta). Robust to gaps/overwrites.
+        deltas = [
+            e
+            for e in events
+            if e.get("_type") == "text_delta" and e.get("turn_id") == turn_id
+        ]
+        text = ""
+        for e in sorted(deltas, key=lambda d: d.get("text_offset") or 0):
+            off = e.get("text_offset")
+            chunk = e.get("delta", "")
+            if not isinstance(off, int):
+                text += chunk
+                continue
+            if off > len(text):
+                text += " " * (off - len(text))
+            text = text[:off] + chunk + text[off + len(chunk):]
+        full_text = text.rstrip()
+
+        # Each tool_start cuts the assistant text into a new bubble. Split on
+        # those offsets and take the last NON-EMPTY segment: while a tool is
+        # running the trailing segment is empty (no text emitted yet), and for
+        # agents that's most of the time — so "text after the final boundary"
+        # would usually be blank. The last non-empty segment is the most recent
+        # thing the bot actually said.
+        boundaries = sorted(
+            {
+                e.get("text_offset")
+                for e in events
+                if e.get("_type") == "tool_event"
+                and e.get("event") == "tool_start"
+                and e.get("turn_id") == turn_id
+                and isinstance(e.get("text_offset"), int)
+            }
+        )
+        cuts = [0, *boundaries, len(full_text)]
+        segments = [
+            full_text[cuts[i]:cuts[i + 1]].strip() for i in range(len(cuts) - 1)
+        ]
+        non_empty = [s for s in segments if s]
+        last_bubble = non_empty[-1] if non_empty else full_text.strip()
+
+        return {
+            "bot_id": bot_id,
+            "user_id": user_id,
+            "turn_id": turn_id,
+            "streaming": not completed,
+            "last_user_prompt": turn_start.get("content"),
+            "assistant_message_id": turn_start.get("assistant_message_id"),
+            "last_bubble": last_bubble,
+            "full_text": full_text,
+            "updated_at": events[0].get("ts"),
+        }
+
     async def cleanup_stale_groups(
         self,
         stream_key: str,

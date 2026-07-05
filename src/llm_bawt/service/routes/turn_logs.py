@@ -423,6 +423,35 @@ def bot_in_turn(
     }
 
 
+@router.get("/v1/bots/{bot_id}/latest", tags=["Bots"])
+async def bot_latest_activity(
+    bot_id: str,
+    user_id: str = Query(
+        ..., description="User scope — the event stream is per (bot, user)."
+    ),
+):
+    """Latest realtime activity for an AGENT bot, reconstructed from the Redis
+    event stream.
+
+    Returns the last user prompt and the streamed assistant text (``full_text``
+    plus ``last_bubble`` — the segment since the most recent tool boundary),
+    with ``streaming`` telling you whether the turn is still in flight. This
+    reflects an in-flight turn AS IT STREAMS — unlike ``/v1/bots/{id}/in-turn``
+    (turn-log DB, lands at turn end). Agent bots only: chat bots don't emit
+    ``text_delta``, so their assistant text can't be reconstructed here.
+    """
+    service = get_service()
+    subscriber = getattr(service, "_redis_subscriber", None)
+    if subscriber is None:
+        raise HTTPException(
+            status_code=503, detail="Redis event stream unavailable"
+        )
+    snap = await subscriber.latest_activity(bot_id, user_id)
+    if snap is None:
+        return {"bot_id": bot_id, "user_id": user_id, "active": False}
+    return {"active": True, **snap}
+
+
 @router.get("/v1/turn-logs/{turn_id}", response_model=TurnLogDetail, tags=["Debug"])
 def get_turn_log(turn_id: str):
     """Get one persisted turn log by ID."""
