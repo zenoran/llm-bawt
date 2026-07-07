@@ -787,14 +787,20 @@ class ChatStreamingMixin:
                     )
                     continue
                 try:
-                    # Off-load to a thread: read_original_as_data_url is a
+                    # Off-load to a thread: read_preview_as_data_url is a
                     # SYNCHRONOUS object-store fetch (Garage/S3) + base64
                     # encode.  Calling it inline blocked the event loop for the
                     # whole download — stalling every other in-flight turn and
                     # padding this turn's time-to-first-byte enough to trip the
                     # reverse proxy (the image-paste 502).
+                    #
+                    # Inline the 1024px PREVIEW (not the 1568px original): ~55%
+                    # fewer pixels at Q82 cuts the per-image vision-token bill
+                    # with only a modest fidelity loss. The full-res original
+                    # stays available via the asset_id for anything that needs
+                    # it (lightbox, download).
                     data_url = await asyncio.to_thread(
-                        media_store.read_original_as_data_url, asset_id
+                        media_store.read_preview_as_data_url, asset_id
                     )
                 except MediaAssetNotFound:
                     log.warning(
@@ -803,14 +809,29 @@ class ChatStreamingMixin:
                     )
                     continue
                 except FileNotFoundError as e:
-                    log.error(
-                        "TASK-225: MediaStore blob missing for asset_id=%s: %s",
+                    # Preview blob missing (older asset predating preview
+                    # generation, or a failed derive) — fall back to the
+                    # full-res original so we degrade to "bigger image"
+                    # rather than silently dropping the attachment.
+                    log.warning(
+                        "TASK-225: preview blob missing for asset_id=%s, "
+                        "falling back to original: %s",
                         asset_id, e,
                     )
-                    continue
+                    try:
+                        data_url = await asyncio.to_thread(
+                            media_store.read_original_as_data_url, asset_id
+                        )
+                    except Exception as e2:
+                        log.error(
+                            "TASK-225: original fallback also failed for "
+                            "asset_id=%s: %s",
+                            asset_id, e2,
+                        )
+                        continue
                 except Exception as e:
                     log.warning(
-                        "TASK-225: MediaStore.read_original failed for asset_id=%s: %s",
+                        "TASK-225: MediaStore.read_preview failed for asset_id=%s: %s",
                         asset_id, e,
                     )
                     continue

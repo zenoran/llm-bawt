@@ -484,9 +484,21 @@ class MediaStore:
 
         Convenience for the LLM inlining path (TASK-225). Always returns
         the cap-bounded original — callers that want the smaller preview
-        should base64 it themselves.
+        should use :meth:`read_preview_as_data_url`.
         """
         data, mime = self.read_variant(asset_id, "original")
+        b64 = base64.b64encode(data).decode("ascii")
+        return f"data:{mime};base64,{b64}"
+
+    def read_preview_as_data_url(self, asset_id: str) -> str:
+        """Return the 1024px preview variant as a ``data:image/webp;base64,...`` URL.
+
+        Preferred for LLM vision inlining: ~55% fewer pixels than the 1568px
+        original (1024² vs 1568²) at Q82, cutting the per-image token bill with
+        only a modest quality loss. Callers that need maximum fidelity (e.g.
+        reading dense fine print) should use :meth:`read_original_as_data_url`.
+        """
+        data, mime = self.read_variant(asset_id, "preview")
         b64 = base64.b64encode(data).decode("ascii")
         return f"data:{mime};base64,{b64}"
 
