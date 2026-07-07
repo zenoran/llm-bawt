@@ -778,7 +778,32 @@ def fetch_grok_api_models(api_key: str) -> Tuple[bool, List[Dict[str, Any]]]:
 
 
 def fetch_codex_models() -> Tuple[bool, List[Dict[str, Any]]]:
-    """Return the curated Codex model catalog used for agent backends."""
+    """Return the live Codex model catalog for the authenticated ChatGPT plan.
+
+    Source of truth is the codex-bridge ``/models`` endpoint, which calls the
+    Codex SDK ``codex.models()`` inside the container that owns the OAuth bundle.
+    The app never imports the Codex SDK — it just does an HTTP GET. The old
+    static ``CODEX_MODEL_CATALOG`` is demoted to two roles only:
+
+    * a human-readable ``summary`` lookup by id (the API returns none), and
+    * a last-resort fallback if the bridge is unreachable / auth fails.
+    """
+    summaries = {m["id"]: m.get("summary", "") for m in CODEX_MODEL_CATALOG}
+    url = os.getenv(
+        "CODEX_BRIDGE_MODELS_URL", "http://codex-bridge:8682/models"
+    )
+    try:
+        import httpx
+
+        resp = httpx.get(url, timeout=10.0)
+        resp.raise_for_status()
+        ids = [m["id"] for m in resp.json().get("models", [])]
+        models = [{"id": i, "summary": summaries.get(i, "")} for i in ids]
+        if models:
+            return True, models
+        console.print("[yellow]codex-bridge /models returned empty; using fallback catalog[/yellow]")
+    except Exception as e:  # bridge down, auth expiry, network
+        console.print(f"[yellow]codex-bridge /models fetch failed ({e}); using fallback catalog[/yellow]")
     return True, [dict(item) for item in CODEX_MODEL_CATALOG]
 
 

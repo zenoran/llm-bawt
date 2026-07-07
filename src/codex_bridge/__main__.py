@@ -10,7 +10,7 @@ Environment:
     CODEX_HOME                      — exported as CODEX_HOME for the SDK (default /home/bridge/.codex)
     CODEX_MODEL                     — default model when chat.send omits it
     CODEX_BACKEND_NAME              — backend filter on commands stream (default 'codex')
-    CODEX_BRIDGE_HEALTH_PORT        — TCP port for /health (default 8682)
+    CODEX_BRIDGE_HEALTH_PORT        — HTTP port for /health + /models (default 8682)
     CODEX_BRIDGE_LOG_LEVEL          — log level (default INFO)
     CODEX_BRIDGE_REQUEST_TIMEOUT    — per-call SDK timeout, seconds (default 300)
     CODEX_BRIDGE_CWD                — codex thread cwd (default /home/bridge/dev)
@@ -24,6 +24,7 @@ Environment:
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
 import signal
@@ -39,30 +40,72 @@ from .parser_patch import install as install_parser_patch
 from .transport import auth_path, scrub_api_key_env, validate_auth_json
 
 
-async def _health_server(publisher: RedisPublisher, port: int) -> None:
-    """Minimal TCP health check.
+async def _fetch_codex_models() -> list[str]:
+    """Return live Codex model ids for the authenticated ChatGPT plan.
 
-    Returns 200 when Redis is connected, 503 otherwise. Mirrors the shape of
-    claude_code_bridge's health server so docker compose healthchecks across
-    bridges look identical.
+    Source of truth is the Codex SDK ``codex.models()`` call (new
+    ``openai_codex`` package), which reflects the models the logged-in
+    subscription can actually use. Runs here — not in the app — because this
+    container already owns the Codex OAuth bundle. The app reaches it via the
+    ``/models`` health-server route so the UI backend never needs the SDK.
     """
+    from openai_codex import AsyncCodex, CodexConfig
+
+    async with AsyncCodex(config=CodexConfig()) as codex:
+        resp = await codex.models()
+    return [m.id for m in resp.data]
+
+
+def _http_response(status: str, body: str) -> bytes:
+    return (
+        f"HTTP/1.1 {status}\r\n"
+        f"Content-Type: application/json\r\n"
+        f"Content-Length: {len(body)}\r\n"
+        f"\r\n"
+        f"{body}"
+    ).encode()
+
+
+async def _health_server(publisher: RedisPublisher, port: int) -> None:
+    """Minimal HTTP server for docker healthchecks + model discovery.
+
+    Routes:
+      * ``/health``  — 200 when Redis is connected, 503 otherwise. Mirrors the
+        shape of claude_code_bridge's health server so compose healthchecks
+        across bridges look identical.
+      * ``/models``  — live Codex model catalog as ``{"models": [{"id": ...}]}``,
+        503 on SDK/auth failure. Lets the app discover models without importing
+        the Codex SDK itself.
+    """
+
+    logger = logging.getLogger("codex_bridge.health")
 
     async def handle(
         reader: asyncio.StreamReader, writer: asyncio.StreamWriter
     ) -> None:
         try:
-            await reader.readline()
-            redis_ok = publisher.connected
-            status = "200 OK" if redis_ok else "503 Service Unavailable"
-            body = f'{{"redis": {str(redis_ok).lower()}}}'
-            resp = (
-                f"HTTP/1.1 {status}\r\n"
-                f"Content-Type: application/json\r\n"
-                f"Content-Length: {len(body)}\r\n"
-                f"\r\n"
-                f"{body}"
-            )
-            writer.write(resp.encode())
+            request_line = await reader.readline()
+            try:
+                path = request_line.decode("latin1").split(" ", 2)[1]
+            except (IndexError, UnicodeDecodeError):
+                path = "/"
+            path = path.split("?", 1)[0]
+
+            if path.startswith("/models"):
+                try:
+                    ids = await _fetch_codex_models()
+                    body = json.dumps({"models": [{"id": i} for i in ids]})
+                    status = "200 OK"
+                except Exception as e:  # auth expiry, offline, SDK drift
+                    logger.warning("Codex /models fetch failed: %s", e)
+                    body = json.dumps({"error": str(e)})
+                    status = "503 Service Unavailable"
+            else:
+                redis_ok = publisher.connected
+                status = "200 OK" if redis_ok else "503 Service Unavailable"
+                body = f'{{"redis": {str(redis_ok).lower()}}}'
+
+            writer.write(_http_response(status, body))
             await writer.drain()
         except Exception:
             pass
@@ -70,8 +113,7 @@ async def _health_server(publisher: RedisPublisher, port: int) -> None:
             writer.close()
 
     server = await asyncio.start_server(handle, "0.0.0.0", port)
-    logger = logging.getLogger("codex_bridge.health")
-    logger.info("Health check listening on :%d", port)
+    logger.info("Health/models server listening on :%d", port)
     async with server:
         await server.serve_forever()
 

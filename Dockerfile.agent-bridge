@@ -100,6 +100,13 @@ RUN uv venv && uv pip install \
     "uvicorn>=0.27.0" \
     "pydantic>=2.0"
 
+# Live Codex model discovery (codex.models()) for the /models health-server route.
+# Separate layer + --prerelease=allow because openai-codex (beta) pulls the
+# prerelease openai-codex-cli-bin; kept out of the main install so it can't drag
+# the stable set toward prereleases. Import name openai_codex — coexists with the
+# openai-codex-sdk runtime above (import openai_codex_sdk).
+RUN uv pip install --prerelease=allow "openai-codex>=0.1.0b3"
+
 # Install project in editable mode so both bridge packages are importable
 RUN uv pip install -e . --no-deps
 
