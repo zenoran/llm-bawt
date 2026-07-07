@@ -227,6 +227,38 @@ async def _poll_video_job(gen_id: str) -> None:
         _poll_tasks.pop(gen_id, None)
 
 
+async def _download_image_job(gen_id: str, image_url: str) -> None:
+    """Download a synchronously-generated image and store it.
+
+    xAI image generation returns a finished (temporary) URL inline, so there
+    is nothing to poll — we just fetch the bytes and persist them, then mark
+    the generation completed.
+    """
+    store = _get_store()
+    storage = _get_storage()
+    client = _get_grok_client()
+    try:
+        logger.info("Downloading image for %s from %s", gen_id, image_url[:80])
+        img_data = await client.download(image_url)
+
+        rel_path, _sha256 = await storage.write_async(img_data, "images", ".jpg")
+        store.update(gen_id, {
+            "status": "completed",
+            "progress": 100,
+            "file_path": rel_path,
+            "thumbnail_path": rel_path,  # images are their own thumbnail for now
+            "file_size_bytes": len(img_data),
+            "mime_type": "image/jpeg",
+            "completed_at": datetime.now(timezone.utc),
+        })
+        logger.info("Image generation %s completed: %s (%d bytes)", gen_id, rel_path, len(img_data))
+    except Exception as e:
+        logger.exception("Failed to download/store image for %s", gen_id)
+        store.update(gen_id, {"status": "failed", "error": str(e)})
+    finally:
+        _poll_tasks.pop(gen_id, None)
+
+
 # ------------------------------------------------------------------
 # Endpoints
 # ------------------------------------------------------------------
@@ -245,7 +277,7 @@ async def create_generation(request: MediaGenerationRequest):
         if request.media_type == "video":
             model = "grok-imagine-video"
         else:
-            model = "grok-imagine"
+            model = "grok-imagine-image"
 
     # Determine provider from model name
     provider = "xai"
@@ -286,8 +318,15 @@ async def create_generation(request: MediaGenerationRequest):
             "revised_prompt": result.revised_prompt,
         })
 
+        # Image generation is synchronous: xAI returns the finished URL inline.
+        # Download + store in the background so the create call stays fast; the
+        # client polls get_generation until the stored output appears.
+        if request.media_type == "image" and result.status == "completed" and result.media_url:
+            store.update(gen_id, {"status": "processing", "progress": 50})
+            task = asyncio.create_task(_download_image_job(gen_id, result.media_url))
+            _poll_tasks[gen_id] = task
         # Start background polling for async jobs (video)
-        if result.status in ("pending", "processing"):
+        elif result.status in ("pending", "processing"):
             task = asyncio.create_task(_poll_video_job(gen_id))
             _poll_tasks[gen_id] = task
 
