@@ -1306,6 +1306,33 @@ class ClaudeCodeBridge:
                                         tu_id = getattr(block, "id", None)
                                         if tu_id:
                                             tool_names_by_id[tu_id] = block.name
+                                        # QDIAG (TASK-413): record when the MODEL
+                                        # actually emits an AskUserQuestion tool_use
+                                        # block. Pair this with the "QDIAG can_use_tool
+                                        # ENTER" line below: block-seen WITHOUT a
+                                        # matching ENTER == the bridge/SDK dropped the
+                                        # question (control-channel wedge on a resumed
+                                        # turn); block NOT seen at all == the model
+                                        # narrated the question in prose without calling
+                                        # the tool. Split model-vs-pipeline for real.
+                                        if self._is_ask_user_question(block.name):
+                                            logger.info(
+                                                "QDIAG model-emitted AskUserQuestion "
+                                                "tool_use_id=%s session=%s parent=%s — "
+                                                "expect a matching 'QDIAG can_use_tool "
+                                                "ENTER' next",
+                                                tu_id, session_key, parent_tuid,
+                                            )
+                                        # TOOLMAP (TASK-414): the id the bridge stamps
+                                        # on TOOL_START. Must equal the TOOL_END
+                                        # tool_use_id for the same call; if the
+                                        # frontend can't heal a card, compare this
+                                        # id against the "TOOLMAP end" line and the
+                                        # frontend "TOOLMAP" orphan line.
+                                        logger.info(
+                                            "TOOLMAP start tool=%s tool_use_id=%s parent=%s session=%s",
+                                            block.name, tu_id, parent_tuid, session_key,
+                                        )
                                         self._publish_event(
                                             request_id, session_key, seq,
                                             kind=AgentEventKind.TOOL_START,
@@ -1363,6 +1390,23 @@ class ClaudeCodeBridge:
                                                 b.get("text", "") if isinstance(b, dict) else str(b)
                                                 for b in result_content
                                             )
+                                        # TOOLMAP (TASK-414): log the id the bridge
+                                        # stamps on TOOL_END. The frontend heals a
+                                        # running card by call_id; the bridge only
+                                        # emits tool_use_id here (no call_id — the SDK
+                                        # ToolResultBlock has none). If a start/end
+                                        # tool_use_id pair diverges, or the app fails
+                                        # to translate id→call_id, the card orphans on
+                                        # "running". Pair this with the frontend
+                                        # "TOOLMAP" console line and the TOOL_START log
+                                        # below (grep both for the same tool_use_id).
+                                        logger.info(
+                                            "TOOLMAP end tool_use_id=%s parent=%s session=%s is_error=%s",
+                                            block.tool_use_id,
+                                            parent_tuid,
+                                            session_key,
+                                            getattr(block, "is_error", None),
+                                        )
                                         self._publish_event(
                                             request_id, session_key, seq,
                                             kind=AgentEventKind.TOOL_END,
@@ -2263,6 +2307,16 @@ class ClaudeCodeBridge:
                 # EXACTLY ONE gate to avoid double-emitting APPROVAL_REQUIRED.
                 # So allow here; the hook is the sole policy enforcement point.
                 return PermissionResultAllow()
+
+            # QDIAG (TASK-413): the callback fired for an AskUserQuestion. If the
+            # model emitted the block (see "QDIAG model-emitted") but this line is
+            # ABSENT, the SDK/control-channel dropped the question before reaching
+            # us — a pipeline bug, not the model. Logged at ENTRY so it survives
+            # even the no-tool_use_id / exception paths below.
+            logger.info(
+                "QDIAG can_use_tool ENTER AskUserQuestion tool_use_id=%s session=%s",
+                (ctx.tool_use_id or "").strip() or "<none>", session_key,
+            )
 
             tool_use_id = (ctx.tool_use_id or "").strip()
             if not tool_use_id:
