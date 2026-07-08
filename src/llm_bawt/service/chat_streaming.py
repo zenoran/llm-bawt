@@ -1262,6 +1262,71 @@ class ChatStreamingMixin:
                     "ts": time.time(),
                 })
 
+        # TASK-370: tool_use_ids of AskUserQuestion awaits already persisted +
+        # surfaced by the streaming WORKER THREAD (_intercept_tool_events), which
+        # runs to completion regardless of client/SSE teardown. Before this, a
+        # deferred question was persisted INLINE in the async generator — which
+        # can be torn down on turn-end before it drains the await chunk on a LONG
+        # turn, silently dropping the question (turn ends end_reason="stop", no
+        # chat_pending_questions row, bot believes it asked and never retries).
+        # This is the exact durability fix approvals got in TASK-292/306.
+        # _await_handled guards the async-gen path from double-handling.
+        _await_handled: set[str] = set()
+
+        def _persist_publish_await(chunk: dict) -> None:
+            """Durably record + surface one deferred AskUserQuestion (worker thread).
+
+            Mirrors _persist_publish_approval: persists the pending question and
+            publishes the live unified ``tool_await_result`` event from a thread
+            that survives async-gen teardown, and sets ``question_id_holder`` so
+            the turn finalizes with end_reason="question" even if the async
+            generator never drains the chunk.
+            """
+            tool_use_id = chunk.get("tool_use_id") or ""
+            if not tool_use_id or tool_use_id in _await_handled:
+                return
+            _await_handled.add(tool_use_id)
+            tool_args = chunk.get("arguments") or {}
+            origin_harness = (chunk.get("provider") or "claude") or "claude"
+            # Set BEFORE the persist so the turn ends as a question regardless of
+            # a transient store failure (matches the prior inline semantics).
+            question_id_holder[0] = tool_use_id
+            try:
+                # A turn that re-asks supersedes its earlier pending question so
+                # only the latest stays answerable.
+                self._pending_question_store.supersede_awaiting_for_turn(
+                    turn_log_id, keep=tool_use_id,
+                )
+                self._pending_question_store.upsert_awaiting(
+                    tool_use_id=tool_use_id,
+                    bot_id=bot_id,
+                    user_id=user_id,
+                    turn_id=turn_log_id,
+                    arguments=tool_args if isinstance(tool_args, dict) else {"value": tool_args},
+                    tool_name=chunk.get("tool_name") or "AskUserQuestion",
+                    trigger_message_id=trigger_message_id,
+                    session_key=chunk.get("session_key") or None,
+                    origin_harness=origin_harness,
+                )
+            except Exception as _persist_err:
+                log.warning(
+                    "Failed to persist pending question tool_use_id=%s: %s",
+                    tool_use_id, _persist_err,
+                )
+            _publish_event_direct({
+                "_type": "tool_await_result",
+                "turn_id": turn_log_id,
+                "trigger_message_id": trigger_message_id,
+                "bot_id": bot_id,
+                "user_id": user_id,
+                "tool_use_id": tool_use_id,
+                "tool_name": chunk.get("tool_name", ""),
+                "arguments": tool_args,
+                "session_key": chunk.get("session_key", ""),
+                "provider": chunk.get("provider", ""),
+                "ts": time.time(),
+            })
+
         def _stream_to_queue():
             """Run streaming in a thread and push chunks to the async queue."""
             def _turn_was_aborted() -> bool:
@@ -1840,6 +1905,15 @@ class ChatStreamingMixin:
                                 # race). Falls through to `yield item`; the
                                 # async-gen branch dedups via _approval_handled.
                                 _persist_publish_approval(item)
+                            if evt == "await_tool_result":
+                                # TASK-370: persist + surface the deferred
+                                # AskUserQuestion from this worker thread so it
+                                # survives async-gen teardown on long turns (the
+                                # same fix approvals got in TASK-292/306). Falls
+                                # through to `yield item`; the async-gen branch is
+                                # now just the originating-client SSE sidecar and
+                                # dedups via _await_handled.
+                                _persist_publish_await(item)
                             if evt == "reasoning":
                                 # Model reasoning ("thinking"). Two destinations,
                                 # both dict-only so it NEVER enters
@@ -2556,45 +2630,24 @@ class ChatStreamingMixin:
                     continue
 
                 if isinstance(chunk, dict) and chunk.get("event") == "await_tool_result":
-                    # TASK-269 — deferred AskUserQuestion from the agent bridge.
-                    # The bridge has already returned a synthetic ack and the
-                    # turn will end cleanly right after this; the question is the
-                    # durable record the user answers later (via a continuation
-                    # turn).  Here we:
-                    #   1. Persist the question to chat_pending_questions (stays
-                    #      "awaiting" indefinitely — no abandon-on-turn-end now).
-                    #   2. Remember its id so turn completion marks the turn
-                    #      end_reason="question" + question_id.
-                    #   3. Emit the originating-stream sidecar chunk + the
-                    #      unified tool_await_result event so every tab renders
-                    #      the question inline.
+                    # TASK-269/370 — deferred AskUserQuestion from the agent
+                    # bridge. Durable persistence (chat_pending_questions),
+                    # question_id_holder, and the unified tool_await_result event
+                    # are now owned ENTIRELY by the streaming worker thread
+                    # (_persist_publish_await), which runs to completion
+                    # regardless of client/SSE teardown — the fix for a question
+                    # emitted at the tail of a LONG turn being dropped when this
+                    # async generator is torn down before draining the chunk
+                    # (TASK-370). By the time this branch runs the worker has
+                    # already persisted the row, set question_id_holder, and
+                    # published the cross-tab event. This branch is now a pure
+                    # sidecar: emit the originating client's OpenAI-compat SSE
+                    # chunk so the live (still-connected) tab renders the question
+                    # inline without waiting for a reload. (Mirrors the
+                    # approval_required async-gen branch, likewise a dedup skip
+                    # after _persist_publish_approval.)
                     tool_use_id = chunk.get("tool_use_id") or ""
                     tool_args = chunk.get("arguments") or {}
-                    origin_harness = (chunk.get("provider") or "claude") or "claude"
-                    if tool_use_id:
-                        question_id_holder[0] = tool_use_id
-                        try:
-                            # A turn that re-asks supersedes its earlier pending
-                            # question so only the latest stays answerable.
-                            self._pending_question_store.supersede_awaiting_for_turn(
-                                turn_log_id, keep=tool_use_id,
-                            )
-                            self._pending_question_store.upsert_awaiting(
-                                tool_use_id=tool_use_id,
-                                bot_id=bot_id,
-                                user_id=user_id,
-                                turn_id=turn_log_id,
-                                arguments=tool_args if isinstance(tool_args, dict) else {"value": tool_args},
-                                tool_name=chunk.get("tool_name") or "AskUserQuestion",
-                                trigger_message_id=trigger_message_id,
-                                session_key=chunk.get("session_key") or None,
-                                origin_harness=origin_harness,
-                            )
-                        except Exception as _persist_err:
-                            log.warning(
-                                "Failed to persist pending question tool_use_id=%s: %s",
-                                tool_use_id, _persist_err,
-                            )
                     await_payload = {
                         "object": "tool.await_result",
                         "tool_use_id": tool_use_id,
@@ -2607,19 +2660,6 @@ class ChatStreamingMixin:
                         "turn_id": turn_log_id,
                     }
                     yield (f"data: {json.dumps(await_payload)}\n\n")
-                    await _publish_unified({
-                        "_type": "tool_await_result",
-                        "turn_id": turn_log_id,
-                        "trigger_message_id": trigger_message_id,
-                        "bot_id": bot_id,
-                        "user_id": user_id,
-                        "tool_use_id": tool_use_id,
-                        "tool_name": chunk.get("tool_name", ""),
-                        "arguments": tool_args,
-                        "session_key": chunk.get("session_key", ""),
-                        "provider": chunk.get("provider", ""),
-                        "ts": time.time(),
-                    })
                     continue
 
                 if isinstance(chunk, dict) and chunk.get("event") == "approval_required":
