@@ -236,6 +236,47 @@ async def list_tasks(
         return {"error": str(e), "status": e.response.status_code}
 
 
+@mcp.tool(name="tasks_search_semantic")
+async def search_tasks_semantic(
+    query: str,
+    limit: int = 20,
+) -> dict:
+    """Find tasks by meaning, not just keywords (semantic / vector search).
+
+    Ranks tasks by how close their content is to your query using embeddings,
+    so "auth is broken" surfaces a task titled "login returns 500" even with no
+    shared words. Prefer this over ``tasks_list(q=...)`` when you're looking for
+    related work by concept; use ``tasks_list`` when you need exact status/project
+    filters or a literal substring match.
+
+    Searches across BOTH the task's title+description and its completed-work
+    response, returning whichever is the closer match. If the embedding service
+    is unavailable it transparently degrades to a keyword scan (``mode`` tells
+    you which ran).
+
+    Args:
+        query: Natural-language description of what you're looking for.
+        limit: Maximum tasks to return (default 20, max 100).
+
+    Returns:
+        Dict with:
+          - ``mode``: "semantic" (vector search) or "keyword" (fallback).
+          - ``results``: ranked list of compact task rows, each with id,
+            shortId, title, description, status, priority, projectId, and
+            ``score`` (cosine similarity in [0,1], higher = closer; 0 for
+            keyword-fallback rows).
+        Use tasks_get for full description, response, and steps.
+    """
+    logger.debug("MCP tool invoked: tools/search_tasks_semantic q=%s limit=%s", query, limit)
+    if not query or not query.strip():
+        return {"error": "query is required"}
+    body = {"query": query, "limit": min(limit, 100)}
+    try:
+        return await _api_post("/tasks/search/semantic", json=body)
+    except httpx.HTTPStatusError as e:
+        return {"error": str(e), "status": e.response.status_code}
+
+
 @mcp.tool(name="tasks_get")
 async def get_task(
     task_id: str,
