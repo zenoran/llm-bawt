@@ -5,8 +5,8 @@ bearer only authorizes ``/responses``. Plan-usage instead rides on every
 ``/responses`` call as ``x-codex-*`` response headers. The claude-code bridge's
 proxy harvests those headers on each codex turn and publishes a canonical
 snapshot to Redis (see
-``src/claude_code_bridge/proxy/usage_capture.py``). This adapter just reads
-that snapshot — it owns no credential and makes no upstream call.
+``src/claude_code_bridge/proxy/usage_capture.py``). This adapter normally reads
+that snapshot, and runs a tiny codex backend probe when the snapshot is stale.
 
 Mapping:
 - ``primary``   window → ``session_5h``  (the rolling 5-hour limit)
@@ -19,6 +19,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import time
 
 from ..base import UsageAdapter
 from ..canonical import (
@@ -26,12 +27,16 @@ from ..canonical import (
     UsageLimit,
     STATUS_ERROR,
     STATUS_OK,
+    STATUS_STALE,
 )
 
 logger = logging.getLogger(__name__)
 
 # Shared contract with the bridge-side writer. Keep both in lockstep.
 REDIS_KEY = "llm_bawt:usage:openai_chatgpt:snapshot"
+_TTL_SECONDS = 7 * 24 * 3600
+_PROBE_MAX_AGE_SECONDS = 60
+_PROBE_MODEL_ENV = "OPENAI_CHATGPT_USAGE_PROBE_MODEL"
 
 _PLAN_LABEL = {
     "free": "Free",
@@ -68,7 +73,103 @@ def _window_label(minutes) -> str | None:
     return f"{m}m"
 
 
-def _limit_from_window(window: dict | None, cid: str, label: str, fallback_window: str) -> UsageLimit | None:
+def _i(headers, key):
+    v = headers.get(key)
+    if v in (None, ""):
+        return None
+    try:
+        return int(float(v))
+    except (TypeError, ValueError):
+        return None
+
+
+def _b(headers, key):
+    v = headers.get(key)
+    if v is None:
+        return None
+    return str(v).strip().lower() in ("true", "1", "yes")
+
+
+def _snapshot_from_headers(headers) -> dict | None:
+    if (
+        headers.get("x-codex-primary-used-percent") is None
+        and headers.get("x-codex-plan-type") is None
+    ):
+        return None
+    return {
+        "captured_at": int(time.time()),
+        "plan_type": headers.get("x-codex-plan-type"),
+        "active_limit": headers.get("x-codex-active-limit"),
+        "primary": {
+            "used_percent": _i(headers, "x-codex-primary-used-percent"),
+            "window_minutes": _i(headers, "x-codex-primary-window-minutes"),
+            "reset_at": _i(headers, "x-codex-primary-reset-at"),
+            "reset_after_seconds": _i(headers, "x-codex-primary-reset-after-seconds"),
+        },
+        "secondary": {
+            "used_percent": _i(headers, "x-codex-secondary-used-percent"),
+            "window_minutes": _i(headers, "x-codex-secondary-window-minutes"),
+            "reset_at": _i(headers, "x-codex-secondary-reset-at"),
+            "reset_after_seconds": _i(headers, "x-codex-secondary-reset-after-seconds"),
+        },
+        "credits": {
+            "has_credits": _b(headers, "x-codex-credits-has-credits"),
+            "balance": headers.get("x-codex-credits-balance") or None,
+            "unlimited": _b(headers, "x-codex-credits-unlimited"),
+        },
+    }
+
+
+def _snapshot_age(snap: dict | None) -> float | None:
+    if not isinstance(snap, dict):
+        return None
+    try:
+        return time.time() - float(snap.get("captured_at"))
+    except (TypeError, ValueError):
+        return None
+
+
+def _snapshot_is_stale(snap: dict | None) -> bool:
+    age = _snapshot_age(snap)
+    if age is None or age > _PROBE_MAX_AGE_SECONDS:
+        return True
+    now = time.time()
+    for key in ("primary", "secondary"):
+        window = snap.get(key) if isinstance(snap, dict) else None
+        if not isinstance(window, dict):
+            continue
+        try:
+            reset_at = window.get("reset_at")
+            if reset_at is not None and float(reset_at) <= now:
+                return True
+        except (TypeError, ValueError):
+            pass
+    return False
+
+
+def _advance_reset(reset_at, window_minutes, now: int):
+    """Roll an elapsed reset boundary forward by whole windows past ``now``.
+
+    Codex snapshots are frozen between turns, so a stored ``reset_at`` can sit
+    well in the past. For a rolling window that just means N whole windows have
+    elapsed; project the boundary forward so the displayed reset is the next
+    real one instead of a stale past timestamp.
+    """
+    if reset_at is None:
+        return None
+    try:
+        period = int(window_minutes) * 60
+    except (TypeError, ValueError):
+        period = 0
+    if period <= 0 or reset_at > now:
+        return reset_at
+    missed = (now - reset_at) // period + 1
+    return int(reset_at + missed * period)
+
+
+def _limit_from_window(
+    window: dict | None, cid: str, label: str, fallback_window: str, now: int
+) -> UsageLimit | None:
     if not isinstance(window, dict):
         return None
     used = window.get("used_percent")
@@ -78,12 +179,21 @@ def _limit_from_window(window: dict | None, cid: str, label: str, fallback_windo
         used_pct = float(used)
     except (TypeError, ValueError):
         return None
+    reset_at = window.get("reset_at")
+    window_minutes = window.get("window_minutes")
+    # A rolling window whose reset boundary has already passed has, by
+    # definition, rolled over: usage is back to zero until the next codex turn
+    # writes a fresh snapshot. The frozen ``used_percent`` is stale — don't
+    # replay it as a scary full bar. Zero it and project the reset forward.
+    if reset_at is not None and reset_at <= now:
+        used_pct = 0.0
+        reset_at = _advance_reset(reset_at, window_minutes, now)
     return UsageLimit(
         id=cid,
         label=label,
         used_pct=used_pct,
-        resets_at=window.get("reset_at"),
-        window=_window_label(window.get("window_minutes")) or fallback_window,
+        resets_at=reset_at,
+        window=_window_label(window_minutes) or fallback_window,
         active=True,
     )
 
@@ -123,8 +233,84 @@ class OpenAIChatGPTUsageAdapter(UsageAdapter):
         except (ValueError, TypeError):
             return None
 
+    async def _write_snapshot(self, snap: dict) -> None:
+        url = (
+            os.getenv("LLM_BAWT_REDIS_URL")
+            or os.getenv("REDIS_URL")
+            or "redis://redis:6379/0"
+        )
+        try:
+            import redis.asyncio as redis
+
+            client = redis.from_url(
+                url,
+                encoding="utf-8",
+                decode_responses=True,
+                socket_timeout=2,
+                socket_connect_timeout=2,
+            )
+            try:
+                await client.set(REDIS_KEY, json.dumps(snap), ex=_TTL_SECONDS)
+            finally:
+                await client.aclose()
+        except Exception as e:  # noqa: BLE001
+            logger.warning("codex usage snapshot write failed: %s", e)
+
+    async def _probe_snapshot(self) -> dict | None:
+        """Fetch current quota headers with a tiny codex backend request."""
+        try:
+            import httpx
+            from claude_code_bridge.proxy.adapters.openai_chatgpt import (
+                OpenAIChatGPTAdapter,
+            )
+
+            adapter = OpenAIChatGPTAdapter()
+            bearer, base_url = await adapter.authorize()
+            headers = {
+                "Authorization": f"Bearer {bearer}",
+                **adapter.extra_headers(),
+            }
+            model = os.getenv(_PROBE_MODEL_ENV) or "gpt-5.4"
+            body = {
+                "model": model,
+                "instructions": "Reply with OK.",
+                "input": [
+                    {
+                        "role": "user",
+                        "content": [{"type": "input_text", "text": "OK"}],
+                    }
+                ],
+                "stream": True,
+                "store": False,
+                "reasoning": {"effort": "none"},
+            }
+            async with httpx.AsyncClient(timeout=20.0) as client:
+                async with client.stream(
+                    "POST",
+                    f"{base_url.rstrip('/')}/responses",
+                    headers=headers,
+                    json=body,
+                ) as resp:
+                    if resp.status_code != 200:
+                        logger.warning(
+                            "codex usage probe failed: HTTP %s", resp.status_code
+                        )
+                        return None
+                    snap = _snapshot_from_headers(resp.headers)
+                    if snap is None:
+                        logger.warning("codex usage probe returned no quota headers")
+                        return None
+                    await self._write_snapshot(snap)
+                    return snap
+        except Exception as e:  # noqa: BLE001
+            logger.warning("codex usage probe failed: %s", e)
+            return None
+
     async def fetch(self) -> ProviderUsage:
         snap = await self._read_snapshot()
+        stale = _snapshot_is_stale(snap)
+        if stale:
+            snap = await self._probe_snapshot() or snap
         if snap is None:
             return self._base(
                 available=False,
@@ -134,12 +320,18 @@ class OpenAIChatGPTUsageAdapter(UsageAdapter):
                     "/responses headers and populates after the next codex turn."
                 ),
             )
+        stale = _snapshot_is_stale(snap)
 
+        now = int(time.time())
         limits: list[UsageLimit] = []
-        primary = _limit_from_window(snap.get("primary"), "session_5h", "5-hour limit", "5h")
+        primary = _limit_from_window(
+            snap.get("primary"), "session_5h", "5-hour limit", "5h", now
+        )
         if primary is not None:
             limits.append(primary)
-        secondary = _limit_from_window(snap.get("secondary"), "weekly_all", "Weekly · all models", "7d")
+        secondary = _limit_from_window(
+            snap.get("secondary"), "weekly_all", "Weekly · all models", "7d", now
+        )
         if secondary is not None:
             limits.append(secondary)
 
@@ -155,8 +347,9 @@ class OpenAIChatGPTUsageAdapter(UsageAdapter):
 
         return self._base(
             available=True,
-            status=STATUS_OK,
+            status=STATUS_STALE if stale else STATUS_OK,
             display_name=display,
+            error="Codex usage snapshot is stale; probe refresh failed." if stale else None,
             fetched_at=snap.get("captured_at"),
             limits=limits,
             raw=snap,

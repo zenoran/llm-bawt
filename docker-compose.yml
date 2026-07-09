@@ -43,6 +43,7 @@ services:
       # in the "Attached Images" prompt manifest. Same in-network address the
       # bridges already use for LLM_BAWT_API_URL.
       - LLM_BAWT_AGENT_ORIGIN=http://app:8642
+      - CODEX_AUTH_PATH=/home/bridge/.codex/auth.json
     ports:
       - "${MCP_PORT:-8001}:8001"
       - "${SERVICE_PORT:-8642}:8642"
@@ -51,6 +52,10 @@ services:
       # endpoint's dedicated Claude login bundle lives under this (RW) mount at
       # claude-usage/.credentials.json — the app refreshes it in place.
       - ${HOME}/.config/llm-bawt:/root/.config/llm-bawt
+      # /v1/usage OpenAI ChatGPT adapter probes the codex backend with the same
+      # OAuth bundle the bridge uses, then stores fresh x-codex quota headers in
+      # Redis for BawtHub.
+      - ${HOME}/.codex/auth.json:/home/bridge/.codex/auth.json
       # Mount logs directory
       - ./.logs:/app/.logs
       # Mount bots.yaml for live updates (nextcloud provisioning, etc.)

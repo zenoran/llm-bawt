@@ -262,8 +262,12 @@ def test_openai_chatgpt_usage_adapter_maps_snapshot_to_canonical() -> None:
     primary = {"used_percent": 10, "window_minutes": 300, "reset_at": 1782093029}
     secondary = {"used_percent": 80, "window_minutes": 10080, "reset_at": 1782335997}
 
-    p = _limit_from_window(primary, "session_5h", "5-hour limit", "5h")
-    s = _limit_from_window(secondary, "weekly_all", "Weekly · all models", "7d")
+    # Fixed clock earlier than both reset boundaries so neither window has
+    # rolled over — the stored used_percent passes through unchanged.
+    now = 1782000000
+
+    p = _limit_from_window(primary, "session_5h", "5-hour limit", "5h", now)
+    s = _limit_from_window(secondary, "weekly_all", "Weekly · all models", "7d", now)
     assert (p.id, p.label, p.window, p.used_pct, p.resets_at, p.active) == (
         "session_5h", "5-hour limit", "5h", 10.0, 1782093029, True,
     )
@@ -271,7 +275,7 @@ def test_openai_chatgpt_usage_adapter_maps_snapshot_to_canonical() -> None:
         "weekly_all", "7d", 80.0, 1782335997,
     )
     # A window with no used_percent yields no limit (not a zero).
-    assert _limit_from_window({"window_minutes": 300}, "session_5h", "x", "5h") is None
+    assert _limit_from_window({"window_minutes": 300}, "session_5h", "x", "5h", now) is None
     assert _display_name("plus") == "ChatGPT · codex · Plus"
     assert _display_name(None) == "ChatGPT · codex"
     assert OpenAIChatGPTUsageAdapter.provider == "openai_chatgpt"
