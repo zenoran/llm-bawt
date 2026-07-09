@@ -52,6 +52,13 @@ from typing import Any
 
 logger = logging.getLogger(__name__)
 
+# Anthropic server-side / built-in tool types carry a versioned suffix
+# (e.g. "web_search_20260209", "bash_20250124"). They only execute on
+# api.anthropic.com, so they must not be forwarded to a proxied provider.
+_SERVER_TOOL_TYPE_RE = re.compile(
+    r"^(web_search|web_fetch|bash|text_editor|code_execution|computer)_\d{6,}$"
+)
+
 
 def _effort_from_budget(budget: Any) -> str | None:
     """Map an Anthropic thinking ``budget_tokens`` to a Responses reasoning
@@ -256,6 +263,19 @@ def _tools_to_responses(tools: list[dict] | None) -> list[dict] | None:
     converted: list[dict] = []
     for tool in tools:
         if not isinstance(tool, dict):
+            continue
+        # Drop Anthropic *server-side* / built-in tools. These carry a versioned
+        # ``type`` (e.g. "web_search_20260209", "web_fetch_20250910",
+        # "bash_20250124", "text_editor_...", "code_execution_...") and NO
+        # input_schema — they only execute against api.anthropic.com. On the
+        # proxy path they'd otherwise collapse into a bogus parameter-less
+        # function that the OpenAI/grok upstream can't run, hanging the turn.
+        # Client/custom tools have no such type (or type=="custom") and DO carry
+        # input_schema, so they pass through. Belt to the bridge's
+        # disallowed_tools suspenders.
+        ttype = tool.get("type")
+        if isinstance(ttype, str) and _SERVER_TOOL_TYPE_RE.match(ttype):
+            logger.debug("Stripping Anthropic server-side tool type=%r from proxy request", ttype)
             continue
         item: dict[str, Any] = {
             "type": "function",

@@ -40,6 +40,13 @@ BASE_URL_ENV = "XAI_BASE_URL"
 API_KEY_ENVS = ("XAI_API_KEY", "LLM_BAWT_XAI_API_KEY", "GROK_API_KEY")
 
 
+def _env_true(name: str, default: bool) -> bool:
+    val = os.getenv(name)
+    if val is None:
+        return default
+    return val.strip().lower() in ("1", "true", "yes", "on")
+
+
 class XaiAdapter(ProviderAdapter):
     """Grok via xAI's standard OpenAI Responses API (default call path)."""
 
@@ -67,3 +74,42 @@ class XaiAdapter(ProviderAdapter):
         appends ``/responses`` to.
         """
         return self._api_key(), self._base_url()
+
+    def prepare_request(self, responses_body: dict) -> dict:
+        """Inject xAI's native **server-side** search tools so Grok can search
+        the live web inside its own turn.
+
+        The Claude CLI's ``WebSearch``/``WebFetch`` are Anthropic server tools
+        (stripped upstream — they hang on the proxy path). xAI has its own,
+        different, server-side ``web_search`` (and ``x_search``) that run on
+        api.x.ai and fold results + inline ``[[N]](url)`` citations straight
+        into the answer. They're not function tools, so the SDK never sends
+        them — we add them here. Grok only invokes them when a query actually
+        needs the web (verified: trivial questions fire 0 searches), so the
+        per-call cost ($5/1k web-search calls + tokens) is demand-driven.
+
+        Knobs (default: web on, x off):
+            XAI_WEB_SEARCH=0   disable native web search
+            XAI_X_SEARCH=1     enable X/Twitter search
+        """
+        tools = list(responses_body.get("tools") or [])
+        existing_types = {
+            t.get("type") for t in tools if isinstance(t, dict)
+        }
+        native: list[dict] = []
+        if _env_true("XAI_WEB_SEARCH", default=True):
+            native.append({"type": "web_search"})
+        if _env_true("XAI_X_SEARCH", default=False):
+            native.append({"type": "x_search"})
+        added = False
+        for nt in native:
+            if nt["type"] not in existing_types:
+                tools.append(nt)
+                added = True
+        if added:
+            responses_body["tools"] = tools
+            logger.debug(
+                "xAI adapter injected native search tools: %s",
+                [t["type"] for t in native],
+            )
+        return responses_body

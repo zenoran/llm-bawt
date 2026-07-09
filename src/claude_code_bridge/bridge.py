@@ -1186,6 +1186,18 @@ class ClaudeCodeBridge:
                         and self._model_provider_prefix(model) is not None
                     )
 
+                    # The CLI's WebSearch/WebFetch are Anthropic *server-side*
+                    # tools — they only execute against api.anthropic.com. On the
+                    # proxy path (grok/openai) they collapse into parameter-less
+                    # function stubs the upstream can't run, so the tool_use hangs
+                    # with no result (verified: TOOLMAP start, no end). Disable
+                    # them for proxied turns; those bots get local web coverage
+                    # via the bawthub `web_search` MCP tool + crawl4ai fetch
+                    # instead. Anthropic-direct bots keep native server search.
+                    proxy_disallowed_tools = (
+                        ["WebSearch", "WebFetch"] if use_proxy else []
+                    )
+
                     sdk_env = {}
                     # Force Task/Agent subagents to run SYNCHRONOUSLY. CLI 2.1.x
                     # backgrounds agents by default: the tool returns immediately,
@@ -1269,6 +1281,7 @@ class ClaudeCodeBridge:
                         # alive on resume instead of decaying to the stock default.
                         system_prompt=system_prompt,
                         cwd=self._cwd,
+                        disallowed_tools=proxy_disallowed_tools,
                         permission_mode=self._permission_mode,
                         include_partial_messages=True,
                         resume=resume_id,

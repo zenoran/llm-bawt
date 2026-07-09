@@ -1371,6 +1371,13 @@ from . import media_tools as _media_tools  # noqa: F401, E402
 from . import self_tools as _self_tools  # noqa: F401, E402
 
 # ---------------------------------------------------------------------------
+# Web search tool (local Brave/Reddit/Tavily fan-out — replaces the Anthropic
+# server-side WebSearch that hangs on the proxy path)
+# ---------------------------------------------------------------------------
+
+from . import search_tools as _search_tools  # noqa: F401, E402
+
+# ---------------------------------------------------------------------------
 # Run helpers
 # ---------------------------------------------------------------------------
 
