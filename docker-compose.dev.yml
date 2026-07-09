@@ -6,7 +6,7 @@ services:
     command: ["/app/server.sh", "start", "--stdout", "--debug"]
     # Dev mode: source mounted, manual restart needed after code changes
     # (--dev flag with auto-reload causes issues in Docker, so we skip it)
-    
+
     # Use extra_hosts for local hostnames (DNS: Docker default handles external resolution)
     extra_hosts:
       - "host.docker.internal:host-gateway"

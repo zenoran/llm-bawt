@@ -424,6 +424,21 @@ services:
       - "${CRAWL4AI_PORT:-11235}:11235"
     environment:
       - CRAWL4AI_API_TOKEN=${CRAWL4AI_API_TOKEN:-}
+    # The embedded Redis runs as appuser but /app is root-owned read-only,
+    # so RDB snapshots fail with "Permission denied". Give it a writable tmpfs
+    # and copy+patch configs to /tmp before launching.
+    tmpfs:
+      - /data:uid=999,gid=999
+    entrypoint:
+      - /bin/bash
+      - -c
+      - |
+        cp /app/supervisord.conf /tmp/supervisord.conf
+        sed -i 's|command=/usr/bin/redis-server|command=/usr/bin/redis-server --dir /data|' /tmp/supervisord.conf
+        cp /app/entrypoint.sh /tmp/entrypoint.sh
+        sed -i 's|supervisord -c supervisord.conf|supervisord -c /tmp/supervisord.conf|' /tmp/entrypoint.sh
+        chmod +x /tmp/entrypoint.sh
+        exec /tmp/entrypoint.sh
     restart: unless-stopped
 
 volumes:
