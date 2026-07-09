@@ -348,6 +348,47 @@ def test_prepare_request_rejects_unsupported_minimal_effort(monkeypatch) -> None
     assert prepared["reasoning"] == {"effort": "high", "summary": "auto"}
 
 
+# ── xAI (Grok) adapter ────────────────────────────────────────────────────────
+def test_xai_registered_under_xai_prefix() -> None:
+    from claude_code_bridge.proxy.adapters import lookup
+    from claude_code_bridge.proxy.adapters.xai import XaiAdapter
+
+    adapter = lookup("xai")
+    assert isinstance(adapter, XaiAdapter)
+    assert adapter.name == "xai"
+
+
+def test_xai_authorize_returns_key_and_responses_base_url(monkeypatch) -> None:
+    from claude_code_bridge.proxy.adapters.xai import XaiAdapter
+
+    monkeypatch.delenv("LLM_BAWT_XAI_API_KEY", raising=False)
+    monkeypatch.delenv("GROK_API_KEY", raising=False)
+    monkeypatch.delenv("XAI_BASE_URL", raising=False)
+    monkeypatch.setenv("XAI_API_KEY", "xai-test-key")
+
+    bearer, base_url = __import__("asyncio").run(XaiAdapter().authorize())
+    assert bearer == "xai-test-key"
+    assert base_url == "https://api.x.ai/v1"
+
+
+def test_xai_api_key_alias_and_missing(monkeypatch) -> None:
+    from claude_code_bridge.proxy.adapters.xai import XaiAdapter
+
+    # Alias resolves when the primary env is unset.
+    monkeypatch.delenv("XAI_API_KEY", raising=False)
+    monkeypatch.delenv("GROK_API_KEY", raising=False)
+    monkeypatch.setenv("LLM_BAWT_XAI_API_KEY", "alias-key")
+    bearer, _ = __import__("asyncio").run(XaiAdapter().authorize())
+    assert bearer == "alias-key"
+
+    # No key anywhere → clear RuntimeError.
+    monkeypatch.delenv("LLM_BAWT_XAI_API_KEY", raising=False)
+    import pytest
+
+    with pytest.raises(RuntimeError, match="xAI API key required"):
+        __import__("asyncio").run(XaiAdapter().authorize())
+
+
 # ── cache_diag ──────────────────────────────────────────────────────────────
 from claude_code_bridge.proxy import cache_diag  # noqa: E402
 

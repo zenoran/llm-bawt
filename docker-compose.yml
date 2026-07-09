@@ -181,6 +181,10 @@ services:
       # Z.AI (Zhipu GLM) — native Anthropic Messages API passthrough.
       # Powers bots whose model_id is namespaced "zai/<glm-model>".
       - ZAI_API_KEY=${ZAI_API_KEY:-}
+      # xAI (Grok) — standard OpenAI Responses API via the proxy's default
+      # call path. Powers bots whose model_id is namespaced "xai/<grok-model>"
+      # (e.g. xai/grok-4.5). LLM_BAWT_XAI_API_KEY accepted as an alias.
+      - XAI_API_KEY=${XAI_API_KEY:-${LLM_BAWT_XAI_API_KEY:-}}
       - ENABLE_TOOL_SEARCH=true
       - CLAUDE_CODE_SKILLS_PATH=/home/bridge/dev/agent-skills
       - CLAUDE_CODE_BAWTHUB_MCP_URL=http://app:8001/mcp

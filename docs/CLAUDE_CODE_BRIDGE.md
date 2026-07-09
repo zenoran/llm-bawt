@@ -26,6 +26,7 @@ Common shapes:
 - Plain Anthropic aliases for native Claude use.
 - `openai_chatgpt/<model>` for ChatGPT-subscription routing through the proxy.
 - `zai/<model>` for z.ai / GLM routing through the proxy.
+- `xai/<model>` for xAI / Grok routing through the proxy (e.g. `xai/grok-4.5`).
 
 If a bot has `agent_backend="claude-code"` but no valid `default_model`, the
 turn is rejected.
@@ -52,6 +53,7 @@ because the local proxy reads ChatGPT OAuth from that file.
 | `CLAUDE_CODE_PERMISSION_MODE` | `bypassPermissions` | SDK permission mode |
 | `CLAUDE_CODE_ADD_DIRS` | unset | Extra Claude `--add-dir` paths |
 | `CLAUDE_CODE_BACKEND_NAME` | `claude-code` | Redis backend filter |
+| `XAI_API_KEY` | unset | xAI/Grok API key for `xai/<model>` routing (`LLM_BAWT_XAI_API_KEY` aliased) |
 | `CLAUDE_CODE_BRIDGE_PROXY_DISABLED` | unset | Disable provider-routing proxy |
 | `CLAUDE_CODE_BRIDGE_PROXY_PORT` | `0` | Pin proxy port instead of ephemeral |
 | `CLAUDE_CODE_APPROVAL_BUNDLE_TTL` | `15` | Approval-policy bundle cache TTL |
