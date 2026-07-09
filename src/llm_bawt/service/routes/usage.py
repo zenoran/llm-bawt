@@ -49,6 +49,9 @@ def _provider_for_bot(service, bot_id: str) -> str:
     _PREFIX_ALIASES = {
         "grok": "xai",
         "x-ai": "xai",
+        "openai": "openai_chatgpt",
+        "chatgpt": "openai_chatgpt",
+        "codex": "openai_chatgpt",
     }
 
     try:
@@ -107,12 +110,24 @@ def _provider_for_bot(service, bot_id: str) -> str:
         if t in {"grok", "xai"}:
             return "xai"
 
-    # Last-resort: alias/name heuristics so "grok-4.5" never maps to Claude.
+    # Last-resort: alias/name heuristics so non-Anthropic proxy aliases never
+    # map to Claude just because their model_id is bare.
     hint = " ".join(
         str(x) for x in (alias, model_id, model_type) if x
     ).lower()
     if "xai/" in hint or hint.startswith("grok") or " grok" in f" {hint}":
         return "xai" if has_provider("xai") else "xai"
+    if (
+        "openai_chatgpt/" in hint
+        or hint.startswith("gpt-")
+        or hint.startswith("o1")
+        or hint.startswith("o3")
+        or hint.startswith("o4")
+        or " gpt-" in f" {hint}"
+        or " codex" in f" {hint}"
+        or " chatgpt" in f" {hint}"
+    ):
+        return "openai_chatgpt"
 
     return "claude"
 
