@@ -1704,6 +1704,87 @@ def list_summaries(
         log.error(f"Failed to list summaries: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
+@router.get("/v1/history/context-seed", tags=["History"])
+def get_context_seed(
+    bot_id: str = Query(..., description="Bot ID to build a session seed for"),
+    model: str | None = Query(None, description="Optional model alias for context-window sizing"),
+):
+    """Return the context payload a chat bot would receive, for seeding a fresh
+    Claude Code SDK session (TASK-445).
+
+    Reuses ``HistoryManager.get_context_messages()`` — the exact function the
+    chat path uses — so the seed matches what a normal chatbot sees: rolling
+    summaries of older sessions PLUS the most recent turns, automatically
+    token-budgeted against the model's context window. System rows are dropped
+    (the SDK session carries its own system prompt).
+
+    Response: ``{bot_id, model, budget_tokens, messages:[{role,content,timestamp}],
+    stats:{summary_count, message_count, total_count, approx_tokens,
+    oldest_timestamp, newest_timestamp}}``.
+    """
+    from ...utils.history import estimate_messages_tokens
+
+    service = get_service()
+    effective_bot_id = bot_id or service._default_bot
+
+    try:
+        resolved_model = model or getattr(service, "_default_model", None)
+        model_alias, _ = service._resolve_request_model(
+            resolved_model, effective_bot_id, local_mode=False
+        )
+        llm_bawt = service._get_llm_bawt(
+            model_alias, effective_bot_id, service.config.DEFAULT_USER
+        )
+        # Load fresh so we never serve a stale in-memory transcript.
+        llm_bawt.history_manager.load_history()
+
+        # Same budget formula the agent path uses (base.py): context window
+        # minus the output reservation. 0 => no budget (return everything).
+        ctx_window = int(service.config.get_model_context_window(model_alias) or 0)
+        max_output = int(service.config.get_model_max_tokens(model_alias) or 4096)
+        budget = max(0, ctx_window - max_output) if ctx_window > 0 else 0
+
+        msgs = llm_bawt.history_manager.get_context_messages(max_tokens=budget)
+        # Drop system rows — the SDK injects its own system prompt every turn.
+        seed_msgs = [m for m in msgs if getattr(m, "role", "") != "system"]
+
+        summary_count = sum(1 for m in seed_msgs if m.role == "summary")
+        convo_count = sum(1 for m in seed_msgs if m.role in ("user", "assistant"))
+        approx_tokens = estimate_messages_tokens(seed_msgs)
+        ts_values = [
+            float(getattr(m, "timestamp", 0.0) or 0.0)
+            for m in seed_msgs
+            if getattr(m, "timestamp", 0.0)
+        ]
+        oldest = min(ts_values) if ts_values else None
+        newest = max(ts_values) if ts_values else None
+
+        return {
+            "bot_id": effective_bot_id,
+            "model": model_alias,
+            "budget_tokens": budget,
+            "messages": [
+                {
+                    "role": m.role,
+                    "content": m.content or "",
+                    "timestamp": float(getattr(m, "timestamp", 0.0) or 0.0),
+                }
+                for m in seed_msgs
+            ],
+            "stats": {
+                "summary_count": summary_count,
+                "message_count": convo_count,
+                "total_count": len(seed_msgs),
+                "approx_tokens": approx_tokens,
+                "oldest_timestamp": oldest,
+                "newest_timestamp": newest,
+            },
+        }
+    except Exception as e:
+        log.error(f"Failed to build context seed for {effective_bot_id}: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @router.delete("/v1/history/summary/{summary_id}", response_model=DeleteSummaryResponse, tags=["History"])
 def delete_summary(
     summary_id: str,

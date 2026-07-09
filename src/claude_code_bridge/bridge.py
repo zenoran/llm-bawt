@@ -6,7 +6,9 @@ import asyncio
 import json
 import logging
 import os
+import re
 import time
+import uuid
 from collections.abc import AsyncIterable
 from datetime import datetime, timezone
 from pathlib import Path
@@ -44,6 +46,15 @@ from agent_bridge.session_queue import SessionQueue
 logger = logging.getLogger(__name__)
 
 SESSION_PREFIX = "claude-code:"
+
+# TASK-445: session-seed constants.
+# agent_backend_config flag that gates history-summary seeding on new sessions.
+SEED_SETTING_KEY = "seed_summary_on_new_session"
+# Stamped on synthetic seed transcript entries. Not load-bearing for resume
+# (the CLI reads message content, not this), just keeps entries well-formed.
+_SEED_CLI_VERSION = "2.1.191"
+# Mirrors the SDK's _sanitize_path: every non-alphanumeric char -> '-'.
+_SEED_SANITIZE_RE = re.compile(r"[^a-zA-Z0-9]")
 
 
 def _bot_slug_from_session_key(session_key: str) -> str:
@@ -474,6 +485,200 @@ class ClaudeCodeBridge:
             logger.warning("Failed to clear session for %s: %s", bot_id, e)
             return False
 
+    # ----- TASK-445: seed a fresh SDK session with chat summary history -----
+
+    async def _get_seed_setting(self, bot_id: str) -> bool:
+        """Read the per-bot ``seed_summary_on_new_session`` flag from
+        agent_backend_config. Defaults to False (off) when absent or on error."""
+        if not self._app_api_url or not bot_id:
+            return False
+        try:
+            async with httpx.AsyncClient(timeout=5) as client:
+                resp = await client.get(f"{self._app_api_url}/v1/bots")
+                resp.raise_for_status()
+                for bot in resp.json().get("data", []):
+                    if bot.get("slug") == bot_id:
+                        bc = bot.get("agent_backend_config") or {}
+                        return bool(bc.get(SEED_SETTING_KEY, False))
+        except Exception as e:
+            logger.warning("Failed to read seed setting for %s: %s", bot_id, e)
+        return False
+
+    async def _fetch_context_seed(self, bot_id: str, model: str) -> dict | None:
+        """Fetch the chatbot-style context payload (summaries + budgeted recent
+        turns) from the app's /v1/history/context-seed endpoint."""
+        if not self._app_api_url or not bot_id:
+            return None
+        try:
+            async with httpx.AsyncClient(timeout=30) as client:
+                resp = await client.get(
+                    f"{self._app_api_url}/v1/history/context-seed",
+                    params={"bot_id": bot_id, "model": model},
+                )
+                resp.raise_for_status()
+                return resp.json()
+        except Exception as e:
+            logger.warning("Failed to fetch context seed for %s: %s", bot_id, e)
+            return None
+
+    def _project_slug(self, cwd: str) -> str:
+        """Reproduce the SDK's project-dir sanitization (non-alnum -> '-')."""
+        return _SEED_SANITIZE_RE.sub("-", cwd or "")
+
+    def _render_seed_briefing(self, messages: list[dict]) -> str:
+        """Flatten the context messages into a single labeled briefing block.
+
+        Summaries keep their ``[Previous conversation X ago]`` headers; recent
+        turns are rendered as a readable transcript. Text-only by construction —
+        no tool_use blocks — so the resumed session never wedges."""
+        lines = [
+            "[Session continuity seed — prior context restored from chat history]",
+            "Below is our earlier conversation for continuity: rolling summaries "
+            "of older sessions, then the most recent messages. Treat it as "
+            "background context; you don't need to repeat it back.",
+            "",
+        ]
+        for m in messages:
+            role = m.get("role")
+            content = (m.get("content") or "").strip()
+            if not content:
+                continue
+            if role == "summary":
+                lines.append(content)
+            elif role == "user":
+                lines.append(f"Nick: {content}")
+            elif role == "assistant":
+                lines.append(f"Assistant (you): {content}")
+            else:
+                lines.append(content)
+            lines.append("")
+        return "\n".join(lines).strip()
+
+    def _write_seed_transcript(self, session_id: str, messages: list[dict]) -> Path:
+        """Write a synthetic two-entry Claude Code transcript (user briefing +
+        assistant ack) so the SDK can ``resume`` it into a fresh session.
+
+        Entry shape verified against real on-disk transcripts. The assistant
+        entry uses ``model: "<synthetic>"`` — Claude Code's own marker for a
+        fabricated turn (the SDK writes these for injected errors and resumes
+        past them cleanly). Ends on the assistant so the leaf is clean."""
+        slug = self._project_slug(self._cwd)
+        proj_dir = Path.home() / ".claude" / "projects" / slug
+        proj_dir.mkdir(parents=True, exist_ok=True)
+        path = proj_dir / f"{session_id}.jsonl"
+
+        briefing = self._render_seed_briefing(messages)
+        ts = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+        user_uuid = str(uuid.uuid4())
+        asst_uuid = str(uuid.uuid4())
+
+        common = {
+            "isSidechain": False,
+            "sessionId": session_id,
+            "cwd": self._cwd,
+            "version": _SEED_CLI_VERSION,
+            "gitBranch": "",
+            "userType": "external",
+        }
+        user_entry = {
+            "parentUuid": None,
+            "type": "user",
+            "message": {"role": "user", "content": briefing},
+            "uuid": user_uuid,
+            "timestamp": ts,
+            **common,
+        }
+        asst_entry = {
+            "parentUuid": user_uuid,
+            "type": "assistant",
+            "uuid": asst_uuid,
+            "timestamp": ts,
+            "message": {
+                "role": "assistant",
+                "model": "<synthetic>",
+                "type": "message",
+                "stop_reason": "stop_sequence",
+                "content": [
+                    {
+                        "type": "text",
+                        "text": (
+                            "Context restored — I've reviewed our prior "
+                            "summaries and recent messages and I'm caught up."
+                        ),
+                    }
+                ],
+                "usage": {"input_tokens": 0, "output_tokens": 0},
+            },
+            **common,
+        }
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(json.dumps(user_entry) + "\n")
+            f.write(json.dumps(asst_entry) + "\n")
+        logger.info(
+            "Seed transcript written: %s (%d context msgs)",
+            path, len(messages),
+        )
+        return path
+
+    async def _seed_new_session(self, bot_id: str, model: str) -> dict | None:
+        """Seed a brand-new SDK session for ``bot_id`` from chat summary history,
+        if the per-bot setting is on. Writes the synthetic transcript, persists
+        the minted session id, and returns a stats dict for the /new ack.
+
+        Returns:
+            None      -> seeding disabled for this bot (caller behaves as before)
+            {seeded: False, reason} -> enabled but nothing to seed / error
+            {seeded: True, session_id, summary_count, message_count,
+             approx_tokens, oldest_timestamp, newest_timestamp}
+        """
+        if not await self._get_seed_setting(bot_id):
+            return None
+        seed = await self._fetch_context_seed(bot_id, model)
+        if not seed:
+            return {"seeded": False, "reason": "seed fetch failed"}
+        messages = seed.get("messages") or []
+        if not messages:
+            return {"seeded": False, "reason": "no history to seed"}
+        try:
+            session_id = str(uuid.uuid4())
+            self._write_seed_transcript(session_id, messages)
+            await self._set_session(bot_id, session_id, model)
+        except Exception as e:
+            logger.warning("Seed write/persist failed for %s: %s", bot_id, e)
+            return {"seeded": False, "reason": f"seed write failed: {e}"}
+        stats = dict(seed.get("stats") or {})
+        stats["seeded"] = True
+        stats["session_id"] = session_id
+        return stats
+
+    @staticmethod
+    def _format_seed_ack(stats: dict | None) -> str:
+        """Human-facing /new acknowledgement, reporting seed stats when present."""
+        base = "Session reset."
+        if stats is None:
+            return f"{base} Ready for a new conversation."
+        if not stats.get("seeded"):
+            reason = stats.get("reason", "nothing to seed")
+            return f"{base} History seeding on, but {reason}. Fresh start."
+        summ = stats.get("summary_count", 0)
+        msgs = stats.get("message_count", 0)
+        toks = stats.get("approx_tokens", 0)
+        span = ""
+        oldest = stats.get("oldest_timestamp")
+        newest = stats.get("newest_timestamp")
+        if oldest and newest:
+            try:
+                o = datetime.fromtimestamp(oldest, timezone.utc).strftime("%Y-%m-%d")
+                n = datetime.fromtimestamp(newest, timezone.utc).strftime("%Y-%m-%d")
+                span = f", spanning {o} → {n}" if o != n else f", from {o}"
+            except Exception:
+                span = ""
+        return (
+            f"{base} Seeded {summ} summary record{'s' if summ != 1 else ''} + "
+            f"{msgs} recent message{'s' if msgs != 1 else ''} "
+            f"(~{_fmt_tokens(toks)} tokens){span}. Continuity restored."
+        )
+
     async def start(self) -> None:
         self._command_task = asyncio.create_task(self._command_listener())
         self._cleanup_task = asyncio.create_task(self._periodic_cache_cleanup())
@@ -688,13 +893,17 @@ class ClaudeCodeBridge:
             self._publish_session_reset_unified(
                 bot_slug or session_key, session_key, had_session=cleared,
             )
+            # TASK-445: optionally seed the fresh session from chat summary
+            # history. Persists the minted session id so a trailing message
+            # below resumes the seeded transcript (no double-seed).
+            seed_stats = await self._seed_new_session(bot_slug, model)
             message = message.lstrip().removeprefix("/new").strip()
             if not message:
                 # Just "/new" with no follow-up — acknowledge and done
                 self._publish_event(
                     request_id, session_key, 1,
                     kind=AgentEventKind.ASSISTANT_DONE,
-                    text="Session reset. Ready for a new conversation.",
+                    text=self._format_seed_ack(seed_stats),
                     model=model,
                 )
                 self._publisher.publish_run_done(request_id)
@@ -755,6 +964,21 @@ class ClaudeCodeBridge:
                             prev_model, model, bot_slug or session_key,
                         )
                         await self._clear_session(bot_slug or session_key)
+
+                # TASK-445: cold start with no session to resume — first-ever
+                # run or post-model-switch. Seed from summary history so the new
+                # SDK session opens with continuity. A /new above that already
+                # seeded will have persisted a session, so _get_session found it
+                # and resume_id is set — this block is skipped (no double-seed).
+                if resume_id is None:
+                    cold_seed = await self._seed_new_session(bot_slug, model)
+                    if cold_seed and cold_seed.get("seeded"):
+                        resume_id = cold_seed["session_id"]
+                        logger.info(
+                            "Cold-start seeded session for %s: %s (%s summaries, %s msgs)",
+                            bot_slug, resume_id,
+                            cold_seed.get("summary_count"), cold_seed.get("message_count"),
+                        )
 
                 # Resolve settings file path
                 settings_path = str(Path.home() / ".claude" / "settings.json")
