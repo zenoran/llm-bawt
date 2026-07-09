@@ -18,6 +18,7 @@ from ..schemas import (
     ModelDefinitionUpsertRequest,
     ModelDetail,
     ModelInfo,
+    ModelPricing,
     ModelsResponse,
     ModelSwitchRequest,
     ModelSwitchResponse,
@@ -120,6 +121,28 @@ def _upstream_lookup(provider: str) -> list[dict]:
     return cleaned
 
 
+def _coerce_pricing(raw: object) -> ModelPricing | None:
+    """Best-effort coerce a stored ``extra['pricing']`` blob into ModelPricing.
+
+    Pricing is user-entered JSONB, so a malformed value must never wedge the
+    whole /v1/models listing — return None on anything unparseable, and keep
+    only the known numeric rate keys.
+    """
+    if not isinstance(raw, dict):
+        return None
+    fields = ("input", "output", "cache_read", "cache_write")
+    rates: dict[str, float] = {}
+    for key in fields:
+        val = raw.get(key)
+        if val is None or isinstance(val, bool):
+            continue
+        try:
+            rates[key] = float(val)
+        except (TypeError, ValueError):
+            continue
+    return ModelPricing(**rates) if rates else None
+
+
 def _public_model_type(info: dict | None) -> str | None:
     """Return the UI-facing provider type for a model definition."""
     if not info:
@@ -152,6 +175,7 @@ def list_models():
             type=_public_model_type(info),
             model_id=info.get("model_id"),
             description=info.get("description"),
+            pricing=_coerce_pricing(info.get("pricing")),
         ))
     return ModelsResponse(data=models)
 

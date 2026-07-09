@@ -136,6 +136,20 @@ class ChatCompletionChunk(BaseModel):
     choices: list[dict]
 
 
+class ModelPricing(BaseModel):
+    """Per-1M-token USD rates for client-side cost estimation.
+
+    All optional — a model with no pricing simply shows no computed cost.
+    Stored in ``ModelDefinition.extra['pricing']`` (no schema migration) and
+    surfaced here so the chat context badge can estimate turn cost as
+    ``sum(tokens_of_kind * rate_of_kind) / 1_000_000``.
+    """
+    input: float | None = None
+    output: float | None = None
+    cache_read: float | None = None
+    cache_write: float | None = None
+
+
 class ModelInfo(BaseModel):
     """Model information for /v1/models endpoint."""
     id: str
@@ -145,6 +159,7 @@ class ModelInfo(BaseModel):
     type: str | None = None
     model_id: str | None = None
     description: str | None = None
+    pricing: ModelPricing | None = None
 
 
 class ModelsResponse(BaseModel):
