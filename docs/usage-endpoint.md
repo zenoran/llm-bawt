@@ -22,9 +22,11 @@ The registry currently includes:
 - `claude`
 - `zai`
 - `openai_chatgpt`
+- `xai` (API-key only — no plan limits; used so Grok bots don't fall back to Claude)
 
 Support level differs by adapter. The canonical response shape is the same for
-all of them.
+all of them. API-key providers like `xai` return `status=ok` with an empty
+`limits` list so the chat context popup shows turn tokens/cost only.
 
 ## Caching
 

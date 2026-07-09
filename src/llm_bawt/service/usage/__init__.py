@@ -31,6 +31,7 @@ from .canonical import (
 from .adapters import (
     ClaudeUsageAdapter,
     OpenAIChatGPTUsageAdapter,
+    XaiUsageAdapter,
     ZaiUsageAdapter,
 )
 
@@ -48,6 +49,7 @@ def register(adapter: UsageAdapter) -> None:
 register(ClaudeUsageAdapter())
 register(ZaiUsageAdapter())
 register(OpenAIChatGPTUsageAdapter())
+register(XaiUsageAdapter())
 
 
 def list_providers() -> list[str]:

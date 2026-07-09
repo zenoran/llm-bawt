@@ -37,9 +37,20 @@ def _provider_for_bot(service, bot_id: str) -> str:
     """Best-effort map a bot slug -> canonical usage provider.
 
     A claude-code bot's model_id carries the provider as a ``<provider>/<model>``
-    prefix (e.g. ``zai/glm-5.2``, ``openai_chatgpt/gpt-5.4``); native Claude
-    bots have no prefix. Falls back to ``claude``.
+    prefix (e.g. ``xai/grok-4.5``, ``zai/glm-5.2``, ``openai_chatgpt/gpt-5.4``);
+    native Claude bots have no prefix. Falls back to ``claude`` only when the
+    model has no provider prefix or the prefix isn't a registered usage
+    provider.
+
+    Aliases: model namespaces sometimes differ from usage provider ids
+    (``grok`` → ``xai``). Keep the map tiny and explicit.
     """
+    # model_id prefix → usage registry key (only when they differ)
+    _PREFIX_ALIASES = {
+        "grok": "xai",
+        "x-ai": "xai",
+    }
+
     try:
         from ...bots import BotManager
 
@@ -51,21 +62,58 @@ def _provider_for_bot(service, bot_id: str) -> str:
 
     alias = getattr(bot, "default_model", None)
     model_id = None
+    model_type = None
     if alias:
         try:
             from ...runtime_settings import ModelDefinitionStore
 
-            for row in ModelDefinitionStore(service.config).list_all():
-                if getattr(row, "alias", None) == alias:
-                    model_id = getattr(row, "model_id", None)
-                    break
+            # Prefer direct get(alias) — list_all is only a fallback.
+            store = ModelDefinitionStore(service.config)
+            row = None
+            try:
+                row = store.get(alias)
+            except Exception:  # noqa: BLE001
+                row = None
+            if row is None:
+                for candidate in store.list_all():
+                    if getattr(candidate, "alias", None) == alias:
+                        row = candidate
+                        break
+            if row is not None:
+                model_id = getattr(row, "model_id", None)
+                model_type = getattr(row, "type", None)
         except Exception:  # noqa: BLE001
             model_id = None
+            model_type = None
 
-    if model_id and "/" in model_id:
-        prefix = model_id.split("/", 1)[0]
+    if model_id and "/" in str(model_id):
+        prefix = str(model_id).split("/", 1)[0].strip().lower()
+        prefix = _PREFIX_ALIASES.get(prefix, prefix)
         if has_provider(prefix):
             return prefix
+        # Known non-Claude bridge prefixes must NOT fall through to Claude
+        # (that put the Anthropic sunburst + Max plan limits on Grok bots).
+        # Prefer a registered alias; otherwise still return the prefix so the
+        # route 404s with a clear "unknown provider" rather than lying.
+        if prefix in {"xai", "grok", "zai", "openai_chatgpt", "openai", "codex"}:
+            return prefix
+
+    # Native (non-namespaced) model types — e.g. type=grok with bare model_id.
+    if model_type:
+        t = str(model_type).strip().lower()
+        t = _PREFIX_ALIASES.get(t, t)
+        if has_provider(t):
+            return t
+        if t in {"grok", "xai"}:
+            return "xai"
+
+    # Last-resort: alias/name heuristics so "grok-4.5" never maps to Claude.
+    hint = " ".join(
+        str(x) for x in (alias, model_id, model_type) if x
+    ).lower()
+    if "xai/" in hint or hint.startswith("grok") or " grok" in f" {hint}":
+        return "xai" if has_provider("xai") else "xai"
+
     return "claude"
 
 

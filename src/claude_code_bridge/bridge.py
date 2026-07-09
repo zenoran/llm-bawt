@@ -74,6 +74,116 @@ def _fmt_tokens(n: int | None) -> str:
     return f"{n / 1000:.1f}k"
 
 
+def _usage_input_total(usage: dict | None) -> int:
+    """Total prompt tokens in an Anthropic-shaped usage dict."""
+    if not isinstance(usage, dict):
+        return 0
+    return (
+        int(usage.get("input_tokens", 0) or 0)
+        + int(usage.get("cache_read_input_tokens", 0) or 0)
+        + int(usage.get("cache_creation_input_tokens", 0) or 0)
+    )
+
+
+def _proxy_context_window(model: str | None) -> int | None:
+    """Context window for proxy-routed models the Claude Code CLI doesn't know.
+
+    The CLI's ``getContextWindowForModel`` defaults unknown models to 200k
+    (Claude's window). Grok-via-bridge is ``xai/<model>`` and would otherwise
+    report 200k + Claude-tier costs. Keep this table small and explicit.
+    """
+    if not model:
+        return None
+    m = str(model).strip().lower()
+    # Exact / prefix matches for known xAI models (docs.x.ai, July 2026).
+    if m.startswith("xai/grok-4.5"):
+        return 500_000
+    if m.startswith("xai/grok-4.3") or m.startswith("xai/grok-4.20"):
+        return 1_000_000
+    if m.startswith("xai/grok-build"):
+        return 256_000
+    if m.startswith("xai/"):
+        return 500_000
+    return None
+
+
+# Per-1M-token USD rates for proxy providers the CLI prices as "unknown"
+# (which falls through to Opus-tier $5/$25 and wildly overstates Grok cost).
+_XAI_RATES = {
+    # model substring -> (input, output, cache_read, cache_write)
+    "grok-4.5": (2.0, 6.0, 0.5, 2.0),
+    "grok-4.3": (1.25, 2.50, 0.20, 1.25),
+    "grok-4.20": (1.25, 2.50, 0.20, 1.25),
+    "grok-build": (1.0, 2.0, 0.20, 1.0),
+}
+_XAI_DEFAULT_RATES = (2.0, 6.0, 0.5, 2.0)
+
+
+def _estimate_proxy_cost_usd(model: str | None, usage: dict | None) -> float | None:
+    """Estimate turn cost for proxy-routed models from token counts.
+
+    Returns None when we can't price the model (leave SDK total_cost_usd).
+    """
+    if not model or not isinstance(usage, dict):
+        return None
+    m = str(model).strip().lower()
+    if not m.startswith("xai/"):
+        return None
+    rates = _XAI_DEFAULT_RATES
+    for key, r in _XAI_RATES.items():
+        if key in m:
+            rates = r
+            break
+    in_rate, out_rate, cr_rate, cw_rate = rates
+    inp = int(usage.get("input_tokens", 0) or 0)
+    cr = int(usage.get("cache_read_input_tokens", 0) or usage.get("cache_read_tokens", 0) or 0)
+    cw = int(
+        usage.get("cache_creation_input_tokens", 0)
+        or usage.get("cache_creation_tokens", 0)
+        or 0
+    )
+    out = int(usage.get("output_tokens", 0) or 0)
+    cost = (inp * in_rate + cr * cr_rate + cw * cw_rate + out * out_rate) / 1_000_000
+    return round(cost, 6) if cost > 0 else 0.0
+
+
+def _pick_iteration_usage(
+    latest_assistant_usage: dict | None,
+    latest_stream_usage: dict | None,
+    cumulative_usage: dict | None,
+    *,
+    proxy_model: bool,
+) -> dict:
+    """Choose the usage snapshot that best represents final context size.
+
+    Preference:
+      1. For proxy streams (xAI / ChatGPT / z.ai): prefer the last
+         ``message_delta`` when it reports a higher total input than the
+         AssistantMessage snapshot. The synthetic Anthropic stream only
+         finalizes real usage on message_delta; AssistantMessage can keep
+         message_start zeros or a partial merge that under-counts.
+      2. Otherwise last AssistantMessage usage (true final API view).
+      3. Stream usage, then cumulative ResultMessage.usage.
+    """
+    am = latest_assistant_usage if isinstance(latest_assistant_usage, dict) else None
+    sm = latest_stream_usage if isinstance(latest_stream_usage, dict) else None
+    cu = cumulative_usage if isinstance(cumulative_usage, dict) else None
+
+    if proxy_model and sm and _usage_input_total(sm) > 0:
+        if not am or _usage_input_total(sm) >= _usage_input_total(am):
+            return sm
+    if am and _usage_input_total(am) > 0:
+        return am
+    if sm and _usage_input_total(sm) > 0:
+        return sm
+    if am:
+        return am
+    if sm:
+        return sm
+    return cu or {}
+
+
+
 def _read_latest_compact_metadata(session_id: str | None) -> dict | None:
     """Return the most recent ``compact_boundary`` metadata for a session.
 
@@ -1696,15 +1806,17 @@ class ClaudeCodeBridge:
                                 max_output = None
                                 try:
                                     cumulative_usage = getattr(msg, "usage", None) or {}
-                                    # Per-iteration view (preferred) — falls back first to the
-                                    # last stream-level message_delta usage (needed for some
-                                    # synthetic proxy streams whose AssistantMessage snapshot
-                                    # keeps message_start's zero input fields), then to the
-                                    # cumulative usage when no finer-grained view exists.
-                                    iter_usage = (
-                                        latest_assistant_usage
-                                        or latest_stream_usage
-                                        or cumulative_usage
+                                    proxy_model = self._model_provider_prefix(
+                                        actual_model or model
+                                    ) is not None
+                                    # Prefer stream message_delta for proxy providers
+                                    # (xAI/ChatGPT/z.ai) — AssistantMessage often keeps
+                                    # message_start zeros or a partial merge.
+                                    iter_usage = _pick_iteration_usage(
+                                        latest_assistant_usage,
+                                        latest_stream_usage,
+                                        cumulative_usage,
+                                        proxy_model=proxy_model,
                                     )
                                     model_usage = getattr(msg, "model_usage", None) or {}
                                     ctx_window = None
@@ -1721,6 +1833,17 @@ class ClaudeCodeBridge:
                                         if isinstance(mu_entry, dict):
                                             ctx_window = mu_entry.get("contextWindow")
                                             max_output = mu_entry.get("maxOutputTokens")
+                                    # Claude Code defaults unknown models to 200k. Override
+                                    # with the real window for proxy-routed providers.
+                                    proxy_ctx = _proxy_context_window(actual_model or model)
+                                    if proxy_ctx:
+                                        # Always trust our table over the CLI default for
+                                        # known proxy models (CLI never knows xAI windows).
+                                        if not ctx_window or int(ctx_window) in (200_000, 0):
+                                            ctx_window = proxy_ctx
+                                        elif int(ctx_window) < proxy_ctx:
+                                            # e.g. CLI said 200k for a 500k/1M model
+                                            ctx_window = proxy_ctx
                                     if iter_usage or ctx_window:
                                         # z.ai reports input_tokens only in message_delta, so the
                                         # per-iteration AssistantMessage.usage (iter_usage) carries
@@ -1734,31 +1857,116 @@ class ClaudeCodeBridge:
                                             _input_tokens = int(
                                                 cumulative_usage.get("input_tokens", 0) or 0
                                             )
+                                        _cache_read = int(
+                                            iter_usage.get("cache_read_input_tokens", 0) or 0
+                                        )
+                                        _cache_create = int(
+                                            iter_usage.get("cache_creation_input_tokens", 0) or 0
+                                        )
+                                        # If the chosen snapshot still has zero total input but
+                                        # cumulative does not, take cache fields from cumulative too.
+                                        if (
+                                            _input_tokens + _cache_read + _cache_create
+                                        ) == 0 and isinstance(cumulative_usage, dict):
+                                            _cache_read = int(
+                                                cumulative_usage.get(
+                                                    "cache_read_input_tokens", 0
+                                                )
+                                                or 0
+                                            )
+                                            _cache_create = int(
+                                                cumulative_usage.get(
+                                                    "cache_creation_input_tokens", 0
+                                                )
+                                                or 0
+                                            )
+                                        _out_tokens = int(
+                                            cumulative_usage.get("output_tokens", 0) or 0
+                                        )
+                                        if _out_tokens == 0:
+                                            _out_tokens = int(
+                                                iter_usage.get("output_tokens", 0) or 0
+                                            )
+                                        # Cost must be CUMULATIVE across the turn
+                                        # (every internal API iteration billed). Context
+                                        # fullness above is last-iteration only.
+                                        if isinstance(cumulative_usage, dict) and (
+                                            _usage_input_total(cumulative_usage) > 0
+                                            or int(cumulative_usage.get("output_tokens", 0) or 0) > 0
+                                        ):
+                                            usage_for_cost = {
+                                                "input_tokens": int(
+                                                    cumulative_usage.get("input_tokens", 0) or 0
+                                                ),
+                                                "cache_read_input_tokens": int(
+                                                    cumulative_usage.get(
+                                                        "cache_read_input_tokens", 0
+                                                    )
+                                                    or 0
+                                                ),
+                                                "cache_creation_input_tokens": int(
+                                                    cumulative_usage.get(
+                                                        "cache_creation_input_tokens", 0
+                                                    )
+                                                    or 0
+                                                ),
+                                                "output_tokens": int(
+                                                    cumulative_usage.get("output_tokens", 0)
+                                                    or 0
+                                                ),
+                                            }
+                                        else:
+                                            usage_for_cost = {
+                                                "input_tokens": _input_tokens,
+                                                "cache_read_input_tokens": _cache_read,
+                                                "cache_creation_input_tokens": _cache_create,
+                                                "output_tokens": _out_tokens,
+                                            }
+                                        # Prefer provider-accurate cost for proxy models;
+                                        # CLI prices unknowns as Opus-tier ($5/$25).
+                                        cost = _estimate_proxy_cost_usd(
+                                            actual_model or model, usage_for_cost
+                                        )
+                                        if cost is None:
+                                            cost = getattr(msg, "total_cost_usd", None)
                                         token_usage_payload = {
                                             "input_tokens": _input_tokens,
-                                            "cache_read_tokens": int(
-                                                iter_usage.get("cache_read_input_tokens", 0) or 0
-                                            ),
-                                            "cache_creation_tokens": int(
-                                                iter_usage.get("cache_creation_input_tokens", 0) or 0
-                                            ),
+                                            "cache_read_tokens": _cache_read,
+                                            "cache_creation_tokens": _cache_create,
                                             # Output is still the cumulative turn total — that's
                                             # what the user generated overall, regardless of how
                                             # many internal iterations produced it.
-                                            "output_tokens": int(
-                                                cumulative_usage.get("output_tokens", 0) or 0
-                                            ),
+                                            "output_tokens": _out_tokens,
                                             "context_window": ctx_window,
                                             "max_output_tokens": max_output,
-                                            "total_cost_usd": getattr(msg, "total_cost_usd", None),
+                                            "total_cost_usd": cost,
                                         }
-                                        if actual_model and str(actual_model).startswith("zai/"):
-                                            logger.debug(
-                                                "zai usage probe: iter_in=%s cum_in=%s out=%s ctx=%s",
-                                                iter_usage.get("input_tokens"),
-                                                cumulative_usage.get("input_tokens"),
-                                                cumulative_usage.get("output_tokens"),
+                                        if actual_model and (
+                                            str(actual_model).startswith("zai/")
+                                            or str(actual_model).startswith("xai/")
+                                        ):
+                                            logger.info(
+                                                "proxy usage: model=%s iter_in=%s stream_in=%s "
+                                                "cum_in=%s out=%s ctx=%s cost=%s",
+                                                actual_model,
+                                                (latest_assistant_usage or {}).get(
+                                                    "input_tokens"
+                                                )
+                                                if isinstance(
+                                                    latest_assistant_usage, dict
+                                                )
+                                                else None,
+                                                (latest_stream_usage or {}).get(
+                                                    "input_tokens"
+                                                )
+                                                if isinstance(latest_stream_usage, dict)
+                                                else None,
+                                                cumulative_usage.get("input_tokens")
+                                                if isinstance(cumulative_usage, dict)
+                                                else None,
+                                                _out_tokens,
                                                 ctx_window,
+                                                cost,
                                             )
                                 except Exception as _usage_err:
                                     logger.debug("Failed to extract token usage: %s", _usage_err)

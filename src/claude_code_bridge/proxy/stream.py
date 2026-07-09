@@ -92,6 +92,15 @@ def _anthropic_message_id() -> str:
     return f"msg_{uuid.uuid4().hex[:24]}"
 
 
+def _usage_get(obj: Any, key: str, default: Any = None) -> Any:
+    """Read ``key`` from an object or dict (Responses usage is either)."""
+    if obj is None:
+        return default
+    if isinstance(obj, dict):
+        return obj.get(key, default)
+    return getattr(obj, key, default)
+
+
 def _extract_usage(resp: Any) -> tuple[int, int, int, int]:
     """Pull (input, output, cache_read, cache_create) from a Response object.
 
@@ -99,16 +108,32 @@ def _extract_usage(resp: Any) -> tuple[int, int, int, int]:
     ``usage.input_tokens_details.cached_tokens``; ``input_tokens`` is the FULL
     prompt (cached + uncached), unlike Anthropic where ``input_tokens`` is the
     uncached remainder. The caller normalises to Anthropic's split.
+
+    Also accepts dict-shaped usage (some SDKs / xAI edge paths) and the
+    chat-completions alias ``prompt_tokens_details.cached_tokens``.
     """
-    usage = getattr(resp, "usage", None)
+    usage = _usage_get(resp, "usage", None)
+    if usage is None and isinstance(resp, dict):
+        usage = resp.get("usage")
     if usage is None:
         return 0, 0, 0, 0
-    input_tokens = getattr(usage, "input_tokens", 0) or 0
-    output_tokens = getattr(usage, "output_tokens", 0) or 0
+    input_tokens = int(
+        _usage_get(usage, "input_tokens", None)
+        or _usage_get(usage, "prompt_tokens", 0)
+        or 0
+    )
+    output_tokens = int(
+        _usage_get(usage, "output_tokens", None)
+        or _usage_get(usage, "completion_tokens", 0)
+        or 0
+    )
     cache_read = 0
-    details = getattr(usage, "input_tokens_details", None)
+    details = (
+        _usage_get(usage, "input_tokens_details", None)
+        or _usage_get(usage, "prompt_tokens_details", None)
+    )
     if details is not None:
-        cache_read = getattr(details, "cached_tokens", 0) or 0
+        cache_read = int(_usage_get(details, "cached_tokens", 0) or 0)
     return input_tokens, output_tokens, cache_read, 0
 
 

@@ -2315,6 +2315,10 @@ class ChatStreamingMixin:
                     "approval_persist_failed": approval_persist_failed,
                     "animation": animation_holder[0],
                     "token_usage": token_usage_holder[0],
+                    # Catalog alias for this turn (matches the persisted turn-log
+                    # `model` and the /v1/models pricing key) so the client can
+                    # cost a live turn without waiting on the turn-log backfill.
+                    "model": model_alias,
                     "ts": time.time(),
                 })
 
