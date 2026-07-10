@@ -11,7 +11,7 @@ Engine-backed against in-memory SQLite (RETURNING + partial-predicate UPDATE
 both supported) so the real SQL path is exercised without a live Postgres.
 """
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from sqlmodel import Session, SQLModel, create_engine, select
 
@@ -26,12 +26,13 @@ def _store():
     return store
 
 
-def _add(store, *, turn_id, bot_id, user_id, ended=False):
+def _add(store, *, turn_id, bot_id, user_id, ended=False, created_at=None):
     with Session(store.engine) as s:
         s.add(TurnLog(
             id=turn_id,
             bot_id=bot_id,
             user_id=user_id,
+            created_at=created_at or datetime.now(timezone.utc),
             status="ok" if ended else "streaming",
             ended_at=datetime.now(timezone.utc) if ended else None,
         ))
@@ -92,6 +93,44 @@ def test_returns_user_id_for_indicator_clear():
     reaped = store.reap_other_open_turns(bot_id="byte", current_turn_id="current")
 
     assert reaped == [{"id": "zombie", "user_id": "someoneelse"}]
+
+
+def test_does_not_reap_newer_queued_turn_when_older_turn_confirms_late():
+    store = _store()
+    base = datetime(2026, 7, 10, 16, 35, 35, tzinfo=timezone.utc)
+    _add(store, turn_id="current", bot_id="byte", user_id="nick", created_at=base)
+    _add(
+        store,
+        turn_id="newer_queued",
+        bot_id="byte",
+        user_id="nick",
+        created_at=base + timedelta(minutes=2),
+    )
+    _add(
+        store,
+        turn_id="older_zombie",
+        bot_id="byte",
+        user_id="nick",
+        created_at=base - timedelta(minutes=5),
+    )
+
+    reaped = store.reap_other_open_turns(bot_id="byte", current_turn_id="current")
+
+    assert [r["id"] for r in reaped] == ["older_zombie"]
+    assert _row(store, "older_zombie").status == "timeout"
+    assert _row(store, "current").ended_at is None
+    assert _row(store, "newer_queued").ended_at is None
+    assert _row(store, "newer_queued").status == "streaming"
+
+
+def test_missing_current_turn_does_not_reap_anything():
+    store = _store()
+    _add(store, turn_id="zombie", bot_id="byte", user_id="nick")
+
+    reaped = store.reap_other_open_turns(bot_id="byte", current_turn_id="missing")
+
+    assert reaped == []
+    assert _row(store, "zombie").ended_at is None
 
 
 def test_no_engine_is_safe():

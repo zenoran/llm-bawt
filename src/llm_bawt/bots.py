@@ -631,6 +631,151 @@ def strip_emotes(text: str) -> str:
     return text
 
 
+def scrub_for_tts(text: str) -> str:
+    """Scrub a COMPLETE assistant response into clean, speakable text for TTS.
+
+    This is the single source of truth for TTS-safe text. It removes Markdown
+    structure that reads terribly aloud (headers, emphasis markers, code fences,
+    link/image URLs, list bullets, blockquote/table punctuation) and then applies
+    ``strip_emotes`` for the roleplay-emote + whitespace-normalization pass.
+
+    Markdown cannot be scrubbed reliably mid-stream (fences/links/tables span
+    token boundaries), so this MUST run on the finalized full response — never
+    per-chunk.
+
+    Args:
+        text: The full, finalized LLM response text.
+
+    Returns:
+        Plain text suitable for speech synthesis.
+    """
+    if not text:
+        return text
+
+    # NOTE: leading-indent anchors use ``[ \t]`` (never ``\s``) — ``\s`` matches
+    # newlines and would swallow the blank lines that separate blocks.
+
+    # Fenced code blocks: drop the ``` fence lines (and any language tag), keep
+    # the inner content so meaning isn't lost — reading fence markers aloud is
+    # noise, deleting the code entirely could drop the answer.
+    text = re.sub(r'^[ \t]*```[^\n]*$', '', text, flags=re.MULTILINE)
+    text = re.sub(r'^[ \t]*~~~[^\n]*$', '', text, flags=re.MULTILINE)
+
+    # Images: ![alt](url) -> alt text (URL is unspeakable).
+    text = re.sub(r'!\[([^\]]*)\]\([^)]*\)', r'\1', text)
+    # Links: [text](url) -> text.
+    text = re.sub(r'\[([^\]]*)\]\([^)]*\)', r'\1', text)
+
+    # Inline code: strip the backticks, keep the token.
+    text = re.sub(r'`+([^`]*)`+', r'\1', text)
+
+    # ATX headers: strip leading #'s (and trailing closing #'s).
+    text = re.sub(r'^[ \t]{0,3}#{1,6}[ \t]*', '', text, flags=re.MULTILINE)
+    text = re.sub(r'[ \t]+#+[ \t]*$', '', text, flags=re.MULTILINE)
+
+    # Blockquote markers.
+    text = re.sub(r'^[ \t]{0,3}>+[ \t]?', '', text, flags=re.MULTILINE)
+
+    # Horizontal rules (---, ***, ___ on their own line). Must run before the
+    # unordered-list rule so a `---` rule isn't mistaken for a `-` bullet.
+    text = re.sub(r'^[ \t]{0,3}([-*_])(?:[ \t]*\1){2,}[ \t]*$', '', text, flags=re.MULTILINE)
+
+    # Table separator rows: | --- | :--: | etc.
+    text = re.sub(r'^[ \t]{0,3}\|?[ \t:]*-{3,}[ \t:|-]*$', '', text, flags=re.MULTILINE)
+    # Remaining table cell pipes -> spaces so cells read as a phrase.
+    text = re.sub(r'\|', ' ', text)
+
+    # List markers (unordered then ordered), keep the item text.
+    text = re.sub(r'^[ \t]*[-*+][ \t]+', '', text, flags=re.MULTILINE)
+    text = re.sub(r'^[ \t]*\d+[.)][ \t]+', '', text, flags=re.MULTILINE)
+
+    # Multi-char emphasis markers (**bold**, __under__, ~~strike~~). Single `*`
+    # pairs are handled by strip_emotes below (which deletes *action* emotes).
+    text = re.sub(r'(\*\*|__|~~)', '', text)
+
+    # Emote + whitespace normalization pass (single source for that logic).
+    return strip_emotes(text)
+
+
+def should_scrub_for_tts(bot, request=None) -> bool:
+    """Single source of truth: does THIS turn's output get scrubbed for TTS?
+
+    Consolidates every "is this a voice/TTS-scrubbed turn" decision into one
+    place so the answer is computed once, shared, and tracked on the turn.
+    Currently keys off the bot's ``voice_optimized`` profile flag; if per-request
+    overrides are added, extend them HERE — never at the call sites.
+
+    Args:
+        bot: The resolved Bot for this turn (may be None).
+        request: The chat request, for future per-request overrides.
+
+    Returns:
+        True if this turn's output should be scrubbed for TTS.
+    """
+    return bool(getattr(bot, "voice_optimized", False))
+
+
+class StreamingTTSScrubber:
+    """Block-boundary streaming scrubber for TTS.
+
+    Markdown can't be scrubbed a *token* at a time — a link, fence or table
+    spans token boundaries. But it CAN be scrubbed a *block* at a time: once a
+    blank-line boundary arrives (and we are not inside an open ``` code fence),
+    everything before it is a complete block that ``scrub_for_tts`` can clean
+    safely. This lets voice-optimized TTS keep streaming at paragraph
+    granularity instead of waiting for the entire turn.
+
+    Usage:
+        sc = StreamingTTSScrubber()
+        for raw_chunk in stream:
+            out = sc.feed(raw_chunk)   # scrubbed completed block(s), or ""
+            if out:
+                speak(out)
+        tail = sc.flush()              # scrub + emit the final partial block
+        if tail:
+            speak(tail)
+    """
+
+    def __init__(self) -> None:
+        self.buf = ""
+
+    def feed(self, chunk: str) -> str:
+        """Accumulate raw text; return scrubbed text for any COMPLETED blocks."""
+        if not chunk:
+            return ""
+        self.buf += chunk
+        out: list[str] = []
+        while True:
+            # Find the earliest blank-line boundary whose preceding text has an
+            # EVEN number of ``` fences (i.e. we are NOT inside an open fence).
+            search = 0
+            idx = -1
+            while True:
+                cand = self.buf.find("\n\n", search)
+                if cand == -1:
+                    break
+                if self.buf[:cand].count("```") % 2 == 0:
+                    idx = cand
+                    break
+                search = cand + 2
+            if idx == -1:
+                break
+            block = self.buf[:idx]
+            self.buf = self.buf[idx + 2:]
+            scrubbed = scrub_for_tts(block)
+            if scrubbed:
+                out.append(scrubbed)
+        # Trailing newline separates consecutive blocks fed to the TTS engine
+        # across successive tts_delta events so words don't run together.
+        return ("\n".join(out) + "\n") if out else ""
+
+    def flush(self) -> str:
+        """Scrub and return the final buffered (partial) block at turn end."""
+        scrubbed = scrub_for_tts(self.buf)
+        self.buf = ""
+        return scrubbed
+
+
 class StreamingEmoteFilter:
     """Buffer-based filter for stripping *emotes* from streaming text.
 

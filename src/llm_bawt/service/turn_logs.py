@@ -35,6 +35,16 @@ def _is_terminal(status: str | None, end_reason: str | None) -> bool:
     return (status in TERMINAL_TURN_STATUSES) or (end_reason is not None)
 
 
+def _terminal_ended_at(created_at: datetime, latency_ms: float | None = None) -> datetime:
+    """Best completion timestamp for a terminal turn update."""
+    if latency_ms is not None:
+        try:
+            return created_at + timedelta(milliseconds=float(latency_ms))
+        except Exception:
+            pass
+    return datetime.now(timezone.utc)
+
+
 def _extract_trigger_id(request_payload: dict) -> str | None:
     """Extract the last user message ID from a request payload."""
     messages = request_payload.get("messages")
@@ -87,6 +97,10 @@ class TurnLog(SQLModel, table=True):
     # Surfaced on TurnLogListItem / TurnLogDetail so the chat UI's per-bubble
     # usage pill survives reloads and history syncs.
     token_usage_json: str | None = Field(default=None, sa_column=Column(Text, nullable=True))
+    # Whether this turn's assistant output was scrubbed for TTS (voice-optimized
+    # bots). Recorded so the scrub decision is tracked on the turn, not just
+    # recomputed — single source of truth is should_scrub_for_tts().
+    tts_scrubbed: bool | None = Field(default=None, sa_column=Column(Boolean, nullable=True))
     # --- Turn-lifecycle / continuation chain (TASK-269) ---
     # Why a turn ended.  Default "stop" (normal completion).  When the agent
     # asked an AskUserQuestion and deferred it, the turn ends cleanly with
@@ -232,6 +246,10 @@ class TurnLogStore:
                 ))
                 conn.execute(sa_text(
                     "ALTER TABLE turn_logs ADD COLUMN IF NOT EXISTS token_usage_json TEXT"
+                ))
+                # Tracks whether the turn's output was scrubbed for TTS.
+                conn.execute(sa_text(
+                    "ALTER TABLE turn_logs ADD COLUMN IF NOT EXISTS tts_scrubbed BOOLEAN"
                 ))
                 # TASK-360 (P4): mid-turn partial reasoning for cold-reload resume.
                 conn.execute(sa_text(
@@ -403,8 +421,10 @@ class TurnLogStore:
         if trigger_message_id is None and request_payload:
             trigger_message_id = _extract_trigger_id(request_payload)
 
+        created_at = datetime.now(timezone.utc)
         row = TurnLog(
             id=turn_id,
+            created_at=created_at,
             request_id=request_id,
             path=path,
             stream=stream,
@@ -430,7 +450,10 @@ class TurnLogStore:
             parent_turn_id=parent_turn_id,
             # Rare: a turn created already-terminal (e.g. errored before any
             # processing) should not look perpetually in-flight.
-            ended_at=(datetime.now(timezone.utc) if _is_terminal(status, None) else None),
+            ended_at=(
+                _terminal_ended_at(created_at, latency_ms)
+                if _is_terminal(status, None) else None
+            ),
         )
 
         with Session(self.engine) as session:
@@ -454,6 +477,7 @@ class TurnLogStore:
         end_reason: str | None = None,
         question_id: str | None = None,
         parent_turn_id: str | None = None,
+        tts_scrubbed: bool | None = None,
     ) -> None:
         """Update an existing turn log row with new data."""
         if self.engine is None:
@@ -463,6 +487,8 @@ class TurnLogStore:
             if row is None:
                 logger.debug("update_turn: no row with id=%s", turn_id)
                 return
+            prior_status = row.status
+            prior_end_reason = row.end_reason
             if status is not None:
                 row.status = status
             if latency_ms is not None:
@@ -491,6 +517,8 @@ class TurnLogStore:
                     json.dumps(token_usage, ensure_ascii=False, default=str)
                     if isinstance(token_usage, dict) else None
                 )
+            if tts_scrubbed is not None:
+                row.tts_scrubbed = tts_scrubbed
             if end_reason is not None:
                 row.end_reason = end_reason
             if question_id is not None:
@@ -501,7 +529,18 @@ class TurnLogStore:
             # Covers every terminal writer (streaming finalize, _finalize_turn,
             # abort route) since they all funnel through update_turn.
             if row.ended_at is None and _is_terminal(status, end_reason):
-                row.ended_at = datetime.now(timezone.utc)
+                row.ended_at = _terminal_ended_at(row.created_at, latency_ms)
+            elif (
+                prior_status == "timeout"
+                and prior_end_reason == "timeout"
+                and status in ("ok", "completed")
+                and end_reason not in (None, "timeout")
+            ):
+                # A queued agent turn can be incorrectly stamped timeout by a
+                # stale-turn reap, then later complete normally when the bridge
+                # drains the queue. In that repair path, the successful
+                # finalization is authoritative and should also repair ended_at.
+                row.ended_at = _terminal_ended_at(row.created_at, latency_ms)
             session.add(row)
             session.commit()
 
@@ -549,16 +588,16 @@ class TurnLogStore:
     def reap_other_open_turns(
         self, *, bot_id: str, current_turn_id: str
     ) -> list[dict]:
-        """Close every OTHER still-open turn for ``bot_id`` as a timeout.
+        """Close older still-open turns for ``bot_id`` as a timeout.
 
         The single source of truth for "a turn began" is the SDK/bridge
         CONFIRMING its first real output (see chat_streaming's confirmed-start
         hook) — not the optimistic ``save_turn`` insert or ``turn_start``
         publish, both of which fire before the backend produces anything. When
-        that confirmed signal lands for a new turn, this reaps any prior turn
-        rows for the same bot that are still ``ended_at IS NULL`` (zombies that
-        never terminated — dropped bridge, aborted-without-finalize, server
-        restart mid-turn). They are stamped ``status='timeout'``,
+        that confirmed signal lands for a new turn, this reaps prior turn rows
+        for the same bot that are still ``ended_at IS NULL`` (zombies that never
+        terminated — dropped bridge, aborted-without-finalize, server restart
+        mid-turn). They are stamped ``status='timeout'``,
         ``end_reason='timeout'`` and ``ended_at=now`` atomically.
 
         At most one turn per bot is ever open afterward, and the system is
@@ -567,24 +606,38 @@ class TurnLogStore:
         Returns the reaped rows as ``[{"id": ..., "user_id": ...}]`` so the
         caller can emit a ``turn_complete`` per row to clear UI indicators on
         the correct ``{bot_id}:{user_id}`` stream. Excludes ``current_turn_id``
-        so the turn that triggered the reap is never closed by it.
+        so the turn that triggered the reap is never closed by it. Newer open
+        rows are also preserved: agent session queues can let an older turn
+        reach confirmed-start after a newer user message has already been
+        inserted, and that newer queued turn must not be reaped as stale.
         """
         if self.engine is None or not bot_id or not current_turn_id:
             return []
         try:
             with self.engine.begin() as conn:
+                current_created_at = conn.execute(
+                    sa_text(
+                        "SELECT created_at FROM turn_logs"
+                        " WHERE id = :current_id"
+                    ),
+                    {"current_id": current_turn_id},
+                ).scalar_one_or_none()
+                if current_created_at is None:
+                    return []
                 rows = conn.execute(
                     sa_text(
                         "UPDATE turn_logs SET status = 'timeout',"
                         " end_reason = 'timeout', ended_at = :now"
                         " WHERE bot_id = :bid AND ended_at IS NULL"
                         " AND id != :current_id"
+                        " AND created_at < :current_created_at"
                         " RETURNING id, user_id"
                     ),
                     {
                         "now": datetime.now(timezone.utc),
                         "bid": bot_id,
                         "current_id": current_turn_id,
+                        "current_created_at": current_created_at,
                     },
                 ).all()
             return [{"id": r[0], "user_id": r[1]} for r in rows]

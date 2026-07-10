@@ -14,7 +14,11 @@ import uuid
 from typing import Any, AsyncIterator
 
 from ..approval_policies import ApprovalPersistError
-from ..bots import StreamingEmoteFilter, get_bot
+from ..bots import (
+    StreamingEmoteFilter,
+    StreamingTTSScrubber,
+    should_scrub_for_tts,
+)
 # TASK-225: MediaStore is used to (a) resolve new-style ``attachment_ids``
 # into inline image bytes for the LLM call and (b) auto-upload legacy
 # inline ``image_url`` base64 so the asset gets a persistent id.
@@ -895,6 +899,12 @@ class ChatStreamingMixin:
 
         chunk_queue: asyncio.Queue = asyncio.Queue()
         full_response_holder = [""]  # Use list to allow mutation in nested function
+        # TTS scrub decision — computed ONCE here (single source of truth via
+        # should_scrub_for_tts), tracked on the turn, and shared by every
+        # downstream consumer: the turn_start flag, the block-boundary scrubber
+        # that emits `tts_delta` events, and the persisted `tts_scrubbed` column.
+        tts_scrub = should_scrub_for_tts(llm_bawt.bot)
+        tts_scrubber = StreamingTTSScrubber() if tts_scrub else None
         reasoning_holder = [""]  # TASK-301: accumulated model reasoning, persisted display-only
         animation_holder = [None]   # Populated by the embedding classifier (TASK-215)
         tool_context_holder = [""]  # Store tool context from native tool calls
@@ -1137,6 +1147,11 @@ class ChatStreamingMixin:
             "role": "user",
             "content": user_prompt,
             "attachments": turn_start_attachments,
+            # TTS consumers (chat_tts_driver): when true, IGNORE raw text_delta
+            # and synthesize the scrubbed `tts_delta` events instead. Markdown
+            # is scrubbed at block boundaries (not per-token), so audio still
+            # streams — just at paragraph granularity.
+            "tts_scrubbed": tts_scrub,
             "ts": time.time(),
         })
 
@@ -1830,6 +1845,22 @@ class ChatStreamingMixin:
                             "delta": s,
                             "ts": time.time(),
                         })
+                        # Voice-optimized turns: feed the SAME raw text through the
+                        # block-boundary scrubber and emit any completed, scrubbed
+                        # block(s) as `tts_delta`. The raw text_delta above still
+                        # carries markdown for the visual stream; only the audio
+                        # path consumes tts_delta. (No-op for non-voice bots.)
+                        if tts_scrubber is not None:
+                            _tts_block = tts_scrubber.feed(s)
+                            if _tts_block:
+                                _publish_event_direct({
+                                    "_type": "tts_delta",
+                                    "turn_id": turn_log_id,
+                                    "bot_id": bot_id,
+                                    "user_id": user_id,
+                                    "delta": _tts_block,
+                                    "ts": time.time(),
+                                })
 
                     for item in inner:
                         # CONFIRMED turn start. This first item is the backend/
@@ -2312,9 +2343,24 @@ class ChatStreamingMixin:
                             json.dumps(approval_persist_failed)
                             if approval_persist_failed else None
                         ),
+                        tts_scrubbed=tts_scrub,
                     )
                 except Exception as _er_err:
                     log.debug("update_turn end_reason failed for %s: %s", turn_log_id, _er_err)
+                # Voice-optimized turns: flush the scrubber's final (partial)
+                # block as one last tts_delta BEFORE turn_complete, so the TTS
+                # driver speaks the tail then hits EOS. Skipped on cancel/abort.
+                if tts_scrubber is not None and status not in ("cancelled", "aborted"):
+                    _tts_tail = tts_scrubber.flush()
+                    if _tts_tail:
+                        _publish_event_direct({
+                            "_type": "tts_delta",
+                            "turn_id": turn_log_id,
+                            "bot_id": bot_id,
+                            "user_id": user_id,
+                            "delta": _tts_tail,
+                            "ts": time.time(),
+                        })
                 _publish_event_direct({
                     "_type": "turn_complete",
                     "turn_id": turn_log_id,
@@ -2345,9 +2391,9 @@ class ChatStreamingMixin:
                     self._end_generation(cancel_event, done_event, bot_id)
 
         try:
-            # Check if this bot needs emote filtering for TTS
-            bot = get_bot(bot_id)
-            emote_filter = StreamingEmoteFilter() if (bot and bot.voice_optimized) else None
+            # Visual-stream emote filtering shares the SAME decision as TTS
+            # scrubbing (should_scrub_for_tts), computed once above as tts_scrub.
+            emote_filter = StreamingEmoteFilter() if tts_scrub else None
             oc_tool_call_index = 0  # OpenClaw agent backend tool call index
             _upstream_model = [None]  # Actual model reported by agent backend
 
