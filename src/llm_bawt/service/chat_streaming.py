@@ -1790,15 +1790,27 @@ class ChatStreamingMixin:
                     # TASK-286: buffer assistant text and publish it to the
                     # unified Redis stream as coalesced ``text_delta`` events so
                     # a refreshed / secondary client recovers (and keeps
-                    # streaming) the response TEXT alongside tool calls. Gated to
-                    # agent backends (claude-code / openclaw) — the only path
-                    # whose text had no durable/resumable channel. Buffer must
-                    # stay in lock-step with ``_text_chars`` so each delta's
+                    # streaming) the response TEXT alongside tool calls. Buffer
+                    # must stay in lock-step with ``_text_chars`` so each delta's
                     # ``text_offset`` (chars emitted before it) is exact.
+                    #
+                    # TASK-456: this was originally gated to agent backends
+                    # (claude-code / openclaw) — the only path whose text lacked a
+                    # durable/resumable channel. The gate is now removed so NATIVE
+                    # chat bots also publish coalesced text_delta. Two reasons:
+                    #   (1) it gives native bots the same cross-tab / cold-reload
+                    #       text recovery agent bots already have, and
+                    #   (2) it is the token source the server-side per-turn chat
+                    #       TTS driver subscribes to (TASK-453/457).
+                    # Safe against double-render: the frontend routes text_delta
+                    # into a SEPARATE ``partialResponseByUserMsgId`` bucket that
+                    # ``useInFlightTurn`` only surfaces when NO live HTTP stream
+                    # exists (refreshed/secondary tab); the originating tab's HTTP
+                    # body wins (useMessageStreamState.ts:122-146). OQ-1 verified.
                     _text_buf: list[str] = []
 
                     def _flush_text(min_chars: int = 0):
-                        if not is_agent_backend or not _text_buf:
+                        if not _text_buf:
                             return
                         s = "".join(_text_buf)
                         if len(s) < min_chars:
