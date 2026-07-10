@@ -40,20 +40,95 @@ from .parser_patch import install as install_parser_patch
 from .transport import auth_path, scrub_api_key_env, validate_auth_json
 
 
-async def _fetch_codex_models() -> list[str]:
-    """Return live Codex model ids for the authenticated ChatGPT plan.
+# Fallback client version if the codex binary can't be probed. The backend
+# hard-requires the ``client_version`` query param and HIDES models whose
+# ``minimal_client_version`` exceeds it — so reporting a version below what the
+# installed binary actually is would silently drop newer models (e.g. gpt-5.6
+# needs >=0.144.0). We derive the real version from the binary at runtime so the
+# listing always matches what turns can actually run; this is only the floor.
+_CODEX_CLIENT_VERSION_FALLBACK = "0.144.1"
 
-    Source of truth is the Codex SDK ``codex.models()`` call (new
-    ``openai_codex`` package), which reflects the models the logged-in
-    subscription can actually use. Runs here — not in the app — because this
-    container already owns the Codex OAuth bundle. The app reaches it via the
-    ``/models`` health-server route so the UI backend never needs the SDK.
+
+async def _codex_client_version() -> str:
+    """Report the installed codex CLI version to the backend's /models gate.
+
+    Order: explicit ``CODEX_CLIENT_VERSION`` env override → the real binary's
+    ``--version`` (so a host ``npm update @openai/codex`` auto-unlocks newer
+    models with no code/env change) → a sane fallback. Never fake a version the
+    binary can't back up: the backend would list models the 5.5-era binary
+    can't actually run.
     """
-    from openai_codex import AsyncCodex, CodexConfig
+    override = os.getenv("CODEX_CLIENT_VERSION")
+    if override:
+        return override.strip()
+    bin_path = os.getenv("CODEX_BIN") or "codex"
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            bin_path, "--version",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.DEVNULL,
+        )
+        out, _ = await asyncio.wait_for(proc.communicate(), timeout=10.0)
+        # Output looks like "codex-cli 0.141.0" — take the trailing token.
+        token = out.decode().strip().split()[-1]
+        if token and token[0].isdigit():
+            return token
+    except Exception:  # binary missing, timeout, odd output
+        pass
+    return _CODEX_CLIENT_VERSION_FALLBACK
 
-    async with AsyncCodex(config=CodexConfig()) as codex:
-        resp = await codex.models()
-    return [m.id for m in resp.data]
+
+async def _fetch_codex_models() -> list[dict]:
+    """Return live Codex models for the authenticated ChatGPT plan.
+
+    Source of truth is the codex backend's own ``/models`` endpoint — the exact
+    surface the codex CLI hits — reached over plain HTTP with the ChatGPT OAuth
+    bearer. We deliberately do NOT use the SDK: the installed package is
+    ``openai_codex_sdk`` and its ``Codex`` class exposes no ``models()`` method,
+    so the old ``from openai_codex import AsyncCodex`` path always 503'd and the
+    app silently fell back to a stale hardcoded catalog.
+
+    Runs here — not in the app — because this container owns the OAuth bundle.
+    The proxy's ``OpenAIChatGPTAdapter`` handles token load + auto-refresh and
+    supplies the mandatory ``chatgpt-account-id`` header. Returns dicts carrying
+    ``id`` and ``context_window`` (hidden models are filtered out).
+    """
+    import httpx
+
+    from claude_code_bridge.proxy.adapters.openai_chatgpt import (
+        OpenAIChatGPTAdapter,
+    )
+
+    adapter = OpenAIChatGPTAdapter()
+    bearer, base_url = await adapter.authorize()
+    headers = {"Authorization": f"Bearer {bearer}", **adapter.extra_headers()}
+    client_version = await _codex_client_version()
+
+    async with httpx.AsyncClient(timeout=20.0) as client:
+        resp = await client.get(
+            f"{base_url.rstrip('/')}/models",
+            params={"client_version": client_version},
+            headers=headers,
+        )
+    resp.raise_for_status()
+
+    out: list[dict] = []
+    for m in resp.json().get("models", []) or []:
+        if not isinstance(m, dict):
+            continue
+        if m.get("visibility") == "hide":
+            continue
+        slug = m.get("slug") or m.get("id")
+        if not slug:
+            continue
+        out.append(
+            {
+                "id": slug,
+                "context_window": m.get("context_window"),
+                "description": m.get("description") or m.get("display_name") or "",
+            }
+        )
+    return out
 
 
 def _http_response(status: str, body: str) -> bytes:
@@ -93,10 +168,10 @@ async def _health_server(publisher: RedisPublisher, port: int) -> None:
 
             if path.startswith("/models"):
                 try:
-                    ids = await _fetch_codex_models()
-                    body = json.dumps({"models": [{"id": i} for i in ids]})
+                    models = await _fetch_codex_models()
+                    body = json.dumps({"models": models})
                     status = "200 OK"
-                except Exception as e:  # auth expiry, offline, SDK drift
+                except Exception as e:  # auth expiry, offline, backend drift
                     logger.warning("Codex /models fetch failed: %s", e)
                     body = json.dumps({"error": str(e)})
                     status = "503 Service Unavailable"

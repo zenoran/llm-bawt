@@ -162,6 +162,40 @@ def _normalize_model_definition(model_data: dict) -> dict:
         normalized.setdefault("tool_support", "none")
     return normalized
 
+
+def _is_codex_served(model_data: dict) -> bool:
+    """True for models served by the ChatGPT/Codex backend — native codex bridge
+    or the claude-code ``openai_chatgpt/`` proxy path."""
+    mid = str(model_data.get("model_id") or "")
+    if mid.startswith("openai_chatgpt/"):
+        return True
+    return (
+        model_data.get("type") == "agent_backend"
+        and str(model_data.get("backend") or "").lower() == "codex"
+    )
+
+
+def _inject_codex_reference_spec(model_data: dict) -> dict:
+    """Auto-populate reference pricing + context_window for codex-served models.
+
+    Only fills what the user left blank — explicit pricing/context_window always
+    win. Applies to both the native codex bridge and the claude-code
+    ``openai_chatgpt/`` proxy, so a freshly-added codex model shows a (starred,
+    estimated) cost on the pill and gets a real window for usage sanitizing.
+    """
+    if not _is_codex_served(model_data):
+        return model_data
+    from ...model_manager import codex_model_spec
+
+    spec = codex_model_spec(model_data.get("model_id"))
+    if not spec:
+        return model_data
+    if not model_data.get("pricing") and spec.get("pricing"):
+        model_data["pricing"] = dict(spec["pricing"])
+    if not model_data.get("context_window") and spec.get("context_window"):
+        model_data["context_window"] = spec["context_window"]
+    return model_data
+
 @router.get("/v1/models", response_model=ModelsResponse, tags=["OpenAI Compatible"])
 def list_models():
     """List available models (OpenAI-compatible)."""
@@ -339,6 +373,7 @@ def upsert_model_definition(alias: str, request: ModelDefinitionUpsertRequest):
         model_data.update(request.extra)
 
     model_data = _normalize_model_definition(model_data)
+    model_data = _inject_codex_reference_spec(model_data)
 
     row = store.upsert(alias, model_data)
     # Reload catalog so the new model is immediately available

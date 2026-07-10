@@ -928,9 +928,20 @@ class CodexBridge:
                 return usage.get(key, default)
             return default
         try:
+            # OpenAI/Codex ``input_tokens`` is INCLUSIVE of the cached subset
+            # (``cached_input_tokens`` ⊆ ``input_tokens``). The frontend context
+            # pill and cost estimator both SUM input + cache_read + cache_creation
+            # (Anthropic's convention, where those buckets are disjoint), so
+            # passing the raw inclusive value double-counts every cached token —
+            # a fully-cached turn shows ~2× its real size (e.g. 2.62M). Report the
+            # buckets disjoint so the sum equals the true prompt size and cache
+            # reads get billed at the cached rate, not full input.
+            raw_input = int(_g("input_tokens", 0) or 0)
+            cached = int(_g("cached_input_tokens", 0) or 0)
+            fresh_input = max(raw_input - cached, 0)
             return {
-                "input_tokens": int(_g("input_tokens", 0) or 0),
-                "cache_read_tokens": int(_g("cached_input_tokens", 0) or 0),
+                "input_tokens": fresh_input,
+                "cache_read_tokens": cached,
                 "cache_creation_tokens": 0,
                 "output_tokens": int(_g("output_tokens", 0) or 0),
                 "context_window": None,  # filled in by _merge_model_info
