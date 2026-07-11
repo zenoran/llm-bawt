@@ -367,22 +367,23 @@ class BaseLLMBawt(ABC):
     def query(self, prompt: str, plaintext_output: bool = False, stream: bool = True) -> str:
         """Send a query to the LLM and return the response.
         
-        This is the main entry point for queries. It uses the RequestPipeline
-        for modular processing.
-        
+        This is the main entry point for queries. It builds the context
+        messages directly via ``_build_context_messages`` (the sole live
+        assembly path) and executes them, optionally through the tool loop.
+
         Args:
             prompt: User's question/message
             plaintext_output: If True, skip rich formatting
             stream: If True, stream the response
-            
+
         Returns:
             Assistant's response string
         """
         try:
             # Add user message to history first
             self.history_manager.add_message("user", prompt)
-            
-            # Build context and execute via pipeline or direct method
+
+            # Build the outbound context messages (system prompt + history)
             context_messages = self._build_context_messages(prompt)
             
             # Use tool loop if bot has tools enabled (full tools or read-only memory)
