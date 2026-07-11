@@ -22,6 +22,7 @@ from rich.console import Console
 from ..bots import Bot, BotManager
 from ..clients import LLMClient
 from ..runtime_settings import RuntimeSettingsResolver
+from ..config_resolver import ConfigResolver
 from ..mcp_server.client import MemoryClient
 from ..integrations.ha_mcp.client import HomeAssistantMCPClient, HomeAssistantNativeClient
 from ..integrations.newsapi.client import NewsAPIClient
@@ -151,6 +152,13 @@ class BaseLLMBawt(ABC):
         # Initialize bot
         self._init_bot(config)
         self.settings = RuntimeSettingsResolver(config=config, bot=self.bot, bot_id=self.bot_id)
+        # TASK-488: single resolver over scalars (runtime_settings) + bodies
+        # (prompt_templates). Wraps self.settings (shares its cache) so the live
+        # prompt path and the inspector resolve everything through one API with
+        # uniform provenance. Other call sites keep the legacy resolvers.
+        self.config_resolver = ConfigResolver(
+            config=config, bot=self.bot, bot_id=self.bot_id, settings=self.settings
+        )
         
         # Initialize memory and profiles
         self._init_memory(config)
@@ -351,10 +359,10 @@ class BaseLLMBawt(ABC):
         return [msg.to_dict() for msg in self.history_manager.messages]
 
     def _resolve_setting(self, key: str, fallback: Any = None) -> Any:
-        """Resolve a runtime setting for this bot."""
+        """Resolve a runtime setting for this bot (via the unified resolver)."""
         if self.settings is None:
             return fallback
-        return self.settings.resolve(key=key, fallback=fallback)
+        return self.config_resolver.resolve_scalar_value(key=key, fallback=fallback)
 
     def _get_generation_kwargs(self) -> dict[str, Any]:
         """Resolve per-bot generation parameters for LLM client calls."""
@@ -590,8 +598,7 @@ class BaseLLMBawt(ABC):
             "agent_backend", "claude-code",
         )
         if self._tts_mode and not _is_agent_backend:
-            from ..prompt_registry import get_prompt_resolver
-            resolved = get_prompt_resolver(self.config).resolve("chat.tts_output_instructions")
+            resolved = self.config_resolver.resolve_body("chat.tts_output_instructions")
             tts_body = resolved.body if resolved else None
             if tts_body:
                 builder.add_section(
@@ -610,8 +617,7 @@ class BaseLLMBawt(ABC):
         # turns unless the DB body changes). Bot-scoped resolve falls back to the
         # global default; an empty body injects nothing even when the flag is on.
         if _is_agent_backend and bool(self._resolve_setting("agent_global_prompt_enabled", False)):
-            from ..prompt_registry import get_prompt_resolver
-            resolved = get_prompt_resolver(self.config).resolve(
+            resolved = self.config_resolver.resolve_body(
                 "agents.global_prompt", scope_type="bot", scope_id=self.bot_id
             )
             agent_global_body = resolved.body if resolved else None
@@ -672,11 +678,8 @@ class BaseLLMBawt(ABC):
         ]
         settings = []
         for key, fallback in setting_keys:
-            if self.settings is not None:
-                value, source = self.settings.resolve_with_source(key, fallback=fallback)
-            else:
-                value, source = fallback, "code_default"
-            settings.append({"key": key, "value": value, "source": source})
+            rv = self.config_resolver.resolve_scalar(key, fallback=fallback)
+            settings.append({"key": key, "value": rv.value, "source": rv.source})
 
         # Flags that live off the runtime-settings table but still shape a turn,
         # annotated with whether this bot_type actually consumes them.
