@@ -817,24 +817,21 @@ class BaseLLMBawt(ABC):
         # without ever landing in stored history/memory or the cached prefix.
         # Matched on word boundaries so it doesn't trip on substrings inside
         # unrelated words.
+        # TASK-490: bodies come from the registry (chat.response_style.*),
+        # bot-overridable. Keyword detection stays here; only the text moved.
         response_style: str | None = None
         if prompt:
             _p = prompt.lower()
+            _style_key: str | None = None
             if re.search(r"\btldr\b", _p):
-                response_style = (
-                    "Answer as a tight TL;DR: lead with the one-line bottom line, "
-                    "then a few short bullets. No preamble, no filler."
-                )
+                _style_key = "chat.response_style.tldr"
             elif re.search(r"\beli5\b", _p):
-                response_style = (
-                    "Explain simply, as if to a smart person outside this field. "
-                    "Plain words, concrete analogies, no jargon."
-                )
+                _style_key = "chat.response_style.eli5"
             elif re.search(r"\bdeep[ -]?dive\b", _p):
-                response_style = (
-                    "Go thorough: cover the mechanism, trade-offs, edge cases, and "
-                    "end with a recommendation. Depth over brevity."
-                )
+                _style_key = "chat.response_style.deep_dive"
+            if _style_key:
+                resolved = self.config_resolver.resolve_body(_style_key)
+                response_style = resolved.body if resolved else None
 
         # Build final system message
         system_content = builder.build()

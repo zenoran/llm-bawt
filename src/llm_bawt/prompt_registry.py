@@ -176,6 +176,22 @@ def _load_global_recall_guidance() -> str:
     return GLOBAL_SYSTEM_PROMPT
 
 
+# Response-style bodies (TASK-490) — inline keyword-triggered answer shaping,
+# stamped onto the outbound user message (never the cached system prefix).
+RESPONSE_STYLE_TLDR = (
+    "Answer as a tight TL;DR: lead with the one-line bottom line, "
+    "then a few short bullets. No preamble, no filler."
+)
+RESPONSE_STYLE_ELI5 = (
+    "Explain simply, as if to a smart person outside this field. "
+    "Plain words, concrete analogies, no jargon."
+)
+RESPONSE_STYLE_DEEP_DIVE = (
+    "Go thorough: cover the mechanism, trade-offs, edge cases, and "
+    "end with a recommendation. Depth over brevity."
+)
+
+
 def _load_agents_task_execution() -> str:
     from .agent_backends.prompts import TASK_EXECUTION_PROMPT
 
@@ -338,6 +354,30 @@ DEFAULT_PROMPT_DEFINITIONS: dict[str, PromptDefinition] = {
                 "TASK-490: migrated out of a hardcoded Python constant."
             ),
         },
+    ),
+    "chat.response_style.tldr": PromptDefinition(
+        key="chat.response_style.tldr",
+        title="Response Style — TL;DR",
+        category="chat",
+        required_vars=(),
+        loader=lambda: RESPONSE_STYLE_TLDR,
+        metadata={"notes": "Stamped on the user message when 'tldr' keyword fires. TASK-490."},
+    ),
+    "chat.response_style.eli5": PromptDefinition(
+        key="chat.response_style.eli5",
+        title="Response Style — ELI5",
+        category="chat",
+        required_vars=(),
+        loader=lambda: RESPONSE_STYLE_ELI5,
+        metadata={"notes": "Stamped on the user message when 'eli5' keyword fires. TASK-490."},
+    ),
+    "chat.response_style.deep_dive": PromptDefinition(
+        key="chat.response_style.deep_dive",
+        title="Response Style — Deep Dive",
+        category="chat",
+        required_vars=(),
+        loader=lambda: RESPONSE_STYLE_DEEP_DIVE,
+        metadata={"notes": "Stamped on the user message when 'deep dive' keyword fires. TASK-490."},
     ),
     "chat.agent_voice_prefix": PromptDefinition(
         key="chat.agent_voice_prefix",
