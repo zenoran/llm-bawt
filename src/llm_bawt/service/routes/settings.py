@@ -793,12 +793,27 @@ async def patch_bot_profile(slug: str, request: BotProfilePatchRequest):
         "avatar": existing.avatar,
         "default_voice": existing.default_voice,
         "nextcloud_config": existing.nextcloud_config,
-        "bot_type": existing.bot_type,
+        # bot_type intentionally omitted here — it is derived from the final
+        # merged agent_backend below, never copied from the (possibly stale)
+        # stored value. See the derivation note after the field loop.
         "agent_backend": existing.agent_backend,
         "agent_backend_config": existing.agent_backend_config,
     }
     for field_name in request.model_fields_set:
         payload[field_name] = getattr(request, field_name)
+
+    # bot_type is DERIVED from agent_backend (the single source of truth), not
+    # carried over from the stored row (TASK-516). A PATCH that touches an
+    # unrelated field (persona, model) must not resurrect a stale bot_type: if
+    # the existing row was already inconsistent (agent-typed with no backend),
+    # copying its bot_type back in would make _validate_profile_payload reject
+    # the edit before the store could heal it — the exact loop that blocked
+    # nova/mira. Derive from the FINAL merged agent_backend so clearing the
+    # backend in this same PATCH also demotes agent→chat. Only an explicit
+    # bot_type in the request overrides (the store guard still enforces that an
+    # explicit 'agent' has a backend).
+    if "bot_type" not in request.model_fields_set:
+        payload["bot_type"] = normalize_bot_type(None, payload.get("agent_backend"))
 
     return await _persist_bot_profile(payload, create_only=False)
 
