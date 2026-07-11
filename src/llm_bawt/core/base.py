@@ -356,13 +356,23 @@ class BaseLLMBawt(ABC):
             )
 
     def _sec_global_instructions(self, builder: PromptBuilder, prompt: str) -> None:
-        """Section 6: Global behavioral instructions (memory-enabled bots only)."""
+        """Section 6: Global behavioral instructions (memory-enabled bots only).
+
+        TASK-490: body comes from the registry (chat.global_recall_guidance,
+        bot-overridable); the GLOBAL_SYSTEM_PROMPT constant is the default and
+        the safety fallback.
+        """
         if self.bot.requires_memory:
+            resolved = self.config_resolver.resolve_body(
+                "chat.global_recall_guidance", scope_type="bot", scope_id=self.bot_id
+            )
+            body = (resolved.body if resolved else None) or GLOBAL_SYSTEM_PROMPT
+            src = f"registry:{resolved.source}" if resolved else "code_default:GLOBAL_SYSTEM_PROMPT"
             builder.add_section(
                 "global_instructions",
-                GLOBAL_SYSTEM_PROMPT,
+                body,
                 position=SectionPosition.GLOBAL_INSTRUCTIONS,
-                metadata={"source": "code_default:GLOBAL_SYSTEM_PROMPT", "gate": "requires_memory"},
+                metadata={"source": src, "gate": "requires_memory"},
             )
 
     def _init_history(self):

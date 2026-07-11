@@ -169,6 +169,13 @@ def _load_agents_task_spec() -> str:
     return TASK_SPEC_PROMPT
 
 
+def _load_global_recall_guidance() -> str:
+    # Lazy import avoids a core <-> prompt_registry circular import at module load.
+    from .core.prompt_builder import GLOBAL_SYSTEM_PROMPT
+
+    return GLOBAL_SYSTEM_PROMPT
+
+
 def _load_agents_task_execution() -> str:
     from .agent_backends.prompts import TASK_EXECUTION_PROMPT
 
@@ -316,6 +323,21 @@ DEFAULT_PROMPT_DEFINITIONS: dict[str, PromptDefinition] = {
         category="chat",
         required_vars=(),
         loader=lambda: TTS_OUTPUT_INSTRUCTIONS,
+    ),
+    "chat.global_recall_guidance": PromptDefinition(
+        key="chat.global_recall_guidance",
+        title="Global Recall / Cross-Bot Memory Guidance",
+        category="chat",
+        required_vars=(),
+        loader=_load_global_recall_guidance,
+        metadata={
+            "notes": (
+                "Injected into the system prompt of every memory-enabled bot "
+                "(gate: requires_memory). Default is the GLOBAL_SYSTEM_PROMPT "
+                "constant; override per bot to change recall/cross-bot guidance. "
+                "TASK-490: migrated out of a hardcoded Python constant."
+            ),
+        },
     ),
     "chat.agent_voice_prefix": PromptDefinition(
         key="chat.agent_voice_prefix",
