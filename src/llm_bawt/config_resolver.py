@@ -29,6 +29,7 @@ from .prompt_registry import (
     get_prompt_resolver,
 )
 from .runtime_settings import RuntimeSettingsResolver
+from .setting_definitions import SETTING_DEFINITIONS
 
 # Provenance labels, shared across scalars and bodies so callers see one
 # vocabulary regardless of which store answered.
@@ -76,6 +77,9 @@ class ConfigResolver:
     ):
         self.config = config
         self.bot_id = (bot_id or getattr(bot, "slug", "") or "").strip().lower() or None
+        # Legacy agent_backend_config blob — the compat fallback for typed
+        # settings promoted out of it (TASK-491), until the blob is retired.
+        self._agent_backend_config = dict(getattr(bot, "agent_backend_config", {}) or {})
         # Reuse the caller's RuntimeSettingsResolver when provided (shares its
         # 5s cache); otherwise build one for this bot.
         self._settings = settings or RuntimeSettingsResolver(
@@ -120,6 +124,39 @@ class ConfigResolver:
     ) -> Any:
         """Convenience: the value only (back-compat with ``.resolve``)."""
         return self.resolve_scalar(key, fallback=fallback, request_overrides=request_overrides).value
+
+    # -- typed config settings (TASK-491 compat shim) -----------------------
+    def resolve_config_setting(self, key: str) -> ResolvedValue:
+        """Resolve a typed setting promoted from ``agent_backend_config``.
+
+        Precedence: runtime_settings (bot > global) -> legacy
+        ``agent_backend_config`` blob -> declared default. During the migration
+        window both the typed row and the blob may exist; the typed row wins so
+        edits made through the new surface take effect, while the blob keeps
+        untouched bots working (and the bridge, which still reads the blob).
+        """
+        definition = SETTING_DEFINITIONS.get(key)
+        default = definition.default if definition is not None else None
+
+        # 1) typed runtime_settings row (bot > global)
+        value, source = self._settings.resolve_with_source(key, fallback=None)
+        if source in (SOURCE_BOT, SOURCE_GLOBAL, SOURCE_REQUEST):
+            scope_type = "bot" if source == SOURCE_BOT else "global"
+            scope_id = (self.bot_id or "") if source == SOURCE_BOT else "*"
+            return ResolvedValue(key=key, value=value, source=source,
+                                 scope_type=scope_type, scope_id=scope_id)
+
+        # 2) legacy agent_backend_config blob fallback
+        if key in self._agent_backend_config:
+            return ResolvedValue(
+                key=key, value=self._agent_backend_config[key],
+                source="agent_backend_config",
+                scope_type="bot", scope_id=(self.bot_id or ""),
+            )
+
+        # 3) declared default
+        return ResolvedValue(key=key, value=default, source=SOURCE_DEFAULT,
+                             scope_type="global", scope_id="*")
 
     # -- bodies (prompt_templates) ------------------------------------------
     def resolve_body(

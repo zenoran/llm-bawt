@@ -712,42 +712,44 @@ class BaseLLMBawt(ABC):
             rv = self.config_resolver.resolve_scalar(key, fallback=fallback)
             settings.append({"key": key, "value": rv.value, "source": rv.source})
 
-        # Flags that live off the runtime-settings table but still shape a turn,
-        # annotated with whether this bot_type actually consumes them.
-        agent_cfg = dict(getattr(self.bot, "agent_backend_config", {}) or {})
-        flags = [
-            {
-                "key": "include_summaries",
-                "value": self._include_summaries,
-                "storage": "request_flag / bot_profiles",
-                "applies_to": ["chat"],
-                "consumed": (not is_agent),
-                "note": (
-                    "IGNORED on this bot: agent bots early-return before the "
-                    "chat history branch (base.py) that reads it."
-                    if is_agent else "Gates summary-row inclusion in chat history."
-                ),
-            },
-            {
-                "key": "seed_summary_on_new_session",
-                "value": agent_cfg.get("seed_summary_on_new_session", False),
-                "storage": "agent_backend_config (JSON blob)",
-                "applies_to": ["agent"],
-                "consumed": is_agent,
-                "note": (
-                    "Read by the bridge on new-session creation to seed a summary."
-                    if is_agent else "N/A for chat bots (bridge-only, agent path)."
-                ),
-            },
-            {
-                "key": "tts_mode",
-                "value": self._tts_mode,
-                "storage": "request_flag",
-                "applies_to": ["chat", "agent"],
-                "consumed": True,
-                "note": "chat: system-prompt TTS section; agent: user-message voice prefix.",
-            },
-        ]
+        # Typed settings + flags, DRIVEN BY THE REGISTRY (TASK-491/492). Each is
+        # annotated with whether this bot_type actually consumes it — the exact
+        # signal that answers "is this switch inert on this bot?" (the Nova case).
+        from ..setting_definitions import SETTING_DEFINITIONS
+
+        flags = []
+        for key, d in SETTING_DEFINITIONS.items():
+            consumed = bot_type in d.applies_to
+            if key == "include_summaries":
+                # per-turn request flag, not stored — reflect the live value
+                value, source = self._include_summaries, "request_flag"
+            else:
+                rv = self.config_resolver.resolve_config_setting(key)
+                value, source = rv.value, rv.source
+            note = d.help
+            if not consumed:
+                note = f"NOT CONSUMED on this {bot_type} bot (applies_to={list(d.applies_to)}). " + note
+            flags.append({
+                "key": key,
+                "value": value,
+                "source": source,
+                "storage": d.storage,
+                "applies_to": list(d.applies_to),
+                "consumed": consumed,
+                "label": d.label,
+                "note": note,
+            })
+        # tts_mode is a per-turn request flag, not a stored setting.
+        flags.append({
+            "key": "tts_mode",
+            "value": self._tts_mode,
+            "source": "request_flag",
+            "storage": "request_flag",
+            "applies_to": ["chat", "agent"],
+            "consumed": True,
+            "label": "TTS mode",
+            "note": "chat: system-prompt TTS section; agent: user-message voice prefix.",
+        })
 
         # Post-app augmentation layers appended downstream by the bridge — not
         # part of the app-assembled prompt above, surfaced so the picture is whole.
