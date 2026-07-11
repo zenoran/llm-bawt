@@ -224,10 +224,14 @@ def _get_extraction_client(config: Config) -> Any:
         return _llm_client
     
     # Check if there's a configured extraction model (global runtime setting,
-    # TASK-522; falls back to its declared default when unset).
+    # TASK-522; job-specific first, then the shared maintenance/default job
+    # model). Empty falls through to the model-discovery heuristic below.
     from ..runtime_settings import resolve_job_model
 
-    extraction_model = resolve_job_model(config, "extraction_model")
+    extraction_model = (
+        resolve_job_model(config, "extraction_model")
+        or resolve_job_model(config, "maintenance_model")
+    )
     
     if not extraction_model:
         # Try to find a suitable model (prefer smaller GGUF or OpenAI)

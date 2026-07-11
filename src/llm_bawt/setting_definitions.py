@@ -142,36 +142,39 @@ SETTING_DEFINITIONS: dict[str, SettingDefinition] = {
     # --- background-job models (TASK-522): global-only, data-driven ----------
     # System-wide model selection for the 3 LLM-using background jobs
     # (summarization, extraction, profile maintenance). Resolved at GLOBAL scope
-    # only — no per-bot override — via resolve_job_model(); the per-call-site
-    # cascade order is preserved. These retire the env/config vars
-    # SUMMARIZATION_MODEL / EXTRACTION_MODEL / MAINTENANCE_MODEL /
-    # PROFILE_MAINTENANCE_MODEL. maintenance_model is kept as the shared
-    # cross-job fallback (option (a) of the task) so the old cascade semantics
-    # survive: job-specific model -> maintenance_model -> summarization_model.
-    "summarization_model": SettingDefinition(
-        key="summarization_model",
+    # only — no per-bot override — via resolve_job_model(). Cascade at every call
+    # site is JOB-SPECIFIC FIRST, then the shared maintenance_model fallback:
+    #     <job>_model -> maintenance_model
+    # so each job's own picker actually controls that job, and maintenance_model
+    # is the single "default for all jobs" knob. The terminal default lives on
+    # maintenance_model (dolphin-qwen-3b), so an all-unset instance still runs.
+    # These retire the env/config vars SUMMARIZATION_MODEL / EXTRACTION_MODEL /
+    # MAINTENANCE_MODEL / PROFILE_MAINTENANCE_MODEL (option (a): keep the shared
+    # maintenance knob).
+    "maintenance_model": SettingDefinition(
+        key="maintenance_model",
         type="str",
         default="dolphin-qwen-3b",
         applies_to=BOT_TYPES_ALL,
         storage=STORAGE_RUNTIME_SETTING,
-        label="History summarization model",
-        help="Model alias the history-summarization job runs. Also the final "
-             "fallback for extraction and profile maintenance when those are unset.",
-        legacy_keys=("SUMMARIZATION_MODEL",),
+        label="Default job model (all jobs)",
+        help="Default model for every background job. Each job (summarization, "
+             "extraction, profile maintenance) inherits this unless it has its "
+             "own model set below. This is the last resort, so it always has a "
+             "value — an all-unset instance runs on it.",
+        legacy_keys=("MAINTENANCE_MODEL",),
         ui_widget="model",
     ),
-    "maintenance_model": SettingDefinition(
-        key="maintenance_model",
+    "summarization_model": SettingDefinition(
+        key="summarization_model",
         type="str",
         default=None,
         applies_to=BOT_TYPES_ALL,
         storage=STORAGE_RUNTIME_SETTING,
-        label="Default maintenance model",
-        help="Shared fallback model for background maintenance jobs. Extraction "
-             "and profile maintenance fall back to this when their own model is "
-             "unset, before finally falling back to the summarization model. "
-             "Empty = use the summarization model.",
-        legacy_keys=("MAINTENANCE_MODEL",),
+        label="History summarization model",
+        help="Model the history-summarization job runs. Unset = inherit the "
+             "default job model (maintenance_model).",
+        legacy_keys=("SUMMARIZATION_MODEL",),
         ui_widget="model",
     ),
     "extraction_model": SettingDefinition(
@@ -181,8 +184,8 @@ SETTING_DEFINITIONS: dict[str, SettingDefinition] = {
         applies_to=BOT_TYPES_ALL,
         storage=STORAGE_RUNTIME_SETTING,
         label="Memory extraction model",
-        help="Model alias the memory-extraction job runs. Empty = fall back to "
-             "the maintenance model, then the summarization model.",
+        help="Model the memory-extraction job runs. Unset = inherit the default "
+             "job model (maintenance_model).",
         legacy_keys=("EXTRACTION_MODEL",),
         ui_widget="model",
     ),
@@ -193,8 +196,8 @@ SETTING_DEFINITIONS: dict[str, SettingDefinition] = {
         applies_to=BOT_TYPES_ALL,
         storage=STORAGE_RUNTIME_SETTING,
         label="Profile maintenance model",
-        help="Model alias the profile-maintenance job runs. Empty = fall back to "
-             "the maintenance model, then the summarization model.",
+        help="Model the profile-maintenance job runs. Unset = inherit the "
+             "default job model (maintenance_model).",
         legacy_keys=("PROFILE_MAINTENANCE_MODEL",),
         ui_widget="model",
     ),

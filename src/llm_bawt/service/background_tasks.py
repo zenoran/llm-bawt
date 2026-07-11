@@ -133,9 +133,8 @@ class BackgroundTasksMixin:
 
         requested_model = (
             task.payload.get("model")
-            or resolve_job_model(self.config, "maintenance_model")
             or resolve_job_model(self.config, "profile_maintenance_model")
-            or resolve_job_model(self.config, "summarization_model")
+            or resolve_job_model(self.config, "maintenance_model")
         )
         try:
             model_to_use, _ = self._resolve_request_model(
@@ -414,8 +413,8 @@ class BackgroundTasksMixin:
         bot_id = task.bot_id or self._default_bot
         requested_model = (
             task.payload.get("model")
-            or resolve_job_model(self.config, "maintenance_model")
             or resolve_job_model(self.config, "summarization_model")
+            or resolve_job_model(self.config, "maintenance_model")
         )
         use_heuristic_fallback = bool(task.payload.get("use_heuristic_fallback", True))
         max_tokens_per_chunk = int(task.payload.get("max_tokens_per_chunk", 4000))

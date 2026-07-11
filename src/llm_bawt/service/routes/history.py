@@ -237,8 +237,8 @@ def _build_summary_callable(service, bot_id: str, user_id: str = "system", model
 
     requested_model = (
         model
-        or resolve_job_model(service.config, "maintenance_model")
         or resolve_job_model(service.config, "summarization_model")
+        or resolve_job_model(service.config, "maintenance_model")
     )
     model_alias = None
     client = None

@@ -445,7 +445,6 @@ class InstanceManagerMixin:
             model_override
             or resolve_job_model(self.config, "extraction_model")
             or resolve_job_model(self.config, "maintenance_model")
-            or resolve_job_model(self.config, "summarization_model")
         )
 
         # Resolve the alias first so the keyed pool is keyed by the actual

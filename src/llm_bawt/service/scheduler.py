@@ -476,14 +476,13 @@ class JobScheduler:
 
             requested_model = (
                 job_config.get("model")
-                or resolve_job_model(config, "maintenance_model")
                 or resolve_job_model(config, "summarization_model")
+                or resolve_job_model(config, "maintenance_model")
             )
             preferred_model = (
                 requested_model
                 or resolve_job_model(config, "extraction_model")
                 or resolve_job_model(config, "maintenance_model")
-                or resolve_job_model(config, "summarization_model")
             )
             model_alias = None
             resolve_model = getattr(self.task_processor, "_resolve_request_model", None)
