@@ -50,6 +50,8 @@ SESSION_PREFIX = "claude-code:"
 # TASK-445: session-seed constants.
 # agent_backend_config flag that gates history-summary seeding on new sessions.
 SEED_SETTING_KEY = "seed_summary_on_new_session"
+# TASK-492: unified session-memory-continuity key (supersedes SEED_SETTING_KEY).
+CONTINUITY_SETTING_KEY = "session_memory_continuity"
 
 # TASK-490: MCP tool context body. Canonical default lives in the app registry
 # (agents.mcp_tool_context_template); the bridge cannot import llm_bawt, so it
@@ -649,10 +651,30 @@ class ClaudeCodeBridge:
         return rendered
 
     async def _get_seed_setting(self, bot_id: str) -> bool:
-        """Read the per-bot ``seed_summary_on_new_session`` flag from
-        agent_backend_config. Defaults to False (off) when absent or on error."""
+        """Resolve whether to seed a new session with history (TASK-492).
+
+        Prefers the UNIFIED typed setting ``session_memory_continuity`` (bot-
+        scoped runtime_settings, via GET /v1/settings). Falls back to the legacy
+        ``agent_backend_config.seed_summary_on_new_session`` for any bot without
+        the typed row. Defaults False (off) on error/absence. Only called on new-
+        session creation, so the extra lookup is off the hot path.
+        """
         if not self._app_api_url or not bot_id:
             return False
+        # 1) Unified typed setting.
+        try:
+            async with httpx.AsyncClient(timeout=5) as client:
+                resp = await client.get(
+                    f"{self._app_api_url}/v1/settings",
+                    params={"scope_type": "bot", "scope_id": bot_id},
+                )
+                resp.raise_for_status()
+                for item in resp.json().get("settings", []):
+                    if item.get("key") == CONTINUITY_SETTING_KEY:
+                        return bool(item.get("value"))
+        except Exception as e:
+            logger.warning("Failed to read continuity setting for %s: %s", bot_id, e)
+        # 2) Legacy fallback: seed flag in agent_backend_config.
         try:
             async with httpx.AsyncClient(timeout=5) as client:
                 resp = await client.get(f"{self._app_api_url}/v1/bots")
