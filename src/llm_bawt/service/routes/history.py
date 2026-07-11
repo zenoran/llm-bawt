@@ -1740,13 +1740,14 @@ def build_context_seed(bot_id: str, model: str | None, service) -> dict:
     max_output = int(service.config.get_model_max_tokens(model_alias) or 4096)
     budget = max(0, ctx_window - max_output) if ctx_window > 0 else 0
 
-    # TASK-493: seed content comes from the ONE shared handler
+    # TASK-493/518: seed content comes from the ONE shared handler
     # (HistoryManager.build_context_payload) — the same function the chat turn
-    # path uses. We are building a seed because the trigger
-    # (maybe_build_session_seed) already decided continuity is on, so pass
-    # continuity=True; history_scope still governs whether summaries ride along.
-    # delivery="seed" -> system rows dropped (the SDK injects its own system
-    # prompt every turn).
+    # path uses. maybe_build_session_seed already decided we should seed (scope
+    # != "none"); history_scope decodes into two INDEPENDENT flags so the seed
+    # can be recent-only, summary-only (dense), or both. delivery="seed" ->
+    # system rows dropped (the SDK injects its own system prompt every turn).
+    from ...utils.history import scope_flags
+
     try:
         scope = str(
             llm_bawt.config_resolver.resolve_config_setting("history_scope").value
@@ -1754,9 +1755,10 @@ def build_context_seed(bot_id: str, model: str | None, service) -> dict:
         )
     except Exception:
         scope = "inline+summaries"
+    include_history, include_summaries = scope_flags(scope)
     payload = llm_bawt.history_manager.build_context_payload(
-        continuity=True,
-        history_scope=scope,
+        include_history=include_history,
+        include_summaries=include_summaries,
         delivery="seed",
         max_tokens=budget,
     )

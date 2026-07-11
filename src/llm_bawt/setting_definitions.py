@@ -51,17 +51,20 @@ SETTING_DEFINITIONS: dict[str, SettingDefinition] = {
         storage=STORAGE_RUNTIME_SETTING,
         label="Carry prior conversation into context",
         help=(
-            "One intent, resolved per bot_type: chat bots include summary rows in "
-            "history assembly; agent bots seed a fresh SDK session with a summary. "
-            "Supersedes include_summaries (chat) and seed_summary_on_new_session (agent)."
+            "Coarse master gate — a MIRROR of history_scope (TASK-518): true iff "
+            "history_scope != 'none' (i.e. at least one of inline history / "
+            "summaries is on). Kept as its own key so legacy readers (bridge seed "
+            "gate, migrations) need no change. UI writes it derived; history_scope "
+            "is the real source of truth for what gets carried."
         ),
         legacy_keys=("include_summaries", "seed_summary_on_new_session"),
     ),
-    # --- history scope: the summaries sub-choice of continuity (TASK-493) -----
+    # --- history scope: the two independent carry-bits (TASK-493/518) ---------
     # NOTE: modelled as a constrained str until the registry grows a real "enum"
-    # type. Allowed values: "inline+summaries" (default) | "inline". Orthogonal to
-    # session_memory_continuity: continuity is the on/off gate, history_scope is
-    # *what* the carried context contains when continuity is on.
+    # type. It encodes TWO INDEPENDENT bits, substring-tested: include_history =
+    # "inline" in scope, include_summaries = "summaries" in scope. The four
+    # canonical values are the full cross-product; there is no coupling between
+    # the two axes (see utils.history.scope_flags).
     "history_scope": SettingDefinition(
         key="history_scope",
         type="str",
@@ -70,10 +73,11 @@ SETTING_DEFINITIONS: dict[str, SettingDefinition] = {
         storage=STORAGE_RUNTIME_SETTING,
         label="History scope",
         help=(
-            "When continuity is on, what prior context is carried: "
-            "'inline+summaries' (recent messages plus rolling summaries) or "
-            "'inline' (recent messages only, no summaries). "
-            "Absorbs the summaries half of the legacy include_summaries flag."
+            "What prior context is carried, as two independent bits: "
+            "'inline+summaries' (recent messages + rolling summaries), "
+            "'inline' (recent messages only), "
+            "'summaries' (dense summary-only, no raw messages), or "
+            "'none' (carry nothing). Absorbs the legacy include_summaries flag."
         ),
         legacy_keys=("include_summaries",),
     ),

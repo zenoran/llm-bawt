@@ -74,6 +74,24 @@ class ContextPayload:
         return self.summary_messages + self.regular_messages
 
 
+def scope_flags(scope: str | None) -> tuple[bool, bool]:
+    """Decode a ``history_scope`` enum into two independent booleans (TASK-518).
+
+    Returns ``(include_history, include_summaries)``. The scope is a set of bits
+    expressed as a string; membership is substring-tested so the four canonical
+    values map cleanly:
+
+        "inline+summaries" -> (True,  True)   recent messages + rolling summaries
+        "inline"           -> (True,  False)  recent messages only
+        "summaries"        -> (False, True)   dense summary-only (no raw messages)
+        "none"             -> (False, False)  carry nothing (cold turn)
+
+    An empty/unknown scope falls back to the registry default (both on).
+    """
+    s = scope or "inline+summaries"
+    return ("inline" in s, "summaries" in s)
+
+
 def estimate_tokens(text: str) -> int:
     """Rough token estimate for a text string.
 
@@ -381,18 +399,25 @@ class HistoryManager:
     def build_context_payload(
         self,
         *,
-        continuity: bool,
-        history_scope: str = "inline+summaries",
+        include_history: bool = True,
+        include_summaries: bool = True,
         delivery: str = "inline",
         max_tokens: int = 0,
     ) -> ContextPayload:
-        """The ONE context-assembly handler (TASK-493).
+        """The ONE context-assembly handler (TASK-493/518).
 
         Decides *what* prior context a conversation gets, identically for chat
         turns and agent seeds. Wraps the shared assembler ``get_context_messages``
-        and categorises its output into buckets, applying the single summary gate:
+        and categorises its output into buckets. The two carried buckets are
+        gated by two INDEPENDENT flags — there is no coupling between them:
 
-            summaries included  iff  continuity AND history_scope == "inline+summaries"
+            regular (inline) messages  included iff  include_history
+            summary rows               included iff  include_summaries
+
+        Both may be on (recent + summaries), either alone (recent-only, or the
+        dense summary-only seed), or both off (carry nothing — a cold turn). The
+        two flags come from the ``history_scope`` enum at the call site:
+        ``"inline" in scope`` and ``"summaries" in scope`` respectively.
 
         System-row handling is NOT decided here — the caller reads the view that
         matches its delivery (``inline_history`` for chat, ``seed_messages`` for a
@@ -401,13 +426,11 @@ class HistoryManager:
         are always separated so either delivery can compose correctly).
 
         Args:
-            continuity: master gate — carry prior context at all.
-            history_scope: "inline+summaries" (default) or "inline" (no summaries).
+            include_history: carry raw recent messages (regular_messages bucket).
+            include_summaries: carry rolling summaries (summary_messages bucket).
             delivery: "inline" (chat) or "seed" (agent) — documentary only.
             max_tokens: token budget passed through to ``get_context_messages``.
         """
-        include_summaries = bool(continuity) and history_scope == "inline+summaries"
-
         payload = ContextPayload()
         for msg in self.get_context_messages(max_tokens=max_tokens):
             role = getattr(msg, "role", "")
@@ -421,7 +444,8 @@ class HistoryManager:
                 else:
                     payload.system_messages.append(msg)
                 continue
-            payload.regular_messages.append(msg)
+            if include_history:
+                payload.regular_messages.append(msg)
         return payload
 
     def _format_time_ago(self, timestamp: float) -> str:

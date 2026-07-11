@@ -30,7 +30,7 @@ from ..search import get_search_client, SearchClient
 from ..tools import get_tools_prompt, get_tools_list, query_with_tools
 from ..utils.config import Config
 from ..utils.paths import resolve_log_dir
-from ..utils.history import HistoryManager, Message
+from ..utils.history import HistoryManager, Message, scope_flags
 from ..adapters import get_adapter, ModelAdapter
 from .prompt_builder import GLOBAL_SYSTEM_PROMPT, PromptBuilder, SectionPosition
 from .prompt_manifest import PROMPT_MANIFEST, STABLE, PER_TURN
@@ -955,12 +955,14 @@ class BaseLLMBawt(ABC):
                 # Skip 'summary' role entirely
             messages.extend(ha_msgs[-6:])
         else:
-            # TASK-493: chat history assembly goes through the ONE shared handler
-            # (build_context_payload) — the same function the agent seed path uses.
-            # continuity + history_scope decide summary inclusion identically for
-            # both bot types. The legacy per-request include_summaries flag is a
-            # compat shim: it can only turn summaries OFF for this turn (scope ->
-            # inline), never force them on when continuity/scope exclude them.
+            # TASK-493/518: chat history assembly goes through the ONE shared
+            # handler (build_context_payload) — the same function the agent seed
+            # path uses. history_scope decodes into two INDEPENDENT flags
+            # (include_history, include_summaries); continuity is the coarse master
+            # (a mirror of scope != "none"), ANDed in so a legacy row that turned
+            # continuity off still carries nothing. The legacy per-request
+            # include_summaries flag is a compat shim: it can only force summaries
+            # OFF for this turn, never on.
             continuity = bool(
                 self.config_resolver.resolve_config_setting(
                     "session_memory_continuity"
@@ -970,11 +972,12 @@ class BaseLLMBawt(ABC):
                 self.config_resolver.resolve_config_setting("history_scope").value
                 or "inline+summaries"
             )
-            if not self._include_summaries:
-                scope = "inline"
+            include_history, include_summaries = scope_flags(scope)
+            include_history = include_history and continuity
+            include_summaries = include_summaries and continuity and self._include_summaries
             payload = self.history_manager.build_context_payload(
-                continuity=continuity,
-                history_scope=scope,
+                include_history=include_history,
+                include_summaries=include_summaries,
                 delivery="inline",
                 max_tokens=max_context_tokens,
             )
