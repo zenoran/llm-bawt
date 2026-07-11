@@ -3,6 +3,7 @@ import json
 import time
 import logging
 import uuid
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Callable, Any
 
 from ..clients.base import LLMClient
@@ -14,6 +15,63 @@ if TYPE_CHECKING:
     from ..memory.postgresql import PostgreSQLShortTermManager as ShortTermMemoryManager
 
 logger = logging.getLogger(__name__)
+
+# A role='system' row that carries tool-execution evidence rather than the
+# persona/system prompt. Detected by content prefix so the two are separable in
+# the context payload (chat keeps these; the plain system row is discarded by
+# both delivery modes). Keep in sync with core/base.py's inline check.
+_TOOL_RESULT_PREFIXES = ("[Tool Results]", "[Tools used:")
+
+
+def _is_tool_result_system(msg) -> bool:
+    if getattr(msg, "role", "") != "system":
+        return False
+    content = getattr(msg, "content", "") or ""
+    return content.startswith(_TOOL_RESULT_PREFIXES)
+
+
+@dataclass
+class ContextPayload:
+    """The ONE context-assembly result (TASK-493).
+
+    Single source of truth for *what* prior context a conversation gets — for
+    BOTH chat turns and agent session-seeds. The two orthogonal user controls
+    resolve here identically for every bot_type:
+
+    - ``continuity`` (bool): carry prior context at all.
+    - ``history_scope`` ("inline+summaries" | "inline"): whether summaries are
+      part of it.
+
+    Delivery (chat inline vs agent seed) is NOT decided here — it is expressed by
+    which composed view the caller reads (``inline_history`` vs ``seed_messages``).
+    The buckets are kept separate so each delivery composes its own shape without
+    re-deriving the summary gate. ``summary_messages`` is already gated: it is
+    empty when summaries are excluded.
+    """
+
+    system_messages: list = field(default_factory=list)       # plain persona/system rows
+    summary_messages: list = field(default_factory=list)       # already gated (empty if excluded)
+    tool_result_messages: list = field(default_factory=list)   # role=system tool-evidence rows
+    regular_messages: list = field(default_factory=list)       # user / assistant
+
+    @property
+    def inline_history(self) -> list:
+        """Rows a CHAT turn appends after its own system-prompt builder.
+
+        Order preserves what the pre-refactor loop produced: tool-result system
+        rows (hoisted to the front by ``get_context_messages``), then summaries,
+        then the regular conversation. The plain persona system row is omitted —
+        the chat path builds its own.
+        """
+        return self.tool_result_messages + self.summary_messages + self.regular_messages
+
+    @property
+    def seed_messages(self) -> list:
+        """Rows an AGENT cold-start seed carries: summaries + conversation, no
+        system rows at all (the SDK injects its own byte-stable system prompt —
+        TASK-288). Matches the pre-refactor ``role != 'system'`` strip.
+        """
+        return self.summary_messages + self.regular_messages
 
 
 def estimate_tokens(text: str) -> int:
@@ -320,6 +378,52 @@ class HistoryManager:
 
         return system_messages + included_summaries + included_droppable + protected
     
+    def build_context_payload(
+        self,
+        *,
+        continuity: bool,
+        history_scope: str = "inline+summaries",
+        delivery: str = "inline",
+        max_tokens: int = 0,
+    ) -> ContextPayload:
+        """The ONE context-assembly handler (TASK-493).
+
+        Decides *what* prior context a conversation gets, identically for chat
+        turns and agent seeds. Wraps the shared assembler ``get_context_messages``
+        and categorises its output into buckets, applying the single summary gate:
+
+            summaries included  iff  continuity AND history_scope == "inline+summaries"
+
+        System-row handling is NOT decided here — the caller reads the view that
+        matches its delivery (``inline_history`` for chat, ``seed_messages`` for a
+        seed). ``delivery`` is accepted for call-site clarity and future use; it
+        does not change the buckets (both plain-system and tool-result-system rows
+        are always separated so either delivery can compose correctly).
+
+        Args:
+            continuity: master gate — carry prior context at all.
+            history_scope: "inline+summaries" (default) or "inline" (no summaries).
+            delivery: "inline" (chat) or "seed" (agent) — documentary only.
+            max_tokens: token budget passed through to ``get_context_messages``.
+        """
+        include_summaries = bool(continuity) and history_scope == "inline+summaries"
+
+        payload = ContextPayload()
+        for msg in self.get_context_messages(max_tokens=max_tokens):
+            role = getattr(msg, "role", "")
+            if role == "summary":
+                if include_summaries:
+                    payload.summary_messages.append(msg)
+                continue
+            if role == "system":
+                if _is_tool_result_system(msg):
+                    payload.tool_result_messages.append(msg)
+                else:
+                    payload.system_messages.append(msg)
+                continue
+            payload.regular_messages.append(msg)
+        return payload
+
     def _format_time_ago(self, timestamp: float) -> str:
         """Format a timestamp as a human-readable relative time."""
         import time

@@ -937,13 +937,12 @@ class BaseLLMBawt(ABC):
                 )
                 max_context_tokens = ctx_window - max_output
 
-        history = self.history_manager.get_context_messages(
-            max_tokens=max_context_tokens
-        )
-
         if self._ha_mode:
             # HA-mode: drop summaries, keep only last 6 user/assistant/tool-result msgs.
             # Device commands are stateless — long history causes hallucinated tool calls.
+            history = self.history_manager.get_context_messages(
+                max_tokens=max_context_tokens
+            )
             ha_msgs = []
             for msg in history:
                 if msg.role in ("user", "assistant"):
@@ -956,18 +955,30 @@ class BaseLLMBawt(ABC):
                 # Skip 'summary' role entirely
             messages.extend(ha_msgs[-6:])
         else:
-            for msg in history:
-                if msg.role == "summary" and not self._include_summaries:
-                    continue
-                if msg.role in ("user", "assistant", "summary"):
-                    messages.append(msg)
-                elif msg.role == "system" and msg.content and (
-                    msg.content.startswith("[Tool Results]")
-                    or msg.content.startswith("[Tools used:")
-                ):
-                    # Include tool-result system messages so the LLM sees
-                    # evidence that past device actions required real tool calls.
-                    messages.append(msg)
+            # TASK-493: chat history assembly goes through the ONE shared handler
+            # (build_context_payload) — the same function the agent seed path uses.
+            # continuity + history_scope decide summary inclusion identically for
+            # both bot types. The legacy per-request include_summaries flag is a
+            # compat shim: it can only turn summaries OFF for this turn (scope ->
+            # inline), never force them on when continuity/scope exclude them.
+            continuity = bool(
+                self.config_resolver.resolve_config_setting(
+                    "session_memory_continuity"
+                ).value
+            )
+            scope = str(
+                self.config_resolver.resolve_config_setting("history_scope").value
+                or "inline+summaries"
+            )
+            if not self._include_summaries:
+                scope = "inline"
+            payload = self.history_manager.build_context_payload(
+                continuity=continuity,
+                history_scope=scope,
+                delivery="inline",
+                max_tokens=max_context_tokens,
+            )
+            messages.extend(payload.inline_history)
 
         # TASK-288: stamp the inline response-style directive onto the OUTBOUND
         # COPY of the latest user message. We replace the list entry with a new

@@ -57,6 +57,26 @@ SETTING_DEFINITIONS: dict[str, SettingDefinition] = {
         ),
         legacy_keys=("include_summaries", "seed_summary_on_new_session"),
     ),
+    # --- history scope: the summaries sub-choice of continuity (TASK-493) -----
+    # NOTE: modelled as a constrained str until the registry grows a real "enum"
+    # type. Allowed values: "inline+summaries" (default) | "inline". Orthogonal to
+    # session_memory_continuity: continuity is the on/off gate, history_scope is
+    # *what* the carried context contains when continuity is on.
+    "history_scope": SettingDefinition(
+        key="history_scope",
+        type="str",
+        default="inline+summaries",
+        applies_to=BOT_TYPES_ALL,
+        storage=STORAGE_RUNTIME_SETTING,
+        label="History scope",
+        help=(
+            "When continuity is on, what prior context is carried: "
+            "'inline+summaries' (recent messages plus rolling summaries) or "
+            "'inline' (recent messages only, no summaries). "
+            "Absorbs the summaries half of the legacy include_summaries flag."
+        ),
+        legacy_keys=("include_summaries",),
+    ),
     # --- promoted from agent_backend_config JSON blob (TASK-491) --------------
     "seed_summary_on_new_session": SettingDefinition(
         key="seed_summary_on_new_session",

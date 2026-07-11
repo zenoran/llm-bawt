@@ -1704,82 +1704,153 @@ def list_summaries(
         log.error(f"Failed to list summaries: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
+def build_context_seed(bot_id: str, model: str | None, service) -> dict:
+    """Build the context-seed payload for a fresh Claude Code SDK session.
+
+    Extracted from the ``/v1/history/context-seed`` handler (TASK-501) so the
+    app can assemble the seed IN-PROCESS at dispatch time and push it to the
+    bridge via ``inject_messages`` — no HTTP round-trip. The bridge no longer
+    has to call back for it.
+
+    Reuses ``HistoryManager.get_context_messages()`` — the exact function the
+    chat path uses — so the seed matches what a normal chatbot sees: rolling
+    summaries of older sessions PLUS the most recent turns, token-budgeted
+    against the model's context window. System rows are dropped (the SDK
+    carries its own system prompt).
+
+    Returns ``{bot_id, model, budget_tokens, messages:[{role,content,timestamp}],
+    stats:{...}}``. Raises on failure (callers decide whether to swallow).
+    """
+    from ...utils.history import estimate_messages_tokens
+
+    effective_bot_id = bot_id or service._default_bot
+    resolved_model = model or getattr(service, "_default_model", None)
+    model_alias, _ = service._resolve_request_model(
+        resolved_model, effective_bot_id, local_mode=False
+    )
+    llm_bawt = service._get_llm_bawt(
+        model_alias, effective_bot_id, service.config.DEFAULT_USER
+    )
+    # Load fresh so we never serve a stale in-memory transcript.
+    llm_bawt.history_manager.load_history()
+
+    # Same budget formula the agent path uses (base.py): context window
+    # minus the output reservation. 0 => no budget (return everything).
+    ctx_window = int(service.config.get_model_context_window(model_alias) or 0)
+    max_output = int(service.config.get_model_max_tokens(model_alias) or 4096)
+    budget = max(0, ctx_window - max_output) if ctx_window > 0 else 0
+
+    # TASK-493: seed content comes from the ONE shared handler
+    # (HistoryManager.build_context_payload) — the same function the chat turn
+    # path uses. We are building a seed because the trigger
+    # (maybe_build_session_seed) already decided continuity is on, so pass
+    # continuity=True; history_scope still governs whether summaries ride along.
+    # delivery="seed" -> system rows dropped (the SDK injects its own system
+    # prompt every turn).
+    try:
+        scope = str(
+            llm_bawt.config_resolver.resolve_config_setting("history_scope").value
+            or "inline+summaries"
+        )
+    except Exception:
+        scope = "inline+summaries"
+    payload = llm_bawt.history_manager.build_context_payload(
+        continuity=True,
+        history_scope=scope,
+        delivery="seed",
+        max_tokens=budget,
+    )
+    seed_msgs = payload.seed_messages
+
+    summary_count = sum(1 for m in seed_msgs if m.role == "summary")
+    convo_count = sum(1 for m in seed_msgs if m.role in ("user", "assistant"))
+    approx_tokens = estimate_messages_tokens(seed_msgs)
+    ts_values = [
+        float(getattr(m, "timestamp", 0.0) or 0.0)
+        for m in seed_msgs
+        if getattr(m, "timestamp", 0.0)
+    ]
+    oldest = min(ts_values) if ts_values else None
+    newest = max(ts_values) if ts_values else None
+
+    return {
+        "bot_id": effective_bot_id,
+        "model": model_alias,
+        "budget_tokens": budget,
+        "messages": [
+            {
+                "role": m.role,
+                "content": m.content or "",
+                "timestamp": float(getattr(m, "timestamp", 0.0) or 0.0),
+            }
+            for m in seed_msgs
+        ],
+        "stats": {
+            "summary_count": summary_count,
+            "message_count": convo_count,
+            "total_count": len(seed_msgs),
+            "approx_tokens": approx_tokens,
+            "oldest_timestamp": oldest,
+            "newest_timestamp": newest,
+        },
+    }
+
+
+def maybe_build_session_seed(llm_bawt, bot_id, model, user_prompt, service) -> list | None:
+    """Decide whether to seed a fresh SDK session and, if so, build it (TASK-501).
+
+    SINGLE source of truth shared by BOTH dispatch paths (streaming
+    ``chat_streaming`` and non-streaming ``background_service.chat_completion``)
+    so they can never drift — the reason non-streaming was a gap in the first
+    place was two copy-pasted dispatch paths.
+
+    Returns a list of ``{role, content, timestamp}`` seed messages to push to
+    the bridge via ``inject_messages``, or None when no seed should attach:
+    non-claude-code backend, continuity off, or a warm session that isn't a
+    ``/new``. Never raises — any failure yields None (bridge falls back to its
+    legacy context-seed callback).
+    """
+    try:
+        if (getattr(llm_bawt.bot, "agent_backend", "") or "") != "claude-code":
+            return None
+        bc = getattr(llm_bawt.bot, "agent_backend_config", None) or {}
+        try:
+            continuity_on = bool(
+                llm_bawt.config_resolver.resolve_config_setting(
+                    "session_memory_continuity"
+                ).value
+            )
+        except Exception:
+            continuity_on = False
+        if not continuity_on:
+            return None
+        # Mirror bridge _get_session: a value with ":" is a legacy routing key,
+        # not a real SDK session id.
+        _sk = bc.get("session_key") or ""
+        _has_session = bool(_sk) and ":" not in _sk
+        _is_new = (user_prompt or "").lstrip().startswith("/new")
+        if not (_is_new or not _has_session):
+            return None
+        seed = build_context_seed(bot_id, model, service)
+        return seed.get("messages") or None
+    except Exception:
+        return None
+
+
 @router.get("/v1/history/context-seed", tags=["History"])
 def get_context_seed(
     bot_id: str = Query(..., description="Bot ID to build a session seed for"),
     model: str | None = Query(None, description="Optional model alias for context-window sizing"),
 ):
     """Return the context payload a chat bot would receive, for seeding a fresh
-    Claude Code SDK session (TASK-445).
-
-    Reuses ``HistoryManager.get_context_messages()`` — the exact function the
-    chat path uses — so the seed matches what a normal chatbot sees: rolling
-    summaries of older sessions PLUS the most recent turns, automatically
-    token-budgeted against the model's context window. System rows are dropped
-    (the SDK session carries its own system prompt).
-
-    Response: ``{bot_id, model, budget_tokens, messages:[{role,content,timestamp}],
-    stats:{summary_count, message_count, total_count, approx_tokens,
-    oldest_timestamp, newest_timestamp}}``.
+    Claude Code SDK session (TASK-445). Thin HTTP wrapper over
+    ``build_context_seed`` — kept for the bridge's legacy fallback path and any
+    external callers.
     """
-    from ...utils.history import estimate_messages_tokens
-
     service = get_service()
     effective_bot_id = bot_id or service._default_bot
-
     try:
-        resolved_model = model or getattr(service, "_default_model", None)
-        model_alias, _ = service._resolve_request_model(
-            resolved_model, effective_bot_id, local_mode=False
-        )
-        llm_bawt = service._get_llm_bawt(
-            model_alias, effective_bot_id, service.config.DEFAULT_USER
-        )
-        # Load fresh so we never serve a stale in-memory transcript.
-        llm_bawt.history_manager.load_history()
-
-        # Same budget formula the agent path uses (base.py): context window
-        # minus the output reservation. 0 => no budget (return everything).
-        ctx_window = int(service.config.get_model_context_window(model_alias) or 0)
-        max_output = int(service.config.get_model_max_tokens(model_alias) or 4096)
-        budget = max(0, ctx_window - max_output) if ctx_window > 0 else 0
-
-        msgs = llm_bawt.history_manager.get_context_messages(max_tokens=budget)
-        # Drop system rows — the SDK injects its own system prompt every turn.
-        seed_msgs = [m for m in msgs if getattr(m, "role", "") != "system"]
-
-        summary_count = sum(1 for m in seed_msgs if m.role == "summary")
-        convo_count = sum(1 for m in seed_msgs if m.role in ("user", "assistant"))
-        approx_tokens = estimate_messages_tokens(seed_msgs)
-        ts_values = [
-            float(getattr(m, "timestamp", 0.0) or 0.0)
-            for m in seed_msgs
-            if getattr(m, "timestamp", 0.0)
-        ]
-        oldest = min(ts_values) if ts_values else None
-        newest = max(ts_values) if ts_values else None
-
-        return {
-            "bot_id": effective_bot_id,
-            "model": model_alias,
-            "budget_tokens": budget,
-            "messages": [
-                {
-                    "role": m.role,
-                    "content": m.content or "",
-                    "timestamp": float(getattr(m, "timestamp", 0.0) or 0.0),
-                }
-                for m in seed_msgs
-            ],
-            "stats": {
-                "summary_count": summary_count,
-                "message_count": convo_count,
-                "total_count": len(seed_msgs),
-                "approx_tokens": approx_tokens,
-                "oldest_timestamp": oldest,
-                "newest_timestamp": newest,
-            },
-        }
+        return build_context_seed(bot_id, model, service)
     except Exception as e:
         log.error(f"Failed to build context seed for {effective_bot_id}: {e}")
         raise HTTPException(status_code=500, detail=str(e))
