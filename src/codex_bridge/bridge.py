@@ -32,6 +32,19 @@ logger = logging.getLogger(__name__)
 CONSUMER_GROUP = "codex-bridge"
 CONSUMER_NAME = "worker-0"
 
+# TASK-490: MCP tool context body. Canonical default lives in the app registry
+# (agents.mcp_tool_context_template); the bridge cannot import llm_bawt, so it
+# fetches the (overridable) body via GET /v1/prompts/{key} and falls back to
+# this BYTE-IDENTICAL copy. The leading "\n\n" separator is added at append time.
+MCP_TOOL_CONTEXT_KEY = "agents.mcp_tool_context_template"
+_MCP_TOOL_CONTEXT_FALLBACK = (
+    "## MCP Tool Context\n"
+    "Your bot_id is \"{bot_slug}\". When using bawthub MCP tools:\n"
+    "- Memory/message tools: always pass bot_id=\"{bot_slug}\"\n"
+    "- Profile tool with entity_type=\"user\": use entity_id=\"nick\" (the user)\n"
+    "- Profile tool with entity_type=\"bot\": use entity_id=\"{bot_slug}\" (yourself)"
+)
+
 
 def _bot_slug_from_session_key(session_key: str) -> str:
     sk = (session_key or "").strip()
@@ -262,6 +275,42 @@ class CodexBridge:
         except RuntimeError as e:
             logger.warning("auth.json still invalid during teardown: %s", e)
         self._transport.reset()
+
+    async def _get_mcp_tool_context(self, bot_slug: str) -> str:
+        """Return the MCP tool context block for a bot (TASK-490).
+
+        Fetches the (bot-overridable) template body from the app registry via
+        GET /v1/prompts/{key}, cached per bot, with a byte-identical local
+        fallback if the app is unreachable. Returns the block WITHOUT the leading
+        separator; the caller prepends ``\\n\\n``.
+        """
+        cache = getattr(self, "_mcp_ctx_cache", None)
+        if cache is None:
+            cache = {}
+            self._mcp_ctx_cache = cache
+        if bot_slug in cache:
+            return cache[bot_slug]
+
+        body = _MCP_TOOL_CONTEXT_FALLBACK
+        if self._app_api_url:
+            try:
+                async with httpx.AsyncClient(timeout=5) as client:
+                    resp = await client.get(
+                        f"{self._app_api_url}/v1/prompts/{MCP_TOOL_CONTEXT_KEY}",
+                        params={"scope_type": "bot", "scope_id": bot_slug},
+                    )
+                    resp.raise_for_status()
+                    fetched = (resp.json() or {}).get("body")
+                    if fetched:
+                        body = fetched
+            except Exception as e:
+                logger.warning(
+                    "MCP tool context fetch failed for %s (%s); using local fallback",
+                    bot_slug, e,
+                )
+        rendered = body.replace("{bot_slug}", bot_slug)
+        cache[bot_slug] = rendered
+        return rendered
 
     # ----- TASK-206: session persistence helpers --------------------------
 
@@ -509,15 +558,11 @@ class CodexBridge:
             tmp_image_paths: list[str] = []
 
             try:
-                # MCP context injection (matches claude bridge)
+                # MCP context injection (matches claude bridge). Body from the
+                # registry (TASK-490) with a byte-identical local fallback.
                 if system_prompt and bot_slug:
-                    system_prompt += (
-                        f"\n\n## MCP Tool Context\n"
-                        f"Your bot_id is \"{bot_slug}\". When using bawthub MCP tools:\n"
-                        f"- Memory/message tools: always pass bot_id=\"{bot_slug}\"\n"
-                        f"- Profile tool with entity_type=\"user\": use entity_id=\"nick\" (the user)\n"
-                        f"- Profile tool with entity_type=\"bot\": use entity_id=\"{bot_slug}\" (yourself)"
-                    )
+                    mcp_ctx = await self._get_mcp_tool_context(bot_slug)
+                    system_prompt += f"\n\n{mcp_ctx}"
 
                 # Resolve resume vs fresh thread (TASK-206)
                 existing = await self._get_session(bot_slug)
