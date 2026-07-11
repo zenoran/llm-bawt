@@ -2,6 +2,7 @@
 
 from .botchat import router as botchat_router
 from .chat import router as chat_router
+from .config import router as config_router
 from .health import router as health_router
 from .history import router as history_router
 from .jobs import router as jobs_router
@@ -42,6 +43,7 @@ all_routers = [
     prompts_router,
     providers_router,
     settings_router,
+    config_router,
     approval_policies_router,
     profiles_router,
     llm_router,

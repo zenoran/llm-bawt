@@ -161,7 +161,15 @@ def parse_arguments(config_obj: "Config") -> argparse.Namespace:
         action="store_true",
         help="List available bots and exit"
     )
-    
+    parser.add_argument(
+        "--inspect-config",
+        type=str,
+        metavar="BOT",
+        default=None,
+        help="Print the effective resolved system prompt + settings (with source "
+             "provenance) for BOT and exit (TASK-487). Uses --user for the user id."
+    )
+
     # Status and info
     parser.add_argument(
         "--status",

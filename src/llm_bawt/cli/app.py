@@ -409,6 +409,40 @@ def query_via_service(
     return False
 
 
+def inspect_effective_config(config: Config, args: argparse.Namespace) -> None:
+    """Print the effective-config inspection for a bot (TASK-487).
+
+    Agent-backend bots are never built as local LLMBawt instances (they dispatch
+    to external agents), so this queries the service endpoint that constructs the
+    bot the same way a live turn does. Requires a running service.
+    """
+    import json as _json
+    import urllib.parse
+    import urllib.request
+
+    bot_id = (getattr(args, "inspect_config", "") or "").strip().lower()
+    user_id = (getattr(args, "user", "") or config.DEFAULT_USER or "").strip()
+
+    service_url = getattr(config, "SERVICE_URL", None)
+    if not service_url and hasattr(config, "SERVICE_PORT"):
+        host = getattr(config, "SERVICE_HOST", "localhost") or "localhost"
+        service_url = f"http://{host}:{config.SERVICE_PORT}"
+    if not service_url:
+        console.print("[bold red]No service URL configured[/bold red] — the inspector needs a running service.")
+        sys.exit(1)
+
+    params = urllib.parse.urlencode({"bot": bot_id, "user": user_id})
+    url = f"{service_url.rstrip('/')}/v1/config/effective?{params}"
+    try:
+        with urllib.request.urlopen(url, timeout=30) as resp:
+            data = _json.loads(resp.read().decode("utf-8"))
+    except Exception as e:
+        console.print(f"[bold red]Inspection failed:[/bold red] {e}")
+        sys.exit(1)
+
+    console.print_json(_json.dumps(data))
+
+
 def show_status(config: Config, args: argparse.Namespace | None = None):
     """Display overall system status including dependencies, bots, memory, and configuration."""
     from llm_bawt.core.status import collect_system_status
@@ -1512,6 +1546,10 @@ def main():
 
     elif getattr(args, 'list_bots', False):
         show_bots(config_obj, service_mode=_is_service_mode(args, config_obj))
+        sys.exit(0)
+
+    elif getattr(args, 'inspect_config', None):
+        inspect_effective_config(config_obj, args)
         sys.exit(0)
 
     elif getattr(args, 'list_users', False):
