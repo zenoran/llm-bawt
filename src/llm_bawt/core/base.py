@@ -33,6 +33,7 @@ from ..utils.paths import resolve_log_dir
 from ..utils.history import HistoryManager, Message
 from ..adapters import get_adapter, ModelAdapter
 from .prompt_builder import GLOBAL_SYSTEM_PROMPT, PromptBuilder, SectionPosition
+from .prompt_manifest import PROMPT_MANIFEST, STABLE, PER_TURN
 from .model_lifecycle import ModelLifecycleManager, get_model_lifecycle
 
 if TYPE_CHECKING:
@@ -264,11 +265,45 @@ class BaseLLMBawt(ABC):
             )
         return self.bot.system_prompt
 
+    @property
+    def _prompt_bot_type(self) -> str:
+        """'agent' for agent-backend bots, else 'chat' — drives manifest gating (TASK-489)."""
+        return (
+            "agent"
+            if self.model_definition.get("type") in ("agent_backend", "claude-code")
+            else "chat"
+        )
+
+    def _walk_manifest(self, builder: "PromptBuilder", prompt: str, stage: str) -> None:
+        """Render the declared PROMPT_MANIFEST sections for `stage` that apply to
+        this bot's type. The single assembly driver (TASK-489) — both the stable
+        base and the per-turn copy are built by walking the same ordered list."""
+        bot_type = self._prompt_bot_type
+        for spec in PROMPT_MANIFEST:
+            if spec.stage != stage or bot_type not in spec.applies_to:
+                continue
+            getattr(self, spec.method)(builder, prompt)
+
     def _init_system_prompt(self):
-        """Build the system prompt using PromptBuilder."""
+        """Build the stable (cacheable) system prompt by walking the manifest."""
         builder = PromptBuilder()
+
+        # Walk the STABLE manifest entries — the cached base prefix (TASK-489).
+        self._walk_manifest(builder, "", STABLE)
+
+        # We store the builder, not the final string, so we can add context later
+        self._prompt_builder = builder
         
-        # Section 1: User profile context
+        # For backward compatibility, also set config.SYSTEM_MESSAGE
+        # This will be the base prompt without per-query memory context
+        self.config.SYSTEM_MESSAGE = builder.build()
+        
+        if self.verbose:
+            console.print(builder.get_verbose_summary())
+
+    # --- stable section renderers (walked by _walk_manifest, STABLE) --------
+    def _sec_user_context(self, builder: PromptBuilder, prompt: str) -> None:
+        """Section 1: User profile context."""
         if self._db_available and self.profile_manager:
             try:
                 user_context = self.profile_manager.get_user_profile_summary(self.user_id)
@@ -285,8 +320,9 @@ class BaseLLMBawt(ABC):
                         console.print(f"[dim]{'─' * 30}[/dim]")
             except Exception as e:
                 logger.warning(f"Failed to load user profile: {e}")
-        
-        # Section 2: Bot personality traits
+
+    def _sec_bot_traits(self, builder: PromptBuilder, prompt: str) -> None:
+        """Section 2: Bot personality traits."""
         if self._db_available and self.profile_manager:
             try:
                 bot_context = self.profile_manager.get_bot_profile_summary(self.bot_id)
@@ -303,8 +339,9 @@ class BaseLLMBawt(ABC):
                         console.print(f"[dim]{'─' * 30}[/dim]")
             except Exception as e:
                 logger.warning(f"Failed to load bot profile: {e}")
-        
-        # Section 3: Base bot prompt (or active persona override, TASK-477)
+
+    def _sec_base_prompt(self, builder: PromptBuilder, prompt: str) -> None:
+        """Section 3: Base bot prompt (or active persona override, TASK-477)."""
         base_prompt = self._resolve_base_prompt()
         _base_src = (
             "persona_override" if getattr(self.bot, "prompt_override_id", None)
@@ -318,7 +355,8 @@ class BaseLLMBawt(ABC):
                 metadata={"source": _base_src, "gate": "always"},
             )
 
-        # Section 6: Global behavioral instructions (memory-enabled bots only)
+    def _sec_global_instructions(self, builder: PromptBuilder, prompt: str) -> None:
+        """Section 6: Global behavioral instructions (memory-enabled bots only)."""
         if self.bot.requires_memory:
             builder.add_section(
                 "global_instructions",
@@ -327,17 +365,6 @@ class BaseLLMBawt(ABC):
                 metadata={"source": "code_default:GLOBAL_SYSTEM_PROMPT", "gate": "requires_memory"},
             )
 
-        # Section 4: Tool instructions (added at query time if needed)
-        # We store the builder, not the final string, so we can add context later
-        self._prompt_builder = builder
-        
-        # For backward compatibility, also set config.SYSTEM_MESSAGE
-        # This will be the base prompt without per-query memory context
-        self.config.SYSTEM_MESSAGE = builder.build()
-        
-        if self.verbose:
-            console.print(builder.get_verbose_summary())
-    
     def _init_history(self):
         """Initialize history manager."""
         self.history_manager = HistoryManager(
@@ -536,7 +563,13 @@ class BaseLLMBawt(ABC):
         # Relative-time grounding needs a proper redesign off the cacheable prefix
         # (a separate future task); do NOT re-add it to the system prompt.
 
-        # Add tool instructions (skip if tool_format is "none")
+        # Walk the PER_TURN manifest entries onto the copy (TASK-489).
+        self._walk_manifest(builder, prompt, PER_TURN)
+        return builder
+
+    # --- per-turn section renderers (walked by _walk_manifest, PER_TURN) -----
+    def _sec_tools(self, builder: PromptBuilder, prompt: str) -> None:
+        """Tool instructions (skip if tool_format is 'none')."""
         if self.tool_format != "none":
             if self.bot.uses_tools:
                 tool_definitions = self._get_tool_definitions()
@@ -565,7 +598,8 @@ class BaseLLMBawt(ABC):
                     metadata={"source": "generated:memory_tool", "gate": "memory_readonly"},
                 )
 
-        # Client-supplied system context (e.g. HA device list)
+    def _sec_client_context(self, builder: PromptBuilder, prompt: str) -> None:
+        """Client-supplied system context (e.g. HA device list)."""
         if self._client_system_context:
             builder.add_section(
                 "client_context",
@@ -574,8 +608,11 @@ class BaseLLMBawt(ABC):
                 metadata={"source": "client_runtime", "gate": "client_system_context"},
             )
 
-        # Cold-start memory priming: inject top memories when history is thin
-        # Skip for HA-mode — device commands don't need semantic memories
+    def _sec_cold_start_memory(self, builder: PromptBuilder, prompt: str) -> None:
+        """Cold-start memory priming: inject top memories when history is thin.
+
+        Skip for HA-mode — device commands don't need semantic memories.
+        """
         if self.memory and not self._ha_mode:
             history_count = len(self.history_manager.messages)
             if history_count <= 3:
@@ -588,16 +625,12 @@ class BaseLLMBawt(ABC):
                         metadata={"source": "memory_search", "gate": "cold_start(history<=3)"},
                     )
 
-        # TTS output instructions (when tts_mode is enabled)
-        # Agent backends (claude-code, codex, openclaw) use a per-turn
-        # user-message prefix instead (chat.agent_voice_prefix, stamped
-        # below) — injecting TTS instructions into both the system prompt
-        # AND the user message double-doses the constraint and cripples
-        # tool chaining by forcing 1-3 sentence responses system-wide.
-        _is_agent_backend = self.model_definition.get("type") in (
-            "agent_backend", "claude-code",
-        )
-        if self._tts_mode and not _is_agent_backend:
+    def _sec_tts_output(self, builder: PromptBuilder, prompt: str) -> None:
+        """TTS output instructions (chat bots only — manifest applies_to gates
+        out agent backends, which use a per-turn user-message voice prefix
+        instead; injecting TTS into both system prompt AND user message would
+        double-dose the constraint and cripple tool chaining)."""
+        if self._tts_mode:
             resolved = self.config_resolver.resolve_body("chat.tts_output_instructions")
             tts_body = resolved.body if resolved else None
             if tts_body:
@@ -611,12 +644,12 @@ class BaseLLMBawt(ABC):
                     },
                 )
 
-        # Agent global prompt (opt-in per bot). Agent backends only — chat bots
-        # never see it. Gated on the `agent_global_prompt_enabled` runtime
-        # setting. Rides the cacheable system-prompt prefix (byte-stable across
-        # turns unless the DB body changes). Bot-scoped resolve falls back to the
-        # global default; an empty body injects nothing even when the flag is on.
-        if _is_agent_backend and bool(self._resolve_setting("agent_global_prompt_enabled", False)):
+    def _sec_agent_global_prompt(self, builder: PromptBuilder, prompt: str) -> None:
+        """Agent global prompt (agent backends only — manifest applies_to gates
+        out chat bots). Opt-in per bot via the `agent_global_prompt_enabled`
+        runtime setting. Rides the cacheable prefix; bot-scoped resolve falls
+        back to the global default; an empty body injects nothing."""
+        if bool(self._resolve_setting("agent_global_prompt_enabled", False)):
             resolved = self.config_resolver.resolve_body(
                 "agents.global_prompt", scope_type="bot", scope_id=self.bot_id
             )
@@ -631,8 +664,6 @@ class BaseLLMBawt(ABC):
                         "gate": "agent_backend & agent_global_prompt_enabled",
                     },
                 )
-
-        return builder
 
     def describe_effective_config(self, prompt: str = "") -> dict[str, Any]:
         """Effective-config inspector (TASK-487) — read-only, no LLM, no writes.
