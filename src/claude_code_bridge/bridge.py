@@ -803,23 +803,69 @@ class ClaudeCodeBridge:
         )
         return path
 
-    async def _seed_new_session(self, bot_id: str, model: str) -> dict | None:
+    @staticmethod
+    def _stats_from_messages(messages: list[dict]) -> dict:
+        """Derive /new-ack stats from app-injected seed messages (TASK-501).
+
+        When the app pushes the seed via ``inject_messages`` there is no
+        precomputed stats block (that lived in the context-seed HTTP response),
+        so recompute the same shape from the message roles. approx_tokens is a
+        cheap char/4 estimate — the bridge has no tokenizer."""
+        summary_count = sum(1 for m in messages if m.get("role") == "summary")
+        convo_count = sum(1 for m in messages if m.get("role") in ("user", "assistant"))
+        approx_tokens = sum(len(m.get("content") or "") for m in messages) // 4
+        ts = [float(m.get("timestamp") or 0.0) for m in messages if m.get("timestamp")]
+        return {
+            "summary_count": summary_count,
+            "message_count": convo_count,
+            "total_count": len(messages),
+            "approx_tokens": approx_tokens,
+            "oldest_timestamp": min(ts) if ts else None,
+            "newest_timestamp": max(ts) if ts else None,
+        }
+
+    async def _seed_new_session(
+        self, bot_id: str, model: str, injected: list | None = None,
+    ) -> dict | None:
         """Seed a brand-new SDK session for ``bot_id`` from chat summary history,
         if the per-bot setting is on. Writes the synthetic transcript, persists
         the minted session id, and returns a stats dict for the /new ack.
 
+        ``injected`` (TASK-501): messages the app pre-assembled and pushed in
+        the dispatch. When provided, seed from these directly. When None, FALL
+        BACK to the legacy ``_fetch_context_seed`` callback (Phase 2 removes the
+        fallback once app-side inject is proven).
+
+        TASK-508 (policy-vs-mechanics): the bridge holds NO policy about whether
+        to seed. When llm-bawt pushes ``injected``, its mere presence IS the
+        authorization — llm-bawt's ``maybe_build_session_seed`` already evaluated
+        continuity + ``/new`` + session state, and only emits messages when a seed
+        is warranted. So the injected path is ungated. The ONLY remaining gate is
+        on the deprecated self-fetch fallback: there the bridge would be pulling a
+        seed on its own initiative, so until Phase 2 deletes that path it must
+        still consult continuity so a continuity-off bot isn't seeded behind
+        llm-bawt's back.
+
         Returns:
-            None      -> seeding disabled for this bot (caller behaves as before)
-            {seeded: False, reason} -> enabled but nothing to seed / error
+            None      -> no seed (fallback path with continuity off, or no path)
+            {seeded: False, reason} -> a seed was warranted but nothing to seed / error
             {seeded: True, session_id, summary_count, message_count,
              approx_tokens, oldest_timestamp, newest_timestamp}
         """
-        if not await self._get_seed_setting(bot_id):
-            return None
-        seed = await self._fetch_context_seed(bot_id, model)
-        if not seed:
-            return {"seeded": False, "reason": "seed fetch failed"}
-        messages = seed.get("messages") or []
+        if injected:
+            # llm-bawt authorized this seed by sending it. No bridge-side re-check.
+            messages = injected
+            stats = self._stats_from_messages(messages)
+        else:
+            # Legacy self-fetch fallback: the bridge acts on its own, so it still
+            # needs the policy gate until TASK-501 Phase 2 removes this path.
+            if not await self._get_seed_setting(bot_id):
+                return None
+            seed = await self._fetch_context_seed(bot_id, model)
+            if not seed:
+                return {"seeded": False, "reason": "seed fetch failed"}
+            messages = seed.get("messages") or []
+            stats = dict(seed.get("stats") or {})
         if not messages:
             return {"seeded": False, "reason": "no history to seed"}
         try:
@@ -829,7 +875,7 @@ class ClaudeCodeBridge:
         except Exception as e:
             logger.warning("Seed write/persist failed for %s: %s", bot_id, e)
             return {"seeded": False, "reason": f"seed write failed: {e}"}
-        stats = dict(seed.get("stats") or {})
+        stats = dict(stats)
         stats["seeded"] = True
         stats["session_id"] = session_id
         return stats
@@ -1002,6 +1048,16 @@ class ClaudeCodeBridge:
         message = fields.get("message", "")
         system_prompt = fields.get("system_prompt") or None
         model = (fields.get("model") or "").strip()
+        # TASK-501: history the app pre-assembled for a fresh-session seed.
+        # When present, the bridge seeds from THIS instead of calling back to
+        # /v1/history/context-seed. JSON-encoded list of {role, content} dicts.
+        inject_messages = None
+        _raw_inject = fields.get("inject_messages")
+        if _raw_inject:
+            try:
+                inject_messages = json.loads(_raw_inject)
+            except (ValueError, TypeError) as _e:
+                logger.warning("Failed to parse inject_messages: %s", _e)
         # Frontend-supplied user-message UUID; stamped on every emitted event
         # so the frontend can bucket tool activity under the originating user
         # message without falling back to turn_id heuristics.
@@ -1079,7 +1135,7 @@ class ClaudeCodeBridge:
             # TASK-445: optionally seed the fresh session from chat summary
             # history. Persists the minted session id so a trailing message
             # below resumes the seeded transcript (no double-seed).
-            seed_stats = await self._seed_new_session(bot_slug, model)
+            seed_stats = await self._seed_new_session(bot_slug, model, injected=inject_messages)
             message = message.lstrip().removeprefix("/new").strip()
             if not message:
                 # Just "/new" with no follow-up — acknowledge and done
@@ -1151,7 +1207,7 @@ class ClaudeCodeBridge:
                 # seeded will have persisted a session, so _get_session found it
                 # and resume_id is set — this block is skipped (no double-seed).
                 if resume_id is None:
-                    cold_seed = await self._seed_new_session(bot_slug, model)
+                    cold_seed = await self._seed_new_session(bot_slug, model, injected=inject_messages)
                     if cold_seed and cold_seed.get("seeded"):
                         resume_id = cold_seed["session_id"]
                         logger.info(
