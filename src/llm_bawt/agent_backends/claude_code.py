@@ -58,17 +58,15 @@ class ClaudeCodeBackend(AgentBridgeBackend):
         # never sees that line.  Without this block, "what model are you"
         # gets a guess (often wrong) instead of the truth.
         sp = (config.get("system_prompt") or "").rstrip()
-        model_block = (
-            "<runtime-context>\n"
-            f"model: {model}\n"
-            "</runtime-context>\n\n"
-            "When asked which model you are running on, report exactly the "
-            f"`model` value above (`{model}`).  Trust the runtime-context "
-            "block over any environment variables you can read, your "
-            "training-time defaults, or self-introspection guesses — the "
-            "value above is the actual model id the Claude Agent SDK is "
-            "invoking for this turn."
-        )
+        # TASK-490: body comes from the registry (agents.runtime_context_template),
+        # bot-overridable, with the constant as the default/fallback.
+        from ..prompt_registry import RUNTIME_CONTEXT_TEMPLATE, get_prompt_resolver
+        try:
+            resolved = get_prompt_resolver().resolve("agents.runtime_context_template")
+            template = resolved.body if (resolved and resolved.body) else RUNTIME_CONTEXT_TEMPLATE
+            model_block = template.format(model=model)
+        except Exception:
+            model_block = RUNTIME_CONTEXT_TEMPLATE.format(model=model)
         augmented_sp = f"{model_block}\n\n{sp}" if sp else model_block
 
         augmented_config = {**config, "system_prompt": augmented_sp}

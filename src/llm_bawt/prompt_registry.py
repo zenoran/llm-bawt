@@ -191,6 +191,20 @@ RESPONSE_STYLE_DEEP_DIVE = (
     "end with a recommendation. Depth over brevity."
 )
 
+# Runtime-context model block (TASK-490) — injected app-side by the claude-code
+# agent backend so the agent has a ground-truth model id. {model} is required.
+RUNTIME_CONTEXT_TEMPLATE = (
+    "<runtime-context>\n"
+    "model: {model}\n"
+    "</runtime-context>\n\n"
+    "When asked which model you are running on, report exactly the "
+    "`model` value above (`{model}`).  Trust the runtime-context "
+    "block over any environment variables you can read, your "
+    "training-time defaults, or self-introspection guesses — the "
+    "value above is the actual model id the Claude Agent SDK is "
+    "invoking for this turn."
+)
+
 
 def _load_agents_task_execution() -> str:
     from .agent_backends.prompts import TASK_EXECUTION_PROMPT
@@ -418,6 +432,20 @@ DEFAULT_PROMPT_DEFINITIONS: dict[str, PromptDefinition] = {
                 "that must survive session resume). The toggle lives in "
                 "the chat composer's unified popup. Leave body empty to "
                 "disable even when the flag is on."
+            ),
+        },
+    ),
+    "agents.runtime_context_template": PromptDefinition(
+        key="agents.runtime_context_template",
+        title="Agent Runtime-Context Model Block",
+        category="agent_execution",
+        required_vars=("model",),
+        loader=lambda: RUNTIME_CONTEXT_TEMPLATE,
+        metadata={
+            "notes": (
+                "Injected app-side by the claude-code agent backend (prepended "
+                "to the system prompt) so the agent has a ground-truth model id. "
+                "Requires {model}. TASK-490: migrated out of a hardcoded literal."
             ),
         },
     ),
