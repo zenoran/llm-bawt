@@ -248,11 +248,38 @@ class BotProfileStore:
                 if "agent_backend_config" in payload:
                     row.agent_backend_config = payload["agent_backend_config"]
                 if "bot_type" in payload or "agent_backend" in payload or not row.bot_type:
-                    row.bot_type = normalize_bot_type(
-                        payload.get("bot_type") if "bot_type" in payload else row.bot_type,
-                        row.agent_backend,
-                    )
+                    # Derive bot_type from a SINGLE source of truth so the two
+                    # fields can never drift (TASK-516):
+                    #   - explicit bot_type in payload wins (caller intent),
+                    #   - else if agent_backend was explicitly set/cleared,
+                    #     derive from the NEW backend ALONE. Feeding the stale
+                    #     row.bot_type back in made normalize_bot_type sticky
+                    #     toward "agent", so clearing the backend (agent→chat)
+                    #     left the row as agent-typed with no backend — an
+                    #     invalid state that then 400s every later edit.
+                    #   - else backfill from the existing row.
+                    if "bot_type" in payload:
+                        derived_type = payload.get("bot_type")
+                    elif "agent_backend" in payload:
+                        derived_type = None
+                    else:
+                        derived_type = row.bot_type
+                    row.bot_type = normalize_bot_type(derived_type, row.agent_backend)
                 row.updated_at = now
+
+            # Single-source-of-truth invariant: a bot is an agent iff it has a
+            # backend. Refuse to persist an agent-typed row with no backend so
+            # the drift that stranded mira (TASK-516) can never land, no matter
+            # which caller (route, CLI, seed, migration) reaches this store.
+            if row.bot_type == "agent" and not row.agent_backend:
+                # Message follows the DB-trigger convention ("bot <slug>: ...")
+                # so routes/settings._humanize_bot_constraint_error lifts it
+                # into a clean 400. Keep the "bot_type=" token — it's the marker
+                # that humanizer matches on.
+                raise ValueError(
+                    f"bot {slug}: agent_backend is required when bot_type=agent "
+                    "(a bot is an agent only if it has a backend)"
+                )
 
             session.add(row)
             session.commit()

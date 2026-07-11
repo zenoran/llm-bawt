@@ -407,6 +407,7 @@ def _humanize_bot_constraint_error(exc: Exception) -> str | None:
         "bot_profiles_check_model_backend",
         "bot_profiles_model_backend_check",
         "agent_backend=",
+        "bot_type=",
         "default_model",
     )
     if not any(m in text for m in markers):
