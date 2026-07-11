@@ -257,8 +257,10 @@ class HistoryManager:
                 continue
             if lowered.startswith("summary:") or lowered.startswith("key details:") or lowered.startswith("intent:") or lowered.startswith("tone:") or lowered.startswith("open loops:"):
                 continue
-            # Keep non-section metadata prefix lines (legacy lines like "On YYYY-MM-DD...")
-            if ":" not in line and not line.startswith("["):
+            # Keep non-section metadata prefix lines (legacy lines like "On YYYY-MM-DD...").
+            # Exclude bullet lines — they belong to a section (e.g. Key Details) and would
+            # otherwise be hoisted to the top AND duplicated inside their section body.
+            if ":" not in line and not line.startswith("[") and not line.lstrip().startswith(("-", "*", "•")):
                 prefix_lines.append(line)
 
         compact_lines: list[str] = []
@@ -267,7 +269,7 @@ class HistoryManager:
             compact_lines.append(section_summary)
         if section_key_details:
             compact_lines.append(f"Details: {section_key_details}")
-        elif section_intent:
+        if section_intent:
             compact_lines.append(f"Intent: {section_intent}")
         if section_open_loops:
             compact_lines.append(f"Open: {section_open_loops}")
