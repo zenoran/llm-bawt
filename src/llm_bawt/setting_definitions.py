@@ -38,6 +38,10 @@ class SettingDefinition:
     # If this setting supersedes/absorbs a legacy key, name it here so the
     # migration and compat shims know the provenance.
     legacy_keys: tuple[str, ...] = field(default_factory=tuple)
+    # Optional frontend render hint. Blank = render by ``type``; "model" tells
+    # the UI to render a model-alias picker (dropdown of /v1/models) instead of
+    # a free-text box. Surfaced verbatim in /v1/config/schema (TASK-522).
+    ui_widget: str = ""
 
 
 # Canonical typed settings. Keyed by setting key.
@@ -134,6 +138,65 @@ SETTING_DEFINITIONS: dict[str, SettingDefinition] = {
         help="Chat bots only: include summary rows when assembling history. "
              "Superseded by session_memory_continuity.",
         legacy_keys=("include_summaries",),
+    ),
+    # --- background-job models (TASK-522): global-only, data-driven ----------
+    # System-wide model selection for the 3 LLM-using background jobs
+    # (summarization, extraction, profile maintenance). Resolved at GLOBAL scope
+    # only — no per-bot override — via resolve_job_model(); the per-call-site
+    # cascade order is preserved. These retire the env/config vars
+    # SUMMARIZATION_MODEL / EXTRACTION_MODEL / MAINTENANCE_MODEL /
+    # PROFILE_MAINTENANCE_MODEL. maintenance_model is kept as the shared
+    # cross-job fallback (option (a) of the task) so the old cascade semantics
+    # survive: job-specific model -> maintenance_model -> summarization_model.
+    "summarization_model": SettingDefinition(
+        key="summarization_model",
+        type="str",
+        default="dolphin-qwen-3b",
+        applies_to=BOT_TYPES_ALL,
+        storage=STORAGE_RUNTIME_SETTING,
+        label="History summarization model",
+        help="Model alias the history-summarization job runs. Also the final "
+             "fallback for extraction and profile maintenance when those are unset.",
+        legacy_keys=("SUMMARIZATION_MODEL",),
+        ui_widget="model",
+    ),
+    "maintenance_model": SettingDefinition(
+        key="maintenance_model",
+        type="str",
+        default=None,
+        applies_to=BOT_TYPES_ALL,
+        storage=STORAGE_RUNTIME_SETTING,
+        label="Default maintenance model",
+        help="Shared fallback model for background maintenance jobs. Extraction "
+             "and profile maintenance fall back to this when their own model is "
+             "unset, before finally falling back to the summarization model. "
+             "Empty = use the summarization model.",
+        legacy_keys=("MAINTENANCE_MODEL",),
+        ui_widget="model",
+    ),
+    "extraction_model": SettingDefinition(
+        key="extraction_model",
+        type="str",
+        default=None,
+        applies_to=BOT_TYPES_ALL,
+        storage=STORAGE_RUNTIME_SETTING,
+        label="Memory extraction model",
+        help="Model alias the memory-extraction job runs. Empty = fall back to "
+             "the maintenance model, then the summarization model.",
+        legacy_keys=("EXTRACTION_MODEL",),
+        ui_widget="model",
+    ),
+    "profile_maintenance_model": SettingDefinition(
+        key="profile_maintenance_model",
+        type="str",
+        default=None,
+        applies_to=BOT_TYPES_ALL,
+        storage=STORAGE_RUNTIME_SETTING,
+        label="Profile maintenance model",
+        help="Model alias the profile-maintenance job runs. Empty = fall back to "
+             "the maintenance model, then the summarization model.",
+        legacy_keys=("PROFILE_MAINTENANCE_MODEL",),
+        ui_widget="model",
     ),
 }
 

@@ -472,16 +472,18 @@ class JobScheduler:
             # global settings and the default model while execution used the
             # bot's runtime settings and resolved background model.  That made
             # the probe say "pending" and execution immediately return zero.
+            from ..runtime_settings import resolve_job_model
+
             requested_model = (
                 job_config.get("model")
-                or getattr(config, "MAINTENANCE_MODEL", None)
-                or getattr(config, "SUMMARIZATION_MODEL", None)
+                or resolve_job_model(config, "maintenance_model")
+                or resolve_job_model(config, "summarization_model")
             )
             preferred_model = (
                 requested_model
-                or getattr(config, "EXTRACTION_MODEL", None)
-                or getattr(config, "MAINTENANCE_MODEL", None)
-                or getattr(config, "SUMMARIZATION_MODEL", None)
+                or resolve_job_model(config, "extraction_model")
+                or resolve_job_model(config, "maintenance_model")
+                or resolve_job_model(config, "summarization_model")
             )
             model_alias = None
             resolve_model = getattr(self.task_processor, "_resolve_request_model", None)

@@ -129,11 +129,13 @@ class BackgroundTasksMixin:
         entity_type = task.payload.get("entity_type", "user")
         dry_run = task.payload.get("dry_run", False)
 
+        from ..runtime_settings import resolve_job_model
+
         requested_model = (
             task.payload.get("model")
-            or getattr(self.config, "MAINTENANCE_MODEL", None)
-            or (self.config.PROFILE_MAINTENANCE_MODEL or None)
-            or getattr(self.config, "SUMMARIZATION_MODEL", None)
+            or resolve_job_model(self.config, "maintenance_model")
+            or resolve_job_model(self.config, "profile_maintenance_model")
+            or resolve_job_model(self.config, "summarization_model")
         )
         try:
             model_to_use, _ = self._resolve_request_model(
@@ -407,11 +409,13 @@ class BackgroundTasksMixin:
         from ..models.message import Message
         from ..prompt_registry import PromptResolver
 
+        from ..runtime_settings import resolve_job_model
+
         bot_id = task.bot_id or self._default_bot
         requested_model = (
             task.payload.get("model")
-            or getattr(self.config, "MAINTENANCE_MODEL", None)
-            or getattr(self.config, "SUMMARIZATION_MODEL", None)
+            or resolve_job_model(self.config, "maintenance_model")
+            or resolve_job_model(self.config, "summarization_model")
         )
         use_heuristic_fallback = bool(task.payload.get("use_heuristic_fallback", True))
         max_tokens_per_chunk = int(task.payload.get("max_tokens_per_chunk", 4000))

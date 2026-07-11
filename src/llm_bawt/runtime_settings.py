@@ -960,3 +960,28 @@ class RuntimeSettingsResolver:
         """Resolve setting using config attribute as final fallback."""
         fallback = getattr(self.config, config_attr, None)
         return self.resolve(key=key, fallback=fallback, request_overrides=request_overrides)
+
+
+def resolve_job_model(config: Config, key: str) -> str | None:
+    """Resolve a background-job model alias from the GLOBAL runtime setting.
+
+    Background-job models (history summarization, memory extraction, profile
+    maintenance) are system-wide, not per-bot (TASK-522), so this resolves at
+    **global scope only** — a fresh ``RuntimeSettingsResolver`` with no bot, so
+    a stray bot-scoped row can never shadow the global value. Falls back to the
+    key's declared ``SETTING_DEFINITIONS`` default when no global row exists.
+
+    These keys retired the old env/config vars (SUMMARIZATION_MODEL /
+    EXTRACTION_MODEL / MAINTENANCE_MODEL / PROFILE_MAINTENANCE_MODEL); call sites
+    keep their cascade by chaining ``resolve_job_model(config, k) or ...``.
+
+    Returns the alias string, or ``None`` (empty string normalized to None) so
+    an unset key falls through a caller's ``or`` cascade.
+    """
+    from .setting_definitions import SETTING_DEFINITIONS
+
+    definition = SETTING_DEFINITIONS.get(key)
+    default = definition.default if definition is not None else None
+    resolver = RuntimeSettingsResolver(config=config, bot=None)
+    value = resolver.resolve(key, fallback=default)
+    return value or None

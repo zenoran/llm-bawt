@@ -59,7 +59,7 @@ async def get_config_schema(
     the controls that apply to a bot's ``bot_type`` instead of hardcoding flag
     lists. Read-only, no auth-sensitive data — pure metadata.
 
-    Returns ``{key: {type, applies_to, storage, label, help, default, legacy_keys}}``.
+    Returns ``{key: {type, applies_to, storage, label, help, default, legacy_keys, ui_widget}}``.
     When ``bot_type`` is given, only settings whose ``applies_to`` includes it
     are returned — the exact filter the admin UI uses to hide inert switches.
     """
@@ -81,5 +81,6 @@ async def get_config_schema(
             "help": d.help,
             "default": d.default,
             "legacy_keys": list(d.legacy_keys),
+            "ui_widget": d.ui_widget,
         }
     return {"bot_type": bt, "settings": schema}

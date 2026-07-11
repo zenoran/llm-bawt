@@ -233,10 +233,12 @@ def _build_summary_callable(service, bot_id: str, user_id: str = "system", model
     from ...models.message import Message
     from ...prompt_registry import PromptResolver
 
+    from ...runtime_settings import resolve_job_model
+
     requested_model = (
         model
-        or getattr(service.config, "MAINTENANCE_MODEL", None)
-        or getattr(service.config, "SUMMARIZATION_MODEL", None)
+        or resolve_job_model(service.config, "maintenance_model")
+        or resolve_job_model(service.config, "summarization_model")
     )
     model_alias = None
     client = None

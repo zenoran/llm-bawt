@@ -439,11 +439,13 @@ class InstanceManagerMixin:
         Returns:
             ``(client, model_alias)`` or ``(None, None)`` if unavailable.
         """
+        from ..runtime_settings import resolve_job_model
+
         preferred = (
             model_override
-            or getattr(self.config, "EXTRACTION_MODEL", None)
-            or getattr(self.config, "MAINTENANCE_MODEL", None)
-            or getattr(self.config, "SUMMARIZATION_MODEL", None)
+            or resolve_job_model(self.config, "extraction_model")
+            or resolve_job_model(self.config, "maintenance_model")
+            or resolve_job_model(self.config, "summarization_model")
         )
 
         # Resolve the alias first so the keyed pool is keyed by the actual

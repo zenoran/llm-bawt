@@ -205,8 +205,8 @@ class Config(RuntimeTunables, BaseSettings):
     MEMORY_PROFILE_ATTRIBUTE_MIN_IMPORTANCE: float = Field(default=0.7, description="Minimum importance for extracted profile attributes")
     MEMORY_EMBEDDING_DIM: int = Field(default=384, description="Dimension of embedding vectors for semantic search (384 for all-MiniLM-L6-v2)")
     MEMORY_EMBEDDING_MODEL: str = Field(default="all-MiniLM-L6-v2", description="Sentence-transformers model for local embeddings")
-    EXTRACTION_MODEL: Optional[str] = Field(default=None, description="Model alias to use for memory extraction (defaults to first available)")
-    
+    # EXTRACTION_MODEL retired -> global runtime setting 'extraction_model' (TASK-522)
+
     # --- Memory Decay Settings --- #
     MEMORY_DECAY_ENABLED: bool = Field(default=True, description="Enable temporal decay for memory relevance scoring")
     MEMORY_DECAY_HALF_LIFE_DAYS: float = Field(default=90.0, description="Half-life in days for memory decay (90 = memory at 50% weight after 90 days)")
@@ -225,11 +225,8 @@ class Config(RuntimeTunables, BaseSettings):
         default=30,
         description="Run history summarization every N minutes",
     )
-    MAINTENANCE_MODEL: str = Field(
-        default="",
-        description="Default model alias for maintenance jobs (empty = job-specific defaults)",
-    )
-    PROFILE_MAINTENANCE_MODEL: str = Field(default="", description="Model to use for profile summarization (empty = default)")
+    # MAINTENANCE_MODEL / PROFILE_MAINTENANCE_MODEL retired -> global runtime
+    # settings 'maintenance_model' / 'profile_maintenance_model' (TASK-522)
 
     # --- Service Settings --- #
     USE_SERVICE: bool = Field(default=False, description="Route queries through the background service by default (same as --service flag)")
@@ -309,11 +306,8 @@ class Config(RuntimeTunables, BaseSettings):
         description="Brave safesearch level: off, moderate, strict"
     )
 
-    # --- Summarization (non-tunable) --- #
-    SUMMARIZATION_MODEL: str = Field(
-        default="dolphin-qwen-3b",
-        description="Model alias to use for history summarization (empty = MAINTENANCE_MODEL/default)"
-    )
+    # SUMMARIZATION_MODEL retired -> global runtime setting 'summarization_model'
+    # (TASK-522); default 'dolphin-qwen-3b' now lives in SETTING_DEFINITIONS.
 
     # --- Tool Calling Settings --- #
     MAX_TOOL_CALLS_PER_TURN: int = Field(

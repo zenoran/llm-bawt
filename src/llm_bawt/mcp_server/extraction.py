@@ -223,8 +223,11 @@ def _get_extraction_client(config: Config) -> Any:
     if _llm_client is not None:
         return _llm_client
     
-    # Check if there's a configured extraction model
-    extraction_model = config.EXTRACTION_MODEL
+    # Check if there's a configured extraction model (global runtime setting,
+    # TASK-522; falls back to its declared default when unset).
+    from ..runtime_settings import resolve_job_model
+
+    extraction_model = resolve_job_model(config, "extraction_model")
     
     if not extraction_model:
         # Try to find a suitable model (prefer smaller GGUF or OpenAI)
