@@ -331,12 +331,30 @@ class BackgroundService(
                 # Log what we're sending to the LLM (verbose mode)
                 log.llm_context(prepared_messages)
 
+                # TASK-501: pre-assemble the fresh-session seed and push it to
+                # the bridge (inject_messages) — SAME shared helper the streaming
+                # path uses, so non-streaming stays consistent (no callback).
+                from .routes.history import maybe_build_session_seed
+                inject_seed_messages = maybe_build_session_seed(
+                    llm_bawt, bot_id, model_alias, user_prompt, self,
+                )
+
                 # Execute the query with prepared messages
                 response, tool_context, tool_call_details = llm_bawt.execute_llm_query(
                     prepared_messages,
                     plaintext_output=True,
                     stream=False,
+                    inject_messages=inject_seed_messages,
                 )
+
+                # Splice the injected seed into the logged prompt so the turn
+                # log reflects what the harness session received: [system,
+                # ...seed history..., user]. Additive — nothing dropped.
+                _logged_messages = prepared_messages
+                if inject_seed_messages:
+                    _sys = [m for m in prepared_messages if getattr(m, "role", None) == "system"]
+                    _rest = [m for m in prepared_messages if getattr(m, "role", None) != "system"]
+                    _logged_messages = [*_sys, *inject_seed_messages, *_rest]
 
                 # Check if cancelled during generation
                 if cancel_event.is_set():
@@ -350,7 +368,7 @@ class BackgroundService(
                     response_text=response,
                     tool_context=tool_context,
                     tool_call_details=tool_call_details,
-                    prepared_messages=prepared_messages,
+                    prepared_messages=_logged_messages,
                     user_prompt=user_prompt,
                     model=model_alias,
                     bot_id=bot_id,

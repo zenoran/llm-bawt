@@ -201,6 +201,7 @@ class AgentBridgeBackend(AgentBackend):
                                 int(config.get("max_turns"))
                                 if config.get("max_turns") is not None else None
                             ),
+                            inject_messages=config.get("inject_messages"),
                         )
                         logger.info(
                             "%s request via bridge: session=%s request_id=%s",

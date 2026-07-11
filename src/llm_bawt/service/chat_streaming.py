@@ -991,6 +991,10 @@ class ChatStreamingMixin:
         # session_key (e.g. ``agent:main:main``), which IS the routing key
         # for that backend.
         oc_session_key: str | None = None
+        # TASK-501: seed history the app pre-assembles and pushes to the bridge
+        # so it need not call back to /v1/history/context-seed. Stays None
+        # unless this is a claude-code agent turn that will open a fresh session.
+        inject_seed_messages: list | None = None
         if is_agent_backend:
             bc = getattr(llm_bawt.bot, "agent_backend_config", None) or {}
             backend_name = getattr(llm_bawt.bot, "agent_backend", "")
@@ -1011,6 +1015,17 @@ class ChatStreamingMixin:
                 oc_session_key = f"{bot_id}:{user_id}"
             else:
                 oc_session_key = bc.get("session_key")
+
+            # TASK-501: pre-assemble the session seed app-side and push it to
+            # the bridge (inject_messages) so the bridge need not call back to
+            # /v1/history/context-seed. Shared decision helper — SAME logic the
+            # non-streaming path uses (background_service.chat_completion) so the
+            # two dispatch routes stay consistent.
+            from .routes.history import maybe_build_session_seed
+            from .dependencies import get_service
+            inject_seed_messages = maybe_build_session_seed(
+                llm_bawt, bot_id, model_alias, user_prompt, get_service()
+            )
 
         # Persist turn log immediately so the user's prompt is recorded
         # even if the backend times out or errors before responding.
@@ -1452,10 +1467,20 @@ class ChatStreamingMixin:
                 # consume_stream_chunks below) — the main LLM call no longer
                 # has to manage a tool call on every turn.
 
-                # Backfill prepared messages into the turn log
+                # Backfill prepared messages into the turn log.
+                # TASK-501: when the app injected a session seed for this turn,
+                # splice it into the logged prompt so the turn log reflects what
+                # the harness session actually received: [system, ...seed
+                # history..., user]. Additive — nothing dropped. The seed dicts
+                # and Message objects both serialize via _message_to_dict.
+                _logged_messages = messages
+                if inject_seed_messages:
+                    _system = [m for m in messages if getattr(m, "role", None) == "system"]
+                    _rest = [m for m in messages if getattr(m, "role", None) != "system"]
+                    _logged_messages = [*_system, *inject_seed_messages, *_rest]
                 self._update_turn_log(
                     turn_id=turn_log_id,
-                    prepared_messages=messages,
+                    prepared_messages=_logged_messages,
                 )
 
                 # Log what we're sending to the LLM (verbose mode)
@@ -1773,6 +1798,10 @@ class ChatStreamingMixin:
                         # so every emitted tool event carries it (frontend
                         # buckets tool activity by trigger_message_id).
                         extra_kwargs["trigger_message_id"] = trigger_message_id
+                    if is_agent_backend and inject_seed_messages:
+                        # TASK-501: push the pre-assembled seed so the bridge
+                        # seeds the fresh session without the context-seed callback.
+                        extra_kwargs["inject_messages"] = inject_seed_messages
                     stream_iter = llm_bawt.client.stream_raw(
                         messages, stop=adapter_stops or None, **gen_kwargs, **extra_kwargs
                     )
@@ -2233,7 +2262,7 @@ class ChatStreamingMixin:
                                 response_text=full_response_holder[0],
                                 tool_context=tool_context_holder[0],
                                 tool_call_details=tool_call_details_holder,
-                                prepared_messages=messages if "messages" in locals() else [],
+                                prepared_messages=_logged_messages if "_logged_messages" in locals() else (messages if "messages" in locals() else []),
                                 user_prompt=user_prompt,
                                 model=model_alias,
                                 bot_id=bot_id,
@@ -2262,7 +2291,7 @@ class ChatStreamingMixin:
                             response_text=full_response_holder[0],
                             tool_context=tool_context_holder[0],
                             tool_call_details=tool_call_details_holder,
-                            prepared_messages=messages if "messages" in locals() else [],
+                            prepared_messages=_logged_messages if "_logged_messages" in locals() else (messages if "messages" in locals() else []),
                             user_prompt=user_prompt,
                             model=model_alias,
                             bot_id=bot_id,

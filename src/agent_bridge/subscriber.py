@@ -150,8 +150,15 @@ class RedisSubscriber:
         trigger_message_id: str | None = None,
         effort: str | None = None,
         max_turns: int | None = None,
+        inject_messages: list | None = None,
     ) -> None:
         """Publish a chat.send command to the bridge's command stream.
+
+        ``inject_messages`` (TASK-501): history the app pre-assembles and
+        pushes down so the bridge can seed a fresh SDK session WITHOUT calling
+        back to the app's ``/v1/history/context-seed`` endpoint. List of
+        ``{role, content}`` dicts; JSON-encoded into the flat command fields
+        like ``attachments``. Only claude-code-bridge consumes it.
 
         ``trigger_message_id`` is the frontend-supplied user-message UUID
         (or ``local-user-*`` placeholder).  Bridges stamp it on every
@@ -188,6 +195,8 @@ class RedisSubscriber:
             fields["effort"] = effort
         if max_turns is not None:
             fields["max_turns"] = str(max_turns)
+        if inject_messages:
+            fields["inject_messages"] = json.dumps(inject_messages, ensure_ascii=False)
         await self._pub_redis.xadd(
             COMMANDS_STREAM,
             fields,

@@ -434,6 +434,7 @@ class ServiceLLMBawt(BaseLLMBawt):
         messages: list[Message],
         plaintext_output: bool = False,
         stream: bool = False,
+        inject_messages: list | None = None,
     ) -> tuple[str, str, list[dict]]:
         """Execute the LLM query and return response.
         
@@ -450,12 +451,26 @@ class ServiceLLMBawt(BaseLLMBawt):
             tool_context is empty if no tools used.
             tool_call_details is a list of per-call dicts for debug logging.
         """
+        # TASK-501: only agent backends (AgentBackendClient, **kwargs) accept
+        # inject_messages; guard so plain clients never receive an unknown kwarg.
+        _q_kwargs = {"inject_messages": inject_messages} if inject_messages else {}
+
+        # Agent backends (claude-code/openclaw) execute tools in their OWN
+        # bridge/runtime — they must NOT go through llm-bawt's tool loop. The
+        # streaming path already enforces this (not is_agent_backend); mirror it
+        # here so non-streaming stays consistent AND so inject_messages reaches
+        # the single client.query below instead of being dropped in the tool
+        # branch.
+        _is_agent_backend = str(
+            (getattr(self.client, "model_definition", None) or {}).get("type", "")
+        ).strip() in ("agent_backend", "claude-code")
+
         tool_format_value = str(getattr(self.tool_format, "value", self.tool_format)).strip().lower()
         tools_enabled_for_model = tool_format_value != "none"
 
         # Use tool loop if bot has tools enabled, model supports tool format,
         # and at least one tool backend is available.
-        if self.bot.uses_tools and tools_enabled_for_model and (
+        if not _is_agent_backend and self.bot.uses_tools and tools_enabled_for_model and (
             self.memory
             or self.search_client
             or self.news_client
@@ -498,6 +513,7 @@ class ServiceLLMBawt(BaseLLMBawt):
             messages,
             plaintext_output=plaintext_output,
             stream=stream,
+            **_q_kwargs,
         )
         return response, "", []
     
