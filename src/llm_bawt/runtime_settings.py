@@ -892,18 +892,37 @@ class RuntimeSettingsResolver:
         request_overrides: dict[str, Any] | None = None,
     ) -> Any:
         """Resolve a setting value using precedence chain."""
+        return self.resolve_with_source(
+            key, fallback=fallback, request_overrides=request_overrides
+        )[0]
+
+    def resolve_with_source(
+        self,
+        key: str,
+        fallback: Any = None,
+        request_overrides: dict[str, Any] | None = None,
+    ) -> tuple[Any, str]:
+        """Resolve a setting AND report which layer supplied it (TASK-487).
+
+        Returns ``(value, source)`` where source is one of:
+        ``request_override`` | ``bot_override`` | ``global_override`` |
+        ``code_default`` | ``unset``. Precedence matches ``resolve``; this is
+        the provenance-carrying sibling the effective-config inspector reads
+        through so "why is this value what it is" is answerable without
+        re-deriving the precedence chain by hand.
+        """
         if request_overrides and key in request_overrides:
-            return request_overrides[key]
+            return request_overrides[key], "request_override"
 
         self._refresh_cache_if_needed()
         if key in self._bot_cache:
-            return self._bot_cache[key]
+            return self._bot_cache[key], "bot_override"
         if key in self._global_cache:
-            return self._global_cache[key]
+            return self._global_cache[key], "global_override"
 
         if fallback is not None:
-            return fallback
-        return None
+            return fallback, "code_default"
+        return None, "unset"
 
     def resolve_from_config_attr(
         self,

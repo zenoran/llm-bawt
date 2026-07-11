@@ -269,6 +269,7 @@ class BaseLLMBawt(ABC):
                         "user_context",
                         f"## About the User\n{user_context}",
                         position=SectionPosition.USER_CONTEXT,
+                        metadata={"source": "profile_db:user", "gate": "db_available & profile"},
                     )
                     if self.verbose:
                         console.print(f"[dim]─── User Profile ({self.user_id}) ───[/dim]")
@@ -286,6 +287,7 @@ class BaseLLMBawt(ABC):
                         "bot_traits",
                         f"## Your Developed Traits\n{bot_context}",
                         position=SectionPosition.BOT_TRAITS,
+                        metadata={"source": "profile_db:bot", "gate": "db_available & profile"},
                     )
                     if self.verbose:
                         console.print(f"[dim]─── Bot Profile ({self.bot_id}) ───[/dim]")
@@ -296,11 +298,16 @@ class BaseLLMBawt(ABC):
         
         # Section 3: Base bot prompt (or active persona override, TASK-477)
         base_prompt = self._resolve_base_prompt()
+        _base_src = (
+            "persona_override" if getattr(self.bot, "prompt_override_id", None)
+            else "bot.system_prompt"
+        )
         if base_prompt:
             builder.add_section(
                 "base_prompt",
                 base_prompt,
                 position=SectionPosition.BASE_PROMPT,
+                metadata={"source": _base_src, "gate": "always"},
             )
 
         # Section 6: Global behavioral instructions (memory-enabled bots only)
@@ -309,6 +316,7 @@ class BaseLLMBawt(ABC):
                 "global_instructions",
                 GLOBAL_SYSTEM_PROMPT,
                 position=SectionPosition.GLOBAL_INSTRUCTIONS,
+                metadata={"source": "code_default:GLOBAL_SYSTEM_PROMPT", "gate": "requires_memory"},
             )
 
         # Section 4: Tool instructions (added at query time if needed)
@@ -495,17 +503,21 @@ class BaseLLMBawt(ABC):
             self.history_manager.remove_last_message_if_partial("assistant")
             return ""
     
-    def _build_context_messages(self, prompt: str, context_suffix: str | None = None) -> list[Message]:
-        """Build messages list with system prompt, memory context, and history.
+    def _assemble_system_builder(self, prompt: str = "") -> PromptBuilder:
+        """Assemble the per-turn system-prompt builder (TASK-487).
 
-        ``context_suffix`` (TASK-391) is per-turn text appended to the OUTBOUND
-        user message only — it is model-visible but never persisted (the caller
-        already stored the clean ``prompt``). Used for the agent attachment
-        manifest; see ``prepare_messages_for_query``.
+        Extracted verbatim from ``_build_context_messages`` so there is exactly
+        ONE assembly path: the live turn and the effective-config inspector both
+        call this, guaranteeing the inspector can never report a prompt that
+        differs from what is actually sent. Pure w.r.t. state that matters to the
+        cached prefix — it starts from a ``.copy()`` of the stable builder and
+        adds only per-turn sections, so the cached base prefix is untouched.
+
+        Each per-turn section is tagged with ``metadata`` {source, gate} purely
+        for inspection; metadata does not affect ``build()`` output.
         """
-        messages = []
-        
-        # Start with a copy of the prompt builder
+        # Start with a copy of the stable prompt builder (TASK-288: per-turn
+        # sections ride the copy, never the cached base).
         builder = self._prompt_builder.copy()
 
         # NOTE: temporal grounding (build_temporal_context @ SectionPosition.DATETIME)
@@ -528,6 +540,7 @@ class BaseLLMBawt(ABC):
                         "tools",
                         tools_prompt,
                         position=SectionPosition.TOOLS,
+                        metadata={"source": "generated:tools", "gate": "uses_tools"},
                     )
             elif self.memory:
                 # Non-tool memory bots get a read-only memory search tool
@@ -540,6 +553,7 @@ class BaseLLMBawt(ABC):
                     "tools",
                     tools_prompt,
                     position=SectionPosition.TOOLS,
+                    metadata={"source": "generated:memory_tool", "gate": "memory_readonly"},
                 )
 
         # Client-supplied system context (e.g. HA device list)
@@ -548,6 +562,7 @@ class BaseLLMBawt(ABC):
                 "client_context",
                 f"## Client Context\n{self._client_system_context}",
                 position=SectionPosition.CLIENT_CONTEXT,
+                metadata={"source": "client_runtime", "gate": "client_system_context"},
             )
 
         # Cold-start memory priming: inject top memories when history is thin
@@ -561,8 +576,9 @@ class BaseLLMBawt(ABC):
                         "cold_start_memory",
                         cold_start_context,
                         position=SectionPosition.MEMORY_CONTEXT,
+                        metadata={"source": "memory_search", "gate": "cold_start(history<=3)"},
                     )
-        
+
         # TTS output instructions (when tts_mode is enabled)
         # Agent backends (claude-code, codex, openclaw) use a per-turn
         # user-message prefix instead (chat.agent_voice_prefix, stamped
@@ -581,6 +597,10 @@ class BaseLLMBawt(ABC):
                     "tts_output",
                     tts_body,
                     position=SectionPosition.CUSTOM,
+                    metadata={
+                        "source": f"registry:{resolved.source}",
+                        "gate": "tts_mode & not agent_backend",
+                    },
                 )
 
         # Agent global prompt (opt-in per bot). Agent backends only — chat bots
@@ -599,7 +619,144 @@ class BaseLLMBawt(ABC):
                     "agent_global_prompt",
                     agent_global_body,
                     position=SectionPosition.GLOBAL_INSTRUCTIONS,
+                    metadata={
+                        "source": f"registry:{resolved.source}",
+                        "gate": "agent_backend & agent_global_prompt_enabled",
+                    },
                 )
+
+        return builder
+
+    def describe_effective_config(self, prompt: str = "") -> dict[str, Any]:
+        """Effective-config inspector (TASK-487) — read-only, no LLM, no writes.
+
+        Given this fully-constructed bot instance (for a resolved bot_id/user_id),
+        return the assembled system prompt broken into named sections with
+        per-section provenance, plus every relevant runtime setting with the
+        layer that supplied it, plus bot_type applicability notes that flag
+        settings which are configured but NOT consumed on this bot type (the
+        exact class of confusion that produced the Nova "summaries on but
+        ignored" report).
+
+        Determinism: driven entirely by ``_assemble_system_builder`` (the same
+        method a live turn uses) so two calls for the same (bot,user) with the
+        same prompt yield byte-identical section content.
+        """
+        is_agent = self.model_definition.get("type") in ("agent_backend", "claude-code")
+        bot_type = "agent" if is_agent else "chat"
+
+        builder = self._assemble_system_builder(prompt)
+        full_prompt = builder.build()
+
+        sections = []
+        for sec in builder.enabled_sections:
+            md = sec.metadata or {}
+            sections.append({
+                "name": sec.name,
+                "position": sec.position,
+                "char_len": len(sec.content),
+                "source": md.get("source", "unknown"),
+                "gate": md.get("gate", "unknown"),
+            })
+
+        # Curated runtime settings with provenance.
+        setting_keys = [
+            ("temperature", self.config.TEMPERATURE),
+            ("top_p", self.config.TOP_P),
+            ("max_output_tokens", self.config.MAX_OUTPUT_TOKENS),
+            ("max_context_tokens", getattr(self.config, "MAX_CONTEXT_TOKENS", 0)),
+            ("memory_n_results", 3),
+            ("memory_min_relevance", getattr(self.config, "MEMORY_MIN_RELEVANCE", None)),
+            ("agent_global_prompt_enabled", False),
+        ]
+        settings = []
+        for key, fallback in setting_keys:
+            if self.settings is not None:
+                value, source = self.settings.resolve_with_source(key, fallback=fallback)
+            else:
+                value, source = fallback, "code_default"
+            settings.append({"key": key, "value": value, "source": source})
+
+        # Flags that live off the runtime-settings table but still shape a turn,
+        # annotated with whether this bot_type actually consumes them.
+        agent_cfg = dict(getattr(self.bot, "agent_backend_config", {}) or {})
+        flags = [
+            {
+                "key": "include_summaries",
+                "value": self._include_summaries,
+                "storage": "request_flag / bot_profiles",
+                "applies_to": ["chat"],
+                "consumed": (not is_agent),
+                "note": (
+                    "IGNORED on this bot: agent bots early-return before the "
+                    "chat history branch (base.py) that reads it."
+                    if is_agent else "Gates summary-row inclusion in chat history."
+                ),
+            },
+            {
+                "key": "seed_summary_on_new_session",
+                "value": agent_cfg.get("seed_summary_on_new_session", False),
+                "storage": "agent_backend_config (JSON blob)",
+                "applies_to": ["agent"],
+                "consumed": is_agent,
+                "note": (
+                    "Read by the bridge on new-session creation to seed a summary."
+                    if is_agent else "N/A for chat bots (bridge-only, agent path)."
+                ),
+            },
+            {
+                "key": "tts_mode",
+                "value": self._tts_mode,
+                "storage": "request_flag",
+                "applies_to": ["chat", "agent"],
+                "consumed": True,
+                "note": "chat: system-prompt TTS section; agent: user-message voice prefix.",
+            },
+        ]
+
+        # Post-app augmentation layers appended downstream by the bridge — not
+        # part of the app-assembled prompt above, surfaced so the picture is whole.
+        downstream = []
+        if is_agent:
+            downstream = [
+                {"name": "runtime_context_model_block",
+                 "appended_by": "agent_backends/claude_code.py",
+                 "note": "<runtime-context> model id block, added by the bridge."},
+                {"name": "mcp_tool_context_block",
+                 "appended_by": "claude_code_bridge/bridge.py",
+                 "note": "## MCP Tool Context (bot_id + entity-id guidance)."},
+            ]
+
+        return {
+            "bot_id": self.bot_id,
+            "user_id": self.user_id,
+            "bot_type": bot_type,
+            "model_alias": self.resolved_model_alias,
+            "model_type": self.model_definition.get("type", "unknown"),
+            "prompt": {
+                "total_chars": len(full_prompt),
+                "section_count": len(sections),
+                "sections": sections,
+            },
+            "settings": settings,
+            "flags": flags,
+            "downstream_augmentation": downstream,
+        }
+
+    def _build_context_messages(self, prompt: str, context_suffix: str | None = None) -> list[Message]:
+        """Build messages list with system prompt, memory context, and history.
+
+        ``context_suffix`` (TASK-391) is per-turn text appended to the OUTBOUND
+        user message only — it is model-visible but never persisted (the caller
+        already stored the clean ``prompt``). Used for the agent attachment
+        manifest; see ``prepare_messages_for_query``.
+        """
+        messages = []
+
+        # Assemble the per-turn system-prompt builder. Extracted into one method
+        # (TASK-487) so the effective-config inspector drives the SAME code path
+        # and can never drift from what a live turn actually sends.
+        builder = self._assemble_system_builder(prompt)
 
         # Response-style instruction derived from keywords in the user's message.
         # Lets the user shape any bot's answer inline without extra config.
