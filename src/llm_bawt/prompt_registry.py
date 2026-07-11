@@ -17,6 +17,20 @@ from .utils.config import Config, has_database_credentials
 
 logger = logging.getLogger(__name__)
 
+#: Category used to group switchable persona prompts in the registry, keeping
+#: them separate from summarization/memory/agent/chat prompts. See TASK-477.
+PERSONA_CATEGORY = "persona"
+#: Key prefix for persona rows (e.g. ``persona.grumpy-editor``).
+PERSONA_KEY_PREFIX = "persona."
+
+
+def _slugify(text: str) -> str:
+    """Lowercase, hyphenated slug from arbitrary text (ASCII word chars only)."""
+    import re
+
+    slug = re.sub(r"[^a-z0-9]+", "-", (text or "").strip().lower()).strip("-")
+    return slug or "persona"
+
 
 class PromptTemplate(SQLModel, table=True):
     """Stored active prompt template."""
@@ -746,6 +760,85 @@ class PromptTemplateStore:
                 .order_by(PromptTemplateVersion.version.desc())
             )
             return list(session.exec(statement).all())
+
+    # ── Persona helpers (TASK-477) ─────────────────────────────────────
+    # Personas are ordinary prompt_templates rows with category='persona'
+    # and global scope, so they inherit versioning + resolution for free.
+    # They are shareable across bots; a bot points at one via
+    # bot_profiles.prompt_override_id (== PromptTemplate.id).
+
+    def get_by_id(self, template_id: int) -> PromptTemplate | None:
+        if self.engine is None or template_id is None:
+            return None
+        with Session(self.engine) as session:
+            return session.get(PromptTemplate, template_id)
+
+    def list_personas(self) -> list[PromptTemplate]:
+        """All global persona prompts, ordered by title/key."""
+        rows = self.list_rows(category=PERSONA_CATEGORY, scope_type="global")
+        return sorted(rows, key=lambda r: ((r.title or r.key or "").lower(), r.id or 0))
+
+    def create_persona(
+        self,
+        *,
+        title: str,
+        body: str,
+        updated_by: str | None = None,
+    ) -> PromptTemplate:
+        """Create a new global persona, generating a unique persona.<slug> key."""
+        if self.engine is None:
+            raise RuntimeError("Prompt template DB unavailable")
+        base_slug = _slugify(title)
+        existing_keys = {r.key for r in self.list_rows(category=PERSONA_CATEGORY, scope_type="global")}
+        key = f"{PERSONA_KEY_PREFIX}{base_slug}"
+        suffix = 2
+        while key in existing_keys:
+            key = f"{PERSONA_KEY_PREFIX}{base_slug}-{suffix}"
+            suffix += 1
+        return self.upsert(
+            key=key,
+            body=body,
+            scope_type="global",
+            title=title.strip() or key,
+            category=PERSONA_CATEGORY,
+            updated_by=updated_by,
+            change_note="Persona created",
+        )
+
+    def update_persona(
+        self,
+        template_id: int,
+        *,
+        body: str | None = None,
+        title: str | None = None,
+        updated_by: str | None = None,
+    ) -> PromptTemplate | None:
+        """Edit an existing persona by id; bumps a new version row."""
+        if self.engine is None:
+            raise RuntimeError("Prompt template DB unavailable")
+        row = self.get_by_id(template_id)
+        if row is None or row.category != PERSONA_CATEGORY:
+            return None
+        return self.upsert(
+            key=row.key,
+            body=body if body is not None else row.body,
+            scope_type=row.scope_type,
+            scope_id=row.scope_id,
+            title=title.strip() if title is not None else row.title,
+            category=PERSONA_CATEGORY,
+            format=row.format,
+            updated_by=updated_by,
+            change_note="Persona edited",
+        )
+
+    def delete_persona(self, template_id: int) -> bool:
+        """Delete a persona by id (its version history is retained)."""
+        if self.engine is None:
+            raise RuntimeError("Prompt template DB unavailable")
+        row = self.get_by_id(template_id)
+        if row is None or row.category != PERSONA_CATEGORY:
+            return False
+        return self.reset(row.key, row.scope_type, row.scope_id)
 
 
 class PromptResolver:

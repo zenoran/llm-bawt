@@ -433,6 +433,7 @@ def list_bots():
             name=bot.name,
             description=bot.description,
             system_prompt=bot.system_prompt,
+            prompt_override_id=getattr(bot, "prompt_override_id", None),
             requires_memory=bot.requires_memory,
             voice_optimized=bot.voice_optimized,
             tts_mode=bot.tts_mode,

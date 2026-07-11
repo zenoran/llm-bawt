@@ -73,12 +73,34 @@ async def _push_soul_background(slug: str, agent_id: str, system_prompt: str) ->
         logger.warning("Auto-push SOUL.md failed for '%s': %s", slug, e)
 
 
+def _resolve_effective_bot_prompt(config, profile) -> str:
+    """Effective prompt for a bot: persona override body if set, else base (TASK-477).
+
+    Falls back to the stored ``system_prompt`` if the override id is missing or
+    no longer resolves to a persona template.
+    """
+    override_id = getattr(profile, "prompt_override_id", None)
+    base = profile.system_prompt or ""
+    if not override_id:
+        return base
+    try:
+        from ...prompt_registry import PERSONA_CATEGORY, PromptTemplateStore
+
+        row = PromptTemplateStore(config).get_by_id(int(override_id))
+        if row is not None and row.category == PERSONA_CATEGORY and (row.body or "").strip():
+            return row.body
+    except Exception as e:
+        logger.warning("Could not resolve persona override id=%s for %s: %s", override_id, profile.slug, e)
+    return base
+
+
 def _to_profile_response(profile, settings: dict[str, object] | None = None) -> BotProfileResponse:
     return BotProfileResponse(
         slug=profile.slug,
         name=profile.name,
         description=profile.description,
         system_prompt=profile.system_prompt,
+        prompt_override_id=getattr(profile, "prompt_override_id", None),
         requires_memory=profile.requires_memory,
         voice_optimized=profile.voice_optimized,
         tts_mode=profile.tts_mode,
@@ -204,6 +226,7 @@ def _request_to_profile_payload(
         "uses_home_assistant": request.uses_home_assistant,
     }
     for field_name in (
+        "prompt_override_id",
         "default_model",
         "color",
         "avatar",
@@ -448,10 +471,8 @@ async def _persist_bot_profile(
     _invalidate_bot_instance_cache(service, profile.slug)
     _clear_session_model_overrides(service, bot_id=profile.slug)
 
-    if (
-        profile.agent_backend == "openclaw"
-        and (profile.system_prompt or "").strip()
-    ):
+    effective_prompt = _resolve_effective_bot_prompt(service.config, profile)
+    if profile.agent_backend == "openclaw" and effective_prompt.strip():
         profile_config = profile.agent_backend_config or {}
         session_key = profile_config.get("session_key", "")
         agent_id = "main"
@@ -459,7 +480,7 @@ async def _persist_bot_profile(
             parts = session_key.split(":")
             if len(parts) >= 2:
                 agent_id = parts[1]
-        await _push_soul_background(profile.slug, agent_id, profile.system_prompt)
+        await _push_soul_background(profile.slug, agent_id, effective_prompt)
 
     return _to_profile_response(profile, settings=_effective_bot_settings(service, profile.slug))
 
@@ -757,6 +778,7 @@ async def patch_bot_profile(slug: str, request: BotProfilePatchRequest):
         "name": existing.name,
         "description": existing.description,
         "system_prompt": existing.system_prompt,
+        "prompt_override_id": existing.prompt_override_id,
         "requires_memory": existing.requires_memory,
         "voice_optimized": existing.voice_optimized,
         "tts_mode": existing.tts_mode,

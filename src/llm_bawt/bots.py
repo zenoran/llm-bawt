@@ -22,6 +22,7 @@ class Bot:
     name: str  # Display name (e.g., "Nova", "Snark", "Mira")
     description: str  # Short description for --list-bots
     system_prompt: str  # The system message sent to the LLM
+    prompt_override_id: int | None = None  # Active persona override (prompt_templates.id); None => use system_prompt
     requires_memory: bool = True  # Whether this bot needs database/memory persistence
     voice_optimized: bool = False  # Whether output is optimized for TTS
     tts_mode: bool = False  # Default for tts_mode request flag (TTS formatting instructions)
@@ -172,6 +173,7 @@ def _load_db_bot_profiles() -> dict[str, dict[str, Any]]:
                 "name": row.name,
                 "description": row.description,
                 "system_prompt": row.system_prompt,
+                "prompt_override_id": getattr(row, "prompt_override_id", None),
                 "requires_memory": row.requires_memory,
                 "voice_optimized": row.voice_optimized,
                 "tts_mode": row.tts_mode,
@@ -239,6 +241,7 @@ def _load_bots_config() -> None:
             name=data.get("name", slug.title()),
             description=data.get("description", ""),
             system_prompt=data.get("system_prompt", "You are a helpful assistant."),
+            prompt_override_id=data.get("prompt_override_id"),
             requires_memory=data.get("requires_memory", True),
             voice_optimized=data.get("voice_optimized", False),
             tts_mode=data.get("tts_mode", False),

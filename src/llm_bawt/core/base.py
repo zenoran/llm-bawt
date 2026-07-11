@@ -220,6 +220,42 @@ class BaseLLMBawt(ABC):
             logger.warning(f"Failed to initialize search: {e}")
             self.search_client = None
     
+    def _resolve_base_prompt(self) -> str:
+        """Return the effective base prompt for this bot (TASK-477).
+
+        If the bot has an active persona override (``prompt_override_id``) that
+        resolves to a persona template, its body REPLACES the bot's stored
+        ``system_prompt``. If the override id is missing/unresolvable, fall back
+        to ``system_prompt`` and log — a stale override must never break a turn.
+        """
+        override_id = getattr(self.bot, "prompt_override_id", None)
+        if not override_id:
+            return self.bot.system_prompt
+
+        try:
+            from ..prompt_registry import PERSONA_CATEGORY, PromptTemplateStore
+
+            store = PromptTemplateStore(self.config)
+            row = store.get_by_id(int(override_id))
+            if row is not None and row.category == PERSONA_CATEGORY and (row.body or "").strip():
+                if self.verbose:
+                    console.print(
+                        f"[dim]─── Persona override: {row.title or row.key} "
+                        f"(id={override_id}) ───[/dim]"
+                    )
+                return row.body
+            logger.warning(
+                "Bot %s persona override id=%s unresolved (missing/non-persona/empty); "
+                "falling back to base system_prompt",
+                self.bot_id, override_id,
+            )
+        except Exception as e:
+            logger.warning(
+                "Failed to resolve persona override id=%s for bot %s: %s; using base prompt",
+                override_id, self.bot_id, e,
+            )
+        return self.bot.system_prompt
+
     def _init_system_prompt(self):
         """Build the system prompt using PromptBuilder."""
         builder = PromptBuilder()
@@ -258,11 +294,12 @@ class BaseLLMBawt(ABC):
             except Exception as e:
                 logger.warning(f"Failed to load bot profile: {e}")
         
-        # Section 3: Base bot prompt
-        if self.bot.system_prompt:
+        # Section 3: Base bot prompt (or active persona override, TASK-477)
+        base_prompt = self._resolve_base_prompt()
+        if base_prompt:
             builder.add_section(
                 "base_prompt",
-                self.bot.system_prompt,
+                base_prompt,
                 position=SectionPosition.BASE_PROMPT,
             )
 

@@ -14,7 +14,7 @@ from typing import TYPE_CHECKING
 from typing import Any
 from urllib.parse import quote_plus
 
-from sqlalchemy import Column, DateTime, String, Text, text
+from sqlalchemy import Column, DateTime, Integer, String, Text, text
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlmodel import Field, Session, SQLModel, create_engine, select
 
@@ -59,6 +59,14 @@ class BotProfile(SQLModel, table=True):
     name: str = Field(sa_column=Column(String(255), nullable=False))
     description: str = Field(sa_column=Column(Text, nullable=False, default=""))
     system_prompt: str = Field(sa_column=Column(Text, nullable=False))
+    # Active persona override. NULL => use ``system_prompt`` (the default persona).
+    # When set, points at a ``prompt_templates`` row (category='persona',
+    # scope_type='global') whose body REPLACES ``system_prompt`` at prompt-build
+    # time. The base ``system_prompt`` is never mutated by switching, so clearing
+    # this back to NULL restores the original prompt. See TASK-477.
+    prompt_override_id: int | None = Field(
+        default=None, sa_column=Column(Integer, nullable=True, index=True)
+    )
     requires_memory: bool = Field(default=True)
     voice_optimized: bool = Field(default=False)
     tts_mode: bool = Field(default=False)
@@ -134,6 +142,7 @@ class BotProfileStore:
             "ALTER TABLE bot_profiles ADD COLUMN IF NOT EXISTS default_voice VARCHAR(128)",
             "ALTER TABLE bot_profiles ADD COLUMN IF NOT EXISTS avatar VARCHAR(512)",
             "ALTER TABLE bot_profiles ADD COLUMN IF NOT EXISTS avatar_render TEXT",
+            "ALTER TABLE bot_profiles ADD COLUMN IF NOT EXISTS prompt_override_id INTEGER",
         ]
         try:
             with self.engine.connect() as conn:
@@ -185,6 +194,7 @@ class BotProfileStore:
                     name=str(payload.get("name") or slug.title()),
                     description=str(payload.get("description") or ""),
                     system_prompt=str(payload.get("system_prompt") or "You are a helpful assistant."),
+                    prompt_override_id=payload.get("prompt_override_id"),
                     requires_memory=bool(payload.get("requires_memory", True)),
                     voice_optimized=bool(payload.get("voice_optimized", False)),
                     tts_mode=bool(payload.get("tts_mode", False)),
@@ -209,6 +219,8 @@ class BotProfileStore:
                 row.name = str(payload.get("name", row.name) or row.name)
                 row.description = str(payload.get("description", row.description) or "")
                 row.system_prompt = str(payload.get("system_prompt", row.system_prompt) or row.system_prompt)
+                if "prompt_override_id" in payload:
+                    row.prompt_override_id = payload.get("prompt_override_id")
                 row.requires_memory = bool(payload.get("requires_memory", row.requires_memory))
                 row.voice_optimized = bool(payload.get("voice_optimized", row.voice_optimized))
                 row.tts_mode = bool(payload.get("tts_mode", row.tts_mode))

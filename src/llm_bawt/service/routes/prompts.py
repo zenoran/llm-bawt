@@ -9,6 +9,9 @@ from fastapi import APIRouter, HTTPException, Query
 from ...prompt_registry import PromptResolver, PromptTemplate, extract_placeholders
 from ..dependencies import get_service
 from ..schemas import (
+    PersonaCreateRequest,
+    PersonaResponse,
+    PersonaUpdateRequest,
     PromptTemplateIndexResponse,
     PromptTemplateListResponse,
     PromptTemplateResponse,
@@ -434,3 +437,88 @@ def reset_prompt(
             raise HTTPException(status_code=404, detail="Prompt template not found")
         raise HTTPException(status_code=404, detail="Prompt template reset but no code default exists")
     return _resolved_to_response(resolved)
+
+
+# ── Personas (TASK-477) ────────────────────────────────────────────────
+# Switchable, shareable system-prompt overrides. Backed by prompt_templates
+# rows (category='persona', global scope) so they inherit versioning.
+
+def _persona_to_response(row: PromptTemplate) -> PersonaResponse:
+    return PersonaResponse(
+        id=row.id,
+        key=row.key,
+        title=row.title or row.key,
+        body=row.body,
+        updated_at=row.updated_at,
+        created_at=row.created_at,
+    )
+
+
+def _persona_store():
+    """Return a prompt-template store, or 503 if the DB is unavailable."""
+    service = get_service()
+    resolver = PromptResolver(service.config)
+    if resolver.store.engine is None:
+        raise HTTPException(status_code=503, detail="Prompt template DB unavailable")
+    return resolver.store
+
+
+@router.get("/v1/personas", tags=["System"])
+def list_personas():
+    """List all global (shareable) personas."""
+    store = _persona_store()
+    return {"personas": [_persona_to_response(r) for r in store.list_personas()]}
+
+
+@router.post("/v1/personas", tags=["System"])
+def create_persona(request: PersonaCreateRequest):
+    """Create a new global persona."""
+    store = _persona_store()
+    title = (request.title or "").strip()
+    body = request.body or ""
+    if not title:
+        raise HTTPException(status_code=400, detail="Persona title is required")
+    if not body.strip():
+        raise HTTPException(status_code=400, detail="Persona body cannot be empty")
+    row = store.create_persona(title=title, body=body, updated_by="ui")
+    return _persona_to_response(row)
+
+
+@router.get("/v1/personas/{persona_id}", tags=["System"])
+def get_persona(persona_id: int):
+    """Get one persona by id."""
+    from ...prompt_registry import PERSONA_CATEGORY
+
+    store = _persona_store()
+    row = store.get_by_id(persona_id)
+    if row is None or row.category != PERSONA_CATEGORY:
+        raise HTTPException(status_code=404, detail="Persona not found")
+    return _persona_to_response(row)
+
+
+@router.put("/v1/personas/{persona_id}", tags=["System"])
+@router.patch("/v1/personas/{persona_id}", tags=["System"])
+def update_persona(persona_id: int, request: PersonaUpdateRequest):
+    """Edit a persona (creates a new version). Shared: affects every bot using it."""
+    store = _persona_store()
+    if request.body is not None and not request.body.strip():
+        raise HTTPException(status_code=400, detail="Persona body cannot be empty")
+    row = store.update_persona(
+        persona_id,
+        body=request.body,
+        title=request.title,
+        updated_by="ui",
+    )
+    if row is None:
+        raise HTTPException(status_code=404, detail="Persona not found")
+    return _persona_to_response(row)
+
+
+@router.delete("/v1/personas/{persona_id}", tags=["System"])
+def delete_persona(persona_id: int):
+    """Delete a persona. Does not clear it from bots still referencing it."""
+    store = _persona_store()
+    deleted = store.delete_persona(persona_id)
+    if not deleted:
+        raise HTTPException(status_code=404, detail="Persona not found")
+    return {"deleted": True, "id": persona_id}

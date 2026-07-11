@@ -251,6 +251,7 @@ class BotInfo(BaseModel):
     name: str
     description: str | None = None
     system_prompt: str = ""
+    prompt_override_id: int | None = None
     requires_memory: bool = True
     voice_optimized: bool = False
     tts_mode: bool = False
@@ -283,6 +284,8 @@ class BotProfileResponse(BaseModel):
     name: str
     description: str
     system_prompt: str
+    # Active persona override (prompt_templates.id). None => use system_prompt.
+    prompt_override_id: int | None = None
     requires_memory: bool = True
     voice_optimized: bool = False
     tts_mode: bool = False
@@ -337,6 +340,7 @@ class BotProfilePatchRequest(BaseModel):
     name: str | None = None
     description: str | None = None
     system_prompt: str | None = None
+    prompt_override_id: int | None = None
     requires_memory: bool | None = None
     voice_optimized: bool | None = None
     tts_mode: bool | None = None
@@ -359,6 +363,31 @@ class BotCreateRequest(BotProfileUpsertRequest):
     """Request payload for creating a new bot profile."""
 
     slug: str
+
+
+class PersonaResponse(BaseModel):
+    """A switchable persona prompt (TASK-477). Global / shareable across bots."""
+
+    id: int
+    key: str
+    title: str
+    body: str
+    updated_at: datetime | None = None
+    created_at: datetime | None = None
+
+
+class PersonaCreateRequest(BaseModel):
+    """Create a new global persona."""
+
+    title: str
+    body: str
+
+
+class PersonaUpdateRequest(BaseModel):
+    """Edit an existing persona (creates a new version)."""
+
+    title: str | None = None
+    body: str | None = None
 
 
 class TaskSubmitRequest(BaseModel):
