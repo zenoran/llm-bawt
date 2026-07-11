@@ -50,6 +50,19 @@ SESSION_PREFIX = "claude-code:"
 # TASK-445: session-seed constants.
 # agent_backend_config flag that gates history-summary seeding on new sessions.
 SEED_SETTING_KEY = "seed_summary_on_new_session"
+
+# TASK-490: MCP tool context body. Canonical default lives in the app registry
+# (agents.mcp_tool_context_template); the bridge cannot import llm_bawt, so it
+# fetches the (overridable) body via GET /v1/prompts/{key} and falls back to
+# this BYTE-IDENTICAL copy. The leading "\n\n" separator is added at append time.
+MCP_TOOL_CONTEXT_KEY = "agents.mcp_tool_context_template"
+_MCP_TOOL_CONTEXT_FALLBACK = (
+    "## MCP Tool Context\n"
+    "Your bot_id is \"{bot_slug}\". When using bawthub MCP tools:\n"
+    "- Memory/message tools: always pass bot_id=\"{bot_slug}\"\n"
+    "- Profile tool with entity_type=\"user\": use entity_id=\"nick\" (the user)\n"
+    "- Profile tool with entity_type=\"bot\": use entity_id=\"{bot_slug}\" (yourself)"
+)
 # Stamped on synthetic seed transcript entries. Not load-bearing for resume
 # (the CLI reads message content, not this), just keeps entries well-formed.
 _SEED_CLI_VERSION = "2.1.191"
@@ -597,6 +610,44 @@ class ClaudeCodeBridge:
 
     # ----- TASK-445: seed a fresh SDK session with chat summary history -----
 
+    async def _get_mcp_tool_context(self, bot_slug: str) -> str:
+        """Return the MCP tool context block for a bot (TASK-490).
+
+        Fetches the (bot-overridable) template body from the app registry via
+        GET /v1/prompts/{key}, cached per bot for the process, and falls back to
+        a byte-identical local copy if the app is unreachable — so behavior is
+        preserved regardless. Returns the block WITHOUT the leading separator;
+        the caller prepends ``\\n\\n``.
+        """
+        cache = getattr(self, "_mcp_ctx_cache", None)
+        if cache is None:
+            cache = {}
+            self._mcp_ctx_cache = cache
+        if bot_slug in cache:
+            return cache[bot_slug]
+
+        body = _MCP_TOOL_CONTEXT_FALLBACK
+        if self._app_api_url:
+            try:
+                async with httpx.AsyncClient(timeout=5) as client:
+                    resp = await client.get(
+                        f"{self._app_api_url}/v1/prompts/{MCP_TOOL_CONTEXT_KEY}",
+                        params={"scope_type": "bot", "scope_id": bot_slug},
+                    )
+                    resp.raise_for_status()
+                    fetched = (resp.json() or {}).get("body")
+                    if fetched:
+                        body = fetched
+            except Exception as e:
+                logger.warning(
+                    "MCP tool context fetch failed for %s (%s); using local fallback",
+                    bot_slug, e,
+                )
+        # Bridge-side substitution (robust against stray braces in overrides).
+        rendered = body.replace("{bot_slug}", bot_slug)
+        cache[bot_slug] = rendered
+        return rendered
+
     async def _get_seed_setting(self, bot_id: str) -> bool:
         """Read the per-bot ``seed_summary_on_new_session`` flag from
         agent_backend_config. Defaults to False (off) when absent or on error."""
@@ -1050,15 +1101,12 @@ class ClaudeCodeBridge:
             turn_screenshot_assets: list[dict] = []
 
             try:
-                # Inject MCP tool context so Claude passes the right identifiers
+                # Inject MCP tool context so Claude passes the right identifiers.
+                # Body comes from the registry (TASK-490) with a byte-identical
+                # local fallback; separator added here.
                 if system_prompt and self._mcp_servers and bot_slug:
-                    system_prompt += (
-                        f"\n\n## MCP Tool Context\n"
-                        f"Your bot_id is \"{bot_slug}\". When using bawthub MCP tools:\n"
-                        f"- Memory/message tools: always pass bot_id=\"{bot_slug}\"\n"
-                        f"- Profile tool with entity_type=\"user\": use entity_id=\"nick\" (the user)\n"
-                        f"- Profile tool with entity_type=\"bot\": use entity_id=\"{bot_slug}\" (yourself)"
-                    )
+                    mcp_ctx = await self._get_mcp_tool_context(bot_slug)
+                    system_prompt += f"\n\n{mcp_ctx}"
 
                 # Reuse SDK session for conversation continuity.
                 # If the model changed, start a fresh session.

@@ -191,6 +191,17 @@ RESPONSE_STYLE_DEEP_DIVE = (
     "end with a recommendation. Depth over brevity."
 )
 
+# MCP tool context block (TASK-490) — appended by the claude-code bridge so the
+# agent passes the right bot_id to bawthub MCP tools. {bot_slug} is required.
+# The leading "\n\n" separator is added at the append site, not in the body.
+MCP_TOOL_CONTEXT_TEMPLATE = (
+    "## MCP Tool Context\n"
+    "Your bot_id is \"{bot_slug}\". When using bawthub MCP tools:\n"
+    "- Memory/message tools: always pass bot_id=\"{bot_slug}\"\n"
+    "- Profile tool with entity_type=\"user\": use entity_id=\"nick\" (the user)\n"
+    "- Profile tool with entity_type=\"bot\": use entity_id=\"{bot_slug}\" (yourself)"
+)
+
 # Runtime-context model block (TASK-490) — injected app-side by the claude-code
 # agent backend so the agent has a ground-truth model id. {model} is required.
 RUNTIME_CONTEXT_TEMPLATE = (
@@ -432,6 +443,22 @@ DEFAULT_PROMPT_DEFINITIONS: dict[str, PromptDefinition] = {
                 "that must survive session resume). The toggle lives in "
                 "the chat composer's unified popup. Leave body empty to "
                 "disable even when the flag is on."
+            ),
+        },
+    ),
+    "agents.mcp_tool_context_template": PromptDefinition(
+        key="agents.mcp_tool_context_template",
+        title="Agent MCP Tool Context Block",
+        category="agent_execution",
+        required_vars=("bot_slug",),
+        loader=lambda: MCP_TOOL_CONTEXT_TEMPLATE,
+        metadata={
+            "notes": (
+                "Appended to the system prompt by the claude-code BRIDGE process "
+                "(gated on MCP servers being configured). Tells the agent its "
+                "bot_id for bawthub MCP calls. Requires {bot_slug}. The bridge "
+                "cannot import llm_bawt, so it fetches this via GET /v1/prompts/"
+                "{key} with a byte-identical local fallback. TASK-490."
             ),
         },
     ),
