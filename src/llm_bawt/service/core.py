@@ -316,6 +316,25 @@ class ServiceLLMBawt(BaseLLMBawt):
             slog.model_loaded(self.resolved_model_alias, "agent_backend", load_time_ms)
             return client
 
+        elif model_type == "ollama":
+            if not model_id:
+                raise ValueError(
+                    f"Missing 'model_id' in definition for '{self.resolved_model_alias}'"
+                )
+            base_url = self.model_definition.get("base_url") or (
+                f"{self.config.OLLAMA_URL.rstrip('/')}/v1"
+            )
+            client = OpenAIClient(
+                model_id,
+                config=self.config,
+                base_url=base_url,
+                api_key=self.model_definition.get("api_key") or "ollama",
+                model_definition=self.model_definition,
+            )
+            load_time_ms = (time.perf_counter() - start_time) * 1000
+            slog.model_loaded(self.resolved_model_alias, model_type, load_time_ms)
+            return client
+
         elif model_type in ("agent_backend", "claude-code"):
             from ..bot_types import agent_backend_for_model_def
             from ..clients.agent_backend_client import AgentBackendClient
@@ -346,7 +365,7 @@ class ServiceLLMBawt(BaseLLMBawt):
         else:
             raise ValueError(
                 f"Unsupported model type: '{model_type}'. "
-                f"Supported types: openai, grok, gguf, vllm, agent_backend, claude-code"
+                f"Supported types: openai, grok, gguf, vllm, ollama, agent_backend, claude-code"
             )
     
     # =========================================================================

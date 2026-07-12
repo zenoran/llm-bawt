@@ -229,21 +229,53 @@ def _upsert_mcp_server_config(
                 end = idx
                 break
 
+        # A server is either URL-based or stdio-based. Older bridge releases
+        # registered Crawl4AI through ``mcp-remote`` (command/args/env); if we
+        # merely add ``url`` to that section, Codex still classifies it as
+        # stdio and rejects the mixed config before starting a turn.
+        stdio_keys = {"command", "args", "cwd", "env"}
+        section_body = [
+            line
+            for line in lines[start + 1 : end]
+            if not (
+                "=" in line
+                and line.split("=", 1)[0].strip() in stdio_keys
+            )
+        ]
+        lines[start + 1 : end] = section_body
+        end = start + 1 + len(section_body)
+
         url_idx = next(
             (
                 idx
                 for idx in range(start + 1, end)
-                if lines[idx].strip().startswith("url")
+                if "=" in lines[idx]
                 and lines[idx].split("=", 1)[0].strip() == "url"
             ),
             None,
         )
         if url_idx is not None:
-            if lines[url_idx].strip() == url_line:
-                return
             lines[url_idx] = url_line
         else:
             lines.insert(start + 1, url_line)
+            end += 1
+
+        for extra_line in extra_lines or []:
+            extra_key = extra_line.split("=", 1)[0].strip()
+            extra_idx = next(
+                (
+                    idx
+                    for idx in range(start + 1, end)
+                    if "=" in lines[idx]
+                    and lines[idx].split("=", 1)[0].strip() == extra_key
+                ),
+                None,
+            )
+            if extra_idx is None:
+                lines.insert(end, extra_line)
+                end += 1
+            else:
+                lines[extra_idx] = extra_line
 
         new_text = "\n".join(lines)
         if existing.endswith("\n") or not new_text:

@@ -269,6 +269,7 @@ class ModelCatalog:
                 "protocol": endpoint.access_path.protocol,
                 "base_url": endpoint.access_path.base_url,
                 "auth_mechanism": endpoint.access_path.auth_mechanism,
+                "engine_kind": endpoint.access_path.engine_kind,
                 "harness": normalized_harness,
                 "upstream_model_id": upstream,
             }

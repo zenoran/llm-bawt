@@ -20,6 +20,7 @@ def _endpoint(
     upstream: str,
     *,
     legacy_type: str = "openai",
+    engine_kind: str | None = None,
     serving_config=None,
 ):
     return ModelEndpoint(
@@ -32,6 +33,7 @@ def _endpoint(
             protocol,
             None,
             "test",
+            engine_kind=engine_kind,
         ),
         upstream_model_id=upstream,
         serving_config=serving_config or {},
@@ -124,6 +126,7 @@ def test_local_serving_config_is_flattened_for_existing_consumers():
         "chat-completions",
         "dolphin",
         legacy_type="gguf",
+        engine_kind="llama-cpp",
         serving_config={
             "repo_id": "org/repo",
             "filename": "model.gguf",
@@ -137,3 +140,4 @@ def test_local_serving_config_is_flattened_for_existing_consumers():
     assert resolved["repo_id"] == "org/repo"
     assert resolved["filename"] == "model.gguf"
     assert resolved["n_gpu_layers"] == 33
+    assert resolved["engine_kind"] == "llama-cpp"

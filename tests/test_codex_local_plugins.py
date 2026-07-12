@@ -3,7 +3,10 @@ from __future__ import annotations
 import logging
 from pathlib import Path
 
-from codex_bridge.local_plugins import install_repo_local_plugins
+from codex_bridge.local_plugins import (
+    ensure_crawl4ai_mcp_config,
+    install_repo_local_plugins,
+)
 
 
 def _write(path: Path, content: str) -> None:
@@ -224,3 +227,31 @@ def test_install_repo_local_plugins_adds_bawthub_mcp_when_plugins_disabled(
     contents = (codex_home / "config.toml").read_text()
     assert "[mcp_servers.bawthub]" in contents
     assert 'url = "http://app:8001/mcp"' in contents
+
+
+def test_crawl4ai_url_replaces_legacy_stdio_transport(monkeypatch, tmp_path: Path):
+    codex_home = tmp_path / ".codex"
+    config_toml = codex_home / "config.toml"
+    _write(
+        config_toml,
+        '[mcp_servers.crawl4ai]\n'
+        'command = "npx"\n'
+        'args = ["mcp-remote", "http://old/mcp/sse"]\n'
+        'env = { AUTH_HEADER = "Bearer old" }\n'
+        "startup_timeout_sec = 30\n",
+    )
+    monkeypatch.setenv("CODEX_CRAWL4AI_MCP_URL", "http://crawl4ai:11235/mcp/sse")
+    monkeypatch.setenv("CRAWL4AI_API_TOKEN", "fresh-token")
+
+    ensure_crawl4ai_mcp_config(
+        logger=logging.getLogger("test.codex_local_plugins"),
+        codex_home=codex_home,
+    )
+
+    contents = config_toml.read_text()
+    assert 'url = "http://crawl4ai:11235/mcp/sse"' in contents
+    assert 'headers = { Authorization = "Bearer fresh-token" }' in contents
+    assert "command =" not in contents
+    assert "args =" not in contents
+    assert "env =" not in contents
+    assert "startup_timeout_sec = 30" in contents

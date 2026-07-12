@@ -574,10 +574,11 @@ class ClaudeCodeBridge:
                 bc.pop("model", None)
                 bc["session_model"] = model
 
-                await client.patch(
+                patch_response = await client.patch(
                     f"{self._app_api_url}/v1/bots/{bot_id}/profile",
                     json={"agent_backend_config": bc},
                 )
+                patch_response.raise_for_status()
             logger.info("Session persisted: %s -> %s", bot_id, sdk_session_id)
         except Exception as e:
             logger.warning("Failed to persist session for %s: %s", bot_id, e)
@@ -600,10 +601,11 @@ class ClaudeCodeBridge:
                         bc.pop("session_key", None)
                         break
 
-                await client.patch(
+                patch_response = await client.patch(
                     f"{self._app_api_url}/v1/bots/{bot_id}/profile",
                     json={"agent_backend_config": bc},
                 )
+                patch_response.raise_for_status()
                 logger.info("Session cleared: %s (had_session=%s)", bot_id, had_session)
                 return had_session
         except Exception as e:
