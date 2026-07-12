@@ -254,7 +254,7 @@ def _collect_model_info(config: Config, model_alias: str) -> ModelStatusInfo | N
     if model_alias not in defined_models:
         return None
 
-    model_def = defined_models[model_alias]
+    model_def = config.resolve_model(model_alias)
     model_type = model_def.get("type", "unknown")
 
     effective_max_tokens = model_def.get("max_tokens", config.MAX_OUTPUT_TOKENS)

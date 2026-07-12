@@ -59,6 +59,15 @@ async def lifespan(app):
         if db_models:
             config.merge_db_models(db_models)
             log.debug("Loaded %d model definitions from DB", len(db_models))
+        try:
+            from ..model_catalog import ModelCatalogStore
+
+            normalized_catalog = ModelCatalogStore(model_store.engine).load()
+            if len(normalized_catalog):
+                config.install_model_catalog(normalized_catalog)
+                log.info("Loaded %d normalized model endpoints", len(normalized_catalog))
+        except Exception as e:
+            log.warning("Normalized model catalog load skipped: %s", e)
 
     # Consolidate legacy agent_backend_config.model onto default_model
     # (idempotent; cheap existence check before doing any work). Runs after

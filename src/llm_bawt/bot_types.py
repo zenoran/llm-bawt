@@ -24,6 +24,11 @@ def agent_backend_for_model_def(model_def: dict[str, Any] | None) -> str | None:
     """
     if not model_def:
         return None
+    harness = str(model_def.get("harness") or "").strip().lower()
+    if harness == "claude-proxy":
+        return "claude-code"
+    if harness in {"claude-code", "codex", "openclaw"}:
+        return harness
     model_type = str(model_def.get("type") or "").strip().lower()
     if model_type == "claude-code":
         return "claude-code"

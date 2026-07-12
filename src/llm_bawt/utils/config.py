@@ -341,6 +341,7 @@ class Config(RuntimeTunables, BaseSettings):
     SYSTEM_MESSAGE: str = Field(default=DEFAULT_SYSTEM_MESSAGE)
 
     defined_models: Dict[str, Any] = Field(default_factory=dict, exclude=True)
+    model_catalog: Any = Field(default=None, exclude=True)
     available_ollama_models: List[str] = Field(default_factory=list, exclude=True)
     ollama_checked: bool = Field(default=False, exclude=True)
 
@@ -357,6 +358,50 @@ class Config(RuntimeTunables, BaseSettings):
         # Models are loaded exclusively from the database.
         # merge_db_models() is called by the service / ModelManager on startup.
         self.defined_models = {"models": {}}
+        self.model_catalog = None
+
+    def install_model_catalog(self, catalog: Any) -> None:
+        """Install the normalized endpoint catalog and its iteration shim."""
+        self.model_catalog = catalog
+        self.defined_models = {"models": catalog.compatibility_mapping()}
+
+    def ensure_model_catalog(self) -> Any:
+        """Lazy-load the normalized catalog for CLI/non-service callers."""
+        if self.model_catalog is not None:
+            return self.model_catalog
+        if not has_database_credentials(self):
+            return None
+        try:
+            from ..model_catalog import ModelCatalogStore
+            from .db import get_shared_engine
+
+            engine = get_shared_engine(self)
+            if engine is None:
+                return None
+            catalog = ModelCatalogStore(engine).load()
+            if len(catalog):
+                self.install_model_catalog(catalog)
+            return self.model_catalog
+        except Exception as exc:
+            logger.debug("Normalized model catalog unavailable: %s", exc)
+            return None
+
+    def resolve_model(
+        self,
+        ref: str | int | Any,
+        harness: str | None = None,
+        default: Any = None,
+    ) -> Any:
+        """Resolve a model/endpoint ref, with legacy virtual-model fallback."""
+        catalog = self.ensure_model_catalog()
+        if catalog is not None:
+            from ..model_catalog import ModelNotFoundError
+
+            try:
+                return catalog.resolve(ref, harness=harness)
+            except ModelNotFoundError:
+                pass
+        return self.defined_models.get("models", {}).get(str(ref), default)
 
     def merge_db_models(self, db_models: dict[str, Any]) -> None:
         """Load model definitions from the database.
@@ -436,7 +481,7 @@ class Config(RuntimeTunables, BaseSettings):
         static fallback. The full auto-sizing logic lives in utils/vram.py
         and runs at model load time.
         """
-        model_def = self.defined_models.get("models", {}).get(model_alias or "", {})
+        model_def = self.resolve_model(model_alias or "", default={})
         def_val = model_def.get("context_window")
         if def_val is not None:
             return int(def_val)
@@ -453,7 +498,7 @@ class Config(RuntimeTunables, BaseSettings):
         2. Global MAX_OUTPUT_TOKENS config
         3. Hardcoded default: 4096
         """
-        model_def = self.defined_models.get("models", {}).get(model_alias or "", {})
+        model_def = self.resolve_model(model_alias or "", default={})
         def_val = model_def.get("max_tokens")
         if def_val is not None:
             return int(def_val)
@@ -467,7 +512,7 @@ class Config(RuntimeTunables, BaseSettings):
         2. Global LLAMA_CPP_N_GPU_LAYERS config
         3. Hardcoded default: -1 (all layers)
         """
-        model_def = self.defined_models.get("models", {}).get(model_alias or "", {})
+        model_def = self.resolve_model(model_alias or "", default={})
         def_val = model_def.get("n_gpu_layers")
         if def_val is not None:
             return int(def_val)
@@ -482,7 +527,7 @@ class Config(RuntimeTunables, BaseSettings):
         3. Auto-detect by provider type
         """
         if model_def is None and model_alias:
-            model_def = self.defined_models.get("models", {}).get(model_alias, {})
+            model_def = self.resolve_model(model_alias, default={})
         model_def = model_def or {}
 
         # 1. Explicit tool_support (new)

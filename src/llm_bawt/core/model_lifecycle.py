@@ -118,7 +118,7 @@ class ModelLifecycleManager:
         # Try case-insensitive match
         normalized = self._normalize_alias(alias)
         if normalized:
-            return self.config.defined_models.get("models", {}).get(normalized)
+            return self.config.resolve_model(normalized)
         return None
     
     def unload_current_model(self) -> bool:

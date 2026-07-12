@@ -86,14 +86,14 @@ class ChatStreamingMixin:
 
     def _is_openclaw_bot(self, model_alias: str) -> bool:
         """Check if this model alias maps to an openclaw agent backend."""
-        model_def = self.config.defined_models.get("models", {}).get(model_alias, {})
+        model_def = self.config.resolve_model(model_alias, default={})
         if model_def.get("type") == "agent_backend" and model_def.get("backend") == "openclaw":
             return True
         return model_alias == "openclaw"
 
     def _get_openclaw_session_key(self, model_alias: str) -> str:
         """Get the session_key for an OpenClaw model from its bot_config."""
-        model_def = self.config.defined_models.get("models", {}).get(model_alias, {})
+        model_def = self.config.resolve_model(model_alias, default={})
         return (
             (model_def.get("bot_config") or {}).get("session_key")
             or "agent:main:main"

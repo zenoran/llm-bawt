@@ -68,23 +68,13 @@ def _provider_for_bot(service, bot_id: str) -> str:
     model_type = None
     if alias:
         try:
-            from ...runtime_settings import ModelDefinitionStore
-
-            # Prefer direct get(alias) — list_all is only a fallback.
-            store = ModelDefinitionStore(service.config)
-            row = None
-            try:
-                row = store.get(alias)
-            except Exception:  # noqa: BLE001
-                row = None
-            if row is None:
-                for candidate in store.list_all():
-                    if getattr(candidate, "alias", None) == alias:
-                        row = candidate
-                        break
-            if row is not None:
-                model_id = getattr(row, "model_id", None)
-                model_type = getattr(row, "type", None)
+            model_def = service.config.resolve_model(
+                alias,
+                harness=getattr(bot, "harness", None),
+                default={},
+            )
+            model_id = model_def.get("model_id")
+            model_type = model_def.get("type")
         except Exception:  # noqa: BLE001
             model_id = None
             model_type = None

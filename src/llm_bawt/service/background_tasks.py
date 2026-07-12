@@ -151,7 +151,7 @@ class BackgroundTasksMixin:
             log.error(err)
             return {"error": err}
 
-        model_def = self.config.defined_models.get("models", {}).get(model_to_use, {})
+        model_def = self.config.resolve_model(model_to_use, default={})
         if model_def.get("type") == "openai" and not (self.config.OPENAI_API_KEY or self.config.XAI_API_KEY):
             err = f"Profile maintenance model '{model_to_use}' requires API key configuration"
             log.error(err)

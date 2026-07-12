@@ -76,6 +76,8 @@ class BotProfile(SQLModel, table=True):
     uses_search: bool = Field(default=False)
     uses_home_assistant: bool = Field(default=False)
     default_model: str | None = Field(default=None, sa_column=Column(String(255), nullable=True))
+    harness: str | None = Field(default=None, sa_column=Column(String(32), nullable=True))
+    endpoint_id: int | None = Field(default=None, sa_column=Column(Integer, nullable=True, index=True))
     color: str | None = Field(default=None, sa_column=Column(String(64), nullable=True))
     avatar: str | None = Field(default=None, sa_column=Column(String(512), nullable=True))
     # Self-hosted, ready-to-embed render of ``avatar`` as a ``data:`` URL
@@ -204,6 +206,8 @@ class BotProfileStore:
                     uses_search=bool(payload.get("uses_search", False)),
                     uses_home_assistant=bool(payload.get("uses_home_assistant", False)),
                     default_model=payload.get("default_model"),
+                    harness=payload.get("harness"),
+                    endpoint_id=payload.get("endpoint_id"),
                     color=payload.get("color"),
                     avatar=payload.get("avatar"),
                     avatar_render=payload.get("avatar_render"),
@@ -231,6 +235,10 @@ class BotProfileStore:
                 row.uses_home_assistant = bool(payload.get("uses_home_assistant", row.uses_home_assistant))
                 if payload.get("default_model") is not None:
                     row.default_model = payload["default_model"]
+                if "harness" in payload:
+                    row.harness = payload.get("harness")
+                if "endpoint_id" in payload:
+                    row.endpoint_id = payload.get("endpoint_id")
                 if payload.get("color") is not None:
                     row.color = payload["color"]
                 if "avatar" in payload:
@@ -326,6 +334,8 @@ class BotProfileStore:
                 "uses_search": bot_data.get("uses_search", False),
                 "uses_home_assistant": bot_data.get("uses_home_assistant", False),
                 "default_model": bot_data.get("default_model"),
+                "harness": bot_data.get("harness"),
+                "endpoint_id": bot_data.get("endpoint_id"),
                 "nextcloud_config": bot_data.get("nextcloud"),
                 "bot_type": normalize_bot_type(
                     bot_data.get("bot_type"),

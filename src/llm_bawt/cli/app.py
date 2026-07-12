@@ -1728,8 +1728,15 @@ def main():
         effective_model = selection.alias
 
         # Auto-switch to service for non-OpenAI model types
-        defined_models = config_obj.defined_models.get("models", {})
-        model_def = defined_models.get(effective_model, {}) if effective_model else {}
+        model_def = (
+            config_obj.resolve_model(
+                effective_model,
+                harness=getattr(target_bot, "harness", None),
+                default={},
+            )
+            if effective_model
+            else {}
+        )
         effective_model_type = model_def.get("type")
         if effective_model_type and effective_model_type != "openai":
             service_client = get_service_client(config_obj)
@@ -1788,7 +1795,11 @@ def _query_agent_backend(prompt: str, bot, plaintext_output: bool):
         _cfg = Config()
         default_alias = getattr(bot, "default_model", None)
         if default_alias:
-            model_def = _cfg.defined_models.get("models", {}).get(default_alias, {})
+            model_def = _cfg.resolve_model(
+                default_alias,
+                harness=getattr(bot, "harness", None),
+                default={},
+            )
             if (
                 agent_backend_for_model_def(model_def) == bot.agent_backend
                 and model_def.get("model_id")

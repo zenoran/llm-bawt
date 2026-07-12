@@ -282,10 +282,17 @@ def reload_models_catalog():
     db_count = 0
     store = get_model_definition_store(config)
     if store.engine is not None:
+        from ...memory.model_catalog_migration import migrate_model_catalog
+        from ...model_catalog import ModelCatalogStore
+
+        migrate_model_catalog(store.engine)
         db_models = store.to_config_dict()
         db_count = len(db_models)
         if db_models:
             config.merge_db_models(db_models)
+        normalized_catalog = ModelCatalogStore(store.engine).load()
+        if len(normalized_catalog):
+            config.install_model_catalog(normalized_catalog)
 
     service._load_available_models()
     cleared = service.invalidate_all_instances()

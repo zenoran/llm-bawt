@@ -328,30 +328,63 @@ def _validate_agent_default_model(
         )
 
     service = get_service()
-    store = get_bot_profile_store(service.config)
-    engine = getattr(store, "engine", None)
-    if engine is None:
-        return  # DB unavailable; the upsert path will surface the failure
-
-    from sqlalchemy import text as sa_text
-
     from ...bot_types import agent_backend_for_model_def
 
+    resolver = getattr(service.config, "resolve_model", None)
+    if not callable(resolver):
+        store = get_bot_profile_store(service.config)
+        engine = getattr(store, "engine", None)
+        if engine is None:
+            return
+        from sqlalchemy import text as sa_text
+
+        try:
+            with engine.connect() as conn:
+                row = conn.execute(
+                    sa_text(
+                        "SELECT type, model_id, COALESCE(extra->>'backend', '') AS extra_backend "
+                        "FROM model_definitions WHERE alias = :v LIMIT 1"
+                    ),
+                    {"v": default_model},
+                ).fetchone()
+        except Exception:
+            return
+        if row is None:
+            model_def = None
+        else:
+            model_def = {
+                "type": (row[0] or "").lower(),
+                "backend": (row[2] or "").lower() or None,
+                "model_id": row[1],
+            }
+    else:
+        model_def = None
     try:
-        with engine.connect() as conn:
-            row = conn.execute(
-                sa_text(
-                    "SELECT type, model_id, COALESCE(extra->>'backend', '') AS extra_backend "
-                    "FROM model_definitions WHERE alias = :v LIMIT 1"
-                ),
-                {"v": default_model},
-            ).fetchone()
+        from ...model_catalog import ModelNotFoundError
+
+        if callable(resolver):
+            harness = payload.get("harness")
+            if not harness and agent_backend == "codex":
+                harness = "codex"
+            if not harness and agent_backend == "claude-code":
+                endpoint = service.config.ensure_model_catalog().resolve_endpoint(default_model)
+                harness = (
+                    "claude-code"
+                    if endpoint.access_path.protocol == "anthropic-messages"
+                    else "claude-proxy"
+                )
+            model_def = resolver(
+                default_model,
+                harness=str(harness) if harness else None,
+            )
+    except ModelNotFoundError:
+        model_def = None
     except Exception:
         # Lookup failure must not gate the save — the DB trigger still
         # enforces backend↔type compatibility on default_model.
         return
 
-    if row is None:
+    if not model_def:
         raise HTTPException(
             status_code=422,
             detail=(
@@ -360,21 +393,16 @@ def _validate_agent_default_model(
             ),
         )
 
-    model_def = {
-        "type": (row[0] or "").lower(),
-        "backend": (row[2] or "").lower() or None,
-        "model_id": row[1],
-    }
     if agent_backend_for_model_def(model_def) != agent_backend:
         raise HTTPException(
             status_code=422,
             detail=(
                 f"default_model={default_model!r} (type={model_def['type'] or 'unknown'}, "
-                f"backend={model_def['backend'] or 'n/a'}) is not compatible with "
+                f"backend={model_def.get('backend') or 'n/a'}) is not compatible with "
                 f"agent_backend={agent_backend}. Pick a {agent_backend} catalog entry."
             ),
         )
-    if not (isinstance(row[1], str) and row[1].strip()):
+    if not (isinstance(model_def.get("model_id"), str) and model_def["model_id"].strip()):
         raise HTTPException(
             status_code=422,
             detail=(
@@ -789,6 +817,8 @@ async def patch_bot_profile(slug: str, request: BotProfilePatchRequest):
         "uses_search": existing.uses_search,
         "uses_home_assistant": existing.uses_home_assistant,
         "default_model": existing.default_model,
+        "harness": getattr(existing, "harness", None),
+        "endpoint_id": getattr(existing, "endpoint_id", None),
         "color": existing.color,
         "avatar": existing.avatar,
         "default_voice": existing.default_voice,

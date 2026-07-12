@@ -89,9 +89,15 @@ class ServiceLLMBawt(BaseLLMBawt):
             # any legacy ``agent_backend_config.model`` (which is migrated to
             # ``session_model`` and no longer user-facing).
             from ..bot_types import agent_backend_for_model_def
+            from ..model_catalog import resolve_model_config
             default_alias = getattr(self.bot, "default_model", None)
             if default_alias:
-                model_def = self.config.defined_models.get("models", {}).get(default_alias, {})
+                model_def = resolve_model_config(
+                    self.config,
+                    default_alias,
+                    harness=getattr(self.bot, "harness", None),
+                    default={},
+                )
                 if (
                     agent_backend_for_model_def(model_def)
                     == getattr(self.bot, "agent_backend", None)

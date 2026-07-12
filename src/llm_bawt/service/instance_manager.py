@@ -10,6 +10,7 @@ from typing import Any
 
 from ..bot_types import agent_backend_for_model_def
 from ..bots import BotManager
+from ..model_catalog import resolve_model_config
 from .logging import get_service_logger
 
 log = get_service_logger(__name__)
@@ -145,7 +146,13 @@ class InstanceManagerMixin:
                     backend_name != "openclaw"
                     and default_alias
                     and default_alias in self._available_models
-                    and agent_backend_for_model_def(models.get(default_alias)) == backend_name
+                    and agent_backend_for_model_def(
+                        resolve_model_config(
+                            self.config,
+                            default_alias,
+                            harness=getattr(default_bot, "harness", None),
+                        )
+                    ) == backend_name
                 ):
                     self._default_model = default_alias
                 else:
@@ -205,11 +212,16 @@ class InstanceManagerMixin:
                 )
             default_alias = getattr(bot, "default_model", None) if bot else None
             if backend_name != "openclaw":
-                models = self.config.defined_models.get("models", {})
                 if (
                     default_alias
                     and default_alias in self._available_models
-                    and agent_backend_for_model_def(models.get(default_alias)) == backend_name
+                    and agent_backend_for_model_def(
+                        resolve_model_config(
+                            self.config,
+                            default_alias,
+                            harness=getattr(bot, "harness", None),
+                        )
+                    ) == backend_name
                 ):
                     return default_alias, warnings
                 log.warning(
@@ -308,7 +320,7 @@ class InstanceManagerMixin:
         # distinct real aliases (e.g. opus-4-7 vs gpt-5.4-codex).
         current_model = self._model_lifecycle.current_model
         if current_model and current_model != model_alias:
-            prev_def = self.config.defined_models.get("models", {}).get(current_model, {})
+            prev_def = resolve_model_config(self.config, current_model, default={})
             if prev_def.get("type") in ("gguf", "vllm", "llamacpp"):
                 log.info(f"🔄 Model: {current_model} → {model_alias}")
                 # Unloading triggers _on_model_unloaded which clears caches
@@ -358,7 +370,13 @@ class InstanceManagerMixin:
         log.cache_miss("llm_bawt", f"{model_alias}/{bot_id}/{user_id}")
 
         # Get model type for logging and cache decisions
-        model_def = self.config.defined_models.get("models", {}).get(model_alias, {})
+        resolution_bot = BotManager(self.config).get_bot(bot_id)
+        model_def = resolve_model_config(
+            self.config,
+            model_alias,
+            harness=getattr(resolution_bot, "harness", None),
+            default={},
+        )
         model_type = model_def.get("type", "unknown")
 
         # Check if we already have a client for this model in the client cache
@@ -466,8 +484,13 @@ class InstanceManagerMixin:
         if cached is not None:
             return cached, model_alias
 
-        models = self.config.defined_models.get("models", {})
-        model_def = models.get(model_alias, {})
+        background_bot = BotManager(self.config).get_bot("nova")
+        model_def = resolve_model_config(
+            self.config,
+            model_alias,
+            harness=getattr(background_bot, "harness", None),
+            default={},
+        )
         model_type = model_def.get("type")
 
         # TASK-276 follow-up: local GPU models (gguf/vllm) run in the standalone

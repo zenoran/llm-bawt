@@ -30,6 +30,8 @@ class Bot:
     include_in_global_search: bool = True  # Whether aggregate cross-bot search includes this bot
     default_voice: str | None = None  # Optional default voice identifier for TTS/voice clients
     default_model: str | None = None  # Default model alias for this bot
+    harness: str | None = None  # Turn execution harness
+    endpoint_id: int | None = None  # Canonical normalized model endpoint
     uses_tools: bool = False  # Whether this bot can use tools (memory search, etc.)
     uses_search: bool = False  # Whether this bot can search the web
     uses_home_assistant: bool = False  # Whether this bot can control Home Assistant via MCP
@@ -45,6 +47,8 @@ class Bot:
     def __post_init__(self):
         self.slug = self.slug.lower().strip()
         self.bot_type = normalize_bot_type(self.bot_type, self.agent_backend)
+        if not self.harness:
+            self.harness = self.agent_backend or "chat"
 
 
 @dataclass
@@ -185,6 +189,8 @@ def _load_db_bot_profiles() -> dict[str, dict[str, Any]]:
             }
             if row.default_model is not None:
                 entry["default_model"] = row.default_model
+            entry["harness"] = getattr(row, "harness", None)
+            entry["endpoint_id"] = getattr(row, "endpoint_id", None)
             if row.color is not None:
                 entry["color"] = row.color
             if row.avatar is not None:
@@ -249,6 +255,8 @@ def _load_bots_config() -> None:
             include_in_global_search=data.get("include_in_global_search", True),
             default_voice=data.get("default_voice"),
             default_model=data.get("default_model"),
+            harness=data.get("harness"),
+            endpoint_id=data.get("endpoint_id"),
             uses_tools=data.get("uses_tools", False),
             uses_search=data.get("uses_search", False),
             uses_home_assistant=data.get("uses_home_assistant", False),
@@ -509,6 +517,11 @@ class BotManager:
         # model must be ignored so requests always route through the backend.
         bot = self.get_bot(bot_slug) if bot_slug else None
         if bot and bot.agent_backend and bot.default_model:
+            if self.config:
+                self.config.resolve_model(
+                    bot.default_model,
+                    harness=bot.harness,
+                )
             return ModelSelection(alias=bot.default_model, source="bot_default")
 
         model_alias = requested_model.strip() if requested_model else None

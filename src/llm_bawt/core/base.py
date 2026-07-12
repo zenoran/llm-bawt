@@ -86,7 +86,15 @@ class BaseLLMBawt(ABC):
             raise ValueError("user_id is required - set LLM_BAWT_DEFAULT_USER or pass --user")
         self.resolved_model_alias = resolved_model_alias
         self.config = config
-        self.model_definition = self.config.defined_models.get("models", {}).get(resolved_model_alias)
+        resolution_bot = BotManager(config).get_bot(bot_id)
+        resolution_harness = getattr(resolution_bot, "harness", None)
+        from ..model_catalog import resolve_model_config
+
+        self.model_definition = resolve_model_config(
+            self.config,
+            resolved_model_alias,
+            harness=resolution_harness,
+        )
         self.tool_format = self.config.get_tool_format(model_alias=resolved_model_alias, model_def=self.model_definition)
         self.local_mode = local_mode
         self.bot_id = bot_id
