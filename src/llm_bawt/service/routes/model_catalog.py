@@ -81,6 +81,18 @@ def _check_endpoint_cas(existing_id: int | None, expected_id: int | None) -> Non
         )
 
 
+def _delete_model_sources(conn, model_key: str):
+    """Delete both catalog authorities so migration cannot resurrect a model."""
+    conn.execute(
+        text("DELETE FROM model_definitions WHERE alias = :key"),
+        {"key": model_key},
+    )
+    return conn.execute(
+        text("DELETE FROM models WHERE key = :key RETURNING id"),
+        {"key": model_key},
+    ).first()
+
+
 @router.get("/harnesses")
 def list_harnesses():
     """List harnesses and the protocol rule used by the cascade UI."""
@@ -142,10 +154,7 @@ def delete_catalog_model(model_key: str):
             """), {"key": model_key}).scalar()
             if bot:
                 raise HTTPException(status_code=409, detail=f"Model is used by bot '{bot}'")
-            row = conn.execute(
-                text("DELETE FROM models WHERE key = :key RETURNING id"),
-                {"key": model_key},
-            ).first()
+            row = _delete_model_sources(conn, model_key)
     except HTTPException:
         raise
     except Exception as exc:
