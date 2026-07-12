@@ -348,6 +348,13 @@ class AgentBridgeBackend(AgentBackend):
                                         # sub-agent tool results under the parent card
                                         # (TASK-344). None for top-level calls.
                                         "parent_tool_use_id": event.parent_tool_use_id,
+                                        # Media refs the bridge persisted for THIS
+                                        # tool call (Playwright screenshots) so the
+                                        # UI can render them inline in the tool card
+                                        # immediately (TASK-483). The end-of-turn
+                                        # ASSISTANT_DONE attachments flush is
+                                        # unchanged and still backs history/reload.
+                                        "attachments": event.attachments or None,
                                     })
 
                             elif event.kind == AgentEventKind.AWAIT_TOOL_RESULT:

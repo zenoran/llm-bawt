@@ -2003,6 +2003,17 @@ class ChatStreamingMixin:
                                     # persistence on the assistant row. Stays out
                                     # of full_response_holder so it never enters
                                     # the answer transcript or LLM context.
+                                    # Absolute reasoning-char offset (chars of
+                                    # reasoning emitted BEFORE this delta) —
+                                    # parallels text_offset. Lets a refreshed
+                                    # client splice each live delta at its true
+                                    # position against the cold-reload seed
+                                    # (resumeScan -> turn_logs.reasoning) with no
+                                    # gap and no double-count, regardless of
+                                    # connect-vs-snapshot ordering. Without it the
+                                    # reasoning lane freezes at the seed until
+                                    # turn_complete (TASK-506).
+                                    _r_offset = len(reasoning_holder[0])
                                     reasoning_holder[0] += _rtext
                                     _publish_event_direct({
                                         "_type": "reasoning_delta",
@@ -2011,6 +2022,7 @@ class ChatStreamingMixin:
                                         "bot_id": bot_id,
                                         "user_id": user_id,
                                         "delta": _rtext,
+                                        "reasoning_offset": _r_offset,
                                         "ts": time.time(),
                                     })
                                     yield {"_type": "reasoning_delta", "delta": _rtext}
@@ -2145,6 +2157,40 @@ class ChatStreamingMixin:
                                         _matched_idx = len(_oc_call_stack) - 1
                                     _end_cid, _ = _oc_call_stack.pop(_matched_idx)
                                 item["_call_id"] = _end_cid
+                                # TASK-483: enrich this call's screenshot refs
+                                # ({asset_id, kind}, bridge-stamped on TOOL_END)
+                                # into the canonical envelope (mime_type/width/
+                                # height/urls) — the SAME shape /v1/history
+                                # emits — so the live tool card can render the
+                                # thumbnail inline the moment the tool finishes.
+                                # We're in the worker thread here, so the sync
+                                # media_assets SELECT is fine (mirrors the
+                                # turn_start enrichment, which offloads only
+                                # because it runs on the event loop). Failure
+                                # degrades to no inline image; the end-of-turn
+                                # grid still covers it.
+                                _tool_end_attachments = None
+                                if item.get("attachments"):
+                                    try:
+                                        from ..media.assets import MediaAssetStore
+                                        from ..media.serializers import (
+                                            enrich_attachments_for_messages,
+                                        )
+                                        _shell = [{
+                                            "attachments": list(item["attachments"]),
+                                        }]
+                                        enrich_attachments_for_messages(
+                                            _shell, MediaAssetStore(self.config)
+                                        )
+                                        _tool_end_attachments = (
+                                            _shell[0].get("attachments") or None
+                                        )
+                                    except Exception as _enrich_err:
+                                        log.warning(
+                                            "TASK-483: tool_end attachment "
+                                            "enrichment failed: %s",
+                                            _enrich_err,
+                                        )
                                 _publish_event_direct({
                                     "_type": "tool_event",
                                     "event": "tool_end",
@@ -2168,6 +2214,10 @@ class ChatStreamingMixin:
                                     # tool_result event → persisted by api.py so the
                                     # red error ring survives reload.
                                     "is_error": item.get("is_error"),
+                                    # Enriched screenshot refs for inline render in
+                                    # the live tool card (TASK-483). None when the
+                                    # tool produced no media.
+                                    "attachments": _tool_end_attachments,
                                 })
                                 # Update the matching detail entry with result +
                                 # failure flag so the finalized tool_calls_json

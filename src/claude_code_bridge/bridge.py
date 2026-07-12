@@ -1845,6 +1845,12 @@ class ClaudeCodeBridge:
                                         # Never let an upload failure break the
                                         # turn — the inline image still reaches
                                         # the model regardless.
+                                        # Refs for THIS tool result only — stamped on
+                                        # the TOOL_END below so the UI can render the
+                                        # screenshot inline in the tool card the moment
+                                        # it exists (TASK-483), instead of only in the
+                                        # end-of-turn grid.
+                                        tool_end_attachments: list[dict] | None = None
                                         if isinstance(result_content, list) and self._is_screenshot_tool(
                                             tool_names_by_id.get(block.tool_use_id or "")
                                         ):
@@ -1853,6 +1859,7 @@ class ClaudeCodeBridge:
                                                     result_content, session_key, block.tool_use_id,
                                                 )
                                                 turn_screenshot_assets.extend(refs)
+                                                tool_end_attachments = refs or None
                                             except Exception:
                                                 logger.warning(
                                                     "Screenshot persist failed (tool_use_id=%s)",
@@ -1899,6 +1906,11 @@ class ClaudeCodeBridge:
                                             # single authoritative failure signal.
                                             # Thread it so the UI can tint the card.
                                             tool_error=bool(getattr(block, "is_error", False)),
+                                            # Screenshot refs for this tool call so the
+                                            # UI can show the image inline immediately
+                                            # (TASK-483). turn_screenshot_assets still
+                                            # flushes on ASSISTANT_DONE for history.
+                                            attachments=tool_end_attachments,
                                         )
 
                             elif isinstance(msg, ResultMessage):
