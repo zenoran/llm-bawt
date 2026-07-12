@@ -456,6 +456,20 @@ Step types: `PLAN`, `READ_FILE`, `EDIT_FILE`, `CREATE_FILE`,
 - Project context:          `GET        {origin}/api/tasks/projects/<id>/context`
 - Activity feed:            `GET        {origin}/api/tasks/activity`
 
+### Model catalog
+
+- Harness cascade:          `GET {origin}/v1/models/catalog/harnesses`
+- Compatible access paths:  `GET {origin}/v1/models/catalog/access-paths?harness=<key>`
+- Models by access path:     `GET {origin}/v1/models/catalog/models?access_path=<key>`
+- Filtered endpoints:       `GET {origin}/v1/models/catalog/endpoints?harness=<key>&access_path=<key>`
+- Model/access CRUD:        `PUT|DELETE {origin}/v1/models/catalog/models/<key>`
+                             and `.../access-paths/<key>`
+- Endpoint upsert:          `PUT {origin}/v1/models/catalog/endpoints/<model>/<access>`
+  (`endpoint_id` is an optional compare-and-set guard on updates)
+
+The alias-keyed `/v1/models/definitions/*` API is compatibility-only and
+refuses updates that would retarget an existing model to another access path.
+
 ## Working a Task (Execution Mode)
 
 1. `tasks_update(task_id=<id>, status="IN_PROGRESS", model_id="<your-model>")`.

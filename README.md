@@ -75,7 +75,10 @@ These are the endpoints BawtHub depends on most:
 
 - `POST /v1/chat/completions` — streaming chat/tool execution
 - `POST /v1/chat/session/reset` — reset an agent-backed bot session
-- `GET /v1/models` and `PUT /v1/models/definitions/{alias}` — model catalog
+- `GET /v1/models` — OpenAI-compatible model list
+- `/v1/models/catalog/*` — normalized model, access-path, endpoint CRUD and
+  harness cascade filters. The alias-keyed `/v1/models/definitions/*` routes
+  remain as a guarded compatibility surface during cutover.
 - `GET /v1/bots` and `/v1/bots/{slug}/profile` — bot registry and config
 - `GET /v1/history`, `/v1/history/around`, `/v1/history/search` — thread history
 - `GET/POST /v1/memory/*` — semantic memory operations

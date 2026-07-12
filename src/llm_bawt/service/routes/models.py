@@ -4,6 +4,7 @@ import os
 import time
 
 from fastapi import APIRouter, HTTPException, Query
+from sqlalchemy import text
 
 from ...bots import BotManager
 from ..dependencies import get_service
@@ -320,33 +321,45 @@ def _get_model_store():
 
 
 def _row_to_response(row) -> ModelDefinitionResponse:
+    get = row.get if isinstance(row, dict) else lambda key, default=None: getattr(row, key, default)
     data = {
-        "type": row.type,
-        "model_id": row.model_id,
-        "repo_id": row.repo_id,
-        "filename": row.filename,
-        "description": row.description,
-        **(row.extra or {}),
+        "type": get("type"),
+        "model_id": get("model_id"),
+        "repo_id": get("repo_id"),
+        "filename": get("filename"),
+        "description": get("description"),
+        **(get("extra") or {}),
     }
     public_type = _public_model_type(data)
     return ModelDefinitionResponse(
-        alias=row.alias,
-        type=public_type or row.type,
-        model_id=row.model_id,
-        repo_id=row.repo_id,
-        filename=row.filename,
-        description=row.description,
-        extra=row.extra,
-        created_at=row.created_at,
-        updated_at=row.updated_at,
+        alias=get("alias"),
+        type=public_type or get("type"),
+        model_id=get("model_id"),
+        repo_id=get("repo_id"),
+        filename=get("filename"),
+        description=get("description"),
+        extra=get("extra"),
+        created_at=get("created_at"),
+        updated_at=get("updated_at"),
     )
+
+
+def _compat_definition_rows(alias: str | None = None) -> list[dict]:
+    store = _get_model_store()
+    sql = "SELECT * FROM model_definitions_compat"
+    params = {}
+    if alias is not None:
+        sql += " WHERE alias = :alias"
+        params["alias"] = alias
+    sql += " ORDER BY alias, id"
+    with store.engine.connect() as conn:
+        return [dict(row) for row in conn.execute(text(sql), params).mappings()]
 
 
 @router.get("/v1/models/definitions", response_model=ModelDefinitionListResponse, tags=["Models"])
 def list_model_definitions():
-    """List all DB-backed model definitions."""
-    store = _get_model_store()
-    rows = store.list_all()
+    """List normalized endpoints in the legacy model-definition shape."""
+    rows = _compat_definition_rows()
     return ModelDefinitionListResponse(
         models=[_row_to_response(r) for r in rows],
         total_count=len(rows),
@@ -355,12 +368,19 @@ def list_model_definitions():
 
 @router.get("/v1/models/definitions/{alias}", response_model=ModelDefinitionResponse, tags=["Models"])
 def get_model_definition(alias: str):
-    """Get a single model definition by alias."""
-    store = _get_model_store()
-    row = store.get(alias)
-    if not row:
+    """Get a unique normalized endpoint in the legacy alias shape."""
+    rows = _compat_definition_rows(alias)
+    if not rows:
         raise HTTPException(status_code=404, detail=f"Model alias '{alias}' not found")
-    return _row_to_response(row)
+    if len(rows) > 1:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"Model alias '{alias}' has multiple endpoints; use "
+                "/v1/models/catalog/endpoints with model=<alias>."
+            ),
+        )
+    return _row_to_response(rows[0])
 
 
 @router.put("/v1/models/definitions/{alias}", response_model=ModelDefinitionResponse, tags=["Models"])
@@ -382,6 +402,48 @@ def upsert_model_definition(alias: str, request: ModelDefinitionUpsertRequest):
     model_data = _normalize_model_definition(model_data)
     model_data = _inject_codex_reference_spec(model_data)
 
+    # The legacy alias endpoint cannot express (model, access-path) identity.
+    # Refuse updates that would silently retarget an existing normalized model
+    # to a different access path; callers must use the endpoint-keyed API.
+    from ...memory.model_catalog_migration import map_legacy_definition
+
+    requested = map_legacy_definition(
+        {
+            "alias": alias,
+            "type": model_data["type"],
+            "model_id": model_data.get("model_id"),
+            "repo_id": model_data.get("repo_id"),
+            "filename": model_data.get("filename"),
+            "description": model_data.get("description"),
+            "extra": model_data,
+        }
+    )
+    with store.engine.connect() as conn:
+        existing_access = {
+            row[0]
+            for row in conn.execute(
+                text("""
+                    SELECT a.key
+                    FROM model_endpoints e
+                    JOIN models m ON m.id = e.model_id
+                    JOIN access_paths a ON a.id = e.access_path_id
+                    WHERE m.key = :alias
+                """),
+                {"alias": alias},
+            )
+        }
+    if existing_access and requested.access_path.key not in existing_access:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"Legacy alias '{alias}' already belongs to access path(s) "
+                f"{sorted(existing_access)}; refusing to retarget it to "
+                f"'{requested.access_path.key}'. Use "
+                f"PUT /v1/models/catalog/endpoints/{alias}/"
+                f"{requested.access_path.key} instead."
+            ),
+        )
+
     row = store.upsert(alias, model_data)
     # Reload catalog so the new model is immediately available
     reload_models_catalog()
@@ -390,11 +452,30 @@ def upsert_model_definition(alias: str, request: ModelDefinitionUpsertRequest):
 
 @router.delete("/v1/models/definitions/{alias}", response_model=ModelDefinitionDeleteResponse, tags=["Models"])
 def delete_model_definition(alias: str):
-    """Delete a model definition by alias. Triggers model catalog reload."""
+    """Delete a unique normalized model plus its legacy compatibility row."""
     store = _get_model_store()
-    deleted = store.delete(alias)
-    if not deleted:
+    rows = _compat_definition_rows(alias)
+    if not rows:
         raise HTTPException(status_code=404, detail=f"Model alias '{alias}' not found")
+    if len(rows) > 1:
+        raise HTTPException(
+            status_code=409,
+            detail="Alias has multiple endpoints; delete a specific normalized endpoint.",
+        )
+    with store.engine.begin() as conn:
+        in_use = conn.execute(
+            text("""
+                SELECT b.slug FROM bot_profiles b
+                JOIN model_endpoints e ON e.id = b.endpoint_id
+                JOIN models m ON m.id = e.model_id
+                WHERE m.key = :alias LIMIT 1
+            """),
+            {"alias": alias},
+        ).scalar()
+        if in_use:
+            raise HTTPException(status_code=409, detail=f"Model is used by bot '{in_use}'")
+        conn.execute(text("DELETE FROM models WHERE key = :alias"), {"alias": alias})
+    store.delete(alias)
     reload_models_catalog()
     return ModelDefinitionDeleteResponse(
         success=True,

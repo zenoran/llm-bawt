@@ -544,12 +544,7 @@ def migrate_model_catalog(engine: Engine, dry_run: bool = False) -> dict[str, An
                     (key, vendor, protocol, base_url, auth_mechanism, engine_kind)
                 VALUES (:key, :vendor, :protocol, :base_url, :auth, :engine)
                 ON CONFLICT (key) DO UPDATE SET
-                    vendor = EXCLUDED.vendor,
-                    protocol = EXCLUDED.protocol,
-                    base_url = EXCLUDED.base_url,
-                    auth_mechanism = EXCLUDED.auth_mechanism,
-                    engine_kind = EXCLUDED.engine_kind,
-                    updated_at = NOW()
+                    key = EXCLUDED.key
                 RETURNING id
             """),
                 {
@@ -569,12 +564,12 @@ def migrate_model_catalog(engine: Engine, dry_run: bool = False) -> dict[str, An
                 VALUES (:key, :vendor, :display, :description, :context_window,
                         :tool_support, COALESCE(:created_at, NOW()), COALESCE(:updated_at, NOW()))
                 ON CONFLICT (key) DO UPDATE SET
-                    vendor = EXCLUDED.vendor,
-                    display_name = EXCLUDED.display_name,
-                    description = EXCLUDED.description,
-                    default_context_window = COALESCE(models.default_context_window, EXCLUDED.default_context_window),
-                    default_tool_support = COALESCE(models.default_tool_support, EXCLUDED.default_tool_support),
-                    updated_at = EXCLUDED.updated_at
+                    vendor = CASE WHEN EXCLUDED.updated_at >= models.updated_at THEN EXCLUDED.vendor ELSE models.vendor END,
+                    display_name = CASE WHEN EXCLUDED.updated_at >= models.updated_at THEN EXCLUDED.display_name ELSE models.display_name END,
+                    description = CASE WHEN EXCLUDED.updated_at >= models.updated_at THEN EXCLUDED.description ELSE models.description END,
+                    default_context_window = CASE WHEN EXCLUDED.updated_at >= models.updated_at THEN COALESCE(models.default_context_window, EXCLUDED.default_context_window) ELSE models.default_context_window END,
+                    default_tool_support = CASE WHEN EXCLUDED.updated_at >= models.updated_at THEN COALESCE(models.default_tool_support, EXCLUDED.default_tool_support) ELSE models.default_tool_support END,
+                    updated_at = GREATEST(models.updated_at, EXCLUDED.updated_at)
                 RETURNING id
             """),
                 {
@@ -598,13 +593,13 @@ def migrate_model_catalog(engine: Engine, dry_run: bool = False) -> dict[str, An
                         :context_window, :tool_support, CAST(:pricing AS JSONB),
                         :legacy_type, COALESCE(:created_at, NOW()), COALESCE(:updated_at, NOW()))
                 ON CONFLICT (model_id, access_path_id) DO UPDATE SET
-                    upstream_model_id = EXCLUDED.upstream_model_id,
-                    serving_config = EXCLUDED.serving_config,
-                    context_window_override = EXCLUDED.context_window_override,
-                    tool_support_override = EXCLUDED.tool_support_override,
-                    pricing = EXCLUDED.pricing,
-                    legacy_type = EXCLUDED.legacy_type,
-                    updated_at = EXCLUDED.updated_at
+                    upstream_model_id = CASE WHEN EXCLUDED.updated_at >= model_endpoints.updated_at THEN EXCLUDED.upstream_model_id ELSE model_endpoints.upstream_model_id END,
+                    serving_config = CASE WHEN EXCLUDED.updated_at >= model_endpoints.updated_at THEN EXCLUDED.serving_config ELSE model_endpoints.serving_config END,
+                    context_window_override = CASE WHEN EXCLUDED.updated_at >= model_endpoints.updated_at THEN EXCLUDED.context_window_override ELSE model_endpoints.context_window_override END,
+                    tool_support_override = CASE WHEN EXCLUDED.updated_at >= model_endpoints.updated_at THEN EXCLUDED.tool_support_override ELSE model_endpoints.tool_support_override END,
+                    pricing = CASE WHEN EXCLUDED.updated_at >= model_endpoints.updated_at THEN EXCLUDED.pricing ELSE model_endpoints.pricing END,
+                    legacy_type = CASE WHEN EXCLUDED.updated_at >= model_endpoints.updated_at THEN EXCLUDED.legacy_type ELSE model_endpoints.legacy_type END,
+                    updated_at = GREATEST(model_endpoints.updated_at, EXCLUDED.updated_at)
                 RETURNING id
             """),
                 {
