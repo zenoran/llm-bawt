@@ -40,6 +40,17 @@ async def lifespan(app):
     from ..runtime_settings import ModelDefinitionStore
     model_store = ModelDefinitionStore(config)
     if model_store.engine is not None:
+        # TASK-548: additive, idempotent catalog normalization.  This runs
+        # before legacy definitions are loaded so bot endpoint/harness columns
+        # and the compatibility projection are always ready for the resolver
+        # and API cutover tasks that follow.
+        try:
+            from ..memory.model_catalog_migration import migrate_model_catalog
+            _catalog_result = migrate_model_catalog(model_store.engine)
+            log.info("model catalog migration: %s", _catalog_result)
+        except Exception as e:
+            log.warning("model catalog migration skipped: %s", e)
+
         yaml_models = config.defined_models.get("models", {})
         if yaml_models and model_store.count() == 0:
             seeded = model_store.seed_from_yaml(yaml_models)
