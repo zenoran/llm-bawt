@@ -266,6 +266,8 @@ class BotInfo(BaseModel):
     avatar: str | None = None
     avatar_render: str | None = None
     bot_type: BotKind = "chat"
+    harness: str | None = None
+    endpoint_id: int | None = None
     agent_backend: str | None = None
     agent_backend_config: dict[str, Any] = Field(default_factory=dict)
     settings: dict[str, Any] = Field(default_factory=dict)
@@ -303,6 +305,8 @@ class BotProfileResponse(BaseModel):
     default_voice: str | None = None
     nextcloud_config: dict[str, Any] | None = None
     bot_type: BotKind = "chat"
+    harness: str | None = None
+    endpoint_id: int | None = None
     agent_backend: str | None = None
     agent_backend_config: dict[str, Any] | None = None
     settings: dict[str, Any] = Field(default_factory=dict)
@@ -330,6 +334,8 @@ class BotProfileUpsertRequest(BaseModel):
     default_voice: str | None = None
     nextcloud_config: dict[str, Any] | None = None
     bot_type: BotKind | None = None
+    harness: str | None = None
+    endpoint_id: int | None = None
     agent_backend: str | None = None
     agent_backend_config: dict[str, Any] | None = None
 
@@ -355,6 +361,8 @@ class BotProfilePatchRequest(BaseModel):
     default_voice: str | None = None
     nextcloud_config: dict[str, Any] | None = None
     bot_type: BotKind | None = None
+    harness: str | None = None
+    endpoint_id: int | None = None
     agent_backend: str | None = None
     agent_backend_config: dict[str, Any] | None = None
 
