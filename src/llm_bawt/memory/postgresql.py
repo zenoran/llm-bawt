@@ -28,6 +28,7 @@ from sqlalchemy import (
     select, delete, text, insert, update, JSON
 )
 from sqlalchemy.orm import Session
+from sqlalchemy.exc import IntegrityError
 
 from .base import MemoryBackend
 
@@ -2403,8 +2404,109 @@ class PostgreSQLShortTermManager:
         if existing:
             return existing["id"]
         new_id = str(uuid.uuid4())
-        self._insert_session_row(new_id, user_id=target_user, bot_id=target_bot)
+        try:
+            self._insert_session_row(new_id, user_id=target_user, bot_id=target_bot)
+        except IntegrityError:
+            # TASK-284: lost a cold-start race — a concurrent first-write created
+            # the active row for this (bot,user) first, and the partial unique
+            # index (one active row per (bot,user)) rejected our INSERT. Re-resolve
+            # and use the winner rather than minting a duplicate active thread.
+            # When the index is absent this branch simply never fires, so the
+            # method is safe to land before the index is deployed.
+            winner = self.get_active_session(bot_id=target_bot, user_id=target_user)
+            if winner:
+                logger.info(
+                    "get_or_create_active_session lost race for (%s,%s); using winner %s",
+                    target_bot, target_user, winner["id"],
+                )
+                return winner["id"]
+            raise
         return new_id
+
+    def rotate_session(
+        self, bot_id: str | None = None, user_id: str | None = None
+    ) -> str:
+        """Atomically close the active thread for (bot,user) and open a new one.
+
+        TASK-284: this is the primitive behind a non-destructive ``/new``. The
+        old thread's rows are untouched (its session row flips to
+        ``status='completed'``); a fresh ``active`` thread is created and its id
+        returned. Close+open run in ONE transaction so a crash cannot leave zero
+        or two active rows for the pair.
+        """
+        target_bot = self.bot_id if bot_id is None else bot_id
+        target_user = self.user_id if user_id is None else user_id
+        new_id = str(uuid.uuid4())
+        with self._backend.engine.begin() as conn:
+            conn.execute(
+                text("""
+                    UPDATE sessions
+                    SET ended_at = CURRENT_TIMESTAMP, status = 'completed'
+                    WHERE bot_id = :bot_id AND status = 'active' AND ended_at IS NULL
+                      AND (user_id = :user_id OR (:user_id IS NULL AND user_id IS NULL))
+                """),
+                {"bot_id": target_bot, "user_id": target_user},
+            )
+            conn.execute(
+                text("""
+                    INSERT INTO sessions (id, bot_id, user_id, started_at, status)
+                    VALUES (:id, :bot_id, :user_id, CURRENT_TIMESTAMP, 'active')
+                """),
+                {"id": new_id, "bot_id": target_bot, "user_id": target_user},
+            )
+        # Point this manager at the freshly opened thread.
+        self._session_id_cache = new_id
+        return new_id
+
+    def activate_session(
+        self,
+        session_id: str,
+        bot_id: str | None = None,
+        user_id: str | None = None,
+    ) -> bool:
+        """Make an existing thread the active one for (bot,user).
+
+        TASK-284: switch primitive for the thread API. Deactivates the current
+        active thread(s) for the pair, then flips ``session_id`` back to
+        ``active`` — in ONE transaction, others-first so the one-active-row
+        invariant is never transiently violated. Returns ``False`` if the target
+        doesn't exist or belongs to a different (bot,user).
+        """
+        target_bot = self.bot_id if bot_id is None else bot_id
+        target_user = self.user_id if user_id is None else user_id
+        with self._backend.engine.begin() as conn:
+            owned = conn.execute(
+                text("""
+                    SELECT id FROM sessions
+                    WHERE id = :id AND bot_id = :bot_id
+                      AND (user_id = :user_id OR (:user_id IS NULL AND user_id IS NULL))
+                """),
+                {"id": session_id, "bot_id": target_bot, "user_id": target_user},
+            ).fetchone()
+            if owned is None:
+                return False
+            # Deactivate the current active thread(s) BEFORE activating the
+            # target, so a partial unique index never sees two active rows.
+            conn.execute(
+                text("""
+                    UPDATE sessions
+                    SET ended_at = CURRENT_TIMESTAMP, status = 'completed'
+                    WHERE bot_id = :bot_id AND status = 'active' AND ended_at IS NULL
+                      AND id <> :id
+                      AND (user_id = :user_id OR (:user_id IS NULL AND user_id IS NULL))
+                """),
+                {"id": session_id, "bot_id": target_bot, "user_id": target_user},
+            )
+            conn.execute(
+                text("""
+                    UPDATE sessions
+                    SET status = 'active', ended_at = NULL
+                    WHERE id = :id
+                """),
+                {"id": session_id},
+            )
+        self._session_id_cache = session_id
+        return True
 
     @property
     def session_id(self) -> str:
