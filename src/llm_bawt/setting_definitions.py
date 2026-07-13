@@ -201,6 +201,33 @@ SETTING_DEFINITIONS: dict[str, SettingDefinition] = {
         legacy_keys=("PROFILE_MAINTENANCE_MODEL",),
         ui_widget="model",
     ),
+    # --- subagent/small-fast model (TASK-546): proxy-compatible override -------
+    # When the claude-code bridge routes through the Anthropic-compat proxy
+    # (non-Anthropic providers like openai_chatgpt/zai/xai), Claude Code's
+    # internal background Haiku calls and subagent model resolution send bare
+    # Anthropic model IDs that the proxy rejects (400). This setting overrides
+    # BOTH ANTHROPIC_SMALL_FAST_MODEL and CLAUDE_CODE_SUBAGENT_MODEL env vars
+    # for proxy-routed turns, so background tasks and subagents use a
+    # provider-qualified model the proxy accepts. Unset = inherit the bot's
+    # main model (default_model) on proxy turns; ignored on Anthropic-direct
+    # turns where the built-in Haiku path works natively.
+    "subagent_model": SettingDefinition(
+        key="subagent_model",
+        type="str",
+        default=None,
+        applies_to=("agent",),
+        storage=STORAGE_AGENT_BACKEND_CONFIG,
+        label="Subagent / background model",
+        help=(
+            "Agent bots only: model used for Claude Code's internal subagents "
+            "and background tasks (title generation, tool-use summaries, etc.) "
+            "when running through the proxy. Unset = inherit the bot's main "
+            "model. Must be a provider-qualified model the proxy accepts "
+            "(e.g. openai_chatgpt/gpt-5.4-mini)."
+        ),
+        legacy_keys=("subagent_model",),
+        ui_widget="model",
+    ),
 }
 
 

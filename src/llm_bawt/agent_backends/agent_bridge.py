@@ -201,6 +201,10 @@ class AgentBridgeBackend(AgentBackend):
                                 int(config.get("max_turns"))
                                 if config.get("max_turns") is not None else None
                             ),
+                            subagent_model=(
+                                str(config.get("subagent_model")).strip()
+                                if config.get("subagent_model") else None
+                            ),
                             inject_messages=config.get("inject_messages"),
                         )
                         logger.info(

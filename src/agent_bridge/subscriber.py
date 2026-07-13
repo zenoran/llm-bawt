@@ -150,6 +150,7 @@ class RedisSubscriber:
         trigger_message_id: str | None = None,
         effort: str | None = None,
         max_turns: int | None = None,
+        subagent_model: str | None = None,
         inject_messages: list | None = None,
     ) -> None:
         """Publish a chat.send command to the bridge's command stream.
@@ -195,6 +196,8 @@ class RedisSubscriber:
             fields["effort"] = effort
         if max_turns is not None:
             fields["max_turns"] = str(max_turns)
+        if subagent_model:
+            fields["subagent_model"] = subagent_model
         if inject_messages:
             fields["inject_messages"] = json.dumps(inject_messages, ensure_ascii=False)
         await self._pub_redis.xadd(

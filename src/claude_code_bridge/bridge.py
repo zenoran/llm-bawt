@@ -1089,6 +1089,14 @@ class ClaudeCodeBridge:
                     max_turns_raw, bot_slug,
                 )
 
+        # TASK-546: Per-bot subagent/background model override. When set,
+        # the bridge injects it as ANTHROPIC_SMALL_FAST_MODEL and
+        # CLAUDE_CODE_SUBAGENT_MODEL on proxy-routed turns so Claude Code's
+        # internal background Haiku calls and subagent model resolution use
+        # a provider-qualified model the proxy accepts instead of bare
+        # Anthropic IDs (claude-haiku-4-5-...) that the proxy rejects.
+        subagent_model = (fields.get("subagent_model") or "").strip() or None
+
         attachments_raw = fields.get("attachments", "")
         attachments: list[dict] = []
         if attachments_raw:
@@ -1351,9 +1359,22 @@ class ClaudeCodeBridge:
                         # ANTHROPIC_AUTH_TOKEN inside the CLI; clear it so
                         # the SDK doesn't fall back to api.anthropic.com.
                         sdk_env["CLAUDE_CODE_OAUTH_TOKEN"] = ""
+                        # TASK-546: Override the small/fast (Haiku) and subagent
+                        # models so Claude Code's internal background calls
+                        # (title gen, tool-use summaries, API verification) and
+                        # Agent tool subagents route through the proxy with a
+                        # provider-qualified model instead of sending bare
+                        # Anthropic IDs that the proxy rejects (HTTP 400).
+                        # If subagent_model is not configured, fall back to the
+                        # main model — the proxy accepts it and the cost is
+                        # acceptable for the low volume of background calls.
+                        effective_subagent_model = subagent_model or model
+                        sdk_env["ANTHROPIC_SMALL_FAST_MODEL"] = effective_subagent_model
+                        sdk_env["CLAUDE_CODE_SUBAGENT_MODEL"] = effective_subagent_model
                         logger.debug(
-                            "Routing turn through proxy: model=%s base=%s",
-                            model, self._proxy_base_url,
+                            "Routing turn through proxy: model=%s base=%s "
+                            "subagent_model=%s",
+                            model, self._proxy_base_url, effective_subagent_model,
                         )
                     else:
                         # Read fresh token on each request (auto-refresh from credentials file)
