@@ -1089,16 +1089,21 @@ class ChatStreamingMixin:
             that races request teardown and is silently dropped (this was the
             TASK-305 approval-card/bell/gold-lock bug). Loop-thread callers must
             ``await _publish_unified(...)`` instead.
+
+            Returns the cross-thread future so callers that require strict event
+            ordering can wait for the Redis write before publishing a terminal
+            event such as ``turn_complete``.
             """
             if not _redis_sub:
-                return
+                return None
             try:
-                asyncio.run_coroutine_threadsafe(
+                return asyncio.run_coroutine_threadsafe(
                     _publish_unified(event_dict),
                     loop,
                 )
             except Exception as pub_err:
                 log.debug("Direct event publish failed: %s", pub_err)
+                return None
 
         # Announce turn kickoff to the unified SSE stream BEFORE the worker
         # thread starts.  Other clients subscribed to this bot (other browser
@@ -2432,7 +2437,7 @@ class ChatStreamingMixin:
                 if tts_scrubber is not None and status not in ("cancelled", "aborted"):
                     _tts_tail = tts_scrubber.flush()
                     if _tts_tail:
-                        _publish_event_direct({
+                        _tts_tail_future = _publish_event_direct({
                             "_type": "tts_delta",
                             "turn_id": turn_log_id,
                             "bot_id": bot_id,
@@ -2440,6 +2445,21 @@ class ChatStreamingMixin:
                             "delta": _tts_tail,
                             "ts": time.time(),
                         })
+                        # The TTS consumer closes its text input as soon as it
+                        # receives turn_complete. Ensure Redis has committed the
+                        # final scrubber tail first; otherwise these independent
+                        # cross-thread publishes may arrive in reverse order and
+                        # consistently drop the response's last sentence.
+                        if _tts_tail_future is not None:
+                            try:
+                                _tts_tail_future.result(timeout=5)
+                            except Exception as _tts_order_err:
+                                log.warning(
+                                    "Final tts_delta publish did not complete before "
+                                    "turn_complete for turn %s: %s",
+                                    turn_log_id,
+                                    _tts_order_err,
+                                )
                 _publish_event_direct({
                     "_type": "turn_complete",
                     "turn_id": turn_log_id,

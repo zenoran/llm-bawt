@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import re
 
-from llm_bawt.bots import scrub_for_tts
+from llm_bawt.bots import StreamingTTSScrubber, scrub_for_tts
 
 
 def _assert_no_markdown(out: str) -> None:
@@ -103,3 +103,18 @@ def test_kitchen_sink_no_markdown_survives():
 def test_empty_and_plain_passthrough():
     assert scrub_for_tts("") == ""
     assert scrub_for_tts("Just a normal sentence.") == "Just a normal sentence."
+
+
+def test_streaming_scrubber_flushes_final_paragraph():
+    scrubber = StreamingTTSScrubber()
+
+    assert scrubber.feed("First paragraph.\n") == ""
+    assert scrubber.feed("\nFinal sentence.") == "First paragraph.\n"
+    assert scrubber.flush() == "Final sentence."
+
+
+def test_streaming_scrubber_single_paragraph_is_terminal_tail():
+    scrubber = StreamingTTSScrubber()
+
+    assert scrubber.feed("A complete response. Last sentence.") == ""
+    assert scrubber.flush() == "A complete response. Last sentence."
