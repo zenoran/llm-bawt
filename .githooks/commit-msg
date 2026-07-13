@@ -1,0 +1,37 @@
+#!/bin/sh
+# Enforce a TASK-NNN prefix on every commit subject.
+#
+# Rationale: task traceability. Every commit subject must lead with the
+# id of the task it belongs to (e.g. "TASK-42 fix(bridge): ..."), so the
+# task shows up in `git log --oneline` and the concatenated one-line
+# history agents skim. See the git-commits skill for the full convention.
+#
+# Auto-generated / rebase-helper subjects (merges, reverts, fixup!,
+# squash!, amend!) are exempt. To bypass once: git commit --no-verify ...
+
+msg_file="$1"
+
+# First non-comment, non-blank line = the subject.
+subject=$(grep -v '^#' "$msg_file" | grep -v '^[[:space:]]*$' | head -n1)
+
+# Exempt git-generated / rebase-helper subjects.
+case "$subject" in
+    "Merge "*|"Revert "*|"fixup! "*|"squash! "*|"amend! "*)
+        exit 0
+        ;;
+esac
+
+# Require: TASK-<digits> followed by a space or a colon.
+if printf '%s' "$subject" | grep -Eq '^TASK-[0-9]+[: ]'; then
+    exit 0
+fi
+
+echo "✗ commit-msg: blocked — subject must lead with a task id." >&2
+echo "" >&2
+echo "  got:      $subject" >&2
+echo "  expected: TASK-NNN <type>(<scope>): summary" >&2
+echo "  example:  TASK-42 fix(bridge): sanitize empty tool params" >&2
+echo "" >&2
+echo "  Find or backfill a task id, then recommit." >&2
+echo "  To bypass once: git commit --no-verify ..." >&2
+exit 1
