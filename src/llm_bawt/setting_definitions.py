@@ -96,6 +96,21 @@ SETTING_DEFINITIONS: dict[str, SettingDefinition] = {
         help="Agent bots only: on new SDK-session creation, seed it with a chat-history summary.",
         legacy_keys=("seed_summary_on_new_session",),
     ),
+    "agent_global_prompt_enabled": SettingDefinition(
+        key="agent_global_prompt_enabled",
+        type="bool",
+        default=False,
+        applies_to=("agent",),
+        storage=STORAGE_RUNTIME_SETTING,
+        label="Inject shared agent global prompt",
+        help=(
+            "Agent bots only: inject the shared 'agents.global_prompt' block into "
+            "the cacheable system-prompt prefix. Steers planning to the BawtHub "
+            "task system (observable) instead of the harness plan mode. Resolves "
+            "global-then-bot, so a global=true baseline applies to every agent bot "
+            "unless a bot overrides it. Chat bots never see it (manifest-gated)."
+        ),
+    ),
     "timeout_seconds": SettingDefinition(
         key="timeout_seconds",
         type="int",
