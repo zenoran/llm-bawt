@@ -75,7 +75,7 @@ def _detect_vram_torch() -> VRAMInfo | None:
 
         device = torch.cuda.current_device()
         props = torch.cuda.get_device_properties(device)
-        total = props.total_mem
+        total = props.total_memory
         # Use memory_reserved to get a better picture of what's actually free
         free = total - torch.cuda.memory_reserved(device)
 

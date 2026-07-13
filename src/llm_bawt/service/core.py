@@ -89,8 +89,8 @@ class ServiceLLMBawt(BaseLLMBawt):
             # any legacy ``agent_backend_config.model`` (which is migrated to
             # ``session_model`` and no longer user-facing).
             from ..bot_types import agent_backend_for_model_def
-            from ..model_catalog import resolve_model_config
-            default_alias = getattr(self.bot, "default_model", None)
+            from ..model_catalog import bot_model_ref, resolve_model_config
+            default_alias = bot_model_ref(self.config, self.bot)
             if default_alias:
                 model_def = resolve_model_config(
                     self.config,
@@ -104,6 +104,10 @@ class ServiceLLMBawt(BaseLLMBawt):
                     and model_def.get("model_id")
                 ):
                     self.client._bot_config["model"] = model_def["model_id"]
+
+            # TASK-546: subagent_model is stored in agent_backend_config (like
+            # effort/max_turns) so it flows through _bot_config automatically.
+            # No resolution needed — agent_bridge.py reads it directly.
 
             # TASK-276: local GPU models are ordinary chat bots whose
             # model_definition was rewritten to type=agent_backend/backend=local
@@ -288,6 +292,9 @@ class ServiceLLMBawt(BaseLLMBawt):
             bot_config = {
                 "bot_id": self.bot_id,
                 "user_id": self.user_id,
+                # The bridge's send_command reads config["model"] to tell the
+                # local-model-bridge which GGUF/vLLM alias to load.
+                "model": self.resolved_model_alias,
             }
             bridge_model_definition = {
                 "type": "agent_backend",
@@ -305,6 +312,15 @@ class ServiceLLMBawt(BaseLLMBawt):
                 bridge_model_definition["context_window"] = self.model_definition["context_window"]
             if self.model_definition.get("max_tokens") is not None:
                 bridge_model_definition["max_tokens"] = self.model_definition["max_tokens"]
+
+            # Update self.model_definition so _build_context_messages()
+            # takes the agent_backend path (system + user only, no history).
+            # Without this, self.model_definition still says "gguf" while
+            # self.client.model_definition says "agent_backend", and the
+            # context builder falls through to the regular history path
+            # which can produce messages the AgentBackendClient doesn't
+            # expect.
+            self.model_definition = bridge_model_definition
 
             client = AgentBackendClient(
                 backend_name="local",

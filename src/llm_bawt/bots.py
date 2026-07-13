@@ -517,12 +517,12 @@ class BotManager:
         # model must be ignored so requests always route through the backend.
         bot = self.get_bot(bot_slug) if bot_slug else None
         if bot and bot.agent_backend and bot.default_model:
+            from .model_catalog import bot_model_ref
+
+            model_ref = bot_model_ref(self.config, bot) if self.config else bot.default_model
             if self.config:
-                self.config.resolve_model(
-                    bot.default_model,
-                    harness=bot.harness,
-                )
-            return ModelSelection(alias=bot.default_model, source="bot_default")
+                self.config.resolve_model(model_ref, harness=bot.harness)
+            return ModelSelection(alias=model_ref, source="bot_default")
 
         model_alias = requested_model.strip() if requested_model else None
         if model_alias == "":

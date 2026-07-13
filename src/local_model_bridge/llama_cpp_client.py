@@ -39,16 +39,40 @@ class LlamaCppClient(LLMClient):
         self._load_model()
 
     def _load_model(self):
-        """Loads the GGUF model, suppressing C++ library stderr."""
-        from llm_bawt.utils.vram import auto_size_context_window
+        """Loads the GGUF model.
 
-        if self.config.VERBOSE:
-            self.console.print(f"Loading GGUF model: [bold yellow]{self.model_path}[/bold yellow]...")
+        Native llama.cpp stderr is NOT suppressed — it flows to the container's
+        stderr (Docker logs) so that a CUDA abort() or segfault leaves
+        diagnosable output instead of a silent restart.
+        """
+        import sys
+        from llm_bawt.utils.vram import auto_size_context_window, detect_vram
 
         # Per-model overrides from model definition, falling back to global config
         n_gpu_layers = self.model_definition.get("n_gpu_layers", self.config.LLAMA_CPP_N_GPU_LAYERS)
         n_batch = getattr(self.config, 'LLAMA_CPP_N_BATCH', 2048)
         flash_attn = getattr(self.config, 'LLAMA_CPP_FLASH_ATTN', True)
+
+        # Pre-flight VRAM check — always logged so crashes have context
+        vram = detect_vram()
+        file_size = os.path.getsize(self.model_path) if os.path.exists(self.model_path) else 0
+        if vram:
+            logger.info(
+                "VRAM pre-flight: %s — %.1f GiB free, model weights ~%.1f GiB",
+                vram.gpu_name, vram.free_gb, file_size / (1024 ** 3),
+            )
+            if file_size > 0 and vram.free_bytes < file_size:
+                logger.error(
+                    "VRAM insufficient: %.1f GiB free < %.1f GiB model weights. "
+                    "Aborting load to prevent CUDA crash.",
+                    vram.free_gb, file_size / (1024 ** 3),
+                )
+                raise RuntimeError(
+                    f"Insufficient VRAM ({vram.free_gb:.1f} GiB free) to load "
+                    f"model weights ({file_size / (1024 ** 3):.1f} GiB)"
+                )
+        else:
+            logger.warning("VRAM detection failed — loading blind (crash risk)")
 
         # Auto-size context window based on VRAM
         sizing = auto_size_context_window(
@@ -60,89 +84,85 @@ class LlamaCppClient(LLMClient):
         self._context_sizing_result = sizing
         n_ctx = sizing.context_window
 
-        if self.config.VERBOSE:
-            self.console.print(f"[dim]Context window: {n_ctx} tokens (source: {sizing.source})[/dim]")
-            if sizing.vram_info:
-                self.console.print(f"[dim]VRAM: {sizing.vram_info}[/dim]")
-                self.console.print(f"[dim]Model weights: {sizing.model_file_size_gb:.1f}GB, KV budget: {sizing.estimated_kv_budget_gb:.1f}GB[/dim]")
+        # Always log load parameters so container logs have crash context
+        logger.info(
+            "Loading GGUF: %s — n_ctx=%d (source=%s), n_gpu_layers=%s, "
+            "n_batch=%d, flash_attn=%s, chat_format=%s",
+            self.model_path, n_ctx, sizing.source,
+            "all" if n_gpu_layers == -1 else n_gpu_layers,
+            n_batch, flash_attn, self.chat_format or "auto",
+        )
+        if sizing.vram_info:
+            logger.info(
+                "VRAM sizing: %s — weights %.1f GiB, KV budget %.1f GiB",
+                sizing.vram_info, sizing.model_file_size_gb,
+                sizing.estimated_kv_budget_gb,
+            )
 
         model_load_params = {
             "model_path": self.model_path,
             "n_gpu_layers": n_gpu_layers,
             "n_ctx": n_ctx,
-            "n_batch": n_batch,  # Higher batch size = faster prompt processing
-            "flash_attn": flash_attn,  # Flash attention reduces VRAM usage for long contexts
-            # Use explicit chat_format if provided, otherwise auto-detect from GGUF metadata
-            # Explicit format is needed for models like MythoMax that have unusual chat formats
+            "n_batch": n_batch,
+            "flash_attn": flash_attn,
             "chat_format": self.chat_format,  # None = auto-detect
-            "verbose": False, # Disable llama-cpp's library-level verbose logging
+            "verbose": False,
         }
-        final_chat_format = model_load_params["chat_format"]
-        if self.config.VERBOSE:
-            log_params = {k: v for k, v in model_load_params.items() if k != 'model_path'}
-            logger.debug(f"Final chat_format passed to Llama(): {final_chat_format!r}")
-            logger.debug(f"llama.cpp model load parameters (excluding path): {log_params}")
 
         try:
-            with open(os.devnull, 'w') as fnull, contextlib.redirect_stderr(fnull):
-                    if Llama is None: # Should have been caught in __init__, but double-check
-                        raise ImportError("Llama class is not available from llama_cpp.")
-                    self.llm_model = Llama(**model_load_params)
+            # Flush before load so pre-flight info survives a CUDA abort()
+            sys.stdout.flush()
+            sys.stderr.flush()
 
-            if self.config.VERBOSE and self.llm_model:
-                ctx_size = getattr(self.llm_model, 'n_ctx', 'N/A')
-                gpu_layers = model_load_params['n_gpu_layers']
-                self.console.print(
-                    f"[green]Model loaded:[/green] Context={ctx_size}, Batch={n_batch}, FlashAttn={flash_attn}, GPU Layers={gpu_layers if gpu_layers != -1 else 'All'}"
-                )
+            if Llama is None:
+                raise ImportError("Llama class is not available from llama_cpp.")
+            self.llm_model = Llama(**model_load_params)
+
+            ctx_size = getattr(self.llm_model, 'n_ctx', 'N/A')
+            gpu_layers = model_load_params['n_gpu_layers']
+            logger.info(
+                "Model loaded: Context=%s, Batch=%d, FlashAttn=%s, GPU Layers=%s",
+                ctx_size, n_batch, flash_attn,
+                "All" if gpu_layers == -1 else gpu_layers,
+            )
         except (ValueError, RuntimeError) as e:
             # Context window too large for available VRAM — retry with smaller values
             if "Failed to create llama_context" in str(e):
-                # Try progressively smaller context windows
                 fallback_sizes = []
-                global_n_ctx = self.config.LLAMA_CPP_N_CTX  # The value that used to work
+                global_n_ctx = self.config.LLAMA_CPP_N_CTX
                 if n_ctx != global_n_ctx and global_n_ctx > 0:
                     fallback_sizes.append(global_n_ctx)
                 if n_ctx > 8192:
                     fallback_sizes.append(8192)
                 if n_ctx > 4096:
                     fallback_sizes.append(4096)
-                # Deduplicate and try largest first to maximize usable context
                 fallback_sizes = sorted(set(s for s in fallback_sizes if s < n_ctx), reverse=True)
 
                 for fallback_ctx in fallback_sizes:
                     logger.warning(
-                        f"Context window {n_ctx} failed. Retrying with {fallback_ctx}..."
-                    )
-                    self.console.print(
-                        f"[yellow]⚠ Context {n_ctx} too large. "
-                        f"Retrying with {fallback_ctx}...[/yellow]"
+                        "Context window %d failed. Retrying with %d...",
+                        n_ctx, fallback_ctx,
                     )
                     model_load_params["n_ctx"] = fallback_ctx
                     try:
-                        with open(os.devnull, 'w') as fnull, contextlib.redirect_stderr(fnull):
-                            self.llm_model = Llama(**model_load_params)
-                        self.console.print(
-                            f"[green]Model loaded with context: {fallback_ctx}[/green]"
-                        )
+                        sys.stdout.flush()
+                        sys.stderr.flush()
+                        self.llm_model = Llama(**model_load_params)
+                        logger.info("Model loaded with fallback context: %d", fallback_ctx)
                         if self._context_sizing_result:
                             self._context_sizing_result.context_window = fallback_ctx
                             self._context_sizing_result.source = "fallback-retry"
                         return  # Success
                     except (ValueError, RuntimeError):
-                        continue  # Try next smaller size
+                        continue
 
-                # All retries failed
-                self.console.print(f"[bold red]Error loading GGUF model {self.model_path}:[/bold red] {e}")
-                self.console.print("All context window sizes failed. The model may not fit in available VRAM.")
+                logger.error("All context window sizes failed for %s: %s", self.model_path, e)
                 raise
             else:
-                self.console.print(f"[bold red]Error loading GGUF model {self.model_path}:[/bold red] {e}")
-                self.console.print("Ensure model path is correct and `llama-cpp-python` is installed with appropriate hardware acceleration (e.g., BLAS, CUDA). Check library docs.")
+                logger.error("GGUF model load failed for %s: %s", self.model_path, e)
                 raise
         except Exception as e:
-            self.console.print(f"[bold red]Error loading GGUF model {self.model_path}:[/bold red] {e}")
-            self.console.print("Ensure model path is correct and `llama-cpp-python` is installed with appropriate hardware acceleration (e.g., BLAS, CUDA). Check library docs.")
+            logger.error("GGUF model load failed for %s: %s", self.model_path, e)
             raise
 
     def stream_raw(self, messages: List[Message], stop: list[str] | str | None = None, **kwargs: Any) -> Iterator[str]:

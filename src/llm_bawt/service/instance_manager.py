@@ -10,7 +10,7 @@ from typing import Any
 
 from ..bot_types import agent_backend_for_model_def
 from ..bots import BotManager
-from ..model_catalog import resolve_model_config
+from ..model_catalog import bot_model_ref, resolve_model_config
 from .logging import get_service_logger
 
 log = get_service_logger(__name__)
@@ -141,7 +141,7 @@ class InstanceManagerMixin:
             if backend_name:
                 # Agent default bot: prefer its real catalog model when it
                 # resolves to a compatible entry; else the virtual alias.
-                default_alias = default_bot.default_model
+                default_alias = bot_model_ref(self.config, default_bot)
                 if (
                     backend_name != "openclaw"
                     and default_alias
@@ -210,7 +210,7 @@ class InstanceManagerMixin:
                 warnings.append(
                     f"Bot '{bot_id}' uses agent backend; ignoring requested model '{requested_model}'"
                 )
-            default_alias = getattr(bot, "default_model", None) if bot else None
+            default_alias = bot_model_ref(self.config, bot) if bot else None
             if backend_name != "openclaw":
                 if (
                     default_alias

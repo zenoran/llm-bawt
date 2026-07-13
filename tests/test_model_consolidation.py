@@ -11,6 +11,13 @@ Covers:
 from types import SimpleNamespace
 
 from llm_bawt.bot_types import agent_backend_for_model_def
+from llm_bawt.model_catalog import (
+    AccessPath,
+    ModelCatalog,
+    ModelEndpoint,
+    ModelIdentity,
+    bot_model_ref,
+)
 from llm_bawt.service.core import ServiceLLMBawt
 from llm_bawt.service.instance_manager import InstanceManagerMixin
 
@@ -46,6 +53,63 @@ def test_helper_chat_models_and_edge_cases():
 
 
 # ---------------------------------------------------------------------------
+# Canonical bot endpoint selection
+# ---------------------------------------------------------------------------
+
+
+def _dual_grok_catalog():
+    model = ModelIdentity(
+        id=1,
+        key="grok-4.5",
+        vendor="xai",
+        display_name="Grok 4.5",
+    )
+    chat = AccessPath(
+        id=1,
+        key="xai-chat",
+        vendor="xai",
+        protocol="chat-completions",
+        base_url="https://api.x.ai/v1",
+        auth_mechanism="api-key",
+    )
+    responses = AccessPath(
+        id=2,
+        key="xai-responses",
+        vendor="xai",
+        protocol="responses",
+        base_url="https://api.x.ai/v1",
+        auth_mechanism="api-key",
+    )
+    return ModelCatalog([
+        ModelEndpoint(17, model, chat, "grok-4.5", legacy_type="grok"),
+        ModelEndpoint(18, model, responses, "grok-4.5", legacy_type="grok"),
+    ])
+
+
+def test_bot_model_ref_prefers_canonical_endpoint():
+    catalog = _dual_grok_catalog()
+    config = SimpleNamespace(ensure_model_catalog=lambda: catalog)
+    bot = SimpleNamespace(
+        default_model="grok-4.5",
+        endpoint_id=18,
+        harness="claude-proxy",
+    )
+
+    assert bot_model_ref(config, bot) == "grok-4.5@xai-responses"
+
+
+def test_bot_model_ref_legacy_fallback_without_catalog():
+    config = SimpleNamespace(ensure_model_catalog=lambda: None)
+    bot = SimpleNamespace(
+        default_model="grok-4.5",
+        endpoint_id=18,
+        harness="claude-proxy",
+    )
+
+    assert bot_model_ref(config, bot) == "grok-4.5"
+
+
+# ---------------------------------------------------------------------------
 # ServiceLLMBawt._init_bot injection
 # ---------------------------------------------------------------------------
 
@@ -54,8 +118,8 @@ class _DummyAgentBackendClient:
         self._bot_config = {}
 
 
-def _run_init_bot(monkeypatch, bot, defined_models):
-    config = SimpleNamespace(defined_models={"models": defined_models})
+def _run_init_bot(monkeypatch, bot, defined_models, config=None):
+    config = config or SimpleNamespace(defined_models={"models": defined_models})
 
     def fake_init_bot(self, _config):
         self.bot = bot
@@ -90,6 +154,28 @@ def test_init_bot_injects_claude_code_model(monkeypatch):
     assert service.client._bot_config["model"] == "claude-opus-4-7"
     assert service.client._bot_config["session_key"] == "abc-123"
     assert service.client._bot_config["bot_id"] == "loopy"
+
+
+def test_init_bot_uses_canonical_endpoint_for_ambiguous_proxy_model(monkeypatch):
+    catalog = _dual_grok_catalog()
+    config = SimpleNamespace(
+        defined_models={"models": catalog.compatibility_mapping()},
+        ensure_model_catalog=lambda: catalog,
+        resolve_model=lambda ref, harness=None, default=None: catalog.resolve(
+            ref, harness=harness
+        ),
+    )
+    bot = SimpleNamespace(
+        agent_backend="claude-code",
+        agent_backend_config={},
+        default_model="grok-4.5",
+        endpoint_id=18,
+        harness="claude-proxy",
+    )
+
+    service = _run_init_bot(monkeypatch, bot, {}, config=config)
+
+    assert service.client._bot_config["model"] == "xai/grok-4.5"
 
 
 def test_init_bot_injection_overrides_legacy_config_model(monkeypatch):
@@ -176,6 +262,32 @@ def test_resolve_agent_bot_returns_real_alias(monkeypatch):
     )
     alias, warnings = mgr._resolve_request_model(None, "loopy", local_mode=False)
     assert alias == "opus-4-7"
+    assert warnings == []
+
+
+def test_resolve_agent_bot_uses_canonical_endpoint_ref(monkeypatch):
+    catalog = _dual_grok_catalog()
+    bot = SimpleNamespace(
+        slug="nova",
+        agent_backend="claude-code",
+        default_model="grok-4.5",
+        endpoint_id=18,
+        harness="claude-proxy",
+    )
+    _patch_bot_manager(monkeypatch, bot)
+    mgr = _make_manager(
+        defined_models=catalog.compatibility_mapping(),
+        available=["grok-4.5@xai-chat", "grok-4.5@xai-responses", "claude-code"],
+        agent_backend_models={"nova": "claude-code"},
+    )
+    mgr.config.ensure_model_catalog = lambda: catalog
+    mgr.config.resolve_model = lambda ref, harness=None, default=None: catalog.resolve(
+        ref, harness=harness
+    )
+
+    alias, warnings = mgr._resolve_request_model(None, "nova", local_mode=False)
+
+    assert alias == "grok-4.5@xai-responses"
     assert warnings == []
 
 

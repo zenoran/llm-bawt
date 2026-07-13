@@ -63,7 +63,40 @@ async def _health_server(publisher: RedisPublisher, port: int) -> None:
         await server.serve_forever()
 
 
+def _install_crash_handler() -> None:
+    """Install a SIGABRT handler so CUDA abort() leaves a log trace.
+
+    llama.cpp's CUDA backend calls ``GGML_CUDA_CHECK()`` which invokes
+    ``abort()`` on any CUDA error.  The default SIGABRT handler just kills
+    the process with zero diagnostics — Docker logs show only the CUDA
+    restart banner.  This handler flushes one line of context before dying.
+    """
+    import traceback
+
+    def _on_abort(signum, frame):
+        # Force-write to fd 2 (real stderr) since Python's sys.stderr
+        # might be in an inconsistent state after a C-level abort().
+        try:
+            msg = (
+                f"\n!!! SIGABRT received (likely CUDA abort) !!!\n"
+                f"Stack at abort:\n"
+                f"{''.join(traceback.format_stack(frame))}\n"
+            )
+            os.write(2, msg.encode("utf-8", errors="replace"))
+        except Exception:
+            os.write(2, b"\n!!! SIGABRT -- could not format stack !!!\n")
+        finally:
+            # Re-raise with default handler so the container exits with
+            # the right signal code (Docker restart policy sees it).
+            signal.signal(signal.SIGABRT, signal.SIG_DFL)
+            os.kill(os.getpid(), signal.SIGABRT)
+
+    signal.signal(signal.SIGABRT, _on_abort)
+
+
 def main() -> None:
+    _install_crash_handler()
+
     log_level = os.getenv("LOCAL_MODEL_BRIDGE_LOG_LEVEL", "INFO")
     logging.basicConfig(
         level=getattr(logging, log_level.upper(), logging.INFO),

@@ -39,6 +39,26 @@ def resolve_model_config(
     )
 
 
+def bot_model_ref(config: Any, bot: Any) -> str | None:
+    """Return a bot's canonical endpoint ref, with legacy alias fallback.
+
+    Normalized profiles bind a bot to ``endpoint_id``.  The mirrored
+    ``default_model`` is only a model key and can be ambiguous when that model
+    has multiple access paths, so runtime routing must prefer the endpoint.
+    """
+    endpoint_id = getattr(bot, "endpoint_id", None)
+    if endpoint_id is not None:
+        ensure_catalog = getattr(config, "ensure_model_catalog", None)
+        catalog = ensure_catalog() if callable(ensure_catalog) else None
+        if catalog is not None:
+            endpoint = catalog.resolve_endpoint(
+                endpoint_id,
+                harness=getattr(bot, "harness", None),
+            )
+            return endpoint.ref
+    return getattr(bot, "default_model", None)
+
+
 @dataclass(frozen=True)
 class ModelIdentity:
     id: int
