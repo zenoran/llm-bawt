@@ -142,17 +142,24 @@ class InstanceManagerMixin:
                 # Agent default bot: prefer its real catalog model when it
                 # resolves to a compatible entry; else the virtual alias.
                 default_alias = bot_model_ref(self.config, default_bot)
-                if (
-                    backend_name != "openclaw"
-                    and default_alias
-                    and default_alias in self._available_models
-                    and agent_backend_for_model_def(
+                # Canonical endpoint refs (``model@access-path``) are valid
+                # resolver inputs even when the compatibility model list exposes
+                # only the unqualified key. Catalog resolution is authoritative.
+                try:
+                    resolved_backend = agent_backend_for_model_def(
                         resolve_model_config(
                             self.config,
                             default_alias,
                             harness=getattr(default_bot, "harness", None),
+                            default={},
                         )
-                    ) == backend_name
+                    )
+                except Exception:  # noqa: BLE001
+                    resolved_backend = None
+                if (
+                    backend_name != "openclaw"
+                    and default_alias
+                    and resolved_backend == backend_name
                 ):
                     self._default_model = default_alias
                 else:
@@ -210,19 +217,25 @@ class InstanceManagerMixin:
                 warnings.append(
                     f"Bot '{bot_id}' uses agent backend; ignoring requested model '{requested_model}'"
                 )
-            default_alias = bot_model_ref(self.config, bot) if bot else None
+            try:
+                default_alias = bot_model_ref(self.config, bot) if bot else None
+            except Exception:  # noqa: BLE001
+                default_alias = getattr(bot, "default_model", None) if bot else None
             if backend_name != "openclaw":
-                if (
-                    default_alias
-                    and default_alias in self._available_models
-                    and agent_backend_for_model_def(
+                # ``bot_model_ref`` deliberately returns the canonical endpoint
+                # ref, which need not exist in the legacy compatibility key list.
+                try:
+                    resolved_backend = agent_backend_for_model_def(
                         resolve_model_config(
                             self.config,
                             default_alias,
                             harness=getattr(bot, "harness", None),
+                            default={},
                         )
-                    ) == backend_name
-                ):
+                    )
+                except Exception:  # noqa: BLE001
+                    resolved_backend = None
+                if default_alias and resolved_backend == backend_name:
                     return default_alias, warnings
                 log.warning(
                     "Agent bot '%s' has missing/incompatible default_model=%r for "

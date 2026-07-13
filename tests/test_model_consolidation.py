@@ -291,6 +291,53 @@ def test_resolve_agent_bot_uses_canonical_endpoint_ref(monkeypatch):
     assert warnings == []
 
 
+def test_resolve_agent_bot_accepts_single_endpoint_canonical_ref(monkeypatch):
+    """A canonical endpoint ref need not appear in the compatibility key list."""
+    model = ModelIdentity(20, "gpt-5.6-sol", "openai", "GPT 5.6 Sol")
+    oauth = AccessPath(
+        11,
+        "openai-oauth",
+        "openai",
+        "responses",
+        "https://chatgpt.com/backend-api/codex",
+        "oauth",
+    )
+    catalog = ModelCatalog([
+        ModelEndpoint(
+            20,
+            model,
+            oauth,
+            "gpt-5.6-sol",
+            legacy_type="agent_backend",
+            serving_config={"compat_extra": {"backend": "codex"}},
+        )
+    ])
+    bot = SimpleNamespace(
+        slug="al",
+        agent_backend="claude-code",
+        default_model="gpt-5.6-sol",
+        endpoint_id=20,
+        harness="claude-proxy",
+    )
+    _patch_bot_manager(monkeypatch, bot)
+    # Single-endpoint compatibility mappings expose only the model key, not
+    # ``model@access-path``. That must not invalidate bot_model_ref's result.
+    mgr = _make_manager(
+        defined_models=catalog.compatibility_mapping(),
+        available=["gpt-5.6-sol", "claude-code"],
+        agent_backend_models={"al": "claude-code"},
+    )
+    mgr.config.ensure_model_catalog = lambda: catalog
+    mgr.config.resolve_model = lambda ref, harness=None, default=None: catalog.resolve(
+        ref, harness=harness
+    )
+
+    alias, warnings = mgr._resolve_request_model(None, "al", local_mode=False)
+
+    assert alias == "gpt-5.6-sol@openai-oauth"
+    assert warnings == []
+
+
 def test_resolve_agent_bot_ignores_requested_model(monkeypatch):
     bot = SimpleNamespace(slug="loopy", agent_backend="claude-code", default_model="opus-4-7")
     _patch_bot_manager(monkeypatch, bot)

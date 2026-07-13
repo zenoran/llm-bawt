@@ -25,6 +25,7 @@ import logging
 
 from fastapi import APIRouter, HTTPException, Query
 
+from ...model_catalog import bot_model_ref
 from ..dependencies import get_service
 from ..usage import AllUsage, ProviderUsage, get_all, get_usage, has_provider, list_providers
 
@@ -63,9 +64,17 @@ def _provider_for_bot(service, bot_id: str) -> str:
     if bot is None:
         return "claude"
 
-    alias = getattr(bot, "default_model", None)
+    # Normalized profiles bind to a canonical endpoint. ``default_model`` is
+    # only the shared model key and may not uniquely identify its access path.
+    # Usage attribution needs that access path (not the harness name) to tell an
+    # OpenAI-backed Claude proxy from a native Anthropic subscription.
+    try:
+        alias = bot_model_ref(service.config, bot)
+    except Exception:  # noqa: BLE001
+        alias = getattr(bot, "default_model", None)
     model_id = None
     model_type = None
+    access_path = None
     if alias:
         try:
             model_def = service.config.resolve_model(
@@ -75,9 +84,17 @@ def _provider_for_bot(service, bot_id: str) -> str:
             )
             model_id = model_def.get("model_id")
             model_type = model_def.get("type")
+            access_path = model_def.get("access_path")
         except Exception:  # noqa: BLE001
             model_id = None
             model_type = None
+            access_path = None
+
+    # ChatGPT/Codex subscription usage is defined by the OAuth access path.
+    # Do not map every OpenAI vendor/API model here: API-key endpoints do not
+    # consume the ChatGPT subscription quota shown by this endpoint.
+    if str(access_path or "").strip().lower() == "openai-oauth":
+        return "openai_chatgpt"
 
     if model_id and "/" in str(model_id):
         prefix = str(model_id).split("/", 1)[0].strip().lower()
