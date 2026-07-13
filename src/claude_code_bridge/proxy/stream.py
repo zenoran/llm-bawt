@@ -448,12 +448,17 @@ async def responses_to_anthropic_sse(
                 item_id = getattr(event, "item_id", "") or ""
                 block = blocks_by_item.get(item_id) or open_block
                 raw = tool_arg_buffers.pop(item_id, "{}")
-                # Strip empty-string values — GPT fills optional params like
-                # pages/limit/offset with "" which the SDK tools reject.
+                # Sanitize tool arguments before the SDK sees them.
+                # GPT fills optional params with empty strings (pages: "")
+                # and requests worktree isolation the env doesn't support.
                 try:
                     parsed = json.loads(raw)
                     if isinstance(parsed, dict):
                         parsed = {k: v for k, v in parsed.items() if v != ""}
+                        # Never request worktree isolation — the bridge CWD
+                        # is not a git repo, so it always fails.
+                        if parsed.get("isolation") == "worktree":
+                            del parsed["isolation"]
                     cleaned = json.dumps(parsed, separators=(",", ":"))
                 except (json.JSONDecodeError, TypeError):
                     cleaned = raw  # forward as-is if unparseable
