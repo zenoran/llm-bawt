@@ -298,12 +298,27 @@ class ChatStreamingMixin:
                 elif event.kind == AgentEventKind.TOOL_END:
                     tool_result = str(event.tool_result or "")
                     tool_failed = bool(event.tool_error)
-                    # Recover the call_id from the matching tool_start.
-                    # Tool calls can nest (e.g. Agent > Grep > Read), so pop
-                    # the stack to pair each tool_end with its tool_start.
+                    # Pair this tool_end with its tool_start. Prefer the stable
+                    # bridge-stamped tool_use_id: tools do NOT always finish in
+                    # LIFO order (parallel tool_use blocks in one message,
+                    # sub-agents), so a blind stack pop can pair a tool_end with
+                    # the WRONG tool_start — stamping a mismatched call_id. The
+                    # frontend keys card-healing on call_id, so the real running
+                    # card never flips and sticks on "running" forever while a
+                    # sibling card wrongly absorbs this result (TASK-414).
                     end_call_id = _last_call_id or ""
-                    if tool_call_details:
+                    end_tuid = getattr(event, "tool_use_id", None)
+                    matched = None
+                    if end_tuid:
+                        for i in range(len(tool_call_details) - 1, -1, -1):
+                            if tool_call_details[i].get("tool_use_id") == end_tuid:
+                                matched = tool_call_details.pop(i)
+                                break
+                    if matched is None and tool_call_details:
+                        # No tool_use_id (non-claude providers) or no id match:
+                        # fall back to the original LIFO pairing.
                         matched = tool_call_details.pop()
+                    if matched is not None:
                         matched["result"] = tool_result
                         matched["is_error"] = tool_failed
                         end_call_id = matched.get("call_id", end_call_id)
