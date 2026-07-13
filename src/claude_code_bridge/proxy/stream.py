@@ -178,6 +178,11 @@ async def responses_to_anthropic_sse(
     next_index = 0
     open_block: dict | None = None          # {"index", "kind", "item_id", "call_id"?}
     blocks_by_item: dict[str, dict] = {}    # item_id → block dict (tools)
+    # Buffer tool argument deltas so we can sanitize before the SDK sees them.
+    # GPT models sometimes fill optional params with empty strings (e.g.
+    # pages: "") which the SDK tools reject. We buffer, strip empties, then
+    # emit on the .done event.
+    tool_arg_buffers: dict[str, str] = {}   # item_id → accumulated JSON string
 
     saw_tool_use = False
     saw_refusal = False
@@ -345,14 +350,8 @@ async def responses_to_anthropic_sse(
                 block = blocks_by_item.get(item_id)
                 if block is None or not partial:
                     continue
-                yield _sse(
-                    "content_block_delta",
-                    {
-                        "type": "content_block_delta",
-                        "index": block["index"],
-                        "delta": {"type": "input_json_delta", "partial_json": partial},
-                    },
-                )
+                # Buffer instead of emitting — we sanitize on .done.
+                tool_arg_buffers[item_id] = tool_arg_buffers.get(item_id, "") + partial
                 continue
 
             # ── output item closed ──────────────────────────────────────────
@@ -443,6 +442,32 @@ async def responses_to_anthropic_sse(
                 )
                 return
 
+            # ── tool argument .done: emit sanitized buffered JSON ────────────
+            if etype in ("response.function_call_arguments.done",
+                         "response.custom_tool_call_input.done"):
+                item_id = getattr(event, "item_id", "") or ""
+                block = blocks_by_item.get(item_id) or open_block
+                raw = tool_arg_buffers.pop(item_id, "{}")
+                # Strip empty-string values — GPT fills optional params like
+                # pages/limit/offset with "" which the SDK tools reject.
+                try:
+                    parsed = json.loads(raw)
+                    if isinstance(parsed, dict):
+                        parsed = {k: v for k, v in parsed.items() if v != ""}
+                    cleaned = json.dumps(parsed, separators=(",", ":"))
+                except (json.JSONDecodeError, TypeError):
+                    cleaned = raw  # forward as-is if unparseable
+                if block is not None and cleaned:
+                    yield _sse(
+                        "content_block_delta",
+                        {
+                            "type": "content_block_delta",
+                            "index": block["index"],
+                            "delta": {"type": "input_json_delta", "partial_json": cleaned},
+                        },
+                    )
+                continue
+
             # ── events with no Anthropic analog: close-out / annotations /
             #    *.done markers / server-tool progress / audio. Safe to skip,
             #    but emit a keepalive so a quiet provider never stalls. ───────
@@ -454,8 +479,6 @@ async def responses_to_anthropic_sse(
                 "response.reasoning_text.done",
                 "response.reasoning_summary_text.done",
                 "response.reasoning_summary_part.done",
-                "response.function_call_arguments.done",
-                "response.custom_tool_call_input.done",
             ):
                 continue
 
@@ -465,6 +488,21 @@ async def responses_to_anthropic_sse(
             yield _ping()
 
         # ── finalize ────────────────────────────────────────────────────────
+        # Flush any remaining buffered tool args (e.g. stream cut off before
+        # .done event). Emit as-is since we can't guarantee well-formed JSON.
+        for item_id, leftover in tool_arg_buffers.items():
+            block = blocks_by_item.get(item_id) or open_block
+            if block is not None and leftover:
+                yield _sse(
+                    "content_block_delta",
+                    {
+                        "type": "content_block_delta",
+                        "index": block["index"],
+                        "delta": {"type": "input_json_delta", "partial_json": leftover},
+                    },
+                )
+        tool_arg_buffers.clear()
+
         if open_block is not None:
             yield _stop_frame(open_block["index"])
             open_block = None
