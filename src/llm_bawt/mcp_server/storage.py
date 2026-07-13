@@ -675,7 +675,9 @@ class MemoryStorage:
                     "role": msg.role,
                     "content": msg.content,
                     "timestamp": msg.timestamp,
-                    "session_id": None,
+                    # TASK-284: preserve the durable thread id instead of dropping
+                    # it — getattr keeps this safe for any Message-like without it.
+                    "session_id": getattr(msg, "session_id", None),
                 }
                 for msg in messages
             ]

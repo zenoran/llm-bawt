@@ -1304,6 +1304,7 @@ class _MCPShortTermManager:
                 content=r.get("content", ""),
                 timestamp=r.get("timestamp", 0.0),
                 db_id=r.get("id"),
+                session_id=r.get("session_id"),  # TASK-284: preserve thread id
             )
             for r in rows
         ]
@@ -1336,6 +1337,7 @@ class _MCPShortTermManager:
                 content=row.get("content", ""),
                 timestamp=row.get("timestamp", 0.0),
                 db_id=row.get("id"),
+                session_id=row.get("session_id"),  # TASK-284: preserve thread id
             )
             for row in rows
         ]

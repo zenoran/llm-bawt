@@ -22,6 +22,10 @@ class Message:
         # When set, to_api_format() emits a multimodal content array instead
         # of a plain string.
         content_parts: list[dict[str, Any]] | None = None,
+        # TASK-284: the durable session/thread this message belongs to. Carried
+        # through hydration so the read path can scope context to one thread.
+        # Internal metadata only — deliberately NOT emitted by to_api_format().
+        session_id: str | None = None,
     ):
         self.role = role
         self.content = content if content is not None else ""
@@ -30,6 +34,7 @@ class Message:
         self.tool_call_id = tool_call_id  # For tool result messages
         self.db_id = db_id  # Primary key from the database (when loaded from PostgreSQL)
         self.content_parts = content_parts  # Extra multimodal parts (image_url, etc.)
+        self.session_id = session_id  # TASK-284 durable thread id (internal only)
 
     @classmethod
     def from_dict(cls, data: dict) -> 'Message':
@@ -40,7 +45,8 @@ class Message:
         tool_calls = data.get("tool_calls")
         tool_call_id = data.get("tool_call_id")
         db_id = data.get("db_id")
-        return cls(role, content, timestamp, tool_calls, tool_call_id, db_id=db_id)
+        session_id = data.get("session_id")
+        return cls(role, content, timestamp, tool_calls, tool_call_id, db_id=db_id, session_id=session_id)
 
     @staticmethod
     def _extract_content(data: dict) -> str:
@@ -59,6 +65,8 @@ class Message:
             d["tool_call_id"] = self.tool_call_id
         if self.db_id:
             d["db_id"] = self.db_id
+        if self.session_id:
+            d["session_id"] = self.session_id
         return d
 
     def to_api_format(self) -> dict:

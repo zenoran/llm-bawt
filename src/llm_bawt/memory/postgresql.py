@@ -2568,7 +2568,7 @@ class PostgreSQLShortTermManager:
             if include_summaries:
                 # Smart filtering: summaries + unsummarized messages
                 sql = f"""
-                    SELECT id, role, content, timestamp
+                    SELECT id, role, content, timestamp, session_id
                     FROM {self._backend._messages_table_name}
                     WHERE
                         (role = 'summary')
@@ -2590,7 +2590,7 @@ class PostgreSQLShortTermManager:
                 rows = conn.execute(text(sql), params).fetchall()
 
                 return [
-                    Message(role=row.role, content=row.content, timestamp=row.timestamp, db_id=row.id)
+                    Message(role=row.role, content=row.content, timestamp=row.timestamp, db_id=row.id, session_id=row.session_id)
                     for row in rows
                 ]
             else:
@@ -2613,7 +2613,7 @@ class PostgreSQLShortTermManager:
                     rows = session.execute(stmt).fetchall()
 
                     return [
-                        Message(role=row.role, content=row.content, timestamp=row.timestamp, db_id=row.id)
+                        Message(role=row.role, content=row.content, timestamp=row.timestamp, db_id=row.id, session_id=row.session_id)
                         for row in rows
                     ]
 
