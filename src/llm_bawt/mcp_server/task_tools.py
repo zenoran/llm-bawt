@@ -192,6 +192,31 @@ async def _api_delete(
     return resp.json()
 
 
+def _http_error(e: httpx.HTTPStatusError) -> dict:
+    """Compact error dict that surfaces the API's own message.
+
+    The BawtHub task API returns a JSON body like ``{"error": "..."}`` (or
+    ``{"detail": "..."}``) explaining *why* a request was rejected — e.g. a
+    REVIEW transition missing an owner. ``str(e)`` throws that away and yields
+    only the opaque ``"Client error '400 Bad Request' ... check MDN"`` line, so
+    callers see a status code with no actionable reason. Extract the server
+    message when present; fall back to ``str(e)`` when the body isn't JSON.
+
+    This is the single source of truth for HTTP-error -> tool-result mapping;
+    every tool's ``except httpx.HTTPStatusError`` returns this.
+    """
+    message = str(e)
+    try:
+        body = e.response.json()
+    except Exception:
+        body = None
+    if isinstance(body, dict):
+        server_message = body.get("error") or body.get("detail")
+        if server_message:
+            message = server_message if isinstance(server_message, str) else str(server_message)
+    return {"error": message, "status": e.response.status_code}
+
+
 # ---------------------------------------------------------------------------
 # Task Tools
 # ---------------------------------------------------------------------------
@@ -233,7 +258,7 @@ async def list_tasks(
     try:
         return _compact_task_list_payload(await _api_get("/tasks", params=params))
     except httpx.HTTPStatusError as e:
-        return {"error": str(e), "status": e.response.status_code}
+        return _http_error(e)
 
 
 @mcp.tool(name="tasks_search_semantic")
@@ -274,7 +299,7 @@ async def search_tasks_semantic(
     try:
         return await _api_post("/tasks/search/semantic", json=body)
     except httpx.HTTPStatusError as e:
-        return {"error": str(e), "status": e.response.status_code}
+        return _http_error(e)
 
 
 @mcp.tool(name="tasks_get")
@@ -295,7 +320,7 @@ async def get_task(
     try:
         return await _api_get(f"/tasks/{task_id}")
     except httpx.HTTPStatusError as e:
-        return {"error": str(e), "status": e.response.status_code}
+        return _http_error(e)
 
 
 @mcp.tool(name="tasks_update")
@@ -319,6 +344,10 @@ async def update_task(
     - Finish work: status="REVIEW", response="Summary of what was done"
     - Report failure: status="FAILED", response="What went wrong"
 
+    Moving a task to REVIEW requires it to have an owner. You don't need to set
+    one by hand: when status="REVIEW" and you pass bot_id (your bot), it's used
+    as the owner automatically. Pass agent_bot_id only to assign a different bot.
+
     IMPORTANT: Set status to REVIEW when done - only humans mark COMPLETED.
 
     BUG status is human-locked: you may SET a task to BUG (to flag a defect for
@@ -337,8 +366,11 @@ async def update_task(
         priority: URGENT, HIGH, MEDIUM, LOW, or NONE.
         planned: True after writing spec + steps.
         project_id: Move task to a different project (UUID).
-        agent_bot_id: Assign task to a specific bot.
-        bot_id: Your bot ID for activity attribution.
+        agent_bot_id: Assign task to a specific bot. Defaults to bot_id when
+                      moving to REVIEW (see note above); pass explicitly only to
+                      hand the task to a different bot.
+        bot_id: Your bot ID for activity attribution. Also becomes the task
+                owner when moving to REVIEW without an explicit agent_bot_id.
 
     Returns:
         Compact updated task summary, or error dict. Use tasks_get for full detail.
@@ -364,6 +396,16 @@ async def update_task(
     if agent_bot_id is not None:
         body["agentBotId"] = agent_bot_id
 
+    # REVIEW requires the task to have an owner (server guard
+    # reviewTransitionMissingBot). The bot submitting its finished work IS that
+    # owner, and we already have its id in bot_id, so default agentBotId to it
+    # when the caller didn't set one explicitly. Without this, moving a task to
+    # REVIEW would 400 unless the caller happened to know the internal rule and
+    # pass agent_bot_id by hand. Only fills on REVIEW and only when unset —
+    # an explicit agent_bot_id always wins.
+    if status == "REVIEW" and agent_bot_id is None and bot_id:
+        body["agentBotId"] = bot_id
+
     if not body:
         return {"error": "No fields to update"}
 
@@ -382,7 +424,7 @@ async def update_task(
             }
         return updated
     except httpx.HTTPStatusError as e:
-        return {"error": str(e), "status": e.response.status_code}
+        return _http_error(e)
 
 
 @mcp.tool(name="tasks_delete")
@@ -410,7 +452,7 @@ async def delete_task(
             headers=_headers(bot_id),
         )
     except httpx.HTTPStatusError as e:
-        return {"error": str(e), "status": e.response.status_code}
+        return _http_error(e)
 
 
 @mcp.tool(name="tasks_add_dependency")
@@ -445,7 +487,7 @@ async def add_task_dependency(
             headers=_headers(bot_id),
         )
     except httpx.HTTPStatusError as e:
-        return {"error": str(e), "status": e.response.status_code}
+        return _http_error(e)
 
 
 @mcp.tool(name="tasks_remove_dependency")
@@ -484,7 +526,7 @@ async def remove_task_dependency(
         resp.raise_for_status()
         return resp.json()
     except httpx.HTTPStatusError as e:
-        return {"error": str(e), "status": e.response.status_code}
+        return _http_error(e)
 
 
 @mcp.tool(name="tasks_promote")
@@ -514,7 +556,7 @@ async def promote_task(
             headers=_headers(bot_id),
         )
     except httpx.HTTPStatusError as e:
-        return {"error": str(e), "status": e.response.status_code}
+        return _http_error(e)
 
 
 @mcp.tool(name="tasks_regenerate")
@@ -545,7 +587,7 @@ async def regenerate_task(
             headers=_headers(bot_id),
         )
     except httpx.HTTPStatusError as e:
-        return {"error": str(e), "status": e.response.status_code}
+        return _http_error(e)
 
 
 @mcp.tool(name="tasks_create")
@@ -591,7 +633,7 @@ async def create_task(
     try:
         return await _api_post("/tasks", json=body, headers=_headers(bot_id))
     except httpx.HTTPStatusError as e:
-        return {"error": str(e), "status": e.response.status_code}
+        return _http_error(e)
 
 
 # ---------------------------------------------------------------------------
@@ -642,7 +684,7 @@ async def update_step(
             headers=_headers(bot_id),
         )
     except httpx.HTTPStatusError as e:
-        return {"error": str(e), "status": e.response.status_code}
+        return _http_error(e)
 
 
 @mcp.tool(name="steps_delete")
@@ -676,7 +718,7 @@ async def delete_step(
             headers=_headers(bot_id),
         )
     except httpx.HTTPStatusError as e:
-        return {"error": str(e), "status": e.response.status_code}
+        return _http_error(e)
 
 
 @mcp.tool(name="steps_add")
@@ -710,7 +752,7 @@ async def add_steps(
             headers=_headers(bot_id),
         )
     except httpx.HTTPStatusError as e:
-        return {"error": str(e), "status": e.response.status_code}
+        return _http_error(e)
 
 
 # ---------------------------------------------------------------------------
@@ -733,7 +775,7 @@ async def list_projects() -> list[dict]:
     try:
         return _compact_project_list_payload(await _api_get("/projects"))
     except httpx.HTTPStatusError as e:
-        return {"error": str(e), "status": e.response.status_code}
+        return _http_error(e)
 
 
 @mcp.tool(name="projects_get")
@@ -756,7 +798,7 @@ async def get_project(
     try:
         return await _api_get(f"/projects/{project_id}")
     except httpx.HTTPStatusError as e:
-        return {"error": str(e), "status": e.response.status_code}
+        return _http_error(e)
 
 
 @mcp.tool(name="projects_create")
@@ -805,7 +847,7 @@ async def create_project(
     try:
         return await _api_post("/projects", json=body, headers=_headers(bot_id))
     except httpx.HTTPStatusError as e:
-        return {"error": str(e), "status": e.response.status_code}
+        return _http_error(e)
 
 
 @mcp.tool(name="projects_update")
@@ -860,7 +902,7 @@ async def update_project(
             headers=_headers(bot_id),
         )
     except httpx.HTTPStatusError as e:
-        return {"error": str(e), "status": e.response.status_code}
+        return _http_error(e)
 
 
 @mcp.tool(name="projects_get_context")
@@ -916,7 +958,7 @@ async def delete_project(
             headers=_headers(bot_id),
         )
     except httpx.HTTPStatusError as e:
-        return {"error": str(e), "status": e.response.status_code}
+        return _http_error(e)
 
 
 # ---------------------------------------------------------------------------
@@ -954,7 +996,7 @@ async def get_activity(
     try:
         return await _api_get("/activity", params=params)
     except httpx.HTTPStatusError as e:
-        return {"error": str(e), "status": e.response.status_code}
+        return _http_error(e)
 
 
 # ---------------------------------------------------------------------------

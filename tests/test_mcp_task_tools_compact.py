@@ -109,15 +109,17 @@ def test_tasks_update_returns_compact_task(monkeypatch: pytest.MonkeyPatch) -> N
         )
     )
 
+    # Moving to REVIEW auto-assigns the caller (bot_id) as owner, so agentBotId
+    # is added to the PATCH body without the caller passing it explicitly.
     assert calls == [
         {
             "path": "/tasks/TASK-266",
-            "json": {"status": "REVIEW", "response": GIANT_TEXT},
+            "json": {"status": "REVIEW", "response": GIANT_TEXT, "agentBotId": "snark"},
             "headers": {"X-Agent-Bot-Id": "snark"},
         }
     ]
     assert result["ok"] is True
-    assert result["updated"] == ["response", "status"]
+    assert result["updated"] == ["agentBotId", "response", "status"]
     assert result["task"]["shortId"] == "TASK-266"
     assert result["task"]["descriptionChars"] == 20_000
     assert "description" not in result["task"]
@@ -165,3 +167,108 @@ def test_projects_list_returns_compact_projects(
         }
     ]
     assert len(json.dumps(result)) < 300
+
+
+# --- Issue 2: REVIEW auto-assigns the owner (reviewTransitionMissingBot guard) ---
+
+
+def _capture_patch(monkeypatch: pytest.MonkeyPatch) -> list[dict[str, Any]]:
+    """Patch _api_patch to record bodies and return a minimal valid task."""
+    calls: list[dict[str, Any]] = []
+
+    async def fake_patch(
+        path: str,
+        json: dict[str, Any],
+        headers: dict[str, str] | None = None,
+    ) -> dict[str, Any]:
+        calls.append({"path": path, "json": json, "headers": headers})
+        return _full_task()
+
+    monkeypatch.setattr(task_tools, "_api_patch", fake_patch)
+    return calls
+
+
+def test_review_autofills_owner_from_bot_id(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls = _capture_patch(monkeypatch)
+
+    result = _run(task_tools.update_task("TASK-1", status="REVIEW", bot_id="byte"))
+
+    # The guard requires an owner; bot_id supplies it without the caller knowing.
+    assert calls[0]["json"] == {"status": "REVIEW", "agentBotId": "byte"}
+    assert result["updated"] == ["agentBotId", "status"]
+
+
+def test_review_explicit_agent_bot_id_wins(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls = _capture_patch(monkeypatch)
+
+    _run(
+        task_tools.update_task(
+            "TASK-1", status="REVIEW", agent_bot_id="vex", bot_id="byte"
+        )
+    )
+
+    # An explicit assignment is never overridden by the bot_id default.
+    assert calls[0]["json"] == {"status": "REVIEW", "agentBotId": "vex"}
+
+
+def test_non_review_status_does_not_autofill_owner(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls = _capture_patch(monkeypatch)
+
+    _run(task_tools.update_task("TASK-1", status="IN_PROGRESS", bot_id="byte"))
+
+    # Only REVIEW is guarded; other transitions must not silently reassign.
+    assert calls[0]["json"] == {"status": "IN_PROGRESS"}
+
+
+def test_review_without_bot_id_does_not_autofill(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls = _capture_patch(monkeypatch)
+
+    _run(task_tools.update_task("TASK-1", status="REVIEW"))
+
+    # Nothing to fill from; the server guard will then return its own 400,
+    # which _http_error surfaces verbatim (see error-body tests below).
+    assert calls[0]["json"] == {"status": "REVIEW"}
+
+
+# --- Issue 1: HTTP errors surface the server's JSON message, not str(e) ---
+
+
+def _http_status_error(status: int, body: Any, *, json_body: bool = True) -> "task_tools.httpx.HTTPStatusError":
+    import httpx
+
+    request = httpx.Request("PATCH", "http://echo.test/api/tasks/tasks/TASK-1")
+    if json_body:
+        response = httpx.Response(status, json=body, request=request)
+    else:
+        response = httpx.Response(status, text=body, request=request)
+    return httpx.HTTPStatusError("boom", request=request, response=response)
+
+
+def test_http_error_surfaces_server_error_field() -> None:
+    err = _http_status_error(
+        400, {"error": "Cannot move task to REVIEW without an assigned bot."}
+    )
+
+    assert task_tools._http_error(err) == {
+        "error": "Cannot move task to REVIEW without an assigned bot.",
+        "status": 400,
+    }
+
+
+def test_http_error_surfaces_detail_field() -> None:
+    err = _http_status_error(404, {"detail": "Task not found"})
+
+    assert task_tools._http_error(err) == {"error": "Task not found", "status": 404}
+
+
+def test_http_error_falls_back_to_str_when_body_not_json() -> None:
+    err = _http_status_error(500, "<html>Internal Server Error</html>", json_body=False)
+
+    result = task_tools._http_error(err)
+    assert result["status"] == 500
+    # No JSON error field -> fall back to the exception's own string.
+    assert result["error"] == str(err)
