@@ -397,6 +397,8 @@ services:
   playwright-mcp:
     image: mcp/playwright
     container_name: llm-bawt-playwright-mcp
+    ports:
+      - "${PLAYWRIGHT_MCP_PORT:-8931}:8931"
     # Token-cost guard:
     #   --snapshot-mode=none — stops the MCP server from bundling the full
     #     accessibility tree onto EVERY action result. The auto-snapshot was
