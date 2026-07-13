@@ -643,6 +643,7 @@ class MemoryStorage:
         since_seconds: int | None = None,
         limit: int | None = None,
         raw: bool = False,
+        session_id: str | None = None,
     ) -> list[dict[str, Any]]:
         """Get messages for building a context window.
 
@@ -656,7 +657,19 @@ class MemoryStorage:
         its ``summarized`` flag, and ``role='summary'`` husks are excluded.
         Callers like self_recap / self_tail want the actual transcript the user
         sees in the app, not a summary of a summary.
+
+        TASK-284: when ``session_id`` is given, the read is scoped to that one
+        durable thread's transcript via the direct-table (raw) path — this is
+        the primitive the thread API and session-scoped context assembly build
+        on. It implies ``raw`` semantics (a specific thread's real bubbles), so
+        the summary-aware window path is bypassed. When ``session_id`` is None,
+        behaviour is exactly as before.
         """
+        if session_id is not None:
+            return self._get_messages_raw(
+                bot_id, since_seconds=since_seconds, limit=limit,
+                session_id=session_id,
+            )
         if raw:
             return self._get_messages_raw(
                 bot_id, since_seconds=since_seconds, limit=limit
@@ -690,6 +703,7 @@ class MemoryStorage:
         bot_id: str = "default",
         since_seconds: int | None = None,
         limit: int | None = None,
+        session_id: str | None = None,
     ) -> list[dict[str, Any]]:
         """Direct-table read of real message bubbles.
 
@@ -698,12 +712,18 @@ class MemoryStorage:
         and ignores the ``summarized`` flag (so bubbles already rolled into a
         summary are still returned). Ordered oldest-first; ``limit`` keeps the
         most recent N.
+
+        TASK-284: when ``session_id`` is given, restrict to that one durable
+        thread's rows.
         """
         from sqlalchemy import text
 
         backend = self._get_backend(bot_id)
         clauses = ["role <> 'summary'"]
         params: dict[str, Any] = {}
+        if session_id is not None:
+            clauses.append("session_id = :session_id")
+            params["session_id"] = session_id
         if since_seconds is not None and since_seconds >= 0:
             params["cutoff"] = time.time() - since_seconds
             clauses.append("timestamp >= :cutoff")

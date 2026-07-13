@@ -563,6 +563,7 @@ class MemoryClient:
         limit: int | None = None,
         since: float | None = None,
         until: float | None = None,
+        session_id: str | None = None,
     ) -> list[dict[str, Any]]:
         """Get conversation messages with optional filtering.
 
@@ -571,15 +572,20 @@ class MemoryClient:
             limit: Maximum messages to return.
             since: Unix timestamp - only include messages after this time.
             until: Unix timestamp - only include messages before this time.
+            session_id: TASK-284 — scope the read to one durable thread's
+                transcript. When None, existing behaviour is unchanged.
 
         Returns:
-            List of message dicts with role, content, timestamp.
+            List of message dicts with role, content, timestamp, session_id.
         """
         self._ensure_initialized()
         if self.server_url:
             result = self._call_server(
                 "messages_get",
-                {"bot_id": self.bot_id, "since_seconds": since_seconds, "limit": limit},
+                {
+                    "bot_id": self.bot_id, "since_seconds": since_seconds,
+                    "limit": limit, "session_id": session_id,
+                },
             )
             # Apply timestamp filtering (server doesn't support since/until yet)
             if since is not None or until is not None:
@@ -595,7 +601,7 @@ class MemoryClient:
             return result
         storage = self._get_storage()
         # Use storage API directly (async) via helper
-        messages = _run_async(storage.get_messages(bot_id=self.bot_id, since_seconds=since_seconds, limit=limit))
+        messages = _run_async(storage.get_messages(bot_id=self.bot_id, since_seconds=since_seconds, limit=limit, session_id=session_id))
 
         # Apply timestamp filtering if specified (post-filter for now)
         if since is not None or until is not None:

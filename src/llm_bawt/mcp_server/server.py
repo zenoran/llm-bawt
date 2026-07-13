@@ -747,11 +747,23 @@ async def get_messages(
     bot_id: str = "default",
     since_seconds: int | None = None,
     limit: int | None = None,
+    session_id: str | None = None,
 ) -> list[dict]:
-    """Get messages for building context windows."""
-    logger.debug("MCP tool invoked: tools/get_messages bot_id=%s", bot_id)
+    """Get messages for building context windows.
+
+    TASK-284: pass ``session_id`` to scope the read to one durable thread's
+    transcript (direct-table read). Omit it for the existing summary-aware
+    behaviour.
+    """
+    logger.debug(
+        "MCP tool invoked: tools/get_messages bot_id=%s session_id=%s",
+        bot_id, session_id,
+    )
     storage = _get_storage()
-    return await storage.get_messages(bot_id=bot_id, since_seconds=since_seconds, limit=limit)
+    return await storage.get_messages(
+        bot_id=bot_id, since_seconds=since_seconds, limit=limit,
+        session_id=session_id,
+    )
 
 
 @mcp.tool(name="messages_clear")
