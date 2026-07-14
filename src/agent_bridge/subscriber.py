@@ -430,6 +430,32 @@ class RedisSubscriber:
         except Exception:
             pass  # group already exists
 
+    async def ensure_groups(
+        self,
+        bot_id: str | list[str],
+        user_id: str,
+        consumer_id: str,
+    ) -> dict[str, str]:
+        """Pre-create the unified-stream consumer group(s) for these bots.
+
+        Returns the ``{stream_key: bot_id}`` mapping. Because the group is
+        created at ``$`` (latest), any event published AFTER this call is
+        captured and delivered on the next ``subscribe_group`` read — even if
+        the caller hasn't started reading yet. This lets a caller create the
+        group up-front and only then signal "subscribed" downstream, closing
+        the race where events published between connect and group-create are
+        lost. Idempotent, so ``subscribe_group`` re-invokes it harmlessly.
+        """
+        bot_ids = [bot_id] if isinstance(bot_id, str) else list(bot_id)
+        group_name = f"ui:{consumer_id}"
+        stream_keys: dict[str, str] = {}
+        for bid in bot_ids:
+            sk = f"{UNIFIED_EVENTS_PREFIX}{bid}:{user_id}"
+            stream_keys[sk] = bid
+        for sk in stream_keys:
+            await self.ensure_consumer_group(sk, group_name)
+        return stream_keys
+
     async def subscribe_group(
         self,
         bot_id: str | list[str],
@@ -450,19 +476,13 @@ class RedisSubscriber:
         Yields raw event dicts (not AgentEvent — unified stream carries
         tool events, OpenClaw events, and application events).
         """
-        bot_ids = [bot_id] if isinstance(bot_id, str) else list(bot_id)
         group_name = f"ui:{consumer_id}"
         consumer_name = "reader"
 
-        # Build {stream_key: bot_id} mapping
-        stream_keys: dict[str, str] = {}
-        for bid in bot_ids:
-            sk = f"{UNIFIED_EVENTS_PREFIX}{bid}:{user_id}"
-            stream_keys[sk] = bid
-
-        # Ensure consumer groups exist for all streams
-        for sk in stream_keys:
-            await self.ensure_consumer_group(sk, group_name)
+        # Ensure consumer groups exist for all streams (idempotent — the SSE
+        # route may have pre-created them via ensure_groups before signaling
+        # "hello"). Returns the {stream_key: bot_id} mapping used below.
+        stream_keys = await self.ensure_groups(bot_id, user_id, consumer_id)
 
         # Phase 1: replay pending (unacked) messages from all streams
         try:

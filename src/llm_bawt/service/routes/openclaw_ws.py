@@ -98,6 +98,13 @@ async def _unified_event_stream(redis_url: str, bot_ids: list[str], user_id: str
     """
     sub = RedisSubscriber(redis_url)
     await sub.connect()
+    # Create the consumer group(s) BEFORE announcing "hello". The group is
+    # anchored at "$" (latest), so it captures every event published from this
+    # point on. A downstream consumer (e.g. the bawthub chat TTS driver) can
+    # therefore treat "hello" as a real "you are subscribed, safe to fire a
+    # turn" signal — closing the race where a turn published between connect and
+    # group-create produced no audio.
+    await sub.ensure_groups(bot_ids, user_id, consumer_id)
     yield _sse(
         "hello",
         {
