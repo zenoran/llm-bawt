@@ -33,6 +33,7 @@ class JobType(str, Enum):
     HISTORY_SUMMARIZATION = "history_summarization"
     MEMORY_EXTRACTION = "memory_extraction"
     MEDIA_GC = "media_gc"
+    TOOL_RESULT_GC = "tool_result_gc"
 
 
 class ScheduledJob(SQLModel, table=True):
@@ -608,6 +609,10 @@ class JobScheduler:
                 # and the worst case is a 24h pile-up at most. Activity
                 # gating would add a separate scan with no real win.
                 return True, None
+
+            if job.job_type == JobType.TOOL_RESULT_GC:
+                # Always-on for the same reason as MEDIA_GC — a cheap sweep.
+                return True, None
         except Exception as e:
             logger.debug(
                 "Activity-gate check failed for job %s (%s); falling back to run: %s",
@@ -627,6 +632,7 @@ class JobScheduler:
             create_media_assets_gc_task,
             create_memory_extraction_task,
             create_profile_maintenance_task,
+            create_tool_result_gc_task,
         )
         
         if job.job_type == JobType.PROFILE_MAINTENANCE:
@@ -679,6 +685,14 @@ class JobScheduler:
             config = self._parse_config_json(job.config_json)
             return create_media_assets_gc_task(
                 grace_days=int(config.get("grace_days", 7)),
+                dry_run=bool(config.get("dry_run", False)),
+                bot_id=job.bot_id or "system",
+                user_id=config.get("user_id", "system"),
+            )
+        elif job.job_type == JobType.TOOL_RESULT_GC:
+            config = self._parse_config_json(job.config_json)
+            return create_tool_result_gc_task(
+                retention_days=int(config.get("retention_days", 14)),
                 dry_run=bool(config.get("dry_run", False)),
                 bot_id=job.bot_id or "system",
                 user_id=config.get("user_id", "system"),
@@ -837,5 +851,43 @@ def init_default_jobs(engine, config) -> None:
             session.commit()
             logger.debug(
                 "Created media_assets GC job (nightly @ 04:00 UTC, next: %s)",
+                next_run.isoformat(),
+            )
+
+        # TASK-594: nightly tool-result GC. Prunes transient overflow blobs +
+        # legacy payload rows past retention. Single global job (scans the whole
+        # table). Anchored to 04:30 UTC so it doesn't overlap media_gc @ 04:00.
+        existing_tool_result_gc = session.exec(
+            select(ScheduledJob).where(ScheduledJob.job_type == JobType.TOOL_RESULT_GC)
+        ).first()
+
+        if not existing_tool_result_gc:
+            now = datetime.now(timezone.utc)
+            next_run = now.replace(hour=4, minute=30, second=0, microsecond=0)
+            if next_run <= now:
+                next_run = next_run + timedelta(days=1)
+
+            tool_result_gc_job = ScheduledJob(
+                job_type=JobType.TOOL_RESULT_GC,
+                bot_id="system",
+                enabled=config.SCHEDULER_ENABLED,
+                interval_minutes=int(
+                    getattr(config, "TOOL_RESULT_GC_INTERVAL_MINUTES", 1440),
+                ),
+                next_run_at=next_run,
+                config_json=json.dumps(
+                    {
+                        "user_id": "system",
+                        "retention_days": int(
+                            getattr(config, "TOOL_RESULT_GC_RETENTION_DAYS", 14),
+                        ),
+                        "dry_run": False,
+                    }
+                ),
+            )
+            session.add(tool_result_gc_job)
+            session.commit()
+            logger.debug(
+                "Created tool_result GC job (nightly @ 04:30 UTC, next: %s)",
                 next_run.isoformat(),
             )

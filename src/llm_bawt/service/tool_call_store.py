@@ -8,16 +8,66 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Any
+from pathlib import Path
+from typing import TYPE_CHECKING, Any
 
 from sqlalchemy import BigInteger, Boolean, Column, DateTime, Float, Integer, String, Text, text as sa_text
 from sqlmodel import Field, SQLModel, Session, select
 
 from agent_bridge.tool_results import ToolResultPayload
 
+if TYPE_CHECKING:
+    from ..media.object_store import BlobBackend
+
 logger = logging.getLogger(__name__)
+
+# TASK-594: overflow tool-call results are offloaded to the object store
+# (Garage S3 in prod) instead of hoarded in Postgres. The backend is resolved
+# once and cached; if it can't be built (fs misconfig, S3 creds missing) the
+# write path degrades to the legacy tool_call_result_payloads table so a result
+# is never lost. Default FS root keeps dev/test working without S3.
+DEFAULT_TOOLBLOBS_FS_ROOT = "/var/lib/llm-bawt/tool-results"
+
+_TOOL_BLOB_BACKEND: "BlobBackend | None" = None
+_TOOL_BLOB_RESOLVED = False
+
+
+def _get_tool_blob_backend() -> "BlobBackend | None":
+    """Return the (cached) blob backend for tool-result overflow, or None.
+
+    None means "no object store available" — callers fall back to the legacy
+    Postgres payload table. Resolution never raises; a misconfigured backend is
+    treated as absent so a tool turn never dies over storage.
+    """
+    global _TOOL_BLOB_BACKEND, _TOOL_BLOB_RESOLVED
+    if _TOOL_BLOB_RESOLVED:
+        return _TOOL_BLOB_BACKEND
+    _TOOL_BLOB_RESOLVED = True
+    try:
+        from ..media.object_store import get_blob_backend, s3_config_from_env
+
+        fs_root = Path(
+            os.environ.get("LLM_BAWT_TOOLBLOBS_FS_ROOT", DEFAULT_TOOLBLOBS_FS_ROOT)
+        )
+        _TOOL_BLOB_BACKEND = get_blob_backend(
+            "tool_results", fs_root=fs_root, s3_cfg=s3_config_from_env()
+        )
+    except Exception:
+        logger.exception(
+            "tool-result blob backend unavailable; overflow will use Postgres fallback"
+        )
+        _TOOL_BLOB_BACKEND = None
+    return _TOOL_BLOB_BACKEND
+
+
+def reset_tool_blob_backend() -> None:
+    """Drop the cached backend (tests / config reload)."""
+    global _TOOL_BLOB_BACKEND, _TOOL_BLOB_RESOLVED
+    _TOOL_BLOB_BACKEND = None
+    _TOOL_BLOB_RESOLVED = False
 
 
 class ToolCallRecord(SQLModel, table=True):
@@ -52,6 +102,10 @@ class ToolCallRecord(SQLModel, table=True):
     result_content_type: str | None = Field(default=None, sa_column=Column(String(128), nullable=True))
     result_complete: bool | None = Field(default=None, sa_column=Column(Boolean, nullable=True))
     result_payload_available: bool = Field(default=False, sa_column=Column(Boolean, nullable=False))
+    # TASK-594: object-store key for overflow results (content-addressed sha256,
+    # relative to the tool_results backend's toolblobs/ prefix). NULL => result
+    # fits in result_text preview, or overflow lives in the legacy payload table.
+    result_blob_key: str | None = Field(default=None, sa_column=Column(String(128), nullable=True))
 
 
 class ToolCallResultPayloadRecord(SQLModel, table=True):
@@ -83,6 +137,20 @@ class ToolResultPage:
     next_offset: int | None
 
 
+@dataclass(frozen=True)
+class ToolResultBlob:
+    """A (possibly Range-bounded) full-result download body. TASK-594."""
+
+    record_id: int
+    data: bytes
+    start: int          # inclusive first byte offset
+    end: int            # inclusive last byte offset
+    total_bytes: int    # size of the whole result
+    content_type: str
+    sha256: str
+    partial: bool       # True => serve HTTP 206 with Content-Range
+
+
 class ToolCallStore:
     def __init__(self, engine) -> None:
         self.engine = engine
@@ -101,7 +169,11 @@ class ToolCallStore:
             "ALTER TABLE tool_call_records ADD COLUMN IF NOT EXISTS result_content_type VARCHAR(128)",
             "ALTER TABLE tool_call_records ADD COLUMN IF NOT EXISTS result_complete BOOLEAN",
             "ALTER TABLE tool_call_records ADD COLUMN IF NOT EXISTS result_payload_available BOOLEAN NOT NULL DEFAULT FALSE",
+            # TASK-594: object-store key for overflow tool-result bytes.
+            "ALTER TABLE tool_call_records ADD COLUMN IF NOT EXISTS result_blob_key VARCHAR(128)",
             "CREATE INDEX IF NOT EXISTS ix_tool_call_records_turn_call ON tool_call_records (turn_id, call_id)",
+            # TASK-594: content-addressed lookup for the TTL prune keep-set.
+            "CREATE INDEX IF NOT EXISTS ix_tool_call_records_blob_key ON tool_call_records (result_blob_key)",
         )
         with self.engine.begin() as conn:
             for statement in statements:
@@ -205,7 +277,6 @@ class ToolCallStore:
                 row.result_sha256 = payload.sha256
                 row.result_content_type = payload.content_type
                 row.result_complete = payload.complete
-                row.result_payload_available = True
                 row.ended_at = ended_at
                 row.is_error = is_error
                 if ended_at and row.started_at:
@@ -213,6 +284,41 @@ class ToolCallStore:
                 session.add(row)
                 session.flush()
                 assert row.id is not None
+
+                # TASK-594 spill gate: the record's result_text already holds the
+                # full preview. Only persist a SECOND copy when the result exceeds
+                # what the preview captured. Small results (the ~95% case) stop
+                # here — no blob, no payload row, no duplication.
+                if payload.total_chars <= len(payload.preview):
+                    row.result_blob_key = None
+                    row.result_payload_available = False
+                    session.add(row)
+                    # A prior write of this same (turn, call) row may have left an
+                    # overflow row behind; drop it so state matches "preview only".
+                    self._clear_legacy_payload(session, row.id)
+                    session.commit()
+                    return row.id, False
+
+                # Overflow: offload the full bytes to the object store (Garage S3
+                # in prod). Content-addressed by sha256 -> identical outputs share
+                # one object. Falls back to the legacy Postgres payload table when
+                # no object store is configured or the write fails.
+                blob_key = self._offload_blob(payload)
+                if blob_key is not None:
+                    row.result_blob_key = blob_key
+                    row.result_payload_available = True
+                    session.add(row)
+                    # New writes never touch Postgres for overflow; clear any
+                    # legacy row from a pre-migration write of this record.
+                    self._clear_legacy_payload(session, row.id)
+                    session.commit()
+                    return row.id, True
+
+                # Fallback path: no object store -> keep overflow in Postgres
+                # exactly as before (the read path still serves it).
+                row.result_blob_key = None
+                row.result_payload_available = True
+                session.add(row)
                 stored = session.get(ToolCallResultPayloadRecord, row.id)
                 if stored is None:
                     stored = ToolCallResultPayloadRecord(tool_call_record_id=row.id, content_text="", content_type="text/plain", total_chars=0, total_bytes=0, sha256="", complete=False)
@@ -229,6 +335,62 @@ class ToolCallStore:
             logger.exception("Failed to persist full tool result turn=%s call=%s", turn_id, call_id)
             return None, False
 
+    @staticmethod
+    def _clear_legacy_payload(session: Session, record_id: int) -> None:
+        """Delete the 1:1 Postgres overflow row for a record if present (idempotent)."""
+        stale = session.get(ToolCallResultPayloadRecord, record_id)
+        if stale is not None:
+            session.delete(stale)
+
+    def _offload_blob(self, payload: ToolResultPayload) -> str | None:
+        """Write full result bytes to the object store; return the blob key or None.
+
+        Content-addressed: the key is the sha256, so identical results dedupe to
+        one object (put is skipped when it already exists). Never raises — any
+        failure returns None and the caller falls back to Postgres.
+        """
+        backend = _get_tool_blob_backend()
+        if backend is None:
+            return None
+        key = payload.sha256
+        try:
+            if not backend.exists(key):
+                backend.put(key, payload.content.encode("utf-8"), payload.content_type)
+            return key
+        except Exception:
+            logger.exception(
+                "tool-result blob offload failed sha=%s; falling back to Postgres",
+                payload.sha256,
+            )
+            return None
+
+    def _resolve_full_text(self, session: Session, row: ToolCallRecord) -> tuple[str, str, str] | None:
+        """Return (content_text, content_type, sha256) for a record's full result.
+
+        Reads the object store when the record carries a blob key, else the
+        legacy Postgres payload row. Returns None if neither source has it.
+        """
+        if row.result_blob_key:
+            backend = _get_tool_blob_backend()
+            if backend is not None:
+                try:
+                    data = backend.get(row.result_blob_key)
+                    return (
+                        data.decode("utf-8", errors="replace"),
+                        row.result_content_type or "text/plain",
+                        row.result_sha256 or "",
+                    )
+                except Exception:
+                    logger.exception(
+                        "blob read failed for record=%s key=%s; trying Postgres fallback",
+                        row.id,
+                        row.result_blob_key,
+                    )
+        payload = session.get(ToolCallResultPayloadRecord, row.id)
+        if payload is None:
+            return None
+        return payload.content_text, payload.content_type, payload.sha256
+
     def page(self, record_id: int, *, bot_id: str, user_id: str, offset: int, limit: int) -> ToolResultPage | None:
         if self.engine is None:
             return None
@@ -236,32 +398,90 @@ class ToolCallStore:
             row = session.get(ToolCallRecord, record_id)
             if row is None or row.bot_id != bot_id or row.user_id != user_id:
                 return None
-            payload = session.get(ToolCallResultPayloadRecord, record_id)
-            if payload is None:
+            resolved = self._resolve_full_text(session, row)
+            if resolved is None:
                 return None
-            end = min(payload.total_chars, offset + limit)
+            content_text, content_type, sha256 = resolved
+            total_chars = len(content_text)
+            end = min(total_chars, offset + limit)
             return ToolResultPage(
                 record_id=record_id,
-                content_type=payload.content_type,
+                content_type=content_type,
                 offset=offset,
-                content=payload.content_text[offset:end],
-                total_chars=payload.total_chars,
-                total_bytes=payload.total_bytes,
-                sha256=payload.sha256,
-                complete=payload.complete,
-                next_offset=end if end < payload.total_chars else None,
+                content=content_text[offset:end],
+                total_chars=total_chars,
+                total_bytes=row.result_total_bytes or len(content_text.encode("utf-8")),
+                sha256=sha256,
+                complete=bool(row.result_complete),
+                next_offset=end if end < total_chars else None,
             )
 
-    def raw(self, record_id: int, *, bot_id: str, user_id: str) -> tuple[ToolCallRecord, ToolCallResultPayloadRecord] | None:
+    def raw_range(
+        self,
+        record_id: int,
+        *,
+        bot_id: str,
+        user_id: str,
+        range_header: str | None = None,
+    ) -> ToolResultBlob | None:
+        """Resolve full-result bytes for download, honoring a Range header.
+
+        Blob-backed records use the object store's native ``get_range`` (so a
+        large download resumes without pulling the whole object); legacy
+        Postgres records return the full body (Range ignored — the pre-migration
+        tail is small). Raises ``ValueError`` for an unsatisfiable range so the
+        route can map it to HTTP 416.
+        """
         if self.engine is None:
             return None
         with Session(self.engine) as session:
             row = session.get(ToolCallRecord, record_id)
             if row is None or row.bot_id != bot_id or row.user_id != user_id:
                 return None
+            if row.result_blob_key:
+                backend = _get_tool_blob_backend()
+                if backend is not None:
+                    try:
+                        from ..media.object_store import BlobNotFound
+
+                        try:
+                            br = backend.get_range(row.result_blob_key, range_header)
+                            return ToolResultBlob(
+                                record_id=record_id,
+                                data=br.data,
+                                start=br.start,
+                                end=br.end,
+                                total_bytes=br.total_size,
+                                content_type=row.result_content_type or br.content_type,
+                                sha256=row.result_sha256 or "",
+                                partial=br.partial,
+                            )
+                        except BlobNotFound:
+                            logger.warning(
+                                "blob missing for record=%s key=%s; trying Postgres fallback",
+                                record_id,
+                                row.result_blob_key,
+                            )
+                    except ValueError:
+                        raise
+                    except Exception:
+                        logger.exception(
+                            "blob range read failed for record=%s key=%s; trying Postgres fallback",
+                            record_id,
+                            row.result_blob_key,
+                        )
             payload = session.get(ToolCallResultPayloadRecord, record_id)
             if payload is None:
                 return None
-            session.expunge(row)
-            session.expunge(payload)
-            return row, payload
+            full = payload.content_text.encode("utf-8")
+            total = len(full)
+            return ToolResultBlob(
+                record_id=record_id,
+                data=full,
+                start=0,
+                end=max(total - 1, 0),
+                total_bytes=total,
+                content_type=payload.content_type,
+                sha256=payload.sha256,
+                partial=False,
+            )

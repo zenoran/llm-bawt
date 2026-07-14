@@ -2,7 +2,7 @@
 
 import json
 
-from fastapi import APIRouter, HTTPException, Query
+from fastapi import APIRouter, HTTPException, Query, Request
 from fastapi.responses import Response
 from sqlalchemy import func
 from sqlmodel import Session, select
@@ -672,31 +672,44 @@ def get_tool_call_result(
 @router.get("/v1/tool-calls/{record_id}/result/raw", tags=["Debug"])
 def download_tool_call_result(
     record_id: int,
+    request: Request,
     bot_id: str = Query(...),
     user_id: str = Query(...),
 ):
     service = get_service()
     store = ToolCallStore(service._turn_log_store.engine)
-    found = store.raw(
-        record_id,
-        bot_id=bot_id.strip().lower(),
-        user_id=user_id.strip().lower(),
-    )
-    if found is None:
+    range_header = request.headers.get("range")
+    try:
+        blob = store.raw_range(
+            record_id,
+            bot_id=bot_id.strip().lower(),
+            user_id=user_id.strip().lower(),
+            range_header=range_header,
+        )
+    except ValueError:
+        # Malformed / unsatisfiable Range header.
+        raise HTTPException(status_code=416, detail="Requested Range Not Satisfiable")
+    if blob is None:
         raise HTTPException(status_code=404, detail="Tool result not found")
-    _row, payload = found
     media_type = (
         "application/json"
-        if payload.content_type == "application/x-tool-blocks+json"
+        if blob.content_type == "application/x-tool-blocks+json"
         else "text/plain"
     )
     extension = "json" if media_type == "application/json" else "txt"
+    headers = {
+        "Content-Disposition": f'attachment; filename="tool-result-{record_id}.{extension}"',
+        "X-Content-Type-Options": "nosniff",
+        "X-Tool-Result-SHA256": blob.sha256,
+        "Accept-Ranges": "bytes",
+    }
+    status_code = 200
+    if blob.partial:
+        headers["Content-Range"] = f"bytes {blob.start}-{blob.end}/{blob.total_bytes}"
+        status_code = 206
     return Response(
-        content=payload.content_text.encode("utf-8"),
+        content=blob.data,
         media_type=media_type,
-        headers={
-            "Content-Disposition": f'attachment; filename="tool-result-{record_id}.{extension}"',
-            "X-Content-Type-Options": "nosniff",
-            "X-Tool-Result-SHA256": payload.sha256,
-        },
+        status_code=status_code,
+        headers=headers,
     )

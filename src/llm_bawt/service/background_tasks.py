@@ -41,6 +41,8 @@ class BackgroundTasksMixin:
                 result = await self._process_memory_extraction(task)
             elif task.task_type == TaskType.MEDIA_ASSETS_GC:
                 result = await self._process_media_assets_gc(task)
+            elif task.task_type == TaskType.TOOL_RESULT_GC:
+                result = await self._process_tool_result_gc(task)
             else:
                 raise ValueError(f"Unknown task type: {task.task_type}")
 
@@ -760,6 +762,29 @@ class BackgroundTasksMixin:
             lambda: run_media_gc(
                 self.config,
                 grace_days=grace_days,
+                dry_run=dry_run,
+            ),
+        )
+        return result
+
+    async def _process_tool_result_gc(self, task: Task) -> dict:
+        """Prune transient overflow tool-result blobs + legacy rows (TASK-594).
+
+        Delegates to :func:`llm_bawt.service.jobs.tool_result_gc.run_tool_result_gc`.
+        Synchronous (Postgres + object-store deletes), so it runs through the
+        executor to keep the event loop free.
+        """
+        from .jobs.tool_result_gc import run_tool_result_gc
+
+        retention_days = int(task.payload.get("retention_days", 14))
+        dry_run = bool(task.payload.get("dry_run", False))
+
+        loop = asyncio.get_event_loop()
+        result = await loop.run_in_executor(
+            self._bg_executor,
+            lambda: run_tool_result_gc(
+                self.config,
+                retention_days=retention_days,
                 dry_run=dry_run,
             ),
         )

@@ -18,6 +18,7 @@ class TaskType(Enum):
     HISTORY_SUMMARIZATION = "history_summarization"
     MEMORY_EXTRACTION = "memory_extraction"
     MEDIA_ASSETS_GC = "media_assets_gc"
+    TOOL_RESULT_GC = "tool_result_gc"
 
 
 class TaskStatus(Enum):
@@ -219,6 +220,33 @@ def create_media_assets_gc_task(
         priority=priority,
         payload={
             "grace_days": grace_days,
+            "dry_run": dry_run,
+        },
+    )
+
+
+def create_tool_result_gc_task(
+    retention_days: int = 14,
+    dry_run: bool = False,
+    bot_id: str = "system",
+    user_id: str = "system",
+    priority: int = -1,
+) -> Task:
+    """Create a tool-result garbage-collection task (TASK-594).
+
+    Prunes overflow tool-result blobs (``toolblobs/<sha256>`` in the object
+    store) and legacy ``tool_call_result_payloads`` rows older than
+    ``retention_days``. Content-addressed blobs shared by a newer record are
+    preserved via a keep-set. The ``tool_call_records`` rows themselves are
+    never deleted — only the heavy result body is reclaimed.
+    """
+    return Task(
+        task_type=TaskType.TOOL_RESULT_GC,
+        bot_id=bot_id,
+        user_id=user_id,
+        priority=priority,
+        payload={
+            "retention_days": retention_days,
             "dry_run": dry_run,
         },
     )
