@@ -42,6 +42,7 @@ from agent_bridge.approval import (
 from agent_bridge.events import AgentEvent, AgentEventKind, synthesize_event_id
 from agent_bridge.publisher import COMMANDS_STREAM, RedisPublisher
 from agent_bridge.session_queue import SessionQueue
+from claude_code_bridge.tool_events import normalize_tool_result
 
 logger = logging.getLogger(__name__)
 
@@ -1322,6 +1323,13 @@ class ClaudeCodeBridge:
                         and self._model_provider_prefix(model) is not None
                     )
 
+                    # ExitPlanMode is disabled on EVERY turn (TASK-388): plan
+                    # mode auto-approves silently under bypassPermissions, so the
+                    # plan never reaches the BawtHub user. Product direction is to
+                    # steer planning to the observable Tasks system (see the
+                    # agent_global_prompt), so we remove the harness plan tool
+                    # outright rather than build a plan-approval pipeline.
+                    disallowed_tools = ["ExitPlanMode"]
                     # The CLI's WebSearch/WebFetch are Anthropic *server-side*
                     # tools — they only execute against api.anthropic.com. On the
                     # proxy path (grok/openai) they collapse into parameter-less
@@ -1330,9 +1338,8 @@ class ClaudeCodeBridge:
                     # them for proxied turns; those bots get local web coverage
                     # via the bawthub `web_search` MCP tool + crawl4ai fetch
                     # instead. Anthropic-direct bots keep native server search.
-                    proxy_disallowed_tools = (
-                        ["WebSearch", "WebFetch"] if use_proxy else []
-                    )
+                    if use_proxy:
+                        disallowed_tools += ["WebSearch", "WebFetch"]
 
                     sdk_env = {}
                     # Force Task/Agent subagents to run SYNCHRONOUSLY. CLI 2.1.x
@@ -1430,7 +1437,7 @@ class ClaudeCodeBridge:
                         # alive on resume instead of decaying to the stock default.
                         system_prompt=system_prompt,
                         cwd=self._cwd,
-                        disallowed_tools=proxy_disallowed_tools,
+                        disallowed_tools=disallowed_tools,
                         permission_mode=self._permission_mode,
                         include_partial_messages=True,
                         resume=resume_id,
