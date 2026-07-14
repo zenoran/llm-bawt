@@ -55,6 +55,7 @@ class AgentToolCall:
     arguments: dict[str, Any] = field(default_factory=dict)
     display_name: str = ""  # friendly name for UI (e.g. first word of exec command)
     result: Any | None = None
+    tool_use_id: str | None = None
 
     def __post_init__(self):
         if not self.display_name:
@@ -303,6 +304,7 @@ class AgentBridgeBackend(AgentBackend):
                                 tc = AgentToolCall(
                                     name=event.tool_name or "unknown",
                                     arguments=event.tool_arguments or {},
+                                    tool_use_id=event.tool_use_id,
                                 )
                                 tool_calls.append(tc)
                                 logger.info("%s tool event: %s", self.name, tc.display_name)
@@ -333,12 +335,21 @@ class AgentBridgeBackend(AgentBackend):
                                     # Gateway may not include actual result —
                                     # use meta/summary or a placeholder so the
                                     # SSE handler always sees a non-None result.
-                                    result = event.tool_result or "(completed)"
-                                    tool_calls[-1].result = result
+                                    result = event.tool_result if event.tool_result is not None else "(completed)"
+                                    # Match completion to its start by the stable SDK
+                                    # tool_use id. Parallel calls need not finish LIFO.
+                                    matched_call = tool_calls[-1]
+                                    if event.tool_use_id:
+                                        for candidate in reversed(tool_calls):
+                                            if getattr(candidate, "tool_use_id", None) == event.tool_use_id:
+                                                matched_call = candidate
+                                                break
+                                    matched_call.result = result
                                     result_queue.put({
                                         "event": "tool_result",
-                                        "name": tool_calls[-1].display_name,
+                                        "name": matched_call.display_name,
                                         "result": result,
+                                        "tool_result_payload": event.tool_result_payload,
                                         "provider": event.provider,
                                         "trigger_message_id": event.trigger_message_id,
                                         "tool_use_id": event.tool_use_id,

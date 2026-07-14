@@ -136,6 +136,8 @@ class ChatStreamingMixin:
 
         # Accumulate response data outside try so the finally block can
         # always access them (including on GeneratorExit from client disconnect).
+        from .tool_event_coordinator import ToolEventCoordinator
+        tool_events = ToolEventCoordinator(self._turn_log_store.engine)
         full_text_parts: list[str] = []
         tool_call_details: list[dict] = []
         _finalized = False
@@ -268,7 +270,7 @@ class ChatStreamingMixin:
                     # Publish tool_start to unified event stream
                     if redis_sub:
                         try:
-                            await redis_sub.publish_tool_event(bot_id, user_id, {
+                            await redis_sub.publish_tool_event(bot_id, user_id, tool_events.start({
                                 "_type": "tool_event",
                                 "event": "tool_start",
                                 "turn_id": turn_log_id,
@@ -278,20 +280,12 @@ class ChatStreamingMixin:
                                 "tool_name": tool_name,
                                 "arguments": tool_args,
                                 "call_id": call_id,
-                                # SDK tool_use id: stable anchor a sub-agent's
-                                # child cards match their parent_tool_use_id
-                                # against (the Agent card is keyed by this).
-                                # parent_tool_use_id nests this card under its
-                                # spawning Agent card; None for top-level calls.
-                                # Available on the AgentEvent (bridge-stamped) but
-                                # was dropped here before — nesting couldn't
-                                # resolve live for claude-code turns (TASK-344).
                                 "tool_use_id": getattr(event, "tool_use_id", None),
                                 "parent_tool_use_id": getattr(event, "parent_tool_use_id", None),
                                 "iteration": _tool_call_index,
                                 "provider": event.provider,
                                 "ts": time.time(),
-                            })
+                            }))
                         except Exception:
                             pass
 
@@ -325,7 +319,7 @@ class ChatStreamingMixin:
                     # Publish tool_end to unified event stream
                     if redis_sub:
                         try:
-                            await redis_sub.publish_tool_event(bot_id, user_id, {
+                            await redis_sub.publish_tool_event(bot_id, user_id, tool_events.end({
                                 "_type": "tool_event",
                                 "event": "tool_end",
                                 "turn_id": turn_log_id,
@@ -334,17 +328,15 @@ class ChatStreamingMixin:
                                 "user_id": user_id,
                                 "tool_name": event.tool_name or "unknown",
                                 "call_id": end_call_id,
-                                # Same ids as tool_start so a reconnect that only
-                                # sees the tool_end can still place the card under
-                                # its parent Agent (TASK-344).
                                 "tool_use_id": getattr(event, "tool_use_id", None),
                                 "parent_tool_use_id": getattr(event, "parent_tool_use_id", None),
                                 "iteration": _tool_call_index,
                                 "provider": event.provider,
-                                "result": tool_result[:2000],
+                                "result": tool_result,
+                                "tool_result_payload": getattr(event, "tool_result_payload", None),
                                 "is_error": tool_failed,
                                 "ts": time.time(),
-                            })
+                            }))
                         except Exception:
                             pass
 
@@ -1095,6 +1087,9 @@ class ChatStreamingMixin:
             except Exception as pub_err:
                 log.debug("Unified event publish failed: %s", pub_err)
 
+        from .tool_event_coordinator import ToolEventCoordinator
+        _tool_event_coordinator = ToolEventCoordinator(self._turn_log_store.engine)
+
         def _publish_event_direct(event_dict):
             """Publish to the unified stream FROM THE WORKER THREAD.
 
@@ -1109,6 +1104,11 @@ class ChatStreamingMixin:
             ordering can wait for the Redis write before publishing a terminal
             event such as ``turn_complete``.
             """
+            if event_dict.get("_type") == "tool_event":
+                if event_dict.get("event") == "tool_start":
+                    event_dict = _tool_event_coordinator.start(event_dict)
+                elif event_dict.get("event") == "tool_end":
+                    event_dict = _tool_event_coordinator.end(event_dict)
             if not _redis_sub:
                 return None
             try:
@@ -1698,7 +1698,7 @@ class ChatStreamingMixin:
                                                 "tool_name": name,
                                                 "arguments": args,
                                                 "call_id": call_id,
-                                                "result": result[:2000] if result else "",
+                                                "result": result or "",
                                                 "iteration": iteration + 1,
                                                 "ts": time.time(),
                                             })
@@ -1708,7 +1708,7 @@ class ChatStreamingMixin:
                                                 "tool": name,
                                                 "arguments": args,
                                                 "call_id": call_id,
-                                                "result": result[:2000] if result else "",
+                                                "result": result or "",
                                                 "iteration": iteration + 1,
                                             })
 
@@ -2221,7 +2221,8 @@ class ChatStreamingMixin:
                                     "user_id": user_id,
                                     "tool_name": _result_name or "unknown",
                                     "call_id": _end_cid,
-                                    "result": str(item.get("result", ""))[:2000],
+                                    "result": item.get("result", ""),
+                                    "tool_result_payload": item.get("tool_result_payload"),
                                     # Same ids as tool_start so a reconnect that only
                                     # sees the tool_end can still place the card under
                                     # its parent Agent (TASK-344).
@@ -2245,7 +2246,11 @@ class ChatStreamingMixin:
                                 # red error ring, not just the live stream.
                                 for _td in reversed(tool_call_details_holder):
                                     if _td.get("call_id") == _end_cid:
-                                        _td["result"] = str(item.get("result", ""))[:2000]
+                                        from agent_bridge.tool_results import payload_from_event
+                                        _payload = payload_from_event(
+                                            item.get("tool_result_payload"), item.get("result", "")
+                                        )
+                                        _td["result"] = _payload.preview
                                         _td["is_error"] = item.get("is_error")
                                         break
                         if isinstance(item, str):

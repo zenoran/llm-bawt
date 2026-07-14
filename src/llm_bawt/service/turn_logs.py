@@ -8,10 +8,11 @@ import time
 from datetime import datetime, timedelta, timezone
 from urllib.parse import quote_plus
 
-from sqlalchemy import Boolean, Column, DateTime, Float, Integer, String, Text, exists as sa_exists, func, text as sa_text
-from sqlmodel import Field, SQLModel, Session, create_engine, delete, select
+from sqlalchemy import Boolean, Column, DateTime, String, Text, exists as sa_exists, func, text as sa_text
+from sqlmodel import Field, SQLModel, Session, delete, select
 
 from ..utils.config import Config, has_database_credentials
+from .tool_call_store import ToolCallRecord, ToolCallStore
 
 logger = logging.getLogger(__name__)
 
@@ -128,58 +129,6 @@ class TurnLog(SQLModel, table=True):
     )
 
 
-class ToolCallRecord(SQLModel, table=True):
-    """Individual tool call persisted incrementally via event stream."""
-
-    __tablename__ = "tool_call_records"
-
-    id: int | None = Field(default=None, sa_column=Column(Integer, primary_key=True, autoincrement=True))
-    created_at: datetime = Field(
-        default_factory=lambda: datetime.now(timezone.utc),
-        sa_column=Column(DateTime(timezone=True), nullable=False, index=True),
-    )
-    turn_id: str | None = Field(default=None, index=True)
-    bot_id: str | None = Field(default=None, index=True)
-    user_id: str | None = Field(default=None, index=True)
-    call_id: str | None = Field(default=None, index=True)
-    tool_name: str = Field(default="unknown", max_length=128)
-    arguments_json: str | None = Field(default=None, sa_column=Column(Text, nullable=True))
-    result_text: str | None = Field(default=None, sa_column=Column(Text, nullable=True))
-    iteration: int = Field(default=1)
-    started_at: float | None = Field(default=None, sa_column=Column(Float, nullable=True))
-    ended_at: float | None = Field(default=None, sa_column=Column(Float, nullable=True))
-    duration_ms: float | None = Field(default=None, sa_column=Column(Float, nullable=True))
-    # Interleave support: number of assistant text characters streamed BEFORE
-    # this tool fired. Lets the frontend split response_text at tool boundaries
-    # and render a fully interleaved transcript (text → tool → text) that
-    # survives a page reload. Null on legacy rows → frontend falls back to the
-    # old "text bubble + activity row" layout for that turn.
-    text_offset: int | None = Field(default=None, sa_column=Column(Integer, nullable=True))
-    # Single source of truth for "did this tool call fail?". Set from the SDK's
-    # is_error flag on the live path and persisted here so a reload/reconnect
-    # reads the same truth instead of re-deriving it (e.g. string-sniffing the
-    # result). Null on legacy rows → frontend treats failure as unknown.
-    is_error: bool | None = Field(default=None, sa_column=Column(Boolean, nullable=True))
-    # TASK-344: SDK tool_use id (toolu_…) and the parent Agent/Workflow call's
-    # tool_use_id when this tool ran inside a sub-agent. Persisted so sub-agent
-    # nesting (child card grouped under its Agent card) survives a reload — the
-    # live SSE carries these ids but the catch-up hydration would otherwise strip
-    # them, un-nesting every child. Null on legacy rows / top-level calls.
-    tool_use_id: str | None = Field(default=None, index=True)
-    parent_tool_use_id: str | None = Field(default=None, index=True)
-    # TASK-305 (persistence): when this tool call was gated by an approval
-    # policy, the approval request id (== tool_use_id for the gated call).
-    # Populated from the approval_resolved event so history recall knows which
-    # tool calls had approval gates. Null on non-gated calls / legacy rows.
-    approval_request_id: str | None = Field(default=None, index=True)
-    # Terminal status of the approval: "approved", "denied", "cancelled",
-    # "responded". Null until resolved / on non-gated calls.
-    approval_status: str | None = Field(default=None)
-    # True when this tool ran on a continuation turn and consumed a live
-    # approval grant (the re-attempt after user approved). Persisted so the
-    # gold "Approved" badge survives reload.
-    preapproved: bool | None = Field(default=None, sa_column=Column(Boolean, nullable=True))
-
 
 class TurnLogStore:
     """DB access helper for persistent turn logs."""
@@ -213,7 +162,8 @@ class TurnLogStore:
     def _ensure_tables_exist(self) -> None:
         if self.engine is None:
             return
-        SQLModel.metadata.create_all(self.engine, tables=[TurnLog.__table__, ToolCallRecord.__table__])
+        SQLModel.metadata.create_all(self.engine, tables=[TurnLog.__table__])
+        ToolCallStore(self.engine).ensure_schema()
         # Add columns that may not exist on older tables.
         with self.engine.connect() as conn:
             try:
@@ -825,32 +775,35 @@ class TurnLogStore:
         """Persist a single tool call record."""
         if self.engine is None:
             return
-        duration_ms = None
-        if started_at and ended_at:
-            duration_ms = (ended_at - started_at) * 1000
-        row = ToolCallRecord(
+        store = ToolCallStore(self.engine)
+        store.save_start(
             turn_id=turn_id,
             bot_id=bot_id,
             user_id=user_id,
             call_id=call_id,
             tool_name=tool_name,
-            arguments_json=json.dumps(arguments or {}, ensure_ascii=False, default=str),
-            result_text=result,
+            arguments=arguments,
             iteration=iteration,
             started_at=started_at,
-            ended_at=ended_at,
-            duration_ms=duration_ms,
             text_offset=text_offset,
-            is_error=is_error,
             tool_use_id=tool_use_id,
             parent_tool_use_id=parent_tool_use_id,
         )
-        try:
-            with Session(self.engine) as session:
-                session.add(row)
-                session.commit()
-        except Exception as e:
-            logger.debug("Failed to save tool call record: %s", e)
+        if result is not None:
+            from agent_bridge.tool_results import ToolResultPayload
+            store.save_result(
+                turn_id=turn_id,
+                call_id=call_id,
+                tool_use_id=tool_use_id,
+                tool_name=tool_name,
+                bot_id=bot_id,
+                user_id=user_id,
+                payload=ToolResultPayload.from_value(result),
+                ended_at=ended_at,
+                is_error=is_error,
+                iteration=iteration,
+                parent_tool_use_id=parent_tool_use_id,
+            )
 
     def update_tool_call_result(
         self,
@@ -860,27 +813,21 @@ class TurnLogStore:
         ended_at: float | None = None,
         is_error: bool | None = None,
     ) -> None:
-        """Update a tool call record with the result (tool_end event)."""
+        """Compatibility delegate for legacy preview-only callers."""
         if self.engine is None or not call_id:
             return
-        try:
-            with Session(self.engine) as session:
-                row = session.exec(
-                    select(ToolCallRecord).where(ToolCallRecord.call_id == call_id)
-                ).first()
-                if row is None:
-                    return
-                row.result_text = result
-                if is_error is not None:
-                    row.is_error = is_error
-                if ended_at:
-                    row.ended_at = ended_at
-                    if row.started_at:
-                        row.duration_ms = (ended_at - row.started_at) * 1000
-                session.add(row)
-                session.commit()
-        except Exception as e:
-            logger.debug("Failed to update tool call record: %s", e)
+        from agent_bridge.tool_results import ToolResultPayload
+        ToolCallStore(self.engine).save_result(
+            turn_id=None,
+            call_id=call_id,
+            tool_use_id=None,
+            tool_name="unknown",
+            bot_id=None,
+            user_id=None,
+            payload=ToolResultPayload.from_value(result),
+            ended_at=ended_at,
+            is_error=is_error,
+        )
 
     def get_tool_calls_for_turn(self, turn_id: str) -> list[ToolCallRecord]:
         """Get all tool call records for a turn."""

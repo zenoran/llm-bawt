@@ -658,7 +658,17 @@ class SessionBridge:
                 "user_id": user_id,
                 "tool_name": event.tool_name or "unknown",
                 "call_id": call_id,
+                # Passive/unowned events intentionally remain preview-only; no
+                # canonical app turn exists to own a durable full payload.
                 "result": str(event.tool_result or "")[:2000],
+                "result_meta": {
+                    "preview_chars": len(str(event.tool_result or "")[:2000]),
+                    "total_chars": len(str(event.tool_result or "")),
+                    "total_bytes": len(str(event.tool_result or "").encode("utf-8")),
+                    "complete": False,
+                    "available": False,
+                    "legacy": False,
+                },
                 "iteration": iteration,
                 "ts": ts,
             })

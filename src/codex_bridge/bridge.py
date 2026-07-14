@@ -25,6 +25,7 @@ from agent_bridge.events import AgentEvent, AgentEventKind, synthesize_event_id
 from agent_bridge.publisher import COMMANDS_STREAM, RedisPublisher
 from agent_bridge.session_queue import SessionQueue
 
+
 from .transport import CodexTransport, validate_auth_json
 
 logger = logging.getLogger(__name__)
@@ -1405,7 +1406,7 @@ class CodexBridge:
                 request_id, session_key, seq,
                 kind=AgentEventKind.TOOL_END,
                 tool_name="shell",
-                tool_result=result[:4000],
+                tool_result=result,
             )
             return seq
 
@@ -1431,7 +1432,7 @@ class CodexBridge:
                 request_id, session_key, seq,
                 kind=AgentEventKind.TOOL_END,
                 tool_name="web_search",
-                tool_result=str(results)[:4000],
+                tool_result=str(results),
             )
             return seq
 
@@ -1443,7 +1444,7 @@ class CodexBridge:
                 request_id, session_key, seq,
                 kind=AgentEventKind.TOOL_END,
                 tool_name=tool_name,
-                tool_result=str(result)[:4000],
+                tool_result=str(result),
             )
             return seq
 
@@ -1455,7 +1456,7 @@ class CodexBridge:
                 request_id, session_key, seq,
                 kind=AgentEventKind.TOOL_END,
                 tool_name=tool_name,
-                tool_result=str(result)[:4000],
+                tool_result=str(result),
             )
             return seq
 

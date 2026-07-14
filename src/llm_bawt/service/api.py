@@ -284,6 +284,11 @@ async def lifespan(app):
                             _partial_reasoning.pop(tid, None)
                         return
                     event_type = event_data.get("event", "")
+                    # Active chat turns persist synchronously through
+                    # ToolEventCoordinator before public publication. The drain
+                    # remains the compatibility path for passive/legacy producers.
+                    if event_data.get("_tool_persisted"):
+                        return
                     if event_type == "tool_start":
                         store.save_tool_call(
                             turn_id=event_data.get("turn_id"),

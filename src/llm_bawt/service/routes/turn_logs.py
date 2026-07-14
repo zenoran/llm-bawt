@@ -3,6 +3,7 @@
 import json
 
 from fastapi import APIRouter, HTTPException, Query
+from fastapi.responses import Response
 from sqlalchemy import func
 from sqlmodel import Session, select
 
@@ -17,7 +18,8 @@ from ..schemas import (
     TurnLogListResponse,
 )
 from ..tool_call_events import extract_trigger_message, message_id_matches, parse_message_filters
-from ..turn_logs import ToolCallRecord, TurnLogStore
+from ..tool_call_store import ToolCallRecord, ToolCallStore
+from ..turn_logs import TurnLogStore
 
 router = APIRouter()
 
@@ -90,6 +92,17 @@ def _records_to_calls(records: list[ToolCallRecord]) -> list[dict]:
             "approval_request_id": row.approval_request_id,
             "approval_status": row.approval_status,
             "preapproved": row.preapproved,
+            "result_meta": {
+                "record_id": row.id,
+                "preview_chars": len(row.result_text or ""),
+                "total_chars": row.result_total_chars,
+                "total_bytes": row.result_total_bytes,
+                "sha256": row.result_sha256,
+                "content_type": row.result_content_type or "text/plain",
+                "complete": row.result_complete,
+                "available": bool(row.result_payload_available),
+                "legacy": row.result_complete is None,
+            },
         })
     return out
 
@@ -620,5 +633,70 @@ def get_tool_call_events(
             "after": after,
             "before": before,
             "limit": limit,
+        },
+    )
+
+
+@router.get("/v1/tool-calls/{record_id}/result", tags=["Debug"])
+def get_tool_call_result(
+    record_id: int,
+    bot_id: str = Query(...),
+    user_id: str = Query(...),
+    offset: int = Query(0, ge=0),
+    limit: int = Query(65_536, ge=1, le=262_144),
+):
+    service = get_service()
+    store = ToolCallStore(service._turn_log_store.engine)
+    page = store.page(
+        record_id,
+        bot_id=bot_id.strip().lower(),
+        user_id=user_id.strip().lower(),
+        offset=offset,
+        limit=limit,
+    )
+    if page is None:
+        raise HTTPException(status_code=404, detail="Tool result not found")
+    return {
+        "record_id": page.record_id,
+        "content_type": page.content_type,
+        "offset": page.offset,
+        "content": page.content,
+        "total_chars": page.total_chars,
+        "total_bytes": page.total_bytes,
+        "sha256": page.sha256,
+        "complete": page.complete,
+        "next_offset": page.next_offset,
+    }
+
+
+@router.get("/v1/tool-calls/{record_id}/result/raw", tags=["Debug"])
+def download_tool_call_result(
+    record_id: int,
+    bot_id: str = Query(...),
+    user_id: str = Query(...),
+):
+    service = get_service()
+    store = ToolCallStore(service._turn_log_store.engine)
+    found = store.raw(
+        record_id,
+        bot_id=bot_id.strip().lower(),
+        user_id=user_id.strip().lower(),
+    )
+    if found is None:
+        raise HTTPException(status_code=404, detail="Tool result not found")
+    _row, payload = found
+    media_type = (
+        "application/json"
+        if payload.content_type == "application/x-tool-blocks+json"
+        else "text/plain"
+    )
+    extension = "json" if media_type == "application/json" else "txt"
+    return Response(
+        content=payload.content_text.encode("utf-8"),
+        media_type=media_type,
+        headers={
+            "Content-Disposition": f'attachment; filename="tool-result-{record_id}.{extension}"',
+            "X-Content-Type-Options": "nosniff",
+            "X-Tool-Result-SHA256": payload.sha256,
         },
     )

@@ -1895,11 +1895,7 @@ class ClaudeCodeBridge:
                                                     "Screenshot persist failed (tool_use_id=%s)",
                                                     block.tool_use_id, exc_info=True,
                                                 )
-                                        if isinstance(result_content, list):
-                                            result_content = "\n".join(
-                                                b.get("text", "") if isinstance(b, dict) else str(b)
-                                                for b in result_content
-                                            )
+                                        result_payload = normalize_tool_result(result_content)
                                         # TOOLMAP (TASK-414): log the id the bridge
                                         # stamps on TOOL_END. The frontend heals a
                                         # running card by call_id; the bridge only
@@ -1930,7 +1926,8 @@ class ClaudeCodeBridge:
                                             tool_name=block.tool_use_id or "unknown",
                                             tool_use_id=block.tool_use_id,
                                             parent_tool_use_id=parent_tuid,
-                                            tool_result=str(result_content)[:2000],
+                                            tool_result=result_payload.preview,
+                                            tool_result_payload=result_payload.to_dict(),
                                             # The SDK marks failed tool runs with
                                             # is_error on the ToolResultBlock — the
                                             # single authoritative failure signal.
@@ -3240,6 +3237,7 @@ class ClaudeCodeBridge:
         tool_name: str | None = None,
         tool_arguments: dict | None = None,
         tool_result: str | None = None,
+        tool_result_payload: dict | None = None,
         tool_error: bool | None = None,
         model: str | None = None,
         token_usage: dict | None = None,
@@ -3266,6 +3264,7 @@ class ClaudeCodeBridge:
             tool_name=tool_name,
             tool_arguments=tool_arguments,
             tool_result=tool_result,
+            tool_result_payload=tool_result_payload,
             tool_error=tool_error,
             model=model,
             seq=seq,

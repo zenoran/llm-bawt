@@ -82,6 +82,10 @@ class AgentEvent:
     tool_name: str | None = None
     tool_arguments: dict | None = None
     tool_result: Any | None = None
+    # Versioned, lossless serialization of the exact provider-delivered result.
+    # It travels only on the short-lived bridge run stream; the app persists it
+    # before publishing a bounded preview to the public unified event stream.
+    tool_result_payload: dict | None = None
     # Whether the tool call failed (the SDK's ToolResultBlock.is_error). Stamped
     # on TOOL_END events so the UI can tint a failed tool card red without
     # re-deriving failure from the result text (which is unreliable across
@@ -145,6 +149,7 @@ class AgentEvent:
             "tool_name": self.tool_name,
             "tool_arguments": self.tool_arguments,
             "tool_result": self.tool_result,
+            "tool_result_payload": self.tool_result_payload,
             "tool_error": self.tool_error,
             "model": self.model,
             "seq": self.seq,
@@ -186,6 +191,7 @@ class AgentEvent:
             tool_name=data.get("tool_name"),
             tool_arguments=data.get("tool_arguments"),
             tool_result=data.get("tool_result"),
+            tool_result_payload=data.get("tool_result_payload"),
             tool_error=data.get("tool_error"),
             model=data.get("model"),
             seq=data.get("seq"),
