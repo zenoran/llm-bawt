@@ -140,10 +140,23 @@ def _extract_usage(resp: Any) -> tuple[int, int, int, int]:
 async def responses_to_anthropic_sse(
     upstream_stream: AsyncIterator[Any],
     anthropic_model: str,
+    tool_schemas: list[dict] | None = None,
 ) -> AsyncIterator[bytes]:
     """Translate a Responses API event stream into Anthropic SSE bytes."""
 
     message_id = _anthropic_message_id()
+    required_args_by_tool: dict[str, frozenset[str]] = {}
+    for tool in tool_schemas or []:
+        if not isinstance(tool, dict):
+            continue
+        name = tool.get("name")
+        schema = tool.get("input_schema")
+        if not isinstance(name, str) or not isinstance(schema, dict):
+            continue
+        required = schema.get("required")
+        required_args_by_tool[name] = frozenset(
+            value for value in required or [] if isinstance(value, str)
+        )
 
     # Emit message_start up front so the SDK has the envelope before any
     # content arrives. Our Responses-backed providers only know real usage at
@@ -244,8 +257,13 @@ async def responses_to_anthropic_sse(
                     name = getattr(item, "name", "") or ""
                     idx = next_index
                     next_index += 1
-                    block = {"index": idx, "kind": "tool",
-                             "item_id": item_id, "call_id": call_id}
+                    block = {
+                        "index": idx,
+                        "kind": "tool",
+                        "item_id": item_id,
+                        "call_id": call_id,
+                        "name": name,
+                    }
                     open_block = block
                     blocks_by_item[item_id] = block
                     saw_tool_use = True
@@ -448,13 +466,22 @@ async def responses_to_anthropic_sse(
                 item_id = getattr(event, "item_id", "") or ""
                 block = blocks_by_item.get(item_id) or open_block
                 raw = tool_arg_buffers.pop(item_id, "{}")
-                # Sanitize tool arguments before the SDK sees them.
-                # GPT fills optional params with empty strings (pages: "")
-                # and requests worktree isolation the env doesn't support.
+                # Sanitize tool arguments before the SDK sees them. GPT fills
+                # optional params with empty strings (pages: ""), but empty
+                # strings can also be intentional required values (notably
+                # Edit.new_string="" for deletion). Only remove empties from
+                # fields that the matching tool schema declares optional.
                 try:
                     parsed = json.loads(raw)
                     if isinstance(parsed, dict):
-                        parsed = {k: v for k, v in parsed.items() if v != ""}
+                        tool_name = block.get("name", "") if block else ""
+                        if tool_name in required_args_by_tool:
+                            required_args = required_args_by_tool[tool_name]
+                            parsed = {
+                                key: value
+                                for key, value in parsed.items()
+                                if value != "" or key in required_args
+                            }
                         # Never request worktree isolation — the bridge CWD
                         # is not a git repo, so it always fails.
                         if parsed.get("isolation") == "worktree":

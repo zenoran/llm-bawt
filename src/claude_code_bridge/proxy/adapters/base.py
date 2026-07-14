@@ -97,6 +97,7 @@ class ProviderAdapter(ABC):
             async for chunk in stream_mod.responses_to_anthropic_sse(
                 upstream_stream,
                 anthropic_model=anthropic_body.get("model", upstream_model),
+                tool_schemas=anthropic_body.get("tools"),
             ):
                 yield chunk
         finally:

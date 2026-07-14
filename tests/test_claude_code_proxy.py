@@ -137,15 +137,145 @@ def test_prompt_cache_key_uses_stable_opening_only() -> None:
     assert _prompt_cache_key(base_payload) != _prompt_cache_key(changed_opening)
 
 
-async def _collect_stream_frames(events: list[object]) -> list[bytes]:
+async def _collect_stream_frames(
+    events: list[object],
+    *,
+    tool_schemas: list[dict] | None = None,
+) -> list[bytes]:
     async def gen():
         for event in events:
             yield event
 
     frames: list[bytes] = []
-    async for frame in responses_to_anthropic_sse(gen(), anthropic_model="openai_chatgpt/gpt-5.4"):
+    async for frame in responses_to_anthropic_sse(
+        gen(),
+        anthropic_model="openai_chatgpt/gpt-5.4",
+        tool_schemas=tool_schemas,
+    ):
         frames.append(frame)
     return frames
+
+
+def _tool_argument_events(tool_name: str, arguments: dict) -> list[object]:
+    item = SimpleNamespace(
+        id="item_1",
+        call_id="call_1",
+        type="function_call",
+        name=tool_name,
+    )
+    return [
+        SimpleNamespace(type="response.output_item.added", item=item),
+        SimpleNamespace(
+            type="response.function_call_arguments.delta",
+            item_id=item.id,
+            delta=json.dumps(arguments),
+        ),
+        SimpleNamespace(
+            type="response.function_call_arguments.done",
+            item_id=item.id,
+        ),
+        SimpleNamespace(type="response.output_item.done", item=item),
+    ]
+
+
+def _streamed_tool_arguments(frames: list[bytes]) -> dict:
+    payloads = _sse_payloads(frames)
+    delta = next(
+        payload["delta"]["partial_json"]
+        for payload in payloads
+        if payload.get("type") == "content_block_delta"
+        and payload.get("delta", {}).get("type") == "input_json_delta"
+    )
+    return json.loads(delta)
+
+
+def test_stream_preserves_required_empty_string_tool_argument() -> None:
+    tool_schemas = [{
+        "name": "Edit",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "file_path": {"type": "string"},
+                "old_string": {"type": "string"},
+                "new_string": {"type": "string"},
+                "replace_all": {"type": "boolean"},
+            },
+            "required": ["file_path", "old_string", "new_string"],
+        },
+    }]
+    arguments = {
+        "file_path": "/tmp/example.py",
+        "old_string": "remove me",
+        "new_string": "",
+    }
+
+    frames = __import__("asyncio").run(
+        _collect_stream_frames(
+            _tool_argument_events("Edit", arguments),
+            tool_schemas=tool_schemas,
+        )
+    )
+
+    assert _streamed_tool_arguments(frames) == arguments
+
+
+def test_stream_strips_only_optional_empty_string_tool_arguments() -> None:
+    tool_schemas = [{
+        "name": "Read",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "file_path": {"type": "string"},
+                "offset": {"type": "number"},
+                "limit": {"type": "number"},
+                "pages": {"type": "string"},
+            },
+            "required": ["file_path"],
+        },
+    }]
+
+    frames = __import__("asyncio").run(
+        _collect_stream_frames(
+            _tool_argument_events(
+                "Read",
+                {
+                    "file_path": "/tmp/example.py",
+                    "offset": "",
+                    "limit": "",
+                    "pages": "",
+                },
+            ),
+            tool_schemas=tool_schemas,
+        )
+    )
+
+    assert _streamed_tool_arguments(frames) == {"file_path": "/tmp/example.py"}
+
+
+def test_stream_still_strips_unsupported_worktree_isolation() -> None:
+    tool_schemas = [{
+        "name": "Agent",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "prompt": {"type": "string"},
+                "isolation": {"type": "string"},
+            },
+            "required": ["prompt"],
+        },
+    }]
+
+    frames = __import__("asyncio").run(
+        _collect_stream_frames(
+            _tool_argument_events(
+                "Agent",
+                {"prompt": "inspect this", "isolation": "worktree"},
+            ),
+            tool_schemas=tool_schemas,
+        )
+    )
+
+    assert _streamed_tool_arguments(frames) == {"prompt": "inspect this"}
 
 
 def test_stream_reports_cached_and_uncached_input_tokens() -> None:
