@@ -43,6 +43,7 @@ from agent_bridge.events import AgentEvent, AgentEventKind, synthesize_event_id
 from agent_bridge.publisher import COMMANDS_STREAM, RedisPublisher
 from agent_bridge.session_queue import SessionQueue
 from claude_code_bridge.tool_events import normalize_tool_result
+from claude_code_bridge.tool_policy import effective_disallowed_tools
 
 logger = logging.getLogger(__name__)
 
@@ -1098,6 +1099,11 @@ class ClaudeCodeBridge:
         # Anthropic IDs (claude-haiku-4-5-...) that the proxy rejects.
         subagent_model = (fields.get("subagent_model") or "").strip() or None
 
+        # TASK-593: app-resolved, DB-managed base SDK tool policy. Keep the raw
+        # field until proxy routing is known; the pure resolver below decodes it,
+        # falls back safely, and adds proxy-only exclusions.
+        configured_disallowed_tools = fields.get("disallowed_tools")
+
         attachments_raw = fields.get("attachments", "")
         attachments: list[dict] = []
         if attachments_raw:
@@ -1323,23 +1329,14 @@ class ClaudeCodeBridge:
                         and self._model_provider_prefix(model) is not None
                     )
 
-                    # ExitPlanMode is disabled on EVERY turn (TASK-388): plan
-                    # mode auto-approves silently under bypassPermissions, so the
-                    # plan never reaches the BawtHub user. Product direction is to
-                    # steer planning to the observable Tasks system (see the
-                    # agent_global_prompt), so we remove the harness plan tool
-                    # outright rather than build a plan-approval pipeline.
-                    disallowed_tools = ["ExitPlanMode"]
-                    # The CLI's WebSearch/WebFetch are Anthropic *server-side*
-                    # tools — they only execute against api.anthropic.com. On the
-                    # proxy path (grok/openai) they collapse into parameter-less
-                    # function stubs the upstream can't run, so the tool_use hangs
-                    # with no result (verified: TOOLMAP start, no end). Disable
-                    # them for proxied turns; those bots get local web coverage
-                    # via the bawthub `web_search` MCP tool + crawl4ai fetch
-                    # instead. Anthropic-direct bots keep native server search.
-                    if use_proxy:
-                        disallowed_tools += ["WebSearch", "WebFetch"]
+                    # TASK-593: the app resolves the DB-managed base list on each
+                    # dispatch. Normalize again at this trust boundary and preserve
+                    # the proxy transport rule: Anthropic server-side WebSearch /
+                    # WebFetch cannot execute through non-Anthropic upstreams.
+                    disallowed_tools = effective_disallowed_tools(
+                        configured_disallowed_tools,
+                        use_proxy=use_proxy,
+                    )
 
                     sdk_env = {}
                     # Force Task/Agent subagents to run SYNCHRONOUSLY. CLI 2.1.x

@@ -206,6 +206,11 @@ class AgentBridgeBackend(AgentBackend):
                                 str(config.get("subagent_model")).strip()
                                 if config.get("subagent_model") else None
                             ),
+                            disallowed_tools=(
+                                config.get("disallowed_tools")
+                                if isinstance(config.get("disallowed_tools"), list)
+                                else None
+                            ),
                             inject_messages=config.get("inject_messages"),
                         )
                         logger.info(

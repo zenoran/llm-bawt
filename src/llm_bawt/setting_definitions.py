@@ -29,7 +29,7 @@ class SettingDefinition:
     """One typed setting."""
 
     key: str
-    type: str  # "bool" | "int" | "float" | "str"
+    type: str  # "bool" | "int" | "float" | "str" | "string_list"
     default: object
     applies_to: tuple[str, ...]  # bot types this setting affects
     storage: str
@@ -109,6 +109,24 @@ SETTING_DEFINITIONS: dict[str, SettingDefinition] = {
             "task system (observable) instead of the harness plan mode. Resolves "
             "global-then-bot, so a global=true baseline applies to every agent bot "
             "unless a bot overrides it. Chat bots never see it (manifest-gated)."
+        ),
+    ),
+    "claude_code_disallowed_tools": SettingDefinition(
+        key="claude_code_disallowed_tools",
+        type="string_list",
+        default=[
+            "EnterPlanMode",
+            "ExitPlanMode",
+            "EnterWorktree",
+            "ExitWorktree",
+        ],
+        applies_to=("agent",),
+        storage=STORAGE_RUNTIME_SETTING,
+        label="Claude Code disabled SDK tools",
+        help=(
+            "Global Claude Code harness policy: tool names withheld from every "
+            "Claude Agent SDK turn. Changes are delivered with the next command; "
+            "proxy turns additionally disable WebSearch and WebFetch."
         ),
     ),
     "timeout_seconds": SettingDefinition(

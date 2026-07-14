@@ -59,6 +59,33 @@ because the local proxy reads ChatGPT OAuth from that file.
 | `CLAUDE_CODE_APPROVAL_BUNDLE_TTL` | `15` | Approval-policy bundle cache TTL |
 | `CLAUDE_CODE_APPROVAL_FAIL_CLOSED` | unset | Fail closed if policy fetch breaks |
 
+## SDK tool policy
+
+The global runtime setting `claude_code_disallowed_tools` controls the base
+`ClaudeAgentOptions.disallowed_tools` list. Its code default disables the
+harness-only planning and worktree workflows:
+
+```json
+[
+  "EnterPlanMode",
+  "ExitPlanMode",
+  "EnterWorktree",
+  "ExitWorktree"
+]
+```
+
+The app resolves this setting on every Claude Code dispatch and includes it in
+the Redis command, so an operator edit takes effect on the **next turn** without
+another restart. Proxy-routed turns always add `WebSearch` and `WebFetch`
+because those Anthropic server-side tools cannot execute through a non-Anthropic
+upstream. An explicit empty list enables every base SDK tool while retaining
+those two proxy transport exclusions.
+
+Manage it in BawtHub under **Tools → Settings → Defaults & Tuning → Global**, or
+through `PUT /v1/settings` with a JSON array of tool-name strings. The policy
+normalizer trims names, removes duplicates, and safely falls back to the defaults
+if a malformed value reaches the bridge.
+
 ## Session behavior
 
 - Session IDs are bridge-managed and persisted on the bot profile.

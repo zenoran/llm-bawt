@@ -151,6 +151,7 @@ class RedisSubscriber:
         effort: str | None = None,
         max_turns: int | None = None,
         subagent_model: str | None = None,
+        disallowed_tools: list[str] | None = None,
         inject_messages: list | None = None,
     ) -> None:
         """Publish a chat.send command to the bridge's command stream.
@@ -167,12 +168,13 @@ class RedisSubscriber:
         bucket activity under the originating user message without relying
         on the brittle ``turn_id`` / ``activeStreamMessageId`` fallback chain.
 
-        ``effort`` and ``max_turns`` (per-bot ClaudeAgentOptions tuning):
-        forwarded as-is to bridges that understand them. Today only
-        claude-code-bridge consumes them — codex/openclaw silently ignore.
+        ``effort``, ``max_turns``, and ``disallowed_tools`` are Claude SDK
+        options forwarded to bridges that understand them. Today only the
+        claude-code bridge consumes them; codex/openclaw silently ignore them.
         ``effort`` must be one of {"low","medium","high","xhigh","max"}
-        (validated at the bridge); ``max_turns`` caps the agent loop
-        length per dispatch.
+        (validated at the bridge); ``max_turns`` caps the agent loop; the tool
+        policy is JSON-encoded so an explicit empty list remains distinguishable
+        from an absent field.
         """
         fields: dict = {
             "action": "chat.send",
@@ -198,6 +200,10 @@ class RedisSubscriber:
             fields["max_turns"] = str(max_turns)
         if subagent_model:
             fields["subagent_model"] = subagent_model
+        if disallowed_tools is not None:
+            fields["disallowed_tools"] = json.dumps(
+                disallowed_tools, ensure_ascii=False
+            )
         if inject_messages:
             fields["inject_messages"] = json.dumps(inject_messages, ensure_ascii=False)
         await self._pub_redis.xadd(

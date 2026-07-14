@@ -9,7 +9,7 @@ Haiku calls and subagent model resolution use a provider-qualified model.
 
 from __future__ import annotations
 
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock
 
 import pytest
 
@@ -57,7 +57,6 @@ class TestSubscriberForwardsSubagentModel:
         from agent_bridge.subscriber import RedisSubscriber
         sub = RedisSubscriber("redis://localhost:6379/0")
         sub._pub_redis = MagicMock()
-        sub._pub_redis.xadd = MagicMock(return_value=asyncio.coroutine(lambda *a, **kw: None)())  # type: ignore
 
         captured_fields: dict = {}
 

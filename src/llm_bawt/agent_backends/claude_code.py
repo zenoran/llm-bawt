@@ -13,6 +13,11 @@ from __future__ import annotations
 from collections.abc import Iterator
 from typing import Any
 
+from claude_code_bridge.tool_policy import (
+    CLAUDE_CODE_DISALLOWED_TOOLS_KEY,
+    configured_disallowed_tools,
+)
+
 from .agent_bridge import AgentBridgeBackend
 
 
@@ -69,7 +74,21 @@ class ClaudeCodeBackend(AgentBridgeBackend):
             model_block = RUNTIME_CONTEXT_TEMPLATE.format(model=model)
         augmented_sp = f"{model_block}\n\n{sp}" if sp else model_block
 
-        augmented_config = {**config, "system_prompt": augmented_sp}
+        # Resolve this system-wide policy at dispatch time so DB edits apply to
+        # the next command without teaching the long-running bridge to poll the
+        # app. A resolver with no bot deliberately ignores bot-scoped rows.
+        from ..runtime_setting_resolution import resolve_global_runtime_setting
+
+        configured = resolve_global_runtime_setting(
+            self._config,
+            CLAUDE_CODE_DISALLOWED_TOOLS_KEY,
+        )
+        disallowed_tools = configured_disallowed_tools(configured)
+        augmented_config = {
+            **config,
+            "system_prompt": augmented_sp,
+            "disallowed_tools": disallowed_tools,
+        }
         return super().stream_raw(
             prompt,
             augmented_config,
