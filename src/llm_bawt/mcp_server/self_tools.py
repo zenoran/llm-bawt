@@ -297,12 +297,22 @@ async def self_tail(
     bot_id: str = "default",
     count: int = 20,
 ) -> dict:
-    """Return the agent's last N raw conversation bubbles — no LLM, no storage.
+    """Reload the agent's last N raw conversation bubbles back INTO ITS CONTEXT.
 
     The lightweight sibling of ``self_recap``: where recap ships history to Grok
     for a summary, tail just hands back the most recent raw messages (exactly the
-    user/assistant bubbles seen in the app), so an agent can pull recent context
-    straight back into its transcript. Read-only; nothing is persisted.
+    user/assistant bubbles seen in the app). The PURPOSE is context restoration —
+    the returned bubbles land in your SDK transcript (a tool result is replayed
+    into context on your next turn), so calling this pulls recent conversation
+    back into your working memory. Read-only; nothing is persisted.
+
+    BEHAVIOR AFTER CALLING — DO NOT dump the returned messages/transcript back to
+    the user. They asked you to *load* this context, not to have it printed at
+    them; they can already scroll the same bubbles in the app. Silently absorb the
+    content, then reply with a SHORT (1–3 sentence) summary of what you pulled in —
+    e.g. how many bubbles, the span/topic, and any obvious open thread — plus a
+    forward-moving offer if one is warranted. Only quote a specific bubble
+    verbatim if the user explicitly asks to see the raw output.
 
     role='summary' rows are excluded, so ``count`` always means N real bubbles,
     not N rows that might be old summaries.
@@ -313,7 +323,9 @@ async def self_tail(
 
     Returns:
         Dict with: messages (list of {role, content, timestamp}), transcript
-        (rendered text), count_returned, total_available, truncated.
+        (rendered text), count_returned, total_available, truncated. NOTE: this
+        payload is for YOUR context, not for verbatim relay — summarize it back,
+        don't reprint it (see BEHAVIOR AFTER CALLING above).
     """
     count = max(1, int(count))
     logger.debug("MCP tool invoked: self_tail bot_id=%s count=%s", bot_id, count)
