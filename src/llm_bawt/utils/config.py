@@ -472,37 +472,41 @@ class Config(RuntimeTunables, BaseSettings):
     def get_model_context_window(self, model_alias: str | None = None) -> int:
         """Get the effective context window for a model.
 
-        Resolution order:
-        1. Per-model `context_window` in model definition
-        2. Global LLAMA_CPP_N_CTX (for GGUF) or 128000 (for OpenAI)
-        3. Hardcoded default: 32768
+        Resolution order (TASK-602 — model-driven, no type-based guessing, no env):
+        1. Per-model catalog `context_window` (model_endpoints.context_window_override
+           -> models.default_context_window, surfaced by resolve_model()).
+        2. The global ``model_context_window_default`` runtime setting (global
+           runtime_settings row -> its declared default in SETTING_DEFINITIONS).
 
-        Note: For GGUF models with VRAM auto-sizing, this is only the
-        static fallback. The full auto-sizing logic lives in utils/vram.py
-        and runs at model load time.
+        The catalog is the source of truth for per-model windows; the global
+        default only catches models whose catalog window is NULL. There is NO
+        type allow-list and NO LLAMA_CPP_N_CTX fallback here — LLAMA_CPP_N_CTX is
+        a *local GGUF inference* knob (utils/vram.py at load time), not the
+        general model window, and folding it in here is exactly what starved
+        claude-code bots (8192 window -> 4096 budget -> zero summaries).
         """
         model_def = self.resolve_model(model_alias or "", default={})
         def_val = model_def.get("context_window")
         if def_val is not None:
             return int(def_val)
-        model_type = model_def.get("type", "")
-        if model_type in ("openai", "grok", "agent_backend"):
-            return 128000
-        return self.LLAMA_CPP_N_CTX or 32768
+        from ..runtime_setting_resolution import resolve_global_runtime_setting
+        return int(resolve_global_runtime_setting(self, "model_context_window_default") or 128000)
 
     def get_model_max_tokens(self, model_alias: str | None = None) -> int:
         """Get the effective max output tokens for a model.
 
-        Resolution order:
-        1. Per-model `max_tokens` in model definition
-        2. Global MAX_OUTPUT_TOKENS config
-        3. Hardcoded default: 4096
+        Resolution order (TASK-602 — settings-driven, no env):
+        1. Per-model catalog `max_tokens`.
+        2. The global ``max_output_tokens`` runtime setting (global
+           runtime_settings row -> its declared default). Retires the direct
+           read of the ``MAX_OUTPUT_TOKENS`` BaseSettings env field.
         """
         model_def = self.resolve_model(model_alias or "", default={})
         def_val = model_def.get("max_tokens")
         if def_val is not None:
             return int(def_val)
-        return self.MAX_OUTPUT_TOKENS or 4096
+        from ..runtime_setting_resolution import resolve_global_runtime_setting
+        return int(resolve_global_runtime_setting(self, "max_output_tokens") or 4096)
 
     def get_model_n_gpu_layers(self, model_alias: str | None = None) -> int:
         """Get the effective n_gpu_layers for a model.

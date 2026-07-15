@@ -261,6 +261,42 @@ SETTING_DEFINITIONS: dict[str, SettingDefinition] = {
         legacy_keys=("subagent_model",),
         ui_widget="model",
     ),
+    # --- context window / output budget (TASK-602: retire env fallbacks) -------
+    # These are resolved at GLOBAL scope via resolve_global_runtime_setting()
+    # (global runtime_settings row -> this declared default), NEVER from a Config
+    # BaseSettings env field. Same pattern resolve_job_model() used to retire the
+    # SUMMARIZATION_MODEL / EXTRACTION_MODEL env vars.
+    "model_context_window_default": SettingDefinition(
+        key="model_context_window_default",
+        type="int",
+        default=128000,
+        applies_to=BOT_TYPES_ALL,
+        storage=STORAGE_RUNTIME_SETTING,
+        label="Default model context window",
+        help=(
+            "Fallback context window (tokens) used ONLY when a model has no "
+            "per-model window in the catalog (models.default_context_window / "
+            "model_endpoints.context_window_override). The catalog is the source "
+            "of truth for per-model windows; this global default just catches "
+            "NULLs. Not a per-model or per-bot value — set the window on the "
+            "model in the catalog instead."
+        ),
+    ),
+    "max_output_tokens": SettingDefinition(
+        key="max_output_tokens",
+        type="int",
+        default=4096,
+        applies_to=BOT_TYPES_ALL,
+        storage=STORAGE_RUNTIME_SETTING,
+        label="Max output tokens",
+        help=(
+            "Max tokens the model may generate per reply. Also subtracted from "
+            "the resolved context window to derive the context token budget "
+            "(budget = window - max_output). Retires the LLM_BAWT_MAX_OUTPUT_TOKENS "
+            "env var."
+        ),
+        legacy_keys=("max_output_tokens",),
+    ),
 }
 
 
