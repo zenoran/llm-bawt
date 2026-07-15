@@ -119,24 +119,58 @@ def _split_leading_temporal_context(system_text: str | None) -> tuple[str | None
     return stable or None, temporal or None
 
 
-def _user_content_to_responses(content: Any) -> tuple[list[dict], list[dict]]:
-    """Split a user-role content payload into (regular content parts, tool_result items).
+def _image_block_to_input_image(block: dict) -> dict | None:
+    """Anthropic image block → Responses ``input_image`` part (or ``None``).
+
+    Handles both base64 (``{source:{type:base64, media_type, data}}``) and URL
+    (``{source:{type:url, url}}``) sources. Shared by the plain user-image path
+    and the tool_result-image path so the two never drift.
+    """
+    src = block.get("source") or {}
+    stype = src.get("type")
+    if stype == "base64":
+        data = src.get("data") or ""
+        if not data:
+            return None
+        media = src.get("media_type") or "image/png"
+        return {
+            "type": "input_image",
+            "image_url": f"data:{media};base64,{data}",
+            "detail": "auto",
+        }
+    if stype == "url":
+        url = src.get("url") or ""
+        if not url:
+            return None
+        return {"type": "input_image", "image_url": url, "detail": "auto"}
+    return None
+
+
+def _user_content_to_responses(content: Any) -> tuple[list[dict], list[dict], list[dict]]:
+    """Split a user-role content payload into (parts, tool_result items, followup images).
 
     Anthropic packs tool_result blocks inside a user message; Responses API
     breaks them out as separate ``function_call_output`` input items. So a
     single Anthropic user message can produce 0–1 user content items + N
     function_call_output items.
+
+    A ``function_call_output.output`` MUST be a plain string, so an image
+    returned *inside* a tool_result (e.g. the ``generate_image`` tool) cannot
+    ride in it. Such images are collected into the third return value so the
+    caller can re-surface them as a trailing user ``input_image`` message — the
+    only way a Responses-API model actually SEES a tool-generated image.
     """
     parts: list[dict] = []
     tool_results: list[dict] = []
+    followup_images: list[dict] = []
 
     if isinstance(content, str):
         if content:
             parts.append({"type": "input_text", "text": content})
-        return parts, tool_results
+        return parts, tool_results, followup_images
 
     if not isinstance(content, list):
-        return parts, tool_results
+        return parts, tool_results, followup_images
 
     for block in content:
         if not isinstance(block, dict):
@@ -147,36 +181,38 @@ def _user_content_to_responses(content: Any) -> tuple[list[dict], list[dict]]:
             if txt:
                 parts.append({"type": "input_text", "text": txt})
         elif btype == "image":
-            # Anthropic image block: {source: {type, media_type, data}} (base64)
-            #                       or {source: {type:"url", url}} (newer API)
-            src = block.get("source") or {}
-            if src.get("type") == "base64":
-                data = src.get("data") or ""
-                media = src.get("media_type") or "image/png"
-                if data:
-                    parts.append({
-                        "type": "input_image",
-                        "image_url": f"data:{media};base64,{data}",
-                        "detail": "auto",
-                    })
-            elif src.get("type") == "url":
-                url = src.get("url") or ""
-                if url:
-                    parts.append({"type": "input_image", "image_url": url, "detail": "auto"})
+            img = _image_block_to_input_image(block)
+            if img:
+                parts.append(img)
         elif btype == "tool_result":
             call_id = block.get("tool_use_id") or ""
-            # tool_result.content can be a string OR list of content blocks
-            # (text/image). Responses API expects a string output, so we
-            # flatten text content and drop images (rare in practice).
+            # tool_result.content can be a string OR a list of content blocks
+            # (text/image). A Responses ``function_call_output.output`` must be
+            # a STRING, so we flatten the text here and pull any image blocks
+            # OUT into ``followup_images`` — the caller re-surfaces them as a
+            # trailing user input_image message so the model can see them.
             raw = block.get("content")
             if isinstance(raw, str):
                 output = raw
             elif isinstance(raw, list):
                 chunks: list[str] = []
+                block_imgs: list[dict] = []
                 for sub in raw:
-                    if isinstance(sub, dict) and sub.get("type") == "text":
+                    if not isinstance(sub, dict):
+                        continue
+                    stype = sub.get("type")
+                    if stype == "text":
                         chunks.append(sub.get("text") or "")
+                    elif stype == "image":
+                        img = _image_block_to_input_image(sub)
+                        if img:
+                            block_imgs.append(img)
                 output = "\n".join(chunks)
+                # If only an image came back, give the output a non-empty note
+                # so the model knows an image accompanies this tool result.
+                if block_imgs and not output.strip():
+                    output = "[image returned by tool — shown in the following message]"
+                followup_images.extend(block_imgs)
             else:
                 output = ""
             tool_results.append({
@@ -185,7 +221,7 @@ def _user_content_to_responses(content: Any) -> tuple[list[dict], list[dict]]:
                 "output": output,
             })
 
-    return parts, tool_results
+    return parts, tool_results, followup_images
 
 
 def _assistant_content_to_responses(content: Any) -> list[dict]:
@@ -316,7 +352,7 @@ def anthropic_to_responses(body: dict, upstream_model: str) -> dict:
         content = msg.get("content")
 
         if role == "user":
-            parts, tool_results = _user_content_to_responses(content)
+            parts, tool_results, followup_images = _user_content_to_responses(content)
             if temporal_prefix and not temporal_prefix_attached:
                 parts = [{"type": "input_text", "text": temporal_prefix}, *parts]
                 temporal_prefix_attached = True
@@ -325,6 +361,19 @@ def anthropic_to_responses(body: dict, upstream_model: str) -> dict:
                 # take the list directly.
                 input_items.append({"role": "user", "content": parts})
             input_items.extend(tool_results)
+            # Images returned inside a tool_result can't ride in a
+            # function_call_output (its output must be a string), so surface
+            # them as a trailing user image message right after the tool
+            # outputs. This is what lets the model actually SEE a tool-generated
+            # image (e.g. generate_image) and iterate on it.
+            if followup_images:
+                input_items.append({
+                    "role": "user",
+                    "content": [
+                        {"type": "input_text", "text": "Image(s) returned by the tool call above:"},
+                        *followup_images,
+                    ],
+                })
         elif role == "assistant":
             input_items.extend(_assistant_content_to_responses(content))
         else:

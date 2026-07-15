@@ -11,6 +11,7 @@ FROM python:3.12-slim
 #   sys/proc:   procps iproute2 less tree htop
 #   net debug:  dnsutils iputils-ping netcat-openbsd rsync
 #   archives:   unzip zip xz-utils
+#   binary/file: file xxd (file type ID + hex dump for image/binary inspect)
 #   build:      make shellcheck nodejs npm
 #   editors:    vim
 #   viewers:    bat (installed as batcat on Debian; symlinked to bat below)
@@ -24,6 +25,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     procps iproute2 less tree htop \
     dnsutils iputils-ping netcat-openbsd rsync \
     unzip zip xz-utils \
+    file xxd \
     make shellcheck nodejs npm \
     vim \
     bat \
@@ -98,7 +100,8 @@ RUN uv venv && uv pip install \
     "openai>=1.69.0" \
     "fastapi>=0.109.0" \
     "uvicorn>=0.27.0" \
-    "pydantic>=2.0"
+    "pydantic>=2.0" \
+    "Pillow>=10.0.0"
 
 # Live Codex model discovery (codex.models()) for the /models health-server route.
 # Separate layer + --prerelease=allow because openai-codex (beta) pulls the

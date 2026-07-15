@@ -1878,7 +1878,7 @@ class ClaudeCodeBridge:
                                         # it exists (TASK-483), instead of only in the
                                         # end-of-turn grid.
                                         tool_end_attachments: list[dict] | None = None
-                                        if isinstance(result_content, list) and self._is_screenshot_tool(
+                                        if isinstance(result_content, list) and self._is_image_result_tool(
                                             tool_names_by_id.get(block.tool_use_id or "")
                                         ):
                                             try:
@@ -3216,12 +3216,20 @@ class ClaudeCodeBridge:
 
     # ----- Screenshot persistence (Playwright -> media store) -----
 
-    @staticmethod
-    def _is_screenshot_tool(tool_name: str | None) -> bool:
-        """True for the Playwright MCP screenshot tool (namespaced or bare)."""
+    #: Tool tails whose image-bearing results we persist to the media store so
+    #: the app can attach them to the reply (browsable per turn + inline card).
+    #: - browser_take_screenshot: Playwright screenshots.
+    #: - generate_image: Grok Imagine output (TASK-599). The tool already stored
+    #:   the identical raw bytes, so this re-upload dedups to the same asset.
+    _IMAGE_RESULT_TOOL_TAILS = frozenset({"browser_take_screenshot", "generate_image"})
+
+    @classmethod
+    def _is_image_result_tool(cls, tool_name: str | None) -> bool:
+        """True for tools whose result carries an image we should persist
+        (namespaced ``mcp__x__name`` or bare)."""
         if not tool_name:
             return False
-        return tool_name.split("__")[-1] == "browser_take_screenshot"
+        return tool_name.split("__")[-1] in cls._IMAGE_RESULT_TOOL_TAILS
 
     @staticmethod
     def _extract_image_block(block: object) -> tuple[str, str] | None:
@@ -3283,7 +3291,7 @@ class ClaudeCodeBridge:
                     headers={"X-Entity-Id": user_id},
                     json={
                         "data_url": data_url,
-                        "filename": f"screenshot-{tool_use_id or 'shot'}.png",
+                        "filename": f"image-{tool_use_id or 'shot'}.png",
                     },
                 )
                 if resp.status_code >= 400:
