@@ -294,7 +294,7 @@ class HistoryManager:
 
         return "\n".join(compact_lines).strip()
 
-    def get_context_messages(self, max_tokens: int = 0):
+    def get_context_messages(self, max_tokens: int = 0, charge_system: bool = True):
         """Assemble LLM context under Nick's strict allocation ladder (TASK-612).
 
         Fill order, highest priority first:
@@ -325,6 +325,14 @@ class HistoryManager:
         Args:
             max_tokens: physical prompt budget (Tier-2 ``resolve_context_budget``).
                         0 = no budget (return everything, back-compat).
+            charge_system: whether system rows consume the budget. True for
+                        inline (chat) delivery — system is sent in the request
+                        window. False for seed delivery (TASK-613): the seed
+                        strips system rows (the SDK carries its own byte-stable
+                        system prompt), so they must NOT reserve seed tokens and
+                        cannot trigger the system-over-budget hard-fail. System
+                        rows are still returned/separated either way; only the
+                        budgeting differs.
         """
         system_messages = []
         summary_messages = []
@@ -366,11 +374,15 @@ class HistoryManager:
 
         # ── Allocation ladder ─────────────────────────────────────
         budget = max_tokens
-        system_cost = estimate_messages_tokens(system_messages)
+        # System rows only consume the budget when they will actually be
+        # delivered (inline chat). Seed delivery strips them, so a seed spends
+        # its whole budget on the delivered summary+raw content (TASK-613).
+        system_cost = estimate_messages_tokens(system_messages) if charge_system else 0
 
-        # (1) System is non-negotiable. System-alone-over-budget is the one
-        #     unrecoverable state — fail loudly instead of truncating it.
-        if system_cost > budget:
+        # (1) System is non-negotiable when delivered. System-alone-over-budget
+        #     is the one unrecoverable state — fail loudly instead of truncating
+        #     it. Not applicable to seeds (system isn't delivered).
+        if charge_system and system_cost > budget:
             raise ContextBudgetError(
                 f"System prompt ({system_cost} tokens) exceeds the prompt budget "
                 f"({budget} tokens) for bot {self.bot_id!r}. Raise the model "
@@ -493,8 +505,13 @@ class HistoryManager:
             delivery: "inline" (chat) or "seed" (agent) — documentary only.
             max_tokens: token budget passed through to ``get_context_messages``.
         """
+        # TASK-613: seed delivery strips system rows (the SDK carries its own
+        # system prompt), so they must not consume the seed's token budget.
+        # Inline (chat) delivers system in the request window, so it does.
         payload = ContextPayload()
-        for msg in self.get_context_messages(max_tokens=max_tokens):
+        for msg in self.get_context_messages(
+            max_tokens=max_tokens, charge_system=(delivery != "seed")
+        ):
             role = getattr(msg, "role", "")
             if role == "summary":
                 if include_summaries:

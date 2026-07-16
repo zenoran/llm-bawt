@@ -143,3 +143,55 @@ def test_newest_turn_over_physical_budget_degrades_without_raising() -> None:
 
     assert any(m.role == "system" for m in context)
     assert not [m for m in context if m.role in ("user", "assistant")]
+
+
+# ── TASK-613: seed delivery must not charge stripped system rows ──
+
+
+def _uniform(n: int, content: str = "aaaaa"):
+    # each message estimates to len//4+4 = 5 tokens; "system" is also 5 tokens
+    return [
+        Message("user" if i % 2 else "assistant", content, timestamp=float(i))
+        for i in range(1, n + 1)
+    ]
+
+
+def test_seed_delivery_does_not_reserve_system_tokens() -> None:
+    # budget=15, system=5 tokens, messages=5 tokens each, history_tokens huge.
+    # charge_system=True (inline): headroom 15-5=10 -> 2 msgs.
+    # charge_system=False (seed):  headroom 15     -> 3 msgs.
+    history = _history(_getter({"history_tokens": 1000, "summary_count": 5}))
+    history.messages = _uniform(20)
+
+    inline = history.get_context_messages(max_tokens=15, charge_system=True)
+    seed = history.get_context_messages(max_tokens=15, charge_system=False)
+
+    assert len([m for m in inline if m.role in ("user", "assistant")]) == 2
+    assert len([m for m in seed if m.role in ("user", "assistant")]) == 3
+
+
+def test_build_context_payload_seed_vs_inline_accounting() -> None:
+    history = _history(_getter({"history_tokens": 1000, "summary_count": 5}))
+    history.messages = _uniform(20)
+
+    inline = history.build_context_payload(delivery="inline", max_tokens=15)
+    seed = history.build_context_payload(delivery="seed", max_tokens=15)
+
+    # inline charges system -> 2 delivered raw msgs; seed doesn't -> 3
+    assert len(inline.regular_messages) == 2
+    assert len(seed.regular_messages) == 3
+    # seed delivery view carries no system rows
+    assert all(m.role != "system" for m in seed.seed_messages)
+
+
+def test_seed_over_system_budget_does_not_hard_fail() -> None:
+    # budget below system cost: inline hard-fails, seed does not (system stripped)
+    history = _history(_getter({"history_tokens": 1000, "summary_count": 5}))
+    history.messages = _uniform(3)
+
+    with pytest.raises(ContextBudgetError):
+        history.get_context_messages(max_tokens=3, charge_system=True)
+
+    # no raise; system not delivered so it can't overflow the seed budget
+    seed = history.get_context_messages(max_tokens=3, charge_system=False)
+    assert seed is not None
