@@ -414,7 +414,7 @@ class BaseLLMBawt(ABC):
         return {
             "temperature": float(self._resolve_setting("temperature", self.config.TEMPERATURE)),
             "top_p": float(self._resolve_setting("top_p", self.config.TOP_P)),
-            "max_tokens": int(self._resolve_setting("max_output_tokens", self.config.MAX_OUTPUT_TOKENS) or self.config.MAX_OUTPUT_TOKENS),
+            "max_tokens": int(self.config.get_model_max_tokens(getattr(self.client, "model_alias", None))),
         }
     
     def query(self, prompt: str, plaintext_output: bool = False, stream: bool = True) -> str:
@@ -934,16 +934,11 @@ class BaseLLMBawt(ABC):
         # Always include history — two-layer architecture handles context overflow
         max_context_tokens = int(self._resolve_setting("max_context_tokens", getattr(self.config, "MAX_CONTEXT_TOKENS", 0)) or 0)
         if max_context_tokens <= 0 and self.client:
-            ctx_window = getattr(self.client, 'effective_context_window', 0)
-            if ctx_window > 0:
-                max_output = int(
-                    self._resolve_setting(
-                        "max_output_tokens",
-                        getattr(self.client, "effective_max_tokens", 4096),
-                    )
-                    or 4096
-                )
-                max_context_tokens = ctx_window - max_output
+            # TASK-609: the ONE Tier-2 budget authority (was a duplicated
+            # ctx_window - max_output). prompt_budget = window - reserve.
+            _, _, max_context_tokens = self.config.resolve_context_budget(
+                getattr(self.client, "model_alias", None)
+            )
 
         if self._ha_mode:
             # HA-mode: drop summaries, keep only last 6 user/assistant/tool-result msgs.

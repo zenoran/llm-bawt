@@ -493,10 +493,8 @@ class BackgroundTasksMixin:
             # Legacy opt-out: derive the budget from the model context window.
             max_context_tokens = 0
             if model_alias:
-                ctx_window = int(self.config.get_model_context_window(model_alias) or 0)
-                max_output = int(self.config.get_model_max_tokens(model_alias) or 4096)
-                if ctx_window > 0:
-                    max_context_tokens = ctx_window - max_output
+                # TASK-609: single Tier-2 budget authority
+                _, _, max_context_tokens = self.config.resolve_context_budget(model_alias)
 
         summarizer = HistorySummarizer(
             self.config,

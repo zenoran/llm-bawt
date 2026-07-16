@@ -257,7 +257,7 @@ def _collect_model_info(config: Config, model_alias: str) -> ModelStatusInfo | N
     model_def = config.resolve_model(model_alias)
     model_type = model_def.get("type", "unknown")
 
-    effective_max_tokens = model_def.get("max_tokens", config.MAX_OUTPUT_TOKENS)
+    effective_max_tokens = model_def.get("max_tokens", config.get_model_max_tokens(model_alias))
     max_tokens_source = "model" if "max_tokens" in model_def else "global"
 
     info = ModelStatusInfo(
@@ -297,8 +297,10 @@ def _collect_model_info(config: Config, model_alias: str) -> ModelStatusInfo | N
         if ctx_window:
             info.context_window = int(ctx_window)
             info.context_source = "model"
-        elif model_type == "openai":
-            info.context_window = 128_000
+        else:
+            # TASK-609: catalog per-model -> global default (no hardcoded 128000,
+            # no type allow-list) — matches config.get_model_context_window.
+            info.context_window = config.get_model_context_window(model_alias)
             info.context_source = "default"
 
     return info

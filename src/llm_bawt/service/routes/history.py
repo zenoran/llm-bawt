@@ -1514,9 +1514,8 @@ def preview_summarizable_sessions(
 
     try:
         # Compute context budget for budget-driven eligibility
-        ctx_window = int(service.config.get_model_context_window(None) or 0)
-        max_output = int(service.config.get_model_max_tokens(None) or 4096)
-        max_context_tokens = max(0, ctx_window - max_output) if ctx_window > 0 else 0
+        # TASK-609: single Tier-2 budget authority
+        _, _, max_context_tokens = service.config.resolve_context_budget(None)
 
         summarizer = HistorySummarizer(
             service.config,
@@ -1579,9 +1578,8 @@ def summarize_history(
         max_prompt_tokens, max_chunk_tokens_resolved = _resolve_summarization_limits(service, resolved_model)
         if max_chunk_tokens == 0:
             max_chunk_tokens = max_chunk_tokens_resolved
-        ctx_window = int(service.config.get_model_context_window(resolved_model) or 0)
-        max_output = int(service.config.get_model_max_tokens(resolved_model) or 4096)
-        max_context_tokens = max(0, ctx_window - max_output) if ctx_window > 0 else 0
+        # TASK-609: single Tier-2 budget authority
+        _, _, max_context_tokens = service.config.resolve_context_budget(resolved_model)
 
         summarizer = HistorySummarizer(
             service.config,
@@ -1634,9 +1632,8 @@ def rebuild_history_summaries(
         )
         # Compute context budget from model
         resolved_model = model or getattr(service, '_default_model', None)
-        ctx_window = int(service.config.get_model_context_window(resolved_model) or 0)
-        max_output = int(service.config.get_model_max_tokens(resolved_model) or 4096)
-        max_context_tokens = max(0, ctx_window - max_output) if ctx_window > 0 else 0
+        # TASK-609: single Tier-2 budget authority
+        _, _, max_context_tokens = service.config.resolve_context_budget(resolved_model)
 
         summarizer = HistorySummarizer(
             service.config,
@@ -1736,11 +1733,9 @@ def build_context_seed(bot_id: str, model: str | None, service) -> dict:
     # Load fresh so we never serve a stale in-memory transcript.
     llm_bawt.history_manager.load_history()
 
-    # Same budget formula the agent path uses (base.py): context window
-    # minus the output reservation. 0 => no budget (return everything).
-    ctx_window = int(service.config.get_model_context_window(model_alias) or 0)
-    max_output = int(service.config.get_model_max_tokens(model_alias) or 4096)
-    budget = max(0, ctx_window - max_output) if ctx_window > 0 else 0
+    # Same budget the agent path uses (base.py) — the ONE Tier-2 authority.
+    # 0 => no budget (return everything). TASK-609.
+    _, _, budget = service.config.resolve_context_budget(model_alias)
 
     # TASK-493/518: seed content comes from the ONE shared handler
     # (HistoryManager.build_context_payload) — the same function the chat turn

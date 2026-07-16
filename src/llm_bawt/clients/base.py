@@ -31,22 +31,26 @@ class LLMClient(ABC):
 
     @property
     def effective_max_tokens(self) -> int:
-        """Get the effective max output tokens for this client's model."""
-        yaml_val = self.model_definition.get("max_tokens")
-        if yaml_val is not None:
-            return int(yaml_val)
-        return self.config.MAX_OUTPUT_TOKENS or 4096
+        """Model output CAPABILITY for API-request parameterization.
+
+        TASK-609: delegates to the single catalog-driven authority
+        (``config.get_model_max_tokens``). No env read, no type guessing —
+        the catalog per-model ``max_tokens`` -> global ``max_output_tokens``.
+        This is the output cap sent to the model, NOT the budget subtraction
+        (that is ``config.resolve_context_budget``'s reserve).
+        """
+        return self.config.get_model_max_tokens(self.model_alias)
 
     @property
     def effective_context_window(self) -> int:
-        """Get the effective context window for this client's model."""
-        yaml_val = self.model_definition.get("context_window")
-        if yaml_val is not None:
-            return int(yaml_val)
-        model_type = self.model_definition.get("type", "")
-        if model_type in ("openai", "grok"):
-            return 128000
-        return self.config.LLAMA_CPP_N_CTX or 32768
+        """Context ceiling for this client's model, for engine sizing / display.
+
+        TASK-609: delegates to the single catalog-driven authority
+        (``config.get_model_context_window``). No type allow-list, no
+        LLAMA_CPP_N_CTX fallback — catalog per-model window -> global
+        ``model_context_window_default``.
+        """
+        return self.config.get_model_context_window(self.model_alias)
 
     def _format_panel_title(self, style: str = "green", is_service: bool = False) -> str:
         """Format the panel title as 'bot_name [model] (service)'."""

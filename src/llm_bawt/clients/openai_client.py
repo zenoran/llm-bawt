@@ -256,7 +256,7 @@ class OpenAIClient(LLMClient):
         if stop:
             payload["stop"] = stop
 
-        max_tokens = self._as_int(kwargs.get("max_tokens"), self.config.MAX_OUTPUT_TOKENS)
+        max_tokens = self._as_int(kwargs.get("max_tokens"), self.effective_max_tokens)
         token_key = self._initial_token_param_key()
         self._set_token_param(payload, token_key, max_tokens)
 
@@ -301,7 +301,7 @@ class OpenAIClient(LLMClient):
             if tool_choice is not None:
                 payload["tool_choice"] = tool_choice
 
-        max_tokens = self._as_int(kwargs.get("max_tokens"), self.config.MAX_OUTPUT_TOKENS)
+        max_tokens = self._as_int(kwargs.get("max_tokens"), self.effective_max_tokens)
         token_key = self._initial_token_param_key()
         self._set_token_param(payload, token_key, max_tokens)
 
@@ -394,7 +394,7 @@ class OpenAIClient(LLMClient):
         response_format = kwargs.get("response_format")
         if response_format is not None:
             payload["response_format"] = response_format
-        max_tokens = self._as_int(kwargs.get("max_tokens"), self.config.MAX_OUTPUT_TOKENS)
+        max_tokens = self._as_int(kwargs.get("max_tokens"), self.effective_max_tokens)
         token_key = self._initial_token_param_key()
         self._set_token_param(payload, token_key, max_tokens)
 
@@ -452,7 +452,7 @@ class OpenAIClient(LLMClient):
             if tool_choice is not None:
                 payload["tool_choice"] = tool_choice
 
-        max_tokens = self._as_int(kwargs.get("max_tokens"), self.config.MAX_OUTPUT_TOKENS)
+        max_tokens = self._as_int(kwargs.get("max_tokens"), self.effective_max_tokens)
         token_key = self._initial_token_param_key()
         self._set_token_param(payload, token_key, max_tokens)
 

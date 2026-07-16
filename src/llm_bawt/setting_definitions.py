@@ -290,12 +290,30 @@ SETTING_DEFINITIONS: dict[str, SettingDefinition] = {
         storage=STORAGE_RUNTIME_SETTING,
         label="Max output tokens",
         help=(
-            "Max tokens the model may generate per reply. Also subtracted from "
-            "the resolved context window to derive the context token budget "
-            "(budget = window - max_output). Retires the LLM_BAWT_MAX_OUTPUT_TOKENS "
-            "env var."
+            "Model output CAPABILITY — the max tokens the model may generate per "
+            "reply, sent as the API request's output cap. Catalog per-model "
+            "max_tokens overrides this global default. NOTE (TASK-609): this is "
+            "no longer what the prompt budget subtracts — that is the separate "
+            "'request_output_reserve' policy knob. Retires LLM_BAWT_MAX_OUTPUT_TOKENS."
         ),
         legacy_keys=("max_output_tokens",),
+    ),
+    "request_output_reserve": SettingDefinition(
+        key="request_output_reserve",
+        type="int",
+        default=4096,
+        applies_to=(),  # GLOBAL-ONLY (TASK-602 Tier 2): rendered in NO per-bot UI;
+                        # bot overrides impossible. Resolved via
+                        # resolve_global_runtime_setting(), which ignores bot rows.
+        storage=STORAGE_RUNTIME_SETTING,
+        label="Request output reserve",
+        help=(
+            "Tokens held back from the context window for the model's reply. "
+            "prompt_budget = context_window - min(reserve, model max-output capability). "
+            "Global-only infrastructure policy (Tier 2 is not bot-aware); distinct "
+            "from max_output_tokens, which is the model's per-request output cap. "
+            "Default 4096 preserves prior behavior (old max_output_tokens double-duty)."
+        ),
     ),
 }
 

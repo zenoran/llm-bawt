@@ -828,9 +828,9 @@ class HistorySummarizer:
                 self.max_context_tokens = cfg_val
             else:
                 # Auto from model context window — conservative default
-                ctx_window = getattr(config, "get_model_context_window", lambda _: 0)(None)
-                max_output = getattr(config, "MAX_OUTPUT_TOKENS", 4096)
-                self.max_context_tokens = max(0, ctx_window - max_output) if ctx_window > 0 else 0
+                # TASK-609: single Tier-2 budget authority
+                budget_fn = getattr(config, "resolve_context_budget", None)
+                self.max_context_tokens = budget_fn(None)[2] if budget_fn else 0
 
         # Initialize the PostgreSQL backend
         from .postgresql import PostgreSQLMemoryBackend

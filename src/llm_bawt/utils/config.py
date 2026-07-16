@@ -508,6 +508,43 @@ class Config(RuntimeTunables, BaseSettings):
         from ..runtime_setting_resolution import resolve_global_runtime_setting
         return int(resolve_global_runtime_setting(self, "max_output_tokens") or 4096)
 
+    def resolve_context_budget(
+        self, model_alias: str | None = None
+    ) -> tuple[int, int, int]:
+        """THE single Tier-2 budget authority (TASK-602/609).
+
+        Returns ``(context_window, effective_reserve, prompt_budget)``:
+        - ``context_window`` — the model's ceiling (catalog per-model -> global
+          ``model_context_window_default``), via ``get_model_context_window``.
+        - ``effective_reserve`` — ``min(request_output_reserve, model max-output
+          capability)``. The reserve is the centrally configured, GLOBAL-ONLY
+          policy for how much of the window to hold back for the reply; it is
+          bounded by what the model can actually emit.
+        - ``prompt_budget`` — ``max(0, context_window - effective_reserve)`` (0
+          when the window is non-positive). What is left for system prompt +
+          history + memory.
+
+        This is the ONLY place a prompt budget is computed. Every chat, seed,
+        client, and summarization caller routes through it — no duplicated
+        ``window - max_output`` math, no hardcoded/type-based windows, no env
+        fallbacks. ``request_output_reserve`` resolves to its declared default
+        (4096) when no global row exists; bot rows are ignored (global-only).
+        """
+        context_window = self.get_model_context_window(model_alias)
+        max_output_capability = self.get_model_max_tokens(model_alias)
+        from ..runtime_setting_resolution import resolve_global_runtime_setting
+        reserve_setting = int(
+            resolve_global_runtime_setting(self, "request_output_reserve")
+        )
+        effective_reserve = min(reserve_setting, max_output_capability)
+        if context_window <= 0:
+            return (context_window, effective_reserve, 0)
+        return (
+            context_window,
+            effective_reserve,
+            max(0, context_window - effective_reserve),
+        )
+
     def get_model_n_gpu_layers(self, model_alias: str | None = None) -> int:
         """Get the effective n_gpu_layers for a model.
 

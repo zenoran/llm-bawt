@@ -224,14 +224,12 @@ class AgentBackendClient(LLMClient):
         if response:
             yield response
 
-    @property
-    def effective_context_window(self) -> int:
-        """Agent backends manage their own context windows."""
-        return 128_000
-
-    @property
-    def effective_max_tokens(self) -> int:
-        return 16_384
+    # effective_context_window / effective_max_tokens: intentionally NOT
+    # overridden (TASK-609). The old flat 128_000 / 16_384 constants were a
+    # third, model-blind budget authority; all bots are agent bots, so the
+    # chat-turn path always hit them. The base LLMClient properties now delegate
+    # to config.get_model_context_window / get_model_max_tokens (catalog-driven),
+    # giving agent clients the correct per-model window/capability too.
 
     # ------------------------------------------------------------------
     # Tool call helpers (used by background_service streaming path)
