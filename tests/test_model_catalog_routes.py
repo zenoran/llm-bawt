@@ -1,13 +1,29 @@
 import pytest
 from fastapi import HTTPException
+from pydantic import ValidationError
 from unittest.mock import MagicMock
 
 from llm_bawt.service.routes.model_catalog import (
+    ModelWrite,
     _check_endpoint_cas,
     _delete_model_sources,
     _normalized_harness,
     list_harnesses,
 )
+
+
+def test_model_write_requires_positive_context_window():
+    # TASK-616: a windowless model must be rejected at write time so the global
+    # default stays a deliberate fallback, not a substitute for missing data.
+    with pytest.raises(ValidationError):
+        ModelWrite(vendor="xai", display_name="Grok")  # no default_context_window
+    with pytest.raises(ValidationError):
+        ModelWrite(vendor="xai", display_name="Grok", default_context_window=0)
+    with pytest.raises(ValidationError):
+        ModelWrite(vendor="xai", display_name="Grok", default_context_window=-1)
+
+    ok = ModelWrite(vendor="xai", display_name="Grok", default_context_window=1000000)
+    assert ok.default_context_window == 1000000
 
 
 def test_catalog_harnesses_are_driven_by_protocol_compatibility():

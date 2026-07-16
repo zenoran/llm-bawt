@@ -19,7 +19,14 @@ class ModelWrite(BaseModel):
     vendor: str
     display_name: str
     description: str | None = None
-    default_context_window: int | None = Field(default=None, gt=0)
+    # TASK-616: required + positive. The catalog is the source of truth for
+    # per-model context windows; a windowless model silently falls back to the
+    # global default (model_context_window_default), which over-budgets small
+    # local models and under-budgets large cloud ones. Reject at write time so
+    # the global default stays a deliberate fallback, not a substitute for
+    # incomplete catalog data. Enforced in the DB by models_context_window
+    # (NOT NULL + CHECK > 0) in model_catalog_migration.py.
+    default_context_window: int = Field(gt=0)
     default_tool_support: str | None = None
 
 

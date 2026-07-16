@@ -537,6 +537,7 @@ def migrate_model_catalog(engine: Engine, dry_run: bool = False) -> dict[str, An
         conn.execute(text(_CREATE_SCHEMA_SQL))
 
         endpoint_by_alias: dict[str, tuple[int, AccessPathSpec]] = {}
+        skipped_windowless: list[str] = []
         for item in mappings:
             access_id = conn.execute(
                 text("""
@@ -556,6 +557,34 @@ def migrate_model_catalog(engine: Engine, dry_run: bool = False) -> dict[str, An
                     "engine": item.access_path.engine_kind,
                 },
             ).scalar_one()
+            # TASK-616: the models.default_context_window NOT NULL constraint
+            # (applied below) is checked against the VALUES tuple of this
+            # INSERT ... ON CONFLICT *before* the DO UPDATE COALESCE runs, so a
+            # NULL legacy window crashes boot even for an already-backfilled
+            # row. When the legacy source has no window, reuse the model's
+            # current catalog window (keeps the ON CONFLICT metadata refresh and
+            # COALESCE intact). If no window exists anywhere — a genuinely
+            # incomplete new model — skip it loudly rather than bake in a fake
+            # default; the catalog API is the way to add its window.
+            context_window_value = item.context_window_override
+            if context_window_value is None:
+                existing = conn.execute(
+                    text(
+                        "SELECT default_context_window FROM models WHERE key = :key"
+                    ),
+                    {"key": item.model_key},
+                ).fetchone()
+                if existing is None or existing[0] is None:
+                    skipped_windowless.append(item.model_key)
+                    logger.warning(
+                        "Skipping windowless legacy model %r: no context_window. "
+                        "Add it via PUT /v1/models/catalog/models/%s with "
+                        "default_context_window set.",
+                        item.model_key,
+                        item.model_key,
+                    )
+                    continue
+                context_window_value = existing[0]
             model_id = conn.execute(
                 text("""
                 INSERT INTO models
@@ -577,7 +606,7 @@ def migrate_model_catalog(engine: Engine, dry_run: bool = False) -> dict[str, An
                     "vendor": item.model_vendor,
                     "display": item.display_name,
                     "description": item.description,
-                    "context_window": item.context_window_override,
+                    "context_window": context_window_value,
                     "tool_support": item.tool_support_override,
                     "created_at": item.created_at,
                     "updated_at": item.updated_at,
@@ -690,6 +719,57 @@ def migrate_model_catalog(engine: Engine, dry_run: bool = False) -> dict[str, An
             )
             conn.execute(text(_BOT_TRIGGER_SQL))
 
+        # TASK-616: enforce catalog completeness for context windows. The
+        # positive CHECK is always (re)applied (DROP-then-ADD, matching the
+        # bot_profiles pattern above). NOT NULL is only enforced once the table
+        # is clean — an incomplete tenant with leftover NULL windows degrades
+        # gracefully (warn + read-path global-default fallback) instead of
+        # crashing boot. The skip guard above keeps the migration itself from
+        # ever inserting a fresh NULL, so once backfilled this stays enforced.
+        null_windows = conn.execute(
+            text("SELECT COUNT(*) FROM models WHERE default_context_window IS NULL")
+        ).scalar_one()
+        conn.execute(
+            text(
+                "ALTER TABLE models "
+                "DROP CONSTRAINT IF EXISTS models_context_window_positive"
+            )
+        )
+        conn.execute(
+            text(
+                "ALTER TABLE models ADD CONSTRAINT models_context_window_positive "
+                "CHECK (default_context_window > 0)"
+            )
+        )
+        if null_windows:
+            logger.warning(
+                "models: %d row(s) have NULL default_context_window; NOT NULL "
+                "not enforced. Backfill via the catalog API so the window is "
+                "the source of truth, not the global default.",
+                null_windows,
+            )
+        else:
+            already_not_null = conn.execute(
+                text(
+                    "SELECT is_nullable = 'NO' FROM information_schema.columns "
+                    "WHERE table_name = 'models' "
+                    "AND column_name = 'default_context_window'"
+                )
+            ).scalar_one()
+            if not already_not_null:
+                conn.execute(
+                    text(
+                        "ALTER TABLE models "
+                        "ALTER COLUMN default_context_window SET NOT NULL"
+                    )
+                )
+        if skipped_windowless:
+            logger.warning(
+                "Skipped %d windowless legacy model(s): %s",
+                len(skipped_windowless),
+                ", ".join(sorted(skipped_windowless)),
+            )
+
         conn.execute(text(_COMPAT_VIEW_SQL))
         conn.commit()
 
@@ -737,6 +817,8 @@ def migrate_model_catalog(engine: Engine, dry_run: bool = False) -> dict[str, An
         "compat_mismatches": compat_mismatches,
         "gpt_5_6_sol_openai_oauth_endpoints": shared_gpt_endpoint_count,
         "unresolved_bots": unresolved_bots,
+        "null_context_windows": null_windows,
+        "skipped_windowless_models": skipped_windowless,
     }
 
 
