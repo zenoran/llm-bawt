@@ -806,23 +806,16 @@ class HistorySummarizer:
         self.session_gap_seconds = job["session_gap_seconds"]
         self.min_messages_per_session = job["min_messages_per_session"]
         self.protected_recent_turns = int(job["protected_recent_turns"])
-        # Token budget: explicit override > config > auto from model context window
+        # Token budget: explicit override > Tier-2 budget authority. TASK-615:
+        # the legacy max_context_tokens runtime/env read is DELETED (that key
+        # became history_tokens, the Tier-3 raw-bucket cap — a different
+        # concept). The summarizer's overflow budget comes from the ONE Tier-2
+        # authority when the caller doesn't pass one.
         if max_context_tokens > 0:
             self.max_context_tokens = max_context_tokens
         else:
-            cfg_val = int(
-                self._setting(
-                    "max_context_tokens",
-                    getattr(config, "MAX_CONTEXT_TOKENS", 0),
-                ) or 0
-            )
-            if cfg_val > 0:
-                self.max_context_tokens = cfg_val
-            else:
-                # Auto from model context window — conservative default
-                # TASK-609: single Tier-2 budget authority
-                budget_fn = getattr(config, "resolve_context_budget", None)
-                self.max_context_tokens = budget_fn(None)[2] if budget_fn else 0
+            budget_fn = getattr(config, "resolve_context_budget", None)
+            self.max_context_tokens = budget_fn(None)[2] if budget_fn else 0
 
         # Initialize the PostgreSQL backend
         from .postgresql import PostgreSQLMemoryBackend

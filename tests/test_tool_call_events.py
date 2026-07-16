@@ -61,7 +61,6 @@ def test_history_manager_uses_backend_message_id():
         HISTORY_FILE=None,
         SYSTEM_MESSAGE="",
         HISTORY_DURATION_SECONDS=3600,
-        SUMMARIZATION_COMPACT_CONTEXT=True,
     )
     history = HistoryManager(
         client=_DummyClient(),

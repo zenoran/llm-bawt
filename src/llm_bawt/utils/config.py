@@ -101,25 +101,24 @@ class RuntimeTunables(BaseModel):
     """Per-bot runtime tunables — introspectable for help text and field metadata.
 
     These are the settings that can be overridden per-bot via DB or YAML.
-    Runtime settings keys are just the lowercase field name (e.g. MAX_OUTPUT_TOKENS -> max_output_tokens).
+    Runtime settings keys are just the lowercase field name (e.g. MEMORY_N_RESULTS -> memory_n_results).
     """
 
     # --- Context & History --- #
-    MAX_CONTEXT_TOKENS: int = Field(default=0, description="Total token budget for the prompt (system + history + memory). 0 = auto from model context window.")
+    # TASK-615 clean break: the legacy context/summarization env fields are
+    # DELETED, not aliased. Canonical replacements (all DB/registry-resolved,
+    # no env): MAX_CONTEXT_TOKENS -> history_tokens (Tier-3 raw-bucket cap;
+    # the total budget is Tier-2 resolve_context_budget). MAX_OUTPUT_TOKENS ->
+    # the max_output_tokens runtime setting. SUMMARIZATION_SESSION_GAP_SECONDS/
+    # _MIN_MESSAGES_PER_SESSION/_TRIGGER_TOKENS -> the Tier-1 summarization_job
+    # dict. SUMMARIZATION_MAX_IN_CONTEXT -> summary_count. SUMMARIZATION_
+    # COMPACT_CONTEXT -> compact_context. MEMORY_PROTECTED_RECENT_TURNS ->
+    # summarization_job.protected_recent_turns.
     MAX_CONTEXT_MESSAGES: int = Field(default=0, description="Max raw history messages to include in prompt context. 0 = no message-count cap.")
-    MAX_OUTPUT_TOKENS: int = Field(default=1024 * 4, description="Max tokens the model may generate per reply")
     HISTORY_RELOAD_TTL_SECONDS: float = Field(default=2.0, description="How long service history cache stays fresh before reloading from DB (0 = every request)")
-
-    # --- Summarization (budget-driven) --- #
-    SUMMARIZATION_SESSION_GAP_SECONDS: int = Field(default=3600, description="Gap (seconds) between messages that splits history into separate sessions (3600 = 1 hr)")
-    SUMMARIZATION_MIN_MESSAGES_PER_SESSION: int = Field(default=2, description="Minimum messages in a session for it to be summarizable")
-    SUMMARIZATION_TRIGGER_TOKENS: int = Field(default=12000, description="How much recent raw conversation to keep verbatim before older sessions are folded into summaries. This is the summarization TRIGGER budget, NOT the chat model's full context window. 0 = fall back to the model's context window (legacy behavior; effectively disables summarization for large-context models).")
-    SUMMARIZATION_MAX_IN_CONTEXT: int = Field(default=5, description="Max past session summaries injected into the prompt")
-    SUMMARIZATION_COMPACT_CONTEXT: bool = Field(default=True, description="Use shorter summary representations in the prompt to save tokens")
 
     # --- Memory Retrieval --- #
     MEMORY_N_RESULTS: int = Field(default=10, description="Semantic-memory results to retrieve on cold start")
-    MEMORY_PROTECTED_RECENT_TURNS: int = Field(default=3, description="Recent conversation turns shielded from eviction when trimming context")
     MEMORY_MIN_RELEVANCE: float = Field(default=0.01, description="Minimum cosine-similarity score for a memory hit to be included (0.0-1.0)")
     MEMORY_MAX_TOKEN_PERCENT: int = Field(default=30, description="Max percentage of context budget that memory results may occupy (0-100)")
     MEMORY_DEDUP_SIMILARITY: float = Field(default=0.85, description="Similarity threshold for deduplicating near-identical memory hits (0.0-1.0)")

@@ -715,12 +715,18 @@ class BaseLLMBawt(ABC):
                 "gate": md.get("gate", "unknown"),
             })
 
-        # Curated runtime settings with provenance.
+        # Curated runtime settings with provenance. TASK-615: canonical keys
+        # with registry defaults as fallbacks — the retired env fields
+        # (MAX_OUTPUT_TOKENS / MAX_CONTEXT_TOKENS) are deleted; history_tokens
+        # is the Tier-3 raw-bucket cap that replaced max_context_tokens.
+        from ..setting_definitions import setting_default
+
         setting_keys = [
             ("temperature", self.config.TEMPERATURE),
             ("top_p", self.config.TOP_P),
-            ("max_output_tokens", self.config.MAX_OUTPUT_TOKENS),
-            ("max_context_tokens", getattr(self.config, "MAX_CONTEXT_TOKENS", 0)),
+            ("max_output_tokens", setting_default("max_output_tokens", 4096)),
+            ("history_tokens", setting_default("history_tokens", 12000)),
+            ("summary_count", setting_default("summary_count", 5)),
             ("memory_n_results", 3),
             ("memory_min_relevance", getattr(self.config, "MEMORY_MIN_RELEVANCE", None)),
             ("agent_global_prompt_enabled", False),
@@ -931,11 +937,13 @@ class BaseLLMBawt(ABC):
             messages.append(Message(role="user", content=user_content))
             return messages
 
-        # Always include history — two-layer architecture handles context overflow
-        max_context_tokens = int(self._resolve_setting("max_context_tokens", getattr(self.config, "MAX_CONTEXT_TOKENS", 0)) or 0)
-        if max_context_tokens <= 0 and self.client:
-            # TASK-609: the ONE Tier-2 budget authority (was a duplicated
-            # ctx_window - max_output). prompt_budget = window - reserve.
+        # Always include history — two-layer architecture handles context overflow.
+        # TASK-615: the legacy max_context_tokens total-budget override is GONE
+        # (that key was renamed to history_tokens with a different meaning: the
+        # Tier-3 raw-bucket cap, applied inside the assembler ladder). The total
+        # prompt budget has exactly one source: Tier-2 resolve_context_budget.
+        max_context_tokens = 0
+        if self.client:
             _, _, max_context_tokens = self.config.resolve_context_budget(
                 getattr(self.client, "model_alias", None)
             )

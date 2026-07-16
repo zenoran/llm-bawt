@@ -26,9 +26,6 @@ def _history(settings_getter=None) -> HistoryManager:
         HISTORY_FILE=None,
         SYSTEM_MESSAGE="system",
         MAX_CONTEXT_MESSAGES=0,
-        MEMORY_PROTECTED_RECENT_TURNS=3,
-        SUMMARIZATION_MAX_IN_CONTEXT=5,
-        SUMMARIZATION_COMPACT_CONTEXT=True,
     )
     return HistoryManager(
         client=_DummyClient(),

@@ -1160,17 +1160,20 @@ def bootstrap_runtime_settings(config: Config, bot_id: str | None, overwrite: bo
             return False
         bots = [target]
 
+    # TASK-615: seed CANONICAL keys only, sourced from the setting registry
+    # (not env fields — the legacy context/summarization env fields are
+    # deleted). Seeding the old keys here would resurrect the exact rows the
+    # TASK-614 migration removes.
+    from llm_bawt.setting_definitions import setting_default
+
     global_map = {
-        "max_context_tokens": config.MAX_CONTEXT_TOKENS,
+        "history_tokens": setting_default("history_tokens", 12000),
         "max_context_messages": config.MAX_CONTEXT_MESSAGES,
-        "max_output_tokens": config.MAX_OUTPUT_TOKENS,
+        "max_output_tokens": setting_default("max_output_tokens", 4096),
         "history_reload_ttl_seconds": config.HISTORY_RELOAD_TTL_SECONDS,
-        "summarization_session_gap_seconds": config.SUMMARIZATION_SESSION_GAP_SECONDS,
-        "summarization_min_messages_per_session": config.SUMMARIZATION_MIN_MESSAGES_PER_SESSION,
-        "summarization_max_in_context": config.SUMMARIZATION_MAX_IN_CONTEXT,
-        "summarization_compact_context": config.SUMMARIZATION_COMPACT_CONTEXT,
+        "summary_count": setting_default("summary_count", 5),
+        "compact_context": setting_default("compact_context", True),
         "memory_n_results": config.MEMORY_N_RESULTS,
-        "memory_protected_recent_turns": config.MEMORY_PROTECTED_RECENT_TURNS,
         "memory_min_relevance": config.MEMORY_MIN_RELEVANCE,
         "memory_max_token_percent": config.MEMORY_MAX_TOKEN_PERCENT,
         "memory_dedup_similarity": config.MEMORY_DEDUP_SIMILARITY,

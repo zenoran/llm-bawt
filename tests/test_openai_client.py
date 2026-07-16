@@ -14,12 +14,20 @@ from llm_bawt.models.message import Message
 class _ConfigStub:
     PLAIN_OUTPUT: bool = True
     NO_STREAM: bool = False
-    MAX_OUTPUT_TOKENS: int = 4096
     TEMPERATURE: float = 0.8
     TOP_P: float = 0.95
     VERBOSE: bool = False
     LLAMA_CPP_N_CTX: int = 8192
     SYSTEM_MESSAGE: str = ""
+
+    # TASK-609/615: effective_context_window / effective_max_tokens delegate to
+    # the single catalog-driven budget authority (no env fields, no type
+    # guessing). The stub returns fixed values so the client can size requests.
+    def get_model_context_window(self, alias: str | None = None) -> int:
+        return 128000
+
+    def get_model_max_tokens(self, alias: str | None = None) -> int:
+        return 4096
 
 
 class _DummyClient(LLMClient):
