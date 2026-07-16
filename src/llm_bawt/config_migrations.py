@@ -96,14 +96,169 @@ def rollback_typed_agent_settings(config: Config, dry_run: bool = True) -> dict:
     return {"dry_run": dry_run, "removed": removed}
 
 
+# ── TASK-614: migrate runtime_settings rows to the canonical tier keys ──
+#
+# One-time data transformation after the Tier-1/2/3 canonical keys landed
+# (TASK-610/611). Moves existing operator choices from the old keys into the
+# new canonical settings, then deletes the old rows. NO env values are read;
+# NO runtime dual-read is introduced (this is a manually-run CLI, not boot
+# code). Idempotent: re-running skips already-migrated rows.
+#
+#   Renames (value preserved, all scopes):
+#     max_context_tokens         -> history_tokens   (drop the 0 footgun row)
+#     summarization_max_in_context -> summary_count
+#   Fold into the global-only Tier-1 summarization_job dict (store only the
+#   deviations from SUMMARIZATION_JOB_DEFAULTS; resolve merges the rest), then
+#   delete the retired standalone keys (all scopes — the job is global-only):
+#     summarization_session_gap_seconds -> session_gap_seconds
+#     summarization_min_messages        -> min_messages_per_session
+#     memory_protected_recent_turns     -> protected_recent_turns
+#
+# Run:
+#     python -m llm_bawt.config_migrations --context --dry-run
+#     python -m llm_bawt.config_migrations --context            # apply
+#     python -m llm_bawt.config_migrations --context --rollback
+
+CONTEXT_RENAMES = {
+    "max_context_tokens": "history_tokens",
+    "summarization_max_in_context": "summary_count",
+}
+JOB_FOLD = {
+    "summarization_session_gap_seconds": "session_gap_seconds",
+    "summarization_min_messages": "min_messages_per_session",
+    "memory_protected_recent_turns": "protected_recent_turns",
+}
+
+
+def _snapshot_rows(store: RuntimeSettingsStore) -> list[tuple[str, str, str, object]]:
+    """(scope_type, scope_id, key, decoded_value) for every runtime_settings row."""
+    import json as _json
+
+    from .runtime_settings import RuntimeSetting
+
+    with Session(store.engine) as s:
+        rows = s.exec(select(RuntimeSetting)).all()
+        out = []
+        for r in rows:
+            try:
+                out.append((r.scope_type, r.scope_id, r.key, _json.loads(r.value_json)))
+            except Exception:
+                out.append((r.scope_type, r.scope_id, r.key, None))
+        return out
+
+
+def migrate_context_config_keys(config: Config, dry_run: bool = True) -> dict:
+    """Move old context/summarization rows onto the canonical tier keys."""
+    from .setting_definitions import SUMMARIZATION_JOB_DEFAULTS
+
+    store = RuntimeSettingsStore(config)
+    rows = _snapshot_rows(store)
+    actions: list[str] = []
+
+    # 1. Renames (value preserved). Drop the max_context_tokens 0-footgun row.
+    for scope_type, scope_id, key, value in rows:
+        if key not in CONTEXT_RENAMES:
+            continue
+        new_key = CONTEXT_RENAMES[key]
+        if key == "max_context_tokens" and value in (0, "0", None):
+            actions.append(f"DROP {scope_type}:{scope_id}:{key}={value!r} (0 footgun; new default is bounded)")
+            if not dry_run:
+                store.delete_value(scope_type, scope_id, key)
+            continue
+        existing = store.get_scope_settings(scope_type, scope_id)
+        if new_key in existing:
+            actions.append(f"SKIP {scope_type}:{scope_id}:{key}->{new_key} (target already {existing[new_key]!r}); drop old")
+            if not dry_run:
+                store.delete_value(scope_type, scope_id, key)
+            continue
+        actions.append(f"RENAME {scope_type}:{scope_id}:{key}->{new_key} = {value!r}")
+        if not dry_run:
+            store.set_value(scope_type, scope_id, new_key, value)
+            store.delete_value(scope_type, scope_id, key)
+
+    # 2. Fold Tier-1 job params (GLOBAL scope only) into the summarization_job
+    #    dict, storing ONLY deviations from the canonical defaults.
+    job_overrides: dict[str, object] = {}
+    for scope_type, scope_id, key, value in rows:
+        if key in JOB_FOLD and scope_type == "global" and scope_id == "*":
+            job_key = JOB_FOLD[key]
+            if value != SUMMARIZATION_JOB_DEFAULTS.get(job_key):
+                job_overrides[job_key] = value
+    existing_global = store.get_scope_settings("global", "*")
+    if "summarization_job" in existing_global:
+        actions.append(f"SKIP summarization_job (already {existing_global['summarization_job']!r})")
+    elif job_overrides:
+        actions.append(f"INSERT global:summarization_job = {job_overrides!r}")
+        if not dry_run:
+            store.set_value("global", "*", "summarization_job", job_overrides)
+    else:
+        actions.append("summarization_job: no deviations from defaults; nothing stored")
+
+    # 3. Delete the retired standalone Tier-1 keys (all scopes — global-only now).
+    for scope_type, scope_id, key, _value in rows:
+        if key in JOB_FOLD:
+            actions.append(f"DELETE {scope_type}:{scope_id}:{key}")
+            if not dry_run:
+                store.delete_value(scope_type, scope_id, key)
+
+    return {"dry_run": dry_run, "actions": actions}
+
+
+def rollback_context_config_keys(config: Config, dry_run: bool = True) -> dict:
+    """Best-effort reverse of migrate_context_config_keys (renames back, drop job dict).
+
+    Cannot resurrect the exact old fold rows (their bot-scope values were
+    dropped by design); restores only the global standalone keys from the
+    stored summarization_job dict. Intended for pre-615 emergency rollback.
+    """
+    from .setting_definitions import SUMMARIZATION_JOB_DEFAULTS
+
+    store = RuntimeSettingsStore(config)
+    rows = _snapshot_rows(store)
+    reverse = {v: k for k, v in CONTEXT_RENAMES.items()}
+    job_reverse = {v: k for k, v in JOB_FOLD.items()}
+    actions: list[str] = []
+
+    for scope_type, scope_id, key, value in rows:
+        if key in reverse:
+            old_key = reverse[key]
+            actions.append(f"REVERT {scope_type}:{scope_id}:{key}->{old_key} = {value!r}")
+            if not dry_run:
+                store.set_value(scope_type, scope_id, old_key, value)
+                store.delete_value(scope_type, scope_id, key)
+        elif key == "summarization_job" and scope_type == "global":
+            merged = dict(SUMMARIZATION_JOB_DEFAULTS)
+            if isinstance(value, dict):
+                merged.update({k: v for k, v in value.items() if k in merged})
+            for job_key, old_key in job_reverse.items():
+                actions.append(f"RESTORE global:{old_key} = {merged[job_key]!r}")
+                if not dry_run:
+                    store.set_value("global", "*", old_key, merged[job_key])
+            actions.append("DELETE global:summarization_job")
+            if not dry_run:
+                store.delete_value("global", "*", "summarization_job")
+
+    return {"dry_run": dry_run, "actions": actions}
+
+
 def main() -> None:
     logging.basicConfig(level=logging.INFO)
-    ap = argparse.ArgumentParser(description="Backfill typed agent settings (TASK-491/492)")
+    ap = argparse.ArgumentParser(description="Config migrations (TASK-491/492/614)")
     ap.add_argument("--dry-run", action="store_true", help="Show actions without writing")
-    ap.add_argument("--rollback", action="store_true", help="Delete backfilled rows")
+    ap.add_argument("--rollback", action="store_true", help="Reverse the migration")
+    ap.add_argument(
+        "--context",
+        action="store_true",
+        help="TASK-614: migrate context/summarization rows to canonical tier keys",
+    )
     args = ap.parse_args()
     config = Config()
-    if args.rollback:
+    if args.context:
+        if args.rollback:
+            result = rollback_context_config_keys(config, dry_run=args.dry_run)
+        else:
+            result = migrate_context_config_keys(config, dry_run=args.dry_run)
+    elif args.rollback:
         result = rollback_typed_agent_settings(config, dry_run=args.dry_run)
     else:
         result = backfill_typed_agent_settings(config, dry_run=args.dry_run)
