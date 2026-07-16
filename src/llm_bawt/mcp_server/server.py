@@ -887,6 +887,26 @@ async def get_active_session(bot_id: str = "default") -> dict | None:
 _inflight_bot_sends: set = set()
 
 
+# TASK-618: cap the effective `wait_for_reply` wait below the MCP client's
+# per-tool-call timeout. The Claude Agent SDK (and other MCP clients) impose a
+# tool-call timeout that is INDEPENDENT of — and, at its 60s default (env
+# MCP_TOOL_TIMEOUT, in ms), lower than — this tool's own `timeout_seconds`
+# argument. A waited send that exceeds that ceiling gets guillotined
+# client-side with a bare "The operation timed out.": the graceful timeout
+# branch in `_dispatch_bot_message` never fires, and the caller sees a FALSE
+# failure for a send that actually succeeded server-side. (Live case: a
+# snark→gavel verdict handoff — gavel's turn took 63s, snark's 180s wait was
+# killed at 60s.) So we clamp the effective wait to a value guaranteed to sit
+# below the client kill, leaving margin. If an operator raises MCP_TOOL_TIMEOUT
+# on the bridge, raise LLM_BAWT_BOT_SEND_WAIT_CEILING_S in tandem. For replies
+# that legitimately take longer, use an async send (omit wait_for_reply) — the
+# target bot answers back via its own async bots_send_message, which has no
+# such ceiling.
+_BOT_SEND_WAIT_CEILING_S = float(
+    os.getenv("LLM_BAWT_BOT_SEND_WAIT_CEILING_S", "55")
+)
+
+
 async def _dispatch_bot_message(
     payload: dict,
     target_bot_id: str,
@@ -1023,7 +1043,12 @@ async def send_message_to_bot(
             honored: `fire_and_forget=True` forces async, and the legacy
             `fire_and_forget=False` is treated as `wait_for_reply=True`.
         timeout_seconds: How long to wait for a response when
-            `wait_for_reply=True`. Defaults to 300s.
+            `wait_for_reply=True`. Defaults to 300s, but the effective wait is
+            CLAMPED to `LLM_BAWT_BOT_SEND_WAIT_CEILING_S` (default 55s) because
+            the MCP client aborts any tool call past ~60s. Requesting more than
+            the ceiling is honored only up to it; for replies that take longer,
+            use an async send (omit `wait_for_reply`) and let the target reply
+            back via its own async `bots_send_message`.
         force: If True, send even when the target bot is mid-turn.
 
     Returns:
@@ -1151,11 +1176,39 @@ async def send_message_to_bot(
             "note": note,
         }
 
+    # Reaching here means do_wait is True (the async path returned above). Clamp
+    # the wait below the MCP client's per-tool-call ceiling so a legitimately
+    # slow reply doesn't get killed client-side with a false timeout. See the
+    # _BOT_SEND_WAIT_CEILING_S note above (TASK-618).
+    effective_timeout = timeout_seconds
+    clamped = timeout_seconds > _BOT_SEND_WAIT_CEILING_S
+    if clamped:
+        logger.warning(
+            "wait_for_reply send to %s requested %.0fs but the MCP client "
+            "tool-call timeout caps it at ~60s; clamping to %.0fs to avoid a "
+            "false client-side timeout. Use an async send for longer replies.",
+            target_bot_id, timeout_seconds, _BOT_SEND_WAIT_CEILING_S,
+        )
+        effective_timeout = _BOT_SEND_WAIT_CEILING_S
+
     result = await _dispatch_bot_message(
-        payload, target_bot_id, sender_bot_id, timeout_seconds
+        payload, target_bot_id, sender_bot_id, effective_timeout
     )
     if forced_while_busy and isinstance(result, dict):
         result["forced_while_busy"] = True
+    if clamped and isinstance(result, dict):
+        result["timeout_clamped"] = True
+        result["requested_timeout_seconds"] = timeout_seconds
+        result["effective_timeout_seconds"] = effective_timeout
+        if not result.get("success"):
+            result["note"] = (
+                (result.get("warning") or result.get("note") or "").strip()
+                + f" NOTE: your requested {timeout_seconds:.0f}s wait was "
+                f"capped at {effective_timeout:.0f}s because the MCP client "
+                "aborts tool calls past ~60s. The target may still be working "
+                "and can reply via an async send. DO NOT retry — that risks a "
+                "duplicate turn."
+            ).strip()
     return result
 
 
