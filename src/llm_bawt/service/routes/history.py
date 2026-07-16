@@ -235,9 +235,11 @@ def _build_summary_callable(service, bot_id: str, user_id: str = "system", model
 
     from ...runtime_settings import resolve_job_model
 
+    # TASK-610: summarization model from the ONE global Tier-1 job dict
+    # (model=None => inherit maintenance_model, as before).
     requested_model = (
         model
-        or resolve_job_model(service.config, "summarization_model")
+        or service.config.resolve_summarization_job().get("model")
         or resolve_job_model(service.config, "maintenance_model")
     )
     model_alias = None

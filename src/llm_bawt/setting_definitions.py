@@ -23,6 +23,20 @@ STORAGE_REQUEST_FLAG = "request_flag"               # per-turn request-only flag
 
 BOT_TYPES_ALL = ("chat", "agent")
 
+# Tier-1 offline-summarization job parameters (TASK-602/610). ONE global-only
+# dict; never bot-aware, never model-catalog policy. These are the canonical
+# CODE defaults (fresh install / no DB row). TASK-614 later inserts the
+# operator-intent dict from the migrated DB rows (which honors min=4, the value
+# a key-mismatch bug had been silently ignoring); the resolver merges any stored
+# dict OVER these per-key so a partial row can't drop a field.
+SUMMARIZATION_JOB_DEFAULTS = {
+    "session_gap_seconds": 3600,        # gap that splits history into sessions
+    "min_messages_per_session": 2,      # min msgs for a session to be summarizable
+    "protected_recent_turns": 3,        # recent turns the JOB never folds into a summary
+    "trigger_tokens": 12000,            # recent raw kept verbatim before older folds
+    "model": None,                      # None = inherit maintenance_model
+}
+
 
 @dataclass(frozen=True)
 class SettingDefinition:
@@ -250,18 +264,9 @@ SETTING_DEFINITIONS: dict[str, SettingDefinition] = {
         legacy_keys=("MAINTENANCE_MODEL",),
         ui_widget="model",
     ),
-    "summarization_model": SettingDefinition(
-        key="summarization_model",
-        type="str",
-        default=None,
-        applies_to=BOT_TYPES_ALL,
-        storage=STORAGE_RUNTIME_SETTING,
-        label="History summarization model",
-        help="Model the history-summarization job runs. Unset = inherit the "
-             "default job model (maintenance_model).",
-        legacy_keys=("SUMMARIZATION_MODEL",),
-        ui_widget="model",
-    ),
+    # summarization_model RETIRED (TASK-610): absorbed into summarization_job.model
+    # (global Tier-1 dict). All consumers rerouted; had 0 DB rows. The generic
+    # resolve_job_model() helper stays for extraction/maintenance/profile models.
     "extraction_model": SettingDefinition(
         key="extraction_model",
         type="str",
@@ -365,6 +370,33 @@ SETTING_DEFINITIONS: dict[str, SettingDefinition] = {
             "Global-only infrastructure policy (Tier 2 is not bot-aware); distinct "
             "from max_output_tokens, which is the model's per-request output cap. "
             "Default 4096 preserves prior behavior (old max_output_tokens double-duty)."
+        ),
+    ),
+    "summarization_job": SettingDefinition(
+        key="summarization_job",
+        type="json",
+        default=SUMMARIZATION_JOB_DEFAULTS,
+        applies_to=(),  # GLOBAL-ONLY (TASK-602 Tier 1): no per-bot override.
+                        # Resolved via resolve_global_runtime_setting(); bot rows ignored.
+        storage=STORAGE_RUNTIME_SETTING,
+        label="Summarization job parameters",
+        help=(
+            "Tier-1 offline-summarization job settings as ONE global dict: "
+            "session_gap_seconds, min_messages_per_session, protected_recent_turns, "
+            "trigger_tokens, and model (None = inherit maintenance_model). "
+            "Global-only job scheduling policy — NOT bot-aware and NOT model-catalog "
+            "physical limits (those are Tier-2 resolve_context_budget). Absorbs the "
+            "legacy summarization_session_gap_seconds / summarization_min_messages / "
+            "memory_protected_recent_turns / summarization_trigger_tokens / "
+            "summarization_model keys."
+        ),
+        legacy_keys=(
+            "summarization_session_gap_seconds",
+            "summarization_min_messages_per_session",
+            "summarization_min_messages",
+            "memory_protected_recent_turns",
+            "summarization_trigger_tokens",
+            "summarization_model",
         ),
     ),
 }

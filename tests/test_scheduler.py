@@ -176,15 +176,25 @@ class TestJobActivityGates:
 
         class _Config:
             MAINTENANCE_MODEL = "grok-4-fast"
-            SUMMARIZATION_MODEL = ""
             EXTRACTION_MODEL = ""
-            SUMMARIZATION_TRIGGER_TOKENS = 12000
+            POSTGRES_PASSWORD = ""  # no DB creds -> resolve_job_model uses registry defaults
 
             def get_model_context_window(self, _alias=None):
                 return 128000  # model window — must NOT be used as the budget
 
             def get_model_max_tokens(self, _alias=None):
                 return 4096
+
+            def resolve_summarization_job(self):
+                # TASK-610: trigger + model now come from the ONE global Tier-1
+                # job dict (was SUMMARIZATION_TRIGGER_TOKENS / summarization_model).
+                return {
+                    "session_gap_seconds": 3600,
+                    "min_messages_per_session": 2,
+                    "protected_recent_turns": 3,
+                    "trigger_tokens": 12000,
+                    "model": None,
+                }
 
         class _TaskProc:
             config = _Config()

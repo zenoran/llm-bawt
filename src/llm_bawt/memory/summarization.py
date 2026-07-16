@@ -799,21 +799,13 @@ class HistorySummarizer:
         self._summarize_fn = summarize_fn
         self._summarize_batch_fn = summarize_batch_fn
 
-        # Budget-driven summarization settings
-        self.session_gap_seconds = self._setting(
-            "summarization_session_gap_seconds",
-            getattr(config, "SUMMARIZATION_SESSION_GAP_SECONDS", 3600),
-        )
-        self.min_messages_per_session = self._setting(
-            "summarization_min_messages_per_session",
-            getattr(config, "SUMMARIZATION_MIN_MESSAGES_PER_SESSION", 2),
-        )
-        self.protected_recent_turns = int(
-            self._setting(
-                "memory_protected_recent_turns",
-                getattr(config, "MEMORY_PROTECTED_RECENT_TURNS", 3),
-            )
-        )
+        # Budget-driven summarization settings — TASK-610: the ONE global-only
+        # Tier-1 job dict (was three per-bot _setting reads with legacy env
+        # fallbacks). Job scheduling params are global, not bot-aware.
+        job = config.resolve_summarization_job()
+        self.session_gap_seconds = job["session_gap_seconds"]
+        self.min_messages_per_session = job["min_messages_per_session"]
+        self.protected_recent_turns = int(job["protected_recent_turns"])
         # Token budget: explicit override > config > auto from model context window
         if max_context_tokens > 0:
             self.max_context_tokens = max_context_tokens

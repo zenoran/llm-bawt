@@ -475,9 +475,12 @@ class JobScheduler:
             # the probe say "pending" and execution immediately return zero.
             from ..runtime_settings import resolve_job_model
 
+            # TASK-610: Tier-1 job params from the ONE global dict (model +
+            # trigger below). model=None => inherit maintenance_model, as before.
+            sum_job = config.resolve_summarization_job()
             requested_model = (
                 job_config.get("model")
-                or resolve_job_model(config, "summarization_model")
+                or sum_job.get("model")
                 or resolve_job_model(config, "maintenance_model")
             )
             preferred_model = (
@@ -508,13 +511,9 @@ class JobScheduler:
             # lenient than execution, so any bot whose unsummarized backlog sat
             # between the trigger and the model window reported "0 pending" and was
             # skipped every cycle (backlog starvation).
-            trigger_tokens = int(
-                resolver.resolve(
-                    "summarization_trigger_tokens",
-                    getattr(config, "SUMMARIZATION_TRIGGER_TOKENS", 12000),
-                )
-                or 0
-            )
+            # TASK-610: trigger from the global Tier-1 job dict (was a per-bot
+            # runtime setting — trigger is a global job param, not bot-aware).
+            trigger_tokens = int(sum_job.get("trigger_tokens") or 0)
             if trigger_tokens > 0:
                 max_context_tokens = trigger_tokens
             else:

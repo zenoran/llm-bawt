@@ -413,9 +413,12 @@ class BackgroundTasksMixin:
         from ..runtime_settings import resolve_job_model
 
         bot_id = task.bot_id or self._default_bot
+        # TASK-610: Tier-1 job params from the ONE global dict (model + trigger
+        # below). model=None => inherit maintenance_model, as before.
+        job = self.config.resolve_summarization_job()
         requested_model = (
             task.payload.get("model")
-            or resolve_job_model(self.config, "summarization_model")
+            or job.get("model")
             or resolve_job_model(self.config, "maintenance_model")
         )
         use_heuristic_fallback = bool(task.payload.get("use_heuristic_fallback", True))
@@ -478,15 +481,10 @@ class BackgroundTasksMixin:
         # before older sessions get folded into summaries.  This is the
         # summarization *trigger*, NOT the chat model's full context window.
         # Tying it to the model window (128K for grok) pushed the threshold so
-        # high that summaries effectively stopped being generated.  Resolve a
-        # per-bot override first, then the config default.
-        trigger_tokens = int(
-            resolver.resolve(
-                "summarization_trigger_tokens",
-                getattr(self.config, "SUMMARIZATION_TRIGGER_TOKENS", 12000),
-            )
-            or 0
-        )
+        # high that summaries effectively stopped being generated.
+        # TASK-610: sourced from the global Tier-1 job dict (was a per-bot
+        # runtime setting — trigger is a global job param, not bot-aware).
+        trigger_tokens = int(job.get("trigger_tokens") or 0)
         if trigger_tokens > 0:
             max_context_tokens = trigger_tokens
         else:

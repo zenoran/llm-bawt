@@ -545,6 +545,28 @@ class Config(RuntimeTunables, BaseSettings):
             max(0, context_window - effective_reserve),
         )
 
+    def resolve_summarization_job(self) -> dict:
+        """THE single Tier-1 summarization-job authority (TASK-602/610).
+
+        Returns the global ``summarization_job`` dict with every key guaranteed
+        present: ``session_gap_seconds``, ``min_messages_per_session``,
+        ``protected_recent_turns``, ``trigger_tokens``, ``model``.
+
+        Global-only (Tier 1 is not bot-aware): resolved via
+        ``resolve_global_runtime_setting`` (bot rows ignored). The canonical CODE
+        defaults are merged UNDER any stored dict, so a partial/absent row still
+        yields a complete dict and no legacy env field is read. ``model`` is
+        ``None`` by default => callers fall through to ``maintenance_model``.
+        """
+        from ..runtime_setting_resolution import resolve_global_runtime_setting
+        from ..setting_definitions import SUMMARIZATION_JOB_DEFAULTS
+
+        merged = dict(SUMMARIZATION_JOB_DEFAULTS)
+        stored = resolve_global_runtime_setting(self, "summarization_job")
+        if isinstance(stored, dict):
+            merged.update({k: v for k, v in stored.items() if k in merged})
+        return merged
+
     def get_model_n_gpu_layers(self, model_alias: str | None = None) -> int:
         """Get the effective n_gpu_layers for a model.
 
