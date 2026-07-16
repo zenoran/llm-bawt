@@ -10,6 +10,7 @@ from ..clients.base import LLMClient
 from ..models.message import Message
 from rich.rule import Rule
 from .config import Config
+from ..setting_definitions import setting_default
 
 if TYPE_CHECKING:
     from ..memory.postgresql import PostgreSQLShortTermManager as ShortTermMemoryManager
@@ -232,8 +233,10 @@ class HistoryManager:
         if not text:
             return text
 
+        # TASK-611: Tier-3 canonical key (was summarization_compact_context).
+        # Registry default only — no retired config env attr.
         compact_enabled = bool(
-            self._setting("summarization_compact_context", getattr(self.config, "SUMMARIZATION_COMPACT_CONTEXT", True))
+            self._setting("compact_context", setting_default("compact_context", True))
         )
         if not compact_enabled:
             return text
@@ -354,14 +357,16 @@ class HistoryManager:
         budget = max_tokens
 
         # Fill from summaries (oldest context → newest)
+        # TASK-611: Tier-3 canonical key (was summarization_max_in_context).
+        # Registry default only. summary_count=0 => carry NO summaries (a
+        # raw-only bot); guard the slice because summary_messages[-0:] would
+        # otherwise select the WHOLE list, not none.
         included_summaries: list[Message] = []
         max_summaries = int(
-            self._setting(
-                "summarization_max_in_context",
-                getattr(self.config, "SUMMARIZATION_MAX_IN_CONTEXT", 5),
-            )
+            self._setting("summary_count", setting_default("summary_count", 5))
         )
-        for s in summary_messages[-max_summaries:]:
+        candidate_summaries = summary_messages[-max_summaries:] if max_summaries > 0 else []
+        for s in candidate_summaries:
             cost = estimate_messages_tokens([s])
             if used + cost <= budget:
                 included_summaries.append(s)

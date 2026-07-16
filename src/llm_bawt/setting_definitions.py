@@ -85,6 +85,58 @@ SETTING_DEFINITIONS: dict[str, SettingDefinition] = {
         ),
         legacy_keys=("include_summaries",),
     ),
+    # --- Tier-3 context-generation policy (TASK-602/611) ----------------------
+    # Bot-aware sizing of the two independent history_scope buckets. Global +
+    # per-bot override (lean agents vs. aware chat bots). These decide HOW BIG
+    # each bucket is; history_scope decides WHICH buckets. Distinct from Tier-1
+    # job params (summarization_job, global-only) and Tier-2 physical limits
+    # (resolve_context_budget, model-aware). The allocation ladder that consumes
+    # history_tokens is a separate task; this registers + resolves the settings.
+    "history_tokens": SettingDefinition(
+        key="history_tokens",
+        type="int",
+        default=12000,
+        applies_to=BOT_TYPES_ALL,
+        storage=STORAGE_RUNTIME_SETTING,
+        label="Raw history token budget",
+        help=(
+            "Tokens of recent raw conversation to carry (the inline-history "
+            "bucket). Bounded on purpose — NEVER 0=fill-the-window (the footgun "
+            "TASK-602 exists to kill). A lean agent can set this small (raw-only "
+            "recent window, summaries off via history_scope) while a chat bot "
+            "carries more. Absorbs the positive-valued legacy max_context_tokens "
+            "bot overrides; the old 0=auto total-budget meaning is gone (Tier-2 "
+            "resolve_context_budget owns the total budget now)."
+        ),
+        legacy_keys=("max_context_tokens",),
+    ),
+    "summary_count": SettingDefinition(
+        key="summary_count",
+        type="int",
+        default=5,
+        applies_to=BOT_TYPES_ALL,
+        storage=STORAGE_RUNTIME_SETTING,
+        label="Summaries in context",
+        help=(
+            "Max rolling summaries injected into the prompt. 0 = carry no "
+            "summaries (a raw-only bot, same effect as history_scope without "
+            "'summaries'). Absorbs the legacy summarization_max_in_context."
+        ),
+        legacy_keys=("summarization_max_in_context",),
+    ),
+    "compact_context": SettingDefinition(
+        key="compact_context",
+        type="bool",
+        default=True,
+        applies_to=BOT_TYPES_ALL,
+        storage=STORAGE_RUNTIME_SETTING,
+        label="Compact summary form",
+        help=(
+            "Use the shorter/compressed summary representation in the prompt to "
+            "save tokens. Absorbs the legacy summarization_compact_context."
+        ),
+        legacy_keys=("summarization_compact_context",),
+    ),
     # --- promoted from agent_backend_config JSON blob (TASK-491) --------------
     "seed_summary_on_new_session": SettingDefinition(
         key="seed_summary_on_new_session",
@@ -328,3 +380,14 @@ def applies_to_bot_type(key: str, bot_type: str) -> bool:
     permissive — an undeclared setting is not something we should hide)."""
     d = SETTING_DEFINITIONS.get(key)
     return True if d is None else (bot_type in d.applies_to)
+
+
+def setting_default(key: str, fallback: object = None) -> object:
+    """The registry-declared default for a setting key (TASK-611).
+
+    The single source of truth for a setting's code-default, so consumers stop
+    reading retired ``config.*`` env attributes as fallbacks. Returns ``fallback``
+    only for an unregistered key.
+    """
+    d = SETTING_DEFINITIONS.get(key)
+    return d.default if d is not None else fallback
