@@ -110,6 +110,17 @@ def estimate_messages_tokens(messages: list) -> int:
     return sum(len(m.content) // 4 + 4 for m in messages)
 
 
+class ContextBudgetError(RuntimeError):
+    """The system prompt alone exceeds the physical prompt budget.
+
+    TASK-612: the ONE hard-fail in the allocation ladder. Every other budget
+    shortfall degrades and logs (shed summaries, then trim raw, but never below
+    the newest complete turn). If the system prompt cannot fit the model's
+    prompt budget there is nothing sane to send, so we fail loudly rather than
+    ship a silently-truncated system prompt.
+    """
+
+
 class HistoryManager:
     messages: list[Message] = []
     client: LLMClient
@@ -284,22 +295,36 @@ class HistoryManager:
         return "\n".join(compact_lines).strip()
 
     def get_context_messages(self, max_tokens: int = 0):
-        """Get messages to be used as context for the LLM.
+        """Assemble LLM context under Nick's strict allocation ladder (TASK-612).
 
-        Includes (in order):
-        - System messages (always)
-        - Summaries of older sessions (role='summary') with time context
-        - Recent messages (newest-first within token budget)
+        Fill order, highest priority first:
+          1. **System** messages — always kept. If they alone exceed the physical
+             budget this raises ``ContextBudgetError`` (the ONLY hard-fail).
+          2. **Raw** unsummarized history — newest-first, bounded by the Tier-3
+             ``history_tokens`` policy knob (default 12000) *and* by physical
+             headroom. The newest complete turn is floored in even when
+             ``history_tokens`` is set absurdly small (degrade-and-log).
+          3. **Summaries** — fill the *remaining physical budget* after system +
+             raw, newest-first, capped by ``summary_count`` (default 5).
+             ``summary_count=0`` carries none (raw-only bot).
 
-        If max_tokens > 0, applies a token budget:
-        1. System messages are always included
-        2. Protected recent turns are always included (newest N pairs)
-        3. Remaining budget fills from newest-first, dropping oldest messages
-        4. Optional max_context_messages caps raw history messages before token budgeting
+        This deliberately reverses the old flow (summaries filled before raw, a
+        ``memory_protected_recent_turns`` reservation carved off the top). Under
+        the ladder raw already outranks summaries and newest already outranks
+        oldest, so the protected-turn reservation is redundant and gone; the
+        recent-turn guarantee now falls out of raw-first + newest-first ordering
+        plus the newest-complete-turn floor. ``memory_protected_recent_turns`` is
+        a Tier-1 summarization-job parameter now (TASK-610), not an assembly knob.
+
+        The raw vs summary partition is the DB ``summarized`` flag (summarized
+        sessions become ``role='summary'`` rows; unsummarized stay raw), so the
+        two buckets are disjoint by construction — no dedup here.
+
+        Output order is chronological: ``system + summaries + raw``.
 
         Args:
-            max_tokens: Maximum token budget for the returned messages.
-                        0 = no limit (backward-compatible default).
+            max_tokens: physical prompt budget (Tier-2 ``resolve_context_budget``).
+                        0 = no budget (return everything, back-compat).
         """
         system_messages = []
         summary_messages = []
@@ -334,75 +359,105 @@ class HistoryManager:
         if max_context_messages > 0 and len(regular_messages) > max_context_messages:
             regular_messages = regular_messages[-max_context_messages:]
 
-        # Without a token budget, return everything
+        # Without a token budget, return everything (chronological: system,
+        # summaries, then raw recent messages).
         if max_tokens <= 0:
             return system_messages + summary_messages + regular_messages
 
-        # ── Token-budget enforcement ──────────────────────────────
-        protected_turns = int(
-            self._setting(
-                "memory_protected_recent_turns",
-                getattr(self.config, "MEMORY_PROTECTED_RECENT_TURNS", 3),
-            )
-        )
-        # Protect the last N user+assistant pairs (= 2*N messages from the end)
-        n_protected = min(protected_turns * 2, len(regular_messages))
-        protected = regular_messages[-n_protected:] if n_protected > 0 else []
-        droppable = regular_messages[:-n_protected] if n_protected > 0 else list(regular_messages)
-
-        # Calculate baseline usage (system + protected)
-        system_cost = estimate_messages_tokens(system_messages)
-        protected_cost = estimate_messages_tokens(protected)
-        used = system_cost + protected_cost
+        # ── Allocation ladder ─────────────────────────────────────
         budget = max_tokens
+        system_cost = estimate_messages_tokens(system_messages)
 
-        # Fill from summaries (oldest context → newest)
-        # TASK-611: Tier-3 canonical key (was summarization_max_in_context).
-        # Registry default only. summary_count=0 => carry NO summaries (a
-        # raw-only bot); guard the slice because summary_messages[-0:] would
-        # otherwise select the WHOLE list, not none.
-        included_summaries: list[Message] = []
+        # (1) System is non-negotiable. System-alone-over-budget is the one
+        #     unrecoverable state — fail loudly instead of truncating it.
+        if system_cost > budget:
+            raise ContextBudgetError(
+                f"System prompt ({system_cost} tokens) exceeds the prompt budget "
+                f"({budget} tokens) for bot {self.bot_id!r}. Raise the model "
+                f"context window or shrink the system prompt."
+            )
+
+        # (2) Raw history: newest-first, bounded by BOTH history_tokens (Tier-3
+        #     policy) and the remaining physical budget.
+        physical_headroom = budget - system_cost
+        history_tokens = int(
+            self._setting("history_tokens", setting_default("history_tokens", 12000))
+        )
+        # history_tokens should always be a positive bound (TASK-602 killed the
+        # 0=whole-window footgun); defensively treat <=0 as "use all headroom".
+        raw_cap = physical_headroom if history_tokens <= 0 else min(history_tokens, physical_headroom)
+
+        included_raw: list[Message] = []
+        raw_used = 0
+        for msg in reversed(regular_messages):  # newest-first
+            cost = estimate_messages_tokens([msg])
+            if raw_used + cost <= raw_cap:
+                included_raw.insert(0, msg)  # keep chronological order
+                raw_used += cost
+            else:
+                break  # older messages only get larger-or-equal in aggregate
+
+        # Newest-complete-turn floor: never drop the newest message purely
+        # because history_tokens is tiny. Force it in if it fits the PHYSICAL
+        # budget (system_cost already fit above). Only a single newest message
+        # that alone blows the physical budget is dropped — degrade-and-log.
+        forced_newest = False
+        if not included_raw and regular_messages:
+            newest = regular_messages[-1]
+            if system_cost + estimate_messages_tokens([newest]) <= budget:
+                included_raw = [newest]
+                raw_used = estimate_messages_tokens([newest])
+                forced_newest = True
+                logger.warning(
+                    "history_tokens=%s too small for even the newest turn; forcing "
+                    "it in under the physical budget (%s).",
+                    history_tokens,
+                    budget,
+                )
+            else:
+                logger.warning(
+                    "Newest turn (%s tokens) exceeds physical budget minus system "
+                    "(%s); dropping it (degrade).",
+                    estimate_messages_tokens([newest]),
+                    physical_headroom,
+                )
+
+        # (3) Summaries: fill the remaining physical budget after system + raw,
+        #     newest-first, capped by summary_count. Guard the slice because
+        #     summary_messages[-0:] would select the WHOLE list, not none.
+        remaining = budget - system_cost - raw_used
         max_summaries = int(
             self._setting("summary_count", setting_default("summary_count", 5))
         )
         candidate_summaries = summary_messages[-max_summaries:] if max_summaries > 0 else []
-        for s in candidate_summaries:
+        included_summaries: list[Message] = []
+        summary_used = 0
+        for s in reversed(candidate_summaries):  # newest summary first under pressure
             cost = estimate_messages_tokens([s])
-            if used + cost <= budget:
-                included_summaries.append(s)
-                used += cost
-
-        # Fill droppable messages (newest-first to keep recent context)
-        included_droppable: list[Message] = []
-        for msg in reversed(droppable):
-            cost = estimate_messages_tokens([msg])
-            if used + cost <= budget:
-                included_droppable.insert(0, msg)  # Maintain chronological order
-                used += cost
+            if summary_used + cost <= remaining:
+                included_summaries.insert(0, s)  # keep chronological order
+                summary_used += cost
             else:
-                # Once we can't fit one, stop (all remaining are older)
                 break
 
-        dropped = len(droppable) - len(included_droppable)
-        summary_cost = estimate_messages_tokens(included_summaries)
-        droppable_cost = estimate_messages_tokens(included_droppable)
-
-        remaining = budget - used
+        raw_dropped = len(regular_messages) - len(included_raw)
+        used = system_cost + raw_used + summary_used
 
         def pct(v: int) -> str:
             return f"{v * 100 // budget}%" if budget > 0 else "n/a"
 
         logger.debug(
-            f"Token budget: {budget} total | used={used} ({pct(used)}) | remaining={remaining} | "
+            f"Ladder budget: {budget} total | used={used} ({pct(used)}) | "
             f"system={system_cost} ({pct(system_cost)}), "
-            f"protected={protected_cost} ({pct(protected_cost)}, {len(protected)} msgs), "
-            f"summaries={summary_cost} ({pct(summary_cost)}, {len(included_summaries)}/{len(summary_messages)}), "
-            f"history={droppable_cost} ({pct(droppable_cost)}, {len(included_droppable)} msgs, {dropped} dropped), "
+            f"raw={raw_used} ({pct(raw_used)}, {len(included_raw)} msgs, "
+            f"{raw_dropped} dropped, cap={raw_cap}{', forced-newest' if forced_newest else ''}), "
+            f"summaries={summary_used} ({pct(summary_used)}, "
+            f"{len(included_summaries)}/{len(summary_messages)}), "
             f"message_cap={max_context_messages or 'none'}"
         )
 
-        return system_messages + included_summaries + included_droppable + protected
-    
+        return system_messages + included_summaries + included_raw
+
     def build_context_payload(
         self,
         *,
