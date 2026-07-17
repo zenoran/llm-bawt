@@ -1725,9 +1725,16 @@ def build_context_seed(bot_id: str, model: str | None, service) -> dict:
     from ...utils.history import estimate_messages_tokens
 
     effective_bot_id = bot_id or service._default_bot
-    resolved_model = model or getattr(service, "_default_model", None)
+    # Pass the caller's model through AS-IS (usually None for a preview). Do NOT
+    # coalesce to the service default here: _resolve_request_model already
+    # resolves None to the BOT's own default_model (priority 3) before the
+    # service default (priority 4). Forcing the service default made it an
+    # "explicit request" (priority 2), which overrode the bot's real model —
+    # e.g. seeding chat-harness 'mira' (grok-4.3) with the service default
+    # grok-4.5@xai-responses, a responses-only endpoint incompatible with
+    # harness=chat → hard failure. TASK-620.
     model_alias, _ = service._resolve_request_model(
-        resolved_model, effective_bot_id, local_mode=False
+        model, effective_bot_id, local_mode=False
     )
     llm_bawt = service._get_llm_bawt(
         model_alias, effective_bot_id, service.config.DEFAULT_USER
@@ -1736,8 +1743,12 @@ def build_context_seed(bot_id: str, model: str | None, service) -> dict:
     llm_bawt.history_manager.load_history()
 
     # Same budget the agent path uses (base.py) — the ONE Tier-2 authority.
-    # 0 => no budget (return everything). TASK-609.
-    _, _, budget = service.config.resolve_context_budget(model_alias)
+    # 0 => no budget (return everything). TASK-609. Capture the full
+    # decomposition (window -> reserve -> prompt budget) so the context-management
+    # UI can paint the whole ceiling picture, not just the prompt budget.
+    context_window, effective_reserve, budget = service.config.resolve_context_budget(
+        model_alias
+    )
 
     # TASK-493/518: seed content comes from the ONE shared handler
     # (HistoryManager.build_context_payload) — the same function the chat turn
@@ -1774,10 +1785,34 @@ def build_context_seed(bot_id: str, model: str | None, service) -> dict:
     oldest = min(ts_values) if ts_values else None
     newest = max(ts_values) if ts_values else None
 
+    # Effective context-sizing knobs that shape the ladder, resolved with the
+    # SAME resolver the assembler uses, each tagged with its provenance
+    # (code_default / global / bot) so the UI can mark default-vs-override
+    # without a second call. TASK-620.
+    def _eff(key: str, fallback):
+        try:
+            rv = llm_bawt.config_resolver.resolve_config_setting(key)
+            return {"value": rv.value, "source": rv.source}
+        except Exception:
+            return {"value": fallback, "source": "code_default"}
+
     return {
         "bot_id": effective_bot_id,
         "model": model_alias,
         "budget_tokens": budget,
+        # Full Tier-2 decomposition: window - reserve = prompt budget.
+        "budget": {
+            "context_window": context_window,
+            "effective_reserve": effective_reserve,
+            "prompt_budget": budget,
+        },
+        # The sizing knobs that bound each ladder bucket, with provenance.
+        "sizing": {
+            "history_scope": _eff("history_scope", "inline+summaries"),
+            "history_tokens": _eff("history_tokens", 12000),
+            "summary_count": _eff("summary_count", 5),
+            "max_context_messages": _eff("max_context_messages", 0),
+        },
         "messages": [
             {
                 "role": m.role,
@@ -1850,8 +1885,31 @@ def get_context_seed(
     """
     service = get_service()
     effective_bot_id = bot_id or service._default_bot
+    from ...model_catalog import ModelResolutionError
     try:
         return build_context_seed(bot_id, model, service)
+    except ModelResolutionError as e:
+        # Not a server fault: this bot's model can't be resolved for a seed
+        # (e.g. a chat-harness bot whose model falls back to a responses-only
+        # endpoint). Return a graceful "not previewable" payload so the
+        # context-management UI degrades instead of surfacing a 500. TASK-620.
+        log.info(f"Context seed not previewable for {effective_bot_id}: {e}")
+        return {
+            "bot_id": effective_bot_id,
+            "model": model,
+            "unavailable": True,
+            "reason": str(e),
+            "budget_tokens": None,
+            "messages": [],
+            "stats": {
+                "summary_count": 0,
+                "message_count": 0,
+                "total_count": 0,
+                "approx_tokens": 0,
+                "oldest_timestamp": None,
+                "newest_timestamp": None,
+            },
+        }
     except Exception as e:
         log.error(f"Failed to build context seed for {effective_bot_id}: {e}")
         raise HTTPException(status_code=500, detail=str(e))
