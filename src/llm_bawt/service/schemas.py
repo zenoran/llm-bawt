@@ -136,113 +136,32 @@ class ChatCompletionChunk(BaseModel):
     choices: list[dict]
 
 
-class ModelPricing(BaseModel):
-    """Per-1M-token USD rates for client-side cost estimation.
-
-    All optional — a model with no pricing simply shows no computed cost.
-    Stored in ``ModelDefinition.extra['pricing']`` (no schema migration) and
-    surfaced here so the chat context badge can estimate turn cost as
-    ``sum(tokens_of_kind * rate_of_kind) / 1_000_000``.
-    """
-    input: float | None = None
-    output: float | None = None
-    cache_read: float | None = None
-    cache_write: float | None = None
 
 
-class ModelInfo(BaseModel):
-    """Model information for /v1/models endpoint."""
-    id: str
-    object: str = "model"
-    created: int = Field(default_factory=lambda: int(time.time()))
-    owned_by: str = "llm-bawt"
-    type: str | None = None
-    model_id: str | None = None
-    description: str | None = None
-    pricing: ModelPricing | None = None
 
 
-class ModelsResponse(BaseModel):
-    """Response for /v1/models endpoint."""
-    object: str = "list"
-    data: list[ModelInfo]
 
 
-class ModelSwitchRequest(BaseModel):
-    """Request to switch the active model."""
-    model: str = Field(..., description="Model alias to switch to")
 
 
-class ModelSwitchResponse(BaseModel):
-    """Response from model switch."""
-    success: bool
-    message: str
-    previous_model: str | None = None
-    new_model: str | None = None
 
 
-class ModelDetail(BaseModel):
-    """Detailed model information."""
-    id: str
-    type: str | None = None
-    model_id: str | None = None
-    description: str | None = None
-    current: bool = False
 
 
 # =============================================================================
 # Model Definition CRUD Schemas
 # =============================================================================
 
-class ModelDefinitionResponse(BaseModel):
-    """Response payload for a single model definition."""
-    alias: str
-    type: str
-    model_id: str | None = None
-    repo_id: str | None = None
-    filename: str | None = None
-    description: str | None = None
-    extra: dict[str, Any] | None = None
-    created_at: datetime | None = None
-    updated_at: datetime | None = None
 
 
-class ModelDefinitionListResponse(BaseModel):
-    """Response for listing model definitions."""
-    models: list[ModelDefinitionResponse]
-    total_count: int
 
 
-class ModelDefinitionUpsertRequest(BaseModel):
-    """Request to create or update a model definition."""
-    type: str = Field(..., description="Model type: openai, codex, ollama, gguf, huggingface, grok, openclaw")
-    model_id: str | None = Field(default=None, description="Model ID (for openai/codex/ollama/grok/openclaw)")
-    repo_id: str | None = Field(default=None, description="HuggingFace repo ID (for gguf/huggingface)")
-    filename: str | None = Field(default=None, description="GGUF filename")
-    description: str | None = None
-    extra: dict[str, Any] | None = Field(
-        default=None,
-        description="Optional fields: chat_format, context_window, max_tokens, n_gpu_layers, tool_support, tool_format",
-    )
 
 
-class ModelDefinitionDeleteResponse(BaseModel):
-    """Response from deleting a model definition."""
-    success: bool
-    alias: str
-    message: str
 
 
-class ModelDefinitionSeedRequest(BaseModel):
-    """Request to seed DB models from current YAML config."""
-    overwrite: bool = Field(default=False, description="If true, overwrite existing DB entries with YAML values")
 
 
-class ModelDefinitionSeedResponse(BaseModel):
-    """Response from seeding model definitions."""
-    seeded: int
-    total_yaml: int
-    message: str
 
 
 class BotInfo(BaseModel):
@@ -398,92 +317,22 @@ class PersonaUpdateRequest(BaseModel):
     body: str | None = None
 
 
-class TaskSubmitRequest(BaseModel):
-    """Request to submit a background task."""
-    task_type: str
-    payload: dict[str, Any]
-    bot_id: str | None = None  # Will use config DEFAULT_BOT if not specified
-    user_id: str  # Required - must be passed explicitly
-    priority: int = 0
 
 
-class TaskSubmitResponse(BaseModel):
-    """Response after submitting a task."""
-    task_id: str
-    status: str = "pending"
 
 
-class TaskStatusResponse(BaseModel):
-    """Response for task status."""
-    task_id: str
-    status: str
-    result: Any | None = None
-    error: str | None = None
-    processing_time_ms: float | None = None
 
 
-class TaskListItem(BaseModel):
-    """A task entry for task listing."""
-    task_id: str
-    status: str
-    task_type: str | None = None
-    bot_id: str | None = None
-    user_id: str | None = None
-    priority: int | None = None
-    created_at: str | None = None
-    completed_at: str | None = None
-    processing_time_ms: float | None = None
-    error: str | None = None
 
 
-class TaskListResponse(BaseModel):
-    """Response for listing tasks."""
-    tasks: list[TaskListItem]
-    total_count: int
-    filters: dict[str, Any] = Field(default_factory=dict)
 
 
-class ScheduledJobInfo(BaseModel):
-    """A scheduled job with latest run summary."""
-    id: str
-    job_type: str
-    bot_id: str
-    enabled: bool
-    interval_minutes: int
-    last_run_at: datetime | None = None
-    next_run_at: datetime | None = None
-    created_at: datetime | None = None
-    last_status: str | None = None
-    last_duration_ms: int | None = None
-    last_error: str | None = None
 
 
-class ScheduledJobsResponse(BaseModel):
-    """Response for listing scheduled jobs."""
-    jobs: list[ScheduledJobInfo]
-    total_count: int
-    filters: dict[str, Any] = Field(default_factory=dict)
 
 
-class JobRunInfo(BaseModel):
-    """A single scheduler job run record."""
-    id: str
-    job_id: str
-    job_type: str | None = None
-    bot_id: str
-    status: str
-    started_at: datetime
-    finished_at: datetime | None = None
-    duration_ms: int | None = None
-    error_message: str | None = None
-    result: Any | None = None
 
 
-class JobRunsResponse(BaseModel):
-    """Response for listing scheduler job run history."""
-    runs: list[JobRunInfo]
-    total_count: int
-    filters: dict[str, Any] = Field(default_factory=dict)
 
 
 class TurnLogListItem(BaseModel):
@@ -657,327 +506,63 @@ class ServiceStatusResponse(BaseModel):
 # Full System Status (mirrors core.status.SystemStatus)
 # =============================================================================
 
-class ServiceInfoSchema(BaseModel):
-    """LLM service status."""
-    available: bool = False
-    healthy: bool = False
-    uptime_seconds: float | None = None
-    current_model: str | None = None
-    default_model: str | None = None
-    default_bot: str | None = None
-    tasks_processed: int = 0
-    tasks_pending: int = 0
 
 
-class MemoryInfoSchema(BaseModel):
-    """Database and memory subsystem status."""
-    postgres_connected: bool = False
-    postgres_host: str | None = None
-    postgres_error: str | None = None
-    messages_count: int = 0
-    memories_count: int = 0
-    pgvector_available: bool = False
-    embeddings_available: bool = False
 
 
-class ModelStatusInfoSchema(BaseModel):
-    """Current model configuration details."""
-    alias: str
-    type: str = "unknown"
-    max_tokens: int = 0
-    max_tokens_source: str = "global"
-    context_window: int | None = None
-    context_source: str | None = None
-    gpu_name: str | None = None
-    vram_total_gb: float | None = None
-    vram_free_gb: float | None = None
-    vram_detection_method: str | None = None
-    n_gpu_layers: str | None = None
-    gpu_layers_source: str | None = None
-    native_context_limit: int | None = None
 
 
-class DependencyInfoSchema(BaseModel):
-    """Optional dependency availability."""
-    cuda_version: str | None = None
-    llama_cpp_available: bool = False
-    llama_cpp_gpu: bool | None = None
-    hf_hub_available: bool = False
-    torch_available: bool = False
-    openai_key_set: bool = False
-    newsapi_key_set: bool = False
-    search_provider: str | None = None
-    embeddings_available: bool = False
 
 
-class McpInfoSchema(BaseModel):
-    """llm-bawt MCP server status."""
-    mode: str = "embedded"
-    status: str = "up"
-    url: str | None = None
-    http_status: int | None = None
 
 
-class BotSummarySchema(BaseModel):
-    """Minimal bot info for the status display."""
-    slug: str
-    name: str
-    is_default: bool = False
 
 
-class ConfigInfoSchema(BaseModel):
-    """System configuration summary."""
-    version: str = SERVICE_VERSION
-    mode: str = "direct"
-    service_url: str | None = None
-    environment: str = "local"
-    bot_name: str = ""
-    bot_slug: str = ""
-    model_alias: str | None = None
-    model_source: str | None = None
-    user_id: str | None = None
-    all_bots: list[BotSummarySchema] = []
-    models_defined: int = 0
-    models_service: int | None = None
-    scheduler_enabled: bool = False
-    scheduler_interval: int = 0
-    ha_mcp_enabled: bool = False
-    ha_mcp_url: str | None = None
-    ha_native_mcp_url: str | None = None
-    ha_native_mcp_tools: int = 0
-    bind_host: str = "0.0.0.0"
 
 
-class SystemStatusResponse(BaseModel):
-    """Full system status — mirrors ``core.status.SystemStatus``."""
-    config: ConfigInfoSchema
-    service: ServiceInfoSchema
-    mcp: McpInfoSchema
-    model: ModelStatusInfoSchema | None = None
-    memory: MemoryInfoSchema
-    dependencies: DependencyInfoSchema
 
 
-class HealthResponse(BaseModel):
-    """Simple health check response."""
-    status: str = "ok"
-    version: str = SERVICE_VERSION
 
 
-class HistoryMessage(BaseModel):
-    """A message in the conversation history.
-
-    ``attachments`` (TASK-226) carries the resolved media-asset envelopes
-    described in :mod:`llm_bawt.media.serializers`. Always present so
-    frontend renderers can iterate unconditionally; an empty list means
-    the row has no media. The list is hydrated by the
-    ``/v1/history`` route only — DB layers strip it from the canonical
-    ``get_messages`` path because LLM-prep code doesn't want it.
-    """
-    id: str | None = None
-    role: str
-    content: str
-    timestamp: float
-    attachments: list[dict] = []
-    # TASK-301: persisted model reasoning ("thinking"), hydrated by the
-    # /v1/history route only (display-only; never in LLM context). None when the
-    # row carried no reasoning (user rows, pre-feature assistant rows).
-    reasoning: str | None = None
 
 
-class HistoryResponse(BaseModel):
-    """Response for conversation history.
-
-    Pagination flags describe the loaded window's boundaries against the
-    bot's full timeline:
-
-    - ``has_more`` / ``has_older``: more messages exist *before* the
-      oldest row returned. The two aliases are kept in sync — ``has_more``
-      pre-dates the deep-link work and is the field every legacy reader
-      checks; ``has_older`` is the explicit name used by the deep-link
-      ``/v1/history/around`` window endpoint and `?after=` forward paging.
-    - ``has_newer``: more messages exist *after* the newest row returned.
-      Newly added for deep-link windows and forward pagination; defaults
-      ``False`` so legacy backward-only pagination behaves unchanged.
-    - ``oldest_timestamp`` / ``newest_timestamp``: window boundaries used
-      by the frontend as cursors for paginating in either direction.
-    """
-    bot_id: str
-    messages: list[HistoryMessage]
-    total_count: int
-    has_more: bool = False
-    has_older: bool = False
-    has_newer: bool = False
-    oldest_timestamp: float | None = None
-    newest_timestamp: float | None = None
-    anchor_id: str | None = None
 
 
-class HistorySearchResponse(BaseModel):
-    """Response for per-bot history search."""
-    bot_id: str
-    query: str
-    messages: list[HistoryMessage]
-    total_count: int
-    has_more: bool = False
-    has_older: bool = False
-    oldest_timestamp: float | None = None
-    newest_timestamp: float | None = None
 
 
-class HistorySearchAllMessage(BaseModel):
-    """A single hit from a cross-bot full-text message search.
-
-    Mirrors :class:`HistoryMessage` plus the ``bot_id`` source attribution
-    (so the frontend knows which bot's chat to deep-link into) and the FTS
-    ``rank`` score (so the dropdown can re-rank or filter low-confidence
-    matches). Carries no attachments — cross-bot search is content-only by
-    design; the attachment hydration round-trip only fires after the user
-    follows the link into the per-bot chat surface.
-    """
-    id: str
-    role: str
-    content: str
-    timestamp: float
-    bot_id: str
-    rank: float
 
 
-class HistorySearchAllResponse(BaseModel):
-    """Response for cross-bot history search.
-
-    ``messages`` are pre-sorted by FTS rank descending then timestamp
-    descending (most recent breaks ties). ``total_count`` matches the
-    length of the returned list; pagination cursors are not used because
-    the storage layer applies the limit before merging across bots.
-    """
-    query: str
-    messages: list[HistorySearchAllMessage]
-    total_count: int
 
 
-class HistoryClearResponse(BaseModel):
-    """Response for clearing history."""
-    success: bool
-    message: str
-    deleted_count: int = 0
 
 
 # Memory Management Models
-class MemoryItem(BaseModel):
-    """A memory item."""
-    id: str | None = None
-    content: str
-    importance: float = 0.5
-    relevance: float | None = None
-    tags: list[str] = []
-    created_at: float | str | None = None
-    last_accessed: float | str | None = None
-    access_count: int = 0
-    source_message_ids: list[str] = []
 
 
-class MemorySearchRequest(BaseModel):
-    """Request for memory search."""
-    query: str
-    method: str = "all"  # text, embedding, high-importance, all
-    limit: int = 10
-    min_importance: float = 0.0
-    bot_id: str | None = None
 
 
-class MemorySearchResponse(BaseModel):
-    """Response for memory search."""
-    bot_id: str
-    method: str
-    query: str
-    results: list[MemoryItem]
-    total_count: int
 
 
-class MemoryStatsResponse(BaseModel):
-    """Memory statistics."""
-    bot_id: str
-    messages: dict
-    memories: dict
 
 
-class MemoryForgetRequest(BaseModel):
-    """Request to forget messages."""
-    count: int | None = None  # forget recent N
-    minutes: int | None = None  # forget last N minutes
-    message_id: str | None = None  # forget specific message by ID
 
 
-class MemoryForgetResponse(BaseModel):
-    """Response for forget operation."""
-    success: bool
-    messages_ignored: int
-    memories_deleted: int
-    message: str
 
 
-class MemoryRestoreResponse(BaseModel):
-    """Response for restore operation."""
-    success: bool
-    messages_restored: int
-    message: str
 
 
-class MemoryDeleteResponse(BaseModel):
-    """Response for deleting a specific memory."""
-    success: bool
-    memory_id: str
-    message: str
 
 
-class MemoryUpdateRequest(BaseModel):
-    """Request payload for updating a memory."""
-    content: str | None = None
-    importance: float | None = Field(default=None, ge=0.0, le=1.0)
-    tags: list[str] | None = None
 
 
-class MessagePreview(BaseModel):
-    """Preview of a message for confirmation."""
-    id: str  # UUID or int, stored as string
-    role: str
-    content: str
-    timestamp: float | None = None
 
 
-class MessagesPreviewResponse(BaseModel):
-    """Response with message previews."""
-    bot_id: str
-    messages: list[MessagePreview]
-    total_count: int
 
 
-class RegenerateEmbeddingsResponse(BaseModel):
-    """Response for regenerate embeddings operation."""
-    success: bool
-    updated: int
-    failed: int
-    embedding_dim: int | None = None
-    message: str
 
 
-class ConsolidateRequest(BaseModel):
-    """Request for memory consolidation."""
-    dry_run: bool = False
-    similarity_threshold: float | None = None
 
 
-class ConsolidateResponse(BaseModel):
-    """Response for consolidation operation."""
-    success: bool
-    dry_run: bool
-    clusters_found: int
-    clusters_merged: int
-    memories_consolidated: int
-    new_memories_created: int
-    errors: list[str] = []
-    message: str
 
 
 class RawCompletionRequest(BaseModel):
@@ -1001,59 +586,16 @@ class RawCompletionResponse(BaseModel):
 
 
 # History Summarization Models
-class SummarizableSession(BaseModel):
-    """A session eligible for summarization."""
-    start_timestamp: float
-    end_timestamp: float
-    start_time: str
-    end_time: str
-    message_count: int
-    first_message: str
-    last_message: str
 
 
-class SummarizePreviewResponse(BaseModel):
-    """Response for summarization preview."""
-    bot_id: str
-    sessions: list[SummarizableSession]
-    total_messages: int
 
 
-class SummarizeResponse(BaseModel):
-    """Response for summarization operation."""
-    success: bool
-    sessions_summarized: int
-    messages_summarized: int
-    sessions_targeted: int | None = None
-    summaries_replaced: int | None = None
-    summaries_purged: int | None = None
-    errors: list[str] = []
 
 
-class SummaryInfo(BaseModel):
-    """Information about a single summary."""
-    id: str
-    content: str
-    timestamp: float
-    session_start_time: str | None
-    session_end_time: str | None
-    message_count: int
-    method: str
 
 
-class ListSummariesResponse(BaseModel):
-    """Response for listing summaries."""
-    bot_id: str
-    summaries: list[SummaryInfo]
-    total_count: int
 
 
-class DeleteSummaryResponse(BaseModel):
-    """Response for deleting a summary."""
-    success: bool
-    summary_id: str | None = None
-    messages_restored: int = 0
-    detail: str | None = None
 
 
 # Profile Attribute Models
@@ -1337,3 +879,71 @@ class PromptTemplateSeedResponse(BaseModel):
 # were used only by the deleted /v1/avatar/animations routes. The catalog now
 # lives in bawthub Prisma. Per-request animation entries use the lighter
 # ChatRequestAnimation defined near the top of this module.
+
+
+# TASK-557: model/bot-catalog + history/memory schema domains were split
+# into sibling modules. Re-imported here so `from ..schemas import X` is unchanged.
+from .schemas_tasks import (  # noqa: E402,F401
+    TaskSubmitRequest,
+    TaskSubmitResponse,
+    TaskStatusResponse,
+    TaskListItem,
+    TaskListResponse,
+    ScheduledJobInfo,
+    ScheduledJobsResponse,
+    JobRunInfo,
+    JobRunsResponse,
+)
+from .schemas_status import (  # noqa: E402,F401
+    ServiceInfoSchema,
+    MemoryInfoSchema,
+    ModelStatusInfoSchema,
+    DependencyInfoSchema,
+    McpInfoSchema,
+    BotSummarySchema,
+    ConfigInfoSchema,
+    SystemStatusResponse,
+    HealthResponse,
+)
+from .schemas_models import (  # noqa: E402,F401
+    ModelPricing,
+    ModelInfo,
+    ModelsResponse,
+    ModelSwitchRequest,
+    ModelSwitchResponse,
+    ModelDetail,
+    ModelDefinitionResponse,
+    ModelDefinitionListResponse,
+    ModelDefinitionUpsertRequest,
+    ModelDefinitionDeleteResponse,
+    ModelDefinitionSeedRequest,
+    ModelDefinitionSeedResponse,
+)
+from .schemas_history_memory import (  # noqa: E402,F401
+    HistoryMessage,
+    HistoryResponse,
+    HistorySearchResponse,
+    HistorySearchAllMessage,
+    HistorySearchAllResponse,
+    HistoryClearResponse,
+    MemoryItem,
+    MemorySearchRequest,
+    MemorySearchResponse,
+    MemoryStatsResponse,
+    MemoryForgetRequest,
+    MemoryForgetResponse,
+    MemoryRestoreResponse,
+    MemoryDeleteResponse,
+    MemoryUpdateRequest,
+    MessagePreview,
+    MessagesPreviewResponse,
+    RegenerateEmbeddingsResponse,
+    ConsolidateRequest,
+    ConsolidateResponse,
+    SummarizableSession,
+    SummarizePreviewResponse,
+    SummarizeResponse,
+    SummaryInfo,
+    ListSummariesResponse,
+    DeleteSummaryResponse,
+)
