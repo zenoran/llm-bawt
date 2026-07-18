@@ -1,0 +1,642 @@
+from __future__ import annotations
+
+import asyncio
+import json
+import logging
+import os
+import re
+import time
+import uuid
+from collections.abc import AsyncIterable
+from datetime import datetime, timezone
+from pathlib import Path
+
+import httpx
+from claude_agent_sdk import ClaudeAgentOptions, ClaudeSDKClient, StreamEvent
+from claude_agent_sdk.types import (
+    AssistantMessage,
+    HookMatcher,
+    MirrorErrorMessage,
+    PermissionResultAllow,
+    PermissionResultDeny,
+    ResultMessage,
+    SystemMessage,
+    TaskNotificationMessage,
+    TaskProgressMessage,
+    TaskStartedMessage,
+    TaskUpdatedMessage,
+    ToolPermissionContext,
+    ToolResultBlock,
+    ToolUseBlock,
+    UserMessage,
+)
+
+from agent_bridge.approval import (
+    ApprovalDecision,
+    PolicyAction,
+    PolicyBundle,
+    evaluate as evaluate_policies,
+)
+from agent_bridge.events import AgentEvent, AgentEventKind, synthesize_event_id
+from agent_bridge.publisher import COMMANDS_STREAM, RedisPublisher
+from agent_bridge.session_queue import SessionQueue
+from claude_code_bridge.tool_events import normalize_tool_result
+from claude_code_bridge.tool_policy import effective_disallowed_tools
+
+from ._bridge_helpers import (
+    SESSION_PREFIX,
+    SEED_SETTING_KEY,
+    CONTINUITY_SETTING_KEY,
+    MCP_TOOL_CONTEXT_KEY,
+    _MCP_TOOL_CONTEXT_FALLBACK,
+    _SEED_CLI_VERSION,
+    _SEED_SANITIZE_RE,
+    _XAI_RATES,
+    _XAI_DEFAULT_RATES,
+    _CREDENTIALS_PATH,
+    _OAUTH_TOKEN_URL,
+    _OAUTH_CLIENT_ID,
+    _REFRESH_BUFFER_MS,
+    _bot_slug_from_session_key,
+    _fmt_tokens,
+    _usage_input_total,
+    _proxy_context_window,
+    _estimate_proxy_cost_usd,
+    _pick_iteration_usage,
+    _read_latest_compact_metadata,
+    _load_oauth_bundle,
+    _save_oauth_bundle,
+    _token_expired_or_stale,
+    _refresh_oauth_bundle,
+    _get_fresh_oauth_token,
+    _is_cli_crash,
+    _is_auth_failure,
+)
+
+logger = logging.getLogger("claude_code_bridge.bridge")
+
+
+class ClaudeApprovalMixin:
+    """Claude tool approval gate + permission hooks (TASK-555).
+
+    Split out of ``ClaudeCodeBridge`` (TASK-555); composed back via
+    inheritance so ``self.*`` state and sibling-mixin methods resolve
+    on the assembled instance.
+    """
+
+    async def _get_policy_bundle(self) -> PolicyBundle:
+        """Return the approval-policy bundle, TTL-cached, fetched from the app.
+
+        Conditional on the cached etag so an unchanged bundle costs one cheap
+        round-trip and no re-parse. On any fetch error the cached bundle is
+        kept; if there's no cache yet, an empty bundle is returned (no policies
+        → default-allow), which is the fail-open posture.
+        """
+        now = time.monotonic()
+        if (
+            self._policy_bundle is not None
+            and (now - self._policy_bundle_fetched_at) < self._policy_bundle_ttl
+        ):
+            return self._policy_bundle
+        if not self._app_api_url:
+            self._policy_bundle = self._policy_bundle or PolicyBundle(version=1, etag="", policies=[])
+            self._policy_bundle_fetched_at = now
+            return self._policy_bundle
+        try:
+            params = {}
+            if self._policy_bundle is not None and self._policy_bundle.etag:
+                params["etag"] = self._policy_bundle.etag
+            async with httpx.AsyncClient(timeout=5) as client:
+                resp = await client.get(
+                    f"{self._app_api_url}/v1/tool-approval-policies/bundle", params=params
+                )
+                resp.raise_for_status()
+                data = resp.json()
+            self._policy_bundle_fetched_at = now
+            self._policy_fetch_ok = True
+            if data.get("unchanged"):
+                return self._policy_bundle  # type: ignore[return-value]
+            self._policy_bundle = PolicyBundle.from_dict(data)
+            logger.debug(
+                "Fetched approval bundle: etag=%s policies=%d",
+                self._policy_bundle.etag, len(self._policy_bundle.policies),
+            )
+            return self._policy_bundle
+        except Exception as e:  # noqa: BLE001
+            # Keep the last-known bundle; only warn occasionally to avoid spam.
+            logger.warning("Approval bundle fetch failed (%s); using cached/empty", e)
+            self._policy_bundle_fetched_at = now  # back off until next TTL
+            self._policy_fetch_ok = False
+            return self._policy_bundle or PolicyBundle(version=1, etag="", policies=[])
+
+    def _grant_approval(self, grant_key: str, ttl_seconds: float) -> None:
+        if not grant_key:
+            return
+        self._approval_grants[grant_key] = time.monotonic() + max(1.0, ttl_seconds)
+        logger.info("Approval grant stored: %s (ttl=%ss)", grant_key[:12], int(ttl_seconds))
+
+    def _consume_grant(self, grant_key: str) -> bool:
+        """Pop a live grant for this key. Prunes expired grants as a side effect."""
+        now = time.monotonic()
+        # prune
+        expired = [k for k, exp in self._approval_grants.items() if exp <= now]
+        for k in expired:
+            self._approval_grants.pop(k, None)
+        exp = self._approval_grants.get(grant_key)
+        if exp is None or exp <= now:
+            return False
+        self._approval_grants.pop(grant_key, None)
+        return True
+
+    def _decide_approval(self, tool_name: str, tool_input: dict) -> ApprovalDecision:
+        """Pure policy decision for the current cached bundle (TASK-292).
+
+        Isolated from the SDK/HTTP glue so it's unit-testable: inject a bundle
+        and grants, assert the action. Does NOT consume grants (the caller does,
+        only when it's actually going to allow).
+        """
+        bundle = self._policy_bundle or PolicyBundle(version=1, etag="", policies=[])
+        return evaluate_policies(
+            bundle.policies, self._backend_name, tool_name,
+            tool_input if isinstance(tool_input, dict) else {},
+        )
+
+    async def _evaluate_tool_gate(
+        self,
+        tool_name: str,
+        tool_input: dict,
+        ctx: ToolPermissionContext,
+        request_id: str,
+        session_key: str,
+        seq_holder: list[int],
+    ):
+        """Permission decision for a non-question tool (TASK-292).
+
+        Returns a PermissionResult. On require_approval (no live grant) emits an
+        APPROVAL_REQUIRED event and returns a deferred deny so the turn ends
+        cleanly — the user's decision arrives as a continuation turn.
+        """
+        await self._get_policy_bundle()
+
+        # Fail-closed: the app is unreachable AND the operator chose safety over
+        # availability → deny every tool until policies can be fetched again.
+        if self._approval_fail_closed and not self._policy_fetch_ok:
+            logger.warning(
+                "Approval fail-closed: policies unreachable, denying %s", tool_name
+            )
+            return PermissionResultDeny(
+                message=(
+                    "[Tool execution is paused: the approval-policy service is "
+                    "unreachable and this bridge is configured fail-closed. "
+                    "Acknowledge and end your turn.]"
+                ),
+                interrupt=False,
+            )
+
+        decision = self._decide_approval(tool_name, tool_input)
+
+        if decision.action is PolicyAction.ALLOW:
+            return PermissionResultAllow()
+
+        if decision.action is PolicyAction.DENY:
+            logger.info(
+                "Tool DENIED by policy %s: %s %r",
+                getattr(decision.policy, "id", "?"), tool_name, decision.subject[:80],
+            )
+            return PermissionResultDeny(
+                message=(
+                    f"[This action is blocked by an approval policy and cannot be "
+                    f"run: {decision.subject[:200]}. Do not retry it. Continue "
+                    f"without it or explain what you need.]"
+                ),
+                interrupt=False,
+            )
+
+        # ---- require_approval ----
+        if self._consume_grant(decision.grant_key):
+            logger.info(
+                "Tool ALLOWED by prior approval grant: %s %r",
+                tool_name, decision.subject[:80],
+            )
+            # TASK-305: mark this re-attempt as pre-approved so the UI can show
+            # the gold/lock affordance on the exact card that ran with prior
+            # authorization. The bridge is the single source of truth for this.
+            self._emit_tool_preapproved(
+                decision, tool_name, (ctx.tool_use_id or "").strip(),
+                request_id, session_key, seq_holder,
+            )
+            return PermissionResultAllow()
+
+        tool_use_id = (ctx.tool_use_id or "").strip()
+        if not tool_use_id:
+            # No id → app can't key a persistent request; defer cleanly anyway.
+            logger.warning(
+                "Approval-gated %s with no tool_use_id — deferring without persistence",
+                tool_name,
+            )
+            return PermissionResultDeny(message=self._APPROVAL_PENDING_ACK, interrupt=False)
+
+        self._emit_approval_required(
+            decision, tool_name, tool_input, tool_use_id,
+            request_id, session_key, seq_holder,
+        )
+        return PermissionResultDeny(message=self._APPROVAL_PENDING_ACK, interrupt=False)
+
+    def _emit_approval_required(
+        self,
+        decision: ApprovalDecision,
+        tool_name: str,
+        tool_input: dict,
+        tool_use_id: str,
+        request_id: str,
+        session_key: str,
+        seq_holder: list[int],
+    ) -> None:
+        """Publish an APPROVAL_REQUIRED event for a gated tool (TASK-292).
+
+        Single source of truth for the approval-request event payload, shared by
+        the can_use_tool gate (_evaluate_tool_gate) and the PreToolUse hook gate
+        (_evaluate_tool_gate_hook). Best-effort: a publish failure is logged,
+        never raised — the caller still ends the turn with the pending-ack.
+        """
+        try:
+            seq_holder[0] += 1
+            self._publish_event(
+                request_id, session_key, seq_holder[0],
+                kind=AgentEventKind.APPROVAL_REQUIRED,
+                tool_name=tool_name,
+                tool_arguments=tool_input if isinstance(tool_input, dict) else {},
+                tool_use_id=tool_use_id,
+                extra_raw={
+                    "policy_id": getattr(decision.policy, "id", None),
+                    "severity": decision.severity.value,
+                    "category": getattr(decision.policy, "category", None),
+                    "subject": decision.subject,
+                    "label": decision.label,
+                    "prompt": decision.prompt,
+                    "grant_key": decision.grant_key,
+                    "action": decision.action.value,
+                },
+            )
+        except Exception:
+            logger.exception(
+                "Failed to publish APPROVAL_REQUIRED for tool_use_id=%s", tool_use_id,
+            )
+
+        logger.info(
+            "Tool gated (approval required): %s tool_use_id=%s policy=%s — turn ends",
+            tool_name, tool_use_id, getattr(decision.policy, "id", "?"),
+        )
+
+    def _emit_tool_preapproved(
+        self,
+        decision: ApprovalDecision,
+        tool_name: str,
+        tool_use_id: str,
+        request_id: str,
+        session_key: str,
+        seq_holder: list[int],
+    ) -> None:
+        """Publish a TOOL_PREAPPROVED event for a re-attempt that consumed a grant.
+
+        Single source of truth for the pre-approved marker (TASK-305), shared by
+        both gate paths (can_use_tool and the PreToolUse hook). The bridge is the
+        only place that knows a tool ran because a one-shot grant was consumed —
+        the client must not re-derive it. Best-effort: a publish failure is
+        logged, never raised — the tool still runs.
+        """
+        if not tool_use_id:
+            return
+        try:
+            seq_holder[0] += 1
+            self._publish_event(
+                request_id, session_key, seq_holder[0],
+                kind=AgentEventKind.TOOL_PREAPPROVED,
+                tool_name=tool_name,
+                tool_use_id=tool_use_id,
+                extra_raw={
+                    "policy_id": getattr(decision.policy, "id", None),
+                    "severity": decision.severity.value,
+                    "grant_key": decision.grant_key,
+                },
+            )
+        except Exception:
+            logger.exception(
+                "Failed to publish TOOL_PREAPPROVED for tool_use_id=%s", tool_use_id,
+            )
+
+    @staticmethod
+    def _hook_deny(reason: str) -> dict:
+        """PreToolUse hook output that blocks a tool with a model-visible reason.
+
+        The reason is surfaced to the model as the tool's failure text (verified
+        live: the model reports the permissionDecisionReason as the block error).
+        """
+        return {
+            "hookSpecificOutput": {
+                "hookEventName": "PreToolUse",
+                "permissionDecision": "deny",
+                "permissionDecisionReason": reason,
+            }
+        }
+
+    async def _evaluate_tool_gate_hook(
+        self,
+        tool_name: str,
+        tool_input: dict,
+        tool_use_id: str,
+        request_id: str,
+        session_key: str,
+        seq_holder: list[int],
+    ) -> dict:
+        """Approval gate as a PreToolUse hook decision (TASK-292).
+
+        The live gate under permission_mode="bypassPermissions": the SDK only
+        consults PreToolUse hooks (never can_use_tool) for regular tools in that
+        mode. Mirrors _evaluate_tool_gate's policy logic but speaks the hook
+        control plane. Returns a hook JSON output dict:
+
+          ALLOW            → {} (no decision; tool proceeds normally)
+          DENY             → "deny" + block reason
+          REQUIRE_APPROVAL → consume a live one-shot grant → {} (allow); else
+                             emit APPROVAL_REQUIRED and "deny" with the
+                             pending-ack reason so the turn ends cleanly and the
+                             user's decision arrives as a continuation turn
+                             (same model as TASK-269 / the can_use_tool gate).
+        """
+        await self._get_policy_bundle()
+
+        # Fail-closed: app unreachable AND operator chose safety → deny all.
+        if self._approval_fail_closed and not self._policy_fetch_ok:
+            logger.warning(
+                "Approval fail-closed: policies unreachable, denying %s", tool_name
+            )
+            return self._hook_deny(
+                "[Tool execution is paused: the approval-policy service is "
+                "unreachable and this bridge is configured fail-closed. "
+                "Acknowledge and end your turn.]"
+            )
+
+        decision = self._decide_approval(tool_name, tool_input)
+
+        if decision.action is PolicyAction.ALLOW:
+            return {}
+
+        if decision.action is PolicyAction.DENY:
+            logger.info(
+                "Tool DENIED by policy %s: %s %r",
+                getattr(decision.policy, "id", "?"), tool_name, decision.subject[:80],
+            )
+            return self._hook_deny(
+                f"[This action is blocked by an approval policy and cannot be "
+                f"run: {decision.subject[:200]}. Do not retry it. Continue "
+                f"without it or explain what you need.]"
+            )
+
+        # ---- require_approval ----
+        if self._consume_grant(decision.grant_key):
+            logger.info(
+                "Tool ALLOWED by prior approval grant: %s %r",
+                tool_name, decision.subject[:80],
+            )
+            # TASK-305: mark this re-attempt as pre-approved (gold/lock card).
+            self._emit_tool_preapproved(
+                decision, tool_name, (tool_use_id or "").strip(),
+                request_id, session_key, seq_holder,
+            )
+            return {}
+
+        tool_use_id = (tool_use_id or "").strip()
+        if not tool_use_id:
+            # No id → app can't key a persistent request; defer cleanly anyway.
+            logger.warning(
+                "Approval-gated %s with no tool_use_id — deferring without persistence",
+                tool_name,
+            )
+            return self._hook_deny(self._APPROVAL_PENDING_ACK)
+
+        self._emit_approval_required(
+            decision, tool_name, tool_input, tool_use_id,
+            request_id, session_key, seq_holder,
+        )
+        return self._hook_deny(self._APPROVAL_PENDING_ACK)
+
+    async def _handle_approval_grant(self, fields: dict, msg_id: str, async_redis) -> None:
+        """Store a one-shot allow from an approval.grant command, then ACK."""
+        try:
+            grant_key = (fields.get("grant_key") or "").strip()
+            ttl = float(fields.get("ttl_seconds") or "600")
+            if grant_key:
+                self._grant_approval(grant_key, ttl)
+        except Exception:
+            logger.exception("Failed to handle approval.grant")
+        finally:
+            try:
+                await async_redis.xack(COMMANDS_STREAM, "claude-code-bridge", msg_id)
+            except Exception:
+                pass
+
+    async def _approval_reload_listener(self, redis_url: str) -> None:
+        """Drop the cached bundle on an approval:policies:reload broadcast.
+
+        Best-effort: any failure is logged and retried; it never crashes the
+        bridge. Lets an admin edit take effect without waiting out the TTL.
+        """
+        import redis.asyncio as aioredis
+
+        while True:
+            client = None
+            pubsub = None
+            try:
+                # socket_timeout=None: pubsub.listen() is a long-lived blocking
+                # read; redis-py 8.0's default 5s socket timeout would fire on
+                # every idle interval and spin this loop. Bound only the connect.
+                # (Mirrors _command_listener's XREADGROUP handling.)
+                client = aioredis.from_url(
+                    redis_url,
+                    decode_responses=True,
+                    socket_timeout=None,
+                    socket_connect_timeout=5,
+                    health_check_interval=30,
+                )
+                pubsub = client.pubsub()
+                await pubsub.subscribe("approval:policies:reload")
+                logger.info("Approval reload listener subscribed")
+                async for msg in pubsub.listen():
+                    if msg.get("type") != "message":
+                        continue
+                    self._policy_bundle_fetched_at = 0.0  # force refetch next call
+                    logger.info("Approval bundle cache invalidated by reload broadcast")
+            except asyncio.CancelledError:
+                # Clean shutdown — release the pubsub connection.
+                if pubsub is not None:
+                    try:
+                        await pubsub.aclose()
+                    except Exception:
+                        pass
+                if client is not None:
+                    try:
+                        await client.aclose()
+                    except Exception:
+                        pass
+                raise
+            except Exception:
+                logger.warning("Approval reload listener error; retrying in 5s", exc_info=True)
+                # Close the failed client so retries don't leak connections.
+                if pubsub is not None:
+                    try:
+                        await pubsub.aclose()
+                    except Exception:
+                        pass
+                if client is not None:
+                    try:
+                        await client.aclose()
+                    except Exception:
+                        pass
+                await asyncio.sleep(5)
+
+    @staticmethod
+    def _is_ask_user_question(tool_name: str) -> bool:
+        """Match AskUserQuestion regardless of MCP namespacing.
+
+        The SDK built-in is just ``AskUserQuestion``, but if it ever shows up
+        prefixed by an MCP server (``mcp__<server>__AskUserQuestion``) we want
+        to intercept that too.
+        """
+        if not tool_name:
+            return False
+        tail = tool_name.rsplit("__", 1)[-1]
+        return tail == "AskUserQuestion"
+
+    def _make_can_use_tool(
+        self,
+        *,
+        request_id: str,
+        session_key: str,
+        seq_holder: list[int],
+    ):
+        """Build the per-run can_use_tool callback bound to this turn.
+
+        TASK-269 — deferred/continuation model.  AskUserQuestion does NOT
+        block the SDK turn.  We emit an AWAIT_TOOL_RESULT event (the app
+        persists the question and marks the turn end_reason="question") and
+        immediately return a synthetic "deferred" ack via
+        PermissionResultDeny.message.  The model reads that as the tool's
+        output, acknowledges, and ends its turn cleanly — no Future, no
+        wait_for, no 30-minute ceiling, no session lock held open.  The user's
+        real answer arrives later as a brand-new continuation turn.
+
+        Why DENY and not ALLOW: an ALLOW makes the SDK actually execute the
+        built-in AskUserQuestion, which crashes in this headless context
+        ("undefined is not an object (evaluating 'H.map')" — no interactive
+        widget renderer) and sends the model into a retry loop.  A DENY with a
+        message is the clean channel to feed text back as the tool result.
+        Everything else gets the SDK's default allow.
+        """
+
+        async def can_use_tool(
+            tool_name: str,
+            tool_input: dict,
+            ctx: ToolPermissionContext,
+        ):
+            if not self._is_ask_user_question(tool_name):
+                # TASK-292: the approval gate moved to the PreToolUse hook
+                # (_make_pre_tool_use_hook). Under bypassPermissions the SDK
+                # doesn't call can_use_tool for regular tools anyway, and we want
+                # EXACTLY ONE gate to avoid double-emitting APPROVAL_REQUIRED.
+                # So allow here; the hook is the sole policy enforcement point.
+                return PermissionResultAllow()
+
+            # QDIAG (TASK-413): the callback fired for an AskUserQuestion. If the
+            # model emitted the block (see "QDIAG model-emitted") but this line is
+            # ABSENT, the SDK/control-channel dropped the question before reaching
+            # us — a pipeline bug, not the model. Logged at ENTRY so it survives
+            # even the no-tool_use_id / exception paths below.
+            logger.info(
+                "QDIAG can_use_tool ENTER AskUserQuestion tool_use_id=%s session=%s",
+                (ctx.tool_use_id or "").strip() or "<none>", session_key,
+            )
+
+            tool_use_id = (ctx.tool_use_id or "").strip()
+            if not tool_use_id:
+                # Without a tool_use_id the app can't key a persistent question
+                # row, but we can still defer cleanly so the turn ends instead
+                # of hanging.  The model just won't get a follow-up answer.
+                logger.warning(
+                    "AskUserQuestion intercepted with no tool_use_id — deferring without persistence"
+                )
+                return PermissionResultDeny(message=self._DEFERRED_ACK, interrupt=False)
+
+            # Emit AWAIT_TOOL_RESULT so the app persists the question, records
+            # it on the turn (end_reason="question", question_id), and fans it
+            # out to the UI.  Ordered in the same seq as surrounding deltas.
+            try:
+                seq_holder[0] += 1
+                self._publish_event(
+                    request_id, session_key, seq_holder[0],
+                    kind=AgentEventKind.AWAIT_TOOL_RESULT,
+                    tool_name=tool_name,
+                    tool_arguments=tool_input if isinstance(tool_input, dict) else {},
+                    tool_use_id=tool_use_id,
+                )
+            except Exception:
+                logger.exception(
+                    "Failed to publish AWAIT_TOOL_RESULT for tool_use_id=%s", tool_use_id,
+                )
+
+            logger.info(
+                "AskUserQuestion deferred: tool_use_id=%s session=%s — turn ends, "
+                "answer arrives as a continuation turn",
+                tool_use_id, session_key,
+            )
+
+            # Immediate synthetic ack — no await.  The model ends its turn.
+            return PermissionResultDeny(message=self._DEFERRED_ACK, interrupt=False)
+
+        return can_use_tool
+
+    def _make_pre_tool_use_hook(
+        self,
+        *,
+        request_id: str,
+        session_key: str,
+        seq_holder: list[int],
+    ):
+        """Build the per-run PreToolUse hook bound to this turn (TASK-292).
+
+        This is the live approval gate. It fires for every tool regardless of
+        permission_mode (verified live under bypassPermissions). AskUserQuestion
+        is handed back to the SDK (return {}) so its dedicated can_use_tool
+        deferral (TASK-269) keeps owning it — the policy gate must not
+        double-handle the question flow. Everything else goes through the policy
+        engine via _evaluate_tool_gate_hook.
+        """
+
+        async def pre_tool_use(input_data, tool_use_id, context):
+            tool_name = ""
+            try:
+                tool_name = input_data.get("tool_name") or ""
+                if self._is_ask_user_question(tool_name):
+                    return {}
+                tool_input = input_data.get("tool_input")
+                if not isinstance(tool_input, dict):
+                    tool_input = {}
+                tuid = (tool_use_id or input_data.get("tool_use_id") or "")
+                return await self._evaluate_tool_gate_hook(
+                    tool_name, tool_input, tuid,
+                    request_id, session_key, seq_holder,
+                )
+            except Exception:
+                logger.exception(
+                    "PreToolUse approval gate errored for %s", tool_name or "?"
+                )
+                # Match the bundle-fetch posture: fail-closed denies on error,
+                # otherwise fail-open so a gate bug can't wedge every tool.
+                if self._approval_fail_closed:
+                    return self._hook_deny(
+                        "[Approval gate error and bridge is fail-closed; "
+                        "tool blocked. Acknowledge and end your turn.]"
+                    )
+                return {}
+
+        return pre_tool_use

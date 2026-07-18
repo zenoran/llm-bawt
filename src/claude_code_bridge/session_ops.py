@@ -1,0 +1,472 @@
+from __future__ import annotations
+
+import asyncio
+import json
+import logging
+import os
+import re
+import time
+import uuid
+from collections.abc import AsyncIterable
+from datetime import datetime, timezone
+from pathlib import Path
+
+import httpx
+from claude_agent_sdk import ClaudeAgentOptions, ClaudeSDKClient, StreamEvent
+from claude_agent_sdk.types import (
+    AssistantMessage,
+    HookMatcher,
+    MirrorErrorMessage,
+    PermissionResultAllow,
+    PermissionResultDeny,
+    ResultMessage,
+    SystemMessage,
+    TaskNotificationMessage,
+    TaskProgressMessage,
+    TaskStartedMessage,
+    TaskUpdatedMessage,
+    ToolPermissionContext,
+    ToolResultBlock,
+    ToolUseBlock,
+    UserMessage,
+)
+
+from agent_bridge.approval import (
+    ApprovalDecision,
+    PolicyAction,
+    PolicyBundle,
+    evaluate as evaluate_policies,
+)
+from agent_bridge.events import AgentEvent, AgentEventKind, synthesize_event_id
+from agent_bridge.publisher import COMMANDS_STREAM, RedisPublisher
+from agent_bridge.session_queue import SessionQueue
+from claude_code_bridge.tool_events import normalize_tool_result
+from claude_code_bridge.tool_policy import effective_disallowed_tools
+
+from ._bridge_helpers import (
+    SESSION_PREFIX,
+    SEED_SETTING_KEY,
+    CONTINUITY_SETTING_KEY,
+    MCP_TOOL_CONTEXT_KEY,
+    _MCP_TOOL_CONTEXT_FALLBACK,
+    _SEED_CLI_VERSION,
+    _SEED_SANITIZE_RE,
+    _XAI_RATES,
+    _XAI_DEFAULT_RATES,
+    _CREDENTIALS_PATH,
+    _OAUTH_TOKEN_URL,
+    _OAUTH_CLIENT_ID,
+    _REFRESH_BUFFER_MS,
+    _bot_slug_from_session_key,
+    _fmt_tokens,
+    _usage_input_total,
+    _proxy_context_window,
+    _estimate_proxy_cost_usd,
+    _pick_iteration_usage,
+    _read_latest_compact_metadata,
+    _load_oauth_bundle,
+    _save_oauth_bundle,
+    _token_expired_or_stale,
+    _refresh_oauth_bundle,
+    _get_fresh_oauth_token,
+    _is_cli_crash,
+    _is_auth_failure,
+)
+
+logger = logging.getLogger("claude_code_bridge.bridge")
+
+
+class ClaudeSessionMixin:
+    """Claude session persistence + /new seed briefing (TASK-555).
+
+    Split out of ``ClaudeCodeBridge`` (TASK-555); composed back via
+    inheritance so ``self.*`` state and sibling-mixin methods resolve
+    on the assembled instance.
+    """
+
+    async def _get_session(self, bot_id: str) -> tuple[str, str] | None:
+        """Get (sdk_session_id, model) from bot's agent_backend_config."""
+        if not self._app_api_url:
+            return None
+        import httpx
+        try:
+            async with httpx.AsyncClient(timeout=5) as client:
+                resp = await client.get(f"{self._app_api_url}/v1/bots")
+                resp.raise_for_status()
+                for bot in resp.json().get("data", []):
+                    if bot.get("slug") == bot_id:
+                        bc = bot.get("agent_backend_config") or {}
+                        sk = bc.get("session_key")
+                        # session_model = bridge-owned record of which model
+                        # the persisted SDK session was created with (drives
+                        # resume-vs-reset). "model" is the pre-migration key.
+                        model = bc.get("session_model") or bc.get("model", "")
+                        if sk:
+                            sk = str(sk).strip()
+                            # Guard against legacy bug where routing keys
+                            # like "snark:nick" were stored as SDK session ids.
+                            if ":" in sk:
+                                logger.warning("Ignoring invalid persisted session_key for %s: %s", bot_id, sk)
+                                return None
+                            return (sk, model)
+                        return None
+        except Exception as e:
+            logger.warning("Failed to get session for %s: %s", bot_id, e)
+        return None
+
+    async def _set_session(self, bot_id: str, sdk_session_id: str, model: str) -> None:
+        """Write SDK session_id back to bot's agent_backend_config via PATCH."""
+        if not self._app_api_url:
+            logger.warning("No API URL — session not persisted for %s", bot_id)
+            return
+        import httpx
+        try:
+            async with httpx.AsyncClient(timeout=5) as client:
+                # Fetch current config to merge session_key in
+                resp = await client.get(f"{self._app_api_url}/v1/bots")
+                resp.raise_for_status()
+                bc = {}
+                for bot in resp.json().get("data", []):
+                    if bot.get("slug") == bot_id:
+                        bc = dict(bot.get("agent_backend_config") or {})
+                        break
+                bc["session_key"] = sdk_session_id
+                # Bridge-owned session metadata. The user-facing model lives
+                # on the bot's default_model (catalog alias); "model" is no
+                # longer accepted in agent_backend_config by the profile API.
+                bc.pop("model", None)
+                bc["session_model"] = model
+
+                patch_response = await client.patch(
+                    f"{self._app_api_url}/v1/bots/{bot_id}/profile",
+                    json={"agent_backend_config": bc},
+                )
+                patch_response.raise_for_status()
+            logger.info("Session persisted: %s -> %s", bot_id, sdk_session_id)
+        except Exception as e:
+            logger.warning("Failed to persist session for %s: %s", bot_id, e)
+
+    async def _clear_session(self, bot_id: str) -> bool:
+        """Remove session_key from bot's agent_backend_config via PATCH."""
+        if not self._app_api_url:
+            return False
+        import httpx
+        try:
+            async with httpx.AsyncClient(timeout=5) as client:
+                resp = await client.get(f"{self._app_api_url}/v1/bots")
+                resp.raise_for_status()
+                bc = {}
+                had_session = False
+                for bot in resp.json().get("data", []):
+                    if bot.get("slug") == bot_id:
+                        bc = dict(bot.get("agent_backend_config") or {})
+                        had_session = "session_key" in bc
+                        bc.pop("session_key", None)
+                        break
+
+                patch_response = await client.patch(
+                    f"{self._app_api_url}/v1/bots/{bot_id}/profile",
+                    json={"agent_backend_config": bc},
+                )
+                patch_response.raise_for_status()
+                logger.info("Session cleared: %s (had_session=%s)", bot_id, had_session)
+                return had_session
+        except Exception as e:
+            logger.warning("Failed to clear session for %s: %s", bot_id, e)
+            return False
+
+    async def _get_mcp_tool_context(self, bot_slug: str) -> str:
+        """Return the MCP tool context block for a bot (TASK-490).
+
+        Fetches the (bot-overridable) template body from the app registry via
+        GET /v1/prompts/{key}, cached per bot for the process, and falls back to
+        a byte-identical local copy if the app is unreachable — so behavior is
+        preserved regardless. Returns the block WITHOUT the leading separator;
+        the caller prepends ``\\n\\n``.
+        """
+        cache = getattr(self, "_mcp_ctx_cache", None)
+        if cache is None:
+            cache = {}
+            self._mcp_ctx_cache = cache
+        if bot_slug in cache:
+            return cache[bot_slug]
+
+        body = _MCP_TOOL_CONTEXT_FALLBACK
+        if self._app_api_url:
+            try:
+                async with httpx.AsyncClient(timeout=5) as client:
+                    resp = await client.get(
+                        f"{self._app_api_url}/v1/prompts/{MCP_TOOL_CONTEXT_KEY}",
+                        params={"scope_type": "bot", "scope_id": bot_slug},
+                    )
+                    resp.raise_for_status()
+                    fetched = (resp.json() or {}).get("body")
+                    if fetched:
+                        body = fetched
+            except Exception as e:
+                logger.warning(
+                    "MCP tool context fetch failed for %s (%s); using local fallback",
+                    bot_slug, e,
+                )
+        # Bridge-side substitution (robust against stray braces in overrides).
+        rendered = body.replace("{bot_slug}", bot_slug)
+        cache[bot_slug] = rendered
+        return rendered
+
+    async def _get_seed_setting(self, bot_id: str) -> bool:
+        """Resolve whether to seed a new session with history (TASK-492).
+
+        Prefers the UNIFIED typed setting ``session_memory_continuity`` (bot-
+        scoped runtime_settings, via GET /v1/settings). Falls back to the legacy
+        ``agent_backend_config.seed_summary_on_new_session`` for any bot without
+        the typed row. Defaults False (off) on error/absence. Only called on new-
+        session creation, so the extra lookup is off the hot path.
+        """
+        if not self._app_api_url or not bot_id:
+            return False
+        # 1) Unified typed setting.
+        try:
+            async with httpx.AsyncClient(timeout=5) as client:
+                resp = await client.get(
+                    f"{self._app_api_url}/v1/settings",
+                    params={"scope_type": "bot", "scope_id": bot_id},
+                )
+                resp.raise_for_status()
+                for item in resp.json().get("settings", []):
+                    if item.get("key") == CONTINUITY_SETTING_KEY:
+                        return bool(item.get("value"))
+        except Exception as e:
+            logger.warning("Failed to read continuity setting for %s: %s", bot_id, e)
+        # 2) Legacy fallback: seed flag in agent_backend_config.
+        try:
+            async with httpx.AsyncClient(timeout=5) as client:
+                resp = await client.get(f"{self._app_api_url}/v1/bots")
+                resp.raise_for_status()
+                for bot in resp.json().get("data", []):
+                    if bot.get("slug") == bot_id:
+                        bc = bot.get("agent_backend_config") or {}
+                        return bool(bc.get(SEED_SETTING_KEY, False))
+        except Exception as e:
+            logger.warning("Failed to read seed setting for %s: %s", bot_id, e)
+        return False
+
+    async def _fetch_context_seed(self, bot_id: str, model: str) -> dict | None:
+        """Fetch the chatbot-style context payload (summaries + budgeted recent
+        turns) from the app's /v1/history/context-seed endpoint."""
+        if not self._app_api_url or not bot_id:
+            return None
+        try:
+            async with httpx.AsyncClient(timeout=30) as client:
+                resp = await client.get(
+                    f"{self._app_api_url}/v1/history/context-seed",
+                    params={"bot_id": bot_id, "model": model},
+                )
+                resp.raise_for_status()
+                return resp.json()
+        except Exception as e:
+            logger.warning("Failed to fetch context seed for %s: %s", bot_id, e)
+            return None
+
+    def _project_slug(self, cwd: str) -> str:
+        """Reproduce the SDK's project-dir sanitization (non-alnum -> '-')."""
+        return _SEED_SANITIZE_RE.sub("-", cwd or "")
+
+    def _render_seed_briefing(self, messages: list[dict]) -> str:
+        """Flatten the context messages into a single labeled briefing block.
+
+        Summaries keep their ``[Previous conversation X ago]`` headers; recent
+        turns are rendered as a readable transcript. Text-only by construction —
+        no tool_use blocks — so the resumed session never wedges."""
+        lines = [
+            "[Session continuity seed — prior context restored from chat history]",
+            "Below is our earlier conversation for continuity: rolling summaries "
+            "of older sessions, then the most recent messages. Treat it as "
+            "background context; you don't need to repeat it back.",
+            "",
+        ]
+        for m in messages:
+            role = m.get("role")
+            content = (m.get("content") or "").strip()
+            if not content:
+                continue
+            if role == "summary":
+                lines.append(content)
+            elif role == "user":
+                lines.append(f"Nick: {content}")
+            elif role == "assistant":
+                lines.append(f"Assistant (you): {content}")
+            else:
+                lines.append(content)
+            lines.append("")
+        return "\n".join(lines).strip()
+
+    def _write_seed_transcript(self, session_id: str, messages: list[dict]) -> Path:
+        """Write a synthetic two-entry Claude Code transcript (user briefing +
+        assistant ack) so the SDK can ``resume`` it into a fresh session.
+
+        Entry shape verified against real on-disk transcripts. The assistant
+        entry uses ``model: "<synthetic>"`` — Claude Code's own marker for a
+        fabricated turn (the SDK writes these for injected errors and resumes
+        past them cleanly). Ends on the assistant so the leaf is clean."""
+        slug = self._project_slug(self._cwd)
+        proj_dir = Path.home() / ".claude" / "projects" / slug
+        proj_dir.mkdir(parents=True, exist_ok=True)
+        path = proj_dir / f"{session_id}.jsonl"
+
+        briefing = self._render_seed_briefing(messages)
+        ts = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+        user_uuid = str(uuid.uuid4())
+        asst_uuid = str(uuid.uuid4())
+
+        common = {
+            "isSidechain": False,
+            "sessionId": session_id,
+            "cwd": self._cwd,
+            "version": _SEED_CLI_VERSION,
+            "gitBranch": "",
+            "userType": "external",
+        }
+        user_entry = {
+            "parentUuid": None,
+            "type": "user",
+            "message": {"role": "user", "content": briefing},
+            "uuid": user_uuid,
+            "timestamp": ts,
+            **common,
+        }
+        asst_entry = {
+            "parentUuid": user_uuid,
+            "type": "assistant",
+            "uuid": asst_uuid,
+            "timestamp": ts,
+            "message": {
+                "role": "assistant",
+                "model": "<synthetic>",
+                "type": "message",
+                "stop_reason": "stop_sequence",
+                "content": [
+                    {
+                        "type": "text",
+                        "text": (
+                            "Context restored — I've reviewed our prior "
+                            "summaries and recent messages and I'm caught up."
+                        ),
+                    }
+                ],
+                "usage": {"input_tokens": 0, "output_tokens": 0},
+            },
+            **common,
+        }
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(json.dumps(user_entry) + "\n")
+            f.write(json.dumps(asst_entry) + "\n")
+        logger.info(
+            "Seed transcript written: %s (%d context msgs)",
+            path, len(messages),
+        )
+        return path
+
+    @staticmethod
+    def _stats_from_messages(messages: list[dict]) -> dict:
+        """Derive /new-ack stats from app-injected seed messages (TASK-501).
+
+        When the app pushes the seed via ``inject_messages`` there is no
+        precomputed stats block (that lived in the context-seed HTTP response),
+        so recompute the same shape from the message roles. approx_tokens is a
+        cheap char/4 estimate — the bridge has no tokenizer."""
+        summary_count = sum(1 for m in messages if m.get("role") == "summary")
+        convo_count = sum(1 for m in messages if m.get("role") in ("user", "assistant"))
+        approx_tokens = sum(len(m.get("content") or "") for m in messages) // 4
+        ts = [float(m.get("timestamp") or 0.0) for m in messages if m.get("timestamp")]
+        return {
+            "summary_count": summary_count,
+            "message_count": convo_count,
+            "total_count": len(messages),
+            "approx_tokens": approx_tokens,
+            "oldest_timestamp": min(ts) if ts else None,
+            "newest_timestamp": max(ts) if ts else None,
+        }
+
+    async def _seed_new_session(
+        self, bot_id: str, model: str, injected: list | None = None,
+    ) -> dict | None:
+        """Seed a brand-new SDK session for ``bot_id`` from chat summary history,
+        if the per-bot setting is on. Writes the synthetic transcript, persists
+        the minted session id, and returns a stats dict for the /new ack.
+
+        ``injected`` (TASK-501): messages the app pre-assembled and pushed in
+        the dispatch. When provided, seed from these directly. When None, FALL
+        BACK to the legacy ``_fetch_context_seed`` callback (Phase 2 removes the
+        fallback once app-side inject is proven).
+
+        TASK-508 (policy-vs-mechanics): the bridge holds NO policy about whether
+        to seed. When llm-bawt pushes ``injected``, its mere presence IS the
+        authorization — llm-bawt's ``maybe_build_session_seed`` already evaluated
+        continuity + ``/new`` + session state, and only emits messages when a seed
+        is warranted. So the injected path is ungated. The ONLY remaining gate is
+        on the deprecated self-fetch fallback: there the bridge would be pulling a
+        seed on its own initiative, so until Phase 2 deletes that path it must
+        still consult continuity so a continuity-off bot isn't seeded behind
+        llm-bawt's back.
+
+        Returns:
+            None      -> no seed (fallback path with continuity off, or no path)
+            {seeded: False, reason} -> a seed was warranted but nothing to seed / error
+            {seeded: True, session_id, summary_count, message_count,
+             approx_tokens, oldest_timestamp, newest_timestamp}
+        """
+        if injected:
+            # llm-bawt authorized this seed by sending it. No bridge-side re-check.
+            messages = injected
+            stats = self._stats_from_messages(messages)
+        else:
+            # Legacy self-fetch fallback: the bridge acts on its own, so it still
+            # needs the policy gate until TASK-501 Phase 2 removes this path.
+            if not await self._get_seed_setting(bot_id):
+                return None
+            seed = await self._fetch_context_seed(bot_id, model)
+            if not seed:
+                return {"seeded": False, "reason": "seed fetch failed"}
+            messages = seed.get("messages") or []
+            stats = dict(seed.get("stats") or {})
+        if not messages:
+            return {"seeded": False, "reason": "no history to seed"}
+        try:
+            session_id = str(uuid.uuid4())
+            self._write_seed_transcript(session_id, messages)
+            await self._set_session(bot_id, session_id, model)
+        except Exception as e:
+            logger.warning("Seed write/persist failed for %s: %s", bot_id, e)
+            return {"seeded": False, "reason": f"seed write failed: {e}"}
+        stats = dict(stats)
+        stats["seeded"] = True
+        stats["session_id"] = session_id
+        return stats
+
+    @staticmethod
+    def _format_seed_ack(stats: dict | None) -> str:
+        """Human-facing /new acknowledgement, reporting seed stats when present."""
+        base = "Session reset."
+        if stats is None:
+            return f"{base} Ready for a new conversation."
+        if not stats.get("seeded"):
+            reason = stats.get("reason", "nothing to seed")
+            return f"{base} History seeding on, but {reason}. Fresh start."
+        summ = stats.get("summary_count", 0)
+        msgs = stats.get("message_count", 0)
+        toks = stats.get("approx_tokens", 0)
+        span = ""
+        oldest = stats.get("oldest_timestamp")
+        newest = stats.get("newest_timestamp")
+        if oldest and newest:
+            try:
+                o = datetime.fromtimestamp(oldest, timezone.utc).strftime("%Y-%m-%d")
+                n = datetime.fromtimestamp(newest, timezone.utc).strftime("%Y-%m-%d")
+                span = f", spanning {o} → {n}" if o != n else f", from {o}"
+            except Exception:
+                span = ""
+        return (
+            f"{base} Seeded {summ} summary record{'s' if summ != 1 else ''} + "
+            f"{msgs} recent message{'s' if msgs != 1 else ''} "
+            f"(~{_fmt_tokens(toks)} tokens){span}. Continuity restored."
+        )
