@@ -294,16 +294,28 @@ class HistoryManager:
 
         return "\n".join(compact_lines).strip()
 
-    def get_context_messages(self, max_tokens: int = 0, charge_system: bool = True):
+    def get_context_messages(
+        self,
+        max_tokens: int = 0,
+        charge_system: bool = True,
+        *,
+        want_history: bool = True,
+        want_summaries: bool = True,
+    ):
         """Assemble LLM context under Nick's strict allocation ladder (TASK-612).
 
         Fill order, highest priority first:
-          1. **System** messages — always kept. If they alone exceed the physical
-             budget this raises ``ContextBudgetError`` (the ONLY hard-fail).
+          1. **Plain system** prompt (persona) — always kept. If it alone exceeds
+             the physical budget this raises ``ContextBudgetError`` (the ONLY
+             hard-fail). Tool-execution evidence rows (role='system' with a
+             ``[Tool Results]`` / ``[Tools used:]`` prefix) are NOT persona — they
+             are raw historical context and ride the raw bucket below, so they can
+             never trigger this hard-fail.
           2. **Raw** unsummarized history — newest-first, bounded by the Tier-3
              ``history_tokens`` policy knob (default 12000) *and* by physical
-             headroom. The newest complete turn is floored in even when
-             ``history_tokens`` is set absurdly small (degrade-and-log).
+             headroom. Includes user/assistant rows plus (inline delivery only)
+             interleaved tool-evidence rows. The newest complete turn is floored
+             in even when ``history_tokens`` is set absurdly small (degrade-and-log).
           3. **Summaries** — fill the *remaining physical budget* after system +
              raw, newest-first, capped by ``summary_count`` (default 5).
              ``summary_count=0`` carries none (raw-only bot).
@@ -333,14 +345,36 @@ class HistoryManager:
                         cannot trigger the system-over-budget hard-fail. System
                         rows are still returned/separated either way; only the
                         budgeting differs.
+            want_history: whether the caller will actually deliver raw history.
+                        When False (summary-only scope), raw is not allocated at
+                        all — otherwise it would consume budget here and then be
+                        discarded downstream, starving summaries that would have
+                        fit (TASK-612 finding 1). Must mirror the caller's
+                        ``include_history`` so allocation matches delivery.
+            want_summaries: whether the caller will deliver summaries. When False,
+                        summaries are not allocated. Mirrors ``include_summaries``.
         """
-        system_messages = []
+        # Only the PLAIN persona/system prompt is the non-negotiable system
+        # bucket. A role='system' row that carries tool-execution EVIDENCE
+        # (``[Tool Results]`` / ``[Tools used:]``) is historical raw context, not
+        # the persona — so it is budgeted with raw history (bounded by
+        # history_tokens, part of the newest-turn floor, obeys want_history) and
+        # can never trigger the system-over-budget hard-fail (TASK-612 follow-up:
+        # tool-result rows previously rode the non-negotiable system budget).
+        # Seed delivery strips ALL system rows (seed_messages), so tool-evidence
+        # is folded into the budgeted raw stream only for inline delivery
+        # (``charge_system``) — otherwise it would consume seed budget for rows
+        # that get stripped, the same starvation bug as finding 1.
+        plain_system_messages = []
         summary_messages = []
-        regular_messages = []
+        raw_stream = []  # chronological user/assistant (+ inline tool-evidence)
 
         for msg in self.messages:
-            if msg.role == "system":
-                system_messages.append(msg)
+            if _is_tool_result_system(msg):
+                if charge_system:
+                    raw_stream.append(msg)
+            elif msg.role == "system":
+                plain_system_messages.append(msg)
             elif msg.role == "summary":
                 # Add time context to summaries
                 time_ago = self._format_time_ago(msg.timestamp)
@@ -352,10 +386,10 @@ class HistoryManager:
                     timestamp=msg.timestamp
                 ))
             else:
-                regular_messages.append(msg)
+                raw_stream.append(msg)
 
-        if not system_messages:
-            system_messages.append(Message(role="system", content=self.config.SYSTEM_MESSAGE))
+        if not plain_system_messages:
+            plain_system_messages.append(Message(role="system", content=self.config.SYSTEM_MESSAGE))
 
         max_context_messages = int(
             self._setting(
@@ -364,20 +398,20 @@ class HistoryManager:
             )
             or 0
         )
-        if max_context_messages > 0 and len(regular_messages) > max_context_messages:
-            regular_messages = regular_messages[-max_context_messages:]
+        if max_context_messages > 0 and len(raw_stream) > max_context_messages:
+            raw_stream = raw_stream[-max_context_messages:]
 
         # Without a token budget, return everything (chronological: system,
         # summaries, then raw recent messages).
         if max_tokens <= 0:
-            return system_messages + summary_messages + regular_messages
+            return plain_system_messages + summary_messages + raw_stream
 
         # ── Allocation ladder ─────────────────────────────────────
         budget = max_tokens
         # System rows only consume the budget when they will actually be
         # delivered (inline chat). Seed delivery strips them, so a seed spends
         # its whole budget on the delivered summary+raw content (TASK-613).
-        system_cost = estimate_messages_tokens(system_messages) if charge_system else 0
+        system_cost = estimate_messages_tokens(plain_system_messages) if charge_system else 0
 
         # (1) System is non-negotiable when delivered. System-alone-over-budget
         #     is the one unrecoverable state — fail loudly instead of truncating
@@ -390,7 +424,10 @@ class HistoryManager:
             )
 
         # (2) Raw history: newest-first, bounded by BOTH history_tokens (Tier-3
-        #     policy) and the remaining physical budget.
+        #     policy) and the remaining physical budget. Skipped entirely when the
+        #     caller won't deliver raw history (summary-only scope) — otherwise raw
+        #     would consume budget here and then be discarded downstream, starving
+        #     summaries that would have fit (TASK-612 finding 1).
         physical_headroom = budget - system_cost
         history_tokens = int(
             self._setting("history_tokens", setting_default("history_tokens", 12000))
@@ -401,47 +438,76 @@ class HistoryManager:
 
         included_raw: list[Message] = []
         raw_used = 0
-        for msg in reversed(regular_messages):  # newest-first
-            cost = estimate_messages_tokens([msg])
-            if raw_used + cost <= raw_cap:
-                included_raw.insert(0, msg)  # keep chronological order
-                raw_used += cost
-            else:
-                break  # older messages only get larger-or-equal in aggregate
+        forced = ""
+        if want_history:
+            for msg in reversed(raw_stream):  # newest-first
+                cost = estimate_messages_tokens([msg])
+                if raw_used + cost <= raw_cap:
+                    included_raw.insert(0, msg)  # keep chronological order
+                    raw_used += cost
+                else:
+                    break  # older messages only get larger-or-equal in aggregate
 
-        # Newest-complete-turn floor: never drop the newest message purely
-        # because history_tokens is tiny. Force it in if it fits the PHYSICAL
-        # budget (system_cost already fit above). Only a single newest message
-        # that alone blows the physical budget is dropped — degrade-and-log.
-        forced_newest = False
-        if not included_raw and regular_messages:
-            newest = regular_messages[-1]
-            if system_cost + estimate_messages_tokens([newest]) <= budget:
-                included_raw = [newest]
-                raw_used = estimate_messages_tokens([newest])
-                forced_newest = True
-                logger.warning(
-                    "history_tokens=%s too small for even the newest turn; forcing "
-                    "it in under the physical budget (%s).",
-                    history_tokens,
-                    budget,
-                )
-            else:
-                logger.warning(
-                    "Newest turn (%s tokens) exceeds physical budget minus system "
-                    "(%s); dropping it (degrade).",
-                    estimate_messages_tokens([newest]),
-                    physical_headroom,
-                )
+            # Newest-COMPLETE-turn floor: history_tokens must never chop the most
+            # recent turn in half. The newest complete turn is the trailing run
+            # back through the most recent user message (captures user + assistant
+            # + any interleaved tool-evidence rows). Guarantee it whenever it fits
+            # the PHYSICAL budget, even if history_tokens was too small to have fit
+            # it in the bounded fill above (TASK-612 finding 2 — a single-message
+            # floor returned the assistant without its user). If the whole turn
+            # can't fit the physical budget, keep the largest newest-first suffix
+            # that does (degrade); if not even the newest message fits, drop it.
+            if raw_stream:
+                turn_start = 0
+                for i in range(len(raw_stream) - 1, -1, -1):
+                    if raw_stream[i].role == "user":
+                        turn_start = i
+                        break
+                turn_msgs = raw_stream[turn_start:]
+                if len(turn_msgs) > len(included_raw):  # fill didn't cover the turn
+                    turn_cost = estimate_messages_tokens(turn_msgs)
+                    if system_cost + turn_cost <= budget:
+                        included_raw = list(turn_msgs)
+                        raw_used = turn_cost
+                        forced = "turn"
+                        logger.warning(
+                            "history_tokens=%s too small for the newest complete "
+                            "turn (%s msgs); forcing it in under the physical "
+                            "budget (%s).",
+                            history_tokens, len(turn_msgs), budget,
+                        )
+                    else:
+                        fit: list[Message] = []
+                        used = 0
+                        for msg in reversed(turn_msgs):  # newest-first
+                            cost = estimate_messages_tokens([msg])
+                            if system_cost + used + cost <= budget:
+                                fit.insert(0, msg)
+                                used += cost
+                            else:
+                                break
+                        included_raw = fit
+                        raw_used = used
+                        forced = "partial-turn" if fit else "dropped"
+                        logger.warning(
+                            "Newest turn (%s tokens) exceeds physical headroom "
+                            "(%s); kept %s of %s msgs (degrade).",
+                            turn_cost, physical_headroom, len(fit), len(turn_msgs),
+                        )
 
         # (3) Summaries: fill the remaining physical budget after system + raw,
-        #     newest-first, capped by summary_count. Guard the slice because
-        #     summary_messages[-0:] would select the WHOLE list, not none.
+        #     newest-first, capped by summary_count. Skipped when the caller won't
+        #     deliver summaries. Guard the slice because summary_messages[-0:]
+        #     would select the WHOLE list, not none.
         remaining = budget - system_cost - raw_used
         max_summaries = int(
             self._setting("summary_count", setting_default("summary_count", 5))
         )
-        candidate_summaries = summary_messages[-max_summaries:] if max_summaries > 0 else []
+        candidate_summaries = (
+            summary_messages[-max_summaries:]
+            if (want_summaries and max_summaries > 0)
+            else []
+        )
         included_summaries: list[Message] = []
         summary_used = 0
         for s in reversed(candidate_summaries):  # newest summary first under pressure
@@ -452,7 +518,7 @@ class HistoryManager:
             else:
                 break
 
-        raw_dropped = len(regular_messages) - len(included_raw)
+        raw_dropped = len(raw_stream) - len(included_raw)
         used = system_cost + raw_used + summary_used
 
         def pct(v: int) -> str:
@@ -462,13 +528,13 @@ class HistoryManager:
             f"Ladder budget: {budget} total | used={used} ({pct(used)}) | "
             f"system={system_cost} ({pct(system_cost)}), "
             f"raw={raw_used} ({pct(raw_used)}, {len(included_raw)} msgs, "
-            f"{raw_dropped} dropped, cap={raw_cap}{', forced-newest' if forced_newest else ''}), "
+            f"{raw_dropped} dropped, cap={raw_cap}{f', forced-{forced}' if forced else ''}), "
             f"summaries={summary_used} ({pct(summary_used)}, "
             f"{len(included_summaries)}/{len(summary_messages)}), "
             f"message_cap={max_context_messages or 'none'}"
         )
 
-        return system_messages + included_summaries + included_raw
+        return plain_system_messages + included_summaries + included_raw
 
     def build_context_payload(
         self,
@@ -510,7 +576,10 @@ class HistoryManager:
         # Inline (chat) delivers system in the request window, so it does.
         payload = ContextPayload()
         for msg in self.get_context_messages(
-            max_tokens=max_tokens, charge_system=(delivery != "seed")
+            max_tokens=max_tokens,
+            charge_system=(delivery != "seed"),
+            want_history=include_history,
+            want_summaries=include_summaries,
         ):
             role = getattr(msg, "role", "")
             if role == "summary":
@@ -519,7 +588,13 @@ class HistoryManager:
                 continue
             if role == "system":
                 if _is_tool_result_system(msg):
-                    payload.tool_result_messages.append(msg)
+                    # Tool-evidence is raw historical context — gate it on
+                    # include_history like any other raw row (TASK-612 follow-up).
+                    # get_context_messages already excludes it from the budgeted
+                    # stream when want_history is False; this keeps direct callers
+                    # honest too.
+                    if include_history:
+                        payload.tool_result_messages.append(msg)
                 else:
                     payload.system_messages.append(msg)
                 continue

@@ -142,6 +142,123 @@ def test_newest_turn_over_physical_budget_degrades_without_raising() -> None:
     assert not [m for m in context if m.role in ("user", "assistant")]
 
 
+def test_newest_complete_turn_preserves_user_and_assistant() -> None:
+    # TASK-612 finding 2: when the newest message is an assistant reply, the
+    # floor must preserve the WHOLE turn (its user prompt too), not just the
+    # trailing assistant. history_tokens=1 fits nothing in the bounded fill, so
+    # the complete-turn floor is what carries the pair.
+    history = _history(_getter({"history_tokens": 1, "summary_count": 5}))
+    history.messages = [
+        Message("user", "u1", timestamp=1.0),
+        Message("assistant", "a1", timestamp=2.0),
+    ]
+
+    context = history.get_context_messages(max_tokens=10_000)
+
+    regular = [m.content for m in context if m.role in ("user", "assistant")]
+    assert regular == ["u1", "a1"]
+
+
+def test_summary_only_scope_not_starved_by_raw() -> None:
+    # TASK-612 finding 1: under a tight budget, a summary-only caller
+    # (include_history=False) must not have its summaries starved by raw that
+    # gets allocated and then discarded. want_history=False skips raw entirely,
+    # so the summary fills the whole physical budget.
+    history = _history(_getter({"history_tokens": 12000, "summary_count": 5}))
+    history.messages = [
+        Message("summary", "S", timestamp=0.0),
+        Message("user", "u1", timestamp=1.0),
+        Message("assistant", "a1", timestamp=2.0),
+    ]
+
+    payload = history.build_context_payload(
+        include_history=False, include_summaries=True, max_tokens=20
+    )
+
+    assert len(payload.summary_messages) == 1
+    assert len(payload.regular_messages) == 0
+
+
+# ── TASK-612 follow-up: tool-evidence rows ride RAW history, not system ──
+
+
+def _tool(content_ish: str, ts: float) -> Message:
+    return Message("system", f"[Tool Results] {content_ish}", timestamp=ts)
+
+
+def test_tool_evidence_rides_raw_and_survives_floor_with_its_turn() -> None:
+    # user -> [Tool Results] -> assistant with history_tokens=1: the whole turn
+    # (including tool evidence) is floored in under the physical budget, and the
+    # tool row never rode the non-negotiable system budget.
+    history = _history(_getter({"history_tokens": 1, "summary_count": 5}))
+    history.messages = [
+        Message("user", "u1", timestamp=1.0),
+        _tool("ran ls", 2.0),
+        Message("assistant", "a1", timestamp=3.0),
+    ]
+
+    context = history.get_context_messages(max_tokens=10_000, charge_system=True)
+
+    contents = [m.content for m in context]
+    assert "u1" in contents and "a1" in contents
+    assert any(c.startswith("[Tool Results]") for c in contents)
+
+
+def test_summary_only_excludes_tool_evidence() -> None:
+    # Summary-only inline scope (include_history=False): tool-evidence must not
+    # sneak through as raw, and must not starve the summary.
+    history = _history(_getter({"history_tokens": 12000, "summary_count": 5}))
+    history.messages = [
+        Message("summary", "S", timestamp=0.0),
+        Message("user", "u1", timestamp=1.0),
+        _tool("big", 2.0),
+        Message("assistant", "a1", timestamp=3.0),
+    ]
+
+    payload = history.build_context_payload(
+        include_history=False, include_summaries=True, max_tokens=20
+    )
+
+    assert len(payload.summary_messages) == 1
+    assert len(payload.tool_result_messages) == 0
+    assert len(payload.regular_messages) == 0
+
+
+def test_seed_delivery_does_not_budget_tool_evidence() -> None:
+    # A large tool-evidence row would eat the seed budget if charged. Seed
+    # delivery strips ALL system rows, so it must not be budgeted — both
+    # conversation rows still fit.
+    history = _history(_getter({"history_tokens": 1000, "summary_count": 5}))
+    history.messages = [
+        Message("user", "aaaaa", timestamp=1.0),
+        _tool("x" * 400, 2.0),
+        Message("assistant", "bbbbb", timestamp=3.0),
+    ]
+
+    seed = history.build_context_payload(delivery="seed", max_tokens=15)
+
+    assert all(m.role != "system" for m in seed.seed_messages)
+    assert len(seed.regular_messages) == 2
+
+
+def test_oversized_tool_evidence_degrades_not_hard_fail() -> None:
+    # Physical budget fits the persona system prompt but not the giant tool turn:
+    # degrade-and-log, never the hard fail (only the persona prompt can raise).
+    history = _history(_getter({"history_tokens": 12000, "summary_count": 5}))
+    history.messages = [
+        Message("user", "u1", timestamp=1.0),
+        _tool("x" * 400, 2.0),
+        Message("assistant", "a1", timestamp=3.0),
+    ]
+
+    context = history.get_context_messages(max_tokens=8, charge_system=True)
+
+    # persona system prompt survives; no ContextBudgetError raised
+    assert any(
+        m.role == "system" and not m.content.startswith("[Tool") for m in context
+    )
+
+
 # ── TASK-613: seed delivery must not charge stripped system rows ──
 
 
