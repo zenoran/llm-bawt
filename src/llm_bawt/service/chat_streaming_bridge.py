@@ -114,6 +114,9 @@ class ChatStreamingBridgeMixin:
         tool_events = ToolEventCoordinator(self._turn_log_store.engine)
         full_text_parts: list[str] = []
         tool_call_details: list[dict] = []
+        # Captures upstream SDK token usage (bridge sends it on ASSISTANT_DONE)
+        # so the finalize path can persist it — mirrors the native stream path.
+        token_usage_holder: list[dict | None] = [None]
         _finalized = False
         # Periodic flush: persist partial response text every N seconds so
         # clients reconnecting after a page refresh can show progress.
@@ -461,6 +464,7 @@ class ChatStreamingBridgeMixin:
                     user_id=user_id,
                     elapsed_ms=elapsed_ms,
                     stream=True,
+                    token_usage=token_usage_holder[0],
                     assistant_message_id=assistant_message_id,
                 )
             else:
@@ -541,6 +545,7 @@ class ChatStreamingBridgeMixin:
                         user_id=user_id,
                         elapsed_ms=elapsed_ms,
                         stream=True,
+                        token_usage=token_usage_holder[0],
                         assistant_message_id=assistant_message_id,
                     )
             except Exception as _persist_err:
@@ -572,6 +577,7 @@ class ChatStreamingBridgeMixin:
                             user_id=user_id,
                             elapsed_ms=elapsed_ms,
                             stream=True,
+                            token_usage=token_usage_holder[0],
                             assistant_message_id=assistant_message_id,
                         )
                     else:
