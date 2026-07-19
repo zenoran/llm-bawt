@@ -152,16 +152,9 @@ SETTING_DEFINITIONS: dict[str, SettingDefinition] = {
         legacy_keys=("summarization_compact_context",),
     ),
     # --- promoted from agent_backend_config JSON blob (TASK-491) --------------
-    "seed_summary_on_new_session": SettingDefinition(
-        key="seed_summary_on_new_session",
-        type="bool",
-        default=False,
-        applies_to=("agent",),
-        storage=STORAGE_RUNTIME_SETTING,
-        label="Seed new session with summary",
-        help="Agent bots only: on new SDK-session creation, seed it with a chat-history summary.",
-        legacy_keys=("seed_summary_on_new_session",),
-    ),
+    # (TASK-615) The standalone seed_summary_on_new_session setting is retired —
+    # session_memory_continuity (above) is the canonical seed gate, and it
+    # already carries seed_summary_on_new_session as a legacy_key for migration.
     "agent_global_prompt_enabled": SettingDefinition(
         key="agent_global_prompt_enabled",
         type="bool",

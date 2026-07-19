@@ -21,11 +21,10 @@ logger = logging.getLogger("claude_code_bridge.bridge")
 
 SESSION_PREFIX = "claude-code:"
 
-# TASK-445: session-seed constants.
-# agent_backend_config flag that gates history-summary seeding on new sessions.
-SEED_SETTING_KEY = "seed_summary_on_new_session"
-# TASK-492: unified session-memory-continuity key (supersedes SEED_SETTING_KEY).
-CONTINUITY_SETTING_KEY = "session_memory_continuity"
+# TASK-615/501 Phase 2: the bridge seed-policy constants (SEED_SETTING_KEY /
+# CONTINUITY_SETTING_KEY) are gone. llm-bawt (maybe_build_session_seed) is the
+# sole seed authority and pushes pre-assembled messages via inject_messages; the
+# bridge no longer reads continuity or self-fetches a seed.
 
 # TASK-490: MCP tool context body. Canonical default lives in the app registry
 # (agents.mcp_tool_context_template); the bridge cannot import llm_bawt, so it

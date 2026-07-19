@@ -46,8 +46,6 @@ from claude_code_bridge.tool_events import normalize_tool_result
 from claude_code_bridge.tool_policy import effective_disallowed_tools
 from ._bridge_helpers import (
     SESSION_PREFIX,
-    SEED_SETTING_KEY,
-    CONTINUITY_SETTING_KEY,
     MCP_TOOL_CONTEXT_KEY,
     _MCP_TOOL_CONTEXT_FALLBACK,
     _SEED_CLI_VERSION,

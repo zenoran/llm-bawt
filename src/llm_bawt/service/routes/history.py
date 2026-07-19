@@ -1842,8 +1842,9 @@ def maybe_build_session_seed(llm_bawt, bot_id, model, user_prompt, service) -> l
     Returns a list of ``{role, content, timestamp}`` seed messages to push to
     the bridge via ``inject_messages``, or None when no seed should attach:
     non-claude-code backend, continuity off, or a warm session that isn't a
-    ``/new``. Never raises — any failure yields None (bridge falls back to its
-    legacy context-seed callback).
+    ``/new``. Never raises — any failure yields None. This is the SOLE seed
+    authority (TASK-615/501 Phase 2): the bridge no longer self-fetches a seed,
+    so None here means the fresh session simply opens unseeded.
     """
     try:
         if (getattr(llm_bawt.bot, "agent_backend", "") or "") != "claude-code":
