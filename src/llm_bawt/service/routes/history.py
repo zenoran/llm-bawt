@@ -1811,7 +1811,6 @@ def build_context_seed(bot_id: str, model: str | None, service) -> dict:
             "history_scope": _eff("history_scope", "inline+summaries"),
             "history_tokens": _eff("history_tokens", 12000),
             "summary_count": _eff("summary_count", 5),
-            "max_context_messages": _eff("max_context_messages", 0),
         },
         "messages": [
             {

@@ -214,14 +214,12 @@ def bootstrap_runtime_settings(config: Config, bot_id: str | None, overwrite: bo
 
     global_map = {
         "history_tokens": setting_default("history_tokens", 12000),
-        "max_context_messages": config.MAX_CONTEXT_MESSAGES,
         "max_output_tokens": setting_default("max_output_tokens", 4096),
         "history_reload_ttl_seconds": config.HISTORY_RELOAD_TTL_SECONDS,
         "summary_count": setting_default("summary_count", 5),
         "compact_context": setting_default("compact_context", True),
         "memory_n_results": config.MEMORY_N_RESULTS,
         "memory_min_relevance": config.MEMORY_MIN_RELEVANCE,
-        "memory_max_token_percent": config.MEMORY_MAX_TOKEN_PERCENT,
         "memory_dedup_similarity": config.MEMORY_DEDUP_SIMILARITY,
         "profile_maintenance_interval_minutes": config.PROFILE_MAINTENANCE_INTERVAL_MINUTES,
         "history_summarization_interval_minutes": config.HISTORY_SUMMARIZATION_INTERVAL_MINUTES,

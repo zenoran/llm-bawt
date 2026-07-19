@@ -391,15 +391,9 @@ class HistoryManager:
         if not plain_system_messages:
             plain_system_messages.append(Message(role="system", content=self.config.SYSTEM_MESSAGE))
 
-        max_context_messages = int(
-            self._setting(
-                "max_context_messages",
-                getattr(self.config, "MAX_CONTEXT_MESSAGES", 0),
-            )
-            or 0
-        )
-        if max_context_messages > 0 and len(raw_stream) > max_context_messages:
-            raw_stream = raw_stream[-max_context_messages:]
+        # (TASK-615) The legacy message-count cap (max_context_messages) is
+        # retired: history_tokens (the token budget below) is the sole control
+        # over how much raw history is carried. No count-based truncation here.
 
         # Without a token budget, return everything (chronological: system,
         # summaries, then raw recent messages).
@@ -530,8 +524,7 @@ class HistoryManager:
             f"raw={raw_used} ({pct(raw_used)}, {len(included_raw)} msgs, "
             f"{raw_dropped} dropped, cap={raw_cap}{f', forced-{forced}' if forced else ''}), "
             f"summaries={summary_used} ({pct(summary_used)}, "
-            f"{len(included_summaries)}/{len(summary_messages)}), "
-            f"message_cap={max_context_messages or 'none'}"
+            f"{len(included_summaries)}/{len(summary_messages)})"
         )
 
         return plain_system_messages + included_summaries + included_raw

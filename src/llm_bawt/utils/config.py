@@ -114,13 +114,11 @@ class RuntimeTunables(BaseModel):
     # dict. SUMMARIZATION_MAX_IN_CONTEXT -> summary_count. SUMMARIZATION_
     # COMPACT_CONTEXT -> compact_context. MEMORY_PROTECTED_RECENT_TURNS ->
     # summarization_job.protected_recent_turns.
-    MAX_CONTEXT_MESSAGES: int = Field(default=0, description="Max raw history messages to include in prompt context. 0 = no message-count cap.")
     HISTORY_RELOAD_TTL_SECONDS: float = Field(default=2.0, description="How long service history cache stays fresh before reloading from DB (0 = every request)")
 
     # --- Memory Retrieval --- #
     MEMORY_N_RESULTS: int = Field(default=10, description="Semantic-memory results to retrieve on cold start")
     MEMORY_MIN_RELEVANCE: float = Field(default=0.01, description="Minimum cosine-similarity score for a memory hit to be included (0.0-1.0)")
-    MEMORY_MAX_TOKEN_PERCENT: int = Field(default=30, description="Max percentage of context budget that memory results may occupy (0-100)")
     MEMORY_DEDUP_SIMILARITY: float = Field(default=0.85, description="Similarity threshold for deduplicating near-identical memory hits (0.0-1.0)")
 
     # --- Generation --- #
