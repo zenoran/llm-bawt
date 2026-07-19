@@ -105,6 +105,43 @@ class ServiceLLMBawt(BaseLLMBawt):
                 ):
                     self.client._bot_config["model"] = model_def["model_id"]
 
+                # TASK-609: resolve the catalog context window app-side and
+                # inject it so the bridge reports the true window for
+                # proxy-routed models the Claude CLI defaults to 200k. The app
+                # owns catalog resolution (the single Tier-2 authority); the
+                # bridge consumes this scalar — no bridge-side window table.
+                # Resolve from the bot's pinned endpoint_id: a bare alias is
+                # ambiguous when a model has >1 endpoint (grok-4.5 ->
+                # xai-chat + xai-responses) even WITH the harness, and
+                # resolve_model only swallows ModelNotFoundError — an
+                # Ambiguous/Incompatible error would propagate. The int
+                # endpoint id is a single-row lookup, so it can't be ambiguous;
+                # the bot's endpoint is harness-compatible by DB invariant.
+                # Fall back to the harness-resolved alias def when no endpoint
+                # is pinned (e.g. direct-Anthropic bots).
+                try:
+                    window = None
+                    ep_id = getattr(self.bot, "endpoint_id", None)
+                    if ep_id is not None:
+                        ep_def = self.config.resolve_model(
+                            ep_id,
+                            harness=getattr(self.bot, "harness", None),
+                            default={},
+                        )
+                        if isinstance(ep_def, dict):
+                            window = ep_def.get("context_window")
+                    if window is None:
+                        window = model_def.get("context_window")
+                    if window and int(window) > 0:
+                        self.client._bot_config["context_window"] = int(window)
+                except Exception:
+                    logger.debug(
+                        "TASK-609: could not resolve context_window "
+                        "(alias=%s endpoint=%s)",
+                        default_alias,
+                        getattr(self.bot, "endpoint_id", None),
+                    )
+
             # TASK-546: subagent_model is stored in agent_backend_config (like
             # effort/max_turns) so it flows through _bot_config automatically.
             # No resolution needed — agent_bridge.py reads it directly.

@@ -60,7 +60,6 @@ from ._bridge_helpers import (
     _bot_slug_from_session_key,
     _fmt_tokens,
     _usage_input_total,
-    _proxy_context_window,
     _estimate_proxy_cost_usd,
     _pick_iteration_usage,
     _read_latest_compact_metadata,
@@ -139,6 +138,23 @@ class ClaudeSendMixin:
         # a provider-qualified model the proxy accepts instead of bare
         # Anthropic IDs (claude-haiku-4-5-...) that the proxy rejects.
         subagent_model = (fields.get("subagent_model") or "").strip() or None
+
+        # TASK-609: app-resolved catalog context window. The app (single Tier-2
+        # authority) resolves the true per-model window and sends it down; the
+        # bridge consumes this scalar to report the real window for
+        # proxy-routed models the Claude CLI defaults to 200k. No bridge-side
+        # window table. Absent/invalid -> None -> defer to the SDK's own view.
+        cw_raw = (fields.get("context_window") or "").strip()
+        bot_context_window: int | None = None
+        if cw_raw:
+            try:
+                cw = int(cw_raw)
+                bot_context_window = cw if cw > 0 else None
+            except ValueError:
+                logger.warning(
+                    "Ignoring invalid context_window=%r for %s (must be positive int)",
+                    cw_raw, bot_slug,
+                )
 
         # TASK-593: app-resolved, DB-managed base SDK tool policy. Keep the raw
         # field until proxy routing is known; the pure resolver below decodes it,
@@ -1058,17 +1074,18 @@ class ClaudeSendMixin:
                                         if isinstance(mu_entry, dict):
                                             ctx_window = mu_entry.get("contextWindow")
                                             max_output = mu_entry.get("maxOutputTokens")
-                                    # Claude Code defaults unknown models to 200k. Override
-                                    # with the real window for proxy-routed providers.
-                                    proxy_ctx = _proxy_context_window(actual_model or model)
-                                    if proxy_ctx:
-                                        # Always trust our table over the CLI default for
-                                        # known proxy models (CLI never knows xAI windows).
+                                    # TASK-609: Claude Code defaults unknown (proxy-routed)
+                                    # models to 200k. Override with the app-resolved catalog
+                                    # window for proxy providers only — the CLI never knows
+                                    # xAI/OpenAI/z.ai windows. Direct-Anthropic models keep the
+                                    # SDK's own contextWindow (the app value would agree, and
+                                    # the SDK is authoritative for its native models).
+                                    if bot_context_window and proxy_model:
                                         if not ctx_window or int(ctx_window) in (200_000, 0):
-                                            ctx_window = proxy_ctx
-                                        elif int(ctx_window) < proxy_ctx:
+                                            ctx_window = bot_context_window
+                                        elif int(ctx_window) < bot_context_window:
                                             # e.g. CLI said 200k for a 500k/1M model
-                                            ctx_window = proxy_ctx
+                                            ctx_window = bot_context_window
                                     if iter_usage or ctx_window:
                                         # z.ai reports input_tokens only in message_delta, so the
                                         # per-iteration AssistantMessage.usage (iter_usage) carries

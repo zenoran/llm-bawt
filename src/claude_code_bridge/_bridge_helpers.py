@@ -74,28 +74,6 @@ def _usage_input_total(usage: dict | None) -> int:
     )
 
 
-def _proxy_context_window(model: str | None) -> int | None:
-    """Context window for proxy-routed models the Claude Code CLI doesn't know.
-
-    The CLI's ``getContextWindowForModel`` defaults unknown models to 200k
-    (Claude's window). Grok-via-bridge is ``xai/<model>`` and would otherwise
-    report 200k + Claude-tier costs. Keep this table small and explicit.
-    """
-    if not model:
-        return None
-    m = str(model).strip().lower()
-    # Exact / prefix matches for known xAI models (docs.x.ai, July 2026).
-    if m.startswith("xai/grok-4.5"):
-        return 500_000
-    if m.startswith("xai/grok-4.3") or m.startswith("xai/grok-4.20"):
-        return 1_000_000
-    if m.startswith("xai/grok-build"):
-        return 256_000
-    if m.startswith("xai/"):
-        return 500_000
-    return None
-
-
 # Per-1M-token USD rates for proxy providers the CLI prices as "unknown"
 # (which falls through to Opus-tier $5/$25 and wildly overstates Grok cost).
 _XAI_RATES = {

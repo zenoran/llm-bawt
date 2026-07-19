@@ -153,6 +153,7 @@ class RedisSubscriber:
         subagent_model: str | None = None,
         disallowed_tools: list[str] | None = None,
         inject_messages: list | None = None,
+        context_window: int | None = None,
     ) -> None:
         """Publish a chat.send command to the bridge's command stream.
 
@@ -200,6 +201,11 @@ class RedisSubscriber:
             fields["max_turns"] = str(max_turns)
         if subagent_model:
             fields["subagent_model"] = subagent_model
+        if context_window is not None and context_window > 0:
+            # TASK-609: app-resolved catalog window. The claude-code bridge
+            # consumes it to report the true context window for proxy-routed
+            # models the CLI defaults to 200k. Other bridges ignore it.
+            fields["context_window"] = str(context_window)
         if disallowed_tools is not None:
             fields["disallowed_tools"] = json.dumps(
                 disallowed_tools, ensure_ascii=False

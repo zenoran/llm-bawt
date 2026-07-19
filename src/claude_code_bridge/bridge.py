@@ -61,7 +61,6 @@ from ._bridge_helpers import (
     _bot_slug_from_session_key,
     _fmt_tokens,
     _usage_input_total,
-    _proxy_context_window,
     _estimate_proxy_cost_usd,
     _pick_iteration_usage,
     _read_latest_compact_metadata,

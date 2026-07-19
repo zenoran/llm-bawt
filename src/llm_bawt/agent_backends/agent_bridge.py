@@ -212,6 +212,10 @@ class AgentBridgeBackend(AgentBackend):
                                 else None
                             ),
                             inject_messages=config.get("inject_messages"),
+                            context_window=(
+                                int(config.get("context_window"))
+                                if config.get("context_window") else None
+                            ),
                         )
                         logger.info(
                             "%s request via bridge: session=%s request_id=%s",
