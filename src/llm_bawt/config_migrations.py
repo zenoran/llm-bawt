@@ -122,12 +122,22 @@ def rollback_typed_agent_settings(config: Config, dry_run: bool = True) -> dict:
 CONTEXT_RENAMES = {
     "max_context_tokens": "history_tokens",
     "summarization_max_in_context": "summary_count",
+    "summarization_compact_context": "compact_context",
 }
 JOB_FOLD = {
     "summarization_session_gap_seconds": "session_gap_seconds",
     "summarization_min_messages": "min_messages_per_session",
     "memory_protected_recent_turns": "protected_recent_turns",
 }
+
+# TASK-615: keys with NO canonical replacement — the second cleanup wave deletes
+# them outright once their code readers are gone. bot-scoped max_output_tokens is
+# retired (Tier-2 is global/model-scoped) but the GLOBAL row is retained.
+PURGE_KEYS_ALL_SCOPES = ("max_context_messages", "memory_max_token_percent")
+PURGE_KEY_BOT_SCOPE_ONLY = ("max_output_tokens",)
+# seed_summary_on_new_session runtime rows are superseded by the derived
+# session_memory_continuity mirror (TASK-492) — the standalone rows are redundant.
+PURGE_KEYS_REDUNDANT = ("seed_summary_on_new_session",)
 
 
 def _snapshot_rows(store: RuntimeSettingsStore) -> list[tuple[str, str, str, object]]:
@@ -149,7 +159,7 @@ def _snapshot_rows(store: RuntimeSettingsStore) -> list[tuple[str, str, str, obj
 
 def migrate_context_config_keys(config: Config, dry_run: bool = True) -> dict:
     """Move old context/summarization rows onto the canonical tier keys."""
-    from .setting_definitions import SUMMARIZATION_JOB_DEFAULTS
+    from .setting_definitions import SETTING_DEFINITIONS, SUMMARIZATION_JOB_DEFAULTS
 
     store = RuntimeSettingsStore(config)
     rows = _snapshot_rows(store)
@@ -162,6 +172,15 @@ def migrate_context_config_keys(config: Config, dry_run: bool = True) -> dict:
         new_key = CONTEXT_RENAMES[key]
         if key == "max_context_tokens" and value in (0, "0", None):
             actions.append(f"DROP {scope_type}:{scope_id}:{key}={value!r} (0 footgun; new default is bounded)")
+            if not dry_run:
+                store.delete_value(scope_type, scope_id, key)
+            continue
+        # A legacy row whose value equals the canonical default carries no
+        # operator choice — resolve() falls back to the default, so the row
+        # would be pure redundancy. Drop it instead of writing the new key.
+        canonical = SETTING_DEFINITIONS.get(new_key)
+        if canonical is not None and value == canonical.default:
+            actions.append(f"DROP {scope_type}:{scope_id}:{key}={value!r} (== canonical {new_key} default; no choice to preserve)")
             if not dry_run:
                 store.delete_value(scope_type, scope_id, key)
             continue
@@ -241,9 +260,98 @@ def rollback_context_config_keys(config: Config, dry_run: bool = True) -> dict:
     return {"dry_run": dry_run, "actions": actions}
 
 
+# ── TASK-615: purge legacy context keys with no canonical home ──────────────
+#
+# The second cleanup wave. Deletes runtime_settings rows for retired knobs
+# once their code readers are gone (max_context_messages cap, the memory-percent
+# knob, bot-scoped max_output_tokens, and the redundant seed_summary rows).
+# NON-reversible by design — these keys have no replacement to restore to. Run
+# ONLY after the code that reads them is deployed (deploy-before-delete), so a
+# deleted row never changes live behavior through still-present code.
+#
+# Run:
+#     python -m llm_bawt.config_migrations --purge-legacy --dry-run
+#     python -m llm_bawt.config_migrations --purge-legacy            # apply
+
+
+def purge_legacy_context_keys(config: Config, dry_run: bool = True) -> dict:
+    """Delete retired legacy runtime_settings rows (TASK-615). Not reversible."""
+    store = RuntimeSettingsStore(config)
+    rows = _snapshot_rows(store)
+    actions: list[str] = []
+
+    for scope_type, scope_id, key, value in rows:
+        drop = False
+        reason = ""
+        if key in PURGE_KEYS_ALL_SCOPES:
+            drop, reason = True, "retired knob, no replacement"
+        elif key in PURGE_KEYS_REDUNDANT:
+            drop, reason = True, "superseded by session_memory_continuity mirror"
+        elif key in PURGE_KEY_BOT_SCOPE_ONLY and scope_type == "bot":
+            drop, reason = True, "bot-scope retired (Tier-2 is global/model-scoped)"
+        if not drop:
+            continue
+        actions.append(f"DELETE {scope_type}:{scope_id}:{key}={value!r} ({reason})")
+        if not dry_run:
+            store.delete_value(scope_type, scope_id, key)
+
+    return {"dry_run": dry_run, "actions": actions}
+
+
+# ── TASK-616: fail-loud catalog context-window integrity preflight ──────────
+#
+# The catalog context window is a MODEL FACT (models.default_context_window /
+# model_endpoints.context_window_override), never a global-default substitute.
+# This preflight refuses to pass an incomplete tenant: it lists every model
+# endpoint whose window is missing or non-positive so the operator corrects the
+# catalog rather than silently degrading to a fallback window.
+#
+# Run:
+#     python -m llm_bawt.config_migrations --catalog-preflight
+
+
+def catalog_window_preflight(config: Config) -> dict:
+    """Return every model endpoint lacking a positive context window (TASK-616)."""
+    store = RuntimeSettingsStore(config)
+    missing: list[str] = []
+    # Direct SQL read — the catalog spans models -> model_endpoints and is
+    # simpler to inspect as a join than via the ORM here.
+    import sqlalchemy as _sa
+
+    with Session(store.engine) as s:
+        result = s.execute(
+            _sa.text(
+                """
+                SELECT m.key AS model_key,
+                       e.id AS endpoint_id,
+                       COALESCE(e.context_window_override, m.default_context_window) AS window
+                FROM models m
+                JOIN model_endpoints e ON e.model_id = m.id
+                ORDER BY m.key, e.id
+                """
+            )
+        )
+        for model_key, endpoint_id, window in result:
+            if window is None or int(window) <= 0:
+                missing.append(f"{model_key} (endpoint {endpoint_id}): window={window!r}")
+
+    ok = not missing
+    return {
+        "ok": ok,
+        "missing": missing,
+        "message": (
+            "All model endpoints have a positive context window."
+            if ok
+            else f"{len(missing)} model endpoint(s) lack a positive context window — "
+            "correct the catalog (models.default_context_window / "
+            "model_endpoints.context_window_override) before enforcing NOT NULL."
+        ),
+    }
+
+
 def main() -> None:
     logging.basicConfig(level=logging.INFO)
-    ap = argparse.ArgumentParser(description="Config migrations (TASK-491/492/614)")
+    ap = argparse.ArgumentParser(description="Config migrations (TASK-491/492/614/615/616)")
     ap.add_argument("--dry-run", action="store_true", help="Show actions without writing")
     ap.add_argument("--rollback", action="store_true", help="Reverse the migration")
     ap.add_argument(
@@ -251,9 +359,23 @@ def main() -> None:
         action="store_true",
         help="TASK-614: migrate context/summarization rows to canonical tier keys",
     )
+    ap.add_argument(
+        "--purge-legacy",
+        action="store_true",
+        help="TASK-615: delete retired legacy rows (not reversible)",
+    )
+    ap.add_argument(
+        "--catalog-preflight",
+        action="store_true",
+        help="TASK-616: fail-loud check that every model endpoint has a positive window",
+    )
     args = ap.parse_args()
     config = Config()
-    if args.context:
+    if args.catalog_preflight:
+        result = catalog_window_preflight(config)
+    elif args.purge_legacy:
+        result = purge_legacy_context_keys(config, dry_run=args.dry_run)
+    elif args.context:
         if args.rollback:
             result = rollback_context_config_keys(config, dry_run=args.dry_run)
         else:
@@ -264,6 +386,8 @@ def main() -> None:
         result = backfill_typed_agent_settings(config, dry_run=args.dry_run)
     import json as _json
     print(_json.dumps(result, indent=2, ensure_ascii=False))
+    if args.catalog_preflight and not result.get("ok"):
+        raise SystemExit(1)
 
 
 if __name__ == "__main__":
