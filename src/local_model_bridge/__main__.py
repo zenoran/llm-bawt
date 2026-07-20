@@ -40,8 +40,21 @@ async def _health_server(publisher: RedisPublisher, port: int) -> None:
         try:
             await reader.readline()
             redis_ok = publisher.connected
+            # Report embed readiness alongside Redis for observability. This port
+            # (8683) stays gated on Redis only — the embed server has its own
+            # authoritative healthcheck on :8684 — but surfacing embed here lets
+            # an operator see both from one probe.
+            try:
+                from .embed_server import embed_ready
+
+                embed_ok = embed_ready()
+            except Exception:
+                embed_ok = False
             status = "200 OK" if redis_ok else "503 Service Unavailable"
-            body = f'{{"redis": {str(redis_ok).lower()}}}'
+            body = (
+                f'{{"redis": {str(redis_ok).lower()}, '
+                f'"embed": {str(embed_ok).lower()}}}'
+            )
             resp = (
                 f"HTTP/1.1 {status}\r\n"
                 f"Content-Type: application/json\r\n"
@@ -154,11 +167,34 @@ def main() -> None:
             "yes",
         )
 
+        # Supervise long-lived tasks: without this, an exception or an
+        # unexpected return in any of them is silently swallowed by asyncio
+        # while the process keeps waiting on shutdown_event — exactly how the
+        # embed server sat dead for days while the container looked healthy.
+        # This logs loudly so the failure is visible in the container logs; the
+        # embed server's :8684 healthcheck is what actually marks the container
+        # unhealthy for recovery.
+        def _supervise(name: str):
+            def _cb(task: asyncio.Task) -> None:
+                if task.cancelled():
+                    return
+                exc = task.exception()
+                if exc is not None:
+                    logger.error("%s task crashed", name, exc_info=exc)
+                else:
+                    logger.warning("%s task exited unexpectedly (no exception)", name)
+
+            return _cb
+
         health_task = asyncio.create_task(_health_server(publisher, health_port))
+        health_task.add_done_callback(_supervise("health"))
         bridge_task = (
             None if embed_only else asyncio.create_task(bridge.run_forever())
         )
+        if bridge_task is not None:
+            bridge_task.add_done_callback(_supervise("inference-bridge"))
         embed_task = asyncio.create_task(serve_embed(embed_port))
+        embed_task.add_done_callback(_supervise("embed"))
         if embed_only:
             logger.info("EMBED-ONLY mode: app/Redis inference bridge NOT started")
 

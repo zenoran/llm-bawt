@@ -10,6 +10,7 @@ Endpoints:
     POST /embed   {"texts": [str, ...], "model"?: str}
                   -> {"embeddings": [[float, ...], ...], "model": str, "dim": int}
     GET  /health  -> {"ok": bool, "model": str, "dim": int}
+                  200 when the model is loaded, 503 until it is (or if it failed).
 
 Environment:
     LOCAL_MODEL_EMBED_MODEL   — sentence-transformers model (default all-MiniLM-L6-v2)
@@ -26,6 +27,7 @@ import warnings
 from typing import Any
 
 from fastapi import FastAPI
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
 logger = logging.getLogger("local_model_bridge.embed")
@@ -50,6 +52,31 @@ def load_model() -> Any:
     global _model
     if _model is not None:
         return _model
+
+    # sentence-transformers v5 (multimodal) hard-imports torchcodec — a
+    # video/audio codec lib — at package import. When that torchcodec is built
+    # for a different CUDA than the container ships (here: torchcodec wants
+    # libnvrtc.so.13 / CUDA 13, container has CUDA 12.9), the import raises
+    # RuntimeError, which s-t's own guard (`except (ImportError, OSError)`) does
+    # NOT catch — so the whole `import sentence_transformers` blows up and /embed
+    # dies. torchcodec is irrelevant to MiniLM text embeddings, so if (and only
+    # if) it fails to import, neutralize it: `sys.modules[...] = None` makes the
+    # downstream `import torchcodec` raise ImportError instead, which the guard
+    # DOES catch (falling back to text-only). A healthy torchcodec is untouched.
+    # See TASK-629.
+    import sys as _sys
+
+    if "torchcodec" not in _sys.modules:
+        try:
+            import torchcodec  # noqa: F401
+        except Exception as e:  # RuntimeError/OSError/ImportError — any load failure
+            logger.warning(
+                "torchcodec failed to import (%s); neutralizing it so "
+                "sentence-transformers loads text-only (torchcodec is unused for "
+                "MiniLM embeddings)",
+                type(e).__name__,
+            )
+            _sys.modules["torchcodec"] = None
 
     try:
         from sentence_transformers import SentenceTransformer
@@ -117,6 +144,15 @@ def load_model() -> Any:
     return _model
 
 
+def embed_ready() -> bool:
+    """True once the embedding model is loaded and ``/embed`` can serve.
+
+    Surfaced in the bridge's own health body (:8683) so operators can see embed
+    readiness alongside Redis without a second probe.
+    """
+    return _model is not None
+
+
 class EmbedRequest(BaseModel):
     texts: list[str]
     model: str | None = None
@@ -126,8 +162,16 @@ def create_app() -> FastAPI:
     app = FastAPI(title="local-model-bridge embed", docs_url=None, redoc_url=None)
 
     @app.get("/health")
-    def health() -> dict:
-        return {"ok": _model is not None, "model": EMBED_MODEL_NAME, "dim": EMBED_DIM}
+    def health() -> JSONResponse:
+        # 503 until the model is actually loaded so a slow / hung / failed load
+        # is caught by the docker healthcheck (`curl -f`) instead of the port
+        # answering 200 while /embed can't serve. NO CPU/keyword fallback — a
+        # not-ready embed server reports unhealthy, it does not silently degrade.
+        ready = _model is not None
+        return JSONResponse(
+            status_code=200 if ready else 503,
+            content={"ok": ready, "model": EMBED_MODEL_NAME, "dim": EMBED_DIM},
+        )
 
     @app.post("/embed")
     def embed(req: EmbedRequest) -> dict:
@@ -159,19 +203,28 @@ def create_app() -> FastAPI:
 
 
 async def serve_embed(port: int) -> None:
-    """Pre-warm the model, then serve the embed API on ``port`` until cancelled.
+    """Serve the embed API on ``port``, loading the model in the background.
 
-    Run as an asyncio task inside the bridge's existing event loop. The model
-    load happens in a thread executor so the loop (and the Redis bridge/health
-    tasks) are not blocked during the (cold) load.
+    Run as an asyncio task inside the bridge's existing event loop.
+
+    Ordering matters: we bind and START the HTTP server FIRST, then load the
+    model in a thread executor. This is the opposite of the old "await load,
+    then serve" flow, which left ``:port`` completely unbound while the model
+    loaded — so a slow or (worse) hung load (e.g. torch's CUDA probe wedging on
+    a stale NVML handle) made the port answer *connection refused*, indistinguishable
+    from the service being absent, and invisible to any healthcheck.
+
+    Now the port is up immediately: ``/health`` answers 503 until the model is
+    ready and 200 afterwards, so the docker healthcheck can see "not ready yet"
+    and mark the container unhealthy if the load never completes. The load runs
+    off the event loop so the server (and the Redis bridge/health tasks) stay
+    responsive during a cold load.
     """
     import asyncio
 
     import uvicorn
 
     loop = asyncio.get_running_loop()
-    logger.info("Pre-warming embedding model %s (device=%s)…", EMBED_MODEL_NAME, EMBED_DEVICE)
-    await loop.run_in_executor(None, load_model)
 
     config = uvicorn.Config(
         create_app(),
@@ -181,5 +234,25 @@ async def serve_embed(port: int) -> None:
         access_log=False,
     )
     server = uvicorn.Server(config)
-    logger.info("Embed API listening on :%d (model=%s)", port, EMBED_MODEL_NAME)
-    await server.serve()
+    serve_task = asyncio.create_task(server.serve())
+    logger.info(
+        "Embed API listening on :%d (loading model %s, device=%s; /health is 503 until ready)…",
+        port,
+        EMBED_MODEL_NAME,
+        EMBED_DEVICE,
+    )
+
+    # Load off the loop. On success /health flips to 200; on failure the model
+    # stays None and /health stays 503 — the outage is surfaced, never papered
+    # over with a CPU/keyword fallback.
+    model = await loop.run_in_executor(None, load_model)
+    if model is not None:
+        logger.info("Embed model %s ready on :%d", EMBED_MODEL_NAME, port)
+    else:
+        logger.error(
+            "Embed model %s FAILED to load; /embed will 503 and /health reports "
+            "unhealthy until resolved",
+            EMBED_MODEL_NAME,
+        )
+
+    await serve_task

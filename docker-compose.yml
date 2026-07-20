@@ -385,7 +385,15 @@ services:
         condition: service_started
     restart: unless-stopped
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8683/health"]
+      # Probe BOTH the bridge health port (8683, Redis/inference) AND the embed
+      # server (8684). The embed /health returns 503 until the model is loaded,
+      # so `curl -f` fails and — after start_period — marks the container
+      # unhealthy if embed never comes up. Previously only 8683 was probed, so a
+      # dead embed server (e.g. a wedged CUDA/NVML load hanging the model) left
+      # the container reporting "healthy" while all semantic search silently
+      # degraded to keyword. See TASK-629.
+      test:
+        ["CMD-SHELL", "curl -f http://localhost:8683/health && curl -f http://localhost:8684/health"]
       interval: 15s
       timeout: 5s
       retries: 3
