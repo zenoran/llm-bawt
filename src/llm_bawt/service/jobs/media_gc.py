@@ -63,26 +63,37 @@ logger = logging.getLogger(__name__)
 # ``payload["grace_days"]`` (the scheduler reads this from ``config_json``).
 DEFAULT_GRACE_DAYS = 7
 
-# Discover every per-bot ``*_messages`` table at run time. We exclude
-# ``*_forgotten_messages`` (the soft-delete archive) since recalled
-# attachments must continue to keep assets alive. Matches the regex used
-# in :func:`llm_bawt.memory.migrations.add_attachments_to_messages` so
-# the table set the GC scans is exactly the set that carries the
-# ``attachments`` column.
+# Discover every table that carries an ``attachments`` column at run time —
+# column-driven so the table set the GC scans is BY CONSTRUCTION the set
+# that can reference media assets, across every storage-layout era:
+#
+# * pre-TASK-571: the legacy per-bot ``<bot>_messages`` shards;
+# * post-TASK-571: the partitioned ``messages`` parent (its ``messages_p_*``
+#   partitions are excluded — scanning the parent covers them) plus, during
+#   the soak window, the renamed ``zz_old_*`` shard copies. Including the
+#   zz_old copies is deliberately conservative: an asset referenced only by
+#   pre-cutover history stays alive until --finalize drops those tables.
+#
+# A name-pattern LIKE here would be a data-loss bug: after cutover nothing
+# matches ``%_messages`` anymore, the referenced-set query would come back
+# empty, and EVERY asset past the grace window would look orphaned.
 _FIND_MESSAGES_TABLES_SQL = text(
     """
-    SELECT table_name
-    FROM information_schema.tables
-    WHERE table_schema = 'public'
-      AND table_name LIKE '%\\_messages' ESCAPE '\\'
-      AND table_name NOT LIKE '%\\_forgotten\\_messages' ESCAPE '\\'
-    ORDER BY table_name
+    SELECT c.table_name
+    FROM information_schema.columns c
+    JOIN information_schema.tables t
+      ON t.table_schema = c.table_schema AND t.table_name = c.table_name
+    WHERE c.table_schema = 'public'
+      AND c.column_name = 'attachments'
+      AND t.table_type = 'BASE TABLE'
+      AND c.table_name NOT LIKE 'messages\\_p\\_%' ESCAPE '\\'
+    ORDER BY c.table_name
     """
 )
 
 
 def _discover_message_tables(conn) -> list[str]:
-    """Return every ``*_messages`` table currently in ``public``."""
+    """Return every attachments-carrying table currently in ``public``."""
     rows = conn.execute(_FIND_MESSAGES_TABLES_SQL).fetchall()
     return [row.table_name for row in rows]
 

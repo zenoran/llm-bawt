@@ -1,9 +1,25 @@
 """PostgreSQL memory backend for llm-bawt with pgvector support.
 
 This backend uses PostgreSQL with the pgvector extension for semantic similarity search.
-Each bot gets its own isolated tables:
-  - {bot_id}_messages: Permanent message storage (all messages)
-  - {bot_id}_memories: Distilled, importance-weighted memories with embeddings
+
+Storage layout (TASK-571): three LIST-partitioned parent tables, one
+partition per bot:
+
+  - ``messages``            PARTITION BY LIST (bot_id) — permanent message storage
+  - ``memories``            PARTITION BY LIST (bot_id) — distilled, importance-weighted
+  - ``forgotten_messages``  PARTITION BY LIST (bot_id) — soft-deleted messages
+
+Each bot's partition is named ``<parent>_p_<sanitized_bot_id>`` (e.g.
+``messages_p_snark``) and the backend addresses its own bot's partition
+DIRECTLY — a query against ``messages_p_snark`` physically cannot return
+another bot's rows, preserving the hard per-bot isolation the legacy
+``<bot>_messages`` shard tables provided. Cross-bot features (Spotlight
+search, source listing) query the parent with ``bot_id`` in the select
+list instead of UNION-ALL-ing shards.
+
+Each partition carries ``ALTER COLUMN bot_id SET DEFAULT '<bot>'`` so the
+existing INSERT statements (which don't mention bot_id) keep working
+unchanged; the partition bound guarantees correctness.
 
 The separation allows:
   - Messages: Complete conversation history, never deleted
@@ -47,6 +63,214 @@ def _sanitize_table_name(bot_id: str) -> str:
     if not sanitized:
         sanitized = "default"
     return sanitized
+
+
+# ---------------------------------------------------------------------------
+# Partitioned parent tables (TASK-571)
+# ---------------------------------------------------------------------------
+
+# Parent table names. Every bot's data lives in a LIST partition of these.
+MESSAGES_PARENT = "messages"
+MEMORIES_PARENT = "memories"
+FORGOTTEN_PARENT = "forgotten_messages"
+
+PARENT_TABLES = (MESSAGES_PARENT, MEMORIES_PARENT, FORGOTTEN_PARENT)
+
+
+def partition_name(base: str, bot_id: str) -> str:
+    """Single authority for a bot's partition name: ``<base>_p_<sanitized>``.
+
+    ``base`` is one of the parent table names (``messages`` / ``memories`` /
+    ``forgotten_messages``); ``bot_id`` may be raw — it is sanitized here.
+    """
+    return f"{base}_p_{_sanitize_table_name(bot_id)}"
+
+
+# Process-wide guard: parent DDL only needs to run once per process.
+_parent_tables_initialized = False
+
+# Set to True when hnsw-on-partitioned-parent turned out to be unsupported by
+# the installed pgvector build; ensure_bot_partitions then creates the vector
+# indexes per-partition instead (functionally identical — a partitioned index
+# is just a template that materializes per-partition anyway).
+_hnsw_parent_unsupported = False
+
+
+def ensure_parent_tables(conn, embedding_dim: int = 384) -> None:
+    """Create the three LIST-partitioned parent tables + parent indexes.
+
+    Idempotent (CREATE ... IF NOT EXISTS throughout). Runs against a live
+    DB safely: new names, no collision with any legacy ``<bot>_*`` shard
+    tables. Indexes created on the parent are templates — every partition
+    (existing and future) gets its own physical index automatically.
+
+    The composite PRIMARY KEY (bot_id, id) is required on partitioned
+    tables (the partition key must be part of the PK). Within a partition
+    ``id`` remains effectively unique (UUIDs), so partition-direct
+    ``WHERE id = :id`` queries are unaffected.
+    """
+    global _hnsw_parent_unsupported
+
+    messages_sql = text(f"""
+        CREATE TABLE IF NOT EXISTS {MESSAGES_PARENT} (
+            bot_id VARCHAR(64) NOT NULL,
+            id VARCHAR(36) NOT NULL,
+            role VARCHAR(20) NOT NULL,
+            content TEXT NOT NULL,
+            timestamp DOUBLE PRECISION NOT NULL,
+            session_id VARCHAR(36),
+            processed BOOLEAN DEFAULT FALSE,
+            summarized BOOLEAN DEFAULT FALSE,
+            summary_metadata JSONB,
+            recalled_history BOOLEAN DEFAULT FALSE,
+            attachments JSONB NOT NULL DEFAULT '[]'::jsonb,
+            reasoning TEXT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            PRIMARY KEY (bot_id, id)
+        ) PARTITION BY LIST (bot_id)
+    """)
+
+    forgotten_sql = text(f"""
+        CREATE TABLE IF NOT EXISTS {FORGOTTEN_PARENT} (
+            bot_id VARCHAR(64) NOT NULL,
+            id VARCHAR(36) NOT NULL,
+            role VARCHAR(20) NOT NULL,
+            content TEXT NOT NULL,
+            timestamp DOUBLE PRECISION NOT NULL,
+            session_id VARCHAR(36),
+            processed BOOLEAN DEFAULT FALSE,
+            created_at TIMESTAMP,
+            forgotten_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            PRIMARY KEY (bot_id, id)
+        ) PARTITION BY LIST (bot_id)
+    """)
+
+    memories_sql = text(f"""
+        CREATE TABLE IF NOT EXISTS {MEMORIES_PARENT} (
+            bot_id VARCHAR(64) NOT NULL,
+            id VARCHAR(36) NOT NULL,
+            content TEXT NOT NULL,
+            tags JSONB NOT NULL DEFAULT '["misc"]'::jsonb,
+            importance REAL NOT NULL DEFAULT 0.5,
+            source_message_ids JSONB,
+            access_count INTEGER DEFAULT 0,
+            last_accessed TIMESTAMP,
+            intent TEXT,
+            stakes TEXT,
+            emotional_charge REAL,
+            recurrence_keywords JSONB,
+            meaning_updated_at TIMESTAMP,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            embedding vector({embedding_dim}),
+            meaning_embedding vector({embedding_dim}),
+            PRIMARY KEY (bot_id, id)
+        ) PARTITION BY LIST (bot_id)
+    """)
+
+    conn.execute(messages_sql)
+    conn.execute(forgotten_sql)
+    conn.execute(memories_sql)
+
+    # Parent-level btree/gin indexes — template to every partition.
+    parent_indexes = [
+        f"CREATE INDEX IF NOT EXISTS idx_{MESSAGES_PARENT}_timestamp ON {MESSAGES_PARENT}(timestamp)",
+        f"CREATE INDEX IF NOT EXISTS idx_{MESSAGES_PARENT}_session ON {MESSAGES_PARENT}(session_id)",
+        f"CREATE INDEX IF NOT EXISTS idx_{MESSAGES_PARENT}_processed ON {MESSAGES_PARENT}(processed)",
+        # GIN trigram index on message content — backs the Spotlight
+        # substring/fuzzy mode (search_all_messages_trgm / ILIKE '%..%').
+        f"CREATE INDEX IF NOT EXISTS {MESSAGES_PARENT}_content_trgm_idx ON {MESSAGES_PARENT} USING gin (content gin_trgm_ops)",
+        f"CREATE INDEX IF NOT EXISTS idx_{MEMORIES_PARENT}_importance ON {MEMORIES_PARENT}(importance)",
+        f"CREATE INDEX IF NOT EXISTS idx_{MEMORIES_PARENT}_accessed ON {MEMORIES_PARENT}(last_accessed)",
+        f"CREATE INDEX IF NOT EXISTS idx_{MEMORIES_PARENT}_tags_gin ON {MEMORIES_PARENT} USING gin (tags)",
+    ]
+    # Each index runs under a SAVEPOINT (begin_nested) so a single failure
+    # doesn't abort the enclosing transaction — load-bearing for the hnsw
+    # fallback below, and for the migration script's rolled-back dry-run.
+    for idx_sql in parent_indexes:
+        try:
+            with conn.begin_nested():
+                conn.execute(text(idx_sql))
+        except Exception as e:
+            logger.debug(f"Parent index creation (may already exist): {e}")
+
+    # HNSW vector indexes on the parent. If the installed pgvector build
+    # rejects hnsw on a partitioned table, fall back to per-partition
+    # creation inside ensure_bot_partitions (same physical result).
+    for col in ("embedding", "meaning_embedding"):
+        hnsw_sql = f"""
+            CREATE INDEX IF NOT EXISTS idx_{MEMORIES_PARENT}_{col}
+            ON {MEMORIES_PARENT}
+            USING hnsw ({col} vector_cosine_ops)
+        """
+        try:
+            with conn.begin_nested():
+                conn.execute(text(hnsw_sql))
+        except Exception as e:
+            _hnsw_parent_unsupported = True
+            logger.warning(
+                f"hnsw index on partitioned parent unsupported ({e}); "
+                "falling back to per-partition vector indexes"
+            )
+
+
+def ensure_bot_partitions(conn, bot_id: str) -> None:
+    """Create (idempotently) one partition per parent table for ``bot_id``.
+
+    The partition NAME uses the sanitized identifier; the partition VALUE is
+    the sanitized bot id too — deliberately: the sanitized form IS the bot's
+    storage identity today (it's what the legacy shard-table prefix was), so
+    every consumer (scheduler aggregates, global-search exclusion sets,
+    Spotlight ``source`` attribution) keeps exactly the identity it already
+    used. A per-partition column DEFAULT makes bot_id transparent to the
+    existing INSERTs, which never mention it.
+
+    No DEFAULT (catch-all) partition on purpose: an unprovisioned bot_id
+    write fails loudly instead of silently pooling — and this function makes
+    that unreachable in practice (it runs at every backend init).
+
+    Concurrent init of the same new bot races CREATE TABLE IF NOT EXISTS —
+    PG serializes on the parent lock; duplicate errors are swallowed.
+    """
+    sanitized = _sanitize_table_name(bot_id)
+    for base in PARENT_TABLES:
+        part = f"{base}_p_{sanitized}"
+        try:
+            # SAVEPOINT so a create race doesn't abort the enclosing txn
+            # before the existence re-check below.
+            with conn.begin_nested():
+                conn.execute(text(
+                    f"CREATE TABLE IF NOT EXISTS {part} "
+                    f"PARTITION OF {base} FOR VALUES IN ('{sanitized}')"
+                ))
+                conn.execute(text(
+                    f"ALTER TABLE {part} ALTER COLUMN bot_id SET DEFAULT '{sanitized}'"
+                ))
+        except Exception as e:
+            # Duplicate-table race from a concurrent backend init, or the
+            # partition already exists with the same bound. Idempotent-ish:
+            # verify existence before treating as fatal.
+            exists = conn.execute(text(
+                "SELECT 1 FROM information_schema.tables WHERE table_name = :n"
+            ), {"n": part}).fetchone()
+            if not exists:
+                raise
+            logger.debug(f"Partition {part} creation race (already exists): {e}")
+
+    # Per-partition vector indexes when the parent-level hnsw template was
+    # rejected by the installed pgvector build.
+    if _hnsw_parent_unsupported:
+        mem_part = f"{MEMORIES_PARENT}_p_{sanitized}"
+        for col in ("embedding", "meaning_embedding"):
+            try:
+                with conn.begin_nested():
+                    conn.execute(text(f"""
+                        CREATE INDEX IF NOT EXISTS idx_{mem_part}_{col}
+                        ON {mem_part}
+                        USING hnsw ({col} vector_cosine_ops)
+                    """))
+            except Exception as e:
+                logger.debug(f"Per-partition hnsw creation: {e}")
 
 
 # Memory backends share the process-wide engine (TASK-202): see
@@ -132,8 +356,13 @@ _sessions_table_initialized = False
 
 
 def get_message_table_pg(bot_id: str) -> Table:
-    """Get or create a message Table for a specific bot (PostgreSQL version)."""
-    table_name = f"{_sanitize_table_name(bot_id)}_messages"
+    """Get or create a message Table for a specific bot (PostgreSQL version).
+
+    Points at the bot's PARTITION of the ``messages`` parent (TASK-571).
+    The Table object deliberately omits ``bot_id`` — the partition's column
+    DEFAULT fills it on insert, and partition-direct reads don't need it.
+    """
+    table_name = partition_name(MESSAGES_PARENT, bot_id)
 
     if table_name in _message_table_cache:
         return _message_table_cache[table_name]
@@ -176,8 +405,10 @@ def get_forgotten_table_pg(bot_id: str) -> Table:
     
     This table stores messages that have been 'forgotten' (soft-deleted).
     They can be restored later if needed.
+
+    Points at the bot's PARTITION of ``forgotten_messages`` (TASK-571).
     """
-    table_name = f"{_sanitize_table_name(bot_id)}_forgotten_messages"
+    table_name = partition_name(FORGOTTEN_PARENT, bot_id)
     
     if table_name in _forgotten_table_cache:
         return _forgotten_table_cache[table_name]
@@ -201,8 +432,11 @@ def get_forgotten_table_pg(bot_id: str) -> Table:
 
 
 def get_memory_table_pg(bot_id: str) -> Table:
-    """Get or create a memory Table for a specific bot (PostgreSQL version)."""
-    table_name = f"{_sanitize_table_name(bot_id)}_memories"
+    """Get or create a memory Table for a specific bot (PostgreSQL version).
+
+    Points at the bot's PARTITION of the ``memories`` parent (TASK-571).
+    """
+    table_name = partition_name(MEMORIES_PARENT, bot_id)
     
     if table_name in _memory_table_cache:
         return _memory_table_cache[table_name]
@@ -269,9 +503,13 @@ class PostgreSQLMemoryBackend(MemoryBackend):
         
         self.database = database
         self.bot_id_sanitized = _sanitize_table_name(bot_id)
-        self._messages_table_name = f"{self.bot_id_sanitized}_messages"
-        self._memories_table_name = f"{self.bot_id_sanitized}_memories"
-        self._forgotten_table_name = f"{self.bot_id_sanitized}_forgotten_messages"
+        # Partition-direct access (TASK-571): all bot-scoped SQL targets the
+        # bot's partition, so every interpolated query below (and in
+        # maintenance/consolidation/summarization, which ride these attrs)
+        # keeps its exact shape — only the name changed.
+        self._messages_table_name = partition_name(MESSAGES_PARENT, bot_id)
+        self._memories_table_name = partition_name(MEMORIES_PARENT, bot_id)
+        self._forgotten_table_name = partition_name(FORGOTTEN_PARENT, bot_id)
         self.embedding_dim = embedding_dim
         
         # Get table definitions
@@ -292,7 +530,18 @@ class PostgreSQLMemoryBackend(MemoryBackend):
         logger.debug(f"Connected to PostgreSQL at {host}:{port}/{database} (bot: {bot_id})")
     
     def _ensure_tables_exist(self) -> None:
-        """Create the bot's tables if they don't exist."""
+        """Ensure the partitioned parents + this bot's partitions exist.
+
+        TASK-571: replaces the legacy per-bot ``CREATE TABLE <bot>_messages``
+        blocks. Parent DDL runs once per process (module guard); the bot's
+        partitions are ensured on every backend init — the same seam the
+        shard tables used, so a brand-new bot is provisioned transparently.
+
+        The legacy column-migration ALTERs are gone: the parents are created
+        with the full current schema, and pre-existing data was carried over
+        by the one-shot copy in ``migrations_partition.py``.
+        """
+        global _parent_tables_initialized
         with self.engine.connect() as conn:
             # Ensure pgvector extension is available
             try:
@@ -302,125 +551,22 @@ class PostgreSQLMemoryBackend(MemoryBackend):
                 logger.debug(f"pgvector extension check: {e}")
 
             # Ensure pg_trgm extension is available — backs the trigram GIN
-            # index on each bot's messages.content (created in
-            # `_create_indexes`). Powers the Spotlight "Exact / substring"
-            # search mode (search_all_messages_trgm) which is the right
-            # path for IDs, file paths, and other tokens the english FTS
-            # config would shred. Idempotent.
+            # index on messages.content (templated from the parent). Powers
+            # the Spotlight "Exact / substring" search mode
+            # (search_all_messages_trgm) which is the right path for IDs,
+            # file paths, and other tokens the english FTS config would
+            # shred. Idempotent.
             try:
                 conn.execute(text("CREATE EXTENSION IF NOT EXISTS pg_trgm"))
                 conn.commit()
             except Exception as e:
                 logger.debug(f"pg_trgm extension check: {e}")
-            
-            # Create messages table
-            # TASK-222: `attachments` is a JSONB array of media asset refs
-            # like [{"asset_id": "ma_...", "kind": "image"}, ...]. Default
-            # '[]' so existing rows and producers that don't yet attach
-            # anything stay valid.
-            messages_sql = text(f"""
-                CREATE TABLE IF NOT EXISTS {self._messages_table_name} (
-                    id VARCHAR(36) PRIMARY KEY,
-                    role VARCHAR(20) NOT NULL,
-                    content TEXT NOT NULL,
-                    timestamp DOUBLE PRECISION NOT NULL,
-                    session_id VARCHAR(36),
-                    processed BOOLEAN DEFAULT FALSE,
-                    summarized BOOLEAN DEFAULT FALSE,
-                    summary_metadata JSONB,
-                    attachments JSONB NOT NULL DEFAULT '[]'::jsonb,
-                    reasoning TEXT,
-                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-                )
-            """)
 
-            # Create forgotten messages table (for soft-deleted messages)
-            forgotten_sql = text(f"""
-                CREATE TABLE IF NOT EXISTS {self._forgotten_table_name} (
-                    id VARCHAR(36) PRIMARY KEY,
-                    role VARCHAR(20) NOT NULL,
-                    content TEXT NOT NULL,
-                    timestamp DOUBLE PRECISION NOT NULL,
-                    session_id VARCHAR(36),
-                    processed BOOLEAN DEFAULT FALSE,
-                    created_at TIMESTAMP,
-                    forgotten_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-                )
-            """)
-            
-            # Create memories table with vector column
-            memories_sql = text(f"""
-                CREATE TABLE IF NOT EXISTS {self._memories_table_name} (
-                    id VARCHAR(36) PRIMARY KEY,
-                    content TEXT NOT NULL,
-                    tags JSONB NOT NULL DEFAULT '["misc"]'::jsonb,
-                    importance REAL NOT NULL DEFAULT 0.5,
-                    source_message_ids JSONB,
-                    access_count INTEGER DEFAULT 0,
-                    last_accessed TIMESTAMP,
-                    intent TEXT,
-                    stakes TEXT,
-                    emotional_charge REAL,
-                    recurrence_keywords JSONB,
-                    meaning_updated_at TIMESTAMP,
-                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    embedding vector({self.embedding_dim}),
-                    meaning_embedding vector({self.embedding_dim})
-                )
-            """)
-            
-            # Migration: drop superseded_by column (we now delete instead of marking)
-            drop_superseded_sql = text(f"""
-                ALTER TABLE {self._memories_table_name}
-                DROP COLUMN IF EXISTS superseded_by
-            """)
-
-            add_tags_sql = text(f"""
-                ALTER TABLE {self._memories_table_name}
-                ADD COLUMN IF NOT EXISTS tags JSONB NOT NULL DEFAULT '["misc"]'::jsonb,
-                ADD COLUMN IF NOT EXISTS intent TEXT,
-                ADD COLUMN IF NOT EXISTS stakes TEXT,
-                ADD COLUMN IF NOT EXISTS emotional_charge REAL,
-                ADD COLUMN IF NOT EXISTS recurrence_keywords JSONB,
-                ADD COLUMN IF NOT EXISTS meaning_updated_at TIMESTAMP,
-                ADD COLUMN IF NOT EXISTS meaning_embedding vector({self.embedding_dim})
-            """)
-
-            # Migration: drop legacy memory_type column
-            drop_memory_type_sql = text(f"""
-                ALTER TABLE {self._memories_table_name}
-                DROP COLUMN IF EXISTS memory_type
-            """)
-
-            # Migration: add summarization columns to messages table
-            add_summarization_cols_sql = text(f"""
-                ALTER TABLE {self._messages_table_name}
-                ADD COLUMN IF NOT EXISTS summarized BOOLEAN DEFAULT FALSE,
-                ADD COLUMN IF NOT EXISTS summary_metadata JSONB
-            """)
-
-            # Migration: add recalled_history column to messages table
-            add_recalled_history_sql = text(f"""
-                ALTER TABLE {self._messages_table_name}
-                ADD COLUMN IF NOT EXISTS recalled_history BOOLEAN DEFAULT FALSE
-            """)
-
-            # TASK-222: add attachments JSONB column to existing message
-            # tables. Existing rows fill with '[]' via the default; no
-            # explicit backfill needed. Kept as a separate ALTER so it
-            # rolls out independently of other migrations.
-            add_attachments_sql = text(f"""
-                ALTER TABLE {self._messages_table_name}
-                ADD COLUMN IF NOT EXISTS attachments JSONB NOT NULL DEFAULT '[]'::jsonb
-            """)
-
-            # TASK-301: persist assistant reasoning ("thinking"). Nullable, no
-            # backfill — pre-existing rows stay NULL (no reasoning captured).
-            add_reasoning_sql = text(f"""
-                ALTER TABLE {self._messages_table_name}
-                ADD COLUMN IF NOT EXISTS reasoning TEXT
-            """)
+            if not _parent_tables_initialized:
+                ensure_parent_tables(conn, self.embedding_dim)
+            ensure_bot_partitions(conn, self.bot_id)
+            conn.commit()
+            _parent_tables_initialized = True
 
             # Shared sessions table (TASK-183). One row per session across
             # all bots; promotes session_id from a bare UUID to a first-class
@@ -457,9 +603,6 @@ class PostgreSQLMemoryBackend(MemoryBackend):
             """)
 
             try:
-                conn.execute(messages_sql)
-                conn.execute(forgotten_sql)
-                conn.execute(memories_sql)
                 conn.execute(sessions_sql)
                 try:
                     conn.execute(sessions_user_col_sql)
@@ -468,93 +611,12 @@ class PostgreSQLMemoryBackend(MemoryBackend):
                     conn.execute(sessions_active_idx_sql)
                 except Exception as e:
                     logger.debug(f"sessions index creation: {e}")
-                # Run migrations for existing tables
-                try:
-                    conn.execute(add_tags_sql)
-                except Exception:
-                    pass
-                try:
-                    conn.execute(drop_memory_type_sql)
-                except Exception:
-                    pass  # Column may already be dropped
-                try:
-                    conn.execute(drop_superseded_sql)
-                except Exception:
-                    pass  # Column may already be dropped
-                try:
-                    conn.execute(add_summarization_cols_sql)
-                except Exception:
-                    pass  # Columns may already exist
-                try:
-                    conn.execute(add_recalled_history_sql)
-                except Exception:
-                    pass  # Column may already exist
-                try:
-                    conn.execute(add_attachments_sql)
-                except Exception:
-                    pass  # Column may already exist
-                try:
-                    conn.execute(add_reasoning_sql)
-                except Exception:
-                    pass  # Column may already exist
                 conn.commit()
-                
-                # Create indexes
-                self._create_indexes(conn)
-                
-                logger.debug(f"Ensured tables exist for bot {self.bot_id}")
+                logger.debug(f"Ensured partitions exist for bot {self.bot_id}")
             except Exception as e:
                 logger.error(f"Failed to create tables: {e}")
                 raise
-    
-    def _create_indexes(self, conn) -> None:
-        """Create indexes for efficient querying."""
-        indexes = [
-            f"CREATE INDEX IF NOT EXISTS idx_{self._messages_table_name}_timestamp ON {self._messages_table_name}(timestamp)",
-            f"CREATE INDEX IF NOT EXISTS idx_{self._messages_table_name}_session ON {self._messages_table_name}(session_id)",
-            f"CREATE INDEX IF NOT EXISTS idx_{self._messages_table_name}_processed ON {self._messages_table_name}(processed)",
-            # GIN trigram index on message content. Backs
-            # search_all_messages_trgm — the substring/fuzzy search mode
-            # exposed by /v1/history/search_all?mode=trgm. With this index
-            # an ILIKE '%foo%' against a 50 MB table is sub-10ms; without
-            # it the query falls back to a sequential scan. Index size is
-            # roughly 30–40% of the content column. Idempotent.
-            f"CREATE INDEX IF NOT EXISTS {self._messages_table_name}_content_trgm_idx ON {self._messages_table_name} USING gin (content gin_trgm_ops)",
-            f"CREATE INDEX IF NOT EXISTS idx_{self._memories_table_name}_importance ON {self._memories_table_name}(importance)",
-            f"CREATE INDEX IF NOT EXISTS idx_{self._memories_table_name}_accessed ON {self._memories_table_name}(last_accessed)",
-            f"CREATE INDEX IF NOT EXISTS idx_{self._memories_table_name}_tags_gin ON {self._memories_table_name} USING gin (tags)",
-        ]
-        
-        # HNSW index for vector similarity (if we have embeddings)
-        # This is the fastest index type for pgvector
-        hnsw_index = f"""
-            CREATE INDEX IF NOT EXISTS idx_{self._memories_table_name}_embedding 
-            ON {self._memories_table_name} 
-            USING hnsw (embedding vector_cosine_ops)
-        """
-        meaning_hnsw_index = f"""
-            CREATE INDEX IF NOT EXISTS idx_{self._memories_table_name}_meaning_embedding 
-            ON {self._memories_table_name} 
-            USING hnsw (meaning_embedding vector_cosine_ops)
-        """
-        
-        for idx_sql in indexes:
-            try:
-                conn.execute(text(idx_sql))
-            except Exception as e:
-                logger.debug(f"Index creation (may already exist): {e}")
-        
-        try:
-            conn.execute(text(hnsw_index))
-        except Exception as e:
-            logger.debug(f"HNSW index creation (may already exist): {e}")
-        try:
-            conn.execute(text(meaning_hnsw_index))
-        except Exception as e:
-            logger.debug(f"Meaning HNSW index creation (may already exist): {e}")
-        
-        conn.commit()
-    
+
     # =========================================================================
     # Message Storage (permanent conversation history)
     # =========================================================================
@@ -1570,10 +1632,10 @@ class PostgreSQLMemoryBackend(MemoryBackend):
                 # Insert into forgotten table
                 for row in rows:
                     insert_sql = text(f"""
-                        INSERT INTO {self._forgotten_table_name} 
+                        INSERT INTO {self._forgotten_table_name}
                         (id, role, content, timestamp, session_id, processed, created_at, forgotten_at)
                         VALUES (:id, :role, :content, :timestamp, :session_id, :processed, :created_at, CURRENT_TIMESTAMP)
-                        ON CONFLICT (id) DO NOTHING
+                        ON CONFLICT (bot_id, id) DO NOTHING
                     """)
                     conn.execute(insert_sql, {
                         "id": row.id,
@@ -1625,10 +1687,10 @@ class PostgreSQLMemoryBackend(MemoryBackend):
                 # Insert into forgotten table
                 for row in rows:
                     insert_sql = text(f"""
-                        INSERT INTO {self._forgotten_table_name} 
+                        INSERT INTO {self._forgotten_table_name}
                         (id, role, content, timestamp, session_id, processed, created_at, forgotten_at)
                         VALUES (:id, :role, :content, :timestamp, :session_id, :processed, :created_at, CURRENT_TIMESTAMP)
-                        ON CONFLICT (id) DO NOTHING
+                        ON CONFLICT (bot_id, id) DO NOTHING
                     """)
                     conn.execute(insert_sql, {
                         "id": row.id,
@@ -1783,10 +1845,10 @@ class PostgreSQLMemoryBackend(MemoryBackend):
                 
                 # Insert into forgotten table
                 insert_sql = text(f"""
-                    INSERT INTO {self._forgotten_table_name} 
+                    INSERT INTO {self._forgotten_table_name}
                     (id, role, content, timestamp, session_id, processed, created_at, forgotten_at)
                     VALUES (:id, :role, :content, :timestamp, :session_id, :processed, :created_at, CURRENT_TIMESTAMP)
-                    ON CONFLICT (id) DO NOTHING
+                    ON CONFLICT (bot_id, id) DO NOTHING
                 """)
                 conn.execute(insert_sql, {
                     "id": row.id,
@@ -1836,10 +1898,10 @@ class PostgreSQLMemoryBackend(MemoryBackend):
                 # Insert back into messages table
                 for row in rows:
                     insert_sql = text(f"""
-                        INSERT INTO {self._messages_table_name} 
+                        INSERT INTO {self._messages_table_name}
                         (id, role, content, timestamp, session_id, processed, created_at)
                         VALUES (:id, :role, :content, :timestamp, :session_id, :processed, :created_at)
-                        ON CONFLICT (id) DO NOTHING
+                        ON CONFLICT (bot_id, id) DO NOTHING
                     """)
                     conn.execute(insert_sql, {
                         "id": row.id,

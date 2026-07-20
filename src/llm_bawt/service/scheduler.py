@@ -350,21 +350,25 @@ class JobScheduler:
             return {}
 
     def _max_timestamp_message_activity(self, bot_id: str) -> float | None:
-        """Return latest non-summary message timestamp for a bot."""
+        """Return latest non-summary message timestamp for a bot.
+
+        Queries the partitioned ``messages`` parent (TASK-571); the
+        ``bot_id`` equality prunes the plan to that bot's partition.
+        """
         table_bot = self._sanitize_identifier(bot_id)
         if not table_bot:
             return None
-        table_name = f"{table_bot}_messages"
         sql = text(
-            f"""
+            """
             SELECT MAX(timestamp) AS latest_ts
-            FROM {table_name}
-            WHERE role != 'summary'
+            FROM messages
+            WHERE bot_id = :bot_id
+              AND role != 'summary'
               AND COALESCE(recalled_history, FALSE) = FALSE
             """
         )
         with self.engine.connect() as conn:
-            row = conn.execute(sql).fetchone()
+            row = conn.execute(sql, {"bot_id": table_bot}).fetchone()
             if not row:
                 return None
             latest_ts = row[0]
@@ -377,10 +381,12 @@ class JobScheduler:
         table_bot = self._sanitize_identifier(bot_id)
         if not table_bot:
             return None
-        table_name = f"{table_bot}_memories"
-        sql = text(f"SELECT MAX(updated_at) AS latest_updated_at FROM {table_name}")
+        sql = text(
+            "SELECT MAX(updated_at) AS latest_updated_at FROM memories "
+            "WHERE bot_id = :bot_id"
+        )
         with self.engine.connect() as conn:
-            row = conn.execute(sql).fetchone()
+            row = conn.execute(sql, {"bot_id": table_bot}).fetchone()
             if not row:
                 return None
             latest = row[0]
@@ -393,18 +399,18 @@ class JobScheduler:
         table_bot = self._sanitize_identifier(bot_id)
         if not table_bot:
             return 0
-        table_name = f"{table_bot}_messages"
         sql = text(
-            f"""
+            """
             SELECT COUNT(*) AS cnt
-            FROM {table_name}
-            WHERE COALESCE(processed, FALSE) = FALSE
+            FROM messages
+            WHERE bot_id = :bot_id
+              AND COALESCE(processed, FALSE) = FALSE
               AND role IN ('user', 'assistant')
             """
         )
         try:
             with self.engine.connect() as conn:
-                row = conn.execute(sql).fetchone()
+                row = conn.execute(sql, {"bot_id": table_bot}).fetchone()
                 return int(row[0]) if row else 0
         except Exception:
             return 0

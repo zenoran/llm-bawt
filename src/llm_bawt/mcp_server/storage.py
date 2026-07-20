@@ -921,40 +921,45 @@ class MemoryStorage:
     # Cross-bot / Source Discovery & Search
     # =========================================================================
 
-    def _discover_tables(self, suffix: str) -> list[tuple[str, str]]:
-        """Discover all bot tables matching a naming convention.
+    def _list_partition_bots(self, parent: str) -> list[str]:
+        """Enumerate bot ids that have a partition of ``parent`` (TASK-571).
 
-        Args:
-            suffix: Table name suffix, e.g. ``_messages`` or ``_memories``.
-
-        Returns:
-            List of ``(bot_id, table_name)`` tuples.
+        Replaces the legacy ``information_schema`` shard-table discovery.
+        Partitions are named ``<parent>_p_<bot>`` by
+        :func:`llm_bawt.memory.postgresql.partition_name`, and the partition
+        bound value equals the suffix, so the name is authoritative. Bots
+        with EMPTY partitions are included — matching the old behavior where
+        an existing-but-empty shard table still surfaced as a source.
         """
         from sqlalchemy import text
 
         backend = self._get_backend("default")
+        prefix = f"{parent}_p_"
         try:
             with backend.engine.connect() as conn:
                 rows = conn.execute(text("""
-                    SELECT table_name
-                    FROM information_schema.tables
-                    WHERE table_schema = 'public'
-                      AND table_name LIKE :pattern
-                    ORDER BY table_name
-                """), {"pattern": f"%\\{suffix}"}).fetchall()
-
-                results: list[tuple[str, str]] = []
-                for (table_name,) in rows:
-                    bot_id = table_name.removesuffix(suffix)
-                    if bot_id:
-                        results.append((bot_id, table_name))
-                return results
+                    SELECT c.relname
+                    FROM pg_inherits i
+                    JOIN pg_class c ON c.oid = i.inhrelid
+                    WHERE i.inhparent = CAST(:parent AS regclass)
+                    ORDER BY c.relname
+                """), {"parent": parent}).fetchall()
+            return [
+                relname.removeprefix(prefix)
+                for (relname,) in rows
+                if relname.startswith(prefix)
+            ]
         except Exception as e:
-            logger.error("Failed to discover %s tables: %s", suffix, e)
+            logger.error("Failed to list %s partitions: %s", parent, e)
             return []
 
     def _global_search_excluded_bot_ids(self) -> set[str]:
-        """Return sanitized bot IDs opted out of aggregate search."""
+        """Return sanitized bot IDs opted out of aggregate search.
+
+        Sanitized on purpose: the ``bot_id`` partition-key values are the
+        sanitized bot identity (same identity the legacy shard-table
+        prefixes carried), so exclusion compares like with like.
+        """
         try:
             from llm_bawt.bots import BotManager
             from llm_bawt.memory.postgresql import _sanitize_table_name
@@ -968,48 +973,44 @@ class MemoryStorage:
             logger.warning("Failed to load global search bot policy: %s", e)
             return set()
 
-    def _discover_global_search_tables(self, suffix: str) -> list[tuple[str, str]]:
-        """Discover tables that are eligible for aggregate search."""
-        tables = self._discover_tables(suffix)
-        if not tables:
+    def _global_search_bots(self, parent: str) -> list[str]:
+        """Bot ids eligible for aggregate search over ``parent``."""
+        bots = self._list_partition_bots(parent)
+        if not bots:
             return []
 
         excluded = self._global_search_excluded_bot_ids()
         if not excluded:
-            return tables
+            return bots
 
-        return [
-            (bot_id, table_name)
-            for bot_id, table_name in tables
-            if bot_id not in excluded
-        ]
+        return [bot_id for bot_id in bots if bot_id not in excluded]
 
     async def list_memory_sources(self) -> list[dict[str, Any]]:
-        """Discover all available memory sources (bot_ids with memory tables).
+        """Discover all available memory sources (bot_ids with memory partitions).
 
-        Queries PostgreSQL for tables matching the ``*_memories`` naming
-        convention and returns basic stats for each source.
+        One GROUP BY over the partitioned ``memories`` parent replaces the
+        legacy per-shard COUNT loop (TASK-571). Bots with empty partitions
+        still appear with ``memory_count`` 0.
         """
         from sqlalchemy import text
 
+        from llm_bawt.memory.postgresql import MEMORIES_PARENT
+
         backend = self._get_backend("default")
-        tables = self._discover_global_search_tables("_memories")
-        if not tables:
+        bots = self._global_search_bots(MEMORIES_PARENT)
+        if not bots:
             return []
 
         try:
-            sources: list[dict[str, Any]] = []
             with backend.engine.connect() as conn:
-                for bot_id, table_name in tables:
-                    count_row = conn.execute(
-                        text(f"SELECT COUNT(*) FROM {table_name}")  # noqa: S608
-                    ).fetchone()
-                    memory_count = count_row[0] if count_row else 0
-                    sources.append({
-                        "source": bot_id,
-                        "memory_count": memory_count,
-                    })
-            return sources
+                rows = conn.execute(text(
+                    f"SELECT bot_id, COUNT(*) FROM {MEMORIES_PARENT} GROUP BY bot_id"
+                )).fetchall()
+            counts = {bot_id: int(n) for bot_id, n in rows}
+            return [
+                {"source": bot_id, "memory_count": counts.get(bot_id, 0)}
+                for bot_id in bots
+            ]
         except Exception as e:
             logger.error("Failed to list memory sources: %s", e)
             return []
@@ -1026,9 +1027,10 @@ class MemoryStorage:
     ) -> list[dict[str, Any]]:
         """Full-text search across ALL bots' message histories.
 
-        Builds a UNION ALL query across every ``*_messages`` table so a single
-        question like *"who was working on the stop button?"* returns ranked
-        results from all bots in one call.
+        One query against the partitioned ``messages`` parent (TASK-571) so a
+        single question like *"who was working on the stop button?"* returns
+        ranked results from all bots in one call. A ``bot_id`` filter prunes
+        to that bot's partition; the unfiltered form scans all partitions.
 
         Parameters drive the Spotlight modal's facet controls:
 
@@ -1048,21 +1050,27 @@ class MemoryStorage:
         rest. Empty result → no rows → caller should treat as ``total=0``.
         """
         from sqlalchemy import text
-        from llm_bawt.memory.postgresql import build_fts_query
+        from llm_bawt.memory.postgresql import MESSAGES_PARENT, build_fts_query
 
         or_query = build_fts_query(query)
         if not or_query:
             return []
 
-        tables = self._discover_global_search_tables("_messages")
-        if not tables:
-            return []
-
-        # Filter to a single bot if requested.
+        # Visibility policy: opted-out bots never appear in aggregate
+        # results — even when explicitly requested by ``bot_id`` (same
+        # semantics the shard-discovery filter enforced).
+        excluded = self._global_search_excluded_bot_ids()
+        params: dict[str, Any] = {"query": or_query, "limit": n_results}
         if bot_id:
-            tables = [(bid, tbl) for bid, tbl in tables if bid == bot_id]
-            if not tables:
+            if bot_id in excluded:
                 return []
+            bot_clause = "AND bot_id = :bot_filter"
+            params["bot_filter"] = bot_id
+        elif excluded:
+            bot_clause = "AND NOT (bot_id = ANY(:excluded))"
+            params["excluded"] = sorted(excluded)
+        else:
+            bot_clause = ""
 
         # Compose conditional WHERE fragments once. They reference bind
         # params resolved per-execution below.
@@ -1070,24 +1078,6 @@ class MemoryStorage:
         time_upper = "AND timestamp <= :until" if until is not None else ""
         role_clause = "AND role = :role_filter" if role_filter else ""
 
-        # Build UNION ALL across all message tables
-        sub_selects: list[str] = []
-        for bot_id, table_name in tables:
-            # bot_id is embedded as a literal; table_name comes from information_schema
-            sub_selects.append(f"""(
-                SELECT id, role, content, timestamp,
-                       '{bot_id}' AS source,
-                       ts_rank(to_tsvector('english', content),
-                               to_tsquery('english', :query)) AS rank
-                FROM {table_name}
-                WHERE to_tsvector('english', content) @@ to_tsquery('english', :query)
-                  AND role != 'system'
-                  {role_clause}
-                  {time_lower}
-                  {time_upper}
-            )""")
-
-        union_sql = "\nUNION ALL\n".join(sub_selects)
         # ``sort_by="recent"`` ignores rank entirely so the user can search
         # for a common word and still see the latest hit. Whitelist before
         # interpolation — sort_by is the only SQL fragment built from a
@@ -1100,13 +1090,22 @@ class MemoryStorage:
         # count them — fine for tens of thousands, watch if we ever hit
         # very common short tokens.
         full_sql = text(f"""
-            SELECT *, COUNT(*) OVER () AS total
-            FROM ({union_sql}) AS u
+            SELECT id, role, content, timestamp,
+                   bot_id AS source,
+                   ts_rank(to_tsvector('english', content),
+                           to_tsquery('english', :query)) AS rank,
+                   COUNT(*) OVER () AS total
+            FROM {MESSAGES_PARENT}
+            WHERE to_tsvector('english', content) @@ to_tsquery('english', :query)
+              AND role != 'system'
+              {bot_clause}
+              {role_clause}
+              {time_lower}
+              {time_upper}
             {order_clause}
             LIMIT :limit
         """)
 
-        params: dict[str, Any] = {"query": or_query, "limit": n_results}
         if role_filter:
             params["role_filter"] = role_filter
         if since is not None:
@@ -1168,51 +1167,11 @@ class MemoryStorage:
         """
         from sqlalchemy import text
 
+        from llm_bawt.memory.postgresql import MESSAGES_PARENT
+
         q = (query or "").strip()
         if not q:
             return []
-
-        tables = self._discover_global_search_tables("_messages")
-        if not tables:
-            return []
-
-        # Optional WHERE fragments. Same pattern as search_all_messages.
-        time_lower = "AND timestamp >= :since" if since is not None else ""
-        time_upper = "AND timestamp <= :until" if until is not None else ""
-        role_clause = "AND role = :role_filter" if role_filter else ""
-
-        # Build UNION ALL across all message tables. Each sub-select runs
-        # the trigram-indexed ILIKE filter and computes a similarity score
-        # for ranking. similarity() is per-row and doesn't use the index,
-        # but it's cheap and only computed on the rows that already
-        # survived the ILIKE filter.
-        sub_selects: list[str] = []
-        for bot_id, table_name in tables:
-            sub_selects.append(f"""(
-                SELECT id, role, content, timestamp,
-                       '{bot_id}' AS source,
-                       similarity(content, :query) AS rank
-                FROM {table_name}
-                WHERE content ILIKE :ilike
-                  AND role != 'system'
-                  {role_clause}
-                  {time_lower}
-                  {time_upper}
-            )""")
-
-        union_sql = "\nUNION ALL\n".join(sub_selects)
-        # ``sort_by="recent"`` ignores similarity — useful for "find the
-        # latest mention of this token" once the user knows the token
-        # itself is common.
-        order_clause = "ORDER BY timestamp DESC" if sort_by == "recent" else "ORDER BY rank DESC, timestamp DESC"
-        # Window COUNT(*) for the unbounded total. See the FTS sibling
-        # for rationale.
-        full_sql = text(f"""
-            SELECT *, COUNT(*) OVER () AS total
-            FROM ({union_sql}) AS u
-            {order_clause}
-            LIMIT :limit
-        """)
 
         # `ilike` carries the wildcarded form used by the WHERE clause.
         # `query` stays raw so similarity() compares against the user's
@@ -1223,6 +1182,44 @@ class MemoryStorage:
             "ilike": f"%{q}%",
             "limit": n_results,
         }
+
+        # Visibility policy — same exclusion semantics as the FTS sibling.
+        excluded = self._global_search_excluded_bot_ids()
+        if excluded:
+            bot_clause = "AND NOT (bot_id = ANY(:excluded))"
+            params["excluded"] = sorted(excluded)
+        else:
+            bot_clause = ""
+
+        # Optional WHERE fragments. Same pattern as search_all_messages.
+        time_lower = "AND timestamp >= :since" if since is not None else ""
+        time_upper = "AND timestamp <= :until" if until is not None else ""
+        role_clause = "AND role = :role_filter" if role_filter else ""
+
+        # ``sort_by="recent"`` ignores similarity — useful for "find the
+        # latest mention of this token" once the user knows the token
+        # itself is common.
+        order_clause = "ORDER BY timestamp DESC" if sort_by == "recent" else "ORDER BY rank DESC, timestamp DESC"
+        # One trigram-indexed ILIKE over the partitioned parent (TASK-571):
+        # each partition uses its own templated gin_trgm_ops index, and
+        # similarity() only runs on rows that survived the ILIKE filter.
+        # Window COUNT(*) for the unbounded total — see the FTS sibling.
+        full_sql = text(f"""
+            SELECT id, role, content, timestamp,
+                   bot_id AS source,
+                   similarity(content, :query) AS rank,
+                   COUNT(*) OVER () AS total
+            FROM {MESSAGES_PARENT}
+            WHERE content ILIKE :ilike
+              AND role != 'system'
+              {bot_clause}
+              {role_clause}
+              {time_lower}
+              {time_upper}
+            {order_clause}
+            LIMIT :limit
+        """)
+
         if role_filter:
             params["role_filter"] = role_filter
         if since is not None:
@@ -1277,18 +1274,20 @@ class MemoryStorage:
         if not query_embedding:
             return []
 
-        tables = self._discover_global_search_tables("_memories")
-        if not tables:
+        from llm_bawt.memory.postgresql import MEMORIES_PARENT
+
+        bots = self._global_search_bots(MEMORIES_PARENT)
+        if not bots:
             return []
 
         # Filter to a single bot if requested.
         if bot_id:
-            tables = [(bid, tbl) for bid, tbl in tables if bid == bot_id]
-            if not tables:
+            bots = [bid for bid in bots if bid == bot_id]
+            if not bots:
                 return []
 
         all_results: list[dict[str, Any]] = []
-        for bot_id, _table_name in tables:
+        for bot_id in bots:
             try:
                 backend = self._get_backend(bot_id)
                 results = backend.search_memories_by_embedding(

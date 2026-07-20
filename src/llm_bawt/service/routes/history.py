@@ -28,7 +28,7 @@ def _fetch_attachments_via_shared_engine(
     bot_id: str,
     message_ids: list[str],
 ) -> dict[str, list[dict]]:
-    """Direct-SQL read of ``{bot}_messages.attachments`` for server-mode.
+    """Direct-SQL read of the bot's messages-partition ``attachments`` column.
 
     The route normally calls into ``PostgreSQLMemoryBackend.get_attachments_for_message_ids``
     via the embedded short-term manager, but MCP-server-mode deployments
@@ -38,13 +38,13 @@ def _fetch_attachments_via_shared_engine(
     """
     from sqlalchemy import text
     from ...media.assets import _build_engine
-    from ...memory.postgresql import _sanitize_table_name
+    from ...memory.postgresql import MESSAGES_PARENT, partition_name
 
     engine = _build_engine(config)
     if engine is None:
         return {mid: [] for mid in message_ids}
 
-    table = f"{_sanitize_table_name(bot_id)}_messages"
+    table = partition_name(MESSAGES_PARENT, bot_id)
     sql = text(f"SELECT id, attachments FROM {table} WHERE id = ANY(:ids)")
     result: dict[str, list[dict]] = {mid: [] for mid in message_ids}
     with engine.connect() as conn:
@@ -128,7 +128,7 @@ def _fetch_reasoning_via_shared_engine(
     bot_id: str,
     message_ids: list[str],
 ) -> dict[str, str | None]:
-    """Direct-SQL read of ``{bot}_messages.reasoning`` for server-mode (TASK-301).
+    """Direct-SQL read of the bot's messages-partition ``reasoning`` column (TASK-301).
 
     Mirror of ``_fetch_attachments_via_shared_engine`` for the reasoning column —
     used when the short-term manager has no embedded backend handle. Returns
@@ -136,13 +136,13 @@ def _fetch_reasoning_via_shared_engine(
     """
     from sqlalchemy import text
     from ...media.assets import _build_engine
-    from ...memory.postgresql import _sanitize_table_name
+    from ...memory.postgresql import MESSAGES_PARENT, partition_name
 
     engine = _build_engine(config)
     if engine is None:
         return {mid: None for mid in message_ids}
 
-    table = f"{_sanitize_table_name(bot_id)}_messages"
+    table = partition_name(MESSAGES_PARENT, bot_id)
     sql = text(f"SELECT id, reasoning FROM {table} WHERE id = ANY(:ids)")
     result: dict[str, str | None] = {mid: None for mid in message_ids}
     with engine.connect() as conn:
@@ -954,13 +954,13 @@ def _load_all_messages_via_sql(
     """
     from sqlalchemy import text
     from ...media.assets import _build_engine
-    from ...memory.postgresql import _sanitize_table_name
+    from ...memory.postgresql import MESSAGES_PARENT, partition_name
 
     engine = _build_engine(service.config)
     if engine is None:
         return None
 
-    table = f"{_sanitize_table_name(bot_id)}_messages"
+    table = partition_name(MESSAGES_PARENT, bot_id)
     sql = text(
         f"""
         SELECT id, role, content, timestamp
@@ -1314,17 +1314,17 @@ async def search_all_history(
 
     * ``mode=fts`` (default) — Postgres FTS via
       :meth:`llm_bawt.mcp_server.storage.MemoryStorage.search_all_messages`.
-      UNION ALL across every ``{bot}_messages`` table, ranked by
+      One query over the partitioned ``messages`` parent, ranked by
       ``ts_rank``. Good for concept-level queries; bad for IDs because
       ``build_fts_query`` strips digits and hyphens before building the
       tsquery (so ``TASK-241`` becomes ``task``, matching every "task"
       message ever).
     * ``mode=trgm`` — pg_trgm substring/fuzzy match via
-      :meth:`MemoryStorage.search_all_messages_trgm`. Same UNION ALL
+      :meth:`MemoryStorage.search_all_messages_trgm`. Same parent-table
       shape but with ``content ILIKE`` filter + ``similarity()`` rank,
-      backed by per-table ``gin_trgm_ops`` GIN indexes. Matches the
-      literal query string verbatim — what the user expects for
-      ``TASK-241`` and friends.
+      backed by the per-partition ``gin_trgm_ops`` GIN indexes templated
+      from the parent. Matches the literal query string verbatim — what
+      the user expects for ``TASK-241`` and friends.
 
     Returns ranked rows with bot attribution so a global search UI can
     render "who said this and when" without N+1 fans-out. First

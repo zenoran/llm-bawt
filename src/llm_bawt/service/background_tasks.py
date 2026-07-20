@@ -383,19 +383,23 @@ class BackgroundTasksMixin:
             if not backend or not hasattr(backend, "engine"):
                 return
             from sqlalchemy import text as sa_text
-            table = f"{bot_id}_messages"
+            from ..memory.postgresql import _sanitize_table_name
             with backend.engine.connect() as conn:
                 conn.execute(
-                    sa_text(f"""
-                        UPDATE {table}
+                    sa_text("""
+                        UPDATE messages
                         SET summary_metadata = jsonb_set(
-                            COALESCE(summary_metadata::jsonb, '{{}}'::jsonb),
-                            '{{extracted_at}}',
+                            COALESCE(summary_metadata::jsonb, '{}'::jsonb),
+                            '{extracted_at}',
                             to_jsonb(:ts)
                         )
-                        WHERE id = :sid AND role = 'summary'
+                        WHERE bot_id = :bot_id AND id = :sid AND role = 'summary'
                     """),
-                    {"ts": datetime.now(timezone.utc).isoformat(), "sid": summary_id},
+                    {
+                        "ts": datetime.now(timezone.utc).isoformat(),
+                        "sid": summary_id,
+                        "bot_id": _sanitize_table_name(bot_id),
+                    },
                 )
                 conn.commit()
         except Exception as e:

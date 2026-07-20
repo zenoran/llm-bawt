@@ -468,7 +468,7 @@ def backfill_intent_with_llm(
     skipped = 0
     errors = []
     
-    messages_table = backend._memories_table_name.replace("_memories", "_messages")
+    messages_table = backend._messages_table_name
     
     with backend.engine.connect() as conn:
         # First, delete orphaned memories (source messages no longer exist)

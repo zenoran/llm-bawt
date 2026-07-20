@@ -518,10 +518,37 @@ def cleanup_orphaned_bot_data(config: Config, dry_run: bool = False) -> dict[str
             ).fetchall()
             all_tables = {r[0] for r in table_rows}
 
+            # TASK-571: per-bot data lives in LIST partitions named
+            # ``<parent>_p_<bot>`` — dropping the partition drops the bot's
+            # rows (implicit detach). The legacy ``<bot>_messages`` shard
+            # handling stays for any straggler shard tables, but skips the
+            # ``zz_old_*`` rename-kept tables from the partition cutover —
+            # those are the migration's rollback safety net and are dropped
+            # only by ``migrations_partition.py --finalize``.
+            partition_prefixes = ("messages_p_", "memories_p_", "forgotten_messages_p_")
             # Check the longest suffix first so bot_forgotten_messages
             # does not get misclassified as prefix=bot_forgotten + _messages.
             dynamic_suffixes = ("_forgotten_messages", "_memories", "_messages")
+            # NEVER touch the partitioned parents themselves — note
+            # ``forgotten_messages`` ends with ``_messages``, so without this
+            # guard the legacy suffix scan would CASCADE-drop every bot's
+            # forgotten rows at once.
+            parent_tables = {"messages", "memories", "forgotten_messages"}
             for tbl in sorted(all_tables):
+                if tbl.startswith("zz_old_") or tbl in parent_tables:
+                    continue
+                matched_partition = False
+                for pprefix in partition_prefixes:
+                    if tbl.startswith(pprefix):
+                        matched_partition = True
+                        bot_suffix = tbl[len(pprefix):]
+                        if bot_suffix and bot_suffix not in known_sanitized:
+                            result["dropped_tables"].append(tbl)
+                            if not dry_run:
+                                conn.execute(_text(f'DROP TABLE IF EXISTS "{tbl}" CASCADE'))
+                        break
+                if matched_partition:
+                    continue
                 for suffix in dynamic_suffixes:
                     if tbl.endswith(suffix):
                         prefix = tbl[: -len(suffix)]
