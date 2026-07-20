@@ -381,11 +381,19 @@ def purge_bot_data(config: Config, slug: str) -> dict[str, Any]:
 
     try:
         with engine.connect() as conn:
-            # 1. Drop per-bot dynamic tables
-            for suffix in ("_messages", "_memories", "_forgotten_messages"):
-                tbl = f"{sanitized}{suffix}"
-                conn.execute(_text(f'DROP TABLE IF EXISTS "{tbl}" CASCADE'))
-                result["dropped_tables"].append(tbl)
+            # 1. Delete per-bot rows from the LIST-partitioned parents (TASK-571).
+            #    The old ``<bot>_messages`` shard tables no longer exist — dropping
+            #    them was a silent no-op that left every message/memory/forgotten
+            #    row alive while reporting success. The bot definition is preserved
+            #    here, so DELETE the rows rather than DROP the partition (a drop
+            #    would race the auto-provision on the bot's next write). ``bot_id``
+            #    in the parents is the sanitized partition value.
+            for parent in ("messages", "memories", "forgotten_messages"):
+                r = conn.execute(
+                    _text(f"DELETE FROM {parent} WHERE bot_id=:s"),
+                    {"s": sanitized},
+                )
+                result["deleted_rows"][parent] = r.rowcount
 
             # 2. runtime_settings
             r = conn.execute(
@@ -461,9 +469,16 @@ def purge_bot_data(config: Config, slug: str) -> dict[str, Any]:
             _message_table_cache,
             _forgotten_table_cache,
         )
+        # Cache keys are the partition table names (``messages_p_<bot>`` etc.,
+        # TASK-571), not the legacy ``<bot>_messages`` form.
+        _evict_keys = {
+            f"messages_p_{sanitized}",
+            f"memories_p_{sanitized}",
+            f"forgotten_messages_p_{sanitized}",
+        }
         for cache in (_memory_table_cache, _message_table_cache, _forgotten_table_cache):
             for key in list(cache.keys()):
-                if key.startswith(f"{sanitized}_"):
+                if key in _evict_keys:
                     del cache[key]
     except Exception:
         pass
