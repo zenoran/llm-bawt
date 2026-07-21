@@ -172,30 +172,14 @@ class HistoryManager:
     def load_history(self, since_minutes: int | None = None):
         self.messages = []
 
-        # TASK-284: session-scoped history — the ACTIVE durable thread's raw
-        # bubbles + rolling summary continuity. Falls back to an unscoped load
-        # when the backend can't scope (no active session yet, or a backend
-        # without the scoped loader) — never a silent empty context.
-        if self._db_backend:
-            loader = getattr(self._db_backend, "load_session_scoped", None)
-            if loader is not None:
-                try:
-                    scoped = loader(since_minutes=since_minutes)
-                    if scoped is not None:
-                        self.messages = scoped
-                        logger.debug(
-                            "Loaded %d messages (session-scoped)",
-                            len(self.messages),
-                        )
-                        return
-                    logger.debug(
-                        "No active session; falling back to unscoped load"
-                    )
-                except Exception as e:
-                    logger.warning(
-                        "Session-scoped load failed (%s); falling back to unscoped",
-                        e,
-                    )
+        # TASK-284 (reverted design): session threads are PROVENANCE METADATA
+        # ONLY — a queryable session_id for restoring a conversation, never a
+        # context boundary. Context is built from the CONTINUOUS message
+        # history (all unsummarized raw + rolling summaries, budget-bounded
+        # downstream). The session-scoped context read shipped in the v2
+        # cutover was a design overreach and is intentionally NOT used here;
+        # `load_session_scoped` remains on the backend for session-restore
+        # queries only.
 
         # Use PostgreSQL backend if available
         if self._db_backend:
