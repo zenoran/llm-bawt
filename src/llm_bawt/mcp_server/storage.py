@@ -878,6 +878,8 @@ class MemoryStorage:
 
         from sqlalchemy import text
 
+        from llm_bawt.memory.summarization import resolve_source_session_ids
+
         backend = self._get_backend(bot_id)
         summary_id = str(uuid.uuid4())
         metadata = {
@@ -892,16 +894,22 @@ class MemoryStorage:
         }
         try:
             with backend.engine.connect() as conn:
+                # TASK-284 step 13: stamp summary provenance (source threads).
+                source_session_ids = resolve_source_session_ids(
+                    conn, backend._messages_table_name, message_ids
+                )
+                metadata["source_session_ids"] = source_session_ids
                 conn.execute(
                     text(
                         f"""
                         INSERT INTO {backend._messages_table_name}
-                        (id, role, content, timestamp, summary_metadata, created_at)
-                        VALUES (:id, 'summary', :content, :ts, :meta, CURRENT_TIMESTAMP)
+                        (id, role, content, timestamp, summary_metadata, session_id, created_at)
+                        VALUES (:id, 'summary', :content, :ts, :meta, :session_id, CURRENT_TIMESTAMP)
                         """
                     ),
                     {
                         "id": summary_id,
+                        "session_id": source_session_ids[0] if len(source_session_ids) == 1 else None,
                         "content": content,
                         "ts": window_end,
                         "meta": json.dumps(metadata),

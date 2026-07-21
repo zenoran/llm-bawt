@@ -355,6 +355,33 @@ class Session:
         return datetime.fromtimestamp(self.end_timestamp)
 
 
+def resolve_source_session_ids(
+    conn: Any, table_name: str, message_ids: list[str] | None
+) -> list[str]:
+    """Distinct durable-thread ids the given source messages belong to.
+
+    TASK-284 step 13: summary provenance. Returns the sorted DISTINCT non-NULL
+    ``session_id`` values of the source rows so a summary can record which DB
+    thread(s) it compacted. A time-gap-detected summarization window can
+    straddle thread rotations, hence a list. Best-effort: an empty list simply
+    means the sources predate session linkage (nothing determinable).
+    """
+    if not message_ids:
+        return []
+    from sqlalchemy import text
+
+    rows = conn.execute(
+        text(
+            f"""
+            SELECT DISTINCT session_id FROM {table_name}
+            WHERE id = ANY(:ids) AND session_id IS NOT NULL
+            """
+        ),
+        {"ids": list(message_ids)},
+    ).fetchall()
+    return sorted(str(r[0]) for r in rows)
+
+
 def detect_sessions(
     messages: list[dict],
     session_gap_seconds: int = 3600,
@@ -1050,6 +1077,16 @@ class HistorySummarizer:
         with self._backend.engine.connect() as conn:
             from sqlalchemy import text
 
+            # TASK-284 step 13: summary provenance — record which durable DB
+            # thread(s) the source rows belong to, and stamp the summary row's
+            # own session_id when the source is a single thread. Raw reads
+            # always filter role <> 'summary', so the stamp can never cause a
+            # summary to double-load into a scoped raw transcript.
+            source_session_ids = resolve_source_session_ids(
+                conn, self._backend._messages_table_name, session.message_ids
+            )
+            summary_metadata["source_session_ids"] = source_session_ids
+
             existing_summary_ids = self._find_existing_summary_ids(conn, session)
             if existing_summary_ids and not replace_existing:
                 return {
@@ -1089,14 +1126,17 @@ class HistorySummarizer:
             # Timestamp is session end time for natural ordering
             insert_sql = text(f"""
                 INSERT INTO {self._backend._messages_table_name}
-                (id, role, content, timestamp, summary_metadata, created_at)
-                VALUES (:id, 'summary', :content, :timestamp, :metadata, CURRENT_TIMESTAMP)
+                (id, role, content, timestamp, summary_metadata, session_id, created_at)
+                VALUES (:id, 'summary', :content, :timestamp, :metadata, :session_id, CURRENT_TIMESTAMP)
             """)
             conn.execute(insert_sql, {
                 "id": summary_id,
                 "content": normalized_text,
                 "timestamp": session.end_timestamp,
                 "metadata": json.dumps(summary_metadata),
+                # Single-thread source -> stamp the column; multi/none -> NULL
+                # (provenance detail stays in summary_metadata.source_session_ids).
+                "session_id": source_session_ids[0] if len(source_session_ids) == 1 else None,
             })
 
             conn.commit()
