@@ -78,6 +78,15 @@ class ActivateSessionResponse(BaseModel):
     bot_id: str
     user_id: str
     activated: bool
+    provider_session: str | None = Field(
+        default=None,
+        description=(
+            "Agent bots only (TASK-284 step 15): 'resumed' when the thread's "
+            "stored provider session id was restored for the next turn, "
+            "'reseed' when none was stored so the provider will cold-start "
+            "and re-seed from this thread's context. None for chat bots."
+        ),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -214,6 +223,12 @@ async def create_session(
     effective_bot = get_effective_bot_id(bot_id)
     user_id = _resolve_user(user)
     new_id = await get_storage().rotate_session(bot_id=effective_bot, user_id=user_id)
+    # TASK-284 step 15: for agent bots a fresh thread must not resume the OLD
+    # provider transcript — clear the stored provider session so the bridge
+    # cold-starts and re-seeds ("reseed"). No-op for chat bots.
+    _coordinate_agent_provider_on_activate(
+        effective_bot, {"id": new_id, "session_metadata": {}}
+    )
     return CreateSessionResponse(
         session_id=new_id, bot_id=effective_bot, user_id=user_id
     )
@@ -234,12 +249,80 @@ async def activate_session(
     user_id = _resolve_user(user)
     # Ownership check first so a cross-user id can't be activated (404, not 403,
     # to avoid confirming the session exists for another user).
-    await _owned_session_or_404(session_id, effective_bot, user_id)
+    row = await _owned_session_or_404(session_id, effective_bot, user_id)
     ok = await get_storage().activate_session(
         session_id, bot_id=effective_bot, user_id=user_id
     )
     if not ok:
         raise HTTPException(status_code=404, detail="Session not found")
+    provider_session = _coordinate_agent_provider_on_activate(effective_bot, row)
     return ActivateSessionResponse(
-        session_id=session_id, bot_id=effective_bot, user_id=user_id, activated=True
+        session_id=session_id,
+        bot_id=effective_bot,
+        user_id=user_id,
+        activated=True,
+        provider_session=provider_session,
     )
+
+
+def _coordinate_agent_provider_on_activate(bot_id: str, session_row: dict) -> str | None:
+    """TASK-284 step 15: point an agent bot's provider at the activated thread.
+
+    Provider hydration stays bridge-owned; this only sets WHICH provider
+    session the bridge resumes next turn:
+
+    - thread metadata carries ``provider_session_id`` (mirrored when the
+      bridge persisted it) → restore it into ``agent_backend_config.
+      session_key`` so the SDK resumes that transcript → returns "resumed";
+    - no stored provider id → clear ``session_key`` so the bridge cold-starts
+      and re-seeds from this thread's context via the shared assembler →
+      returns "reseed".
+
+    Applies only to claude-code/codex (openclaw's session_key is a routing
+    key, never per-thread). Best-effort: any failure leaves the profile
+    untouched and returns None — the DB-side activation already succeeded.
+    """
+    try:
+        service = get_service()
+        from ...bots import BotManager, invalidate_bots_cache
+
+        bot = BotManager(service.config).get_bot(bot_id)
+        backend = (getattr(bot, "agent_backend", None) or "").strip() if bot else ""
+        if backend not in ("claude-code", "codex"):
+            return None
+
+        meta = session_row.get("session_metadata") or {}
+        provider_sid = str(meta.get("provider_session_id") or "").strip()
+
+        from ..dependencies import get_bot_profile_store
+
+        store = get_bot_profile_store(service.config)
+        profile = store.get(bot_id)
+        if profile is None:
+            return None
+        bc = dict(profile.agent_backend_config or {})
+        if provider_sid and ":" not in provider_sid:
+            bc["session_key"] = provider_sid
+            if meta.get("provider_session_model"):
+                bc["session_model"] = meta["provider_session_model"]
+            outcome = "resumed"
+        else:
+            bc.pop("session_key", None)
+            outcome = "reseed"
+        profile.agent_backend_config = bc
+        store.upsert(profile)
+        # Cached Bot/instance state must see the new session_key (the bridge
+        # reads it live over HTTP, but the app-side seed decision reads the
+        # cached bot).
+        invalidate_bots_cache()
+        invalidate = getattr(service, "invalidate_bot_instances", None)
+        if callable(invalidate):
+            invalidate(bot_id)
+        log.info(
+            "Agent thread activate: bot=%s thread=%s provider_session=%s",
+            bot_id, session_row.get("id"), outcome,
+        )
+        return outcome
+    except Exception as e:
+        log.warning("Agent provider coordination failed for %s: %s", bot_id, e)
+        return None

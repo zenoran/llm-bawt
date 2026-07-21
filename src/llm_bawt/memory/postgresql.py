@@ -2293,7 +2293,11 @@ class PostgreSQLShortTermManager:
             "started_at": row.started_at.isoformat() if row.started_at else None,
             "ended_at": row.ended_at.isoformat() if row.ended_at else None,
             "status": row.status,
-            "metadata": row.session_metadata,
+            # TASK-284 step 15 fix: key must match the column name — every
+            # consumer (routes/sessions.py, the provider↔thread coordinator)
+            # reads "session_metadata"; the old "metadata" key had zero readers
+            # and made the /v1/sessions API silently return null metadata.
+            "session_metadata": row.session_metadata,
         }
 
     # ---------- Public session query API ----------
@@ -2569,6 +2573,33 @@ class PostgreSQLShortTermManager:
             )
         self._session_id_cache = session_id
         return True
+
+    def update_session_metadata(self, session_id: str, patch: dict) -> bool:
+        """Merge ``patch`` into a session row's ``session_metadata`` (jsonb).
+
+        TASK-284 step 15: backs the provider↔thread mirror — the durable DB
+        thread records which provider/SDK session hydrates it (e.g.
+        ``provider_session_id``). Shallow jsonb merge (``||``): existing keys
+        not in ``patch`` are preserved. Returns ``False`` when the row doesn't
+        exist or the update fails; never raises.
+        """
+        if not session_id or not patch:
+            return False
+        try:
+            with self._backend.engine.begin() as conn:
+                res = conn.execute(
+                    text("""
+                        UPDATE sessions
+                        SET session_metadata =
+                            COALESCE(session_metadata, '{}'::jsonb) || CAST(:patch AS jsonb)
+                        WHERE id = :id
+                    """),
+                    {"id": session_id, "patch": json.dumps(patch)},
+                )
+                return (res.rowcount or 0) > 0
+        except Exception as e:
+            logger.warning(f"update_session_metadata({session_id}) failed: {e}")
+            return False
 
     @property
     def session_id(self) -> str:

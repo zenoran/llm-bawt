@@ -1020,6 +1020,33 @@ class MemoryStorage:
         manager = self.get_short_term_manager(bot_id)
         return manager.activate_session(session_id, bot_id=bot_id, user_id=user_id)
 
+    async def get_or_create_active_session(
+        self,
+        bot_id: str = "default",
+        user_id: str | None = None,
+    ) -> str:
+        """Return the active thread id for (bot, user), creating one if none.
+
+        TASK-284 step 15: used by the provider↔thread mirror so a freshly
+        minted provider session always has a durable DB thread to map onto.
+        """
+        manager = self.get_short_term_manager(bot_id)
+        return manager.get_or_create_active_session(bot_id=bot_id, user_id=user_id)
+
+    async def update_session_metadata(
+        self,
+        session_id: str,
+        patch: dict,
+        bot_id: str = "default",
+    ) -> bool:
+        """Shallow-merge ``patch`` into a session row's ``session_metadata``.
+
+        TASK-284 step 15: records provider session identity on the durable
+        thread (``provider``/``provider_session_id``/``provider_session_model``).
+        """
+        manager = self.get_short_term_manager(bot_id)
+        return manager.update_session_metadata(session_id, patch)
+
 
     # =========================================================================
     # Cross-bot / Source Discovery & Search

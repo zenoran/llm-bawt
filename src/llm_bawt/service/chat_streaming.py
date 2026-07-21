@@ -415,6 +415,10 @@ class ChatStreamingMixin(ChatStreamingBridgeMixin):
                 user_prompt = remainder
 
         if is_agent_backend:
+            # TASK-284 step 15: an agent /new also rotates the durable DB
+            # thread (flag-gated, non-destructive). The bridge still owns the
+            # provider-side reset+seed — the message passes through unchanged.
+            self._maybe_rotate_agent_session(llm_bawt, bot_id, user_prompt)
             cancel_event = threading.Event()
             done_event = threading.Event()
         else:

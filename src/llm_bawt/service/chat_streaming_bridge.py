@@ -93,6 +93,30 @@ class ChatStreamingBridgeMixin:
             log.error("Failed to rotate session for bot=%s: %s", slug, e)
             return False
 
+    def _maybe_rotate_agent_session(self, llm_bawt, bot_id: str, user_prompt: str) -> bool:
+        """TASK-284 step 15: rotate the durable DB thread on an agent ``/new``.
+
+        Agent ``/new`` reset+seed stays bridge-owned (provider hydration is
+        untouched); this coordinates the DURABLE side so the fresh provider
+        session maps onto a fresh DB thread — the /new turn's persisted
+        messages then land on the new thread, and the bridge's subsequent
+        session_key PATCH mirrors the new provider id onto it.
+
+        Detection mirrors the bridge exactly (``lstrip().startswith("/new")``)
+        so DB rotation fires iff the bridge will reset. Flag-gated on
+        ``session_history_v2``; returns True only when a rotation happened.
+        Shared by BOTH dispatch paths (streaming + non-streaming) so they
+        cannot drift.
+        """
+        try:
+            if not (user_prompt or "").lstrip().startswith("/new"):
+                return False
+            if not bool(llm_bawt._resolve_setting("session_history_v2", False)):
+                return False
+        except Exception:
+            return False
+        return self._rotate_chat_session(llm_bawt, bot_id)
+
     def _is_openclaw_bot(self, model_alias: str) -> bool:
         """Check if this model alias maps to an openclaw agent backend."""
         model_def = self.config.resolve_model(model_alias, default={})

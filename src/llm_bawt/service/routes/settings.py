@@ -614,7 +614,65 @@ async def patch_bot_profile(slug: str, request: BotProfilePatchRequest):
     if "bot_type" not in request.model_fields_set:
         payload["bot_type"] = normalize_bot_type(None, payload.get("agent_backend"))
 
-    return await _persist_bot_profile(payload, create_only=False)
+    response = await _persist_bot_profile(payload, create_only=False)
+
+    # TASK-284 step 15: provider↔thread mirror. The bridges persist their SDK
+    # session id through THIS chokepoint (PATCH agent_backend_config.session_key
+    # — see claude_code_bridge/session_ops.py). When that id changes, stamp it
+    # onto the durable active DB thread's session_metadata so each thread knows
+    # which provider session hydrates it. Additive metadata only (no read-path
+    # impact), best-effort, never fails the PATCH.
+    if "agent_backend_config" in request.model_fields_set:
+        try:
+            await _mirror_provider_session_to_thread(service, existing, payload)
+        except Exception as _mirror_err:
+            logger.warning(
+                "provider session mirror failed for %s: %s",
+                payload.get("slug"), _mirror_err,
+            )
+
+    return response
+
+
+async def _mirror_provider_session_to_thread(service, existing, payload: dict) -> None:
+    """Stamp a changed provider session id onto the active durable thread.
+
+    TASK-284 step 15. Guards:
+    - only fires when ``session_key`` actually changed and is non-empty;
+    - a value containing ``:`` is a ROUTING key (openclaw ``agent:main:main``,
+      legacy ``bot:user``), never a provider session id — skipped by design
+      (acceptance: routing keys must not be mistaken for provider session ids).
+    Uses get_or_create so a freshly minted provider session always has a
+    durable thread to map onto (single-user deployment: DEFAULT_USER).
+    """
+    new_bc = dict(payload.get("agent_backend_config") or {})
+    old_bc = dict(getattr(existing, "agent_backend_config", None) or {})
+    new_sk = str(new_bc.get("session_key") or "").strip()
+    old_sk = str(old_bc.get("session_key") or "").strip()
+    if not new_sk or new_sk == old_sk or ":" in new_sk:
+        return
+    user_id = (getattr(service.config, "DEFAULT_USER", "") or "").strip()
+    if not user_id:
+        return
+    from ...mcp_server.storage import get_storage
+    import time as _time
+
+    slug = str(payload.get("slug") or "").strip().lower()
+    storage = get_storage()
+    session_id = await storage.get_or_create_active_session(
+        bot_id=slug, user_id=user_id
+    )
+    patch = {
+        "provider": str(payload.get("agent_backend") or "") or None,
+        "provider_session_id": new_sk,
+        "provider_session_model": str(new_bc.get("session_model") or "") or None,
+        "provider_session_updated_at": _time.time(),
+    }
+    ok = await storage.update_session_metadata(session_id, patch, bot_id=slug)
+    logger.info(
+        "Mirrored provider session onto thread: bot=%s thread=%s provider_sid=%s ok=%s",
+        slug, session_id, new_sk, ok,
+    )
 
 
 @router.post("/v1/admin/reload-bots", tags=["Admin"])
