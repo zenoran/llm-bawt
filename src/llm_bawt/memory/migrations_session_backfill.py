@@ -6,7 +6,7 @@ predate session tracking and carry ``session_id IS NULL``. They cannot be
 split by user — the partitioned ``messages`` table has **no ``user_id``
 column** (only ``bot_id`` + ``timestamp``) — so they bucket per bot.
 
-Strategy: create ONE ``status='completed'`` legacy session per bot
+Strategy: create ONE ``status='archived'`` legacy session per bot
 (``id = 'legacy-<bot>'``, owned by ``DEFAULT_USER``, metadata-flagged) and
 point every NULL-session message for that bot at it.
 
@@ -91,7 +91,7 @@ def _upsert_legacy_session(conn, bot_id: str, user_id: str) -> str:
                 :sid, :bot_id, :user_id,
                 COALESCE(to_timestamp(MIN(m.timestamp)) AT TIME ZONE 'UTC', CURRENT_TIMESTAMP),
                 COALESCE(to_timestamp(MAX(m.timestamp)) AT TIME ZONE 'UTC', CURRENT_TIMESTAMP),
-                'completed', CAST(:meta AS jsonb)
+                'archived', CAST(:meta AS jsonb)
             FROM messages m
             WHERE m.bot_id = :bot_id AND m.session_id IS NULL
             ON CONFLICT (id) DO NOTHING

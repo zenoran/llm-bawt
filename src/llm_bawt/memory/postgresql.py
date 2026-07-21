@@ -332,7 +332,9 @@ _message_table_cache: dict[str, Table] = {}
 #   bot_id      Which bot the session belongs to
 #   started_at  When the session opened
 #   ended_at    When the session was closed (NULL while active)
-#   status      'active' or 'completed'
+#   status      'active' | 'archived' | 'deleted' (TASK-250; legacy rows may
+#               still read 'completed' — normalized to 'archived' on read)
+#   archived_at When the session left the active state (NULL while active)
 #   metadata    JSONB grab-bag for future extensibility
 sessions_table = Table(
     "sessions",
@@ -346,6 +348,8 @@ sessions_table = Table(
     Column("started_at", DateTime, nullable=False, default=_utcnow),
     Column("ended_at", DateTime, nullable=True),
     Column("status", String(16), nullable=False, default="active"),
+    # TASK-250: when the session left the active state (archive timestamp).
+    Column("archived_at", DateTime, nullable=True),
     Column("session_metadata", JSON, nullable=True),
     extend_existing=True,
 )
@@ -2272,12 +2276,13 @@ class PostgreSQLShortTermManager:
             conn.commit()
 
     def _close_session_row(self, session_id: str) -> None:
-        """Mark a session row as completed (sets ended_at + status)."""
+        """Mark a session row as archived (sets ended_at/archived_at + status)."""
         with self._backend.engine.connect() as conn:
             stmt = text("""
                 UPDATE sessions
                 SET ended_at = CURRENT_TIMESTAMP,
-                    status = 'completed'
+                    archived_at = CURRENT_TIMESTAMP,
+                    status = 'archived'
                 WHERE id = :id AND ended_at IS NULL
             """)
             conn.execute(stmt, {"id": session_id})
@@ -2286,13 +2291,20 @@ class PostgreSQLShortTermManager:
     @staticmethod
     def _row_to_session_dict(row: Any) -> dict:
         """Coerce a `sessions` row into a JSON-friendly dict."""
+        # TASK-250: status vocabulary is active|archived|deleted. Legacy rows
+        # written before the migration (or by a not-yet-restarted process) may
+        # still carry 'completed' — normalize on read so no consumer ever sees
+        # the retired value.
+        status = "archived" if row.status == "completed" else row.status
+        archived_at = getattr(row, "archived_at", None)
         return {
             "id": row.id,
             "bot_id": row.bot_id,
             "user_id": getattr(row, "user_id", None),
             "started_at": row.started_at.isoformat() if row.started_at else None,
             "ended_at": row.ended_at.isoformat() if row.ended_at else None,
-            "status": row.status,
+            "archived_at": archived_at.isoformat() if archived_at else None,
+            "status": status,
             # TASK-284 step 15 fix: key must match the column name — every
             # consumer (routes/sessions.py, the provider↔thread coordinator)
             # reads "session_metadata"; the old "metadata" key had zero readers
@@ -2306,7 +2318,7 @@ class PostgreSQLShortTermManager:
     # calls while still accepting an override for cross-bot lookups.
 
     def close_session(self, session_id: str | None = None) -> bool:
-        """Close a session: set `ended_at=now()` and `status='completed'`.
+        """Close a session: set `ended_at=now()` and `status='archived'`.
 
         If `session_id` is None, closes this manager's current session and
         keeps `_current_session_id` pointing at it (no rotation). Use
@@ -2323,7 +2335,8 @@ class PostgreSQLShortTermManager:
                 stmt = text("""
                     UPDATE sessions
                     SET ended_at = CURRENT_TIMESTAMP,
-                        status = 'completed'
+                        archived_at = CURRENT_TIMESTAMP,
+                        status = 'archived'
                     WHERE id = :id AND ended_at IS NULL
                     RETURNING id
                 """)
@@ -2341,7 +2354,8 @@ class PostgreSQLShortTermManager:
         try:
             with self._backend.engine.connect() as conn:
                 stmt = text("""
-                    SELECT id, bot_id, user_id, started_at, ended_at, status, session_metadata
+                    SELECT id, bot_id, user_id, started_at, ended_at, archived_at,
+                           status, session_metadata
                     FROM sessions
                     WHERE id = :id
                 """)
@@ -2358,6 +2372,7 @@ class PostgreSQLShortTermManager:
         status: str | None = None,
         limit: int = 50,
         user_id: str | None = None,
+        include_deleted: bool = False,
     ) -> list[dict]:
         """List sessions, newest first.
 
@@ -2366,11 +2381,15 @@ class PostgreSQLShortTermManager:
                 an empty string to query across all bots.
             since: Only sessions with ``started_at >= since``. Accepts a
                 Unix timestamp (float/int) or an ISO-8601 string.
-            status: Filter by status ('active' or 'completed').
+            status: Filter by status ('active' | 'archived' | 'deleted';
+                legacy 'completed' is accepted as an alias for 'archived').
             limit: Max rows to return.
             user_id: Restrict to this user (TASK-284). Pass ``None`` to leave
                 the user dimension unfiltered (cross-user for this bot); pass a
                 value to scope to one user's threads.
+            include_deleted: TASK-250 — soft-deleted sessions are excluded by
+                default; pass True (or an explicit ``status='deleted'``
+                filter) to include them.
 
         Returns:
             List of session dicts in ``started_at DESC`` order.
@@ -2386,8 +2405,16 @@ class PostgreSQLShortTermManager:
             clauses.append("user_id = :user_id")
             params["user_id"] = user_id
         if status:
-            clauses.append("status = :status")
-            params["status"] = status
+            if status == "completed":  # retired alias (TASK-250)
+                status = "archived"
+            if status == "archived":
+                # Match legacy rows a not-yet-restarted writer may still mint.
+                clauses.append("status IN ('archived', 'completed')")
+            else:
+                clauses.append("status = :status")
+                params["status"] = status
+        elif not include_deleted:
+            clauses.append("status <> 'deleted'")
         if since is not None:
             if isinstance(since, (int, float)):
                 params["since"] = datetime.fromtimestamp(float(since), tz=timezone.utc)
@@ -2397,7 +2424,8 @@ class PostgreSQLShortTermManager:
 
         where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
         sql = f"""
-            SELECT id, bot_id, user_id, started_at, ended_at, status, session_metadata
+            SELECT id, bot_id, user_id, started_at, ended_at, archived_at,
+                   status, session_metadata
             FROM sessions
             {where}
             ORDER BY started_at DESC
@@ -2434,7 +2462,8 @@ class PostgreSQLShortTermManager:
             clauses.append("user_id = :user_id")
             params["user_id"] = user_id
         sql = f"""
-            SELECT id, bot_id, user_id, started_at, ended_at, status, session_metadata
+            SELECT id, bot_id, user_id, started_at, ended_at, archived_at,
+                   status, session_metadata
             FROM sessions
             WHERE {' AND '.join(clauses)}
             ORDER BY started_at DESC
@@ -2496,7 +2525,7 @@ class PostgreSQLShortTermManager:
 
         TASK-284: this is the primitive behind a non-destructive ``/new``. The
         old thread's rows are untouched (its session row flips to
-        ``status='completed'``); a fresh ``active`` thread is created and its id
+        ``status='archived'``); a fresh ``active`` thread is created and its id
         returned. Close+open run in ONE transaction so a crash cannot leave zero
         or two active rows for the pair.
         """
@@ -2507,7 +2536,9 @@ class PostgreSQLShortTermManager:
             conn.execute(
                 text("""
                     UPDATE sessions
-                    SET ended_at = CURRENT_TIMESTAMP, status = 'completed'
+                    SET ended_at = CURRENT_TIMESTAMP,
+                        archived_at = CURRENT_TIMESTAMP,
+                        status = 'archived'
                     WHERE bot_id = :bot_id AND status = 'active' AND ended_at IS NULL
                       AND (user_id = :user_id OR (:user_id IS NULL AND user_id IS NULL))
                 """),
@@ -2556,7 +2587,9 @@ class PostgreSQLShortTermManager:
             conn.execute(
                 text("""
                     UPDATE sessions
-                    SET ended_at = CURRENT_TIMESTAMP, status = 'completed'
+                    SET ended_at = CURRENT_TIMESTAMP,
+                        archived_at = CURRENT_TIMESTAMP,
+                        status = 'archived'
                     WHERE bot_id = :bot_id AND status = 'active' AND ended_at IS NULL
                       AND id <> :id
                       AND (user_id = :user_id OR (:user_id IS NULL AND user_id IS NULL))
@@ -2566,13 +2599,47 @@ class PostgreSQLShortTermManager:
             conn.execute(
                 text("""
                     UPDATE sessions
-                    SET status = 'active', ended_at = NULL
+                    SET status = 'active', ended_at = NULL, archived_at = NULL
                     WHERE id = :id
                 """),
                 {"id": session_id},
             )
         self._session_id_cache = session_id
         return True
+
+    def set_session_status(self, session_id: str, status: str) -> bool:
+        """Set a session's lifecycle status to 'archived' or 'deleted' (TASK-250).
+
+        - ``archived``: sets ``archived_at``/``ended_at`` if not already set.
+          Also the restore target for a soft-deleted thread.
+        - ``deleted``: soft delete — messages are retained; the row is excluded
+          from default listings and its deep-links return 410.
+
+        Reactivation is NOT handled here — that is :meth:`activate_session`,
+        which owns the one-active-per-(bot,user) invariant.
+
+        Returns ``False`` for an unknown status, a missing row, or a DB error;
+        never raises.
+        """
+        if status not in ("archived", "deleted"):
+            logger.warning(f"set_session_status: invalid status {status!r}")
+            return False
+        try:
+            with self._backend.engine.begin() as conn:
+                res = conn.execute(
+                    text("""
+                        UPDATE sessions
+                        SET status = :status,
+                            ended_at = COALESCE(ended_at, CURRENT_TIMESTAMP),
+                            archived_at = COALESCE(archived_at, CURRENT_TIMESTAMP)
+                        WHERE id = :id
+                    """),
+                    {"id": session_id, "status": status},
+                )
+                return (res.rowcount or 0) > 0
+        except Exception as e:
+            logger.warning(f"set_session_status({session_id}, {status}) failed: {e}")
+            return False
 
     def update_session_metadata(self, session_id: str, patch: dict) -> bool:
         """Merge ``patch`` into a session row's ``session_metadata`` (jsonb).
@@ -2609,7 +2676,7 @@ class PostgreSQLShortTermManager:
     def new_session(self) -> str:
         """Start a new session and return its ID.
 
-        Closes the previous session (sets ended_at, status='completed'),
+        Closes the previous session (sets ended_at, status='archived'),
         then opens a new one with a fresh UUID. Both operations are
         best-effort: failures are logged but don't block returning the
         new ID since callers depend on it for message attribution.

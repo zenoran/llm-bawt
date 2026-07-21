@@ -934,7 +934,7 @@ class MemoryStorage:
         session_id: str,
         bot_id: str = "default",
     ) -> bool:
-        """Mark a session row completed (sets ended_at + status='completed').
+        """Mark a session row archived (sets ended_at + status='archived').
 
         Returns True iff a row was updated. Idempotent: closing an already-
         closed session returns False without error.
@@ -961,12 +961,15 @@ class MemoryStorage:
         status: str | None = None,
         limit: int = 50,
         user_id: str | None = None,
+        include_deleted: bool = False,
     ) -> list[dict]:
         """List sessions for a bot, newest first.
 
         Pass `bot_id=""` to query across all bots. Pass ``user_id`` (TASK-284)
         to scope to one user's threads; ``None`` leaves the user dimension
-        unfiltered.
+        unfiltered. Soft-deleted sessions are excluded unless
+        ``include_deleted=True`` or an explicit ``status='deleted'`` filter is
+        given (TASK-250).
         """
         # Use a default manager engine, but pass the requested bot through
         # to the query (manager is bot-scoped, the table is not).
@@ -977,6 +980,7 @@ class MemoryStorage:
             status=status,
             limit=limit,
             user_id=user_id,
+            include_deleted=include_deleted,
         )
 
     async def get_active_session(
@@ -1000,7 +1004,7 @@ class MemoryStorage:
         """Close the active thread for (bot, user) and open a new one.
 
         TASK-284: the non-destructive ``/new`` primitive — old rows untouched,
-        the previous session row flips to ``status='completed'``. Returns the
+        the previous session row flips to ``status='archived'``. Returns the
         new active session id. Close+open run in one transaction.
         """
         manager = self.get_short_term_manager(bot_id)
@@ -1032,6 +1036,21 @@ class MemoryStorage:
         """
         manager = self.get_short_term_manager(bot_id)
         return manager.get_or_create_active_session(bot_id=bot_id, user_id=user_id)
+
+    async def set_session_status(
+        self,
+        session_id: str,
+        status: str,
+        bot_id: str = "default",
+    ) -> bool:
+        """Set a session's lifecycle status: 'archived' or 'deleted' (TASK-250).
+
+        Soft-delete keeps the messages; the row just leaves default listings
+        and its deep-links return 410. Reactivation goes through
+        :meth:`activate_session`, never here.
+        """
+        manager = self.get_short_term_manager(bot_id)
+        return manager.set_session_status(session_id, status)
 
     async def update_session_metadata(
         self,

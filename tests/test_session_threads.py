@@ -316,3 +316,75 @@ class TestRegistryInvariantsLiveDB:
         assert all(r.get("user_id") == "u1" for r in u1_rows), (
             f"cross-user leak in list_sessions: {u1_rows}"
         )
+
+    # ── TASK-250: status lifecycle (active|archived|deleted) ──────────────
+
+    def test_rotate_archives_old_thread(self, live_managers):
+        bot, make = live_managers["bot"], live_managers["make"]
+        m = make("lc1")
+        old = m.get_or_create_active_session(bot_id=bot, user_id="lc1")
+        m.rotate_session(bot_id=bot, user_id="lc1")
+        row = m.get_session(old)
+        assert row["status"] == "archived"
+        assert row["archived_at"] is not None
+        assert row["ended_at"] is not None
+
+    def test_activate_clears_archive_state(self, live_managers):
+        bot, make = live_managers["bot"], live_managers["make"]
+        m = make("lc2")
+        old = m.get_or_create_active_session(bot_id=bot, user_id="lc2")
+        m.rotate_session(bot_id=bot, user_id="lc2")
+        assert m.activate_session(old, bot_id=bot, user_id="lc2") is True
+        row = m.get_session(old)
+        assert row["status"] == "active"
+        assert row["archived_at"] is None
+        assert row["ended_at"] is None
+
+    def test_soft_delete_excluded_from_default_list(self, live_managers):
+        bot, make = live_managers["bot"], live_managers["make"]
+        m = make("lc3")
+        doomed = m.get_or_create_active_session(bot_id=bot, user_id="lc3")
+        m.rotate_session(bot_id=bot, user_id="lc3")
+        assert m.set_session_status(doomed, "deleted") is True
+        default_ids = [r["id"] for r in m.list_sessions(bot_id=bot, user_id="lc3")]
+        assert doomed not in default_ids, "deleted thread leaked into default list"
+        admin_ids = [
+            r["id"]
+            for r in m.list_sessions(bot_id=bot, user_id="lc3", include_deleted=True)
+        ]
+        assert doomed in admin_ids, "include_deleted did not re-include the thread"
+        # Restore (undelete → archived) and it reappears.
+        assert m.set_session_status(doomed, "archived") is True
+        restored = [r["id"] for r in m.list_sessions(bot_id=bot, user_id="lc3")]
+        assert doomed in restored
+
+    def test_set_session_status_rejects_bad_values(self, live_managers):
+        bot, make = live_managers["bot"], live_managers["make"]
+        m = make("lc4")
+        sid = m.get_or_create_active_session(bot_id=bot, user_id="lc4")
+        assert m.set_session_status(sid, "active") is False, (
+            "reactivation must go through activate_session, not set_session_status"
+        )
+        assert m.set_session_status(sid, "completed") is False
+        assert m.get_session(sid)["status"] == "active"
+
+    def test_legacy_completed_normalized_on_read(self, live_managers):
+        from sqlalchemy import text as _text
+
+        bot, make = live_managers["bot"], live_managers["make"]
+        m = make("lc5")
+        sid = m.get_or_create_active_session(bot_id=bot, user_id="lc5")
+        m.rotate_session(bot_id=bot, user_id="lc5")
+        # Simulate a row written by a pre-TASK-250 process.
+        with m._backend.engine.begin() as conn:
+            conn.execute(
+                _text("UPDATE sessions SET status = 'completed' WHERE id = :id"),
+                {"id": sid},
+            )
+        assert m.get_session(sid)["status"] == "archived"
+        # And the archived filter still finds it.
+        ids = [
+            r["id"]
+            for r in m.list_sessions(bot_id=bot, user_id="lc5", status="archived")
+        ]
+        assert sid in ids

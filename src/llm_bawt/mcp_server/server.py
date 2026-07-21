@@ -797,7 +797,7 @@ async def close_session(
     session_id: str,
     bot_id: str = "default",
 ) -> bool:
-    """Close a session (sets ended_at + status='completed').
+    """Close a session (sets ended_at + status='archived').
 
     Idempotent: returns True if a row was updated, False if the session was
     already closed or not found.
@@ -848,7 +848,8 @@ async def list_sessions(
         bot_id: Bot namespace. Pass empty string to query across all bots.
         since: Lower bound on started_at — Unix timestamp (float/int) or
             ISO-8601 string. Optional.
-        status: Filter to 'active' or 'completed'. Optional.
+        status: Filter to 'active', 'archived', or 'deleted'. Optional
+            (legacy 'completed' is accepted as an alias for 'archived').
         limit: Max sessions to return (default 50).
 
     Returns:

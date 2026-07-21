@@ -219,7 +219,7 @@ def backfill_sessions(
     ended_at inferred from MIN/MAX message timestamps. The bot_id is
     derived from the table name prefix (`{bot_id}_messages`).
 
-    Sessions backfilled this way are marked `status='completed'` since
+    Sessions backfilled this way are marked `status='archived'` since
     they predate the new tracking — there's no live process holding them
     open. Existing rows are left alone (ON CONFLICT DO NOTHING).
 
@@ -316,7 +316,7 @@ def backfill_sessions(
                         (id, bot_id, started_at, ended_at, status,
                          session_metadata)
                     VALUES
-                        (:id, :bot_id, :started_at, :ended_at, 'completed',
+                        (:id, :bot_id, :started_at, :ended_at, 'archived',
                          CAST(:metadata AS jsonb))
                     ON CONFLICT (id) DO NOTHING
                 """)

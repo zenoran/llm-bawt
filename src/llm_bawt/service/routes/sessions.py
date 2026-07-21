@@ -36,6 +36,7 @@ class SessionInfo(BaseModel):
     user_id: str | None = None
     started_at: str | None = None
     ended_at: str | None = None
+    archived_at: str | None = None
     status: str
     session_metadata: dict | None = None
 
@@ -60,6 +61,37 @@ class SessionTranscriptResponse(BaseModel):
     bot_id: str
     messages: list[SessionMessage]
     total_count: int
+
+
+class ForkFrom(BaseModel):
+    """TASK-250: fork provenance — both fields required when forking."""
+
+    session_id: str
+    at_message_id: str
+
+
+class CreateSessionRequest(BaseModel):
+    """Optional JSON body for POST /v1/sessions (TASK-250).
+
+    Back-compat: the route still accepts bare query-param usage (TASK-284
+    callers send no body at all).
+    """
+
+    bot_id: str | None = None
+    user: str | None = None
+    title: str | None = None
+    fork_from: ForkFrom | None = None
+
+
+class UpdateSessionRequest(BaseModel):
+    """PATCH /v1/sessions/{id} body (TASK-250)."""
+
+    title: str | None = None
+    status: str | None = Field(
+        default=None,
+        description="'archived' or 'deleted'. Reactivation goes through "
+        "POST /v1/sessions/{id}/activate, not PATCH.",
+    )
 
 
 class CreateSessionResponse(BaseModel):
@@ -104,6 +136,35 @@ def _resolve_user(user: str | None) -> str:
     return user_id
 
 
+def _normalize_metadata(row: dict) -> dict:
+    """Backfill-on-read: coerce ``session_metadata`` to the standard shape
+    (TASK-250) without force-writing anything back.
+
+    Target shape::
+
+        {title, title_source: user|auto|default,
+         agent_session_keys: {<provider>: sdk-id},
+         forked_from: {session_id, at_message_id} | None,
+         archived_at}
+
+    Legacy keys (``provider``/``provider_session_id``/``provider_session_model``
+    from the TASK-284 mirror) are preserved verbatim alongside the derived
+    ``agent_session_keys`` view until TASK-252 makes the new home canonical.
+    """
+    meta = dict(row.get("session_metadata") or {})
+    meta.setdefault("title", None)
+    meta.setdefault("title_source", "user" if meta.get("title") else "default")
+    if "agent_session_keys" not in meta:
+        provider = str(meta.get("provider") or "").strip()
+        sid = str(meta.get("provider_session_id") or "").strip()
+        meta["agent_session_keys"] = (
+            {provider.replace("-", "_"): sid} if provider and sid else {}
+        )
+    meta.setdefault("forked_from", None)
+    meta.setdefault("archived_at", row.get("archived_at"))
+    return meta
+
+
 def _to_info(row: dict) -> SessionInfo:
     return SessionInfo(
         id=row["id"],
@@ -111,18 +172,31 @@ def _to_info(row: dict) -> SessionInfo:
         user_id=row.get("user_id"),
         started_at=str(row["started_at"]) if row.get("started_at") is not None else None,
         ended_at=str(row["ended_at"]) if row.get("ended_at") is not None else None,
+        archived_at=str(row["archived_at"]) if row.get("archived_at") is not None else None,
         status=row.get("status", ""),
-        session_metadata=row.get("session_metadata"),
+        session_metadata=_normalize_metadata(row),
     )
 
 
-async def _owned_session_or_404(session_id: str, bot_id: str, user_id: str) -> dict:
-    """Fetch a session and enforce (bot, user) ownership; 404 otherwise."""
+async def _owned_session_or_404(
+    session_id: str,
+    bot_id: str,
+    user_id: str,
+    allow_deleted: bool = False,
+) -> dict:
+    """Fetch a session and enforce (bot, user) ownership; 404 otherwise.
+
+    TASK-250: a soft-deleted session's deep-link answers 410 Gone (the row
+    exists, the resource is intentionally unavailable) unless the caller asks
+    for it explicitly via ``allow_deleted``.
+    """
     storage = get_storage()
     row = await storage.get_session(session_id, bot_id=bot_id)
     if not row or row.get("bot_id") != bot_id or row.get("user_id") != user_id:
         # Cross-user / cross-bot / missing all look identical to the caller.
         raise HTTPException(status_code=404, detail="Session not found")
+    if row.get("status") == "deleted" and not allow_deleted:
+        raise HTTPException(status_code=410, detail="Session deleted")
     return row
 
 
@@ -133,14 +207,25 @@ async def _owned_session_or_404(session_id: str, bot_id: str, user_id: str) -> d
 async def list_sessions(
     bot_id: str = Query(None, description="Bot slug; defaults to service default bot"),
     user: str | None = Query(None, description="User id; defaults to DEFAULT_USER"),
-    status: str | None = Query(None, description="Filter by status: active | completed"),
+    status: str | None = Query(
+        None, description="Filter by status: active | archived | deleted"
+    ),
+    include_deleted: bool = Query(
+        False,
+        description="TASK-250: soft-deleted threads are excluded by default; "
+        "pass true (admin) to include them.",
+    ),
     limit: int = Query(50, ge=1, le=200),
 ):
-    """List a user's threads for a bot, newest first."""
+    """List a user's threads for a bot, newest first (excludes deleted)."""
     effective_bot = get_effective_bot_id(bot_id)
     user_id = _resolve_user(user)
     rows = await get_storage().list_sessions(
-        bot_id=effective_bot, user_id=user_id, status=status, limit=limit
+        bot_id=effective_bot,
+        user_id=user_id,
+        status=status,
+        limit=limit,
+        include_deleted=include_deleted,
     )
     return SessionListResponse(
         bot_id=effective_bot,
@@ -214,15 +299,43 @@ async def get_session_messages(
 
 @router.post("/v1/sessions", response_model=CreateSessionResponse, tags=["Sessions"])
 async def create_session(
+    body: CreateSessionRequest | None = None,
     bot_id: str = Query(None, description="Bot slug; defaults to service default bot"),
     user: str | None = Query(None, description="User id; defaults to DEFAULT_USER"),
 ):
     """Open a fresh thread for (bot, user), rotating (closing) the prior active
     one. Non-destructive: old rows are preserved under the closed session.
+
+    TASK-250: optional JSON body ``{bot_id?, title?, fork_from?}``. ``title``
+    is stored as a user-sourced title; ``fork_from`` records fork provenance
+    (``at_message_id`` required — enforced by the schema) after verifying the
+    source thread is owned by the same (bot, user).
     """
-    effective_bot = get_effective_bot_id(bot_id)
-    user_id = _resolve_user(user)
-    new_id = await get_storage().rotate_session(bot_id=effective_bot, user_id=user_id)
+    body = body or CreateSessionRequest()
+    effective_bot = get_effective_bot_id(body.bot_id or bot_id)
+    user_id = _resolve_user(body.user or user)
+    storage = get_storage()
+
+    # Validate fork provenance BEFORE rotating anything.
+    if body.fork_from is not None:
+        await _owned_session_or_404(
+            body.fork_from.session_id, effective_bot, user_id
+        )
+
+    new_id = await storage.rotate_session(bot_id=effective_bot, user_id=user_id)
+
+    meta: dict = {}
+    if body.title and body.title.strip():
+        meta["title"] = body.title.strip()
+        meta["title_source"] = "user"
+    if body.fork_from is not None:
+        meta["forked_from"] = {
+            "session_id": body.fork_from.session_id,
+            "at_message_id": body.fork_from.at_message_id,
+        }
+    if meta:
+        await storage.update_session_metadata(new_id, meta, bot_id=effective_bot)
+
     # TASK-284 step 15: for agent bots a fresh thread must not resume the OLD
     # provider transcript — clear the stored provider session so the bridge
     # cold-starts and re-seeds ("reseed"). No-op for chat bots.
@@ -232,6 +345,83 @@ async def create_session(
     return CreateSessionResponse(
         session_id=new_id, bot_id=effective_bot, user_id=user_id
     )
+
+
+@router.patch("/v1/sessions/{session_id}", response_model=SessionInfo, tags=["Sessions"])
+async def update_session(
+    session_id: str,
+    body: UpdateSessionRequest,
+    bot_id: str = Query(None, description="Bot slug; defaults to service default bot"),
+    user: str | None = Query(None, description="User id; defaults to DEFAULT_USER"),
+):
+    """Rename and/or archive/soft-delete a thread (TASK-250, user-scoped).
+
+    - ``title``: stored with ``title_source='user'`` (a user rename locks out
+      future auto-titling).
+    - ``status``: ``archived`` or ``deleted`` only. Reactivation goes through
+      ``POST /v1/sessions/{id}/activate`` (it owns the one-active invariant).
+      ``archived`` on a deleted thread restores it (undelete).
+    """
+    effective_bot = get_effective_bot_id(bot_id)
+    user_id = _resolve_user(user)
+    # allow_deleted so a soft-deleted thread can be restored via PATCH.
+    await _owned_session_or_404(
+        session_id, effective_bot, user_id, allow_deleted=True
+    )
+    storage = get_storage()
+
+    if body.status is not None:
+        if body.status not in ("archived", "deleted"):
+            raise HTTPException(
+                status_code=422,
+                detail="status must be 'archived' or 'deleted' "
+                "(use POST /v1/sessions/{id}/activate to reactivate)",
+            )
+        ok = await storage.set_session_status(
+            session_id, body.status, bot_id=effective_bot
+        )
+        if not ok:
+            raise HTTPException(status_code=500, detail="Status update failed")
+
+    if body.title is not None:
+        title = body.title.strip()
+        if not title:
+            raise HTTPException(status_code=422, detail="title must be non-empty")
+        await storage.update_session_metadata(
+            session_id,
+            {"title": title, "title_source": "user"},
+            bot_id=effective_bot,
+        )
+
+    row = await storage.get_session(session_id, bot_id=effective_bot)
+    return _to_info(row)
+
+
+@router.delete("/v1/sessions/{session_id}", tags=["Sessions"])
+async def delete_session(
+    session_id: str,
+    bot_id: str = Query(None, description="Bot slug; defaults to service default bot"),
+    user: str | None = Query(None, description="User id; defaults to DEFAULT_USER"),
+):
+    """Soft-delete a thread (TASK-250, user-scoped).
+
+    Sets ``status='deleted'``; messages are retained. The thread leaves
+    default listings and its deep-links answer 410 Gone. Restore with
+    ``PATCH {status: 'archived'}``. Idempotent: deleting an already-deleted
+    thread is a no-op success.
+    """
+    effective_bot = get_effective_bot_id(bot_id)
+    user_id = _resolve_user(user)
+    row = await _owned_session_or_404(
+        session_id, effective_bot, user_id, allow_deleted=True
+    )
+    if row.get("status") != "deleted":
+        ok = await get_storage().set_session_status(
+            session_id, "deleted", bot_id=effective_bot
+        )
+        if not ok:
+            raise HTTPException(status_code=500, detail="Delete failed")
+    return {"session_id": session_id, "status": "deleted", "deleted": True}
 
 
 @router.post(
