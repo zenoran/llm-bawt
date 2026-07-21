@@ -58,6 +58,41 @@ class ChatStreamingBridgeMixin:
         except Exception as e:
             log.error("Failed to set conversation offset for bot=%s: %s", slug, e)
 
+    def _rotate_chat_session(self, llm_bawt, bot_id: str) -> bool:
+        """TASK-284 step 14: non-destructive DB session rotation for chatbot /new.
+
+        The v2 replacement for ``_set_conversation_offset``: instead of moving a
+        timestamp marker, it closes the active durable thread and opens a fresh
+        one (old rows untouched). The next turn's session-scoped load then sees
+        only the new empty thread plus rolling summaries. Also clears the live
+        in-memory transcript so a sub-TTL follow-up starts clean immediately.
+
+        Returns True on success. On any failure returns False so the caller can
+        fall back to the legacy offset path rather than leaving /new a no-op.
+        """
+        slug = (bot_id or "").strip().lower()
+        try:
+            backend = getattr(llm_bawt.history_manager, "_db_backend", None)
+            rotate = getattr(backend, "rotate_session", None) if backend else None
+            if not callable(rotate):
+                return False
+            new_id = rotate()
+            inv = getattr(llm_bawt, "invalidate_history_cache", None)
+            if callable(inv):
+                inv()
+            try:
+                hm = llm_bawt.history_manager
+                hm.messages = [
+                    m for m in hm.messages if getattr(m, "role", "") == "summary"
+                ]
+            except Exception:
+                pass
+            log.info("Rotated DB session for bot=%s -> %s (/new v2)", slug, new_id)
+            return True
+        except Exception as e:
+            log.error("Failed to rotate session for bot=%s: %s", slug, e)
+            return False
+
     def _is_openclaw_bot(self, model_alias: str) -> bool:
         """Check if this model alias maps to an openclaw agent backend."""
         model_def = self.config.resolve_model(model_alias, default={})

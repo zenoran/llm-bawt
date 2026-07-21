@@ -644,6 +644,8 @@ class MemoryStorage:
         limit: int | None = None,
         raw: bool = False,
         session_id: str | None = None,
+        summaries_only: bool = False,
+        exclude_summarized: bool = False,
     ) -> list[dict[str, Any]]:
         """Get messages for building a context window.
 
@@ -664,11 +666,19 @@ class MemoryStorage:
         on. It implies ``raw`` semantics (a specific thread's real bubbles), so
         the summary-aware window path is bypassed. When ``session_id`` is None,
         behaviour is exactly as before.
+
+        TASK-284 step 12: ``summaries_only`` returns ONLY the ``role='summary''``
+        continuity husks (across all of the bot's sessions), newest-last. The
+        session-scoped v2 read composes this with the active thread's raw bubbles
+        (``session_id=...``) to reproduce the legacy summary-aware view for a
+        single selected thread. Cheap: it never pulls cross-session raw rows.
         """
+        if summaries_only:
+            return self._get_summary_husks(bot_id, limit=limit)
         if session_id is not None:
             return self._get_messages_raw(
                 bot_id, since_seconds=since_seconds, limit=limit,
-                session_id=session_id,
+                session_id=session_id, exclude_summarized=exclude_summarized,
             )
         if raw:
             return self._get_messages_raw(
@@ -704,17 +714,23 @@ class MemoryStorage:
         since_seconds: int | None = None,
         limit: int | None = None,
         session_id: str | None = None,
+        exclude_summarized: bool = False,
     ) -> list[dict[str, Any]]:
         """Direct-table read of real message bubbles.
 
         Bypasses the summary-aware manager entirely. Returns every row whose
         role is NOT ``summary`` (so prior recaps/session summaries are excluded)
-        and ignores the ``summarized`` flag (so bubbles already rolled into a
-        summary are still returned). Ordered oldest-first; ``limit`` keeps the
-        most recent N.
+        and — by default — ignores the ``summarized`` flag (so bubbles already
+        rolled into a summary are still returned; self_recap/self_tail want the
+        literal transcript). Ordered oldest-first; ``limit`` keeps the most
+        recent N.
 
         TASK-284: when ``session_id`` is given, restrict to that one durable
-        thread's rows.
+        thread's rows. ``exclude_summarized`` (step 12) additionally drops rows
+        whose content is already captured in a ``role='summary'`` husk — the
+        session-scoped context read sets it so summarized bubbles are NEVER
+        double-loaded alongside their summary (the raw/summary partition stays
+        disjoint, exactly as the legacy summary-aware path).
         """
         from sqlalchemy import text
 
@@ -724,6 +740,8 @@ class MemoryStorage:
         if session_id is not None:
             clauses.append("session_id = :session_id")
             params["session_id"] = session_id
+        if exclude_summarized:
+            clauses.append("(summarized IS NULL OR summarized = FALSE)")
         if since_seconds is not None and since_seconds >= 0:
             params["cutoff"] = time.time() - since_seconds
             clauses.append("timestamp >= :cutoff")
@@ -752,6 +770,47 @@ class MemoryStorage:
             return out
         except Exception as e:
             logger.error("Failed to get raw messages: %s", e)
+            return []
+
+    def _get_summary_husks(
+        self,
+        bot_id: str = "default",
+        limit: int | None = None,
+    ) -> list[dict[str, Any]]:
+        """Direct-table read of the ``role='summary'`` continuity husks only.
+
+        TASK-284 step 12: the session-scoped v2 read composes the active thread's
+        raw bubbles with these rolling summaries so a `/new`'d thread still shows
+        the gist of prior threads. Ordered oldest-first; ``limit`` keeps the most
+        recent N (the assembler's ``summary_count`` still bounds what's injected).
+        """
+        from sqlalchemy import text
+
+        backend = self._get_backend(bot_id)
+        sql = f"""
+            SELECT id, role, content, timestamp, session_id
+            FROM {backend._messages_table_name}
+            WHERE role = 'summary'
+            ORDER BY timestamp ASC
+        """
+        try:
+            with backend.engine.connect() as conn:
+                rows = conn.execute(text(sql)).fetchall()
+            out = [
+                {
+                    "id": r.id,
+                    "role": r.role,
+                    "content": r.content,
+                    "timestamp": r.timestamp,
+                    "session_id": r.session_id,
+                }
+                for r in rows
+            ]
+            if limit is not None and limit >= 0:
+                out = out[-limit:]
+            return out
+        except Exception as e:
+            logger.error("Failed to get summary husks: %s", e)
             return []
 
     async def clear_messages(self, bot_id: str = "default") -> int:

@@ -748,21 +748,27 @@ async def get_messages(
     since_seconds: int | None = None,
     limit: int | None = None,
     session_id: str | None = None,
+    summaries_only: bool = False,
+    exclude_summarized: bool = False,
 ) -> list[dict]:
     """Get messages for building context windows.
 
     TASK-284: pass ``session_id`` to scope the read to one durable thread's
     transcript (direct-table read). Omit it for the existing summary-aware
-    behaviour.
+    behaviour. ``summaries_only`` returns only the rolling summary husks — the
+    session-scoped v2 read (step 12) composes it with a thread's raw bubbles.
+    ``exclude_summarized`` drops already-summarized bubbles from a session-scoped
+    read so raw and summary rows stay disjoint (no double-loading).
     """
     logger.debug(
-        "MCP tool invoked: tools/get_messages bot_id=%s session_id=%s",
-        bot_id, session_id,
+        "MCP tool invoked: tools/get_messages bot_id=%s session_id=%s summaries_only=%s excl_summ=%s",
+        bot_id, session_id, summaries_only, exclude_summarized,
     )
     storage = _get_storage()
     return await storage.get_messages(
         bot_id=bot_id, since_seconds=since_seconds, limit=limit,
-        session_id=session_id,
+        session_id=session_id, summaries_only=summaries_only,
+        exclude_summarized=exclude_summarized,
     )
 
 
@@ -859,22 +865,43 @@ async def list_sessions(
 
 
 @mcp.tool(name="sessions_get_active")
-async def get_active_session(bot_id: str = "default") -> dict | None:
-    """Get the most-recent active session for a bot.
+async def get_active_session(
+    bot_id: str = "default", user_id: str | None = None
+) -> dict | None:
+    """Get the most-recent active session for a (bot, user).
 
-    An active session has status='active' and ended_at IS NULL. If a bot
+    An active session has status='active' and ended_at IS NULL. If a pair
     has multiple active rows (rare — happens after a crash mid-rotation),
     returns the most recently started.
 
     Args:
         bot_id: Bot namespace.
+        user_id: TASK-284 — scope to this user's active thread. ``None``
+            preserves the legacy bot-only lookup.
 
     Returns:
-        Session dict, or None if the bot has no active session.
+        Session dict, or None if the pair has no active session.
     """
-    logger.debug("MCP tool invoked: sessions_get_active bot_id=%s", bot_id)
+    logger.debug(
+        "MCP tool invoked: sessions_get_active bot_id=%s user_id=%s", bot_id, user_id
+    )
     storage = _get_storage()
-    return await storage.get_active_session(bot_id=bot_id)
+    return await storage.get_active_session(bot_id=bot_id, user_id=user_id)
+
+
+@mcp.tool(name="sessions_rotate")
+async def rotate_session(bot_id: str = "default", user_id: str | None = None) -> str:
+    """Non-destructively rotate the active thread for a (bot, user).
+
+    TASK-284 step 14: closes the current active session (its rows are untouched)
+    and opens a fresh active one in ONE transaction. Backs the v2 chatbot `/new`.
+    Returns the new session id.
+    """
+    logger.debug(
+        "MCP tool invoked: sessions_rotate bot_id=%s user_id=%s", bot_id, user_id
+    )
+    storage = _get_storage()
+    return await storage.rotate_session(bot_id=bot_id, user_id=user_id)
 
 
 # ---------------------------------------------------------------------------

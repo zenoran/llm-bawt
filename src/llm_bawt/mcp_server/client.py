@@ -564,6 +564,8 @@ class MemoryClient:
         since: float | None = None,
         until: float | None = None,
         session_id: str | None = None,
+        summaries_only: bool = False,
+        exclude_summarized: bool = False,
     ) -> list[dict[str, Any]]:
         """Get conversation messages with optional filtering.
 
@@ -574,6 +576,8 @@ class MemoryClient:
             until: Unix timestamp - only include messages before this time.
             session_id: TASK-284 — scope the read to one durable thread's
                 transcript. When None, existing behaviour is unchanged.
+            summaries_only: TASK-284 step 12 — return only the rolling summary
+                husks (continuity), no raw bubbles.
 
         Returns:
             List of message dicts with role, content, timestamp, session_id.
@@ -585,6 +589,8 @@ class MemoryClient:
                 {
                     "bot_id": self.bot_id, "since_seconds": since_seconds,
                     "limit": limit, "session_id": session_id,
+                    "summaries_only": summaries_only,
+                    "exclude_summarized": exclude_summarized,
                 },
             )
             # Apply timestamp filtering (server doesn't support since/until yet)
@@ -601,7 +607,7 @@ class MemoryClient:
             return result
         storage = self._get_storage()
         # Use storage API directly (async) via helper
-        messages = _run_async(storage.get_messages(bot_id=self.bot_id, since_seconds=since_seconds, limit=limit, session_id=session_id))
+        messages = _run_async(storage.get_messages(bot_id=self.bot_id, since_seconds=since_seconds, limit=limit, session_id=session_id, summaries_only=summaries_only, exclude_summarized=exclude_summarized))
 
         # Apply timestamp filtering if specified (post-filter for now)
         if since is not None or until is not None:
@@ -616,6 +622,41 @@ class MemoryClient:
             return filtered
 
         return messages
+
+    def get_active_session(self) -> dict[str, Any] | None:
+        """Return this (bot, user)'s active durable session, or None.
+
+        TASK-284 step 12: the read-path resolver for session-scoped history.
+        Scopes by ``self.user_id`` so it targets the same thread the write path
+        attributes messages to. Returns None when no active thread exists yet
+        (callers fall back to the legacy whole-history load).
+        """
+        self._ensure_initialized()
+        if self.server_url:
+            return self._call_server(
+                "sessions_get_active",
+                {"bot_id": self.bot_id, "user_id": self.user_id},
+            )
+        storage = self._get_storage()
+        return _run_async(
+            storage.get_active_session(bot_id=self.bot_id, user_id=self.user_id)
+        )
+
+    def rotate_session(self) -> str | None:
+        """Non-destructively rotate this (bot, user)'s active thread.
+
+        TASK-284 step 14: closes the current active session and opens a fresh
+        one, returning the new session id. Backs the v2 chatbot ``/new``.
+        """
+        self._ensure_initialized()
+        if self.server_url:
+            return self._call_server(
+                "sessions_rotate", {"bot_id": self.bot_id, "user_id": self.user_id}
+            )
+        storage = self._get_storage()
+        return _run_async(
+            storage.rotate_session(bot_id=self.bot_id, user_id=self.user_id)
+        )
 
     def clear_messages(self) -> int:
         self._ensure_initialized()
@@ -1325,6 +1366,50 @@ class _MCPShortTermManager:
                 if m.role == "summary" or m.timestamp >= after_timestamp
             ]
         return messages
+
+    def load_session_scoped(self, since_minutes: int | None = None) -> list | None:
+        """TASK-284 step 12: session-scoped v2 history read.
+
+        Loads the SELECTED/ACTIVE durable thread's raw bubbles composed with the
+        bot's rolling summary husks (continuity) — the same content shape the
+        legacy summary-aware path produced, but with raw scoped to ONE thread
+        instead of every unsummarized message across all sessions. A `/new`'d
+        thread therefore shows only its own raw turns plus the prior threads'
+        summaries.
+
+        Returns a chronologically-ordered ``list[Message]``, or ``None`` when
+        there is no active session yet (the caller falls back to the legacy
+        whole-history load — never a silent empty context).
+        """
+        from llm_bawt.models.message import Message
+
+        active = self._memory_client.get_active_session()
+        if not active or not active.get("id"):
+            return None
+        session_id = active["id"]
+
+        raw_rows = self._memory_client.get_messages(
+            session_id=session_id, since_seconds=since_minutes,
+            exclude_summarized=True,
+        )
+        summary_rows = self._memory_client.get_messages(summaries_only=True)
+
+        merged = [
+            Message(
+                role=r.get("role", ""),
+                content=r.get("content", ""),
+                timestamp=r.get("timestamp", 0.0) or 0.0,
+                db_id=r.get("id"),
+                session_id=r.get("session_id"),
+            )
+            for r in (list(raw_rows) + list(summary_rows))
+        ]
+        merged.sort(key=lambda m: m.timestamp or 0.0)
+        return merged
+
+    def rotate_session(self) -> str | None:
+        """TASK-284 step 14: rotate the active thread (backs v2 chatbot /new)."""
+        return self._memory_client.rotate_session()
 
     def clear(self) -> bool:
         deleted = self._memory_client.clear_messages()

@@ -388,7 +388,17 @@ class ChatStreamingMixin(ChatStreamingBridgeMixin):
             _stripped = (user_prompt or "").lstrip()
             _low = _stripped.lower()
             if _low == "/new" or _low.startswith("/new ") or _low.startswith("/new\n"):
-                self._set_conversation_offset(llm_bawt, bot_id, time.time())
+                # TASK-284 step 14: under session_history_v2, /new rotates the
+                # durable DB thread (non-destructive) instead of moving the
+                # conversation_offset marker. Falls back to the offset path if
+                # the flag is off or rotation can't run (keeps /new working).
+                _v2 = False
+                try:
+                    _v2 = bool(llm_bawt._resolve_setting("session_history_v2", False))
+                except Exception:
+                    _v2 = False
+                if not (_v2 and self._rotate_chat_session(llm_bawt, bot_id)):
+                    self._set_conversation_offset(llm_bawt, bot_id, time.time())
                 remainder = _stripped[len("/new"):].strip()
                 if not remainder:
                     confirm = (

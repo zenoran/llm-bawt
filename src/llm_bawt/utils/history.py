@@ -172,6 +172,35 @@ class HistoryManager:
     def load_history(self, since_minutes: int | None = None):
         self.messages = []
 
+        # TASK-284 step 12: session-scoped history (v2), behind a rollout flag
+        # (default OFF -> the legacy conversation_offset path below runs
+        # unchanged, byte-identical to pre-TASK-284). When ON, load the ACTIVE
+        # durable thread's raw bubbles + rolling summary continuity instead of
+        # every unsummarized message across all sessions. Falls back to legacy
+        # when the backend can't scope (no active session yet, or a backend
+        # without the v2 method) — never a silent empty context.
+        if self._db_backend and bool(self._setting("session_history_v2", False)):
+            loader = getattr(self._db_backend, "load_session_scoped", None)
+            if loader is not None:
+                try:
+                    scoped = loader(since_minutes=since_minutes)
+                    if scoped is not None:
+                        self.messages = scoped
+                        logger.debug(
+                            "Loaded %d messages via session_history_v2 (scoped)",
+                            len(self.messages),
+                        )
+                        return
+                    logger.debug(
+                        "session_history_v2 ON but no active session; "
+                        "falling back to legacy load"
+                    )
+                except Exception as e:
+                    logger.warning(
+                        "session_history_v2 load failed (%s); falling back to legacy",
+                        e,
+                    )
+
         # Conversation offset marker (moved forward by the `/new` command).
         # Raw messages older than the marker are dropped from the live context;
         # summaries + long-term memory are unaffected. None = no offset set.
