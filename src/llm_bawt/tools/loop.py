@@ -53,7 +53,7 @@ class ToolLoop:
         user_id: str = "",  # Required - must be passed explicitly
         bot_id: str = "nova",
         max_iterations: int | None = None,
-        tool_format: ToolFormat | str = ToolFormat.XML,
+        tool_format: ToolFormat | str = ToolFormat.REACT,
         tools: list | None = None,
         adapter: "ModelAdapter | None" = None,
         history_manager: "HistoryManager | None" = None,
@@ -225,18 +225,10 @@ class ToolLoop:
             tool_calls, remaining_text = handler.parse_response(response)
             effective_handler = handler
 
-            # Fallback parsing if response contains tool markers in a different format
+            # Fallback parsing if a native-capable model emits ReAct text.
             if not tool_calls and isinstance(response, str):
                 lower = response.lower()
-                if "<tool_call>" in lower or "<function_call>" in lower:
-                    from .formats.xml_legacy import LegacyXMLFormatHandler
-
-                    legacy_handler = LegacyXMLFormatHandler()
-                    tool_calls, remaining_text = legacy_handler.parse_response(response)
-                    if tool_calls:
-                        logger.warning("Detected legacy XML tool call while using %s handler", type(handler).__name__)
-                        effective_handler = legacy_handler
-                elif "action:" in lower and "action input:" in lower:
+                if "action:" in lower and "action input:" in lower:
                     from .formats.react import ReActFormatHandler
 
                     react_handler = ReActFormatHandler()
@@ -250,9 +242,6 @@ class ToolLoop:
                 final_text = remaining_text or (response if isinstance(response, str) else "")
                 if isinstance(response, str):
                     lower = response.lower()
-                    if "<tool_call>" in lower or "<function_call>" in lower:
-                        from .formats.xml_legacy import LegacyXMLFormatHandler
-                        return LegacyXMLFormatHandler().sanitize_response(final_text)
                     if "action:" in lower and "action input:" in lower:
                         from .formats.react import ReActFormatHandler
                         return ReActFormatHandler().sanitize_response(final_text)
@@ -486,7 +475,7 @@ def query_with_tools(
     bot_id: str = "nova",
     max_iterations: int = DEFAULT_MAX_ITERATIONS,
     stream: bool = True,
-    tool_format: ToolFormat | str = ToolFormat.XML,
+    tool_format: ToolFormat | str = ToolFormat.REACT,
     tools: list | None = None,
     adapter: "ModelAdapter | None" = None,
     history_manager: "HistoryManager | None" = None,

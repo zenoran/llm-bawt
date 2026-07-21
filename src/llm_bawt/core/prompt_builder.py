@@ -50,7 +50,7 @@ class PromptSection:
 # Standard section positions
 class SectionPosition:
     """Standard ordering for prompt sections."""
-    DATETIME = -1  # Current date/time (always first)
+    DATETIME = -1  # Reserved for the dormant legacy pipeline; not live prompt assembly.
     USER_CONTEXT = 0
     BOT_TRAITS = 1
     BASE_PROMPT = 2

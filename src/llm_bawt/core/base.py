@@ -587,7 +587,7 @@ class BaseLLMBawt(ABC):
 
     # --- per-turn section renderers (walked by _walk_manifest, PER_TURN) -----
     def _sec_tools(self, builder: PromptBuilder, prompt: str) -> None:
-        """Tool instructions (skip if tool_format is 'none')."""
+        """Chat-model tool instructions (native agent harnesses own theirs)."""
         if self.tool_format != "none":
             if self.bot.uses_tools:
                 tool_definitions = self._get_tool_definitions()

@@ -6,7 +6,6 @@ from llm_bawt.tools.formats import ToolFormat, get_format_handler
 from llm_bawt.tools.formats.base import ToolCallRequest
 from llm_bawt.tools.formats.react import ReActFormatHandler
 from llm_bawt.tools.formats.native_openai import NativeOpenAIFormatHandler
-from llm_bawt.tools.formats.xml_legacy import LegacyXMLFormatHandler
 
 
 class TestToolFormatRegistry:
@@ -19,10 +18,6 @@ class TestToolFormatRegistry:
     def test_get_native_handler(self):
         handler = get_format_handler(ToolFormat.NATIVE_OPENAI)
         assert isinstance(handler, NativeOpenAIFormatHandler)
-
-    def test_get_xml_handler(self):
-        handler = get_format_handler(ToolFormat.XML)
-        assert isinstance(handler, LegacyXMLFormatHandler)
 
     def test_get_handler_by_string(self):
         handler = get_format_handler("react")
@@ -291,34 +286,6 @@ class TestNativeOpenAIFormatHandler:
         assert "limit" not in schema[0]["function"]["parameters"]["required"]
 
 
-class TestLegacyXMLFormatHandler:
-    """Tests for legacy XML format handler."""
-
-    @pytest.fixture
-    def handler(self):
-        return LegacyXMLFormatHandler()
-
-    def test_stop_sequences(self, handler):
-        stops = handler.get_stop_sequences()
-        assert "</tool_call>" in stops
-
-    def test_sanitize_removes_tool_call_tags(self, handler):
-        response = '''Here is my response <tool_call>{"name": "test", "arguments": {}}</tool_call> and more'''
-
-        sanitized = handler.sanitize_response(response)
-
-        assert "<tool_call>" not in sanitized
-        assert "</tool_call>" not in sanitized
-
-    def test_sanitize_removes_function_call_tags(self, handler):
-        response = '''Response <function_call>stuff</function_call> end'''
-
-        sanitized = handler.sanitize_response(response)
-
-        assert "<function_call>" not in sanitized
-        assert "</function_call>" not in sanitized
-
-
 class TestRegressionDebugTurnCase:
     """Regression tests for the debug_turn.txt failure case.
 
@@ -335,19 +302,6 @@ class TestRegressionDebugTurnCase:
 <tool_call>
 {"name":"delete_user_attribute","arguments":{"query":"qwen"}}
 </tool_call>'''
-
-        sanitized = handler.sanitize_response(response)
-
-        assert "<tool_call>" not in sanitized
-        assert "</tool_call>" not in sanitized
-
-    def test_xml_tags_never_shown_to_user_xml_handler(self):
-        """XML handler should sanitize its own tags."""
-        handler = LegacyXMLFormatHandler()
-
-        response = '''I'll check that for you. <tool_call>
-{"name":"search_memories","arguments":{"query":"test"}}
-</tool_call> Let me explain...'''
 
         sanitized = handler.sanitize_response(response)
 

@@ -41,7 +41,7 @@ def _looks_like_tool_call_start(text: str) -> bool:
         return False
     
     # ReAct format markers - check both directions for partial matches
-    tool_prefixes = ("thought:", "action:", "# tool:", "tool:", "<tool_call>", "<function_call>")
+    tool_prefixes = ("thought:", "action:", "# tool:", "tool:")
     for prefix in tool_prefixes:
         # Either text starts with prefix, or prefix starts with text (partial match)
         if stripped.startswith(prefix) or prefix.startswith(stripped):

@@ -582,23 +582,26 @@ class Config(RuntimeTunables, BaseSettings):
         """Return the tool format for a given model alias or definition.
         
         Resolution order:
-        1. Explicit tool_support field (native|react|xml|none)
-        2. Legacy tool_format override (deprecated)
+        1. Explicit tool_support field (native|react|none)
+        2. Legacy tool_format override (deprecated; XML maps to ReAct)
         3. Auto-detect by provider type
         """
         if model_def is None and model_alias:
             model_def = self.resolve_model(model_alias, default={})
         model_def = model_def or {}
 
-        # 1. Explicit tool_support (new)
+        # 1. Explicit tool_support (new). XML was retired with the legacy
+        # prompt protocol; old catalog rows degrade safely to ReAct text tools.
         tool_support = model_def.get("tool_support")
-        if tool_support in ("native", "react", "xml", "none"):
+        if tool_support in ("native", "react", "none"):
             return tool_support
+        if tool_support == "xml":
+            return "react"
 
         # 2. Legacy tool_format override (existing)
-        tool_format = model_def.get("tool_format")
+        tool_format = str(model_def.get("tool_format") or "").strip().lower()
         if tool_format:
-            return str(tool_format)
+            return "react" if tool_format == "xml" else tool_format
 
         # 3. Auto-detect by provider type (existing + vLLM)
         model_type = model_def.get("type")
@@ -612,7 +615,7 @@ class Config(RuntimeTunables, BaseSettings):
             return "none"
         if model_type in (PROVIDER_GGUF, PROVIDER_OLLAMA, PROVIDER_HF):
             return "react"
-        return "xml"
+        return "react"
 
 
 def set_config_value(key: str, value: str, config: Config) -> bool:

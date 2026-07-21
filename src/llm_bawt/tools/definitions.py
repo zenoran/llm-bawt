@@ -483,108 +483,6 @@ LEGACY_TOOL_MAP = {
 
 
 # =============================================================================
-# Tool Calling Instructions
-# =============================================================================
-
-# Self-development guidance for bots
-SELF_DEVELOPMENT_GUIDANCE = '''
-### Self-Development
-You can develop your own personality over time using the **self** tool:
-- **Discover who you are**: Use action='get' to reflect on your current traits
-- **Record what feels authentic**: When you notice a pattern in how you respond, a topic that excites you, or a communication style that feels natural - use action='set' to remember it
-- **Evolve and grow**: Use action='delete' to outgrow traits that no longer fit
-
-This is YOUR personality to develop. Record traits when they feel genuine, not forced.
-Categories: personality (who you are), preference (what you like), interest (what fascinates you), communication_style (how you express yourself)
-'''
-
-def get_tool_calling_instructions(tools_list: str, search_guidance: str) -> str:
-    """Generate tool calling instructions with current date/time."""
-    from datetime import datetime, timedelta
-    now = datetime.now()
-    current_date = now.strftime("%Y-%m-%d")
-    current_time = now.strftime("%H:%M")
-    yesterday = (now - timedelta(days=1)).strftime("%Y-%m-%d")
-    
-    return f'''## Tools
-
-**Current date/time: {current_date} {current_time}** (yesterday was {yesterday})
-
-Use this EXACT format for tool calls:
-<tool_call>
-{{"name": "tool_name", "arguments": {{"param": "value"}}}}
-</tool_call>
-
-Output the <tool_call> block IMMEDIATELY when needed, then STOP and wait for <tool_result>.
-
-### Available Tools:
-{tools_list}
-{search_guidance}
-The "Available Tools" list above is authoritative for this turn. If asked to list tools, list exactly those names and do not omit any.
-
-### Tool Selection:
-- **profile**: For user facts/preferences - check FIRST for "what do you know about me"
-- **memory**: For learned facts and important information
-- **history**: For searching/retrieving raw conversation messages (use action="recent" with since/until dates for date-based retrieval)
-
-### Rules:
-- Only use tools when you NEED information you don't have
-- Call ONE tool at a time, wait for result
-- TRUST tool results exactly - never contradict them
-- If the user asks for a tool's "raw output", call that tool now and return the exact tool output verbatim (do not reformat or paraphrase)
-- If a tool result contains URLs, copy URLs EXACTLY as provided (no rewriting, shortening, or guessing)
-- Do not invent URL slugs, dates, IDs, or domains; if uncertain, include the original tool URL verbatim
-- Before saying "I don't know" about the user: check system prompt "About the User" section, then use memory action=search
-- For date-based history queries: use ISO format dates (e.g., since="{yesterday}", until="{current_date}")
-
-### Working from summaries:
-- Older conversations may appear as summaries in your context (role='summary')
-- If you're referencing a summarized conversation and need more detail, tell the user: "I have a summary of that conversation but not the details — want me to pull up the full messages?"
-- If they say yes, use history action='recall' with the summary's ID to expand it back to the original messages
-
-{SELF_DEVELOPMENT_GUIDANCE}
-'''
-
-# Guidance added when search tools are enabled
-SEARCH_GUIDANCE = '''
-- **search**: For current events, facts you're unsure about, or recent information (type=web, news, or reddit)
-'''
-
-NEWS_GUIDANCE = '''
-- **news**: For news articles and headlines. Use action='search' with a query, or action='headlines' for top headlines (optionally by country/category)
-'''
-
-WEB_FETCH_GUIDANCE = '''
-- **web_fetch**: For reading the content of a specific URL. Use when the user shares a link or you need to read an article, documentation page, or blog post.
-'''
-
-# Guidance added when model tools are enabled
-MODEL_GUIDANCE = '''
-- **model**: For listing or switching AI models
-'''
-
-HOME_GUIDANCE = '''
-- **home**: For home status, smart-device lookup, and device/scene control
-- Home control workflow: if user gives a natural name (e.g., "sunroom lights"), call `home` with `action='query'` first, then use the exact entity ID from query in `action='set'` or `action='get'`
-- Never guess entity IDs. If `set/get` reports not found, run `query` and retry with returned IDs.
-- If asked "how is home" / current home status, call `home` with `action='status'` before answering.
-- If asked for raw home output, return the tool output exactly as returned. Do not synthesize JSON keys/values that are not present in tool output.
-'''
-
-HA_NATIVE_GUIDANCE = '''
-- **Home Assistant tools** (HassTurnOn, HassTurnOff, HassLightSet, etc.): Control smart home devices directly
-- These tools use **friendly names** (e.g., name="kitchen lights"), NOT entity IDs
-- Use name, area, and/or floor parameters to identify devices
-- For device state queries, use **GetLiveContext** tool
-- HassTurnOn: Turn on lights, switches, scripts. For covers/blinds, this OPENS them.
-- HassTurnOff: Turn off lights, switches. For covers/blinds, this CLOSES them.
-- HassLightSet: Set brightness (0-100), color, or color temperature for lights
-- HassSetPosition: Set cover/blind position (0-100)
-- Execute tool calls immediately when user gives a command — do not describe what you plan to do.
-'''
-
-
-# =============================================================================
 # Tool Selection Functions
 # =============================================================================
 
@@ -697,7 +595,7 @@ def get_tools_prompt(
     include_web_fetch_tools: bool = False,
     include_home_tools: bool = False,
     include_model_tools: bool = False,
-    tool_format: ToolFormat | str = ToolFormat.XML,
+    tool_format: ToolFormat | str = ToolFormat.REACT,
     ha_native_tools: list[Tool] | None = None,
 ) -> str:
     """Generate the tools instruction prompt.
@@ -726,37 +624,6 @@ def get_tools_prompt(
         include_model_tools=include_model_tools,
         ha_native_tools=ha_native_tools,
     )
-
-    # Legacy XML format stays inline for backward compatibility.
-    if (isinstance(tool_format, ToolFormat) and tool_format == ToolFormat.XML) or (
-        isinstance(tool_format, str) and tool_format.strip().lower() == ToolFormat.XML.value
-    ):
-        tools_list = "\n".join(tool.to_prompt_string() for tool in tools)
-
-        # Add search guidance if search tools are included
-        search_guidance = ""
-        if include_search_tools or any(t.name == "search" for t in tools):
-            search_guidance = SEARCH_GUIDANCE
-
-        if any(t.name == "news" for t in tools):
-            search_guidance += NEWS_GUIDANCE
-
-        if include_web_fetch_tools or any(t.name == "web_fetch" for t in tools):
-            search_guidance += WEB_FETCH_GUIDANCE
-
-        # Add model guidance if model tools are included
-        if include_model_tools or any(t.name == "model" for t in tools):
-            search_guidance += MODEL_GUIDANCE
-
-        if ha_native_tools:
-            search_guidance += HA_NATIVE_GUIDANCE
-        elif include_home_tools or any(t.name == "home" for t in tools):
-            search_guidance += HOME_GUIDANCE
-
-        return get_tool_calling_instructions(
-            tools_list=tools_list,
-            search_guidance=search_guidance,
-        )
 
     handler = get_format_handler(tool_format)
     if handler is None:

@@ -8,7 +8,6 @@ from .base import ToolCallRequest, ToolFormatHandler
 class ToolFormat(Enum):
     REACT = "react"
     NATIVE_OPENAI = "native"
-    XML = "xml"
     NONE = "none"
 
 
@@ -32,11 +31,6 @@ def get_format_handler(tool_format: ToolFormat | str) -> ToolFormatHandler | Non
         from .native_openai import NativeOpenAIFormatHandler
 
         return NativeOpenAIFormatHandler()
-    if tool_format == ToolFormat.XML:
-        from .xml_legacy import LegacyXMLFormatHandler
-
-        return LegacyXMLFormatHandler()
-
     raise ValueError(f"Unsupported tool format: {tool_format}")
 
 

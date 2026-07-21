@@ -42,7 +42,7 @@ from .definitions import (
     Tool,
     ToolParameter,
 )
-from .parser import parse_tool_calls, ToolCall, has_tool_call, format_tool_result, strip_tool_result_tags, KNOWN_TOOLS
+from .parser import ToolCall, format_tool_result, strip_tool_result_tags
 from .executor import ToolExecutor
 from .loop import ToolLoop, query_with_tools
 from .streaming import stream_with_tools
@@ -73,13 +73,10 @@ __all__ = [
     # Types
     "Tool",
     "ToolParameter",
-    # Parser
-    "parse_tool_calls",
+    # Parser/result formatting
     "ToolCall",
-    "has_tool_call",
     "format_tool_result",
     "strip_tool_result_tags",
-    "KNOWN_TOOLS",
     # Executor
     "ToolExecutor",
     # Loop

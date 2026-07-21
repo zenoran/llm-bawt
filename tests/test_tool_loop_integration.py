@@ -140,26 +140,6 @@ class TestToolLoopWithNativeFormat:
         assert result == "Just text, no tools."
 
 
-class TestToolLoopWithXMLFormat:
-    """Tests for tool loop with legacy XML format."""
-
-    @pytest.fixture
-    def loop(self):
-        return ToolLoop(user_id="test_user", tool_format=ToolFormat.XML)
-
-    def test_sanitizes_xml_tags(self, loop):
-        """XML tool_call tags are removed from final response."""
-        client = MockLLMClient([
-            'Here is info <tool_call>{"name":"test"}</tool_call> and more.'
-        ])
-        messages = [MockMessage("user", "Question")]
-
-        result = loop.run(messages, client)
-
-        assert "<tool_call>" not in result
-        assert "</tool_call>" not in result
-
-
 class TestToolLoopFallbackParsing:
     """Tests for fallback parsing when format mismatch occurs."""
 
@@ -174,22 +154,6 @@ class TestToolLoopFallbackParsing:
         sanitized = loop.format_handler.sanitize_response(response)
 
         assert "<tool_call>" not in sanitized
-
-    def test_react_detected_in_xml_mode(self):
-        """ReAct format is sanitized even in XML mode."""
-        loop = ToolLoop(user_id="test", tool_format=ToolFormat.XML)
-
-        # XML handler doesn't specifically sanitize ReAct, but the
-        # fallback detection in loop.py handles this
-        response = "Thought: thinking\nAction: test\nFinal Answer: result"
-
-        # XML sanitizer only handles XML tags
-        sanitized = loop.format_handler.sanitize_response(response)
-
-        # XML handler doesn't sanitize ReAct markers
-        # This is expected - the fallback is in the loop itself
-        assert "Final Answer:" in sanitized or "result" in sanitized
-
 
 class TestToolLoopIterationLimits:
     """Tests for iteration limiting."""
@@ -237,20 +201,6 @@ Final Answer: Found results."""
         assert "</tool_call>" not in sanitized
         assert "Thought:" not in sanitized
         assert "Action:" not in sanitized
-
-    def test_raw_tags_never_in_final_response_xml(self):
-        """Raw tool tags should never appear in final response (XML)."""
-        loop = ToolLoop(user_id="test", tool_format=ToolFormat.XML)
-
-        response = """Done. <tool_call>
-{"name":"delete_user_attribute","arguments":{"query":"qwen"}}
-</tool_call>"""
-
-        sanitized = loop.format_handler.sanitize_response(response)
-
-        assert "<tool_call>" not in sanitized
-        assert "</tool_call>" not in sanitized
-
 
 class TestToolLoopWithMockedExecutor:
     """Tests with mocked tool executor for full loop testing."""
