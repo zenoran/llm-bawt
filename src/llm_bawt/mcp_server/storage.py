@@ -893,10 +893,13 @@ class MemoryStorage:
         since: float | str | None = None,
         status: str | None = None,
         limit: int = 50,
+        user_id: str | None = None,
     ) -> list[dict]:
         """List sessions for a bot, newest first.
 
-        Pass `bot_id=""` to query across all bots.
+        Pass `bot_id=""` to query across all bots. Pass ``user_id`` (TASK-284)
+        to scope to one user's threads; ``None`` leaves the user dimension
+        unfiltered.
         """
         # Use a default manager engine, but pass the requested bot through
         # to the query (manager is bot-scoped, the table is not).
@@ -906,15 +909,49 @@ class MemoryStorage:
             since=since,
             status=status,
             limit=limit,
+            user_id=user_id,
         )
 
     async def get_active_session(
         self,
         bot_id: str = "default",
+        user_id: str | None = None,
     ) -> dict | None:
-        """Return the most-recent active session for a bot, or None."""
+        """Return the most-recent active session for a (bot, user), or None.
+
+        TASK-284: ``user_id`` scopes to that user's active thread; ``None``
+        preserves the legacy bot-only lookup.
+        """
         manager = self.get_short_term_manager(bot_id)
-        return manager.get_active_session(bot_id=bot_id)
+        return manager.get_active_session(bot_id=bot_id, user_id=user_id)
+
+    async def rotate_session(
+        self,
+        bot_id: str = "default",
+        user_id: str | None = None,
+    ) -> str:
+        """Close the active thread for (bot, user) and open a new one.
+
+        TASK-284: the non-destructive ``/new`` primitive — old rows untouched,
+        the previous session row flips to ``status='completed'``. Returns the
+        new active session id. Close+open run in one transaction.
+        """
+        manager = self.get_short_term_manager(bot_id)
+        return manager.rotate_session(bot_id=bot_id, user_id=user_id)
+
+    async def activate_session(
+        self,
+        session_id: str,
+        bot_id: str = "default",
+        user_id: str | None = None,
+    ) -> bool:
+        """Make an existing thread the active one for (bot, user).
+
+        TASK-284: the thread-switch primitive. Returns ``False`` if the target
+        doesn't exist or belongs to a different (bot, user).
+        """
+        manager = self.get_short_term_manager(bot_id)
+        return manager.activate_session(session_id, bot_id=bot_id, user_id=user_id)
 
 
     # =========================================================================
