@@ -469,26 +469,23 @@ async def session_reset(request: SessionResetRequest) -> SessionResetResponse:
         # on a best-effort path, so the frontend-visible reset still
         # happens.  See TASK-249.
 
-    # TASK-284 step 15: under session_history_v2, an explicit session reset
-    # also rotates the durable DB thread (non-destructive) so the provider's
-    # fresh session maps onto a fresh thread — same coordination as agent
-    # /new. Best-effort: a rotation failure never fails the reset.
+    # TASK-284: an explicit session reset also rotates the durable DB thread
+    # (non-destructive) so the provider's fresh session maps onto a fresh
+    # thread — same coordination as agent /new. Best-effort: a rotation
+    # failure never fails the reset.
     rotated_thread: str | None = None
     try:
-        from .settings import _effective_bot_settings
+        user_id = (getattr(service.config, "DEFAULT_USER", "") or "").strip()
+        if user_id:
+            from ...mcp_server.storage import get_storage
 
-        if bool(_effective_bot_settings(service, request.bot_id).get("session_history_v2")):
-            user_id = (getattr(service.config, "DEFAULT_USER", "") or "").strip()
-            if user_id:
-                from ...mcp_server.storage import get_storage
-
-                rotated_thread = await get_storage().rotate_session(
-                    bot_id=request.bot_id, user_id=user_id
-                )
-                log.info(
-                    "Rotated durable thread on session reset: bot=%s -> %s",
-                    request.bot_id, rotated_thread,
-                )
+            rotated_thread = await get_storage().rotate_session(
+                bot_id=request.bot_id, user_id=user_id
+            )
+            log.info(
+                "Rotated durable thread on session reset: bot=%s -> %s",
+                request.bot_id, rotated_thread,
+            )
     except Exception as e:
         log.warning("Thread rotation on reset failed for %s: %s", request.bot_id, e)
 

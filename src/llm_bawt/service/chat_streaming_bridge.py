@@ -23,52 +23,17 @@ log = get_service_logger(__name__)
 class ChatStreamingBridgeMixin:
     """Agent-bridge streaming + session helpers for BackgroundService."""
 
-    def _set_conversation_offset(self, llm_bawt, bot_id: str, ts: float) -> None:
-        """Move the per-bot conversation offset marker to ``ts`` (unix seconds).
-
-        Backs the chat-bot ``/new`` command. Persists the marker in
-        runtime_settings (bot scope), then forces the cached instance to pick
-        it up immediately: invalidates the settings cache (so the new value is
-        read), invalidates the history cache (so the next turn reloads with the
-        offset applied), and trims the in-memory transcript right now so even a
-        sub-TTL follow-up starts clean. Summaries are always retained.
-        """
-        slug = (bot_id or "").strip().lower()
-        try:
-            llm_bawt.settings.store.set_value("bot", slug, "conversation_offset", float(ts))
-            # Resolver caches the whole bot-scope dict for a few seconds; reset
-            # so the freshly written marker is visible on the next resolve().
-            try:
-                llm_bawt.settings._cache_loaded_at = 0.0
-            except Exception:
-                pass
-            inv = getattr(llm_bawt, "invalidate_history_cache", None)
-            if callable(inv):
-                inv()
-            # Immediate effect on the live in-memory transcript.
-            try:
-                hm = llm_bawt.history_manager
-                hm.messages = [
-                    m for m in hm.messages
-                    if getattr(m, "role", "") == "summary" or getattr(m, "timestamp", 0.0) >= float(ts)
-                ]
-            except Exception:
-                pass
-            log.info("Conversation offset moved for bot=%s -> %.3f (/new)", slug, float(ts))
-        except Exception as e:
-            log.error("Failed to set conversation offset for bot=%s: %s", slug, e)
-
     def _rotate_chat_session(self, llm_bawt, bot_id: str) -> bool:
-        """TASK-284 step 14: non-destructive DB session rotation for chatbot /new.
+        """TASK-284: non-destructive DB session rotation for chatbot /new.
 
-        The v2 replacement for ``_set_conversation_offset``: instead of moving a
-        timestamp marker, it closes the active durable thread and opens a fresh
-        one (old rows untouched). The next turn's session-scoped load then sees
-        only the new empty thread plus rolling summaries. Also clears the live
-        in-memory transcript so a sub-TTL follow-up starts clean immediately.
+        Closes the active durable thread and opens a fresh one (old rows
+        untouched). The next turn's session-scoped load then sees only the new
+        empty thread plus rolling summaries. Also clears the live in-memory
+        transcript so a sub-TTL follow-up starts clean immediately.
 
-        Returns True on success. On any failure returns False so the caller can
-        fall back to the legacy offset path rather than leaving /new a no-op.
+        Returns True on success, False on failure (callers log; nothing is
+        deleted either way, so a failed rotation just means the thread didn't
+        advance).
         """
         slug = (bot_id or "").strip().lower()
         try:
@@ -103,15 +68,12 @@ class ChatStreamingBridgeMixin:
         session_key PATCH mirrors the new provider id onto it.
 
         Detection mirrors the bridge exactly (``lstrip().startswith("/new")``)
-        so DB rotation fires iff the bridge will reset. Flag-gated on
-        ``session_history_v2``; returns True only when a rotation happened.
-        Shared by BOTH dispatch paths (streaming + non-streaming) so they
-        cannot drift.
+        so DB rotation fires iff the bridge will reset. Returns True only when
+        a rotation happened. Shared by BOTH dispatch paths (streaming +
+        non-streaming) so they cannot drift.
         """
         try:
             if not (user_prompt or "").lstrip().startswith("/new"):
-                return False
-            if not bool(llm_bawt._resolve_setting("session_history_v2", False)):
                 return False
         except Exception:
             return False

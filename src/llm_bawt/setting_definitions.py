@@ -99,29 +99,6 @@ SETTING_DEFINITIONS: dict[str, SettingDefinition] = {
         ),
         legacy_keys=("include_summaries",),
     ),
-    # --- session_history_v2 rollout flag (TASK-284 step 19) -------------------
-    # Shadow/cutover gate for session-scoped history loading. When FALSE (the
-    # default), load_history uses the legacy conversation_offset path — behaviour
-    # is byte-identical to pre-TASK-284. When TRUE, load_history loads the raw
-    # transcript of the SELECTED/ACTIVE durable session plus rolling summary
-    # continuity, and chatbot `/new` rotates the DB session instead of moving the
-    # conversation_offset marker. Off by default so the code can land and be
-    # shadow-compared per bot/user before any behaviour change.
-    "session_history_v2": SettingDefinition(
-        key="session_history_v2",
-        type="bool",
-        default=False,
-        applies_to=BOT_TYPES_ALL,
-        storage=STORAGE_RUNTIME_SETTING,
-        label="Session-scoped history (v2)",
-        help=(
-            "TASK-284 rollout gate. FALSE (default): legacy conversation_offset "
-            "history loading, unchanged. TRUE: history is loaded from the active "
-            "durable session's raw transcript plus summary continuity, and `/new` "
-            "rotates the DB thread non-destructively. Enable per bot/user only "
-            "after shadow-compare parity is confirmed."
-        ),
-    ),
     # --- Tier-3 context-generation policy (TASK-602/611) ----------------------
     # Bot-aware sizing of the two independent history_scope buckets. Global +
     # per-bot override (lean agents vs. aware chat bots). These decide HOW BIG

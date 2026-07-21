@@ -321,10 +321,9 @@ class BackgroundService(
                 )
                 if _is_agent:
                     llm_bawt._tts_mode = request.tts_mode
-                    # TASK-284 step 15: an agent /new rotates the durable DB
-                    # thread — SAME shared helper as the streaming path so the
-                    # two dispatch routes stay consistent. Flag-gated no-op
-                    # when session_history_v2 is off.
+                    # TASK-284: an agent /new rotates the durable DB thread —
+                    # SAME shared helper as the streaming path so the two
+                    # dispatch routes stay consistent.
                     self._maybe_rotate_agent_session(llm_bawt, bot_id, user_prompt)
                 else:
                     llm_bawt._tts_mode = request.tts_mode or llm_bawt.bot.tts_mode

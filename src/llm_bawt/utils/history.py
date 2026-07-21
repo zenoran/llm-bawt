@@ -172,14 +172,11 @@ class HistoryManager:
     def load_history(self, since_minutes: int | None = None):
         self.messages = []
 
-        # TASK-284 step 12: session-scoped history (v2), behind a rollout flag
-        # (default OFF -> the legacy conversation_offset path below runs
-        # unchanged, byte-identical to pre-TASK-284). When ON, load the ACTIVE
-        # durable thread's raw bubbles + rolling summary continuity instead of
-        # every unsummarized message across all sessions. Falls back to legacy
+        # TASK-284: session-scoped history — the ACTIVE durable thread's raw
+        # bubbles + rolling summary continuity. Falls back to an unscoped load
         # when the backend can't scope (no active session yet, or a backend
-        # without the v2 method) — never a silent empty context.
-        if self._db_backend and bool(self._setting("session_history_v2", False)):
+        # without the scoped loader) — never a silent empty context.
+        if self._db_backend:
             loader = getattr(self._db_backend, "load_session_scoped", None)
             if loader is not None:
                 try:
@@ -187,35 +184,24 @@ class HistoryManager:
                     if scoped is not None:
                         self.messages = scoped
                         logger.debug(
-                            "Loaded %d messages via session_history_v2 (scoped)",
+                            "Loaded %d messages (session-scoped)",
                             len(self.messages),
                         )
                         return
                     logger.debug(
-                        "session_history_v2 ON but no active session; "
-                        "falling back to legacy load"
+                        "No active session; falling back to unscoped load"
                     )
                 except Exception as e:
                     logger.warning(
-                        "session_history_v2 load failed (%s); falling back to legacy",
+                        "Session-scoped load failed (%s); falling back to unscoped",
                         e,
                     )
-
-        # Conversation offset marker (moved forward by the `/new` command).
-        # Raw messages older than the marker are dropped from the live context;
-        # summaries + long-term memory are unaffected. None = no offset set.
-        after_timestamp = self._setting("conversation_offset", None)
-        try:
-            after_timestamp = float(after_timestamp) if after_timestamp is not None else None
-        except (TypeError, ValueError):
-            after_timestamp = None
 
         # Use PostgreSQL backend if available
         if self._db_backend:
             try:
                 self.messages = self._db_backend.get_messages(
                     since_minutes=since_minutes,
-                    after_timestamp=after_timestamp,
                 )
                 logger.debug(f"Loaded {len(self.messages)} messages from PostgreSQL short-term memory")
                 return
@@ -244,12 +230,6 @@ class HistoryManager:
             logger.debug(f"Loading history from {since_minutes} seconds ago ({len(self.messages)} messages)")
             cutoff = time.time() - since_minutes
             self.messages = [msg for msg in self.messages if msg.timestamp >= cutoff]
-        if after_timestamp is not None and self.messages:
-            # Honor the /new conversation offset; always keep summary rows.
-            self.messages = [
-                msg for msg in self.messages
-                if msg.role == "summary" or msg.timestamp >= after_timestamp
-            ]
 
     def save_history(self):
         """Persist message history to the history file."""

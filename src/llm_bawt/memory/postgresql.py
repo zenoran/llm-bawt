@@ -2729,7 +2729,6 @@ class PostgreSQLShortTermManager:
         self,
         since_minutes: int | None = None,
         include_summaries: bool = True,
-        after_timestamp: float | None = None,
     ) -> list:
         """Get messages with smart summary filtering.
 
@@ -2745,14 +2744,6 @@ class PostgreSQLShortTermManager:
             since_minutes: If provided, only return messages from the last N seconds.
                           When None, returns all messages (token budget handles windowing).
             include_summaries: If True, include summary rows and exclude summarized messages.
-            after_timestamp: Conversation offset marker (unix seconds). When set,
-                          raw messages with timestamp < marker are dropped from the
-                          live context — this is what ``/new`` moves to "start
-                          fresh". Summary rows are ALWAYS kept regardless of the
-                          marker, so the gist of the dropped transcript survives
-                          (and not-yet-summarized messages get summarized later by
-                          the background job, then reappear as a summary). Nothing
-                          is deleted.
 
         Returns:
             List of Message objects.
@@ -2777,10 +2768,6 @@ class PostgreSQLShortTermManager:
                     sql += " AND (timestamp >= :cutoff OR role = 'summary')"
                     params["cutoff"] = cutoff
 
-                if after_timestamp is not None:
-                    sql += " AND (timestamp >= :offset OR role = 'summary')"
-                    params["offset"] = float(after_timestamp)
-
                 sql += " ORDER BY timestamp ASC"
                 rows = conn.execute(text(sql), params).fetchall()
 
@@ -2798,11 +2785,6 @@ class PostgreSQLShortTermManager:
                 if since_minutes is not None:
                     cutoff = time.time() - since_minutes
                     stmt = stmt.where(self._backend.messages_table.c.timestamp >= cutoff)
-
-                if after_timestamp is not None:
-                    stmt = stmt.where(
-                        self._backend.messages_table.c.timestamp >= float(after_timestamp)
-                    )
 
                 with Session(self._backend.engine) as session:
                     rows = session.execute(stmt).fetchall()

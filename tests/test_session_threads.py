@@ -47,18 +47,10 @@ class _Bridge(ChatStreamingBridgeMixin):
         return self._rotate_result
 
 
-def _llm(flag: bool | Exception = True, backend=None):
-    """Fake llm_bawt instance: _resolve_setting + history_manager backend."""
-
-    def resolve(key, default):
-        assert key == "session_history_v2"
-        if isinstance(flag, Exception):
-            raise flag
-        return flag
-
+def _llm(backend=None):
+    """Fake llm_bawt instance: history_manager backend + cache invalidation."""
     hm = SimpleNamespace(_db_backend=backend, messages=[])
     return SimpleNamespace(
-        _resolve_setting=resolve,
         history_manager=hm,
         invalidate_history_cache=lambda: None,
     )
@@ -71,35 +63,24 @@ def _llm(flag: bool | Exception = True, backend=None):
 class TestAgentNewRotationGate:
     def test_non_new_prompt_never_rotates(self):
         b = _Bridge()
-        assert b._maybe_rotate_agent_session(_llm(True), "byte", "hello there") is False
+        assert b._maybe_rotate_agent_session(_llm(), "byte", "hello there") is False
         assert b.rotate_calls == []
 
     def test_new_mentioned_mid_message_does_not_rotate(self):
         # Detection is prefix-only — "/new" inside a sentence must not reset.
         b = _Bridge()
-        assert b._maybe_rotate_agent_session(_llm(True), "byte", "tell me about /new") is False
+        assert b._maybe_rotate_agent_session(_llm(), "byte", "tell me about /new") is False
         assert b.rotate_calls == []
 
-    def test_flag_off_does_not_rotate(self):
+    def test_new_prompt_rotates(self):
         b = _Bridge()
-        assert b._maybe_rotate_agent_session(_llm(False), "byte", "/new") is False
-        assert b.rotate_calls == []
-
-    def test_new_with_flag_on_rotates(self):
-        b = _Bridge()
-        assert b._maybe_rotate_agent_session(_llm(True), "byte", "  /new please") is True
+        assert b._maybe_rotate_agent_session(_llm(), "byte", "  /new please") is True
         assert b.rotate_calls == ["byte"]
 
     def test_empty_prompt_is_safe(self):
         b = _Bridge()
-        assert b._maybe_rotate_agent_session(_llm(True), "byte", "") is False
-        assert b._maybe_rotate_agent_session(_llm(True), "byte", None) is False
-        assert b.rotate_calls == []
-
-    def test_flag_resolution_error_fails_closed(self):
-        b = _Bridge()
-        out = b._maybe_rotate_agent_session(_llm(RuntimeError("db down")), "byte", "/new")
-        assert out is False
+        assert b._maybe_rotate_agent_session(_llm(), "byte", "") is False
+        assert b._maybe_rotate_agent_session(_llm(), "byte", None) is False
         assert b.rotate_calls == []
 
 
