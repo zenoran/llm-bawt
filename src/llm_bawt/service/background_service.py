@@ -324,6 +324,13 @@ class BackgroundService(
                 else:
                     llm_bawt._tts_mode = request.tts_mode or llm_bawt.bot.tts_mode
                 llm_bawt._inject_user_prefix = bool(request.inject_user_prefix)
+                # TASK-251: explicit thread selection — set FRESH every turn
+                # (cached instance; a stale override must never leak into a
+                # continuous request).
+                _sid = getattr(request, "session_id", None)
+                llm_bawt._session_id_override = (
+                    _sid.strip() if isinstance(_sid, str) and _sid.strip() else None
+                )
 
                 # Prepare messages with history and memory context
                 prepared_messages = llm_bawt.prepare_messages_for_query(user_prompt, message_id=trigger_message_id)

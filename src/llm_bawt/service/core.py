@@ -463,13 +463,25 @@ class ServiceLLMBawt(BaseLLMBawt):
         Returns:
             List of messages ready for LLM query
         """
-        # Refresh from DB only when stale to reduce per-turn read pressure.
-        # Set HISTORY_RELOAD_TTL_SECONDS=0 to force legacy "reload every request".
-        self._refresh_history_if_stale()
+        # TASK-251: explicit thread selection. When the request carried a
+        # session_id, this turn assembles context from THAT thread's pool
+        # (raw scoped to the thread + rolling summaries) and persists to it.
+        # The scoped pool is strictly per-turn state on this cached instance —
+        # invalidate the history cache so the next continuous turn reloads the
+        # continuous pool instead of inheriting the scoped one.
+        _thread_override = (getattr(self, "_session_id_override", None) or "").strip() or None
+        if _thread_override:
+            self.history_manager.load_history(session_id=_thread_override)
+            self.invalidate_history_cache()
+        else:
+            # Refresh from DB only when stale to reduce per-turn read pressure.
+            # Set HISTORY_RELOAD_TTL_SECONDS=0 to force legacy "reload every request".
+            self._refresh_history_if_stale()
 
         # Add user message to history first (with optional attachment refs).
         self.history_manager.add_message(
             "user", prompt, message_id=message_id, attachments=attachments,
+            session_id=_thread_override,
         )
 
         # Build context with system prompt, memory, and history. context_suffix
@@ -624,16 +636,22 @@ class ServiceLLMBawt(BaseLLMBawt):
                 (see makeMessageId.ts). None → server mints a fresh UUID (legacy
                 / server-originated turns like inter-bot, cron, agent dispatch).
         """
+        # TASK-251: an explicit-thread turn persists its assistant/tool rows to
+        # the SAME requested thread as the user row — never the active one.
+        _thread_override = (getattr(self, "_session_id_override", None) or "").strip() or None
+
         # Save tool context first so it appears before the response in history
         if tool_context:
             self.history_manager.add_message(
-                "system", f"[Tool Results]\n{tool_context}"
+                "system", f"[Tool Results]\n{tool_context}",
+                session_id=_thread_override,
             )
 
         if response:
             self.history_manager.add_message(
                 "assistant", response, message_id=message_id,
-                attachments=attachments, reasoning=reasoning
+                attachments=attachments, reasoning=reasoning,
+                session_id=_thread_override,
             )
     
     def refine_prompt(self, prompt: str, history: list | None = None) -> str:

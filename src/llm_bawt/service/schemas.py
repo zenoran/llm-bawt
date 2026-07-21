@@ -69,6 +69,14 @@ class ChatCompletionRequest(BaseModel):
     user: str | None = None
     # llm-bawt extensions
     bot_id: str | None = Field(default=None, description="Bot personality to use")
+    session_id: str | None = Field(
+        default=None,
+        description="TASK-251: converse in an explicitly selected thread — the "
+        "turn persists to AND assembles context from this session. Absent "
+        "(the primary mode): continuous history, byte-identical to before "
+        "threads existed. Requested session must belong to (bot, user); "
+        "deleted threads answer 410.",
+    )
     augment_memory: bool = Field(default=True, description="Whether to augment with memory context")
     extract_memory: bool = Field(default=True, description="Whether to extract memories from response")
     include_summaries: bool = Field(default=True, description="Whether to inject conversation summary records into context")

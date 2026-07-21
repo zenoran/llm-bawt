@@ -105,6 +105,13 @@ class TurnStreamWorker(TurnStreamPublishMixin):
             else:
                 llm_bawt._tts_mode = request.tts_mode or llm_bawt.bot.tts_mode
             llm_bawt._inject_user_prefix = bool(request.inject_user_prefix)
+            # TASK-251: explicit thread selection — set FRESH every turn so a
+            # cached instance never leaks a prior turn's thread override into
+            # a continuous (no-session_id) request.
+            _sid = getattr(request, "session_id", None)
+            llm_bawt._session_id_override = (
+                _sid.strip() if isinstance(_sid, str) and _sid.strip() else None
+            )
 
             # TASK-214: animations now arrive on the request payload from
             # bawthub (Prisma is the source of truth). llm-bawt no longer

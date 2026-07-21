@@ -2708,6 +2708,7 @@ class PostgreSQLShortTermManager:
         message_id: str | None = None,
         attachments: list[dict] | None = None,
         reasoning: str | None = None,
+        session_id: str | None = None,
     ) -> str:
         """Add a message to the current session.
 
@@ -2716,6 +2717,10 @@ class PostgreSQLShortTermManager:
         ``message_id``, ``attachments`` and ``reasoning`` are passed through to
         the backend so this adapter matches the MCP adapter signature used by
         ``HistoryManager`` (TASK-222 / TASK-301 plumbing).
+
+        ``session_id`` (TASK-251): explicit thread override for
+        continue-old-thread turns — when set, the row lands on THAT thread
+        instead of the active one. None = active thread (unchanged default).
         """
         mid = (str(message_id).strip() if message_id else "") or str(uuid.uuid4())
         ts = timestamp or datetime.now(timezone.utc).timestamp()
@@ -2731,13 +2736,76 @@ class PostgreSQLShortTermManager:
             role=role,
             content=content,
             timestamp=ts,
-            session_id=self._current_session_id,
+            session_id=session_id or self._current_session_id,
             attachments=attachments,
             reasoning=reasoning,
         )
 
         return mid
     
+    def load_session_scoped(
+        self, since_minutes: int | None = None, session_id: str | None = None
+    ) -> list | None:
+        """Session-scoped history read (TASK-251) — direct-manager twin of the
+        MCP adapter's ``load_session_scoped`` so embedded mode (no MCP server)
+        supports explicit-thread context too.
+
+        One thread's raw bubbles (role <> 'summary', not yet summarized)
+        composed with the bot's rolling summary husks, chronological. When
+        ``session_id`` is None resolves the active thread; returns None when
+        no thread can be resolved (caller falls back to the continuous load).
+        """
+        from ..models.message import Message
+
+        if not session_id:
+            active = self.get_active_session(bot_id=self.bot_id, user_id=self.user_id)
+            if not active or not active.get("id"):
+                return None
+            session_id = active["id"]
+
+        params: dict = {"session_id": session_id}
+        raw_clauses = [
+            "role <> 'summary'",
+            "session_id = :session_id",
+            "(summarized IS NULL OR summarized = FALSE)",
+        ]
+        if since_minutes is not None and since_minutes >= 0:
+            # NOTE: legacy naming — value is seconds (matches get_messages).
+            params["cutoff"] = time.time() - since_minutes
+            raw_clauses.append("timestamp >= :cutoff")
+
+        with self._backend.engine.connect() as conn:
+            raw_rows = conn.execute(
+                text(f"""
+                    SELECT id, role, content, timestamp, session_id
+                    FROM {self._backend._messages_table_name}
+                    WHERE {' AND '.join(raw_clauses)}
+                    ORDER BY timestamp ASC
+                """),
+                params,
+            ).fetchall()
+            summary_rows = conn.execute(
+                text(f"""
+                    SELECT id, role, content, timestamp, session_id
+                    FROM {self._backend._messages_table_name}
+                    WHERE role = 'summary'
+                    ORDER BY timestamp ASC
+                """),
+            ).fetchall()
+
+        merged = [
+            Message(
+                role=r.role,
+                content=r.content,
+                timestamp=r.timestamp or 0.0,
+                db_id=r.id,
+                session_id=r.session_id,
+            )
+            for r in (list(raw_rows) + list(summary_rows))
+        ]
+        merged.sort(key=lambda m: m.timestamp or 0.0)
+        return merged
+
     def get_session_history(self, limit: int = 50) -> list[dict]:
         """Get messages from the current session."""
         with Session(self._backend.engine) as session:

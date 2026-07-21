@@ -125,6 +125,12 @@ class BaseLLMBawt(ABC):
         # for agent backends. Independent of tts_mode (which gates the voice
         # prefix) — both can fire and stack.
         self._inject_user_prefix: bool = False
+        # TASK-251: per-turn explicit thread selection. When set (request
+        # carried session_id), the turn persists to AND assembles context from
+        # that thread. None (the default and the primary mode) = continuous
+        # history. Set fresh on every turn by the dispatch paths — never
+        # sticky across turns on a cached instance.
+        self._session_id_override: str | None = None
 
         if not self.model_definition:
             raise ValueError(f"Could not find model definition for: '{resolved_model_alias}'")

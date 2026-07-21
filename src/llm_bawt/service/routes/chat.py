@@ -513,10 +513,24 @@ async def chat_completions(request: ChatCompletionRequest):
     from fastapi.responses import StreamingResponse
     
     service = get_service()
-    
+
     # Log request BEFORE validation so we can debug failures
     log.debug(f"Request payload: {request.model_dump(exclude_none=True)}")
-    
+
+    # TASK-251: explicit thread selection — validate ownership/lifecycle up
+    # front (404 for missing/cross-user, 410 for deleted) so a bad thread id
+    # fails loudly instead of silently persisting the turn to a dead thread.
+    # Absent session_id = continuous default; no validation, no DB read.
+    if getattr(request, "session_id", None):
+        from ..dependencies import get_effective_bot_id
+        from .sessions import _owned_session_or_404, _resolve_user
+
+        await _owned_session_or_404(
+            request.session_id.strip(),
+            get_effective_bot_id(request.bot_id),
+            _resolve_user(request.user),
+        )
+
     if request.stream:
         # Streaming response
         try:

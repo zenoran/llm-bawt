@@ -169,17 +169,47 @@ class HistoryManager:
         except Exception:
             return fallback
 
-    def load_history(self, since_minutes: int | None = None):
+    def load_history(
+        self, since_minutes: int | None = None, session_id: str | None = None
+    ):
         self.messages = []
 
         # TASK-284 (reverted design): session threads are PROVENANCE METADATA
         # ONLY — a queryable session_id for restoring a conversation, never a
         # context boundary. Context is built from the CONTINUOUS message
         # history (all unsummarized raw + rolling summaries, budget-bounded
-        # downstream). The session-scoped context read shipped in the v2
-        # cutover was a design overreach and is intentionally NOT used here;
-        # `load_session_scoped` remains on the backend for session-restore
-        # queries only.
+        # downstream) — that is the DEFAULT and the primary mode.
+        #
+        # TASK-251: ``session_id`` is the ONE sanctioned exception — an
+        # EXPLICITLY selected thread (user picked a conversation in the UI).
+        # The pool becomes that thread's raw bubbles + the bot's rolling
+        # summaries; the downstream assembler (build_context_payload) budgets
+        # it identically. Never set implicitly — a request without session_id
+        # must never take this branch.
+        if session_id and self._db_backend:
+            scoped_loader = getattr(self._db_backend, "load_session_scoped", None)
+            if callable(scoped_loader):
+                try:
+                    scoped = scoped_loader(
+                        since_minutes=since_minutes, session_id=session_id
+                    )
+                    if scoped is not None:
+                        self.messages = scoped
+                        logger.debug(
+                            "Loaded %d messages scoped to thread %s (TASK-251)",
+                            len(self.messages), session_id,
+                        )
+                        return
+                except Exception as e:
+                    logger.warning(
+                        "Scoped history load failed for thread %s, "
+                        "falling back to continuous: %s", session_id, e,
+                    )
+            else:
+                logger.warning(
+                    "Backend lacks load_session_scoped; ignoring session_id=%s "
+                    "and loading continuous history", session_id,
+                )
 
         # Use PostgreSQL backend if available
         if self._db_backend:
@@ -633,7 +663,8 @@ class HistoryManager:
             else:
                 return [Message(role="system", content=self.config.SYSTEM_MESSAGE)]
 
-    def add_message(self, role, content, message_id=None, attachments=None, reasoning=None):
+    def add_message(self, role, content, message_id=None, attachments=None,
+                    reasoning=None, session_id=None):
         """Append a message to history and save.
 
         If ``message_id`` is provided, it is used as the persistent ID so
@@ -663,11 +694,18 @@ class HistoryManager:
             # turn_log status="error", then re-raises) rather than recording a
             # ghost reference. Every caller wraps add_message in its own
             # try/except, so the raise aborts the turn loudly and safely.
+            # TASK-251: ``session_id`` is the explicit thread override for
+            # continue-old-thread turns. Passed ONLY when set so backends
+            # (and test doubles) without the parameter keep working on the
+            # continuous default path; a scoped write against such a backend
+            # fails loudly instead of silently landing on the wrong thread.
+            _extra = {"session_id": session_id} if session_id else {}
             persisted_id = self._db_backend.add_message(
                 role, content, message.timestamp,
                 message_id=provided_id,
                 attachments=attachments,
                 reasoning=reasoning,
+                **_extra,
             )
             if persisted_id:
                 message.db_id = str(persisted_id)

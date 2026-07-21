@@ -1323,9 +1323,12 @@ class _MCPShortTermManager:
         message_id: str | None = None,
         attachments: list[dict] | None = None,
         reasoning: str | None = None,
+        session_id: str | None = None,
     ) -> str:
         # ``reasoning`` (TASK-301) is forwarded through the MCP write chain so
         # server-mode deployments persist it too (display-only on the row).
+        # ``session_id`` (TASK-251): explicit thread override — None keeps the
+        # server-side active-thread resolution (the primary mode).
         msg = self._memory_client.add_message(
             role=role,
             content=content,
@@ -1333,6 +1336,7 @@ class _MCPShortTermManager:
             message_id=message_id,
             attachments=attachments,
             reasoning=reasoning,
+            session_id=session_id,
         )
         return msg.id
 
@@ -1355,26 +1359,32 @@ class _MCPShortTermManager:
             for r in rows
         ]
 
-    def load_session_scoped(self, since_minutes: int | None = None) -> list | None:
-        """TASK-284 step 12: session-scoped v2 history read.
+    def load_session_scoped(
+        self, since_minutes: int | None = None, session_id: str | None = None
+    ) -> list | None:
+        """Session-scoped history read (TASK-284 step 12 / TASK-251).
 
-        Loads the SELECTED/ACTIVE durable thread's raw bubbles composed with the
-        bot's rolling summary husks (continuity) — the same content shape the
-        legacy summary-aware path produced, but with raw scoped to ONE thread
-        instead of every unsummarized message across all sessions. A `/new`'d
-        thread therefore shows only its own raw turns plus the prior threads'
-        summaries.
+        Loads ONE durable thread's raw bubbles composed with the bot's rolling
+        summary husks (continuity) — the same content shape the legacy
+        summary-aware path produced, but with raw scoped to a single thread.
+
+        ``session_id`` (TASK-251): the EXPLICITLY selected thread — this is the
+        only caller-facing mode now; a request carrying session_id views or
+        continues that thread. When None, falls back to the active thread
+        (legacy step-12 behaviour; no longer used as a default context source
+        anywhere — sessions are metadata, not a context filter).
 
         Returns a chronologically-ordered ``list[Message]``, or ``None`` when
-        there is no active session yet (the caller falls back to the legacy
-        whole-history load — never a silent empty context).
+        no thread can be resolved (the caller falls back to the continuous
+        load — never a silent empty context).
         """
         from llm_bawt.models.message import Message
 
-        active = self._memory_client.get_active_session()
-        if not active or not active.get("id"):
-            return None
-        session_id = active["id"]
+        if not session_id:
+            active = self._memory_client.get_active_session()
+            if not active or not active.get("id"):
+                return None
+            session_id = active["id"]
 
         raw_rows = self._memory_client.get_messages(
             session_id=session_id, since_seconds=since_minutes,

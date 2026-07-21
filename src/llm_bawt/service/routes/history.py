@@ -536,6 +536,7 @@ def _resolve_cursor(
 def _load_sorted_visible_messages(
     service,
     effective_bot_id: str,
+    session_id: str | None = None,
 ) -> list[dict]:
     """Pull all visible messages for a bot, sorted chronologically.
 
@@ -543,12 +544,21 @@ def _load_sorted_visible_messages(
     ``/v1/history/around``). Filters out ``system`` / ``summary`` rows
     so summaries — which have their own surface — don't bleed into chat
     history paging.
+
+    ``session_id`` (TASK-251): scope to one thread's transcript for the UI
+    thread viewer. ``None`` (the default) = continuous scroll-back across
+    all threads, unchanged.
     """
     client = service.get_memory_client(effective_bot_id)
     if not client:
         raise HTTPException(status_code=503, detail="Memory service unavailable")
 
-    messages = client.get_messages(since_seconds=None)
+    # TASK-251: forward the thread filter ONLY when set, so client doubles /
+    # adapters without the parameter keep working on the continuous path.
+    if session_id:
+        messages = client.get_messages(since_seconds=None, session_id=session_id)
+    else:
+        messages = client.get_messages(since_seconds=None)
     visible = [m for m in messages if m.get("role") not in ("system", "summary")]
     visible.sort(key=lambda m: (float(m.get("timestamp") or 0.0), str(m.get("id") or "")))
     return visible
@@ -1065,6 +1075,14 @@ def get_history(
             "user scrolls down past the loaded window. Mutually exclusive with `before`."
         ),
     ),
+    session_id: str | None = Query(
+        None,
+        description=(
+            "TASK-251: scope the page to one thread's transcript (UI thread "
+            "viewer). Absent = continuous scroll-back across all threads — "
+            "the primary mode, unchanged."
+        ),
+    ),
 ):
     """Get conversation history for a bot.
 
@@ -1078,6 +1096,9 @@ def get_history(
 
     Cursors accept unix timestamps, ISO-8601 strings, or message IDs.
     Passing both ``before`` and ``after`` is rejected (400).
+
+    ``session_id`` (TASK-251) scopes the page to one thread; cursors work
+    identically within the scoped transcript.
     """
     if before and after:
         raise HTTPException(
@@ -1089,7 +1110,9 @@ def get_history(
     effective_bot_id = bot_id or service._default_bot
 
     try:
-        visible_messages = _load_sorted_visible_messages(service, effective_bot_id)
+        visible_messages = _load_sorted_visible_messages(
+            service, effective_bot_id, session_id=session_id
+        )
 
         before_ts = _resolve_cursor(before, visible_messages) if before else None
         after_ts = _resolve_cursor(after, visible_messages) if after else None
