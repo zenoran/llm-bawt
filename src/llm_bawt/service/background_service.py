@@ -321,10 +321,6 @@ class BackgroundService(
                 )
                 if _is_agent:
                     llm_bawt._tts_mode = request.tts_mode
-                    # TASK-284: an agent /new rotates the durable DB thread —
-                    # SAME shared helper as the streaming path so the two
-                    # dispatch routes stay consistent.
-                    self._maybe_rotate_agent_session(llm_bawt, bot_id, user_prompt)
                 else:
                     llm_bawt._tts_mode = request.tts_mode or llm_bawt.bot.tts_mode
                 llm_bawt._inject_user_prefix = bool(request.inject_user_prefix)
@@ -342,6 +338,14 @@ class BackgroundService(
                 inject_seed_messages = maybe_build_session_seed(
                     llm_bawt, bot_id, model_alias, user_prompt, self,
                 )
+                # TASK-284: an agent /new rotates the durable DB thread —
+                # AFTER the seed is built so the seed captured the outgoing
+                # thread's raw messages (session-scoped load reads the active
+                # thread; rotating first emptied every inline-history seed).
+                # SAME shared helper as the streaming path so the two
+                # dispatch routes stay consistent.
+                if _is_agent:
+                    self._maybe_rotate_agent_session(llm_bawt, bot_id, user_prompt)
 
                 # Execute the query with prepared messages
                 response, tool_context, tool_call_details = llm_bawt.execute_llm_query(

@@ -413,9 +413,11 @@ class ChatStreamingMixin(ChatStreamingBridgeMixin):
 
         if is_agent_backend:
             # TASK-284 step 15: an agent /new also rotates the durable DB
-            # thread (flag-gated, non-destructive). The bridge still owns the
-            # provider-side reset+seed — the message passes through unchanged.
-            self._maybe_rotate_agent_session(llm_bawt, bot_id, user_prompt)
+            # thread (non-destructive). Rotation is deferred until AFTER the
+            # session seed is assembled below — the seed must read the
+            # OUTGOING thread's raw messages (session-scoped load), not the
+            # fresh empty one. The bridge still owns the provider-side
+            # reset+seed — the message passes through unchanged.
             cancel_event = threading.Event()
             done_event = threading.Event()
         else:
@@ -473,6 +475,11 @@ class ChatStreamingMixin(ChatStreamingBridgeMixin):
             inject_seed_messages = maybe_build_session_seed(
                 llm_bawt, bot_id, model_alias, user_prompt, get_service()
             )
+            # TASK-284 step 15: rotate the durable DB thread on /new — AFTER
+            # the seed is built so the seed captured the outgoing thread's
+            # raw messages (the session-scoped load reads the active thread;
+            # rotating first made every inline-history seed come up empty).
+            self._maybe_rotate_agent_session(llm_bawt, bot_id, user_prompt)
 
         # Persist turn log immediately so the user's prompt is recorded
         # even if the backend times out or errors before responding.
