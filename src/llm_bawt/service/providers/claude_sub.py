@@ -64,7 +64,11 @@ _COMPLETE_WAIT_S = 45.0
 
 _ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[a-zA-Z]|\x1b\][^\x07]*(?:\x07|\x1b\\)|\x1b[=>()][A-Za-z0-9]?")
 _URL_RE = re.compile(r"https://claude\.com/\S*oauth/authorize\S*")
-_SUCCESS_RE = re.compile(r"created successfully|login successful", re.I)
+_SUCCESS_RE = re.compile(r"created successfully|login successful|logged in as", re.I)
+# CLI-reported exchange failure (e.g. "Login failed: Request failed with status
+# code 400" on a bad/expired/mismatched code). Surface it fast — don't sit out
+# the full completion timeout.
+_FAIL_RE = re.compile(r"login failed[^\r\n]*", re.I)
 # Claude long-lived OAuth token, printed on success (fallback to the file bundle).
 _TOKEN_RE = re.compile(r"sk-ant-[A-Za-z0-9_\-]{20,}")
 
@@ -173,11 +177,23 @@ class ClaudeSubAdapter(ProviderAdapter):
     def __init__(self, config: Config):
         super().__init__(config)
 
+    # --- subclass hooks (see claude.ClaudeAdapter) ---------------------------
+    def _cli_args(self) -> list[str]:
+        """argv (after the binary) for the login CLI invocation."""
+        return ["setup-token"]
+
+    def _login_config_dir(self) -> Path:
+        """CLAUDE_CONFIG_DIR the CLI writes ``.credentials.json`` into."""
+        return _target_config_dir()
+
+    def _cleanup_login_dir(self, config_dir: Path) -> None:
+        """Called when a login session ends in error. No-op for the shared dir."""
+
     # --- cli oauth ----------------------------------------------------------
     def start_cli_login(self) -> CliLoginStart:
         _reap()
         binary = _claude_binary()
-        config_dir = _target_config_dir()
+        config_dir = self._login_config_dir()
         config_dir.mkdir(parents=True, exist_ok=True)
         session_id = uuid.uuid4().hex
 
@@ -189,7 +205,7 @@ class ClaudeSubAdapter(ProviderAdapter):
                 # Force the interactive login flow — ignore any inherited creds.
                 for var in ("CLAUDE_CODE_OAUTH_TOKEN", "ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN"):
                     os.environ.pop(var, None)
-                os.execv(binary, [binary, "setup-token"])
+                os.execv(binary, [binary, *self._cli_args()])
             except Exception:  # noqa: BLE001
                 os._exit(127)
 
@@ -210,6 +226,7 @@ class ClaudeSubAdapter(ProviderAdapter):
                 break
         if not url:
             session.close()
+            self._cleanup_login_dir(config_dir)
             raise ClaudeLoginError("timed out waiting for the Claude authorize URL")
 
         with _LOCK:
@@ -231,6 +248,7 @@ class ClaudeSubAdapter(ProviderAdapter):
             os.write(session.fd, (code.strip() + "\r").encode())
         except OSError as e:
             self._drop(session_id)
+            self._cleanup_login_dir(session.config_dir)
             return CliLoginResult(status="error", detail=f"failed to submit code: {e}")
 
         deadline = time.monotonic() + _COMPLETE_WAIT_S
@@ -238,9 +256,16 @@ class ClaudeSubAdapter(ProviderAdapter):
         ok = False
         while time.monotonic() < deadline:
             session.pump(0.3)
-            if _SUCCESS_RE.search(session.text()):
+            txt = session.text()
+            if _SUCCESS_RE.search(txt):
                 ok = True
                 break
+            fail = _FAIL_RE.search(txt)
+            if fail:
+                detail = fail.group(0).strip()
+                self._drop(session_id)
+                self._cleanup_login_dir(session.config_dir)
+                return CliLoginResult(status="error", detail=detail)
             bundle = _read_bundle(creds_path)
             if bundle is not None:
                 ok = True
@@ -253,14 +278,38 @@ class ClaudeSubAdapter(ProviderAdapter):
         token_match = _TOKEN_RE.search(session.text())
         token = token_match.group(0) if token_match else None
 
-        self._drop(session_id)
-
         if not ok and bundle is None and token is None:
+            # Log the CLI's screen tail for diagnosis — the paste prompt may not
+            # have rendered at all (e.g. CLI too old for the headless code flow).
+            logger.warning(
+                "cli login for %s timed out with no result; output tail: %r",
+                self.id,
+                session.text()[-300:],
+            )
+            self._drop(session_id)
+            self._cleanup_login_dir(session.config_dir)
             return CliLoginResult(
                 status="error",
                 detail="login did not complete — no credentials written (bad code or timeout)",
             )
 
+        self._drop(session_id)
+
+        try:
+            record = self._build_record(bundle, token, creds_path)
+        except Exception as e:  # noqa: BLE001
+            self._cleanup_login_dir(session.config_dir)
+            return CliLoginResult(status="error", detail=str(e))
+        try:
+            self.store.save(record)
+        except Exception as e:  # noqa: BLE001
+            logger.warning("Claude login succeeded but failed to persist status record: %s", e)
+        return CliLoginResult(status="connected", record=record)
+
+    def _build_record(
+        self, bundle: dict | None, token: str | None, creds_path: Path
+    ) -> ConnectionRecord:
+        """Turn a completed login into the persisted ConnectionRecord."""
         account = None
         expires_at = None
         if bundle:
@@ -283,11 +332,7 @@ class ClaudeSubAdapter(ProviderAdapter):
         # the printed long-lived token only as an encrypted fallback (env path).
         if token:
             record.secret = {"oauth_token": token}
-        try:
-            self.store.save(record)
-        except Exception as e:  # noqa: BLE001
-            logger.warning("Claude login succeeded but failed to persist status record: %s", e)
-        return CliLoginResult(status="connected", record=record)
+        return record
 
     def disconnect(self) -> bool:
         ok = self.store.delete(self.id)
