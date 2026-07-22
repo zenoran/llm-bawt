@@ -381,6 +381,16 @@ class MemoryStorage:
             reasoning=reasoning,
         )
 
+        # TASK-256: cheap auto-title from the first user message on a thread
+        # still carrying the default title. Cosmetic + best-effort — the
+        # helper never raises, so it can't break the write path.
+        if role == "user" and session_id:
+            from ..sessions.auto_title import maybe_auto_title
+
+            maybe_auto_title(
+                self.get_short_term_manager(bot_id), session_id, content
+            )
+
         return Message(
             id=message_id_final,
             role=role,
