@@ -514,9 +514,24 @@ class CodexCommandMixin:
         try:
             if method == "session.reset":
                 session_key = params.get("sessionKey", "")
+                # TASK-257 (Gavel recheck): app-scoped reset — emit on the
+                # caller's user stream; only clear the bot-global provider
+                # session when the app says so (DEFAULT_USER's continuous
+                # conversation owns it). Legacy callers (no params) keep the
+                # old behavior exactly.
+                reset_user = (params.get("userId") or "").strip() or "nick"
+                clear_provider = params.get("clearProviderSession", True)
                 target = _bot_slug_from_session_key(session_key) or session_key
                 if target:
-                    cleared = await self._clear_session(target)
+                    cleared = False
+                    if clear_provider:
+                        cleared = await self._clear_session(target)
+                    else:
+                        logger.info(
+                            "session.reset for non-default user=%s — "
+                            "skipping bot-global provider session clear for %s",
+                            reset_user, target,
+                        )
                     logger.info(
                         "Session reset: %s (had_session=%s)", target, cleared,
                     )
@@ -524,10 +539,17 @@ class CodexCommandMixin:
                     # consumer for this bot clears its visible buffer.
                     # TASK-249.
                     self._publish_session_reset_unified(
-                        target, session_key or target, had_session=cleared,
+                        target, session_key or target,
+                        had_session=cleared, user_id=reset_user,
                     )
                     self._publisher.publish_rpc_result(
-                        request_id, {"ok": True, "reset": target, "had_session": cleared},
+                        request_id,
+                        {
+                            "ok": True,
+                            "reset": target,
+                            "had_session": cleared,
+                            "cleared_provider": bool(clear_provider),
+                        },
                     )
                 else:
                     self._publisher.publish_rpc_result(

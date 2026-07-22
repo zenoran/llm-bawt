@@ -373,17 +373,37 @@ class SessionBridge:
                     bot_id_for_reset = (
                         self._resolve_bot_id(session_key_arg) or session_key_arg
                     )
-                    cleared = await self._reset_openclaw_session(session_key_arg)
+                    # TASK-257 (Gavel recheck): app-scoped reset — emit on the
+                    # caller's user stream; only clear the bot-global gateway
+                    # context when the app says so. Legacy callers (no params)
+                    # keep the old behavior exactly.
+                    reset_user = (params.get("userId") or "").strip() or "nick"
+                    clear_provider = params.get("clearProviderSession", True)
+                    cleared = False
+                    if clear_provider:
+                        cleared = await self._reset_openclaw_session(session_key_arg)
+                    else:
+                        logger.info(
+                            "session.reset for non-default user=%s — "
+                            "skipping gateway-side context clear for %s",
+                            reset_user, bot_id_for_reset,
+                        )
                     logger.info(
                         "Session reset via RPC: session=%s bot=%s gateway_cleared=%s",
                         session_key_arg, bot_id_for_reset, cleared,
                     )
                     self._publish_session_reset_unified(
-                        bot_id_for_reset, session_key_arg, had_session=cleared,
+                        bot_id_for_reset, session_key_arg,
+                        had_session=cleared, user_id=reset_user,
                     )
                     self._publisher.publish_rpc_result(
                         request_id,
-                        {"ok": True, "reset": bot_id_for_reset, "had_session": cleared},
+                        {
+                            "ok": True,
+                            "reset": bot_id_for_reset,
+                            "had_session": cleared,
+                            "cleared_provider": bool(clear_provider),
+                        },
                     )
                 return
 

@@ -460,11 +460,27 @@ async def session_reset(request: SessionResetRequest) -> SessionResetResponse:
     if not subscriber:
         raise HTTPException(status_code=503, detail="Redis subscriber not available")
 
+    # TASK-257 (Gavel recheck): resolve the caller's user BEFORE the RPC so
+    # the bridge can scope its side too. The bot-global provider session
+    # (agent_backend_config.session_key / gateway context) belongs to the
+    # DEFAULT_USER's continuous conversation — a reset issued for any OTHER
+    # user must NOT clear it, and the bridge's session_reset unified event
+    # must publish on the CALLER's stream, not DEFAULT_USER's. Policy lives
+    # here (app = intelligence, bridge = hands): the bridge just honors
+    # userId + clearProviderSession.
+    default_user = (getattr(service.config, "DEFAULT_USER", "") or "").strip()
+    user_id = (request.user_id or "").strip() or default_user
+    clear_provider = bool(user_id) and (not default_user or user_id == default_user)
+
     rpc_req_id = f"reset_{uuid.uuid4().hex}"
     try:
         await subscriber.send_rpc(
             "session.reset",
-            {"sessionKey": session_key},
+            {
+                "sessionKey": session_key,
+                "userId": user_id,
+                "clearProviderSession": clear_provider,
+            },
             rpc_req_id,
             timeout_s=10,
             backend=backend_name,
@@ -483,9 +499,6 @@ async def session_reset(request: SessionResetRequest) -> SessionResetResponse:
     # failure never fails the reset.
     rotated_thread: str | None = None
     try:
-        user_id = (request.user_id or "").strip() or (
-            getattr(service.config, "DEFAULT_USER", "") or ""
-        ).strip()
         if user_id:
             from ...mcp_server.storage import get_storage
 

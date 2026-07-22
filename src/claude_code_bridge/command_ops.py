@@ -212,18 +212,42 @@ class ClaudeCommandMixin:
         try:
             if method == "session.reset":
                 session_key = params.get("sessionKey", "")
+                # TASK-257 (Gavel recheck): the app scopes the reset — the
+                # unified event publishes on the CALLER's user stream, and the
+                # bot-global provider session (agent_backend_config
+                # .session_key) is only cleared when the app says so (it
+                # belongs to DEFAULT_USER's continuous conversation; another
+                # user's reset must not nuke it). Absent params (legacy
+                # caller) preserve the old behavior exactly.
+                reset_user = (params.get("userId") or "").strip() or "nick"
+                clear_provider = params.get("clearProviderSession", True)
                 target = _bot_slug_from_session_key(session_key) or session_key
                 if target:
-                    cleared = await self._clear_session(target)
+                    cleared = False
+                    if clear_provider:
+                        cleared = await self._clear_session(target)
+                    else:
+                        logger.info(
+                            "session.reset for non-default user=%s — "
+                            "skipping bot-global provider session clear for %s",
+                            reset_user, target,
+                        )
                     logger.info("Session reset: %s (had_session=%s)", target, cleared)
                     # Emit a deterministic SESSION_RESET unified event so any
                     # active frontend SSE consumer for this bot can clear its
                     # visible buffer.  See TASK-249.
                     self._publish_session_reset_unified(
-                        target, session_key or target, had_session=cleared,
+                        target, session_key or target,
+                        had_session=cleared, user_id=reset_user,
                     )
                     self._publisher.publish_rpc_result(
-                        request_id, {"ok": True, "reset": target, "had_session": cleared}
+                        request_id,
+                        {
+                            "ok": True,
+                            "reset": target,
+                            "had_session": cleared,
+                            "cleared_provider": bool(clear_provider),
+                        },
                     )
                 else:
                     self._publisher.publish_rpc_result(

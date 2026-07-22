@@ -74,20 +74,42 @@ class ChatStreamingBridgeMixin:
     ) -> None:
         """TASK-257: emit ``thread_switched`` onto the unified event stream.
 
-        Uses a lazy SYNC redis client singleton because rotation runs in
-        BOTH loop-thread (streaming dispatch) and executor-thread
-        (non-streaming ``_do_query``) contexts — a sync XADD is safe from
-        either, where create_task/run_coroutine_threadsafe each break in one
-        of them. Gavel (TASK-257 review): the client is TIGHTLY BOUNDED
-        (1s connect + 1s command timeouts) so a stalled Redis can cost the
-        event loop at most ~2s on a rare /new, never hang it — the shared
-        RedisPublisher's socket_timeout=None was not acceptable here.
+        Fire-and-forget from a daemon thread. Rotation runs in BOTH
+        loop-thread (streaming dispatch) and executor-thread (non-streaming
+        ``_do_query``) contexts, so the publish must not assume a loop —
+        and per Gavel's recheck, socket timeouts alone do NOT bound a sync
+        publish: DNS resolution of the Redis hostname happens BEFORE the
+        connect timeout applies and can block arbitrarily. Offloading the
+        entire body (client creation + XADD) to a short-lived daemon thread
+        makes the caller's cost ~thread-spawn regardless of Redis/DNS
+        health. /new is rare, so a thread per event is fine.
         Best-effort: never raises, a lost event only costs a list refresh.
         """
         try:
+            import threading
+
             uid = (user_id or "").strip() or (
                 getattr(self.config, "DEFAULT_USER", "") or ""
             ).strip() or "nick"
+            threading.Thread(
+                target=self._publish_thread_switched_blocking,
+                args=(bot_id, uid, new_session_id, source),
+                daemon=True,
+                name=f"thread-switched-pub-{bot_id}",
+            ).start()
+        except Exception as e:
+            log.warning("thread_switched publish failed for %s: %s", bot_id, e)
+
+    def _publish_thread_switched_blocking(
+        self, bot_id: str, uid: str, new_session_id: str, source: str,
+    ) -> None:
+        """Blocking half of the thread_switched publish (daemon thread only).
+
+        Socket timeouts stay tight (1s connect + 1s command) so the daemon
+        thread itself is short-lived; redis-py's connection pool is
+        thread-safe, so the lazy singleton is shared across publishes.
+        """
+        try:
             client = getattr(self, "_thread_event_redis", None)
             if client is None:
                 import redis as _redis

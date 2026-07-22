@@ -92,8 +92,10 @@ def test_clear_session_checks_patch_status(monkeypatch, caplog):
 @pytest.mark.parametrize(
     "path",
     [
-        "src/codex_bridge/bridge.py",
-        "src/claude_code_bridge/bridge.py",
+        # _set_session/_clear_session moved bridge.py -> session_ops.py in the
+        # TASK-555 mixin split; the guard now scans their real home.
+        "src/codex_bridge/session_ops.py",
+        "src/claude_code_bridge/session_ops.py",
     ],
 )
 @pytest.mark.parametrize("method_name", ["_set_session", "_clear_session"])
