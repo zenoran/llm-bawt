@@ -91,12 +91,12 @@ class TestAgentNewRotationGate:
 class TestChatRotation:
     def test_no_backend_returns_false_for_legacy_fallback(self):
         b = ChatStreamingBridgeMixin()
-        assert b._rotate_chat_session(_llm(backend=None), "nova") is False
+        assert b._rotate_chat_session(_llm(backend=None), "nova") is None  # TASK-257: falsy, not False
 
     def test_rotate_failure_returns_false(self):
         backend = SimpleNamespace(rotate_session=lambda: (_ for _ in ()).throw(RuntimeError("boom")))
         b = ChatStreamingBridgeMixin()
-        assert b._rotate_chat_session(_llm(backend=backend), "nova") is False
+        assert b._rotate_chat_session(_llm(backend=backend), "nova") is None  # TASK-257: falsy, not False
 
     def test_success_rotates_invalidates_and_keeps_only_summaries(self):
         backend = SimpleNamespace(rotate_session=lambda: "new-session-id")
@@ -109,7 +109,7 @@ class TestChatRotation:
             SimpleNamespace(role="assistant", content="b"),
         ]
         b = ChatStreamingBridgeMixin()
-        assert b._rotate_chat_session(llm, "nova") is True
+        assert b._rotate_chat_session(llm, "nova") == "new-session-id"  # TASK-257: returns the new id
         assert invalidated == [True]
         assert [m.role for m in llm.history_manager.messages] == ["summary"]
 

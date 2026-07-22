@@ -23,6 +23,15 @@ class AgentEventKind(str, Enum):
     # racing turn_complete timing.  Payload uses raw={"bot_id", "session_key",
     # "target", "had_session"} so the UI can scope the clear.
     SESSION_RESET = "session_reset"
+    # TASK-257: emitted by the APP layer (not the bridges) when a /new — or an
+    # explicit session.reset — rotates a bot's durable DB thread. Rotation is
+    # app-owned (TASK-284), so a single app-side emit covers claude-code,
+    # codex, openclaw AND chat bots for free. Payload (raw dict on the unified
+    # stream): {_type:"thread_switched", bot_id, user_id, new_session_id,
+    # source:"new_command"|"session_reset"}. Lets the UI refresh its
+    # conversation list deterministically instead of text-matching "/new" or
+    # racing turn_complete.
+    THREAD_SWITCHED = "thread_switched"
     # Emitted when a bridge has paused the SDK on an interactive tool call
     # (currently only the Claude Agent SDK's built-in ``AskUserQuestion``).
     # The bridge holds an asyncio.Future keyed by ``tool_use_id``; the run

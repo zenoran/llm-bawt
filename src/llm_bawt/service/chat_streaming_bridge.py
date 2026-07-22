@@ -23,7 +23,7 @@ log = get_service_logger(__name__)
 class ChatStreamingBridgeMixin:
     """Agent-bridge streaming + session helpers for BackgroundService."""
 
-    def _rotate_chat_session(self, llm_bawt, bot_id: str) -> bool:
+    def _rotate_chat_session(self, llm_bawt, bot_id: str) -> str | None:
         """TASK-284: non-destructive DB session rotation for chatbot /new.
 
         Closes the active durable thread and opens a fresh one (old rows
@@ -31,16 +31,20 @@ class ChatStreamingBridgeMixin:
         empty thread plus rolling summaries. Also clears the live in-memory
         transcript so a sub-TTL follow-up starts clean immediately.
 
-        Returns True on success, False on failure (callers log; nothing is
-        deleted either way, so a failed rotation just means the thread didn't
-        advance).
+        Returns the NEW session id on success (truthy — callers may treat it
+        as a bool), None on failure (callers log; nothing is deleted either
+        way, so a failed rotation just means the thread didn't advance).
+
+        TASK-257: a successful rotation also publishes the deterministic
+        ``thread_switched`` unified event so the UI's conversation list
+        refreshes without text-matching "/new" or racing turn_complete.
         """
         slug = (bot_id or "").strip().lower()
         try:
             backend = getattr(llm_bawt.history_manager, "_db_backend", None)
             rotate = getattr(backend, "rotate_session", None) if backend else None
             if not callable(rotate):
-                return False
+                return None
             new_id = rotate()
             inv = getattr(llm_bawt, "invalidate_history_cache", None)
             if callable(inv):
@@ -53,10 +57,73 @@ class ChatStreamingBridgeMixin:
             except Exception:
                 pass
             log.info("Rotated DB session for bot=%s -> %s (/new v2)", slug, new_id)
-            return True
+            if new_id:
+                self._publish_thread_switched(
+                    slug,
+                    getattr(backend, "user_id", None),
+                    str(new_id),
+                    source="new_command",
+                )
+            return str(new_id) if new_id else None
         except Exception as e:
             log.error("Failed to rotate session for bot=%s: %s", slug, e)
-            return False
+            return None
+
+    def _publish_thread_switched(
+        self, bot_id: str, user_id: str | None, new_session_id: str, source: str,
+    ) -> None:
+        """TASK-257: emit ``thread_switched`` onto the unified event stream.
+
+        Uses a lazy SYNC redis client singleton because rotation runs in
+        BOTH loop-thread (streaming dispatch) and executor-thread
+        (non-streaming ``_do_query``) contexts — a sync XADD is safe from
+        either, where create_task/run_coroutine_threadsafe each break in one
+        of them. Gavel (TASK-257 review): the client is TIGHTLY BOUNDED
+        (1s connect + 1s command timeouts) so a stalled Redis can cost the
+        event loop at most ~2s on a rare /new, never hang it — the shared
+        RedisPublisher's socket_timeout=None was not acceptable here.
+        Best-effort: never raises, a lost event only costs a list refresh.
+        """
+        try:
+            uid = (user_id or "").strip() or (
+                getattr(self.config, "DEFAULT_USER", "") or ""
+            ).strip() or "nick"
+            client = getattr(self, "_thread_event_redis", None)
+            if client is None:
+                import redis as _redis
+
+                client = _redis.Redis.from_url(
+                    self.config.REDIS_URL,
+                    decode_responses=True,
+                    socket_timeout=1.0,
+                    socket_connect_timeout=1.0,
+                )
+                self._thread_event_redis = client
+            from agent_bridge.publisher import (
+                UNIFIED_EVENTS_PREFIX,
+                UNIFIED_STREAM_MAXLEN,
+            )
+
+            payload = json.dumps({
+                "_type": "thread_switched",
+                "bot_id": bot_id,
+                "user_id": uid,
+                "new_session_id": new_session_id,
+                "source": source,
+                "ts": time.time(),
+            }, ensure_ascii=False)
+            client.xadd(
+                f"{UNIFIED_EVENTS_PREFIX}{bot_id}:{uid}",
+                {"payload": payload},
+                maxlen=UNIFIED_STREAM_MAXLEN,
+                approximate=True,
+            )
+            log.info(
+                "thread_switched published: bot=%s user=%s -> %s (%s)",
+                bot_id, uid, new_session_id, source,
+            )
+        except Exception as e:
+            log.warning("thread_switched publish failed for %s: %s", bot_id, e)
 
     def _bind_agent_thread(self, llm_bawt, request) -> dict | None:
         """TASK-252: resolve the per-thread SDK binding for an explicit-thread turn.
@@ -114,7 +181,7 @@ class ChatStreamingBridgeMixin:
 
     def _maybe_rotate_agent_session(
         self, llm_bawt, bot_id: str, user_prompt: str, thread_binding: dict | None = None,
-    ) -> bool:
+    ) -> str | None | bool:
         """TASK-284 step 15: rotate the durable DB thread on an agent ``/new``.
 
         Agent ``/new`` reset+seed stays bridge-owned (provider hydration is
@@ -124,9 +191,9 @@ class ChatStreamingBridgeMixin:
         session_key PATCH mirrors the new provider id onto it.
 
         Detection mirrors the bridge exactly (``lstrip().startswith("/new")``)
-        so DB rotation fires iff the bridge will reset. Returns True only when
-        a rotation happened. Shared by BOTH dispatch paths (streaming +
-        non-streaming) so they cannot drift.
+        so DB rotation fires iff the bridge will reset. Returns the new
+        session id (truthy) only when a rotation happened. Shared by BOTH
+        dispatch paths (streaming + non-streaming) so they cannot drift.
         """
         try:
             if not (user_prompt or "").lstrip().startswith("/new"):

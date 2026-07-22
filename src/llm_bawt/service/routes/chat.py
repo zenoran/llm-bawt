@@ -406,6 +406,14 @@ async def list_pending_questions(
 class SessionResetRequest(BaseModel):
     """Request to reset an agent backend session."""
     bot_id: str = Field(..., description="Bot slug to reset session for")
+    # TASK-257 (Gavel finding): rotation + thread_switched emit must target
+    # the CALLER's user context, not blindly DEFAULT_USER — otherwise a reset
+    # issued for another user rotates the default user's thread and publishes
+    # on their stream. Optional for backward compatibility (single-user
+    # deployments omit it and get DEFAULT_USER exactly as before).
+    user_id: str | None = Field(
+        None, description="User whose thread rotates; defaults to DEFAULT_USER"
+    )
 
 
 class SessionResetResponse(BaseModel):
@@ -475,7 +483,9 @@ async def session_reset(request: SessionResetRequest) -> SessionResetResponse:
     # failure never fails the reset.
     rotated_thread: str | None = None
     try:
-        user_id = (getattr(service.config, "DEFAULT_USER", "") or "").strip()
+        user_id = (request.user_id or "").strip() or (
+            getattr(service.config, "DEFAULT_USER", "") or ""
+        ).strip()
         if user_id:
             from ...mcp_server.storage import get_storage
 
@@ -486,6 +496,13 @@ async def session_reset(request: SessionResetRequest) -> SessionResetResponse:
                 "Rotated durable thread on session reset: bot=%s -> %s",
                 request.bot_id, rotated_thread,
             )
+            # TASK-257: deterministic thread_switched event for the UI's
+            # conversation list (same emit as the /new path; source differs).
+            if rotated_thread:
+                service._publish_thread_switched(
+                    request.bot_id, user_id, str(rotated_thread),
+                    source="session_reset",
+                )
     except Exception as e:
         log.warning("Thread rotation on reset failed for %s: %s", request.bot_id, e)
 
