@@ -520,6 +520,10 @@ class TurnStreamWorker(TurnStreamPublishMixin):
                     # TASK-501: push the pre-assembled seed so the bridge
                     # seeds the fresh session without the context-seed callback.
                     extra_kwargs["inject_messages"] = inject_seed_messages
+                if is_agent_backend and ctx.thread_binding:
+                    # TASK-252: request-local explicit-thread binding — rides
+                    # the kwarg channel so it can never leak between turns.
+                    extra_kwargs["thread_binding"] = ctx.thread_binding
                 stream_iter = llm_bawt.client.stream_raw(
                     messages, stop=adapter_stops or None, **gen_kwargs, **extra_kwargs
                 )

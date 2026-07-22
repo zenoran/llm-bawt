@@ -94,6 +94,21 @@ class UpdateSessionRequest(BaseModel):
     )
 
 
+class AgentSessionKeyRequest(BaseModel):
+    """PUT /v1/sessions/{id}/agent-session-key body (TASK-252).
+
+    The bridge write-back: persist the SDK session id a thread's turns run
+    under so re-opening the thread later resumes the right transcript.
+    """
+
+    backend: str = Field(description="Agent backend, e.g. 'claude-code'")
+    session_key: str = Field(description="Provider/SDK session id (no routing keys)")
+    model: str | None = Field(
+        default=None,
+        description="Model the SDK session was created with (drives resume-vs-reset)",
+    )
+
+
 class CreateSessionResponse(BaseModel):
     session_id: str
     bot_id: str
@@ -134,6 +149,52 @@ def _resolve_user(user: str | None) -> str:
             detail="user is required (no DEFAULT_USER configured)",
         )
     return user_id
+
+
+def agent_key_name(backend: str) -> str:
+    """Canonical ``agent_session_keys`` key for a backend (TASK-252).
+
+    Underscore style per the M1c spec shape: ``claude-code`` → ``claude_code``.
+    """
+    return (backend or "").strip().replace("-", "_")
+
+
+def resolve_agent_session_key(
+    meta: dict, backend: str, current_model: str | None = None
+) -> str | None:
+    """Resolve the SDK session id stored for a thread + backend (TASK-252).
+
+    Read order:
+    1. canonical ``session_metadata.agent_session_keys[<backend>]``;
+    2. legacy TASK-284 mirror keys (``provider``/``provider_session_id``) when
+       the provider matches — one-release fallback, removal tracked separately.
+
+    Guards: a value containing ``:`` is a routing key (openclaw / legacy bug),
+    never an SDK session id. When ``current_model`` is given and the thread
+    recorded a different ``provider_session_model``, returns None so the
+    caller cold-starts instead of resuming a transcript minted under another
+    model (mirrors the bridge's scalar model-change reset).
+    """
+    meta = meta or {}
+    keys = meta.get("agent_session_keys") or {}
+    val = str(keys.get(agent_key_name(backend)) or "").strip()
+    if not val and str(meta.get("provider") or "").strip() == (backend or "").strip():
+        val = str(meta.get("provider_session_id") or "").strip()
+    if not val or ":" in val:
+        return None
+    # Model gate: provider_session_model is a SCALAR describing the provider
+    # named in meta["provider"] — apply it only when it describes THIS
+    # backend, or a second backend's model would wrongly veto the first's
+    # key (keys are per-backend; the model note is not).
+    stored_model = str(meta.get("provider_session_model") or "").strip()
+    if (
+        current_model
+        and stored_model
+        and stored_model != current_model
+        and str(meta.get("provider") or "").strip() == (backend or "").strip()
+    ):
+        return None
+    return val
 
 
 def _normalize_metadata(row: dict) -> dict:
@@ -424,6 +485,67 @@ async def delete_session(
     return {"session_id": session_id, "status": "deleted", "deleted": True}
 
 
+@router.put(
+    "/v1/sessions/{session_id}/agent-session-key",
+    tags=["Sessions"],
+)
+async def put_agent_session_key(
+    session_id: str,
+    body: AgentSessionKeyRequest,
+    bot_id: str = Query(None, description="Bot slug; defaults to service default bot"),
+):
+    """Persist an SDK session id onto its thread (TASK-252, bridge write-back).
+
+    Writes the canonical ``session_metadata.agent_session_keys[<backend>]``
+    entry (merged — other backends' keys preserved) plus the legacy TASK-284
+    mirror keys (``provider*``) for one release of read-side compat.
+
+    Bot-scoped, not user-scoped: the caller is a trusted bridge on the LAN
+    that knows the thread id from the dispatch command; the originating turn
+    already passed user-ownership validation at /v1/chat/completions.
+    """
+    import time as _time
+
+    effective_bot = get_effective_bot_id(bot_id)
+    backend = (body.backend or "").strip()
+    session_key = (body.session_key or "").strip()
+    if not backend or not session_key:
+        raise HTTPException(status_code=422, detail="backend and session_key required")
+    if ":" in session_key:
+        # Routing keys (openclaw "agent:main:main", legacy "bot:user") are
+        # never SDK session ids — refuse rather than poison the thread.
+        raise HTTPException(status_code=422, detail="session_key looks like a routing key")
+
+    storage = get_storage()
+    row = await storage.get_session(session_id, bot_id=effective_bot)
+    if not row or row.get("bot_id") != effective_bot:
+        raise HTTPException(status_code=404, detail="Session not found")
+
+    keys = dict((row.get("session_metadata") or {}).get("agent_session_keys") or {})
+    keys[agent_key_name(backend)] = session_key
+    patch: dict = {
+        "agent_session_keys": keys,
+        "provider": backend,
+        "provider_session_id": session_key,
+        "provider_session_updated_at": _time.time(),
+    }
+    if body.model:
+        patch["provider_session_model"] = body.model
+    ok = await storage.update_session_metadata(session_id, patch, bot_id=effective_bot)
+    if not ok:
+        raise HTTPException(status_code=500, detail="Metadata update failed")
+    log.info(
+        "Agent session key stored: bot=%s thread=%s backend=%s sid=%s",
+        effective_bot, session_id, backend, session_key,
+    )
+    return {
+        "session_id": session_id,
+        "backend": backend,
+        "agent_session_keys": keys,
+        "stored": True,
+    }
+
+
 @router.post(
     "/v1/sessions/{session_id}/activate",
     response_model=ActivateSessionResponse,
@@ -482,7 +604,9 @@ def _coordinate_agent_provider_on_activate(bot_id: str, session_row: dict) -> st
             return None
 
         meta = session_row.get("session_metadata") or {}
-        provider_sid = str(meta.get("provider_session_id") or "").strip()
+        # TASK-252: canonical agent_session_keys first, legacy mirror keys as
+        # fallback (resolver applies the routing-key guard internally).
+        provider_sid = resolve_agent_session_key(meta, backend) or ""
 
         from ..dependencies import get_bot_profile_store
 

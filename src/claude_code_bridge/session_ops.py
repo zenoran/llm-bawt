@@ -137,6 +137,45 @@ class ClaudeSessionMixin:
         except Exception as e:
             logger.warning("Failed to persist session for %s: %s", bot_id, e)
 
+    async def _set_thread_session(
+        self, thread_session_id: str, bot_id: str, sdk_session_id: str, model: str,
+    ) -> None:
+        """TASK-252: persist an SDK session id onto its bawthub thread.
+
+        Per-thread write-back for explicit-thread (scoped) turns — the
+        counterpart of ``_set_session``, targeting
+        ``sessions.session_metadata.agent_session_keys`` instead of the bot's
+        scalar ``agent_backend_config.session_key`` (which belongs to the
+        continuous conversation and must never be clobbered by a scoped turn).
+        """
+        if not self._app_api_url:
+            logger.warning(
+                "No API URL — thread session not persisted for %s/%s",
+                bot_id, thread_session_id,
+            )
+            return
+        try:
+            async with httpx.AsyncClient(timeout=5) as client:
+                resp = await client.put(
+                    f"{self._app_api_url}/v1/sessions/{thread_session_id}/agent-session-key",
+                    params={"bot_id": bot_id},
+                    json={
+                        "backend": "claude-code",
+                        "session_key": sdk_session_id,
+                        "model": model,
+                    },
+                )
+                resp.raise_for_status()
+            logger.info(
+                "Thread session persisted: %s thread=%s -> %s",
+                bot_id, thread_session_id, sdk_session_id,
+            )
+        except Exception as e:
+            logger.warning(
+                "Failed to persist thread session for %s/%s: %s",
+                bot_id, thread_session_id, e,
+            )
+
     async def _clear_session(self, bot_id: str) -> bool:
         """Remove session_key from bot's agent_backend_config via PATCH."""
         if not self._app_api_url:
@@ -325,7 +364,11 @@ class ClaudeSessionMixin:
         }
 
     async def _seed_new_session(
-        self, bot_id: str, model: str, injected: list | None = None,
+        self,
+        bot_id: str,
+        model: str,
+        injected: list | None = None,
+        thread_session_id: str | None = None,
     ) -> dict | None:
         """Seed a brand-new SDK session for ``bot_id`` from app-injected history.
         Writes the synthetic transcript, persists the minted session id, and
@@ -353,7 +396,15 @@ class ClaudeSessionMixin:
         try:
             session_id = str(uuid.uuid4())
             self._write_seed_transcript(session_id, messages)
-            await self._set_session(bot_id, session_id, model)
+            # TASK-252: a scoped (explicit-thread) seed persists to the
+            # thread's own key map; the bot's scalar session_key stays
+            # untouched so the continuous conversation is unharmed.
+            if thread_session_id:
+                await self._set_thread_session(
+                    thread_session_id, bot_id, session_id, model,
+                )
+            else:
+                await self._set_session(bot_id, session_id, model)
         except Exception as e:
             logger.warning("Seed write/persist failed for %s: %s", bot_id, e)
             return {"seeded": False, "reason": f"seed write failed: {e}"}

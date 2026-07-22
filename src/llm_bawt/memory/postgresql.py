@@ -175,7 +175,10 @@ def ensure_parent_tables(conn, embedding_dim: int = 384) -> None:
     # Parent-level btree/gin indexes — template to every partition.
     parent_indexes = [
         f"CREATE INDEX IF NOT EXISTS idx_{MESSAGES_PARENT}_timestamp ON {MESSAGES_PARENT}(timestamp)",
-        f"CREATE INDEX IF NOT EXISTS idx_{MESSAGES_PARENT}_session ON {MESSAGES_PARENT}(session_id)",
+        # TASK-252: composite — serves both equality-only session lookups and
+        # the ordered scoped-transcript read (no sort node). Replaces the old
+        # single-column idx_messages_session (dropped live 2026-07-22).
+        f"CREATE INDEX IF NOT EXISTS idx_{MESSAGES_PARENT}_session_ts ON {MESSAGES_PARENT}(session_id, timestamp DESC)",
         f"CREATE INDEX IF NOT EXISTS idx_{MESSAGES_PARENT}_processed ON {MESSAGES_PARENT}(processed)",
         # GIN trigram index on message content — backs the Spotlight
         # substring/fuzzy mode (search_all_messages_trgm / ILIKE '%..%').
@@ -582,6 +585,7 @@ class PostgreSQLMemoryBackend(MemoryBackend):
                     user_id VARCHAR(64),
                     started_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
                     ended_at TIMESTAMP,
+                    archived_at TIMESTAMP,
                     status VARCHAR(16) NOT NULL DEFAULT 'active',
                     session_metadata JSONB
                 )
@@ -590,6 +594,29 @@ class PostgreSQLMemoryBackend(MemoryBackend):
             sessions_user_col_sql = text("""
                 ALTER TABLE sessions
                 ADD COLUMN IF NOT EXISTS user_id VARCHAR(64)
+            """)
+            # TASK-250 gap (caught in review): pre-existing tables bootstrapped
+            # before the status-lifecycle migration lack archived_at.
+            sessions_archived_col_sql = text("""
+                ALTER TABLE sessions
+                ADD COLUMN IF NOT EXISTS archived_at TIMESTAMP
+            """)
+            # Idempotent legacy-data migration: retire the pre-TASK-250
+            # 'completed' status and stamp archived_at on any archived row
+            # still missing it (backfilled from ended_at). Zero rows touched
+            # on an already-migrated deployment.
+            sessions_legacy_status_sql = text("""
+                UPDATE sessions
+                SET status = 'archived',
+                    archived_at = COALESCE(archived_at, ended_at)
+                WHERE status = 'completed'
+            """)
+            sessions_archived_backfill_sql = text("""
+                UPDATE sessions
+                SET archived_at = ended_at
+                WHERE status = 'archived'
+                  AND archived_at IS NULL
+                  AND ended_at IS NOT NULL
             """)
             sessions_idx_sql = text("""
                 CREATE INDEX IF NOT EXISTS idx_sessions_bot_started
@@ -610,6 +637,9 @@ class PostgreSQLMemoryBackend(MemoryBackend):
                 conn.execute(sessions_sql)
                 try:
                     conn.execute(sessions_user_col_sql)
+                    conn.execute(sessions_archived_col_sql)
+                    conn.execute(sessions_legacy_status_sql)
+                    conn.execute(sessions_archived_backfill_sql)
                     conn.execute(sessions_idx_sql)
                     conn.execute(sessions_status_idx_sql)
                     conn.execute(sessions_active_idx_sql)

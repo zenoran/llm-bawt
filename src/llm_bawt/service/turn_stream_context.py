@@ -60,3 +60,6 @@ class TurnStreamContext:
     user_attachments: Any
     user_id: Any
     user_prompt: Any
+    # TASK-252: request-local explicit-thread SDK binding
+    # ({thread_session_id, thread_resume_id?}) or None for continuous turns.
+    thread_binding: Any = None

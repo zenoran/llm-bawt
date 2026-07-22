@@ -642,6 +642,22 @@ class MemoryClient:
             storage.get_active_session(bot_id=self.bot_id, user_id=self.user_id)
         )
 
+    def get_session(self, session_id: str) -> dict[str, Any] | None:
+        """Return one session row by id (TASK-252), or None.
+
+        Backs the per-thread SDK-key resolution at agent dispatch: the app
+        reads the target thread's ``session_metadata`` synchronously through
+        the same client chain the rotate/activate helpers use.
+        """
+        self._ensure_initialized()
+        if self.server_url:
+            return self._call_server(
+                "sessions_get",
+                {"bot_id": self.bot_id, "session_id": session_id},
+            )
+        storage = self._get_storage()
+        return _run_async(storage.get_session(session_id, bot_id=self.bot_id))
+
     def rotate_session(self) -> str | None:
         """Non-destructively rotate this (bot, user)'s active thread.
 
@@ -1404,6 +1420,10 @@ class _MCPShortTermManager:
         ]
         merged.sort(key=lambda m: m.timestamp or 0.0)
         return merged
+
+    def get_session(self, session_id: str) -> dict | None:
+        """TASK-252: one session row by id (per-thread SDK-key resolution)."""
+        return self._memory_client.get_session(session_id)
 
     def rotate_session(self) -> str | None:
         """TASK-284 step 14: rotate the active thread (backs v2 chatbot /new)."""

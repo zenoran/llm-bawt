@@ -216,6 +216,16 @@ class AgentBridgeBackend(AgentBackend):
                                 int(config.get("context_window"))
                                 if config.get("context_window") else None
                             ),
+                            # TASK-252: per-thread SDK binding (explicit
+                            # session_id turns). Absent on continuous turns.
+                            thread_session_id=(
+                                str(config.get("thread_session_id") or "").strip()
+                                or None
+                            ),
+                            thread_resume_id=(
+                                str(config.get("thread_resume_id") or "").strip()
+                                or None
+                            ),
                         )
                         logger.info(
                             "%s request via bridge: session=%s request_id=%s",

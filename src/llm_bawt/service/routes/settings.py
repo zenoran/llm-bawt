@@ -668,6 +668,28 @@ async def _mirror_provider_session_to_thread(service, existing, payload: dict) -
         "provider_session_model": str(new_bc.get("session_model") or "") or None,
         "provider_session_updated_at": _time.time(),
     }
+    # TASK-252: also maintain the canonical per-thread key map so scoped
+    # turns can resume this thread later. Merged (other backends preserved).
+    # Best-effort read of existing keys — a read failure must never break
+    # the mirror itself.
+    backend = str(payload.get("agent_backend") or "").strip()
+    if backend:
+        from .sessions import agent_key_name
+
+        keys: dict = {}
+        try:
+            getter = getattr(storage, "get_session", None)
+            if callable(getter):
+                row = await getter(session_id, bot_id=slug)
+                keys = dict(
+                    ((row or {}).get("session_metadata") or {}).get(
+                        "agent_session_keys"
+                    ) or {}
+                )
+        except Exception:
+            keys = {}
+        keys[agent_key_name(backend)] = new_sk
+        patch["agent_session_keys"] = keys
     ok = await storage.update_session_metadata(session_id, patch, bot_id=slug)
     logger.info(
         "Mirrored provider session onto thread: bot=%s thread=%s provider_sid=%s ok=%s",

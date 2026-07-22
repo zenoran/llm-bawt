@@ -444,6 +444,8 @@ class ChatStreamingMixin(ChatStreamingBridgeMixin):
         # so it need not call back to /v1/history/context-seed. Stays None
         # unless this is a claude-code agent turn that will open a fresh session.
         inject_seed_messages: list | None = None
+        # TASK-252: request-local explicit-thread binding (None = continuous).
+        thread_binding: dict | None = None
         if is_agent_backend:
             bc = getattr(llm_bawt.bot, "agent_backend_config", None) or {}
             backend_name = getattr(llm_bawt.bot, "agent_backend", "")
@@ -465,6 +467,12 @@ class ChatStreamingMixin(ChatStreamingBridgeMixin):
             else:
                 oc_session_key = bc.get("session_key")
 
+            # TASK-252: resolve the turn's explicit-thread binding (if any)
+            # BEFORE the seed decision — the scoped seed branch consumes it.
+            # REQUEST-LOCAL: passed by value down the kwarg channel, never
+            # stored on the shared cached client (no cross-turn bind leaks).
+            thread_binding = self._bind_agent_thread(llm_bawt, request)
+
             # TASK-501: pre-assemble the session seed app-side and push it to
             # the bridge (inject_messages) so the bridge need not call back to
             # /v1/history/context-seed. Shared decision helper — SAME logic the
@@ -473,13 +481,16 @@ class ChatStreamingMixin(ChatStreamingBridgeMixin):
             from .routes.history import maybe_build_session_seed
             from .dependencies import get_service
             inject_seed_messages = maybe_build_session_seed(
-                llm_bawt, bot_id, model_alias, user_prompt, get_service()
+                llm_bawt, bot_id, model_alias, user_prompt, get_service(),
+                thread_binding=thread_binding,
             )
             # TASK-284 step 15: rotate the durable DB thread on /new — AFTER
             # the seed is built so the seed captured the outgoing thread's
             # raw messages (the session-scoped load reads the active thread;
             # rotating first made every inline-history seed come up empty).
-            self._maybe_rotate_agent_session(llm_bawt, bot_id, user_prompt)
+            self._maybe_rotate_agent_session(
+                llm_bawt, bot_id, user_prompt, thread_binding=thread_binding
+            )
 
         # Persist turn log immediately so the user's prompt is recorded
         # even if the backend times out or errors before responding.
@@ -548,6 +559,7 @@ class ChatStreamingMixin(ChatStreamingBridgeMixin):
             turn_log_id=turn_log_id,
             is_agent_backend=is_agent_backend,
             inject_seed_messages=inject_seed_messages,
+            thread_binding=thread_binding,
             cancel_event=cancel_event,
             done_event=done_event,
             chunk_queue=chunk_queue,

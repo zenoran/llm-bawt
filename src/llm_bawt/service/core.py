@@ -525,6 +525,7 @@ class ServiceLLMBawt(BaseLLMBawt):
         plaintext_output: bool = False,
         stream: bool = False,
         inject_messages: list | None = None,
+        thread_binding: dict | None = None,
     ) -> tuple[str, str, list[dict]]:
         """Execute the LLM query and return response.
         
@@ -544,6 +545,11 @@ class ServiceLLMBawt(BaseLLMBawt):
         # TASK-501: only agent backends (AgentBackendClient, **kwargs) accept
         # inject_messages; guard so plain clients never receive an unknown kwarg.
         _q_kwargs = {"inject_messages": inject_messages} if inject_messages else {}
+        # TASK-252: request-local per-thread SDK binding (explicit session_id
+        # turns) — rides the same kwarg channel as inject_messages so it can
+        # never leak between concurrent turns via shared instance state.
+        if thread_binding:
+            _q_kwargs["thread_binding"] = thread_binding
 
         # Agent backends (claude-code/openclaw) execute tools in their OWN
         # bridge/runtime — they must NOT go through llm-bawt's tool loop. The

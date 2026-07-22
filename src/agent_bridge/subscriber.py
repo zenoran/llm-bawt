@@ -154,6 +154,8 @@ class RedisSubscriber:
         disallowed_tools: list[str] | None = None,
         inject_messages: list | None = None,
         context_window: int | None = None,
+        thread_session_id: str | None = None,
+        thread_resume_id: str | None = None,
     ) -> None:
         """Publish a chat.send command to the bridge's command stream.
 
@@ -212,6 +214,12 @@ class RedisSubscriber:
             )
         if inject_messages:
             fields["inject_messages"] = json.dumps(inject_messages, ensure_ascii=False)
+        if thread_session_id:
+            # TASK-252: explicit-thread turn. The bridge resumes/persists the
+            # SDK session PER THREAD instead of the bot's scalar session_key.
+            fields["thread_session_id"] = thread_session_id
+            if thread_resume_id:
+                fields["thread_resume_id"] = thread_resume_id
         await self._pub_redis.xadd(
             COMMANDS_STREAM,
             fields,

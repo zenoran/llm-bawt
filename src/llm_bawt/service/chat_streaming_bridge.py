@@ -58,7 +58,63 @@ class ChatStreamingBridgeMixin:
             log.error("Failed to rotate session for bot=%s: %s", slug, e)
             return False
 
-    def _maybe_rotate_agent_session(self, llm_bawt, bot_id: str, user_prompt: str) -> bool:
+    def _bind_agent_thread(self, llm_bawt, request) -> dict | None:
+        """TASK-252: resolve the per-thread SDK binding for an explicit-thread turn.
+
+        When a claude-code agent turn carries an explicit ``session_id`` (a
+        thread the user opened in the UI), resolve THAT thread's stored SDK
+        session key so the bridge resumes the thread's own transcript instead
+        of the bot's scalar (active) session. Returns a REQUEST-LOCAL dict
+        (never stored on the shared cached client — concurrent turns must not
+        cross-bind):
+
+        - ``thread_session_id``: the durable bawthub thread id;
+        - ``thread_resume_id``: the SDK session id stored for it (absent when
+          the thread has none — the bridge then cold-starts + seeds and writes
+          the minted id back via PUT /v1/sessions/{id}/agent-session-key).
+
+        Returns None for unscoped turns and non-claude-code bots. Shared by
+        BOTH dispatch paths so they cannot drift. Never raises.
+        """
+        try:
+            if (getattr(llm_bawt.bot, "agent_backend", "") or "") != "claude-code":
+                return None
+            sid = getattr(request, "session_id", None)
+            sid = sid.strip() if isinstance(sid, str) and sid.strip() else None
+            if not sid:
+                return None
+            binding: dict = {"thread_session_id": sid}
+            backend = getattr(llm_bawt.history_manager, "_db_backend", None)
+            get_sess = getattr(backend, "get_session", None) if backend else None
+            row = get_sess(sid) if callable(get_sess) else None
+            if not row:
+                # Route-level validation already proved the thread exists; a
+                # miss here (backend without get_session) just means no
+                # resume — the bridge cold-starts + seeds scoped context.
+                log.warning("Thread binding: no session row for %s (cold-start)", sid)
+                return binding
+            from .routes.sessions import resolve_agent_session_key
+
+            bc = getattr(getattr(llm_bawt, "client", None), "_bot_config", None) or {}
+            resume = resolve_agent_session_key(
+                row.get("session_metadata") or {},
+                "claude-code",
+                str(bc.get("model") or "").strip() or None,
+            )
+            if resume:
+                binding["thread_resume_id"] = resume
+            log.info(
+                "Agent thread bound: thread=%s resume=%s",
+                sid, resume or "none (cold-start)",
+            )
+            return binding
+        except Exception as e:
+            log.warning("Agent thread binding failed: %s", e)
+            return None
+
+    def _maybe_rotate_agent_session(
+        self, llm_bawt, bot_id: str, user_prompt: str, thread_binding: dict | None = None,
+    ) -> bool:
         """TASK-284 step 15: rotate the durable DB thread on an agent ``/new``.
 
         Agent ``/new`` reset+seed stays bridge-owned (provider hydration is
@@ -74,6 +130,15 @@ class ChatStreamingBridgeMixin:
         """
         try:
             if not (user_prompt or "").lstrip().startswith("/new"):
+                return False
+            # TASK-252: a turn explicitly bound to a thread never rotates —
+            # "/new" inside an opened old thread is treated as plain text
+            # rather than silently rotating the user's ACTIVE thread.
+            if thread_binding and thread_binding.get("thread_session_id"):
+                log.warning(
+                    "Skipping /new rotation: turn is bound to thread %s",
+                    thread_binding.get("thread_session_id"),
+                )
                 return False
         except Exception:
             return False

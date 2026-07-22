@@ -1728,7 +1728,9 @@ def list_summaries(
         log.error(f"Failed to list summaries: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
-def build_context_seed(bot_id: str, model: str | None, service) -> dict:
+def build_context_seed(
+    bot_id: str, model: str | None, service, session_id: str | None = None
+) -> dict:
     """Build the context-seed payload for a fresh Claude Code SDK session.
 
     Extracted from the ``/v1/history/context-seed`` handler (TASK-501) so the
@@ -1763,7 +1765,9 @@ def build_context_seed(bot_id: str, model: str | None, service) -> dict:
         model_alias, effective_bot_id, service.config.DEFAULT_USER
     )
     # Load fresh so we never serve a stale in-memory transcript.
-    llm_bawt.history_manager.load_history()
+    # ``session_id`` (TASK-252): scoped seed for hydrating an explicitly
+    # opened thread — pool becomes that thread's raw + rolling summaries.
+    llm_bawt.history_manager.load_history(session_id=session_id)
 
     # Same budget the agent path uses (base.py) — the ONE Tier-2 authority.
     # 0 => no budget (return everything). TASK-609. Capture the full
@@ -1854,7 +1858,9 @@ def build_context_seed(bot_id: str, model: str | None, service) -> dict:
     }
 
 
-def maybe_build_session_seed(llm_bawt, bot_id, model, user_prompt, service) -> list | None:
+def maybe_build_session_seed(
+    llm_bawt, bot_id, model, user_prompt, service, thread_binding: dict | None = None,
+) -> list | None:
     """Decide whether to seed a fresh SDK session and, if so, build it (TASK-501).
 
     SINGLE source of truth shared by BOTH dispatch paths (streaming
@@ -1872,6 +1878,19 @@ def maybe_build_session_seed(llm_bawt, bot_id, model, user_prompt, service) -> l
     try:
         if (getattr(llm_bawt.bot, "agent_backend", "") or "") != "claude-code":
             return None
+        # TASK-252: explicit-thread turn (user opened a past conversation).
+        # Orthogonal to the continuity toggle — this is hydration of a
+        # selected thread, not cross-session carry. ``thread_binding`` is the
+        # REQUEST-LOCAL dict the dispatch's _bind_agent_thread resolved.
+        _binding = thread_binding or {}
+        _thread_id = str(_binding.get("thread_session_id") or "").strip()
+        if _thread_id:
+            if str(_binding.get("thread_resume_id") or "").strip():
+                # Thread has its own SDK session — the bridge resumes it;
+                # seeding too would double-inject the transcript.
+                return None
+            seed = build_context_seed(bot_id, model, service, session_id=_thread_id)
+            return seed.get("messages") or None
         bc = getattr(llm_bawt.bot, "agent_backend_config", None) or {}
         try:
             continuity_on = bool(

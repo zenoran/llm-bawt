@@ -332,6 +332,14 @@ class BackgroundService(
                     _sid.strip() if isinstance(_sid, str) and _sid.strip() else None
                 )
 
+                # TASK-252: resolve the turn's explicit-thread binding (if
+                # any) BEFORE the seed decision — the scoped seed branch
+                # consumes it. REQUEST-LOCAL (kwarg channel, never shared
+                # instance state). SAME shared helper as the streaming path.
+                thread_binding = (
+                    self._bind_agent_thread(llm_bawt, request) if _is_agent else None
+                )
+
                 # Prepare messages with history and memory context
                 prepared_messages = llm_bawt.prepare_messages_for_query(user_prompt, message_id=trigger_message_id)
 
@@ -344,6 +352,7 @@ class BackgroundService(
                 from .routes.history import maybe_build_session_seed
                 inject_seed_messages = maybe_build_session_seed(
                     llm_bawt, bot_id, model_alias, user_prompt, self,
+                    thread_binding=thread_binding,
                 )
                 # TASK-284: an agent /new rotates the durable DB thread —
                 # AFTER the seed is built so the seed captured the outgoing
@@ -352,7 +361,9 @@ class BackgroundService(
                 # SAME shared helper as the streaming path so the two
                 # dispatch routes stay consistent.
                 if _is_agent:
-                    self._maybe_rotate_agent_session(llm_bawt, bot_id, user_prompt)
+                    self._maybe_rotate_agent_session(
+                        llm_bawt, bot_id, user_prompt, thread_binding=thread_binding
+                    )
 
                 # Execute the query with prepared messages
                 response, tool_context, tool_call_details = llm_bawt.execute_llm_query(
@@ -360,6 +371,7 @@ class BackgroundService(
                     plaintext_output=True,
                     stream=False,
                     inject_messages=inject_seed_messages,
+                    thread_binding=thread_binding,
                 )
 
                 # Splice the injected seed into the logged prompt so the turn

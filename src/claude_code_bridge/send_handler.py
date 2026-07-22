@@ -115,6 +115,10 @@ class ClaudeSendMixin(ClaudeStreamMixin, ClaudeUsageMixin):
         bot_context_window = req.bot_context_window
         configured_disallowed_tools = req.configured_disallowed_tools
         attachments = req.attachments
+        # TASK-252: explicit-thread (scoped) turn — resume/persist the SDK
+        # session PER THREAD; never touch the bot's scalar session_key.
+        thread_session_id = req.thread_session_id
+        thread_scoped = bool(thread_session_id)
 
         if not request_id or not message:
             logger.warning("Invalid send command: missing request_id or message")
@@ -143,8 +147,10 @@ class ClaudeSendMixin(ClaudeStreamMixin, ClaudeUsageMixin):
         if trigger_message_id:
             self._trigger_message_ids[request_id] = trigger_message_id
 
-        # /new resets the session — strip it and start fresh
-        if message.lstrip().startswith("/new"):
+        # /new resets the session — strip it and start fresh. A thread-scoped
+        # turn never takes this branch (TASK-252): "/new" inside an opened old
+        # thread must not clear the bot's scalar (continuous) session.
+        if message.lstrip().startswith("/new") and not thread_scoped:
             cleared = await self._clear_session(bot_slug or session_key)
             logger.info("Session reset via /new: %s (had_session=%s)", bot_slug or session_key, cleared)
             # Publish a deterministic SESSION_RESET unified event so the
@@ -209,18 +215,30 @@ class ClaudeSendMixin(ClaudeStreamMixin, ClaudeUsageMixin):
 
                 # Reuse SDK session for conversation continuity.
                 # If the model changed, start a fresh session.
-                existing = await self._get_session(bot_slug)
                 resume_id = None
-                if existing:
-                    prev_sid, prev_model = existing
-                    if prev_model == model:
-                        resume_id = prev_sid
-                    else:
-                        logger.info(
-                            "Model changed (%s -> %s), starting new session for %s",
-                            prev_model, model, bot_slug or session_key,
-                        )
-                        await self._clear_session(bot_slug or session_key)
+                if thread_scoped:
+                    # TASK-252: the app resolved this thread's stored SDK
+                    # session (canonical agent_session_keys, model-checked).
+                    # None -> cold-start below, seeded from the thread's own
+                    # scoped context via inject_messages; the minted id is
+                    # written back to the THREAD, not the scalar.
+                    resume_id = req.thread_resume_id
+                    logger.info(
+                        "Thread-scoped turn: thread=%s resume=%s",
+                        thread_session_id, resume_id or "none (cold-start)",
+                    )
+                else:
+                    existing = await self._get_session(bot_slug)
+                    if existing:
+                        prev_sid, prev_model = existing
+                        if prev_model == model:
+                            resume_id = prev_sid
+                        else:
+                            logger.info(
+                                "Model changed (%s -> %s), starting new session for %s",
+                                prev_model, model, bot_slug or session_key,
+                            )
+                            await self._clear_session(bot_slug or session_key)
 
                 # TASK-445: cold start with no session to resume — first-ever
                 # run or post-model-switch. Seed from summary history so the new
@@ -228,7 +246,10 @@ class ClaudeSendMixin(ClaudeStreamMixin, ClaudeUsageMixin):
                 # seeded will have persisted a session, so _get_session found it
                 # and resume_id is set — this block is skipped (no double-seed).
                 if resume_id is None:
-                    cold_seed = await self._seed_new_session(bot_slug, model, injected=inject_messages)
+                    cold_seed = await self._seed_new_session(
+                        bot_slug, model, injected=inject_messages,
+                        thread_session_id=thread_session_id,
+                    )
                     if cold_seed and cold_seed.get("seeded"):
                         resume_id = cold_seed["session_id"]
                         logger.info(
@@ -515,7 +536,16 @@ class ClaudeSendMixin(ClaudeStreamMixin, ClaudeUsageMixin):
                                     if not resume_id:
                                         sid = data.get("session_id")
                                         if sid:
-                                            await self._set_session(bot_slug or session_key, sid, model)
+                                            # TASK-252: scoped turns persist to
+                                            # the thread, never the scalar.
+                                            if thread_scoped:
+                                                await self._set_thread_session(
+                                                    thread_session_id,
+                                                    bot_slug or session_key,
+                                                    sid, model,
+                                                )
+                                            else:
+                                                await self._set_session(bot_slug or session_key, sid, model)
                                     session_persisted = True
                                 # Track the session_id for this turn regardless of
                                 # resume state — used to read the compaction result
@@ -916,7 +946,11 @@ class ClaudeSendMixin(ClaudeStreamMixin, ClaudeUsageMixin):
                             )
                             if stderr_lines:
                                 logger.warning("Captured stderr before retry: %s", stderr_lines)
-                            await self._clear_session(bot_slug or session_key)
+                            # TASK-252: scoped turns never clear the scalar —
+                            # the wedged session belongs to the THREAD; a
+                            # fresh sid gets written back to it on retry.
+                            if not thread_scoped:
+                                await self._clear_session(bot_slug or session_key)
                             resume_id = None
                             continue
 

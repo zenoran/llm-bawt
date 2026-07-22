@@ -248,9 +248,33 @@ def backfill_sessions(
                 bot_id VARCHAR(64) NOT NULL,
                 started_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
                 ended_at TIMESTAMP,
+                archived_at TIMESTAMP,
                 status VARCHAR(16) NOT NULL DEFAULT 'active',
                 session_metadata JSONB
             )
+        """))
+        # TASK-250 gap (caught in review): tables bootstrapped before the
+        # status-lifecycle migration lack archived_at (and pre-284, user_id).
+        conn.execute(text("""
+            ALTER TABLE sessions ADD COLUMN IF NOT EXISTS user_id VARCHAR(64)
+        """))
+        conn.execute(text("""
+            ALTER TABLE sessions ADD COLUMN IF NOT EXISTS archived_at TIMESTAMP
+        """))
+        # Idempotent legacy migration: retire pre-TASK-250 'completed' rows
+        # and stamp archived_at (from ended_at) on archived rows missing it.
+        conn.execute(text("""
+            UPDATE sessions
+            SET status = 'archived',
+                archived_at = COALESCE(archived_at, ended_at)
+            WHERE status = 'completed'
+        """))
+        conn.execute(text("""
+            UPDATE sessions
+            SET archived_at = ended_at
+            WHERE status = 'archived'
+              AND archived_at IS NULL
+              AND ended_at IS NOT NULL
         """))
         conn.execute(text("""
             CREATE INDEX IF NOT EXISTS idx_sessions_bot_started
@@ -311,13 +335,15 @@ def backfill_sessions(
                     row.last_ts, tz=timezone.utc
                 )
 
+                # TASK-250 (review finding): an archived row must carry its
+                # archival timestamp — use the inferred ended_at.
                 insert_sql = text("""
                     INSERT INTO sessions
-                        (id, bot_id, started_at, ended_at, status,
+                        (id, bot_id, started_at, ended_at, archived_at, status,
                          session_metadata)
                     VALUES
-                        (:id, :bot_id, :started_at, :ended_at, 'archived',
-                         CAST(:metadata AS jsonb))
+                        (:id, :bot_id, :started_at, :ended_at, :ended_at,
+                         'archived', CAST(:metadata AS jsonb))
                     ON CONFLICT (id) DO NOTHING
                 """)
                 metadata_json = json.dumps({

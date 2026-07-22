@@ -115,6 +115,8 @@ class AgentBackendClient(LLMClient):
         # stream_raw's inject_messages). Threaded into the config _chat_full
         # hands the backend.
         inject_messages = kwargs.pop("inject_messages", None)
+        # TASK-252: request-local per-thread SDK binding (explicit-thread turn).
+        thread_binding = kwargs.pop("thread_binding", None)
 
         # Run the async backend call synchronously.
         # If there's already a running loop we schedule via run_in_executor.
@@ -128,10 +130,13 @@ class AgentBackendClient(LLMClient):
 
             with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
                 result = pool.submit(
-                    asyncio.run, self._chat_full(prompt, inject_messages)
+                    asyncio.run,
+                    self._chat_full(prompt, inject_messages, thread_binding),
                 ).result()
         else:
-            result = asyncio.run(self._chat_full(prompt, inject_messages))
+            result = asyncio.run(
+                self._chat_full(prompt, inject_messages, thread_binding)
+            )
 
         self.last_result = result
         return result.text if hasattr(result, "text") else str(result)
@@ -187,6 +192,10 @@ class AgentBackendClient(LLMClient):
         # (seed). Merged into config so the bridge receives it in the Redis
         # command and seeds WITHOUT calling back to /v1/history/context-seed.
         inject_messages = kwargs.pop("inject_messages", None)
+        # TASK-252: request-local per-thread SDK binding (explicit-thread
+        # turn). Merged into the per-call config COPY below — never written to
+        # the shared _bot_config, so concurrent turns cannot cross-bind.
+        thread_binding = kwargs.pop("thread_binding", None)
 
         # Extract system prompt from messages for backends that support it
         # (e.g. claude-code bridge). Merge into config so the backend can
@@ -200,6 +209,8 @@ class AgentBackendClient(LLMClient):
             config["system_prompt"] = "\n\n".join(p for p in system_parts if p)
         if inject_messages:
             config["inject_messages"] = inject_messages
+        if thread_binding:
+            config.update(thread_binding)
 
         if hasattr(self._backend, "stream_raw"):
             backend_kwargs: dict[str, Any] = {"attachments": attachments}
@@ -266,14 +277,25 @@ class AgentBackendClient(LLMClient):
     # Internal
     # ------------------------------------------------------------------
 
-    async def _chat_full(self, prompt: str, inject_messages: list | None = None) -> Any:
+    async def _chat_full(
+        self,
+        prompt: str,
+        inject_messages: list | None = None,
+        thread_binding: dict | None = None,
+    ) -> Any:
         """Call the backend's ``chat_full`` (or fall back to ``chat``)."""
         # TASK-501: merge the seed into the config the backend forwards to the
         # bridge (chat_full delegates to stream_raw, which reads
         # config["inject_messages"]). Copy so we never mutate shared _bot_config.
+        # TASK-252: thread_binding rides the same copy — request-local, never
+        # written to the shared _bot_config.
         config = self._bot_config
-        if inject_messages:
-            config = {**self._bot_config, "inject_messages": inject_messages}
+        if inject_messages or thread_binding:
+            config = {**self._bot_config}
+            if inject_messages:
+                config["inject_messages"] = inject_messages
+            if thread_binding:
+                config.update(thread_binding)
         if hasattr(self._backend, "chat_full"):
             return await self._backend.chat_full(prompt, config)
         # Fallback for backends that only implement chat()

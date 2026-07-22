@@ -127,6 +127,8 @@ def mirror_env(monkeypatch):
     store = SimpleNamespace(
         get_or_create_active_session=AsyncMock(return_value="thread-1"),
         update_session_metadata=AsyncMock(return_value=True),
+        # TASK-252: the mirror reads existing agent_session_keys to merge.
+        get_session=AsyncMock(return_value={"session_metadata": {}}),
     )
     monkeypatch.setattr(storage_mod, "get_storage", lambda: store)
     service = SimpleNamespace(config=SimpleNamespace(DEFAULT_USER="nick"))
@@ -160,6 +162,8 @@ class TestProviderSessionMirror:
         assert patch["provider_session_id"] == "new-sid-123"
         assert patch["provider_session_model"] == "glm-5.2"
         assert isinstance(patch["provider_session_updated_at"], float)
+        # TASK-252: mirror also maintains the canonical per-thread key map.
+        assert patch["agent_session_keys"] == {"claude_code": "new-sid-123"}
 
     def test_unchanged_session_key_is_not_stamped(self, mirror_env):
         _, store, call = mirror_env

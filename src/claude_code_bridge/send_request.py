@@ -39,6 +39,12 @@ class SendRequest:
     bot_context_window: int | None
     configured_disallowed_tools: object
     attachments: list[dict] = field(default_factory=list)
+    # TASK-252: explicit-thread turn — the app resolved the durable thread and
+    # its stored SDK session id. When thread_session_id is set the bridge
+    # resumes/persists the SDK session PER THREAD (never touching the bot's
+    # scalar session_key, which belongs to the continuous conversation).
+    thread_session_id: str | None = None
+    thread_resume_id: str | None = None
 
     @classmethod
     def from_fields(cls, fields: dict) -> "SendRequest":
@@ -121,6 +127,18 @@ class SendRequest:
         # falls back safely, and adds proxy-only exclusions.
         configured_disallowed_tools = fields.get("disallowed_tools")
 
+        # TASK-252: per-thread SDK binding. A resume value containing ":" is
+        # a routing key, never an SDK session id — drop it (same guard as the
+        # scalar path in session_ops._get_session).
+        thread_session_id = (fields.get("thread_session_id") or "").strip() or None
+        thread_resume_id = (fields.get("thread_resume_id") or "").strip() or None
+        if thread_resume_id and ":" in thread_resume_id:
+            logger.warning(
+                "Ignoring routing-key thread_resume_id for %s: %s",
+                bot_slug, thread_resume_id,
+            )
+            thread_resume_id = None
+
         attachments_raw = fields.get("attachments", "")
         attachments: list[dict] = []
         if attachments_raw:
@@ -144,4 +162,6 @@ class SendRequest:
             bot_context_window=bot_context_window,
             configured_disallowed_tools=configured_disallowed_tools,
             attachments=attachments,
+            thread_session_id=thread_session_id,
+            thread_resume_id=thread_resume_id,
         )
