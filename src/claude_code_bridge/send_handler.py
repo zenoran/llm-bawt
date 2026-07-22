@@ -51,9 +51,6 @@ from ._bridge_helpers import (
     _SEED_SANITIZE_RE,
     _XAI_RATES,
     _XAI_DEFAULT_RATES,
-    _CREDENTIALS_PATH,
-    _OAUTH_TOKEN_URL,
-    _OAUTH_CLIENT_ID,
     _REFRESH_BUFFER_MS,
     _bot_slug_from_session_key,
     _fmt_tokens,
@@ -61,10 +58,7 @@ from ._bridge_helpers import (
     _estimate_proxy_cost_usd,
     _pick_iteration_usage,
     _read_latest_compact_metadata,
-    _load_oauth_bundle,
-    _save_oauth_bundle,
     _token_expired_or_stale,
-    _refresh_oauth_bundle,
     _get_fresh_oauth_token,
     _is_cli_crash,
     _is_auth_failure,
@@ -74,6 +68,21 @@ from .send_stream import ClaudeStreamMixin
 from .send_usage import ClaudeUsageMixin
 
 logger = logging.getLogger("claude_code_bridge.bridge")
+
+
+def _classify_send_error(exc_text: str) -> str:
+    """TASK-637: tag credential-death errors with a structured marker.
+
+    A turn that dies on an expired/revoked Claude credential (after the
+    one-shot auth-retry above has already failed) gets a
+    ``[credential_expired:claude]`` prefix so the chat UI can deterministically
+    render the inline Reconnect flow (frontend: chat/CredentialErrorCard.tsx)
+    instead of a dead error bubble. Reuses the same matcher the auth-retry
+    path uses — one definition of "auth failure".
+    """
+    if _is_auth_failure(Exception(exc_text), []):
+        return f"[credential_expired:claude] {exc_text}"
+    return exc_text
 
 
 class ClaudeSendMixin(ClaudeStreamMixin, ClaudeUsageMixin):
@@ -960,7 +969,7 @@ class ClaudeSendMixin(ClaudeStreamMixin, ClaudeUsageMixin):
                 self._publish_event(
                     request_id, session_key, seq,
                     kind=AgentEventKind.ERROR,
-                    text=str(e),
+                    text=_classify_send_error(str(e)),
                 )
                 self._publisher.publish_run_done(request_id)
             finally:

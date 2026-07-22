@@ -8,13 +8,18 @@ from __future__ import annotations
 
 from ...utils.config import Config
 from .base import ProviderAdapter
-from .claude_sub import ClaudeSubAdapter
+from .claude import ClaudeAdapter
+from .codex import CodexAdapter
 from .github import GitHubAdapter
 
 # Adapter classes keyed by provider id. Extend here as providers are added.
+# TASK-635: the single `claude` adapter supersedes the old claude-sub +
+# claude-usage dual flow (ClaudeSubAdapter remains as its unregistered base).
+# TASK-637: `codex` is status-only (health/expiry) until TASK-636 phase 2.
 _ADAPTER_CLASSES: dict[str, type[ProviderAdapter]] = {
     GitHubAdapter.id: GitHubAdapter,
-    ClaudeSubAdapter.id: ClaudeSubAdapter,
+    ClaudeAdapter.id: ClaudeAdapter,
+    CodexAdapter.id: CodexAdapter,
 }
 
 
