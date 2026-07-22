@@ -75,8 +75,10 @@ def main() -> None:
     from .bridge import _get_fresh_oauth_token
     if not _get_fresh_oauth_token():
         logger.error(
-            "No OAuth token available. Either set CLAUDE_CODE_OAUTH_TOKEN "
-            "or mount ~/.claude/.credentials.json into the container."
+            "No OAuth token available. Mount the app-owned Claude credential "
+            "read-only and set CLAUDE_CREDENTIALS_PATH (TASK-635), or set "
+            "CLAUDE_CODE_OAUTH_TOKEN, or mount a legacy "
+            "~/.claude/.credentials.json into the container."
         )
         sys.exit(1)
 

@@ -35,6 +35,39 @@ STATUS_PENDING = "pending"
 STATUS_DISCONNECTED = "disconnected"
 STATUS_ERROR = "error"
 
+# Credential health states (TASK-637). ``warning`` is the load-bearing one: it
+# means "still working, but will break — act now" (e.g. refresh chain failing
+# while the access token is still valid).
+HEALTH_OK = "ok"
+HEALTH_WARNING = "warning"
+HEALTH_BROKEN = "broken"
+HEALTH_UNCONFIGURED = "unconfigured"
+HEALTH_UNKNOWN = "unknown"
+
+
+def health_block(
+    state: str,
+    *,
+    detail: str | None = None,
+    expires_at: int | None = None,
+    last_refresh_at: int | None = None,
+    fix: str | None = None,
+) -> dict[str, Any]:
+    """Normalized credential-health dict every adapter reports.
+
+    ``expires_at``/``last_refresh_at`` are epoch **milliseconds** (matching the
+    claudeAiOauth bundle convention). ``fix`` names the recovery action the UI
+    should offer (``"reconnect"`` → the adapter's own auth flow, ``"cli"`` →
+    an operator command described in ``detail``).
+    """
+    return {
+        "state": state,
+        "detail": detail,
+        "expires_at": expires_at,
+        "last_refresh_at": last_refresh_at,
+        "fix": fix,
+    }
+
 _SETTING_PREFIX = "provider_connection:"
 
 
@@ -208,7 +241,26 @@ class ProviderAdapter:
             "label": self.label,
             "auth_methods": list(self.auth_methods),
             "connection": (rec or ConnectionRecord(provider=self.id)).public(),
+            "health": self.health(),
         }
+
+    def health(self) -> dict[str, Any]:
+        """Normalized credential health — override where real expiry is known.
+
+        Default derives from the stored connection record only (fine for
+        adapters whose credentials don't age, e.g. GitHub App mints
+        installation tokens on demand).
+        """
+        rec = self.store.load(self.id)
+        if not rec or rec.status == STATUS_DISCONNECTED:
+            return health_block(HEALTH_UNCONFIGURED, detail="not connected")
+        if rec.status == STATUS_ERROR:
+            return health_block(
+                HEALTH_BROKEN,
+                detail=str(rec.meta.get("error") or "connection in error state"),
+                fix="reconnect",
+            )
+        return health_block(HEALTH_OK)
 
     # --- device oauth --------------------------------------------------------
     def start_device_flow(self) -> DeviceFlowStart:

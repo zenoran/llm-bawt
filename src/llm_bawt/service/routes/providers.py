@@ -55,6 +55,29 @@ async def list_providers():
     return {"providers": [a.descriptor() for a in all_adapters(service.config)]}
 
 
+@router.get("/v1/providers/health")
+async def providers_health():
+    """Cheap aggregate credential health for UI polling (TASK-637).
+
+    No secrets, no PTY, no upstream calls — file/DB reads only. Registered
+    BEFORE the ``{provider_id}`` route so "health" isn't captured as an id.
+    """
+    service = get_service()
+
+    def _collect() -> list[dict]:
+        out = []
+        for a in all_adapters(service.config):
+            try:
+                h = a.health()
+            except Exception as e:  # noqa: BLE001 — one bad adapter must not hide the rest
+                logger.warning("health probe failed for %s: %s", a.id, e)
+                h = {"state": "unknown", "detail": str(e)[:200]}
+            out.append({"id": a.id, "label": a.label, **h})
+        return out
+
+    return {"providers": await run_in_threadpool(_collect)}
+
+
 @router.get("/v1/providers/{provider_id}")
 async def get_provider(provider_id: str):
     return _adapter_or_404(provider_id).descriptor()
@@ -144,6 +167,34 @@ async def disconnect(provider_id: str):
     adapter = _adapter_or_404(provider_id)
     ok = await run_in_threadpool(adapter.disconnect)
     return {"disconnected": ok}
+
+
+# --- Claude token broker (TASK-635) -----------------------------------------
+@router.get("/v1/providers/claude/token")
+async def claude_access_token(request: Request, force: bool = False):
+    """Internal: hand a reader the current app-owned Claude access token.
+
+    The claude-code bridge calls this when its read-only view of the bundle
+    looks stale (or with ``?force=true`` after a 401). The app is the SOLE
+    refresher of the underlying rotate-on-use refresh chain — readers never
+    refresh. Same trust model as the git-credential endpoint above: internal
+    network only; if ``BRIDGE_CLAUDE_TOKEN_SECRET`` is set we additionally
+    require it via the ``X-Bridge-Token`` header for defense in depth.
+    """
+    from ..usage.claude_oauth import get_access_token  # noqa: PLC0415
+
+    expected = os.getenv("BRIDGE_CLAUDE_TOKEN_SECRET")
+    if expected and request.headers.get("X-Bridge-Token") != expected:
+        raise HTTPException(status_code=401, detail="bad bridge token")
+
+    result = await run_in_threadpool(get_access_token, force_refresh=force)
+    if result.token is None:
+        raise HTTPException(status_code=503, detail="no Claude credential installed")
+    return {
+        "access_token": result.token,
+        "expires_at": result.expires_at,
+        "state": result.state,
+    }
 
 
 # --- GitHub-specific --------------------------------------------------------

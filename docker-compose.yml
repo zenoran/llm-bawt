@@ -165,6 +165,10 @@ services:
       - ./.env
     environment:
       - CLAUDE_CODE_OAUTH_TOKEN=${CLAUDE_CODE_OAUTH_TOKEN:-}
+      # TASK-635: the bridge is a READ-ONLY consumer of the app-owned Claude
+      # credential (single login, app is sole refresher). Points at the
+      # read-only mount below; falls back to GET /v1/providers/claude/token.
+      - CLAUDE_CREDENTIALS_PATH=/home/bridge/.claude-broker/.credentials.json
       # CLAUDE_CODE_MODEL intentionally not set — there is no default
       # model.  Each request carries its model, resolved from the bot's
       # default_model catalog entry (type=claude-code).  See
@@ -204,6 +208,10 @@ services:
       - ${HOME}/dev:/home/bridge/dev
       - ${HOME}/.config/claude-code-bridge:/home/bridge/.claude
       - ${HOME}/.config/claude-code-bridge/.claude.json:/home/bridge/.claude.json
+      # TASK-635: app-owned Claude credential, read-only. Mount the DIRECTORY
+      # (not the file) — the app refreshes via tmp+rename, and a single-file
+      # bind mount would pin the old inode (codex auth.json EBUSY class).
+      - ${HOME}/.config/llm-bawt/claude-usage:/home/bridge/.claude-broker:ro
       # Bridge SSH identity. Default = the host operator's ~/.ssh (echo today,
       # for non-GitHub SSH targets). NOTE: tenant GitHub auth no longer relies on
       # a hand-made deploy key — it uses the provider-connect git credential

@@ -29,7 +29,7 @@ from ..canonical import (
     STATUS_STALE,
     STATUS_ERROR,
 )
-from ..claude_oauth import load_usage_token, usage_credentials_path
+from ..claude_oauth import credentials_mode, load_usage_token, usage_credentials_path
 
 logger = logging.getLogger(__name__)
 
@@ -185,15 +185,25 @@ class ClaudeUsageAdapter(UsageAdapter):
                 ),
             )
         if cred.state == "stale":
-            return self._base(
-                available=False,
-                status=STATUS_STALE,
-                error=(
+            if credentials_mode() == "owned":
+                error = (
+                    "Owned usage credential could not be refreshed (refresh "
+                    "token rejected upstream). Re-mint the dedicated login: "
+                    "isolated `claude login` + copy the bundle to "
+                    f"{usage_credentials_path()}. Using Claude Code does NOT "
+                    "fix this — the owned bundle is a separate login."
+                )
+            else:
+                error = (
                     "Usage credential's access token has expired. It refreshes "
                     "automatically the next time you use Claude Code (the shared "
                     "login owner); this app does not refresh it to avoid rotating "
                     "the token out from under your session."
-                ),
+                )
+            return self._base(
+                available=False,
+                status=STATUS_STALE,
+                error=error,
             )
         token = cred.token
         headers = {

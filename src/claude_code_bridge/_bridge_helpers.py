@@ -190,25 +190,44 @@ def _read_latest_compact_metadata(session_id: str | None) -> dict | None:
         return None
 
 
-_CREDENTIALS_PATH = Path.home() / ".claude" / ".credentials.json"
-_OAUTH_TOKEN_URL = "https://platform.claude.com/v1/oauth/token"
-_OAUTH_CLIENT_ID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e"
+# TASK-635: the bridge is a READ-ONLY consumer of the app-owned Claude
+# credential. The app (llm-bawt) is the sole refresher of the rotate-on-use
+# refresh chain — the bridge must NEVER refresh or write a bundle (two
+# independent refreshers racing on one bundle is the exact invalid_grant
+# failure this design removes).
+#
+# Resolution order:
+#   1. the app-maintained bundle, read-only mounted at CLAUDE_CREDENTIALS_PATH
+#   2. the app's token broker endpoint (GET /v1/providers/claude/token) when
+#      the file looks stale/missing or a caller forces (post-401 retry)
+#   3. the legacy self-owned bundle at ~/.claude/.credentials.json (read-only
+#      now — pre-cutover deployments keep working until their token lapses)
+#   4. env CLAUDE_CODE_OAUTH_TOKEN (long-lived setup-token)
+
+_LEGACY_CREDENTIALS_PATH = Path.home() / ".claude" / ".credentials.json"
 _REFRESH_BUFFER_MS = 5 * 60 * 1000
 
 
-def _load_oauth_bundle() -> tuple[dict, dict | None]:
-    """Return (raw_credentials, claudeAiOauth bundle)."""
-    if not _CREDENTIALS_PATH.exists():
-        return {}, None
-    data = json.loads(_CREDENTIALS_PATH.read_text())
-    oauth = data.get("claudeAiOauth") or None
-    return data, oauth
+def _broker_credentials_path() -> Path | None:
+    p = os.environ.get("CLAUDE_CREDENTIALS_PATH")
+    return Path(p) if p else None
 
 
-def _save_oauth_bundle(raw_credentials: dict, oauth: dict) -> None:
-    raw_credentials["claudeAiOauth"] = oauth
-    _CREDENTIALS_PATH.parent.mkdir(parents=True, exist_ok=True)
-    _CREDENTIALS_PATH.write_text(json.dumps(raw_credentials, indent=2))
+def _read_oauth_bundle(path: Path) -> dict | None:
+    """Read a claudeAiOauth bundle (wrapper or bare form). Never writes."""
+    try:
+        if not path.exists():
+            return None
+        data = json.loads(path.read_text())
+    except Exception as e:
+        logger.warning("Failed to read Claude credential %s: %s", path, e)
+        return None
+    if not isinstance(data, dict):
+        return None
+    bundle = data.get("claudeAiOauth")
+    if bundle is None and data.get("accessToken"):
+        bundle = data
+    return bundle if isinstance(bundle, dict) else None
 
 
 def _token_expired_or_stale(expires_at: int | None) -> bool:
@@ -218,58 +237,79 @@ def _token_expired_or_stale(expires_at: int | None) -> bool:
     return (now_ms + _REFRESH_BUFFER_MS) >= int(expires_at)
 
 
-def _refresh_oauth_bundle(oauth: dict, *, raw_credentials: dict | None = None) -> dict:
-    refresh_token = oauth.get("refreshToken")
-    if not refresh_token:
-        raise RuntimeError("Claude OAuth refresh token missing")
-
-    scopes = oauth.get("scopes") or []
-    resp = httpx.post(
-        _OAUTH_TOKEN_URL,
-        json={
-            "grant_type": "refresh_token",
-            "refresh_token": refresh_token,
-            "client_id": _OAUTH_CLIENT_ID,
-            "scope": " ".join(scopes),
-        },
-        headers={"Content-Type": "application/json"},
-        timeout=15.0,
-    )
-    if resp.is_error:
-        detail = (resp.text or "").strip().replace("\n", " ")[:500]
-        raise RuntimeError(f"Claude OAuth refresh failed ({resp.status_code}): {detail}")
-    payload = resp.json()
-
-    refreshed = {
-        **oauth,
-        "accessToken": payload["access_token"],
-        "refreshToken": payload.get("refresh_token", refresh_token),
-        "expiresAt": int(time.time() * 1000) + int(payload["expires_in"]) * 1000,
-        "scopes": payload.get("scope", "").split() if payload.get("scope") else scopes,
-    }
-    if raw_credentials is not None:
-        try:
-            _save_oauth_bundle(raw_credentials, refreshed)
-        except Exception as e:
-            logger.warning("Refreshed Claude OAuth token but could not persist credentials file: %s", e)
-    return refreshed
+def _fetch_broker_token(*, force: bool = False) -> str | None:
+    """Ask the app for the current access token (it refreshes if needed)."""
+    api_url = (os.environ.get("LLM_BAWT_API_URL") or "").rstrip("/")
+    if not api_url:
+        return None
+    headers = {}
+    secret = os.environ.get("BRIDGE_CLAUDE_TOKEN_SECRET")
+    if secret:
+        headers["X-Bridge-Token"] = secret
+    try:
+        resp = httpx.get(
+            f"{api_url}/v1/providers/claude/token",
+            params={"force": "true"} if force else None,
+            headers=headers,
+            timeout=25.0,  # a broker-side upstream refresh can take ~15s
+        )
+        if resp.is_error:
+            logger.warning(
+                "Claude token broker returned %s: %s",
+                resp.status_code,
+                (resp.text or "")[:200],
+            )
+            return None
+        payload = resp.json()
+        token = payload.get("access_token")
+        if token:
+            logger.info("Fetched Claude access token from app broker (state=%s)", payload.get("state"))
+        return token or None
+    except Exception as e:
+        logger.warning("Claude token broker unreachable: %s", e)
+        return None
 
 
 def _get_fresh_oauth_token(*, force_refresh: bool = False) -> str | None:
-    """Return a valid Claude OAuth token, refreshing file-backed creds when needed."""
-    try:
-        raw_credentials, oauth = _load_oauth_bundle()
-        if oauth:
-            if force_refresh or _token_expired_or_stale(oauth.get("expiresAt")):
-                oauth = _refresh_oauth_bundle(oauth, raw_credentials=raw_credentials)
-                logger.info("Refreshed Claude OAuth token from credentials file")
-            token = oauth.get("accessToken")
-            if token:
+    """Return a valid Claude OAuth access token WITHOUT ever refreshing.
+
+    ``force_refresh`` (post-401 retry) skips the file fast-path and asks the
+    app broker to force an upstream refresh.
+    """
+    broker_path = _broker_credentials_path()
+    stale_candidate: str | None = None
+
+    # 1. App-maintained bundle on the read-only mount (fast path).
+    if broker_path is not None:
+        bundle = _read_oauth_bundle(broker_path)
+        if bundle:
+            token = bundle.get("accessToken")
+            if token and not force_refresh and not _token_expired_or_stale(bundle.get("expiresAt")):
                 return token
-    except Exception as e:
-        logger.warning("Failed to load/refresh Claude OAuth token from credentials file: %s", e)
-    # Fall back to env var
-    return os.environ.get("CLAUDE_CODE_OAUTH_TOKEN")
+            stale_candidate = token or stale_candidate
+
+    # 2. Broker endpoint — the app refreshes (it is the sole refresher).
+    token = _fetch_broker_token(force=force_refresh)
+    if token:
+        return token
+
+    # 3. Legacy self-owned bundle, READ-ONLY (pre-cutover compatibility).
+    bundle = _read_oauth_bundle(_LEGACY_CREDENTIALS_PATH)
+    if bundle:
+        token = bundle.get("accessToken")
+        if token and not _token_expired_or_stale(bundle.get("expiresAt")):
+            return token
+        stale_candidate = stale_candidate or token
+
+    # 4. Long-lived setup-token from env.
+    env_token = os.environ.get("CLAUDE_CODE_OAUTH_TOKEN")
+    if env_token:
+        return env_token
+
+    # Last resort: a stale token beats none (clock skew may save it).
+    if stale_candidate:
+        logger.warning("Only a stale Claude access token is available — using it anyway")
+    return stale_candidate
 
 
 def _is_cli_crash(exc: Exception) -> bool:

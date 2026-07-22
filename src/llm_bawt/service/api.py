@@ -356,6 +356,15 @@ async def lifespan(app):
         config.MCP_SERVER_URL or "",
     )
 
+    # TASK-635: the app is the SOLE refresher of the app-owned Claude
+    # credential (bridge + usage are read-only consumers). Keep it fresh
+    # proactively so readers never see a lapsed token, even when idle.
+    # NB: local asyncio alias — the conditional `import asyncio` above
+    # shadows the module-level import inside this function scope.
+    import asyncio as _aio
+    from .usage.claude_oauth import proactive_refresh_loop
+    service._claude_refresh_task = _aio.create_task(proactive_refresh_loop())
+
     try:
         yield
     finally:
@@ -367,7 +376,7 @@ async def lifespan(app):
         #     except (asyncio.CancelledError, Exception):
         #         pass
         # Cancel background tasks
-        for task_attr in ("_group_cleanup_task", "_tool_persist_task"):
+        for task_attr in ("_group_cleanup_task", "_tool_persist_task", "_claude_refresh_task"):
             task = getattr(service, task_attr, None)
             if task:
                 task.cancel()

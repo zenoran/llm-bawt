@@ -55,11 +55,29 @@ In the main compose stack, the app is configured for `owned` mode and uses:
 
 `/root/.config/llm-bawt/claude-usage/.credentials.json`
 
+### TASK-635: this is now THE Claude credential (single login)
+
+The owned bundle is no longer usage-only — it is the deployment's ONE Claude
+credential. The `claude` provider adapter's wizard login mints a full-scope
+bundle (`user:inference` + `user:profile` + …); the app is the sole refresher
+(serialized + a proactive lifespan loop that refreshes at `expiresAt − 20min`,
+so it never lapses even when idle). Consumers are read-only:
+
+- the usage adapter (same process),
+- the claude-code bridge, via a read-only compose mount
+  (`CLAUDE_CREDENTIALS_PATH`) with `GET /v1/providers/claude/token` as its
+  stale-file/force fallback (the app refreshes on demand; optional
+  `BRIDGE_CLAUDE_TOKEN_SECRET` guards the endpoint via `X-Bridge-Token`).
+
+The bridge never refreshes — the old dual-login (`claude-sub` + `claude-usage`)
+and its refresh-rotation race are gone.
+
 ## Relevant environment variables
 
 | Variable | Default | Purpose |
 |---|---|---|
-| `CLAUDE_USAGE_CREDENTIALS_PATH` | `~/.config/llm-bawt/claude-usage-credentials.json` | Claude usage bundle path |
+| `CLAUDE_CREDENTIALS_PATH` | unset | Preferred bundle-path override (TASK-635 name) |
+| `CLAUDE_USAGE_CREDENTIALS_PATH` | `~/.config/llm-bawt/claude-usage-credentials.json` | Legacy bundle-path env (still honored) |
 | `CLAUDE_USAGE_CREDENTIALS_MODE` | `shared` | `shared` or `owned` |
 | `LLM_BAWT_USAGE_CACHE_TTL` | `120` | Cache TTL in seconds |
 | `ZAI_API_KEY` | unset | Required for live z.ai usage |
