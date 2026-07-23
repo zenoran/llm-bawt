@@ -349,6 +349,13 @@ class BackgroundService(
                 # TASK-501: pre-assemble the fresh-session seed and push it to
                 # the bridge (inject_messages) — SAME shared helper the streaming
                 # path uses, so non-streaming stays consistent (no callback).
+                # TASK-641: on /new, summarize the OUTGOING thread FIRST so
+                # the seed below carries a fresh summary of the ending
+                # conversation (bounded; no-op unless /new + scope carries
+                # summaries). SAME shared helper as the streaming path.
+                self._maybe_summarize_on_new(
+                    llm_bawt, bot_id, user_prompt, thread_binding=thread_binding
+                )
                 from .routes.history import maybe_build_session_seed
                 inject_seed_messages = maybe_build_session_seed(
                     llm_bawt, bot_id, model_alias, user_prompt, self,

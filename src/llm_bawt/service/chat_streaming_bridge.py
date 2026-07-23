@@ -201,6 +201,105 @@ class ChatStreamingBridgeMixin:
             log.warning("Agent thread binding failed: %s", e)
             return None
 
+    def _maybe_summarize_on_new(
+        self, llm_bawt, bot_id: str, user_prompt: str,
+        thread_binding: dict | None = None, timeout_s: float = 8.0,
+    ) -> bool:
+        """TASK-641: summarize the OUTGOING thread before the /new seed builds.
+
+        Runs on ``/new`` only (same gate as ``_maybe_rotate_agent_session``,
+        shared by BOTH dispatch paths), BEFORE ``maybe_build_session_seed`` —
+        so the seed's summary bucket includes a fresh summary of the
+        conversation that just ended, via THE common per-thread unit
+        (``HistorySummarizer.summarize_thread``, same function the background
+        job calls).
+
+        Gated on the bot's ``history_scope`` including summaries: with
+        summaries off, summarizing would only STARVE the seed (flagged rows
+        leave the raw pool and no summary bucket exists to carry the result).
+
+        Bounded: the summarize (LLM attempt with short timeout -> heuristic
+        fallback -> DB write) runs in a worker thread joined for at most
+        ``timeout_s``. On timeout the turn proceeds without waiting — the
+        summary commits moments later against the (by then archived) thread
+        with its session_id stamp intact, and the seed degrades to today's
+        raw-only behavior. Never raises; failure costs nothing.
+        """
+        try:
+            if not (user_prompt or "").lstrip().startswith("/new"):
+                return False
+            if thread_binding and thread_binding.get("thread_session_id"):
+                return False
+            from ..utils.history import scope_flags
+            try:
+                scope = llm_bawt.config_resolver.resolve_config_setting(
+                    "history_scope"
+                ).value
+            except Exception:
+                scope = None
+            _, include_summaries = scope_flags(scope)
+            if not include_summaries:
+                return False
+
+            backend = getattr(llm_bawt.history_manager, "_db_backend", None)
+            if backend is None:
+                return False
+            session_id = str(getattr(backend, "_current_session_id", "") or "")
+            if not session_id:
+                return False
+
+            import threading
+
+            from ..memory.summarization import (
+                HistorySummarizer,
+                summarize_session_with_llm,
+            )
+
+            llm_timeout = max(1.0, timeout_s - 2.0)
+
+            def _bounded_llm(session):
+                return summarize_session_with_llm(
+                    session, config=self.config, timeout=llm_timeout,
+                )
+
+            def _work():
+                try:
+                    summarizer = HistorySummarizer(
+                        self.config, bot_id=bot_id, summarize_fn=_bounded_llm,
+                    )
+                    result = summarizer.summarize_thread(
+                        session_id, protect_recent_turns=True,
+                    )
+                    log.info(
+                        "/new pre-seed summarization: bot=%s thread=%s "
+                        "created=%s messages=%s errors=%s",
+                        bot_id, session_id[:8],
+                        result.get("summaries_created"),
+                        result.get("messages_summarized"),
+                        result.get("errors") or None,
+                    )
+                except Exception as e:
+                    log.warning(
+                        "/new pre-seed summarization failed for %s: %s", bot_id, e
+                    )
+
+            worker = threading.Thread(
+                target=_work, daemon=True, name=f"new-summarize-{bot_id}",
+            )
+            worker.start()
+            worker.join(timeout=timeout_s)
+            if worker.is_alive():
+                log.warning(
+                    "/new summarization still running after %.0fs for bot=%s — "
+                    "proceeding without it (summary will land on the archived "
+                    "thread)", timeout_s, bot_id,
+                )
+                return False
+            return True
+        except Exception as e:
+            log.warning("/new summarize gate failed for %s: %s", bot_id, e)
+            return False
+
     def _maybe_rotate_agent_session(
         self, llm_bawt, bot_id: str, user_prompt: str, thread_binding: dict | None = None,
     ) -> str | None | bool:

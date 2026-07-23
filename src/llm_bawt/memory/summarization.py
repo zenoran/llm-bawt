@@ -332,11 +332,18 @@ def is_summary_low_quality(text: str, source_session: "Session | None" = None) -
 
 @dataclass
 class Session:
-    """A detected conversation session."""
+    """A detected conversation session.
+
+    TASK-641: ``session_id`` is the durable DB thread the messages belong to
+    when the window was cut along thread boundaries (the live path). ``None``
+    only for legacy gap-detected windows (re-split tooling / NULL-session
+    fallback).
+    """
     start_timestamp: float
     end_timestamp: float
     messages: list[dict]
     message_ids: list[str]
+    session_id: str | None = None
 
     @property
     def message_count(self) -> int:
@@ -449,6 +456,56 @@ def detect_sessions(
     return sessions
 
 
+def group_messages_by_thread(
+    messages: list[dict],
+    session_gap_seconds: int = 3600,
+) -> list[Session]:
+    """Group messages into Sessions along durable-thread boundaries (TASK-641).
+
+    The durable ``session_id`` stamped on every message row IS the
+    conversation boundary — one Session per distinct thread, so a
+    summarization window can never span threads and every summary gets a
+    structural (not incidental) session_id stamp.
+
+    Messages without a ``session_id`` (legacy rows predating thread linkage)
+    fall back to timestamp-gap detection (``detect_sessions``) so they still
+    summarize; in the live deployment that set is empty (TASK-630 verified
+    0 orphans).
+
+    Returns Sessions sorted by start timestamp, mirroring detect_sessions.
+    """
+    if not messages:
+        return []
+
+    sorted_msgs = sorted(messages, key=lambda m: (m.get("timestamp", 0), str(m.get("id", ""))))
+
+    by_thread: dict[str, list[dict]] = {}
+    orphans: list[dict] = []
+    for msg in sorted_msgs:
+        if msg.get("role") == "summary":
+            continue
+        sid = msg.get("session_id")
+        if sid:
+            by_thread.setdefault(str(sid), []).append(msg)
+        else:
+            orphans.append(msg)
+
+    sessions: list[Session] = []
+    for sid, msgs in by_thread.items():
+        sessions.append(Session(
+            start_timestamp=msgs[0].get("timestamp", 0),
+            end_timestamp=msgs[-1].get("timestamp", 0),
+            messages=msgs,
+            message_ids=[m.get("id", "") for m in msgs],
+            session_id=sid,
+        ))
+
+    if orphans:
+        sessions.extend(detect_sessions(orphans, session_gap_seconds))
+
+    return sorted(sessions, key=lambda s: s.start_timestamp)
+
+
 def find_budget_overflow_sessions(
     all_messages: list[dict],
     session_gap_seconds: int = 3600,
@@ -520,8 +577,11 @@ def find_budget_overflow_sessions(
     if not overflow_messages:
         return []
 
-    # Detect sessions within the overflow messages
-    sessions = detect_sessions(overflow_messages, session_gap_seconds)
+    # TASK-641: cut windows along durable-thread boundaries, not time gaps —
+    # a window can never span threads, so every summary stamps one session_id.
+    # (Gap detection survives only as the fallback for NULL-session legacy
+    # rows inside group_messages_by_thread, and for the re-split tooling.)
+    sessions = group_messages_by_thread(overflow_messages, session_gap_seconds)
 
     # Filter to sessions with enough messages to be worth summarizing
     return [s for s in sessions if s.message_count >= min_messages_per_session]
@@ -623,6 +683,7 @@ def split_session_into_chunks(
                 end_timestamp=current_msgs[-1].get("timestamp", 0),
                 messages=current_msgs.copy(),
                 message_ids=current_ids.copy(),
+                session_id=session.session_id,
             ))
             current_msgs = []
             current_ids = []
@@ -639,6 +700,7 @@ def split_session_into_chunks(
             end_timestamp=current_msgs[-1].get("timestamp", 0),
             messages=current_msgs.copy(),
             message_ids=current_ids.copy(),
+            session_id=session.session_id,
         ))
     
     logger.info(f"Split session with {session.message_count} messages into {len(chunks)} chunks")
@@ -859,7 +921,7 @@ class HistorySummarizer:
         with self._backend.engine.connect() as conn:
             from sqlalchemy import text
             sql = text(f"""
-                SELECT id, role, content, timestamp, summarized, recalled_history, summary_metadata
+                SELECT id, role, content, timestamp, summarized, recalled_history, summary_metadata, session_id
                 FROM {self._backend._messages_table_name}
                 ORDER BY timestamp ASC
             """)
@@ -873,6 +935,7 @@ class HistorySummarizer:
                     "summarized": row.summarized,
                     "recalled_history": row.recalled_history,
                     "summary_metadata": row.summary_metadata,
+                    "session_id": row.session_id,
                 }
                 for row in rows
             ]
@@ -1134,9 +1197,14 @@ class HistorySummarizer:
                 "content": normalized_text,
                 "timestamp": session.end_timestamp,
                 "metadata": json.dumps(summary_metadata),
-                # Single-thread source -> stamp the column; multi/none -> NULL
-                # (provenance detail stays in summary_metadata.source_session_ids).
-                "session_id": source_session_ids[0] if len(source_session_ids) == 1 else None,
+                # TASK-641: the Session's own thread id is authoritative when
+                # the window was cut along thread boundaries (the live path);
+                # otherwise fall back to the single-distinct-source stamp.
+                # Multi/none -> NULL (provenance detail stays in
+                # summary_metadata.source_session_ids).
+                "session_id": session.session_id or (
+                    source_session_ids[0] if len(source_session_ids) == 1 else None
+                ),
             })
 
             conn.commit()
@@ -1153,6 +1221,106 @@ class HistorySummarizer:
             "replaced_existing": replaced_existing,
             "session_start": session.start_timestamp,
             "session_end": session.end_timestamp,
+        }
+
+    def summarize_thread(
+        self,
+        session_id: str,
+        message_ids: list[str] | None = None,
+        use_heuristic_fallback: bool = True,
+        protect_recent_turns: bool = False,
+        max_tokens_per_chunk: int = 4000,
+    ) -> dict:
+        """THE common per-thread summarization unit (TASK-641).
+
+        Shared by BOTH callers so they cannot drift:
+        - the background job passes the ``message_ids`` its budget-overflow
+          pass selected for this thread (protection already applied there);
+        - the ``/new`` path passes no ids — the whole thread's eligible
+          unsummarized rows are summarized, minus the protected recent tail
+          when ``protect_recent_turns`` is set (keeps the seed's
+          high-fidelity raw tail instead of degrading it to summaries-only).
+
+        Chunks large threads exactly like the job path and stores each chunk
+        via ``summarize_session`` — so every summary row created here carries
+        this thread's ``session_id`` structurally.
+
+        Returns an aggregate dict: ``{"success", "summaries_created",
+        "messages_summarized", "results", "errors"}``. Never raises.
+        """
+        from sqlalchemy import text as _sql_text
+
+        try:
+            with self._backend.engine.connect() as conn:
+                rows = conn.execute(
+                    _sql_text(f"""
+                        SELECT id, role, content, timestamp, session_id
+                        FROM {self._backend._messages_table_name}
+                        WHERE session_id = :sid
+                          AND role IN ('user', 'assistant')
+                          AND COALESCE(summarized, FALSE) = FALSE
+                          AND COALESCE(recalled_history, FALSE) = FALSE
+                        ORDER BY timestamp ASC, id ASC
+                    """),
+                    {"sid": session_id},
+                ).fetchall()
+        except Exception as e:
+            logger.error(f"summarize_thread: failed to load thread {session_id}: {e}")
+            return {"success": False, "summaries_created": 0,
+                    "messages_summarized": 0, "results": [], "errors": [str(e)]}
+
+        msgs = [
+            {"id": r.id, "role": r.role, "content": r.content,
+             "timestamp": r.timestamp, "session_id": r.session_id}
+            for r in rows
+        ]
+        if message_ids is not None:
+            wanted = set(message_ids)
+            msgs = [m for m in msgs if m["id"] in wanted]
+        elif protect_recent_turns:
+            n_protected = self.protected_recent_turns * 2
+            if n_protected > 0:
+                msgs = msgs[:-n_protected] if len(msgs) > n_protected else []
+
+        if len(msgs) < self.min_messages_per_session:
+            return {"success": True, "summaries_created": 0,
+                    "messages_summarized": 0, "results": [], "errors": []}
+
+        session = Session(
+            start_timestamp=msgs[0]["timestamp"],
+            end_timestamp=msgs[-1]["timestamp"],
+            messages=msgs,
+            message_ids=[m["id"] for m in msgs],
+            session_id=str(session_id),
+        )
+
+        results: list[dict] = []
+        errors: list[str] = []
+        created = 0
+        total_messages = 0
+        for i, chunk in enumerate(split_session_into_chunks(session, max_tokens_per_chunk)):
+            try:
+                result = self.summarize_session(chunk, use_heuristic_fallback)
+            except Exception as e:
+                errors.append(f"thread {session_id} chunk {i + 1}: {e}")
+                continue
+            if result.get("success"):
+                results.append(result)
+                if result.get("created", True):
+                    created += 1
+                    total_messages += chunk.message_count
+            else:
+                errors.append(
+                    f"thread {session_id} chunk {i + 1}: "
+                    f"{result.get('error', 'Unknown error')}"
+                )
+
+        return {
+            "success": not errors or created > 0,
+            "summaries_created": created,
+            "messages_summarized": total_messages,
+            "results": results,
+            "errors": errors,
         }
 
     def _summarize_sessions_batch(
@@ -1429,7 +1597,27 @@ class HistorySummarizer:
         if created_count == 0 and not results and not errors:
             for session in eligible:
                 try:
-                    # Check if session needs to be chunked
+                    if session.session_id:
+                        # TASK-641: thread-keyed window — route through THE
+                        # common per-thread unit (same function the /new path
+                        # calls) so job and /new summaries cannot drift.
+                        thread_result = self.summarize_thread(
+                            session_id=session.session_id,
+                            message_ids=session.message_ids,
+                            use_heuristic_fallback=use_heuristic_fallback,
+                            max_tokens_per_chunk=max_tokens_per_chunk,
+                        )
+                        results.extend(thread_result.get("results", []))
+                        errors.extend(thread_result.get("errors", []))
+                        created_count += thread_result.get("summaries_created", 0)
+                        total_messages += thread_result.get("messages_summarized", 0)
+                        skipped_existing_count += sum(
+                            1 for r in thread_result.get("results", [])
+                            if not r.get("created", True)
+                        )
+                        continue
+
+                    # Legacy fallback: NULL-session rows (gap-detected window)
                     chunks = split_session_into_chunks(session, max_tokens_per_chunk)
 
                     for i, chunk in enumerate(chunks):

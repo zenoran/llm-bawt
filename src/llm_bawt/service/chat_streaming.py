@@ -388,6 +388,10 @@ class ChatStreamingMixin(ChatStreamingBridgeMixin):
             _stripped = (user_prompt or "").lstrip()
             _low = _stripped.lower()
             if _low == "/new" or _low.startswith("/new ") or _low.startswith("/new\n"):
+                # TASK-641: summarize the outgoing thread BEFORE rotation so
+                # the next turn's context (rebuilt every turn for chat bots)
+                # carries a summary of the conversation that just ended.
+                self._maybe_summarize_on_new(llm_bawt, bot_id, user_prompt)
                 # TASK-284: /new rotates the durable DB thread
                 # (non-destructive). Nothing is deleted on failure — the
                 # thread simply doesn't advance, so log loudly and move on.
@@ -478,6 +482,14 @@ class ChatStreamingMixin(ChatStreamingBridgeMixin):
             # /v1/history/context-seed. Shared decision helper — SAME logic the
             # non-streaming path uses (background_service.chat_completion) so the
             # two dispatch routes stay consistent.
+            # TASK-641: on /new, summarize the OUTGOING thread FIRST so the
+            # seed below finds a fresh summary of the ending conversation in
+            # its summary bucket (bounded; no-op unless /new + scope carries
+            # summaries). Shared helper — same gate + same per-thread unit on
+            # both dispatch paths.
+            self._maybe_summarize_on_new(
+                llm_bawt, bot_id, user_prompt, thread_binding=thread_binding
+            )
             from .routes.history import maybe_build_session_seed
             from .dependencies import get_service
             inject_seed_messages = maybe_build_session_seed(
