@@ -245,8 +245,8 @@ class BotProfileStore:
                     row.avatar = payload.get("avatar")
                 if "avatar_render" in payload:
                     row.avatar_render = payload.get("avatar_render")
-                if payload.get("default_voice") is not None:
-                    row.default_voice = payload["default_voice"]
+                if "default_voice" in payload:
+                    row.default_voice = payload.get("default_voice")
                 if payload.get("nextcloud_config") is not None:
                     row.nextcloud_config = payload["nextcloud_config"]
                 if "agent_backend" in payload:
