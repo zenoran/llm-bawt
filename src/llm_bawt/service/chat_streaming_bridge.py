@@ -229,6 +229,7 @@ class ChatStreamingBridgeMixin:
             if not (user_prompt or "").lstrip().startswith("/new"):
                 return False
             if thread_binding and thread_binding.get("thread_session_id"):
+                log.info("/new summarize skipped: thread-bound turn (bot=%s)", bot_id)
                 return False
             from ..utils.history import scope_flags
             try:
@@ -239,14 +240,36 @@ class ChatStreamingBridgeMixin:
                 scope = None
             _, include_summaries = scope_flags(scope)
             if not include_summaries:
+                log.info(
+                    "/new summarize skipped: scope=%r has no summaries (bot=%s)",
+                    scope, bot_id,
+                )
                 return False
 
             backend = getattr(llm_bawt.history_manager, "_db_backend", None)
             if backend is None:
+                log.info("/new summarize skipped: no db backend (bot=%s)", bot_id)
                 return False
             session_id = str(getattr(backend, "_current_session_id", "") or "")
             if not session_id:
+                # MCP server mode: _db_backend is the _MCPShortTermManager
+                # proxy, which keeps no local session cache — resolve the
+                # active thread through its memory client, the SAME resolver
+                # the session-scoped read path uses (load_session_scoped).
+                mc = getattr(backend, "_memory_client", None)
+                getter = getattr(mc, "get_active_session", None) if mc else None
+                try:
+                    active = getter() if callable(getter) else None
+                except Exception:
+                    active = None
+                session_id = str((active or {}).get("id") or "")
+            if not session_id:
+                log.info("/new summarize skipped: no session id (bot=%s)", bot_id)
                 return False
+            log.info(
+                "/new pre-seed summarize starting: bot=%s thread=%s",
+                bot_id, session_id[:8],
+            )
 
             import threading
 
