@@ -124,6 +124,23 @@ SETTING_DEFINITIONS: dict[str, SettingDefinition] = {
         ),
         legacy_keys=("max_context_tokens",),
     ),
+    "history_max_age_hours": SettingDefinition(
+        key="history_max_age_hours",
+        type="int",
+        default=0,
+        applies_to=BOT_TYPES_ALL,
+        storage=STORAGE_RUNTIME_SETTING,
+        label="Raw history max age (hours)",
+        help=(
+            "Age bound on the raw inline-history bucket (TASK-647): messages "
+            "older than this many hours are excluded from context regardless of "
+            "the history_tokens budget. 0 = no age limit (default). Bounds raw "
+            "history ONLY — summaries are unaffected (they carry their own "
+            "temporal framing and are capped by summary_count). A stale-enough "
+            "conversation therefore seeds summary-first instead of replaying "
+            "day-old raw messages."
+        ),
+    ),
     "summary_count": SettingDefinition(
         key="summary_count",
         type="int",

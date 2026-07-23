@@ -283,3 +283,61 @@ def test_seed_over_system_budget_does_not_hard_fail() -> None:
     # no raise; system not delivered so it can't overflow the seed budget
     seed = history.get_context_messages(max_tokens=3, charge_system=False)
     assert seed is not None
+
+
+# ── TASK-647: history_max_age_hours bounds the raw bucket by age ──
+
+
+def test_max_age_drops_old_raw_keeps_recent_and_summaries() -> None:
+    import time as _time
+
+    now = _time.time()
+    history = _history(_getter({
+        "history_tokens": 12000,
+        "summary_count": 5,
+        "history_max_age_hours": 2,
+    }))
+    history.messages = [
+        Message("summary", "summary A", timestamp=now - 90000),
+        Message("user", "old question", timestamp=now - 10800),      # 3h ago
+        Message("assistant", "old answer", timestamp=now - 10700),
+        Message("user", "fresh question", timestamp=now - 60),
+        Message("assistant", "fresh answer", timestamp=now - 30),
+    ]
+
+    context = history.get_context_messages(max_tokens=10_000)
+
+    regular = [m.content for m in context if m.role in ("user", "assistant")]
+    assert regular == ["fresh question", "fresh answer"]
+    # summaries are NOT age-bounded
+    assert len([m for m in context if m.role == "summary"]) == 1
+
+
+def test_max_age_zero_is_unlimited() -> None:
+    import time as _time
+
+    now = _time.time()
+    history = _history(_getter({"history_max_age_hours": 0}))
+    history.messages = [
+        Message("user", "ancient", timestamp=now - 10 * 86400),
+        Message("assistant", "reply", timestamp=now - 10 * 86400 + 5),
+    ]
+
+    context = history.get_context_messages(max_tokens=10_000)
+    regular = [m.content for m in context if m.role in ("user", "assistant")]
+    assert regular == ["ancient", "reply"]
+
+
+def test_max_age_applies_on_no_budget_path_and_keeps_untimestamped() -> None:
+    import time as _time
+
+    now = _time.time()
+    history = _history(_getter({"history_max_age_hours": 1}))
+    stale = Message("user", "stale", timestamp=now - 7200)
+    no_ts = Message("assistant", "no timestamp", timestamp=None)
+    fresh = Message("user", "fresh", timestamp=now - 10)
+    history.messages = [stale, no_ts, fresh]
+
+    context = history.get_context_messages(max_tokens=0)  # no-budget path
+    regular = [m.content for m in context if m.role in ("user", "assistant")]
+    assert regular == ["no timestamp", "fresh"]

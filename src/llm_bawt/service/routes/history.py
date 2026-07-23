@@ -1837,6 +1837,7 @@ def build_context_seed(
         "sizing": {
             "history_scope": _eff("history_scope", "inline+summaries"),
             "history_tokens": _eff("history_tokens", 12000),
+            "history_max_age_hours": _eff("history_max_age_hours", 0),
             "summary_count": _eff("summary_count", 5),
         },
         "messages": [

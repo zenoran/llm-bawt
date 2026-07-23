@@ -418,6 +418,32 @@ class HistoryManager:
         # retired: history_tokens (the token budget below) is the sole control
         # over how much raw history is carried. No count-based truncation here.
 
+        # (TASK-647) Age bound on the raw bucket: raw messages older than
+        # history_max_age_hours are excluded up front, regardless of token
+        # budget (applies to the no-budget path too). 0 = unlimited (default).
+        # Raw ONLY — summaries keep their own temporal framing and are bounded
+        # by summary_count. Rows without a timestamp are kept defensively.
+        # Deliberate consequence: if the entire newest turn is older than the
+        # cutoff, the newest-complete-turn floor below has nothing to force in —
+        # an operator setting an age cap is explicitly asking stale raw context
+        # NOT to be carried.
+        max_age_hours = int(
+            self._setting(
+                "history_max_age_hours",
+                setting_default("history_max_age_hours", 0),
+            )
+        )
+        if max_age_hours > 0 and raw_stream:
+            cutoff = time.time() - max_age_hours * 3600
+            kept = [m for m in raw_stream if not m.timestamp or m.timestamp >= cutoff]
+            if len(kept) != len(raw_stream):
+                logger.debug(
+                    "history_max_age_hours=%s: dropped %s/%s raw messages older "
+                    "than the cutoff.",
+                    max_age_hours, len(raw_stream) - len(kept), len(raw_stream),
+                )
+                raw_stream = kept
+
         # Without a token budget, return everything (chronological: system,
         # summaries, then raw recent messages).
         if max_tokens <= 0:
