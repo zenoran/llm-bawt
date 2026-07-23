@@ -215,6 +215,45 @@ class TestMaybeSummarizeOnNew:
             "bot_id": "byte", "session_id": "thread-1", "protect": True,
         }
 
+    def test_mcp_proxy_backend_resolves_active_session(self, monkeypatch):
+        """Deployed (MCP server) mode: _db_backend is the _MCPShortTermManager
+        proxy — NO _current_session_id attribute. The gate must resolve the
+        active thread through the proxy's memory client instead of silently
+        no-oping (the live-smoke miss that shipped in ea0876b)."""
+        calls = {}
+
+        class _FakeSummarizer:
+            def __init__(self, config, bot_id, summarize_fn=None, **kw):
+                pass
+
+            def summarize_thread(self, session_id, protect_recent_turns=False, **kw):
+                calls["session_id"] = session_id
+                return {"summaries_created": 1, "messages_summarized": 4,
+                        "errors": []}
+
+        import llm_bawt.memory.summarization as summod
+        monkeypatch.setattr(summod, "HistorySummarizer", _FakeSummarizer)
+
+        proxy = SimpleNamespace(  # no _current_session_id, like the real proxy
+            user_id="nick",
+            _memory_client=SimpleNamespace(
+                get_active_session=lambda: {"id": "active-thread-9"},
+            ),
+        )
+        assert _Bridge()._maybe_summarize_on_new(
+            _llm(backend=proxy), "byte", "/new"
+        ) is True
+        assert calls == {"session_id": "active-thread-9"}
+
+    def test_proxy_without_active_session_is_noop(self):
+        proxy = SimpleNamespace(
+            user_id="nick",
+            _memory_client=SimpleNamespace(get_active_session=lambda: None),
+        )
+        assert _Bridge()._maybe_summarize_on_new(
+            _llm(backend=proxy), "byte", "/new"
+        ) is False
+
 
 # ──────────────────────────────────────────────────────────────────────────
 # Source-level drift guards
