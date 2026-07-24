@@ -20,8 +20,56 @@ from .logging import get_service_logger
 log = get_service_logger(__name__)
 
 
+# TASK-646: confirmation text for a bare chat-bot /new — module-level so both
+# dispatch paths emit byte-identical copy (streaming SSE + non-streaming JSON).
+CHAT_NEW_CONFIRMATION = (
+    "Fresh start. I've set down the recent back-and-forth — "
+    "I still keep the longer-term summaries and what I know "
+    "about you, just not this last thread. What's on your mind?"
+)
+
+
 class ChatStreamingBridgeMixin:
     """Agent-bridge streaming + session helpers for BackgroundService."""
+
+    def _maybe_handle_chat_new_command(
+        self, llm_bawt, bot_id: str, user_prompt: str,
+    ) -> tuple[str | None, str]:
+        """TASK-646: chat-bot ``/new`` interception, shared by BOTH dispatch
+        paths (streaming ``chat_completion_stream`` and non-streaming
+        ``chat_completion``) so they cannot drift — same pattern as
+        ``_maybe_summarize_on_new`` / ``_maybe_rotate_agent_session``.
+
+        Agent bots handle /new via session rotation at the bridge; chat bots
+        have no bridge, so /new here summarizes the outgoing thread FIRST
+        (TASK-641), then rotates the durable DB thread (TASK-284,
+        non-destructive — failure just means the thread didn't advance).
+
+        Returns ``(confirm_text, effective_prompt)``:
+        - not a /new           → ``(None, user_prompt)`` — proceed unchanged.
+        - ``/new <message>``   → ``(None, "<message>")`` — rotated; answer the
+          remainder in the clean context.
+        - bare ``/new``        → ``(CHAT_NEW_CONFIRMATION, "")`` — rotated;
+          caller short-circuits with the confirmation, NO LLM round-trip
+          (letting it reach the model makes it hallucinate a fake reset).
+        """
+        stripped = (user_prompt or "").lstrip()
+        low = stripped.lower()
+        if not (low == "/new" or low.startswith("/new ") or low.startswith("/new\n")):
+            return None, user_prompt
+        # TASK-641: summarize the outgoing thread BEFORE rotation so the next
+        # turn's context (rebuilt every turn for chat bots) carries a summary
+        # of the conversation that just ended.
+        self._maybe_summarize_on_new(llm_bawt, bot_id, user_prompt)
+        if not self._rotate_chat_session(llm_bawt, bot_id):
+            log.error(
+                "/new: session rotation failed for bot=%s — thread not advanced",
+                bot_id,
+            )
+        remainder = stripped[len("/new"):].strip()
+        if remainder:
+            return None, remainder
+        return CHAT_NEW_CONFIRMATION, ""
 
     def _rotate_chat_session(self, llm_bawt, bot_id: str) -> str | None:
         """TASK-284: non-destructive DB session rotation for chatbot /new.

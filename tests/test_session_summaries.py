@@ -273,9 +273,10 @@ class TestCallSiteGuards:
         assert summarize_idx < seed_idx, f"{path}: summarize must precede seed"
 
     def test_chat_new_summarizes_before_rotation(self):
-        text = (SRC / "llm_bawt/service/chat_streaming.py").read_text()
-        # In the chat-bot /new branch the summarize call precedes rotation.
-        branch = text[text.index('_low == "/new"'):]
+        text = (SRC / "llm_bawt/service/chat_streaming_bridge.py").read_text()
+        # The shared chat-bot /new helper owns summarize-before-rotation ordering.
+        branch = text[text.index("def _maybe_handle_chat_new_command"):]
+        branch = branch[:branch.index("\n    def ", 10)]
         assert branch.index("_maybe_summarize_on_new") < branch.index(
             "_rotate_chat_session"
         )

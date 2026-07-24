@@ -384,36 +384,18 @@ class ChatStreamingMixin(ChatStreamingBridgeMixin):
         # kept (see HistoryManager/get_messages). Nothing is deleted — it's a
         # pointer move, and the dropped transcript still gets summarized by
         # the background job and reappears as a summary.
+        # TASK-646: summarize → rotate → confirm lives in the SHARED helper
+        # (chat_streaming_bridge.py) so this path and the non-streaming
+        # chat_completion cannot drift.
         if not is_agent_backend:
-            _stripped = (user_prompt or "").lstrip()
-            _low = _stripped.lower()
-            if _low == "/new" or _low.startswith("/new ") or _low.startswith("/new\n"):
-                # TASK-641: summarize the outgoing thread BEFORE rotation so
-                # the next turn's context (rebuilt every turn for chat bots)
-                # carries a summary of the conversation that just ended.
-                self._maybe_summarize_on_new(llm_bawt, bot_id, user_prompt)
-                # TASK-284: /new rotates the durable DB thread
-                # (non-destructive). Nothing is deleted on failure — the
-                # thread simply doesn't advance, so log loudly and move on.
-                if not self._rotate_chat_session(llm_bawt, bot_id):
-                    log.error(
-                        "/new: session rotation failed for bot=%s — thread not advanced",
-                        bot_id,
-                    )
-                remainder = _stripped[len("/new"):].strip()
-                if not remainder:
-                    confirm = (
-                        "Fresh start. I've set down the recent back-and-forth — "
-                        "I still keep the longer-term summaries and what I know "
-                        "about you, just not this last thread. What's on your mind?"
-                    )
-                    yield f"data: {json.dumps({'id': response_id, 'object': 'chat.completion.chunk', 'created': created, 'model': model_alias, 'choices': [{'index': 0, 'delta': {'role': 'assistant', 'content': confirm}, 'finish_reason': None}]})}\n\n"
-                    yield f"data: {json.dumps({'id': response_id, 'object': 'chat.completion.chunk', 'created': created, 'model': model_alias, 'choices': [{'index': 0, 'delta': {}, 'finish_reason': 'stop'}]})}\n\n"
-                    yield "data: [DONE]\n\n"
-                    return
-                # `/new <message>`: start fresh, then answer the message in the
-                # clean context.
-                user_prompt = remainder
+            _confirm, user_prompt = self._maybe_handle_chat_new_command(
+                llm_bawt, bot_id, user_prompt
+            )
+            if _confirm is not None:
+                yield f"data: {json.dumps({'id': response_id, 'object': 'chat.completion.chunk', 'created': created, 'model': model_alias, 'choices': [{'index': 0, 'delta': {'role': 'assistant', 'content': _confirm}, 'finish_reason': None}]})}\n\n"
+                yield f"data: {json.dumps({'id': response_id, 'object': 'chat.completion.chunk', 'created': created, 'model': model_alias, 'choices': [{'index': 0, 'delta': {}, 'finish_reason': 'stop'}]})}\n\n"
+                yield "data: [DONE]\n\n"
+                return
 
         if is_agent_backend:
             # TASK-284 step 15: an agent /new also rotates the durable DB

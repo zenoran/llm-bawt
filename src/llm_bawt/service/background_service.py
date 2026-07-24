@@ -262,6 +262,34 @@ class BackgroundService(
         # single-model execution.
         model_type = llm_bawt.client.model_definition.get("type", "")
         is_agent_backend = model_type in ("agent_backend", "claude-code")
+
+        # TASK-646: intercept chat-bot /new HERE too — SAME shared helper as
+        # the streaming path (summarize → rotate → confirm). Without this a
+        # stream:false /new fell through to the LLM as plain text with full
+        # history and the model hallucinated a fake "session reset"
+        # confirmation. Bare /new short-circuits with the shared confirmation
+        # and no LLM round-trip (mirrors streaming, which also skips the turn
+        # log for the bare command).
+        if not is_agent_backend:
+            _confirm, user_prompt = self._maybe_handle_chat_new_command(
+                llm_bawt, bot_id, user_prompt
+            )
+            if _confirm is not None:
+                log.api_response(ctx, status=200, tokens=0)
+                return ChatCompletionResponse(
+                    model=model_alias,
+                    choices=[
+                        ChatCompletionChoice(
+                            index=0,
+                            message=ChatMessage(role="assistant", content=_confirm),
+                            finish_reason="stop",
+                        )
+                    ],
+                    usage=UsageInfo(
+                        prompt_tokens=0, completion_tokens=0, total_tokens=0
+                    ),
+                )
+
         if is_agent_backend:
             cancel_event = threading.Event()
             done_event = threading.Event()
