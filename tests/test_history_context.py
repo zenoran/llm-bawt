@@ -341,3 +341,126 @@ def test_max_age_applies_on_no_budget_path_and_keeps_untimestamped() -> None:
     context = history.get_context_messages(max_tokens=0)  # no-budget path
     regular = [m.content for m in context if m.role in ("user", "assistant")]
     assert regular == ["no timestamp", "fresh"]
+
+
+# ── TASK-650: inline delivery must never drop the in-flight user message ──
+
+
+def test_inline_scope_none_still_carries_current_turn() -> None:
+    # nova bug 2026-07-23: history_scope=none on a chat bot sent a
+    # system-only prompt — the just-persisted user message rode the raw
+    # bucket and was dropped with the rest of history.
+    history = _history(_getter({"history_tokens": 12000, "summary_count": 5}))
+    history.messages = [
+        Message("user", "old q", timestamp=1.0),
+        Message("assistant", "old a", timestamp=2.0),
+        Message("user", "Hi", timestamp=3.0),  # in-flight, unanswered
+    ]
+
+    payload = history.build_context_payload(
+        include_history=False, include_summaries=False, max_tokens=10_000
+    )
+
+    assert [m.content for m in payload.regular_messages] == ["Hi"]
+
+
+def test_inline_summaries_scope_carries_current_turn_and_summaries() -> None:
+    history = _history(_getter({"history_tokens": 12000, "summary_count": 5}))
+    history.messages = [
+        Message("summary", "S", timestamp=0.0),
+        Message("user", "old q", timestamp=1.0),
+        Message("assistant", "old a", timestamp=2.0),
+        Message("user", "fresh q", timestamp=3.0),
+    ]
+
+    payload = history.build_context_payload(
+        include_history=False, include_summaries=True, max_tokens=10_000
+    )
+
+    assert [m.content for m in payload.regular_messages] == ["fresh q"]
+    assert len(payload.summary_messages) == 1
+
+
+def test_inline_floor_skips_answered_trailing_turn() -> None:
+    # A completed turn (user answered by assistant) is prior history —
+    # scope=none legitimately carries nothing.
+    history = _history(_getter({"history_tokens": 12000, "summary_count": 5}))
+    history.messages = [
+        Message("user", "u1", timestamp=1.0),
+        Message("assistant", "a1", timestamp=2.0),
+    ]
+
+    payload = history.build_context_payload(
+        include_history=False, include_summaries=False, max_tokens=10_000
+    )
+
+    assert payload.regular_messages == []
+
+
+def test_inline_floor_budgets_current_turn_before_summaries() -> None:
+    # Gavel review: the floor must be RESERVED during allocation, not
+    # appended after summaries fill the budget. Big summaries + a current
+    # user message under a tight budget: the user message is delivered and
+    # summaries shed to fit — total stays within max_tokens.
+    from llm_bawt.utils.history import estimate_messages_tokens
+
+    history = _history(_getter({"history_tokens": 12000, "summary_count": 5}))
+    history.messages = [
+        Message("summary", "S" * 400, timestamp=0.0),   # ~104 tokens enhanced
+        Message("summary", "T" * 400, timestamp=1.0),
+        Message("user", "q" * 200, timestamp=2.0),      # ~54 tokens, in-flight
+    ]
+
+    budget = 200
+    payload = history.build_context_payload(
+        include_history=False, include_summaries=True, max_tokens=budget
+    )
+
+    # current turn always delivered
+    assert [m.content for m in payload.regular_messages] == ["q" * 200]
+    # and the whole delivered payload fits the physical budget
+    delivered = (
+        payload.system_messages
+        + payload.summary_messages
+        + payload.regular_messages
+    )
+    assert estimate_messages_tokens(delivered) <= budget
+    # at least one summary had to be shed to make room
+    assert len(payload.summary_messages) < 2
+
+
+def test_inline_floor_carries_in_flight_tool_evidence() -> None:
+    # Tool loop mid-turn: user question + tool-result rows, no assistant
+    # reply yet. Evidence rides the tool_result_messages bucket (same as the
+    # include_history=True path) and the user message rides regular.
+    history = _history(_getter({"history_tokens": 12000, "summary_count": 5}))
+    history.messages = [
+        Message("user", "fresh q", timestamp=1.0),
+        Message("system", "[Tool Results] time: 12:57", timestamp=2.0),
+    ]
+
+    payload = history.build_context_payload(
+        include_history=False, include_summaries=False, max_tokens=10_000
+    )
+
+    assert [m.content for m in payload.regular_messages] == ["fresh q"]
+    assert [m.content for m in payload.tool_result_messages] == [
+        "[Tool Results] time: 12:57"
+    ]
+    # inline view carries both
+    contents = [m.content for m in payload.inline_history]
+    assert set(contents) == {"fresh q", "[Tool Results] time: 12:57"}
+
+
+def test_seed_delivery_unaffected_by_current_turn_floor() -> None:
+    history = _history(_getter({"history_tokens": 12000, "summary_count": 5}))
+    history.messages = [
+        Message("user", "fresh q", timestamp=1.0),
+    ]
+
+    payload = history.build_context_payload(
+        include_history=False, include_summaries=False,
+        delivery="seed", max_tokens=10_000,
+    )
+
+    assert payload.regular_messages == []

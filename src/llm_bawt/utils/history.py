@@ -317,6 +317,22 @@ class HistoryManager:
 
         return "\n".join(compact_lines).strip()
 
+    @staticmethod
+    def _unanswered_trailing_turn(msgs: list) -> list:
+        """The in-flight turn (TASK-650): the trailing run from the newest
+        user row — user message plus any interleaved tool-evidence rows —
+        provided NO assistant reply follows it. Empty when the newest turn is
+        already answered (that's prior history, not the current turn)."""
+        turn_start = -1
+        for i in range(len(msgs) - 1, -1, -1):
+            role = getattr(msgs[i], "role", "")
+            if role == "assistant":
+                break
+            if role == "user":
+                turn_start = i
+                break
+        return list(msgs[turn_start:]) if turn_start >= 0 else []
+
     def get_context_messages(
         self,
         max_tokens: int = 0,
@@ -324,6 +340,7 @@ class HistoryManager:
         *,
         want_history: bool = True,
         want_summaries: bool = True,
+        floor_current_turn: bool = False,
     ):
         """Assemble LLM context under Nick's strict allocation ladder (TASK-612).
 
@@ -376,6 +393,13 @@ class HistoryManager:
                         ``include_history`` so allocation matches delivery.
             want_summaries: whether the caller will deliver summaries. When False,
                         summaries are not allocated. Mirrors ``include_summaries``.
+            floor_current_turn: (TASK-650) when True, an UNANSWERED trailing
+                        turn (the in-flight user message + its tool-evidence)
+                        is reserved as a mandatory raw floor even when
+                        ``want_history`` is False — scope governs PRIOR
+                        context, never the message being answered. Summaries
+                        then fill the remainder. Inline delivery only; seeds
+                        are built between turns and pass False.
         """
         # Only the PLAIN persona/system prompt is the non-negotiable system
         # bucket. A role='system' row that carries tool-execution EVIDENCE
@@ -491,52 +515,70 @@ class HistoryManager:
                 else:
                     break  # older messages only get larger-or-equal in aggregate
 
-            # Newest-COMPLETE-turn floor: history_tokens must never chop the most
-            # recent turn in half. The newest complete turn is the trailing run
-            # back through the most recent user message (captures user + assistant
-            # + any interleaved tool-evidence rows). Guarantee it whenever it fits
-            # the PHYSICAL budget, even if history_tokens was too small to have fit
-            # it in the bounded fill above (TASK-612 finding 2 — a single-message
-            # floor returned the assistant without its user). If the whole turn
-            # can't fit the physical budget, keep the largest newest-first suffix
-            # that does (degrade); if not even the newest message fits, drop it.
-            if raw_stream:
+        # Newest-COMPLETE-turn floor: history_tokens must never chop the most
+        # recent turn in half. The newest complete turn is the trailing run
+        # back through the most recent user message (captures user + assistant
+        # + any interleaved tool-evidence rows). Guarantee it whenever it fits
+        # the PHYSICAL budget, even if history_tokens was too small to have fit
+        # it in the bounded fill above (TASK-612 finding 2 — a single-message
+        # floor returned the assistant without its user). If the whole turn
+        # can't fit the physical budget, keep the largest newest-first suffix
+        # that does (degrade); if not even the newest message fits, drop it.
+        #
+        # (TASK-650) The floor ALSO applies when the caller carries no raw
+        # history (history_scope none/summaries on inline delivery): an
+        # unanswered trailing turn is the in-flight message being answered,
+        # not prior context, so it is reserved HERE — before summaries fill —
+        # so allocation stays within the physical budget instead of a
+        # post-hoc append blowing past it.
+        turn_msgs: list[Message] = []
+        if raw_stream:
+            if want_history:
                 turn_start = 0
                 for i in range(len(raw_stream) - 1, -1, -1):
                     if raw_stream[i].role == "user":
                         turn_start = i
                         break
                 turn_msgs = raw_stream[turn_start:]
-                if len(turn_msgs) > len(included_raw):  # fill didn't cover the turn
-                    turn_cost = estimate_messages_tokens(turn_msgs)
-                    if system_cost + turn_cost <= budget:
-                        included_raw = list(turn_msgs)
-                        raw_used = turn_cost
-                        forced = "turn"
-                        logger.warning(
-                            "history_tokens=%s too small for the newest complete "
-                            "turn (%s msgs); forcing it in under the physical "
-                            "budget (%s).",
-                            history_tokens, len(turn_msgs), budget,
-                        )
+            elif floor_current_turn:
+                turn_msgs = self._unanswered_trailing_turn(raw_stream)
+        if turn_msgs and len(turn_msgs) > len(included_raw):  # fill didn't cover the turn
+            turn_cost = estimate_messages_tokens(turn_msgs)
+            if system_cost + turn_cost <= budget:
+                included_raw = list(turn_msgs)
+                raw_used = turn_cost
+                forced = "turn"
+                if want_history:
+                    logger.warning(
+                        "history_tokens=%s too small for the newest complete "
+                        "turn (%s msgs); forcing it in under the physical "
+                        "budget (%s).",
+                        history_tokens, len(turn_msgs), budget,
+                    )
+                else:
+                    logger.debug(
+                        "Current-turn floor (scope carries no raw history): "
+                        "reserved %s in-flight message(s), %s tokens.",
+                        len(turn_msgs), turn_cost,
+                    )
+            else:
+                fit: list[Message] = []
+                used = 0
+                for msg in reversed(turn_msgs):  # newest-first
+                    cost = estimate_messages_tokens([msg])
+                    if system_cost + used + cost <= budget:
+                        fit.insert(0, msg)
+                        used += cost
                     else:
-                        fit: list[Message] = []
-                        used = 0
-                        for msg in reversed(turn_msgs):  # newest-first
-                            cost = estimate_messages_tokens([msg])
-                            if system_cost + used + cost <= budget:
-                                fit.insert(0, msg)
-                                used += cost
-                            else:
-                                break
-                        included_raw = fit
-                        raw_used = used
-                        forced = "partial-turn" if fit else "dropped"
-                        logger.warning(
-                            "Newest turn (%s tokens) exceeds physical headroom "
-                            "(%s); kept %s of %s msgs (degrade).",
-                            turn_cost, physical_headroom, len(fit), len(turn_msgs),
-                        )
+                        break
+                included_raw = fit
+                raw_used = used
+                forced = "partial-turn" if fit else "dropped"
+                logger.warning(
+                    "Newest turn (%s tokens) exceeds physical headroom "
+                    "(%s); kept %s of %s msgs (degrade).",
+                    turn_cost, physical_headroom, len(fit), len(turn_msgs),
+                )
 
         # (3) Summaries: fill the remaining physical budget after system + raw,
         #     newest-first, capped by summary_count. Skipped when the caller won't
@@ -616,14 +658,35 @@ class HistoryManager:
         # TASK-613: seed delivery strips system rows (the SDK carries its own
         # system prompt), so they must not consume the seed's token budget.
         # Inline (chat) delivers system in the request window, so it does.
+        # (TASK-650) Current-turn floor for INLINE delivery: history_scope
+        # governs PRIOR context only — it must never swallow the message the
+        # user just sent. On the chat path the in-flight user message is
+        # already persisted into self.messages, so with include_history=False
+        # ("none"/"summaries" scope) it would be dropped with the rest of raw
+        # history and the model would receive a system-only prompt (observed:
+        # nova replying "tool format locked in" to "Hi"). The assembler
+        # reserves the unanswered trailing turn as a mandatory raw floor
+        # (summaries then fill the remainder — allocation stays within
+        # budget); the id-set below exempts exactly those rows from the
+        # include_history gate. Seed delivery is untouched: a seed is built
+        # between turns and has no current message.
+        floor_current = delivery == "inline" and not include_history
+        current_turn_ids: set[int] = (
+            set(map(id, self._unanswered_trailing_turn(self.messages)))
+            if floor_current
+            else set()
+        )
+
         payload = ContextPayload()
         for msg in self.get_context_messages(
             max_tokens=max_tokens,
             charge_system=(delivery != "seed"),
             want_history=include_history,
             want_summaries=include_summaries,
+            floor_current_turn=floor_current,
         ):
             role = getattr(msg, "role", "")
+            is_current_turn = id(msg) in current_turn_ids
             if role == "summary":
                 if include_summaries:
                     payload.summary_messages.append(msg)
@@ -631,16 +694,17 @@ class HistoryManager:
             if role == "system":
                 if _is_tool_result_system(msg):
                     # Tool-evidence is raw historical context — gate it on
-                    # include_history like any other raw row (TASK-612 follow-up).
+                    # include_history like any other raw row (TASK-612 follow-up),
+                    # except the in-flight turn's own evidence (TASK-650).
                     # get_context_messages already excludes it from the budgeted
                     # stream when want_history is False; this keeps direct callers
                     # honest too.
-                    if include_history:
+                    if include_history or is_current_turn:
                         payload.tool_result_messages.append(msg)
                 else:
                     payload.system_messages.append(msg)
                 continue
-            if include_history:
+            if include_history or is_current_turn:
                 payload.regular_messages.append(msg)
         return payload
 
