@@ -185,7 +185,8 @@ def _validate_agent_default_model(
                 endpoint = service.config.ensure_model_catalog().resolve_endpoint(default_model)
                 harness = (
                     "claude-code"
-                    if endpoint.access_path.protocol == "anthropic-messages"
+                    if endpoint.access_path.vendor == "anthropic"
+                    and endpoint.access_path.protocol == "anthropic-messages"
                     else "claude-proxy"
                 )
             model_def = resolver(

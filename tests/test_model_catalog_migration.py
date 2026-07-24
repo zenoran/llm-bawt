@@ -1,4 +1,5 @@
 from llm_bawt.memory.model_catalog_migration import (
+    _CREATE_SCHEMA_SQL,
     _derive_harness,
     map_legacy_definition,
 )
@@ -18,6 +19,11 @@ def _row(**overrides):
     }
     row.update(overrides)
     return row
+
+
+def test_access_path_schema_adds_harness_prompt_mapping_idempotently():
+    assert "system_prompt_overrides JSONB NOT NULL DEFAULT '{}'::jsonb" in _CREATE_SCHEMA_SQL
+    assert "ADD COLUMN IF NOT EXISTS system_prompt_overrides" in _CREATE_SCHEMA_SQL
 
 
 def test_codex_and_claude_proxy_map_to_same_openai_oauth_endpoint_shape():
@@ -51,7 +57,7 @@ def test_codex_and_claude_proxy_map_to_same_openai_oauth_endpoint_shape():
     assert _derive_harness("claude-code", proxy.access_path) == "claude-proxy"
 
 
-def test_native_claude_and_zai_passthrough_use_anthropic_message_harness():
+def test_native_claude_is_direct_but_zai_passthrough_uses_proxy_harness():
     claude = map_legacy_definition(
         _row(alias="claude-opus-4-7", type="claude-code", model_id="claude-opus-4-7")
     )
@@ -67,7 +73,7 @@ def test_native_claude_and_zai_passthrough_use_anthropic_message_harness():
     assert claude.access_path.key == "anthropic-oauth"
     assert zai.access_path.key == "zai-anthropic"
     assert _derive_harness("claude-code", claude.access_path) == "claude-code"
-    assert _derive_harness("claude-code", zai.access_path) == "claude-code"
+    assert _derive_harness("claude-code", zai.access_path) == "claude-proxy"
 
 
 def test_local_gguf_serving_fields_belong_to_endpoint():

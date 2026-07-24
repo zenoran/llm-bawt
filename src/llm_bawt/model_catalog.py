@@ -79,6 +79,7 @@ class AccessPath:
     base_url: str | None
     auth_mechanism: str
     engine_kind: str | None = None
+    system_prompt_overrides: Mapping[str, str] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -108,7 +109,9 @@ class ProtocolCompatibility:
         "claude-proxy": "anthropic-messages",
         "openclaw": None,
     }
-    PROXY_TARGETS = frozenset({"chat-completions", "responses"})
+    PROXY_TARGETS = frozenset(
+        {"anthropic-messages", "chat-completions", "responses"}
+    )
 
     @classmethod
     def normalize_harness(cls, harness: str | None) -> str | None:
@@ -124,6 +127,11 @@ class ProtocolCompatibility:
             return False
         if normalized == "openclaw":
             return True
+        if normalized == "claude-code":
+            return (
+                access_path.vendor == "anthropic"
+                and access_path.protocol == "anthropic-messages"
+            )
         if normalized == "claude-proxy":
             return (
                 access_path.vendor != "anthropic"
@@ -296,6 +304,11 @@ class ModelCatalog:
         )
         if backend:
             config["backend"] = backend
+        provider_system_prompt = endpoint.access_path.system_prompt_overrides.get(
+            normalized_harness or ""
+        )
+        if isinstance(provider_system_prompt, str) and provider_system_prompt.strip():
+            config["provider_system_prompt"] = provider_system_prompt.strip()
         if endpoint.model.description:
             config["description"] = endpoint.model.description
         context_window = (
@@ -345,7 +358,8 @@ class ModelCatalogStore:
                     a.protocol,
                     a.base_url,
                     a.auth_mechanism,
-                    a.engine_kind
+                    a.engine_kind,
+                    a.system_prompt_overrides
                 FROM model_endpoints e
                 JOIN models m ON m.id = e.model_id
                 JOIN access_paths a ON a.id = e.access_path_id
@@ -375,6 +389,7 @@ class ModelCatalogStore:
                 base_url=row["base_url"],
                 auth_mechanism=row["auth_mechanism"],
                 engine_kind=row["engine_kind"],
+                system_prompt_overrides=row["system_prompt_overrides"] or {},
             )
             endpoints.append(
                 ModelEndpoint(

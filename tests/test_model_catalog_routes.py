@@ -4,6 +4,7 @@ from pydantic import ValidationError
 from unittest.mock import MagicMock
 
 from llm_bawt.service.routes.model_catalog import (
+    AccessPathWrite,
     ModelWrite,
     _check_endpoint_cas,
     _delete_model_sources,
@@ -24,6 +25,39 @@ def test_model_write_requires_positive_context_window():
 
     ok = ModelWrite(vendor="xai", display_name="Grok", default_context_window=1000000)
     assert ok.default_context_window == 1000000
+
+
+def test_access_path_prompt_overrides_trim_drop_blanks_and_preserve_entries():
+    request = AccessPathWrite(
+        vendor="openai",
+        protocol="responses",
+        auth_mechanism="oauth",
+        system_prompt_overrides={
+            "claude-proxy": "  proxy instructions  ",
+            "codex": " \n ",
+        },
+    )
+
+    assert request.system_prompt_overrides == {
+        "claude-proxy": "proxy instructions"
+    }
+
+
+def test_access_path_prompt_overrides_reject_unknown_harness_and_non_string():
+    with pytest.raises(ValidationError, match="Unknown harness"):
+        AccessPathWrite(
+            vendor="openai",
+            protocol="responses",
+            auth_mechanism="oauth",
+            system_prompt_overrides={"future-harness": "instructions"},
+        )
+    with pytest.raises(ValidationError):
+        AccessPathWrite(
+            vendor="openai",
+            protocol="responses",
+            auth_mechanism="oauth",
+            system_prompt_overrides={"claude-proxy": 42},
+        )
 
 
 def test_catalog_harnesses_are_driven_by_protocol_compatibility():

@@ -22,6 +22,7 @@ def _endpoint(
     legacy_type: str = "openai",
     engine_kind: str | None = None,
     serving_config=None,
+    system_prompt_overrides=None,
 ):
     return ModelEndpoint(
         id=endpoint_id,
@@ -34,6 +35,7 @@ def _endpoint(
             None,
             "test",
             engine_kind=engine_kind,
+            system_prompt_overrides=system_prompt_overrides or {},
         ),
         upstream_model_id=upstream,
         serving_config=serving_config or {},
@@ -65,6 +67,45 @@ def test_shared_openai_oauth_endpoint_resolves_differently_by_harness():
     assert codex["endpoint_id"] == proxy["endpoint_id"] == 20
 
 
+def test_provider_system_prompt_resolves_only_for_active_harness():
+    instruction = "Use OpenAI-compatible tool semantics."
+    endpoint = _endpoint(
+        20,
+        "gpt-5.6-sol",
+        "openai-oauth",
+        "openai",
+        "responses",
+        "gpt-5.6-sol",
+        legacy_type="agent_backend",
+        system_prompt_overrides={"claude-proxy": f"  {instruction}  "},
+    )
+    catalog = ModelCatalog([endpoint])
+
+    proxy = catalog.resolve("gpt-5.6-sol", harness="claude-proxy")
+    codex = catalog.resolve("gpt-5.6-sol", harness="codex")
+
+    assert proxy["provider_system_prompt"] == instruction
+    assert "provider_system_prompt" not in codex
+
+
+def test_blank_provider_system_prompt_is_absent():
+    endpoint = _endpoint(
+        20,
+        "gpt-5.6-sol",
+        "openai-oauth",
+        "openai",
+        "responses",
+        "gpt-5.6-sol",
+        system_prompt_overrides={"claude-proxy": " \n "},
+    )
+
+    resolved = ModelCatalog([endpoint]).resolve(
+        "gpt-5.6-sol", harness="claude-proxy"
+    )
+
+    assert "provider_system_prompt" not in resolved
+
+
 def test_bare_unique_proxy_ref_preserves_legacy_provider_prefix():
     endpoint = _endpoint(
         2,
@@ -86,10 +127,15 @@ def test_protocol_compatibility_is_single_filter_rule():
         1, "claude-opus", "anthropic-oauth", "anthropic", "anthropic-messages", "opus"
     )
     xai = _endpoint(2, "grok", "xai-responses", "xai", "responses", "grok-4")
+    zai = _endpoint(
+        3, "glm", "zai-anthropic", "zai", "anthropic-messages", "glm-5.2"
+    )
 
     assert ProtocolCompatibility.is_compatible("claude-code", anthropic.access_path)
+    assert not ProtocolCompatibility.is_compatible("claude-code", zai.access_path)
     assert not ProtocolCompatibility.is_compatible("codex", anthropic.access_path)
     assert ProtocolCompatibility.is_compatible("claude-proxy", xai.access_path)
+    assert ProtocolCompatibility.is_compatible("claude-proxy", zai.access_path)
     assert not ProtocolCompatibility.is_compatible(
         "claude-proxy", anthropic.access_path
     )

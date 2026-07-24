@@ -104,6 +104,14 @@ class ServiceLLMBawt(BaseLLMBawt):
                     and model_def.get("model_id")
                 ):
                     self.client._bot_config["model"] = model_def["model_id"]
+                for field in ("endpoint_id", "harness", "access_path"):
+                    if model_def.get(field) is not None:
+                        self.client._bot_config[field] = model_def[field]
+                provider_system_prompt = model_def.get("provider_system_prompt")
+                if isinstance(provider_system_prompt, str) and provider_system_prompt:
+                    self.client._bot_config["provider_system_prompt"] = (
+                        provider_system_prompt
+                    )
 
                 # TASK-609: resolve the catalog context window app-side and
                 # inject it so the bridge reports the true window for

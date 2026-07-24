@@ -276,6 +276,7 @@ CREATE TABLE IF NOT EXISTS access_paths (
     base_url TEXT,
     auth_mechanism VARCHAR(64) NOT NULL,
     engine_kind VARCHAR(64),
+    system_prompt_overrides JSONB NOT NULL DEFAULT '{}'::jsonb,
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     CONSTRAINT access_paths_protocol_check
@@ -299,6 +300,15 @@ CREATE TABLE IF NOT EXISTS model_endpoints (
 
 CREATE INDEX IF NOT EXISTS idx_model_endpoints_model_id ON model_endpoints(model_id);
 CREATE INDEX IF NOT EXISTS idx_model_endpoints_access_path_id ON model_endpoints(access_path_id);
+
+ALTER TABLE access_paths
+    ADD COLUMN IF NOT EXISTS system_prompt_overrides JSONB NOT NULL DEFAULT '{}'::jsonb;
+UPDATE access_paths
+   SET system_prompt_overrides = '{}'::jsonb
+ WHERE system_prompt_overrides IS NULL;
+ALTER TABLE access_paths
+    ALTER COLUMN system_prompt_overrides SET DEFAULT '{}'::jsonb,
+    ALTER COLUMN system_prompt_overrides SET NOT NULL;
 """
 
 
@@ -350,7 +360,8 @@ BEGIN
               INTO endpoint_protocol, endpoint_vendor
               FROM model_endpoints e JOIN access_paths a ON a.id = e.access_path_id
              WHERE e.id = NEW.endpoint_id;
-            IF endpoint_protocol = 'anthropic-messages' THEN
+            IF endpoint_vendor = 'anthropic'
+               AND endpoint_protocol = 'anthropic-messages' THEN
                 NEW.harness := 'claude-code';
             ELSE
                 NEW.harness := 'claude-proxy';
@@ -404,13 +415,15 @@ BEGIN
     ELSIF NEW.harness = 'codex' AND endpoint_protocol <> 'responses' THEN
         RAISE EXCEPTION 'bot %: codex harness requires responses endpoint, got %',
             NEW.slug, endpoint_protocol USING ERRCODE = 'check_violation';
-    ELSIF NEW.harness = 'claude-code' AND endpoint_protocol <> 'anthropic-messages' THEN
-        RAISE EXCEPTION 'bot %: claude-code harness requires anthropic-messages endpoint, got %',
-            NEW.slug, endpoint_protocol USING ERRCODE = 'check_violation';
+    ELSIF NEW.harness = 'claude-code'
+          AND (endpoint_protocol <> 'anthropic-messages'
+               OR endpoint_vendor <> 'anthropic') THEN
+        RAISE EXCEPTION 'bot %: claude-code harness requires an Anthropic anthropic-messages endpoint',
+            NEW.slug USING ERRCODE = 'check_violation';
     ELSIF NEW.harness = 'claude-proxy'
-          AND (endpoint_protocol NOT IN ('responses', 'chat-completions')
+          AND (endpoint_protocol NOT IN ('anthropic-messages', 'responses', 'chat-completions')
                OR endpoint_vendor = 'anthropic') THEN
-        RAISE EXCEPTION 'bot %: claude-proxy requires a non-Anthropic responses/chat endpoint',
+        RAISE EXCEPTION 'bot %: claude-proxy requires a non-Anthropic endpoint supported by the bridge proxy',
             NEW.slug USING ERRCODE = 'check_violation';
     END IF;
 
@@ -463,7 +476,11 @@ def _derive_harness(agent_backend: str | None, access: AccessPathSpec | None) ->
     if backend == "openclaw":
         return "openclaw"
     if backend == "claude-code":
-        if access and access.protocol == "anthropic-messages":
+        if (
+            access
+            and access.vendor == "anthropic"
+            and access.protocol == "anthropic-messages"
+        ):
             return "claude-code"
         return "claude-proxy"
     return "chat"

@@ -63,6 +63,26 @@ class ClaudeCodeBackend(AgentBridgeBackend):
         # never sees that line.  Without this block, "what model are you"
         # gets a guess (often wrong) instead of the truth.
         sp = (config.get("system_prompt") or "").rstrip()
+        provider_system_prompt = str(
+            config.get("provider_system_prompt") or ""
+        ).strip()
+        endpoint_id = config.get("endpoint_id")
+        harness = str(config.get("harness") or "").strip() or None
+        if endpoint_id is not None and harness:
+            try:
+                current = self._config.resolve_model(
+                    int(endpoint_id), harness=harness, default={}
+                )
+                resolved_prompt = current.get("provider_system_prompt")
+                provider_system_prompt = (
+                    resolved_prompt.strip()
+                    if isinstance(resolved_prompt, str)
+                    else ""
+                )
+            except Exception:
+                # Keep the construction-time value if a transient catalog reload
+                # fails; the turn still has a valid, previously resolved config.
+                pass
         # TASK-490: body comes from the registry (agents.runtime_context_template),
         # bot-overridable, with the constant as the default/fallback.
         from ..prompt_registry import RUNTIME_CONTEXT_TEMPLATE, get_prompt_resolver
@@ -73,6 +93,8 @@ class ClaudeCodeBackend(AgentBridgeBackend):
         except Exception:
             model_block = RUNTIME_CONTEXT_TEMPLATE.format(model=model)
         augmented_sp = f"{model_block}\n\n{sp}" if sp else model_block
+        if provider_system_prompt:
+            augmented_sp = f"{augmented_sp}\n\n{provider_system_prompt}"
 
         # Resolve this system-wide policy at dispatch time so DB edits apply to
         # the next command without teaching the long-running bridge to poll the

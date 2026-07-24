@@ -6,7 +6,7 @@ import json
 from typing import Any, Literal
 
 from fastapi import APIRouter, HTTPException, Query
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 from sqlalchemy import text
 
 from ...model_catalog import AccessPath, ProtocolCompatibility
@@ -36,6 +36,21 @@ class AccessPathWrite(BaseModel):
     base_url: str | None = None
     auth_mechanism: str
     engine_kind: str | None = None
+    system_prompt_overrides: dict[str, str] = Field(default_factory=dict)
+
+    @field_validator("system_prompt_overrides")
+    @classmethod
+    def normalize_system_prompt_overrides(
+        cls, value: dict[str, str]
+    ) -> dict[str, str]:
+        unknown = sorted(set(value) - set(ProtocolCompatibility.HARNESS_PROTOCOLS))
+        if unknown:
+            raise ValueError(f"Unknown harness key(s): {', '.join(unknown)}")
+        return {
+            harness: body.strip()
+            for harness, body in value.items()
+            if body.strip()
+        }
 
 
 class EndpointWrite(BaseModel):
@@ -197,22 +212,27 @@ def put_access_path(access_key: str, request: AccessPathWrite):
     sql = """
         INSERT INTO access_paths
             (key, vendor, protocol, base_url, auth_mechanism, engine_kind,
-             created_at, updated_at)
+             system_prompt_overrides, created_at, updated_at)
         VALUES
             (:key, :vendor, :protocol, :base_url, :auth_mechanism, :engine_kind,
-             NOW(), NOW())
+             CAST(:system_prompt_overrides AS jsonb), NOW(), NOW())
         ON CONFLICT (key) DO UPDATE SET
             vendor = EXCLUDED.vendor,
             protocol = EXCLUDED.protocol,
             base_url = EXCLUDED.base_url,
             auth_mechanism = EXCLUDED.auth_mechanism,
             engine_kind = EXCLUDED.engine_kind,
+            system_prompt_overrides = EXCLUDED.system_prompt_overrides,
             updated_at = NOW()
         RETURNING *
     """
     try:
         with _engine().begin() as conn:
-            row = dict(conn.execute(text(sql), {"key": access_key, **request.model_dump()}).mappings().one())
+            params = {"key": access_key, **request.model_dump()}
+            params["system_prompt_overrides"] = json.dumps(
+                request.system_prompt_overrides
+            )
+            row = dict(conn.execute(text(sql), params).mappings().one())
     except Exception as exc:
         raise HTTPException(status_code=409, detail=f"Access path update rejected: {exc}") from exc
     _refresh_catalog()

@@ -182,3 +182,101 @@ class TestClaudeBackendResolution:
 
         dispatched = parent_stream.call_args.args[1]
         assert dispatched["disallowed_tools"] == configured
+
+    def test_provider_system_prompt_follows_bot_prompt_and_is_byte_stable(self):
+        from llm_bawt.agent_backends.claude_code import ClaudeCodeBackend
+
+        backend = ClaudeCodeBackend()
+        config = {
+            "model": "openai_chatgpt/gpt-5.6-sol",
+            "bot_id": "loopy",
+            "system_prompt": "Bot instructions.",
+            "provider_system_prompt": "OpenAI harness instructions.",
+        }
+
+        with (
+            patch(
+                "llm_bawt.runtime_setting_resolution.resolve_global_runtime_setting",
+                return_value=[],
+            ),
+            patch(
+                "llm_bawt.agent_backends.agent_bridge.AgentBridgeBackend.stream_raw",
+                return_value=iter(()),
+            ) as parent_stream,
+        ):
+            list(backend.stream_raw("first", config))
+            first = parent_stream.call_args.args[1]["system_prompt"]
+            list(backend.stream_raw("second", config))
+            second = parent_stream.call_args.args[1]["system_prompt"]
+
+        assert first == second
+        assert first.endswith(
+            "Bot instructions.\n\nOpenAI harness instructions."
+        )
+        assert first.index("<runtime-context>") < first.index("Bot instructions.")
+        assert first.index("Bot instructions.") < first.index(
+            "OpenAI harness instructions."
+        )
+
+    def test_provider_system_prompt_refreshes_from_catalog_each_dispatch(self):
+        from llm_bawt.agent_backends.claude_code import ClaudeCodeBackend
+
+        backend = ClaudeCodeBackend()
+        current = {"provider_system_prompt": "First provider instructions."}
+        backend._config = SimpleNamespace(resolve_model=lambda *args, **kwargs: current)
+        config = {
+            "model": "openai_chatgpt/gpt-5.6-sol",
+            "bot_id": "loopy",
+            "endpoint_id": 20,
+            "harness": "claude-proxy",
+            "system_prompt": "Bot instructions.",
+        }
+
+        with (
+            patch(
+                "llm_bawt.runtime_setting_resolution.resolve_global_runtime_setting",
+                return_value=[],
+            ),
+            patch(
+                "llm_bawt.agent_backends.agent_bridge.AgentBridgeBackend.stream_raw",
+                return_value=iter(()),
+            ) as parent_stream,
+        ):
+            list(backend.stream_raw("first", config))
+            first = parent_stream.call_args.args[1]["system_prompt"]
+            current["provider_system_prompt"] = "Second provider instructions."
+            list(backend.stream_raw("second", config))
+            second = parent_stream.call_args.args[1]["system_prompt"]
+
+        assert first.endswith("First provider instructions.")
+        assert second.endswith("Second provider instructions.")
+
+    def test_blank_provider_system_prompt_adds_no_separator(self):
+        from llm_bawt.agent_backends.claude_code import ClaudeCodeBackend
+
+        backend = ClaudeCodeBackend()
+        with (
+            patch(
+                "llm_bawt.runtime_setting_resolution.resolve_global_runtime_setting",
+                return_value=[],
+            ),
+            patch(
+                "llm_bawt.agent_backends.agent_bridge.AgentBridgeBackend.stream_raw",
+                return_value=iter(()),
+            ) as parent_stream,
+        ):
+            list(
+                backend.stream_raw(
+                    "hello",
+                    {
+                        "model": "openai_chatgpt/gpt-5.6-sol",
+                        "bot_id": "loopy",
+                        "system_prompt": "Bot instructions.",
+                        "provider_system_prompt": " \n ",
+                    },
+                )
+            )
+
+        assert parent_stream.call_args.args[1]["system_prompt"].endswith(
+            "Bot instructions."
+        )
