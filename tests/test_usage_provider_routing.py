@@ -62,6 +62,28 @@ def test_openai_oauth_claude_proxy_maps_to_chatgpt_usage(monkeypatch):
     assert usage_routes._provider_for_bot(service, "al") == "openai_chatgpt"
 
 
+def test_kimi_coding_prefix_maps_to_coding_usage(monkeypatch):
+    config = SimpleNamespace(
+        ensure_model_catalog=lambda: None,
+        resolve_model=lambda ref, harness=None, default=None: {
+            "type": "claude-code",
+            "model_id": "kimi_coding/k3",
+        },
+    )
+    bot = SimpleNamespace(
+        slug="al",
+        default_model="kimi-k3",
+        endpoint_id=None,
+        harness="claude-proxy",
+        agent_backend="claude-code",
+    )
+    _patch_bot(monkeypatch, bot)
+
+    assert usage_routes._provider_for_bot(
+        SimpleNamespace(config=config), "al"
+    ) == "kimi_coding"
+
+
 def test_native_anthropic_endpoint_maps_to_claude(monkeypatch):
     endpoint = ModelEndpoint(
         id=17,

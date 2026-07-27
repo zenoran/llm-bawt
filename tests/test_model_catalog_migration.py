@@ -76,6 +76,33 @@ def test_native_claude_is_direct_but_zai_passthrough_uses_proxy_harness():
     assert _derive_harness("claude-code", zai.access_path) == "claude-proxy"
 
 
+def test_moonshot_and_kimi_coding_map_to_distinct_proxy_access_paths():
+    moonshot = map_legacy_definition(
+        _row(
+            alias="moonshot-k3-1m",
+            type="claude-code",
+            model_id="moonshot/kimi-k3[1m]",
+            extra={"provider": "moonshot", "upstream_model": "kimi-k3[1m]"},
+        )
+    )
+    coding = map_legacy_definition(
+        _row(
+            alias="kimi-k3",
+            type="claude-code",
+            model_id="kimi_coding/k3",
+            extra={"provider": "kimi_coding", "upstream_model": "k3"},
+        )
+    )
+
+    assert moonshot.access_path.key == "moonshot-anthropic"
+    assert moonshot.access_path.protocol == "anthropic-messages"
+    assert moonshot.upstream_model_id == "kimi-k3[1m]"
+    assert coding.access_path.key == "kimi-coding-chat"
+    assert coding.access_path.protocol == "chat-completions"
+    assert coding.upstream_model_id == "k3"
+    assert _derive_harness("claude-code", coding.access_path) == "claude-proxy"
+
+
 def test_local_gguf_serving_fields_belong_to_endpoint():
     mapped = map_legacy_definition(
         _row(

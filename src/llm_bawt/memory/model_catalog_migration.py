@@ -97,7 +97,21 @@ ACCESS_PATHS: dict[str, AccessPathSpec] = {
         "zai-anthropic",
         "zai",
         "anthropic-messages",
-        None,
+        "https://api.z.ai/api/anthropic",
+        "api-key",
+    ),
+    "moonshot-anthropic": AccessPathSpec(
+        "moonshot-anthropic",
+        "moonshot",
+        "anthropic-messages",
+        "https://api.moonshot.ai/anthropic",
+        "api-key",
+    ),
+    "kimi-coding-chat": AccessPathSpec(
+        "kimi-coding-chat",
+        "kimi",
+        "chat-completions",
+        "https://api.kimi.com/coding/v1",
         "api-key",
     ),
     "local-llamacpp": AccessPathSpec(
@@ -152,6 +166,8 @@ def _strip_provider_prefix(model_id: str | None) -> tuple[str | None, str | None
         ("openai_chatgpt/", "openai_chatgpt"),
         ("xai/", "xai"),
         ("zai/", "zai"),
+        ("moonshot/", "moonshot"),
+        ("kimi_coding/", "kimi_coding"),
     ):
         if model_id.startswith(prefix):
             return model_id[len(prefix) :], provider
@@ -175,6 +191,10 @@ def _access_path_for(
             return ACCESS_PATHS["xai-responses"]
         if provider == "zai":
             return ACCESS_PATHS["zai-anthropic"]
+        if provider == "moonshot":
+            return ACCESS_PATHS["moonshot-anthropic"]
+        if provider in {"kimi_coding", "kimi", "kimi-code"}:
+            return ACCESS_PATHS["kimi-coding-chat"]
         return ACCESS_PATHS["anthropic-oauth"]
     if kind == "openai":
         return ACCESS_PATHS["openai-api"]
@@ -451,6 +471,10 @@ SELECT
         THEN 'xai/' || e.upstream_model_id
       WHEN e.legacy_type = 'claude-code' AND a.key = 'zai-anthropic'
         THEN 'zai/' || e.upstream_model_id
+      WHEN e.legacy_type = 'claude-code' AND a.key = 'moonshot-anthropic'
+        THEN 'moonshot/' || e.upstream_model_id
+      WHEN e.legacy_type = 'claude-code' AND a.key = 'kimi-coding-chat'
+        THEN 'kimi_coding/' || e.upstream_model_id
       ELSE e.upstream_model_id
     END::VARCHAR(512) AS model_id,
     (e.serving_config->>'repo_id')::VARCHAR(512) AS repo_id,

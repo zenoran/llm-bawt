@@ -1,6 +1,5 @@
 """Model and bot listing routes."""
 
-import os
 import time
 
 from fastapi import APIRouter, HTTPException, Query
@@ -36,90 +35,21 @@ _upstream_cache: dict[str, tuple[float, list[dict]]] = {}
 
 
 def _upstream_lookup(provider: str) -> list[dict]:
-    """Fetch upstream provider catalog with TTL caching.
-
-    Returns a list of ``{id, description}`` dicts. Raises ``HTTPException``
-    on missing API keys or fetch failure (so the UI can surface a clear
-    message).
-    """
+    """Fetch and cache one provider's normalized upstream catalog."""
     now = time.time()
     cached = _upstream_cache.get(provider)
     if cached and (now - cached[0]) < _UPSTREAM_TTL_S:
         return cached[1]
 
-    from ...model_manager import (
-        fetch_anthropic_api_models,
-        fetch_codex_models,
-        fetch_grok_api_models,
-        fetch_openai_api_models,
-    )
+    from ..model_discovery import ModelDiscoveryError, discover_models
 
-    if provider == "codex":
-        ok, models = fetch_codex_models()
-    elif provider == "openai":
-        ok, models = fetch_openai_api_models()
-    elif provider == "grok":
-        api_key = (
-            os.getenv("LLM_BAWT_XAI_API_KEY")
-            or os.getenv("XAI_API_KEY")
-            or ""
-        )
-        if not api_key:
-            raise HTTPException(
-                status_code=503,
-                detail="Grok discovery requires LLM_BAWT_XAI_API_KEY in env",
-            )
-        ok, models = fetch_grok_api_models(api_key)
-    elif provider in ("anthropic", "claude-code"):
-        # Both alias to the same upstream: Anthropic /v1/models.
-        # The CLAUDE_CODE_OAUTH_TOKEN (subscription) cannot authenticate
-        # the models endpoint — only ANTHROPIC_API_KEY works.
-        api_key = (
-            os.getenv("LLM_BAWT_ANTHROPIC_API_KEY")
-            or os.getenv("ANTHROPIC_API_KEY")
-            or ""
-        )
-        if not api_key:
-            raise HTTPException(
-                status_code=503,
-                detail=(
-                    "Anthropic discovery requires ANTHROPIC_API_KEY in env "
-                    "(the Claude Code OAuth token does not work for /v1/models)."
-                ),
-            )
-        ok, models = fetch_anthropic_api_models()
-    else:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Unknown provider '{provider}'. Use openai, codex, grok, anthropic, or claude-code.",
-        )
+    try:
+        models = discover_models(provider)
+    except ModelDiscoveryError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc
 
-    if not ok:
-        raise HTTPException(
-            status_code=502,
-            detail=f"Failed to fetch {provider} model catalog from upstream",
-        )
-
-    # Normalize to {id, description}; description is whatever the source gave us.
-    cleaned: list[dict] = []
-    for m in models or []:
-        if not isinstance(m, dict):
-            continue
-        mid = m.get("id") or m.get("model_id")
-        if not mid:
-            continue
-        cleaned.append({
-            "id": mid,
-            "description": (
-                m.get("description")
-                or m.get("summary")
-                or m.get("name")
-                or ""
-            ),
-        })
-
-    _upstream_cache[provider] = (now, cleaned)
-    return cleaned
+    _upstream_cache[provider] = (now, models)
+    return models
 
 
 def _coerce_pricing(raw: object) -> ModelPricing | None:
@@ -217,13 +147,16 @@ def list_models():
 
 @router.get("/v1/models/upstream", tags=["Models"])
 def list_upstream_models(
-    provider: str = Query(..., description="Provider catalog: openai | codex | grok"),
+    provider: str = Query(
+        ...,
+        description="Provider catalog: openai | codex | grok | anthropic | kimi",
+    ),
 ):
     """List available models from a provider's upstream catalog.
 
-    Used by the bots admin Quick-Add Model dialog so users can pick from
-    real model IDs instead of typing blind. Codex returns a curated static
-    list; OpenAI / Grok hit the live API. Results cached for 5 minutes.
+    Used by the Add Model dialog so users can pick from real model IDs instead
+    of typing blind. Codex is bridge-backed; OpenAI, Grok, Anthropic, and Kimi
+    use their provider catalogs. Results are cached for 5 minutes.
 
     Returns ``{provider, models: [{id, description}]}``.
     """

@@ -30,6 +30,8 @@ from .canonical import (
 )
 from .adapters import (
     ClaudeUsageAdapter,
+    KimiCodingUsageAdapter,
+    MoonshotUsageAdapter,
     OpenAIChatGPTUsageAdapter,
     XaiUsageAdapter,
     ZaiUsageAdapter,
@@ -50,6 +52,12 @@ register(ClaudeUsageAdapter())
 register(ZaiUsageAdapter())
 register(OpenAIChatGPTUsageAdapter())
 register(XaiUsageAdapter())
+# Moonshot OpenPlatform and Kimi For Coding are separate products. Do not
+# surface an unauthorized Moonshot card when only the Kimi subscription is
+# configured; register OpenPlatform usage once its own key exists.
+if os.getenv("MOONSHOT_API_KEY") or os.getenv("LLM_BAWT_MOONSHOT_API_KEY"):
+    register(MoonshotUsageAdapter())
+register(KimiCodingUsageAdapter())
 
 
 def list_providers() -> list[str]:

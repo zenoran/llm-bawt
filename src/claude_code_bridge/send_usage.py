@@ -199,9 +199,8 @@ class ClaudeUsageMixin:
                     "max_output_tokens": max_output,
                     "total_cost_usd": cost,
                 }
-                if actual_model and (
-                    str(actual_model).startswith("zai/")
-                    or str(actual_model).startswith("xai/")
+                if actual_model and str(actual_model).startswith(
+                    ("zai/", "xai/", "moonshot/", "kimi_coding/")
                 ):
                     logger.info(
                         "proxy usage: model=%s iter_in=%s stream_in=%s "

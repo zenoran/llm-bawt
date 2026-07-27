@@ -12,7 +12,6 @@ import logging
 import os
 import re
 import time
-from datetime import datetime, timezone
 from pathlib import Path
 
 import httpx
@@ -93,6 +92,11 @@ def _estimate_proxy_cost_usd(model: str | None, usage: dict | None) -> float | N
     if not model or not isinstance(usage, dict):
         return None
     m = str(model).strip().lower()
+    # Kimi For Coding is a flat subscription surface. The Claude CLI does not
+    # know that model and otherwise prices it as Opus-tier pay-as-you-go, which
+    # is pure fiction. There is no marginal per-token charge to estimate.
+    if m.startswith("kimi_coding/"):
+        return 0.0
     if not m.startswith("xai/"):
         return None
     rates = _XAI_DEFAULT_RATES

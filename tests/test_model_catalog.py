@@ -122,6 +122,24 @@ def test_bare_unique_proxy_ref_preserves_legacy_provider_prefix():
     assert resolved["model_id"] == "xai/grok-4.5"
 
 
+def test_kimi_coding_proxy_gets_provider_namespace():
+    endpoint = _endpoint(
+        4,
+        "kimi-k3",
+        "kimi-coding-chat",
+        "kimi",
+        "chat-completions",
+        "k3",
+        legacy_type="claude-code",
+    )
+
+    resolved = ModelCatalog([endpoint]).resolve(
+        "kimi-k3", harness="claude-proxy"
+    )
+    assert resolved["type"] == "claude-code"
+    assert resolved["model_id"] == "kimi_coding/k3"
+
+
 def test_protocol_compatibility_is_single_filter_rule():
     anthropic = _endpoint(
         1, "claude-opus", "anthropic-oauth", "anthropic", "anthropic-messages", "opus"

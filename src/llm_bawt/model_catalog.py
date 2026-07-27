@@ -241,6 +241,10 @@ class ModelCatalog:
             return "xai"
         if access_path.vendor == "zai":
             return "zai"
+        if access_path.vendor == "moonshot":
+            return "moonshot"
+        if access_path.vendor == "kimi":
+            return "kimi_coding"
         return None
 
     @classmethod

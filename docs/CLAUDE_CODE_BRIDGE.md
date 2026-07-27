@@ -27,6 +27,8 @@ Common shapes:
 - `openai_chatgpt/<model>` for ChatGPT-subscription routing through the proxy.
 - `zai/<model>` for z.ai / GLM routing through the proxy.
 - `xai/<model>` for xAI / Grok routing through the proxy (e.g. `xai/grok-4.5`).
+- `moonshot/<model>` for Moonshot OpenPlatform's Anthropic-compatible API.
+- `kimi_coding/<model>` for the Kimi For Coding subscription's Chat Completions API.
 
 If a bot has `agent_backend="claude-code"` but no valid `default_model`, the
 turn is rejected.
@@ -54,6 +56,8 @@ because the local proxy reads ChatGPT OAuth from that file.
 | `CLAUDE_CODE_ADD_DIRS` | unset | Extra Claude `--add-dir` paths |
 | `CLAUDE_CODE_BACKEND_NAME` | `claude-code` | Redis backend filter |
 | `XAI_API_KEY` | unset | xAI/Grok API key for `xai/<model>` routing (`LLM_BAWT_XAI_API_KEY` aliased) |
+| `MOONSHOT_API_KEY` | unset | Moonshot OpenPlatform key for `moonshot/<model>` routing |
+| `KIMI_CODING_API_KEY` | unset | Kimi For Coding subscription key for `kimi_coding/<model>` routing |
 | `CLAUDE_CODE_BRIDGE_PROXY_DISABLED` | unset | Disable provider-routing proxy |
 | `CLAUDE_CODE_BRIDGE_PROXY_PORT` | `0` | Pin proxy port instead of ephemeral |
 | `CLAUDE_CODE_APPROVAL_BUNDLE_TTL` | `15` | Approval-policy bundle cache TTL |

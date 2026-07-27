@@ -53,6 +53,8 @@ def _provider_for_bot(service, bot_id: str) -> str:
         "openai": "openai_chatgpt",
         "chatgpt": "openai_chatgpt",
         "codex": "openai_chatgpt",
+        "kimi": "kimi_coding",
+        "kimi-code": "kimi_coding",
     }
 
     try:
@@ -105,7 +107,10 @@ def _provider_for_bot(service, bot_id: str) -> str:
         # (that put the Anthropic sunburst + Max plan limits on Grok bots).
         # Prefer a registered alias; otherwise still return the prefix so the
         # route 404s with a clear "unknown provider" rather than lying.
-        if prefix in {"xai", "grok", "zai", "openai_chatgpt", "openai", "codex"}:
+        if prefix in {
+            "xai", "grok", "zai", "openai_chatgpt", "openai", "codex",
+            "moonshot", "kimi_coding", "kimi", "kimi-code",
+        }:
             return prefix
 
     # Native (non-namespaced) model types — e.g. type=grok with bare model_id.

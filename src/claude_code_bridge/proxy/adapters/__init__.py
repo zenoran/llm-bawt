@@ -8,6 +8,8 @@ OpenAI ChatGPT adapter so callers only need to import this package.
 from __future__ import annotations
 
 from .base import ProviderAdapter
+from .kimi_coding import KimiCodingAdapter
+from .moonshot import MoonshotAdapter
 from .openai_chatgpt import OpenAIChatGPTAdapter
 from .xai import XaiAdapter
 from .zai import ZaiAdapter
@@ -28,5 +30,7 @@ def lookup(name: str) -> ProviderAdapter | None:
 register(OpenAIChatGPTAdapter())
 register(XaiAdapter())
 register(ZaiAdapter())
+register(MoonshotAdapter())
+register(KimiCodingAdapter())
 
 __all__ = ["ProviderAdapter", "REGISTRY", "register", "lookup"]

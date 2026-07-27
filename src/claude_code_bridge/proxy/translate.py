@@ -119,12 +119,14 @@ def _split_leading_temporal_context(system_text: str | None) -> tuple[str | None
     return stable or None, temporal or None
 
 
-def _image_block_to_input_image(block: dict) -> dict | None:
-    """Anthropic image block → Responses ``input_image`` part (or ``None``).
+def image_block_to_url(block: dict) -> str | None:
+    """Anthropic image block → a URL string usable by any OpenAI-family API.
 
-    Handles both base64 (``{source:{type:base64, media_type, data}}``) and URL
-    (``{source:{type:url, url}}``) sources. Shared by the plain user-image path
-    and the tool_result-image path so the two never drift.
+    Handles both base64 (``{source:{type:base64, media_type, data}}``, rendered
+    as a ``data:`` URI) and URL (``{source:{type:url, url}}``) sources. Shared
+    by the Responses translator below AND by ``translate_cc`` (Chat Completions
+    packs the same URL as ``{"type":"image_url","image_url":{"url":...}}``), so
+    the source-parsing rules can't drift between the two surfaces.
     """
     src = block.get("source") or {}
     stype = src.get("type")
@@ -133,17 +135,18 @@ def _image_block_to_input_image(block: dict) -> dict | None:
         if not data:
             return None
         media = src.get("media_type") or "image/png"
-        return {
-            "type": "input_image",
-            "image_url": f"data:{media};base64,{data}",
-            "detail": "auto",
-        }
+        return f"data:{media};base64,{data}"
     if stype == "url":
-        url = src.get("url") or ""
-        if not url:
-            return None
-        return {"type": "input_image", "image_url": url, "detail": "auto"}
+        return (src.get("url") or "") or None
     return None
+
+
+def _image_block_to_input_image(block: dict) -> dict | None:
+    """Anthropic image block → Responses ``input_image`` part (or ``None``)."""
+    url = image_block_to_url(block)
+    if not url:
+        return None
+    return {"type": "input_image", "image_url": url, "detail": "auto"}
 
 
 def _user_content_to_responses(content: Any) -> tuple[list[dict], list[dict], list[dict]]:
