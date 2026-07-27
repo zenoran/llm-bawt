@@ -331,7 +331,9 @@ class ClaudeStreamMixin:
                 if btext:
                     snapshot_parts.append(str(btext))
         if snapshot_parts:
-            assistant_snapshot_text = "".join(snapshot_parts)
+            # Separate text blocks are separate narration beats — join with a
+            # paragraph break, not "" (which glues "…Palworld.Grabbing coords…").
+            assistant_snapshot_text = "\n\n".join(snapshot_parts)
         return seq, latest_assistant_usage, assistant_snapshot_text
 
     async def _on_user_message_tool_results(

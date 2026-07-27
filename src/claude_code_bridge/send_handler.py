@@ -667,6 +667,26 @@ class ClaudeSendMixin(ClaudeStreamMixin, ClaudeUsageMixin):
                                     if block.get("type") == "tool_use":
                                         current_tool_name = block.get("name", "unknown")
                                         current_tool_input = ""
+                                    elif block.get("type") == "text":
+                                        # A NEW text block. Narrating agents emit one
+                                        # text block per iteration ("Looking up X." →
+                                        # tool → "Grabbing coords." → tool → answer).
+                                        # `text_parts` is joined with "", so without a
+                                        # boundary those blocks glue into
+                                        # "…Palworld.Grabbing exact coords…" — one run-on
+                                        # paragraph in the persisted message body.
+                                        # Emit the separator as a real ASSISTANT_DELTA so
+                                        # the live stream, the persisted content, and the
+                                        # tool `textOffset` char counts all stay in sync.
+                                        tail = text_parts[-1] if text_parts else ""
+                                        if tail and not tail.endswith("\n"):
+                                            seq += 1
+                                            text_parts.append("\n\n")
+                                            self._publish_event(
+                                                request_id, session_key, seq,
+                                                kind=AgentEventKind.ASSISTANT_DELTA,
+                                                text="\n\n",
+                                            )
 
                                 elif event_type == "content_block_stop":
                                     if current_tool_name:
