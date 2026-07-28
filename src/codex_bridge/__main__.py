@@ -201,6 +201,49 @@ def _redact(s: str | None, *, keep: int = 6) -> str:
     return s[:keep] + "*" * (len(s) - keep)
 
 
+def _materialize_auth_from_broker(auth_file: Path) -> bool:
+    """Fetch the full OAuth bundle from the app broker and write auth.json.
+
+    TASK-636 Phase 2c: the codex CLI reads ``~/.codex/auth.json`` as a file.
+    With the bind mount removed, the bridge materializes a container-local copy
+    from the app's encrypted DB store via ``GET /v1/providers/openai_chatgpt/bundle``.
+
+    Returns True on success, False if the broker is unreachable.
+    """
+    import httpx  # noqa: PLC0415
+
+    api_url = (os.environ.get("LLM_BAWT_API_URL") or "").rstrip("/")
+    if not api_url:
+        logger.warning("LLM_BAWT_API_URL not set — cannot materialize auth.json from broker")
+        return False
+    headers = {}
+    secret = os.environ.get("BRIDGE_CLAUDE_TOKEN_SECRET")
+    if secret:
+        headers["X-Bridge-Token"] = secret
+    try:
+        resp = httpx.get(
+            f"{api_url}/v1/providers/openai_chatgpt/bundle",
+            headers=headers,
+            timeout=10.0,
+        )
+        if resp.is_error:
+            logger.warning(
+                "Auth bundle broker returned %s: %s",
+                resp.status_code,
+                (resp.text or "")[:200],
+            )
+            return False
+        bundle = resp.json()
+        auth_file.parent.mkdir(parents=True, exist_ok=True)
+        auth_file.write_text(json.dumps(bundle, indent=2))
+        os.chmod(auth_file, 0o600)
+        logger.info("Materialized auth.json from app broker (path=%s)", auth_file)
+        return True
+    except Exception as e:  # noqa: BLE001
+        logger.warning("Auth bundle broker unreachable: %s", e)
+        return False
+
+
 def main() -> None:
     log_level = os.getenv("CODEX_BRIDGE_LOG_LEVEL", "INFO")
     logging.basicConfig(
@@ -227,6 +270,22 @@ def main() -> None:
 
     # --- TASK-204: validate auth.json before any SDK call ---
     auth_file = auth_path()
+
+    # TASK-636 Phase 2c: materialize auth.json from the app's broker endpoint.
+    # The codex CLI reads auth.json as a file — it can't use the broker directly.
+    # The bridge fetches the full bundle and writes it container-local (no mount).
+    # If the broker is unreachable, fall back to an existing file (pre-cutover).
+    if not auth_file.exists():
+        materialized = _materialize_auth_from_broker(auth_file)
+        if not materialized:
+            logger.error(
+                "auth.json missing at %s and broker unreachable — "
+                "cannot start. Ensure the app is running and the ChatGPT "
+                "provider is connected.",
+                auth_file,
+            )
+            sys.exit(1)
+
     try:
         auth_data = validate_auth_json(auth_file)
     except RuntimeError as e:

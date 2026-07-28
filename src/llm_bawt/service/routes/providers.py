@@ -197,6 +197,57 @@ async def claude_access_token(request: Request, force: bool = False):
     }
 
 
+# --- ChatGPT/codex token broker (TASK-636 Phase 2) -----------------------
+@router.get("/v1/providers/openai_chatgpt/token")
+async def chatgpt_access_token(request: Request, force: bool = False):
+    """Internal: hand a reader the current app-owned ChatGPT/codex access token.
+
+    The proxy adapter (claude-code-bridge) and the codex-bridge call this to
+    resolve tokens without reading a bind-mounted file. The app is the SOLE
+    refresher — readers never refresh. Same trust model as the Claude broker
+    above: internal network only; ``X-Bridge-Token`` defense in depth.
+    """
+    from ..usage.codex_oauth import get_access_token  # noqa: PLC0415
+
+    expected = os.getenv("BRIDGE_CLAUDE_TOKEN_SECRET")
+    if expected and request.headers.get("X-Bridge-Token") != expected:
+        raise HTTPException(status_code=401, detail="bad bridge token")
+
+    result = await run_in_threadpool(get_access_token, force_refresh=force)
+    if result.token is None:
+        raise HTTPException(status_code=503, detail="no ChatGPT credential installed")
+    return {
+        "access_token": result.token,
+        "account_id": result.account_id,
+        "expires_at": result.expires_at,
+        "state": result.state,
+    }
+
+
+@router.get("/v1/providers/openai_chatgpt/bundle")
+async def chatgpt_auth_bundle(request: Request):
+    """Internal: hand the codex-bridge the full OAuth bundle for materialization.
+
+    The codex CLI binary reads ``~/.codex/auth.json`` directly (it cannot call
+    a broker endpoint). The codex-bridge calls this at startup to materialize
+    a container-local auth.json from the DB-backed bundle — no bind mount
+    needed (TASK-636 Phase 2c).
+
+    Same trust model as the token broker above. Returns the full bundle dict
+    suitable for writing verbatim to auth.json.
+    """
+    from ..usage.codex_oauth import _load  # noqa: PLC0415
+
+    expected = os.getenv("BRIDGE_CLAUDE_TOKEN_SECRET")
+    if expected and request.headers.get("X-Bridge-Token") != expected:
+        raise HTTPException(status_code=401, detail="bad bridge token")
+
+    _, bundle = await run_in_threadpool(_load)
+    if not bundle:
+        raise HTTPException(status_code=503, detail="no ChatGPT credential installed")
+    return bundle
+
+
 # --- GitHub-specific --------------------------------------------------------
 @router.get("/v1/providers/github/installations")
 async def github_installations():

@@ -16,10 +16,12 @@ Mapping:
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
 import time
+import uuid
 
 from ..base import UsageAdapter
 from ..canonical import (
@@ -260,16 +262,28 @@ class OpenAIChatGPTUsageAdapter(UsageAdapter):
         """Fetch current quota headers with a tiny codex backend request."""
         try:
             import httpx
-            from claude_code_bridge.proxy.adapters.openai_chatgpt import (
-                OpenAIChatGPTAdapter,
-            )
 
-            adapter = OpenAIChatGPTAdapter()
-            bearer, base_url = await adapter.authorize()
+            from ..codex_oauth import get_access_token
+
+            # TASK-636: call the in-process credential owner directly instead
+            # of going through the proxy adapter (which uses the HTTP broker
+            # endpoint — not reachable from inside the app container).
+            result = await asyncio.to_thread(get_access_token)
+            if not result.token:
+                logger.warning("codex usage probe: no ChatGPT token available")
+                return None
+            base_url = (
+                os.getenv("OPENAI_BASE_URL")
+                or "https://chatgpt.com/backend-api/codex"
+            )
             headers = {
-                "Authorization": f"Bearer {bearer}",
-                **adapter.extra_headers(),
+                "Authorization": f"Bearer {result.token}",
+                "OpenAI-Beta": "responses=experimental",
+                "originator": "codex_cli_rs",
+                "session_id": uuid.uuid4().hex,
             }
+            if result.account_id:
+                headers["chatgpt-account-id"] = result.account_id
             model = os.getenv(_PROBE_MODEL_ENV) or "gpt-5.4"
             body = {
                 "model": model,

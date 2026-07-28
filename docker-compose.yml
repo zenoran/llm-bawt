@@ -43,7 +43,8 @@ services:
       # in the "Attached Images" prompt manifest. Same in-network address the
       # bridges already use for LLM_BAWT_API_URL.
       - LLM_BAWT_AGENT_ORIGIN=http://app:8642
-      - CODEX_AUTH_PATH=/home/bridge/.codex/auth.json
+      # TASK-636: CODEX_AUTH_PATH removed — the app reads the codex bundle
+      # from the encrypted DB store (provider_connection:openai_chatgpt).
     ports:
       - "${MCP_PORT:-8001}:8001"
       - "${SERVICE_PORT:-8642}:8642"
@@ -52,10 +53,9 @@ services:
       # endpoint's dedicated Claude login bundle lives under this (RW) mount at
       # claude-usage/.credentials.json — the app refreshes it in place.
       - ${HOME}/.config/llm-bawt:/root/.config/llm-bawt
-      # /v1/usage OpenAI ChatGPT adapter probes the codex backend with the same
-      # OAuth bundle the bridge uses, then stores fresh x-codex quota headers in
-      # Redis for BawtHub.
-      - ${HOME}/.codex/auth.json:/home/bridge/.codex/auth.json
+      # TASK-636: codex auth.json bind mount REMOVED — the app reads the
+      # bundle from the encrypted DB store (usage probe calls codex_oauth
+      # in-process; broker endpoint serves bridges).
       # Mount logs directory
       - ./.logs:/app/.logs
       # Mount bots.yaml for live updates (nextcloud provisioning, etc.)
@@ -165,10 +165,9 @@ services:
       - ./.env
     environment:
       - CLAUDE_CODE_OAUTH_TOKEN=${CLAUDE_CODE_OAUTH_TOKEN:-}
-      # TASK-635: the bridge is a READ-ONLY consumer of the app-owned Claude
-      # credential (single login, app is sole refresher). Points at the
-      # read-only mount below; falls back to GET /v1/providers/claude/token.
-      - CLAUDE_CREDENTIALS_PATH=/home/bridge/.claude-broker/.credentials.json
+      # TASK-636: the bridge consumes Claude tokens via the broker endpoint
+      # (GET /v1/providers/claude/token) with an in-memory cache. No
+      # credential bind mount — the DB row is the single source of truth.
       # CLAUDE_CODE_MODEL intentionally not set — there is no default
       # model.  Each request carries its model, resolved from the bot's
       # default_model catalog entry (type=claude-code).  See
@@ -182,11 +181,8 @@ services:
       # talk to the API without a flag override.
       - LLM_BAWT_SERVICE_HOST=app
       - REDIS_URL=redis://redis:6379/0
-      # TASK-270: TASK-270 proxy reads ChatGPT subscription OAuth from
-      # ~/.codex/auth.json (the artifact `codex login` produces). Same
-      # bind-mount the codex-bridge uses so a single `codex login` on the
-      # host re-credentials both bridges.
-      - CODEX_AUTH_PATH=/home/bridge/.codex/auth.json
+      # TASK-636: CODEX_AUTH_PATH removed — the proxy adapter fetches tokens
+      # from the app's broker endpoint (GET /v1/providers/openai_chatgpt/token).
       # Z.AI (Zhipu GLM) — native Anthropic Messages API passthrough.
       # Powers bots whose model_id is namespaced "zai/<glm-model>".
       - ZAI_API_KEY=${ZAI_API_KEY:-}
@@ -211,10 +207,8 @@ services:
       - ${HOME}/dev:/home/bridge/dev
       - ${HOME}/.config/claude-code-bridge:/home/bridge/.claude
       - ${HOME}/.config/claude-code-bridge/.claude.json:/home/bridge/.claude.json
-      # TASK-635: app-owned Claude credential, read-only. Mount the DIRECTORY
-      # (not the file) — the app refreshes via tmp+rename, and a single-file
-      # bind mount would pin the old inode (codex auth.json EBUSY class).
-      - ${HOME}/.config/llm-bawt/claude-usage:/home/bridge/.claude-broker:ro
+      # TASK-636: credential bind mount REMOVED — the bridge fetches tokens
+      # from the app's broker endpoint (DB-backed, encrypted at rest).
       # Bridge SSH identity. Default = the host operator's ~/.ssh (echo today,
       # for non-GitHub SSH targets). NOTE: tenant GitHub auth no longer relies on
       # a hand-made deploy key — it uses the provider-connect git credential
@@ -223,10 +217,8 @@ services:
       # available for any non-GitHub SSH remotes a bridge still needs.
       - ${BRIDGE_SSH_DIR:-${HOME}/.ssh}:/home/bridge/.ssh:ro
       - ${HOME}/.config/claude-code-bridge/ssh_config:/etc/ssh/ssh_config:ro
-      # TASK-270 proxy reads/refreshes the ChatGPT OAuth bundle here.
-      # RW so the proxy can persist refreshed tokens; same inode as the
-      # codex-bridge mount so both stay in lockstep.
-      - ${HOME}/.codex/auth.json:/home/bridge/.codex/auth.json
+      # TASK-636: codex auth.json bind mount REMOVED — the proxy adapter
+      # resolves tokens via the broker endpoint (DB-backed, encrypted at rest).
       # Shared agent scripts (bw-secret etc.) — live, no rebuild needed
       - ${HOME}/dev/agent-skills/scripts:/opt/agent-skills/bin:ro
     depends_on:
@@ -250,7 +242,8 @@ services:
       - ./.env
     environment:
       - CODEX_HOME=/home/bridge/.codex
-      - CODEX_AUTH_PATH=/home/bridge/.codex/auth.json
+      # TASK-636: CODEX_AUTH_PATH removed — the bridge materializes auth.json
+      # from the app's broker endpoint at startup (container-local, no mount).
       - CODEX_MODEL=${CODEX_MODEL:-gpt-5.4}
       - CODEX_BACKEND_NAME=${CODEX_BACKEND_NAME:-codex}
       - CODEX_BRIDGE_LOG_LEVEL=${CODEX_BRIDGE_LOG_LEVEL:-INFO}
@@ -282,10 +275,9 @@ services:
     volumes:
       - ./.logs:/app/.logs
       - ${HOME}/dev:/home/bridge/dev
-      # OAuth bundle is bind-mounted RW so codex can self-refresh tokens.
-      # `codex login` on the host writes back to this same inode and the
-      # bridge picks up the new tokens on the next turn — no restart needed.
-      - ${HOME}/.codex/auth.json:/home/bridge/.codex/auth.json
+      # TASK-636: auth.json bind mount REMOVED — materialized from the app's
+      # broker endpoint at startup (GET /v1/providers/openai_chatgpt/bundle).
+      # config.toml + sessions stay mounted (not credential material).
       - ${HOME}/.codex/config.toml:/home/bridge/.codex/config.toml
       - ${HOME}/.codex/sessions:/home/bridge/.codex/sessions
       # Bridge SSH identity. Default = the host operator's ~/.ssh (echo today,

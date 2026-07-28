@@ -5,13 +5,17 @@ panel) dual auth into a single wizard flow. It drives the FULL login —
 ``claude auth login --claudeai`` — whose scope set covers everything the
 deployment needs (``user:inference`` for the claude-code bridge,
 ``user:profile`` for ``/v1/usage``), in an ISOLATED throwaway config dir so it
-can never rotate or clobber an interactive TUI login. On success the minted
-``claudeAiOauth`` bundle is installed at :func:`claude_credentials_path`, where:
+can never rotate or clobber an interactive TUI login.
 
-* the app's owned-mode refresher (``usage/claude_oauth.py``) keeps it fresh
-  forever (proactive loop + on-demand), and
-* the claude-code bridge reads it via a read-only mount / the
-  ``GET /v1/providers/claude/token`` broker endpoint — readers never refresh.
+TASK-636: the minted ``claudeAiOauth`` bundle is stored in the encrypted
+CredentialStore row (``secret["claudeAiOauth"]`` — Fernet at rest) instead of
+a host file. The DB row is the single source of truth:
+
+* the app's owned-mode refresher (``usage/claude_oauth.py``) reads/writes the
+  row and keeps it fresh forever (proactive loop + on-demand), and
+* the claude-code bridge consumes it via the
+  ``GET /v1/providers/claude/token`` broker endpoint — readers never refresh,
+  and no credential bind mounts exist.
 
 Reuses the PTY engine from :class:`ClaudeSubAdapter` (which remains as the
 unregistered base class).
@@ -92,13 +96,11 @@ class ClaudeAdapter(ClaudeSubAdapter):
                 "it could not serve both inference and usage; not installing"
             )
 
-        target = claude_credentials_path()
-        target.parent.mkdir(parents=True, exist_ok=True)
-        # In-place write (no tmp+rename): the file can be a bind-mounted single
-        # file, where rename fails EBUSY (same class of issue as codex auth.json).
-        target.write_text(json.dumps({"claudeAiOauth": bundle}, indent=2))
-        logger.info("Installed fresh Claude credential at %s", target)
         self._cleanup_login_dir(creds_path.parent)
+        # TASK-636: the bundle goes into the encrypted CredentialStore row —
+        # the DB is the single source of truth. The caller's save() persists
+        # both the record and the secret (Fernet at rest).
+        logger.info("Installed fresh Claude credential into the encrypted DB store")
 
         return ConnectionRecord(
             provider=self.id,
@@ -106,19 +108,19 @@ class ClaudeAdapter(ClaudeSubAdapter):
             auth_method=AUTH_CLI_OAUTH,
             account=bundle.get("subscriptionType") or "claude-subscription",
             meta={
-                "credentials_path": str(target),
                 "scopes": scopes,
                 "expires_at": bundle.get("expiresAt"),
             },
+            secret={"claudeAiOauth": bundle},
         )
 
     # --- honest status -------------------------------------------------------
     def descriptor(self) -> dict[str, Any]:
-        """Report truth from the bundle FILE, not just the stored record.
+        """Report truth from the DB-backed bundle, not just wizard bookkeeping.
 
-        The bundle may predate this adapter (minted by the legacy claude-usage
-        flow or installed out-of-band) — if a usable bundle exists, the
-        deployment IS connected regardless of wizard bookkeeping.
+        The bundle may predate this adapter (minted by the legacy flow or
+        imported from the legacy file on first load) — if a usable bundle
+        exists, the deployment IS connected regardless of stored bookkeeping.
         """
         desc = super().descriptor()
         status = bundle_status()
@@ -132,7 +134,6 @@ class ClaudeAdapter(ClaudeSubAdapter):
                 conn["account"] = status.get("subscription") or "claude-subscription"
             conn["meta"] = {
                 **(conn.get("meta") or {}),
-                "credentials_path": str(claude_credentials_path()),
                 "scopes": status.get("scopes"),
                 "expires_at": status.get("expires_at"),
                 "expired": status.get("expired"),

@@ -365,6 +365,10 @@ async def lifespan(app):
     from .usage.claude_oauth import proactive_refresh_loop
     service._claude_refresh_task = _aio.create_task(proactive_refresh_loop())
 
+    # TASK-636 Phase 2: same pattern for the ChatGPT/codex OAuth bundle.
+    from .usage.codex_oauth import proactive_refresh_loop as _codex_loop
+    service._codex_refresh_task = _aio.create_task(_codex_loop())
+
     try:
         yield
     finally:
@@ -376,7 +380,7 @@ async def lifespan(app):
         #     except (asyncio.CancelledError, Exception):
         #         pass
         # Cancel background tasks
-        for task_attr in ("_group_cleanup_task", "_tool_persist_task", "_claude_refresh_task"):
+        for task_attr in ("_group_cleanup_task", "_tool_persist_task", "_claude_refresh_task", "_codex_refresh_task"):
             task = getattr(service, task_attr, None)
             if task:
                 task.cancel()

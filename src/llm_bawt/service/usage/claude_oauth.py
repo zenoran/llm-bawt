@@ -3,13 +3,20 @@
 TASK-635: there is ONE Claude login for the whole deployment. The app owns the
 full-scope ``claudeAiOauth`` bundle (``user:inference`` + ``user:profile`` + …,
 minted by the ``claude`` provider adapter's wizard login) and is the SOLE
-refresher of its rotate-on-use refresh-token chain. Everything else is a
-read-only consumer:
+refresher of its rotate-on-use refresh-token chain.
+
+TASK-636: the bundle now lives in the **encrypted CredentialStore** (the
+``provider_connection:claude`` row's ``secret_enc`` — Fernet, key from
+LLM_BAWT_SECRET_KEY) instead of a host file. The DB row is the single source
+of truth; consumers:
 
 * the ``/v1/usage`` Claude adapter (same process — calls :func:`load_usage_token`),
-* the claude-code bridge (reads the bundle file via a read-only mount, falling
-  back to ``GET /v1/providers/claude/token`` when the file looks stale — see
-  ``claude_code_bridge/_bridge_helpers.py``; it NEVER refreshes).
+* the claude-code bridge (broker endpoint ``GET /v1/providers/claude/token``
+  with an in-memory cache — no credential bind mounts at all).
+
+One-time cutover: on first load, if the DB row has no bundle but the legacy
+file exists (:func:`claude_credentials_path`), the file is imported into the
+DB — so existing deployments switch over with zero re-login.
 
 Refresh is serialized behind a process-wide lock and re-checks freshness after
 acquiring it, so concurrent callers (usage fetch, broker endpoint, proactive
@@ -17,22 +24,13 @@ loop) can never race the single-use refresh token. A proactive background loop
 (:func:`proactive_refresh_loop`, started from the app lifespan) refreshes at
 ``expiresAt - buffer`` so the access token never lapses even when idle.
 
-TWO MODES (``CLAUDE_USAGE_CREDENTIALS_MODE``):
+``CLAUDE_USAGE_CREDENTIALS_MODE=shared`` is obsolete: the app owns the row and
+is always the refresher. The legacy file, when it exists, is only ever READ
+(once, for the migration import) — never written.
 
-* ``owned`` — the deployment default: the dedicated bundle this app exclusively
-  refreshes + rewrites.
-* ``shared`` — legacy read-only reuse of a bundle some OTHER owner (e.g. an
-  interactive TUI) maintains. We never write it; it goes stale if the owner is
-  idle. Kept for setups without a dedicated login.
-
-PATH: ``CLAUDE_CREDENTIALS_PATH`` (preferred) or the legacy
-``CLAUDE_USAGE_CREDENTIALS_PATH`` env; default
-``~/.config/llm-bawt/claude-usage-credentials.json``. When sharing across
-containers, mount the DIRECTORY (not the single file) — refresh persists via
-tmp+rename, and a single-file bind mount pins the old inode.
-
-The file may be the standard wrapper ``{"claudeAiOauth": {...}}`` or a bare
-bundle ``{"accessToken": ..., "refreshToken": ...}`` — both are accepted.
+The bundle is the standard wrapper ``{"claudeAiOauth": {...}}`` on disk; in the
+DB secret it is stored as the bare bundle (``accessToken``/``refreshToken``/
+``expiresAt``/``scopes``/…).
 """
 
 from __future__ import annotations
@@ -60,6 +58,9 @@ _REFRESH_BUFFER_MS = 5 * 60 * 1000
 _PROACTIVE_CHECK_S = 300.0
 _PROACTIVE_BUFFER_MS = 20 * 60 * 1000
 
+_PROVIDER_ID = "claude"
+_SECRET_KEY = "claudeAiOauth"
+
 # Serializes refresh across the usage fetch, the broker endpoint, and the
 # proactive loop — the refresh token is single-use, so two concurrent
 # refreshes would invalidate each other (the exact race TASK-635 exists to
@@ -74,6 +75,9 @@ _REFRESH_LOCK = threading.Lock()
 _last_refresh_ok_at: int | None = None  # epoch ms
 _last_refresh_error: str | None = None
 _last_refresh_error_at: int | None = None
+
+# Migration import runs at most once per process.
+_migrated = False
 
 
 def _record_refresh_outcome(error: str | None) -> None:
@@ -98,7 +102,13 @@ def refresh_health() -> dict:
 
 
 def claude_credentials_path() -> Path:
-    """The app-owned Claude credential bundle file."""
+    """The LEGACY app-owned Claude credential bundle file (migration source).
+
+    TASK-636: no longer the source of truth — the encrypted DB row is. This
+    path is only ever read (one-time import on first load) and kept so older
+    docs/scripts still resolve. ``CLAUDE_CREDENTIALS_PATH`` /
+    ``CLAUDE_USAGE_CREDENTIALS_PATH`` env overrides honored for the import.
+    """
     override = os.getenv("CLAUDE_CREDENTIALS_PATH") or os.getenv(
         "CLAUDE_USAGE_CREDENTIALS_PATH"
     )
@@ -112,8 +122,8 @@ usage_credentials_path = claude_credentials_path
 
 
 def credentials_mode() -> str:
-    """Active credential mode: ``shared`` (default) or ``owned``."""
-    return (os.getenv("CLAUDE_USAGE_CREDENTIALS_MODE") or "shared").strip().lower()
+    """Legacy knob — always ``owned`` now (the app owns the DB row)."""
+    return "owned"
 
 
 # Backwards-compatible private alias (internal callers use _mode()).
@@ -126,9 +136,9 @@ class UsageToken:
 
     ``state`` is one of:
       * ``ok``      — usable access token (``token`` set)
-      * ``missing`` — no credential file / bundle configured
+      * ``missing`` — no credential configured
       * ``stale``   — credential present but its access token has expired and
-                      we couldn't (owned) or won't (shared) refresh it
+                      we couldn't refresh it
     """
 
     token: str | None
@@ -136,33 +146,107 @@ class UsageToken:
     expires_at: int | None = None
 
 
-def _load() -> tuple[dict, dict | None]:
-    """Return (raw_file_json, oauth_bundle). bundle is None if absent."""
+# ── DB-backed bundle storage (CredentialStore) ───────────────────────
+
+
+def _credential_store():
+    """The app's CredentialStore, or None when the service isn't up yet."""
+    try:
+        from ..dependencies import get_service  # noqa: PLC0415
+
+        from ..providers.base import CredentialStore  # noqa: PLC0415
+
+        return CredentialStore(get_service().config)
+    except Exception:  # noqa: BLE001 — service not initialized (CLI contexts)
+        return None
+
+
+def _read_file_bundle() -> dict | None:
+    """Read the legacy bundle file (wrapper or bare form). Never writes."""
     path = claude_credentials_path()
     if not path.exists():
-        return {}, None
+        return None
     try:
         data = json.loads(path.read_text())
     except Exception as e:  # noqa: BLE001
-        logger.warning("Failed to read Claude credential %s: %s", path, e)
-        return {}, None
-    bundle = data.get("claudeAiOauth") if isinstance(data, dict) else None
-    if bundle is None and isinstance(data, dict) and data.get("accessToken"):
+        logger.warning("Failed to read legacy Claude credential %s: %s", path, e)
+        return None
+    if not isinstance(data, dict):
+        return None
+    bundle = data.get("claudeAiOauth")
+    if bundle is None and data.get("accessToken"):
         bundle = data
-    return (data if isinstance(data, dict) else {}), bundle
+    return bundle if isinstance(bundle, dict) else None
+
+
+def _load() -> tuple[dict, dict | None]:
+    """Return (raw_record_json, oauth_bundle). bundle is None if absent.
+
+    Source of truth is the DB row; the first load imports the legacy file
+    into the DB when the row has no bundle (one-time cutover, TASK-636).
+    """
+    global _migrated
+    store = _credential_store()
+    if store is None or not store.available:
+        # Service down / no DB — fall back to the legacy file read-only so
+        # CLI contexts keep working.
+        return {}, _read_file_bundle()
+
+    record = store.load(_PROVIDER_ID)
+    raw = record.public() if record else {}
+    bundle = None
+    if record:
+        candidate = record.secret.get(_SECRET_KEY)
+        if isinstance(candidate, dict):
+            bundle = candidate
+
+    if bundle is None and not _migrated:
+        _migrated = True
+        legacy = _read_file_bundle()
+        if legacy:
+            try:
+                _save(raw, legacy)
+                logger.info(
+                    "Migrated legacy Claude credential file into the encrypted DB store"
+                )
+                bundle = legacy
+            except Exception as e:  # noqa: BLE001
+                logger.warning("Claude credential DB migration failed: %s", e)
+    return raw, bundle
 
 
 def _save(raw: dict, bundle: dict) -> None:
-    path = claude_credentials_path()
-    path.parent.mkdir(parents=True, exist_ok=True)
-    if "claudeAiOauth" in raw or not raw:
-        out = dict(raw)
-        out["claudeAiOauth"] = bundle
-    else:
-        out = bundle
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    tmp.write_text(json.dumps(out, indent=2))
-    tmp.replace(path)
+    """Persist the bundle to the DB row (the only write path, TASK-636)."""
+    store = _credential_store()
+    if store is None or not store.available:
+        raise RuntimeError("CredentialStore unavailable — cannot persist Claude bundle")
+    from ..providers.base import (  # noqa: PLC0415
+        AUTH_CLI_OAUTH,
+        STATUS_CONNECTED,
+        ConnectionRecord,
+    )
+
+    store.save(
+        ConnectionRecord(
+            provider=_PROVIDER_ID,
+            status=STATUS_CONNECTED,
+            auth_method=AUTH_CLI_OAUTH,
+            account=bundle.get("subscriptionType") or "claude-subscription",
+            meta={
+                "scopes": bundle.get("scopes") or [],
+                "expires_at": bundle.get("expiresAt"),
+                # Preserve the wizard login timestamp across refreshes — the
+                # ~30-day session-lifetime warning keys off it (providers/claude.py).
+                **(
+                    {"connected_at": raw["connected_at"]}
+                    if raw.get("connected_at")
+                    else {}
+                ),
+            },
+            secret={_SECRET_KEY: bundle},
+            connected_at=raw.get("connected_at"),
+        )
+    )
 
 
 def _expired(expires_at: int | None, *, buffer_ms: int = 0) -> bool:
@@ -202,7 +286,7 @@ def _refresh_upstream(bundle: dict) -> dict:
 
 
 def _refresh_serialized(*, buffer_ms: int, force: bool = False) -> dict | None:
-    """Refresh + persist the bundle under the lock (owned mode only).
+    """Refresh + persist the bundle under the lock.
 
     Re-loads inside the lock and skips the upstream call if another caller
     already refreshed while we waited. Returns the current bundle (refreshed
@@ -223,17 +307,16 @@ def _refresh_serialized(*, buffer_ms: int, force: bool = False) -> dict | None:
         try:
             _save(raw, refreshed)
         except Exception as e:  # noqa: BLE001
-            logger.warning("Refreshed Claude token but could not persist file: %s", e)
-        logger.info("Refreshed Claude OAuth token (owned mode)")
+            logger.warning("Refreshed Claude token but could not persist to DB: %s", e)
+        logger.info("Refreshed Claude OAuth token")
         return refreshed
 
 
 def get_access_token(*, force_refresh: bool = False) -> UsageToken:
     """Resolve the app-owned Claude access token.
 
-    In ``owned`` mode this refreshes (serialized) when expired-or-near-expiry,
-    or unconditionally with ``force_refresh`` (e.g. a reader got a 401). In
-    ``shared`` mode we never refresh/write — the file's owner does.
+    Refreshes (serialized) when expired-or-near-expiry, or unconditionally
+    with ``force_refresh`` (e.g. a reader got a 401).
     """
     raw, bundle = _load()
     if not bundle:
@@ -241,12 +324,12 @@ def get_access_token(*, force_refresh: bool = False) -> UsageToken:
 
     expired = _expired(bundle.get("expiresAt"))
     needs = force_refresh or _expired(bundle.get("expiresAt"), buffer_ms=_REFRESH_BUFFER_MS)
-    if _mode() == "owned" and needs:
+    if needs:
         try:
             bundle = _refresh_serialized(buffer_ms=_REFRESH_BUFFER_MS, force=force_refresh) or bundle
             expired = _expired(bundle.get("expiresAt"))
         except Exception as e:  # noqa: BLE001 — fall back to existing token
-            logger.warning("Failed to refresh owned Claude token: %s", e)
+            logger.warning("Failed to refresh Claude token: %s", e)
             expired = _expired(bundle.get("expiresAt"))
 
     token = bundle.get("accessToken")
@@ -277,25 +360,20 @@ def bundle_status() -> dict:
 
 
 async def proactive_refresh_loop() -> None:
-    """Keep the owned bundle fresh forever — refresh at expiresAt - buffer.
+    """Keep the bundle fresh forever — refresh at expiresAt - buffer.
 
-    Started from the app lifespan. No-op (sleep only) in shared mode or when
-    no bundle exists yet. Failures are logged and retried next tick; the
-    on-demand path in :func:`get_access_token` remains the backstop.
+    Started from the app lifespan. Sleeps only when no bundle exists yet.
+    Failures are logged and retried next tick; the on-demand path in
+    :func:`get_access_token` remains the backstop.
     """
-    logger.info(
-        "Claude credential proactive refresh loop started (mode=%s, path=%s)",
-        _mode(),
-        claude_credentials_path(),
-    )
+    logger.info("Claude credential proactive refresh loop started (DB store)")
     while True:
         try:
-            if _mode() == "owned":
-                _, bundle = _load()
-                if bundle and _expired(bundle.get("expiresAt"), buffer_ms=_PROACTIVE_BUFFER_MS):
-                    await asyncio.to_thread(
-                        _refresh_serialized, buffer_ms=_PROACTIVE_BUFFER_MS
-                    )
+            _, bundle = _load()
+            if bundle and _expired(bundle.get("expiresAt"), buffer_ms=_PROACTIVE_BUFFER_MS):
+                await asyncio.to_thread(
+                    _refresh_serialized, buffer_ms=_PROACTIVE_BUFFER_MS
+                )
         except asyncio.CancelledError:
             raise
         except Exception as e:  # noqa: BLE001
