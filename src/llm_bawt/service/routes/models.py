@@ -3,19 +3,12 @@
 import time
 
 from fastapi import APIRouter, HTTPException, Query
-from sqlalchemy import text
 
 from ...bots import BotManager
 from ..dependencies import get_service
 from ..schemas import (
     BotInfo,
     BotsResponse,
-    ModelDefinitionDeleteResponse,
-    ModelDefinitionListResponse,
-    ModelDefinitionResponse,
-    ModelDefinitionSeedRequest,
-    ModelDefinitionSeedResponse,
-    ModelDefinitionUpsertRequest,
     ModelDetail,
     ModelInfo,
     ModelPricing,
@@ -83,49 +76,6 @@ def _public_model_type(info: dict | None) -> str | None:
         return "codex"
     return model_type
 
-
-def _normalize_model_definition(model_data: dict) -> dict:
-    """Normalize UI-facing model definitions into runtime-compatible storage."""
-    normalized = dict(model_data)
-    if str(normalized.get("type") or "").lower() == "codex":
-        normalized["type"] = "agent_backend"
-        normalized["backend"] = "codex"
-        normalized.setdefault("tool_support", "none")
-    return normalized
-
-
-def _is_codex_served(model_data: dict) -> bool:
-    """True for models served by the ChatGPT/Codex backend — native codex bridge
-    or the claude-code ``openai_chatgpt/`` proxy path."""
-    mid = str(model_data.get("model_id") or "")
-    if mid.startswith("openai_chatgpt/"):
-        return True
-    return (
-        model_data.get("type") == "agent_backend"
-        and str(model_data.get("backend") or "").lower() == "codex"
-    )
-
-
-def _inject_codex_reference_spec(model_data: dict) -> dict:
-    """Auto-populate reference pricing + context_window for codex-served models.
-
-    Only fills what the user left blank — explicit pricing/context_window always
-    win. Applies to both the native codex bridge and the claude-code
-    ``openai_chatgpt/`` proxy, so a freshly-added codex model shows a (starred,
-    estimated) cost on the pill and gets a real window for usage sanitizing.
-    """
-    if not _is_codex_served(model_data):
-        return model_data
-    from ...model_manager import codex_model_spec
-
-    spec = codex_model_spec(model_data.get("model_id"))
-    if not spec:
-        return model_data
-    if not model_data.get("pricing") and spec.get("pricing"):
-        model_data["pricing"] = dict(spec["pricing"])
-    if not model_data.get("context_window") and spec.get("context_window"):
-        model_data["context_window"] = spec["context_window"]
-    return model_data
 
 @router.get("/v1/models", response_model=ModelsResponse, tags=["OpenAI Compatible"])
 def list_models():
@@ -208,25 +158,16 @@ def reload_models_catalog():
     service = get_service()
     config = service.config
 
-    # Reset to empty and reload from DB (sole source of truth).
-    config.defined_models = {"models": {}}
+    from ...memory.model_catalog_migration import migrate_model_catalog
+    from ...model_catalog import ModelCatalogStore
+    from ..dependencies import get_model_catalog_engine
 
-    from ..dependencies import get_model_definition_store
-
-    db_count = 0
-    store = get_model_definition_store(config)
-    if store.engine is not None:
-        from ...memory.model_catalog_migration import migrate_model_catalog
-        from ...model_catalog import ModelCatalogStore
-
-        migrate_model_catalog(store.engine)
-        db_models = store.to_config_dict()
-        db_count = len(db_models)
-        if db_models:
-            config.merge_db_models(db_models)
-        normalized_catalog = ModelCatalogStore(store.engine).load()
-        if len(normalized_catalog):
-            config.install_model_catalog(normalized_catalog)
+    engine = get_model_catalog_engine(config)
+    if engine is None:
+        raise HTTPException(status_code=503, detail="Model catalog database unavailable")
+    migrate_model_catalog(engine)
+    normalized_catalog = ModelCatalogStore(engine).load()
+    config.install_model_catalog(normalized_catalog)
 
     service._load_available_models()
     cleared = service.invalidate_all_instances()
@@ -235,213 +176,9 @@ def reload_models_catalog():
         "ok": True,
         "models": list(service._available_models),
         "default_model": service._default_model,
-        "db_models_loaded": db_count,
+        "catalog_endpoints_loaded": len(normalized_catalog),
         "cleared_instances": cleared,
     }
-
-# =============================================================================
-# Model Definition CRUD (DB-backed)
-# =============================================================================
-
-def _get_model_store():
-    """Get a ModelDefinitionStore instance."""
-    from ..dependencies import get_model_definition_store
-    service = get_service()
-    store = get_model_definition_store(service.config)
-    if store.engine is None:
-        raise HTTPException(status_code=503, detail="Model definitions database unavailable")
-    return store
-
-
-def _row_to_response(row) -> ModelDefinitionResponse:
-    get = row.get if isinstance(row, dict) else lambda key, default=None: getattr(row, key, default)
-    data = {
-        "type": get("type"),
-        "model_id": get("model_id"),
-        "repo_id": get("repo_id"),
-        "filename": get("filename"),
-        "description": get("description"),
-        **(get("extra") or {}),
-    }
-    public_type = _public_model_type(data)
-    return ModelDefinitionResponse(
-        alias=get("alias"),
-        type=public_type or get("type"),
-        model_id=get("model_id"),
-        repo_id=get("repo_id"),
-        filename=get("filename"),
-        description=get("description"),
-        extra=get("extra"),
-        created_at=get("created_at"),
-        updated_at=get("updated_at"),
-    )
-
-
-def _compat_definition_rows(alias: str | None = None) -> list[dict]:
-    store = _get_model_store()
-    sql = "SELECT * FROM model_definitions_compat"
-    params = {}
-    if alias is not None:
-        sql += " WHERE alias = :alias"
-        params["alias"] = alias
-    sql += " ORDER BY alias, id"
-    with store.engine.connect() as conn:
-        return [dict(row) for row in conn.execute(text(sql), params).mappings()]
-
-
-@router.get("/v1/models/definitions", response_model=ModelDefinitionListResponse, tags=["Models"])
-def list_model_definitions():
-    """List normalized endpoints in the legacy model-definition shape."""
-    rows = _compat_definition_rows()
-    return ModelDefinitionListResponse(
-        models=[_row_to_response(r) for r in rows],
-        total_count=len(rows),
-    )
-
-
-@router.get("/v1/models/definitions/{alias}", response_model=ModelDefinitionResponse, tags=["Models"])
-def get_model_definition(alias: str):
-    """Get a unique normalized endpoint in the legacy alias shape."""
-    rows = _compat_definition_rows(alias)
-    if not rows:
-        raise HTTPException(status_code=404, detail=f"Model alias '{alias}' not found")
-    if len(rows) > 1:
-        raise HTTPException(
-            status_code=409,
-            detail=(
-                f"Model alias '{alias}' has multiple endpoints; use "
-                "/v1/models/catalog/endpoints with model=<alias>."
-            ),
-        )
-    return _row_to_response(rows[0])
-
-
-@router.put("/v1/models/definitions/{alias}", response_model=ModelDefinitionResponse, tags=["Models"])
-def upsert_model_definition(alias: str, request: ModelDefinitionUpsertRequest):
-    """Create or update a model definition. Triggers model catalog reload."""
-    store = _get_model_store()
-    model_data: dict = {"type": request.type}
-    if request.model_id is not None:
-        model_data["model_id"] = request.model_id
-    if request.repo_id is not None:
-        model_data["repo_id"] = request.repo_id
-    if request.filename is not None:
-        model_data["filename"] = request.filename
-    if request.description is not None:
-        model_data["description"] = request.description
-    if request.extra:
-        model_data.update(request.extra)
-
-    model_data = _normalize_model_definition(model_data)
-    model_data = _inject_codex_reference_spec(model_data)
-
-    # The legacy alias endpoint cannot express (model, access-path) identity.
-    # Refuse updates that would silently retarget an existing normalized model
-    # to a different access path; callers must use the endpoint-keyed API.
-    from ...memory.model_catalog_migration import map_legacy_definition
-
-    requested = map_legacy_definition(
-        {
-            "alias": alias,
-            "type": model_data["type"],
-            "model_id": model_data.get("model_id"),
-            "repo_id": model_data.get("repo_id"),
-            "filename": model_data.get("filename"),
-            "description": model_data.get("description"),
-            "extra": model_data,
-        }
-    )
-    with store.engine.connect() as conn:
-        existing_access = {
-            row[0]
-            for row in conn.execute(
-                text("""
-                    SELECT a.key
-                    FROM model_endpoints e
-                    JOIN models m ON m.id = e.model_id
-                    JOIN access_paths a ON a.id = e.access_path_id
-                    WHERE m.key = :alias
-                """),
-                {"alias": alias},
-            )
-        }
-    if existing_access and requested.access_path.key not in existing_access:
-        raise HTTPException(
-            status_code=409,
-            detail=(
-                f"Legacy alias '{alias}' already belongs to access path(s) "
-                f"{sorted(existing_access)}; refusing to retarget it to "
-                f"'{requested.access_path.key}'. Use "
-                f"PUT /v1/models/catalog/endpoints/{alias}/"
-                f"{requested.access_path.key} instead."
-            ),
-        )
-
-    row = store.upsert(alias, model_data)
-    # Reload catalog so the new model is immediately available
-    reload_models_catalog()
-    return _row_to_response(row)
-
-
-@router.delete("/v1/models/definitions/{alias}", response_model=ModelDefinitionDeleteResponse, tags=["Models"])
-def delete_model_definition(alias: str):
-    """Delete a unique normalized model plus its legacy compatibility row."""
-    store = _get_model_store()
-    rows = _compat_definition_rows(alias)
-    if not rows:
-        raise HTTPException(status_code=404, detail=f"Model alias '{alias}' not found")
-    if len(rows) > 1:
-        raise HTTPException(
-            status_code=409,
-            detail="Alias has multiple endpoints; delete a specific normalized endpoint.",
-        )
-    with store.engine.begin() as conn:
-        in_use = conn.execute(
-            text("""
-                SELECT b.slug FROM bot_profiles b
-                JOIN model_endpoints e ON e.id = b.endpoint_id
-                JOIN models m ON m.id = e.model_id
-                WHERE m.key = :alias LIMIT 1
-            """),
-            {"alias": alias},
-        ).scalar()
-        if in_use:
-            raise HTTPException(status_code=409, detail=f"Model is used by bot '{in_use}'")
-        conn.execute(text("DELETE FROM models WHERE key = :alias"), {"alias": alias})
-    store.delete(alias)
-    reload_models_catalog()
-    return ModelDefinitionDeleteResponse(
-        success=True,
-        alias=alias,
-        message=f"Model '{alias}' deleted",
-    )
-
-
-@router.post("/v1/models/definitions/seed", response_model=ModelDefinitionSeedResponse, tags=["Models"])
-def seed_model_definitions(request: ModelDefinitionSeedRequest | None = None):
-    """Seed DB model definitions from the current YAML config."""
-    service = get_service()
-    yaml_models = service.config.defined_models.get("models", {})
-    if not yaml_models:
-        return ModelDefinitionSeedResponse(seeded=0, total_yaml=0, message="No models in YAML config")
-
-    store = _get_model_store()
-    if request and request.overwrite:
-        seeded = 0
-        for alias, model_data in yaml_models.items():
-            if isinstance(model_data, dict):
-                store.upsert(alias, model_data)
-                seeded += 1
-    else:
-        seeded = store.seed_from_yaml(yaml_models)
-
-    reload_models_catalog()
-    return ModelDefinitionSeedResponse(
-        seeded=seeded,
-        total_yaml=len(yaml_models),
-        message=f"Seeded {seeded} model(s) from YAML",
-    )
-
 
 @router.get("/v1/bots", response_model=BotsResponse, tags=["System"])
 def list_bots():

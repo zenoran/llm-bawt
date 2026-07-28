@@ -19,7 +19,6 @@ def _endpoint(
     protocol: str,
     upstream: str,
     *,
-    legacy_type: str = "openai",
     engine_kind: str | None = None,
     serving_config=None,
     system_prompt_overrides=None,
@@ -39,7 +38,6 @@ def _endpoint(
         ),
         upstream_model_id=upstream,
         serving_config=serving_config or {},
-        legacy_type=legacy_type,
     )
 
 
@@ -51,7 +49,6 @@ def test_shared_openai_oauth_endpoint_resolves_differently_by_harness():
         "openai",
         "responses",
         "gpt-5.6-sol",
-        legacy_type="agent_backend",
     )
     catalog = ModelCatalog([endpoint])
 
@@ -76,7 +73,6 @@ def test_provider_system_prompt_resolves_only_for_active_harness():
         "openai",
         "responses",
         "gpt-5.6-sol",
-        legacy_type="agent_backend",
         system_prompt_overrides={"claude-proxy": f"  {instruction}  "},
     )
     catalog = ModelCatalog([endpoint])
@@ -114,11 +110,12 @@ def test_bare_unique_proxy_ref_preserves_legacy_provider_prefix():
         "xai",
         "responses",
         "grok-4.5",
-        legacy_type="claude-code",
     )
 
+    # A bare (no-harness) ref can't know the endpoint is proxy-only, so type is
+    # derived from the vendor; the provider prefix on model_id is still preserved.
     resolved = ModelCatalog([endpoint]).resolve("grok-4.5")
-    assert resolved["type"] == "claude-code"
+    assert resolved["type"] == "grok"
     assert resolved["model_id"] == "xai/grok-4.5"
 
 
@@ -130,7 +127,6 @@ def test_kimi_coding_proxy_gets_provider_namespace():
         "kimi",
         "chat-completions",
         "k3",
-        legacy_type="claude-code",
     )
 
     resolved = ModelCatalog([endpoint]).resolve(
@@ -189,7 +185,6 @@ def test_local_serving_config_is_flattened_for_existing_consumers():
         "local",
         "chat-completions",
         "dolphin",
-        legacy_type="gguf",
         engine_kind="llama-cpp",
         serving_config={
             "repo_id": "org/repo",

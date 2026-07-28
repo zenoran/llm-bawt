@@ -10,7 +10,7 @@ from pydantic import BaseModel, Field, field_validator
 from sqlalchemy import text
 
 from ...model_catalog import AccessPath, ProtocolCompatibility
-from ..dependencies import get_model_definition_store, get_service
+from ..dependencies import get_model_catalog_engine, get_service
 
 router = APIRouter(prefix="/v1/models/catalog", tags=["Models"])
 
@@ -63,14 +63,13 @@ class EndpointWrite(BaseModel):
     context_window_override: int | None = Field(default=None, gt=0)
     tool_support_override: str | None = None
     pricing: dict[str, Any] | None = None
-    legacy_type: str | None = None
 
 
 def _engine():
-    store = get_model_definition_store(get_service().config)
-    if store.engine is None:
+    engine = get_model_catalog_engine(get_service().config)
+    if engine is None:
         raise HTTPException(status_code=503, detail="Model catalog database unavailable")
-    return store.engine
+    return engine
 
 
 def _refresh_catalog() -> None:
@@ -103,12 +102,8 @@ def _check_endpoint_cas(existing_id: int | None, expected_id: int | None) -> Non
         )
 
 
-def _delete_model_sources(conn, model_key: str):
-    """Delete both catalog authorities so migration cannot resurrect a model."""
-    conn.execute(
-        text("DELETE FROM model_definitions WHERE alias = :key"),
-        {"key": model_key},
-    )
+def _delete_catalog_model(conn, model_key: str):
+    """Delete one normalized model and cascade its unassigned endpoints."""
     return conn.execute(
         text("DELETE FROM models WHERE key = :key RETURNING id"),
         {"key": model_key},
@@ -176,7 +171,7 @@ def delete_catalog_model(model_key: str):
             """), {"key": model_key}).scalar()
             if bot:
                 raise HTTPException(status_code=409, detail=f"Model is used by bot '{bot}'")
-            row = _delete_model_sources(conn, model_key)
+            row = _delete_catalog_model(conn, model_key)
     except HTTPException:
         raise
     except Exception as exc:
@@ -264,7 +259,9 @@ def list_endpoints(
     normalized = _normalized_harness(harness)
     sql = """
         SELECT e.*, m.key AS model_key, m.vendor AS model_vendor,
-               m.display_name, a.key AS access_path_key, a.vendor AS access_vendor,
+               m.display_name, m.description,
+               m.default_context_window, m.default_tool_support,
+               a.key AS access_path_key, a.vendor AS access_vendor,
                a.protocol, a.base_url, a.auth_mechanism, a.engine_kind
         FROM model_endpoints e
         JOIN models m ON m.id = e.model_id
@@ -320,25 +317,22 @@ def put_endpoint(model_key: str, access_key: str, request: EndpointWrite):
             "context_window_override": request.context_window_override,
             "tool_support_override": request.tool_support_override,
             "pricing": json.dumps(request.pricing) if request.pricing is not None else None,
-            "legacy_type": request.legacy_type,
         }
         row = conn.execute(text("""
             INSERT INTO model_endpoints
                 (model_id, access_path_id, upstream_model_id, serving_config,
                  context_window_override, tool_support_override, pricing,
-                 legacy_type, created_at, updated_at)
+                 created_at, updated_at)
             VALUES
                 (:model_id, :access_path_id, :upstream_model_id,
                  CAST(:serving_config AS jsonb), :context_window_override,
-                 :tool_support_override, CAST(:pricing AS jsonb), :legacy_type,
-                 NOW(), NOW())
+                 :tool_support_override, CAST(:pricing AS jsonb), NOW(), NOW())
             ON CONFLICT (model_id, access_path_id) DO UPDATE SET
                 upstream_model_id = EXCLUDED.upstream_model_id,
                 serving_config = EXCLUDED.serving_config,
                 context_window_override = EXCLUDED.context_window_override,
                 tool_support_override = EXCLUDED.tool_support_override,
                 pricing = EXCLUDED.pricing,
-                legacy_type = EXCLUDED.legacy_type,
                 updated_at = NOW()
             RETURNING *
         """), params).mappings().one()

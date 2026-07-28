@@ -52,7 +52,6 @@ def test_openai_oauth_claude_proxy_maps_to_chatgpt_usage(monkeypatch):
             "oauth",
         ),
         upstream_model_id="opaque-upstream-name",
-        legacy_type="agent_backend",
     )
     service, bot = _service_and_bot(
         endpoint, harness="claude-proxy", backend="claude-code"
@@ -97,7 +96,6 @@ def test_native_anthropic_endpoint_maps_to_claude(monkeypatch):
             "oauth",
         ),
         upstream_model_id="claude-opus-current",
-        legacy_type="claude-code",
     )
     service, bot = _service_and_bot(
         endpoint, harness="claude-code", backend="claude-code"

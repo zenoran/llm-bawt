@@ -92,7 +92,6 @@ class ModelEndpoint:
     context_window_override: int | None = None
     tool_support_override: str | None = None
     pricing: Mapping[str, Any] | None = None
-    legacy_type: str | None = None
 
     @property
     def ref(self) -> str:
@@ -260,14 +259,25 @@ class ModelCatalog:
             if key != "compat_extra":
                 config[key] = value
 
-        model_type = endpoint.legacy_type or "openai-compatible"
         upstream = endpoint.upstream_model_id
         concrete_model = upstream
         backend: str | None = None
+        if endpoint.access_path.engine_kind == "llama-cpp":
+            model_type = "gguf"
+        elif endpoint.access_path.engine_kind in {"vllm", "ollama"}:
+            model_type = endpoint.access_path.engine_kind
+        elif endpoint.access_path.vendor == "xai":
+            model_type = "grok"
+        elif endpoint.access_path.vendor == "openai":
+            model_type = "openai"
+        elif endpoint.access_path.vendor == "anthropic":
+            model_type = "claude-code"
+        else:
+            model_type = "openai-compatible"
 
-        if normalized_harness is None and endpoint.legacy_type == "claude-code":
+        if normalized_harness is None:
             prefix = cls._provider_prefix(endpoint.access_path)
-            if prefix and upstream:
+            if prefix and upstream and endpoint.access_path.protocol != "chat-completions":
                 concrete_model = f"{prefix}/{upstream}"
         elif normalized_harness == "codex":
             model_type = "agent_backend"
@@ -348,7 +358,6 @@ class ModelCatalogStore:
                     e.context_window_override,
                     e.tool_support_override,
                     e.pricing,
-                    e.legacy_type,
                     m.id AS model_id,
                     m.key AS model_key,
                     m.vendor AS model_vendor,
@@ -405,7 +414,6 @@ class ModelCatalogStore:
                     context_window_override=row["context_window_override"],
                     tool_support_override=row["tool_support_override"],
                     pricing=row["pricing"],
-                    legacy_type=row["legacy_type"],
                 )
             )
         return ModelCatalog(endpoints)

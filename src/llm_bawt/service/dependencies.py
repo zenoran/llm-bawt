@@ -113,13 +113,11 @@ def get_runtime_settings_store(config: Any):
     )
 
 
-def get_model_definition_store(config: Any):
-    """Process-wide ``ModelDefinitionStore`` singleton."""
-    from ..runtime_settings import ModelDefinitionStore
+def get_model_catalog_engine(config: Any):
+    """Return the shared PostgreSQL engine for normalized model catalog access."""
+    from ..utils.db import get_shared_engine
 
-    return _get_or_build_store(
-        "model_definition_store", config, lambda: ModelDefinitionStore(config)
-    )
+    return get_shared_engine(config)
 
 
 # TASK-214: get_avatar_animation_store() was removed. The avatar animation

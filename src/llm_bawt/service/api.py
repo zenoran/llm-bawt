@@ -35,66 +35,21 @@ async def lifespan(app):
     # This ensures memory retrieval happens via MCP tools and can be logged clearly.
     _ensure_mcp_server(config)
 
-    # Load model definitions from DB and merge into config.
-    # DB always takes priority; YAML is seeded to DB on first run if DB is empty.
-    from ..runtime_settings import ModelDefinitionStore
-    model_store = ModelDefinitionStore(config)
-    if model_store.engine is not None:
-        # TASK-548: additive, idempotent catalog normalization.  This runs
-        # before legacy definitions are loaded so bot endpoint/harness columns
-        # and the compatibility projection are always ready for the resolver
-        # and API cutover tasks that follow.
-        try:
-            from ..memory.model_catalog_migration import migrate_model_catalog
-            _catalog_result = migrate_model_catalog(model_store.engine)
-            log.info("model catalog migration: %s", _catalog_result)
-        except Exception as e:
-            log.warning("model catalog migration skipped: %s", e)
+    # The normalized catalog is the only model authority. Migration/repair is
+    # transactional and intentionally fatal: serving with unresolved bot pins is
+    # worse than refusing startup with a concrete error.
+    from ..memory.model_catalog_migration import migrate_model_catalog
+    from ..model_catalog import ModelCatalogStore
+    from ..utils.db import get_shared_engine
 
-        yaml_models = config.defined_models.get("models", {})
-        if yaml_models and model_store.count() == 0:
-            seeded = model_store.seed_from_yaml(yaml_models)
-            log.info("Seeded %d model definitions from YAML to DB", seeded)
-        db_models = model_store.to_config_dict()
-        if db_models:
-            config.merge_db_models(db_models)
-            log.debug("Loaded %d model definitions from DB", len(db_models))
-        try:
-            from ..model_catalog import ModelCatalogStore
-
-            normalized_catalog = ModelCatalogStore(model_store.engine).load()
-            if len(normalized_catalog):
-                config.install_model_catalog(normalized_catalog)
-                log.info("Loaded %d normalized model endpoints", len(normalized_catalog))
-        except Exception as e:
-            log.warning("Normalized model catalog load skipped: %s", e)
-
-    # Consolidate legacy agent_backend_config.model onto default_model
-    # (idempotent; cheap existence check before doing any work). Runs after
-    # model seeding so created catalog entries are immediately visible, and
-    # the merged config is refreshed when the migration created entries.
-    if model_store.engine is not None:
-        try:
-            from sqlalchemy import text as _sa_text
-            with model_store.engine.connect() as _conn:
-                _has_legacy = _conn.execute(_sa_text(
-                    "SELECT 1 FROM bot_profiles "
-                    "WHERE agent_backend IS NOT NULL "
-                    "  AND agent_backend_config ? 'model' "
-                    "  AND NOT (agent_backend_config ? 'session_model') LIMIT 1"
-                )).fetchone()
-            if _has_legacy:
-                from types import SimpleNamespace
-                from ..memory.migrations import migrate_agent_backend_config_model
-                _result = migrate_agent_backend_config_model(
-                    SimpleNamespace(engine=model_store.engine)
-                )
-                log.info("agent_backend_config.model migration: %s", _result)
-                db_models = model_store.to_config_dict()
-                if db_models:
-                    config.merge_db_models(db_models)
-        except Exception as e:
-            log.warning("agent_backend_config.model migration skipped: %s", e)
+    model_engine = get_shared_engine(config)
+    if model_engine is None:
+        raise RuntimeError("Normalized model catalog database unavailable")
+    catalog_result = migrate_model_catalog(model_engine)
+    log.info("normalized model catalog ready: %s", catalog_result)
+    normalized_catalog = ModelCatalogStore(model_engine).load()
+    config.install_model_catalog(normalized_catalog)
+    log.info("Loaded %d normalized model endpoints", len(normalized_catalog))
 
     # Ensure media_generations table exists
     try:

@@ -1,21 +1,12 @@
 from types import SimpleNamespace
 
 from llm_bawt.service.core import ServiceLLMBawt
-from llm_bawt.service.routes.models import _normalize_model_definition, _public_model_type
+from llm_bawt.service.routes.models import _public_model_type
 
 
 def test_public_model_type_exposes_codex_group():
     info = {"type": "agent_backend", "backend": "codex", "model_id": "gpt-5.5"}
     assert _public_model_type(info) == "codex"
-
-
-def test_normalize_model_definition_maps_codex_to_agent_backend():
-    normalized = _normalize_model_definition(
-        {"type": "codex", "model_id": "gpt-5.4", "description": "test"}
-    )
-    assert normalized["type"] == "agent_backend"
-    assert normalized["backend"] == "codex"
-    assert normalized["tool_support"] == "none"
 
 
 def test_service_bot_init_applies_codex_default_model(monkeypatch):

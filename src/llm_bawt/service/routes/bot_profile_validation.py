@@ -2,13 +2,12 @@
 
 Split out of ``routes/settings.py`` (TASK-554) as a cohesive unit: turning an
 upsert/create request into a profile payload, normalizing the legacy
-``agent_backend_config.model`` key, validating that an agent bot's
-``default_model`` resolves to a backend-compatible catalog entry, and
+``agent_backend_config.model`` key, validating that an agent bot's normalized
+``endpoint_id`` resolves to a harness-compatible catalog endpoint, and
 humanizing the ``bot_profiles`` DB constraint errors.
 
-``routes/settings.py`` re-imports every name here so existing attribute access
-(``settings_routes._normalize_agent_backend_config_model`` etc., used by tests)
-and the route handlers keep working unchanged.
+``routes/settings.py`` imports the names it invokes directly; tests target the
+helpers on this module.
 """
 
 import logging
@@ -16,7 +15,7 @@ import logging
 from fastapi import HTTPException
 
 from ...bot_types import normalize_bot_type
-from ..dependencies import get_bot_profile_store, get_service
+from ..dependencies import get_service
 from ..schemas import BotCreateRequest, BotProfileUpsertRequest
 
 logger = logging.getLogger(__name__)
@@ -48,6 +47,8 @@ def _request_to_profile_payload(
         "default_voice",
         "nextcloud_config",
         "bot_type",
+        "harness",
+        "endpoint_id",
         "agent_backend",
         "agent_backend_config",
     ):
@@ -65,7 +66,7 @@ def _validate_profile_payload(payload: dict[str, object]) -> None:
     if resolved_type == "agent" and not agent_backend:
         raise HTTPException(status_code=400, detail="Agent bots require agent_backend")
     _normalize_agent_backend_config_model(agent_backend, payload)
-    _validate_agent_default_model(agent_backend, payload)
+    _validate_model_endpoint(payload)
 
 
 #: Agent backends whose model is canonically configured via ``default_model``
@@ -113,152 +114,89 @@ def _normalize_agent_backend_config_model(
     payload["agent_backend_config"] = config
 
 
-def _validate_agent_default_model(
-    agent_backend: str,
-    payload: dict[str, object],
-) -> None:
-    """Config-time guarantee that an agent bot's model is resolvable.
+def _validate_model_endpoint(payload: dict[str, object]) -> None:
+    """Validate and canonicalize the bot's normalized model assignment."""
+    from ...model_catalog import (
+        IncompatibleModelError,
+        ModelNotFoundError,
+        ProtocolCompatibility,
+    )
 
-    For claude-code/codex bots, ``default_model`` must reference a
-    ``model_definitions`` entry whose shape matches the backend (see
-    ``agent_backend_for_model_def``) and which carries a non-empty
-    ``model_id``. This fails the SAVE with a 422 instead of letting the
-    bot 500 at request time (claude_code.py's hard-require remains as the
-    final safety net). Openclaw is exempt; chat bots are covered by the
-    DB trigger.
-    """
-    if agent_backend not in _CATALOG_MODEL_BACKENDS:
+    harness = str(payload.get("harness") or "").strip().lower()
+    backend = str(payload.get("agent_backend") or "").strip().lower()
+    if not harness:
+        harness = "openclaw" if backend == "openclaw" else "chat"
+        payload["harness"] = harness
+
+    if harness == "openclaw":
+        payload["endpoint_id"] = None
+        payload["default_model"] = None
+        payload["agent_backend"] = "openclaw"
         return
 
-    raw = payload.get("default_model")
-    default_model = raw.strip() if isinstance(raw, str) else ""
-    if not default_model:
+    endpoint_id = payload.get("endpoint_id")
+    if not isinstance(endpoint_id, int):
         raise HTTPException(
             status_code=422,
-            detail=(
-                f"Agent bots with agent_backend={agent_backend} require "
-                f"default_model: set it to a {agent_backend} model catalog "
-                f"entry (add one via /v1/models/definitions if needed)."
-            ),
+            detail=f"harness={harness} requires a normalized endpoint_id",
         )
 
     service = get_service()
-    from ...bot_types import agent_backend_for_model_def
-
-    resolver = getattr(service.config, "resolve_model", None)
-    if not callable(resolver):
-        store = get_bot_profile_store(service.config)
-        engine = getattr(store, "engine", None)
-        if engine is None:
-            return
-        from sqlalchemy import text as sa_text
-
-        try:
-            with engine.connect() as conn:
-                row = conn.execute(
-                    sa_text(
-                        "SELECT type, model_id, COALESCE(extra->>'backend', '') AS extra_backend "
-                        "FROM model_definitions WHERE alias = :v LIMIT 1"
-                    ),
-                    {"v": default_model},
-                ).fetchone()
-        except Exception:
-            return
-        if row is None:
-            model_def = None
-        else:
-            model_def = {
-                "type": (row[0] or "").lower(),
-                "backend": (row[2] or "").lower() or None,
-                "model_id": row[1],
-            }
-    else:
-        model_def = None
+    catalog = service.config.ensure_model_catalog()
+    if catalog is None:
+        raise HTTPException(status_code=503, detail="Model catalog unavailable")
     try:
-        from ...model_catalog import ModelNotFoundError
+        endpoint = catalog.resolve_endpoint(endpoint_id, harness=harness)
+    except ModelNotFoundError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except IncompatibleModelError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
 
-        if callable(resolver):
-            harness = payload.get("harness")
-            if not harness and agent_backend == "codex":
-                harness = "codex"
-            if not harness and agent_backend == "claude-code":
-                endpoint = service.config.ensure_model_catalog().resolve_endpoint(default_model)
-                harness = (
-                    "claude-code"
-                    if endpoint.access_path.vendor == "anthropic"
-                    and endpoint.access_path.protocol == "anthropic-messages"
-                    else "claude-proxy"
-                )
-            model_def = resolver(
-                default_model,
-                harness=str(harness) if harness else None,
-            )
-    except ModelNotFoundError:
-        model_def = None
-    except Exception:
-        # Lookup failure must not gate the save — the DB trigger still
-        # enforces backend↔type compatibility on default_model.
-        return
-
-    if not model_def:
+    if not ProtocolCompatibility.is_compatible(harness, endpoint.access_path):
         raise HTTPException(
             status_code=422,
-            detail=(
-                f"default_model={default_model!r} is not a known model "
-                f"catalog entry. Register it via /v1/models/definitions first."
-            ),
+            detail=f"endpoint_id={endpoint_id} is incompatible with harness={harness}",
         )
 
-    if agent_backend_for_model_def(model_def) != agent_backend:
-        raise HTTPException(
-            status_code=422,
-            detail=(
-                f"default_model={default_model!r} (type={model_def['type'] or 'unknown'}, "
-                f"backend={model_def.get('backend') or 'n/a'}) is not compatible with "
-                f"agent_backend={agent_backend}. Pick a {agent_backend} catalog entry."
-            ),
-        )
-    if not (isinstance(model_def.get("model_id"), str) and model_def["model_id"].strip()):
-        raise HTTPException(
-            status_code=422,
-            detail=(
-                f"default_model={default_model!r} has no model_id — the "
-                f"{agent_backend} bridge needs the SDK model id. Fix the "
-                f"catalog entry via /v1/models/definitions."
-            ),
-        )
+    expected_backend = {
+        "chat": None,
+        "claude-code": "claude-code",
+        "claude-proxy": "claude-code",
+        "codex": "codex",
+    }[harness]
+    payload["default_model"] = endpoint.model.key
+    payload["agent_backend"] = expected_backend
 
 
 def _humanize_bot_constraint_error(exc: Exception) -> str | None:
     """Extract a clean message from a bot_profiles DB constraint failure.
 
-    The migration ``add_bot_model_constraints`` installs:
-      • a foreign key on ``default_model``
-      • a BEFORE trigger that enforces backend↔model.type compatibility
-
-    Both surface through SQLAlchemy as ``IntegrityError`` wrapping a
-    psycopg ``ForeignKeyViolation`` / ``RaiseException``. The trigger's
-    own ``RAISE EXCEPTION`` text is already user-friendly (e.g.
-    ``bot loopy: agent_backend=codex requires a model of type=openai...``)
-    so we just lift it out of the SQLAlchemy wrapper.
+    The catalog migration installs a BEFORE trigger
+    (``bot_profiles_model_endpoint_check``) that enforces harness↔endpoint
+    compatibility on ``bot_profiles`` (e.g. a claude-code bot must point at an
+    Anthropic Messages endpoint). It surfaces through SQLAlchemy as a
+    ``DBAPIError`` wrapping a psycopg ``RaiseException`` whose ``RAISE
+    EXCEPTION`` text is already user-friendly (e.g. ``bot loopy: harness
+    claude-code requires an Anthropic Messages endpoint``), so we just lift it
+    out of the SQLAlchemy wrapper.
 
     Returns the cleaned message, or None if this isn't a bot-constraint
     error (in which case the caller re-raises).
     """
     text = str(getattr(exc, "orig", exc) or exc)
+    # Every trigger RAISE starts with ``bot <slug>: ...`` — lift the first such
+    # line verbatim; that alone identifies it as our constraint.
+    for line in text.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("bot ") and ":" in stripped:
+            return stripped
+    # Fall back to constraint/FK-name detection for non-RAISE violations.
     markers = (
+        "bot_profiles_model_endpoint_check",
         "bot_profiles_default_model_fk",
-        "bot_profiles_check_model_backend",
-        "bot_profiles_model_backend_check",
-        "agent_backend=",
-        "bot_type=",
-        "default_model",
+        "endpoint_id",
+        "harness",
     )
     if not any(m in text for m in markers):
         return None
-    # Strip psycopg/SQLAlchemy line prefixes and extra context.
-    for line in text.splitlines():
-        line = line.strip()
-        if line.startswith("bot ") and ":" in line:
-            return line
     return text.split("CONTEXT:")[0].strip() or None

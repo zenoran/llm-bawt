@@ -645,52 +645,92 @@ class ServiceClient:
 
         return None
 
-    def upsert_model_definition(self, alias: str, model_data: dict[str, Any]) -> dict[str, Any] | None:
-        """Create or update a model definition on the service.
-
-        model_data should contain keys like type, model_id, description, etc.
-        Returns the response dict on success, None on failure.
-        """
+    def upsert_catalog_model(self, alias: str, model_data: dict[str, Any]) -> dict[str, Any] | None:
+        """Translate one CLI model entry into normalized model + endpoint writes."""
         if not self.is_available():
             return None
 
-        # Separate known top-level fields from extras
-        top_fields = {"type", "model_id", "repo_id", "filename", "description"}
-        payload: dict[str, Any] = {}
-        extra: dict[str, Any] = {}
-        for k, v in model_data.items():
-            if k in top_fields:
-                payload[k] = v
-            else:
-                extra[k] = v
-        if extra:
-            payload["extra"] = extra
+        model_type = str(model_data.get("type") or "openai").strip().lower()
+        backend = str(model_data.get("backend") or "").strip().lower()
+        raw_model_id = str(model_data.get("model_id") or "").strip()
+        provider = str(model_data.get("provider") or "").strip().lower()
+        if model_type == "codex" or (model_type == "agent_backend" and backend == "codex"):
+            vendor, access_key = "openai", "openai-oauth"
+        elif model_type == "claude-code" and (provider == "openai_chatgpt" or raw_model_id.startswith("openai_chatgpt/")):
+            vendor, access_key = "openai", "openai-oauth"
+            raw_model_id = raw_model_id.removeprefix("openai_chatgpt/")
+        elif model_type == "claude-code" and (provider == "xai" or raw_model_id.startswith("xai/")):
+            vendor, access_key = "xai", "xai-responses"
+            raw_model_id = raw_model_id.removeprefix("xai/")
+        elif model_type == "claude-code" and (provider == "zai" or raw_model_id.startswith("zai/")):
+            vendor, access_key = "zai", "zai-anthropic"
+            raw_model_id = raw_model_id.removeprefix("zai/")
+        elif model_type == "claude-code":
+            vendor, access_key = "anthropic", "anthropic-oauth"
+        elif model_type in {"grok", "xai"}:
+            vendor, access_key = "xai", "xai-chat"
+        elif model_type == "gguf":
+            vendor, access_key = "community", "local-llamacpp"
+        elif model_type == "vllm":
+            vendor, access_key = "community", "local-vllm"
+        elif model_type == "ollama":
+            vendor, access_key = "community", "ollama"
+        else:
+            vendor, access_key = "openai", "openai-api"
+
+        context_window = model_data.get("context_window")
+        if not isinstance(context_window, int) or context_window <= 0:
+            logger.warning("Cannot add '%s': normalized catalog requires context_window", alias)
+            return None
+        serving_config = {
+            key: value
+            for key, value in model_data.items()
+            if key not in {
+                "type", "model_id", "description", "context_window",
+                "tool_support", "pricing", "provider", "upstream_model",
+            }
+        }
+        if model_data.get("repo_id") is not None:
+            serving_config["repo_id"] = model_data["repo_id"]
+        if model_data.get("filename") is not None:
+            serving_config["filename"] = model_data["filename"]
 
         try:
-            response = self._request("PUT", f"/v1/models/definitions/{alias}", data=payload)
-            if isinstance(response, dict):
-                return response
-        except Exception as e:
-            logger.warning(f"Upsert model definition '{alias}' via service failed: {e}")
-
-        return None
-
-    def delete_model_definition(self, alias: str) -> dict[str, Any] | None:
-        """Delete a model definition from the service.
-
-        Returns the response dict on success, None on failure.
-        """
-        if not self.is_available():
+            model = self._request(
+                "PUT",
+                f"/v1/models/catalog/models/{alias}",
+                data={
+                    "vendor": vendor,
+                    "display_name": model_data.get("description") or alias,
+                    "description": model_data.get("description"),
+                    "default_context_window": context_window,
+                    "default_tool_support": model_data.get("tool_support"),
+                },
+            )
+            endpoint = self._request(
+                "PUT",
+                f"/v1/models/catalog/endpoints/{alias}/{access_key}",
+                data={
+                    "upstream_model_id": model_data.get("upstream_model") or raw_model_id or None,
+                    "serving_config": serving_config,
+                    "pricing": model_data.get("pricing"),
+                },
+            )
+            return {"model": model, "endpoint": endpoint}
+        except Exception as exc:
+            logger.warning("Upsert normalized model '%s' via service failed: %s", alias, exc)
             return None
 
+    def delete_catalog_model(self, alias: str) -> dict[str, Any] | None:
+        """Delete a normalized model and its unassigned endpoint rows."""
+        if not self.is_available():
+            return None
         try:
-            response = self._request("DELETE", f"/v1/models/definitions/{alias}")
-            if isinstance(response, dict):
-                return response
-        except Exception as e:
-            logger.warning(f"Delete model definition '{alias}' via service failed: {e}")
-
-        return None
+            response = self._request("DELETE", f"/v1/models/catalog/models/{alias}")
+            return response if isinstance(response, dict) else None
+        except Exception as exc:
+            logger.warning("Delete normalized model '%s' via service failed: %s", alias, exc)
+            return None
 
     def get_history(self, bot_id: str | None = None, limit: int = 50, before: str | None = None) -> dict[str, Any] | None:
         """Fetch conversation history from the service history endpoint.

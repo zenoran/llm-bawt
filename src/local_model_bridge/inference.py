@@ -4,12 +4,11 @@ Owns the single-local-model-at-a-time loader that the bridge uses to turn a
 model *alias* into a live ``LLMClient`` (``LlamaCppClient`` for gguf,
 ``VLLMClient`` for vllm or gguf-with-backend=vllm).
 
-Model definitions are resolved by querying the main app:
-    GET {app_api_url}/v1/models/definitions/{alias}
-which returns the catalog row (type, repo_id, filename, description, extra).
-The ``extra`` blob carries the runtime fields (backend, chat_format,
-context_window, n_gpu_layers, ...) the clients expect to find nested in the
-model definition.  Results are cached; a miss triggers a single refetch.
+Local endpoints are resolved from the normalized catalog:
+    GET {app_api_url}/v1/models/catalog/endpoints?model={alias}&harness=chat
+The endpoint's ``serving_config`` carries repo/filename/chat-format/runtime
+fields, while model/endpoint columns carry context and tool capabilities.
+Results are cached; a miss triggers a single refetch.
 
 Only one local model is held in memory at a time.  Switching aliases unloads
 the previous client first (freeing VRAM) before loading the new one.  Callers
@@ -37,13 +36,8 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
-class _ModelDefinitionCache:
-    """Resolve a model alias -> full model definition via the main app.
-
-    Mirrors codex_bridge's ``_ModelInfoCache`` shape but fetches the full
-    catalog row (we need repo_id/filename/backend/chat_format, not just the
-    context window).
-    """
+class _ModelEndpointCache:
+    """Resolve a local model alias through its normalized chat endpoint."""
 
     def __init__(self, app_api_url: str) -> None:
         self._app_api_url = (app_api_url or "").rstrip("/")
@@ -53,33 +47,33 @@ class _ModelDefinitionCache:
     def _fetch(self, alias: str) -> dict[str, Any] | None:
         if not self._app_api_url:
             return None
-        url = f"{self._app_api_url}/v1/models/definitions/{alias}"
+        url = f"{self._app_api_url}/v1/models/catalog/endpoints"
         try:
             with httpx.Client(timeout=10) as client:
-                resp = client.get(url)
-                if resp.status_code == 404:
-                    return None
+                resp = client.get(url, params={"model": alias, "harness": "chat"})
                 resp.raise_for_status()
-                payload = resp.json() or {}
+                rows = (resp.json() or {}).get("endpoints") or []
         except Exception as e:
-            logger.warning("Model definition fetch failed for %s: %s", alias, e)
+            logger.warning("Model endpoint fetch failed for %s: %s", alias, e)
+            return None
+        if len(rows) != 1:
+            if rows:
+                logger.warning("Local model %s has %d chat endpoints; expected one", alias, len(rows))
             return None
 
-        # Flatten the catalog row into the runtime model_definition shape the
-        # local clients expect: top-level type/model_id/repo_id/filename plus
-        # the ``extra`` blob (backend, chat_format, context_window, ...).
-        definition: dict[str, Any] = {
-            "type": payload.get("type"),
-            "model_id": payload.get("model_id"),
-            "repo_id": payload.get("repo_id"),
-            "filename": payload.get("filename"),
-            "description": payload.get("description"),
-        }
-        extra = payload.get("extra")
-        if isinstance(extra, dict):
-            for k, v in extra.items():
-                definition.setdefault(k, v)
-        # Drop None top-level keys so client `.get(..., default)` fallbacks work.
+        endpoint = rows[0]
+        definition = dict(endpoint.get("serving_config") or {})
+        engine = str(endpoint.get("engine_kind") or "").strip().lower()
+        definition["type"] = "gguf" if engine == "llama-cpp" else engine
+        definition["model_id"] = endpoint.get("upstream_model_id")
+        definition["context_window"] = (
+            endpoint.get("context_window_override")
+            or endpoint.get("default_context_window")
+        )
+        definition["tool_support"] = (
+            endpoint.get("tool_support_override")
+            or endpoint.get("default_tool_support")
+        )
         return {k: v for k, v in definition.items() if v is not None}
 
     def get(self, alias: str, *, fallback: dict[str, Any] | None = None) -> dict[str, Any] | None:
@@ -117,7 +111,7 @@ class LocalModelLoader:
 
     def __init__(self, config: Config, app_api_url: str = "") -> None:
         self._config = config
-        self._defs = _ModelDefinitionCache(app_api_url)
+        self._defs = _ModelEndpointCache(app_api_url)
         self._current_alias: str | None = None
         self._current_client: "LLMClient | None" = None
         self._lock = threading.RLock()

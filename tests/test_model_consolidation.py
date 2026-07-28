@@ -81,8 +81,8 @@ def _dual_grok_catalog():
         auth_mechanism="api-key",
     )
     return ModelCatalog([
-        ModelEndpoint(17, model, chat, "grok-4.5", legacy_type="grok"),
-        ModelEndpoint(18, model, responses, "grok-4.5", legacy_type="grok"),
+        ModelEndpoint(17, model, chat, "grok-4.5"),
+        ModelEndpoint(18, model, responses, "grok-4.5"),
     ])
 
 
@@ -308,7 +308,6 @@ def test_resolve_agent_bot_accepts_single_endpoint_canonical_ref(monkeypatch):
             model,
             oauth,
             "gpt-5.6-sol",
-            legacy_type="agent_backend",
             serving_config={"compat_extra": {"backend": "codex"}},
         )
     ])
@@ -378,62 +377,44 @@ def test_resolve_openclaw_bot_keeps_virtual_alias(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
-# migration alias derivation
-# ---------------------------------------------------------------------------
-
-def test_derive_model_alias():
-    from llm_bawt.memory.migrations import _derive_model_alias
-
-    assert _derive_model_alias("claude-opus-4-20250514") == "opus-4-20250514"
-    assert _derive_model_alias("claude-sonnet-4-5") == "sonnet-4-5"
-    assert _derive_model_alias("gpt-5.5") == "gpt-5-5"
-    assert _derive_model_alias("GPT-5.5 Codex") == "gpt-5-5-codex"
-    assert _derive_model_alias("") == "model"
-
-
-# ---------------------------------------------------------------------------
-# settings-route config-time validation (Phase 3)
+# settings-route config-time validation — normalized endpoint model (TASK-616)
 # ---------------------------------------------------------------------------
 
 import pytest
 from fastapi import HTTPException
 
-from llm_bawt.service.routes import settings as settings_routes
+from llm_bawt.service.routes import bot_profile_validation as validation
 
 
-class _FakeConn:
-    def __init__(self, row):
-        self._row = row
-
-    def __enter__(self):
-        return self
-
-    def __exit__(self, *_a):
-        return False
-
-    def execute(self, *_a, **_k):
-        row = self._row
-        return SimpleNamespace(fetchone=lambda: row)
-
-
-class _FakeEngine:
-    def __init__(self, row):
-        self._row = row
-
-    def connect(self):
-        return _FakeConn(self._row)
-
-
-def _patch_catalog_row(monkeypatch, row):
-    """Make _validate_agent_default_model see ``row`` as the catalog lookup."""
-    monkeypatch.setattr(
-        settings_routes, "get_service", lambda: SimpleNamespace(config=None)
+def _validation_catalog():
+    """Catalog with one endpoint per harness family for validation tests."""
+    anthropic = ModelEndpoint(
+        10,
+        ModelIdentity(1, "opus-4-7", "anthropic", "Opus 4.7"),
+        AccessPath(1, "anthropic-oauth", "anthropic", "anthropic-messages", None, "oauth"),
+        "claude-opus-4-7",
     )
-    monkeypatch.setattr(
-        settings_routes,
-        "get_bot_profile_store",
-        lambda _cfg: SimpleNamespace(engine=_FakeEngine(row)),
+    codex = ModelEndpoint(
+        20,
+        ModelIdentity(2, "gpt-5-5", "openai", "GPT 5.5"),
+        AccessPath(2, "openai-oauth", "openai", "responses", None, "oauth"),
+        "gpt-5.5",
     )
+    chat = ModelEndpoint(
+        30,
+        ModelIdentity(3, "grok-4", "xai", "Grok 4"),
+        AccessPath(3, "xai-chat", "xai", "chat-completions", None, "api-key"),
+        "grok-4",
+    )
+    return ModelCatalog([anthropic, codex, chat])
+
+
+def _patch_catalog(monkeypatch, catalog):
+    """Make ``_validate_model_endpoint`` resolve against ``catalog``."""
+    service = SimpleNamespace(
+        config=SimpleNamespace(ensure_model_catalog=lambda: catalog)
+    )
+    monkeypatch.setattr(validation, "get_service", lambda: service)
 
 
 def test_normalize_mirrors_model_to_session_model():
@@ -441,7 +422,7 @@ def test_normalize_mirrors_model_to_session_model():
         "slug": "loopy",
         "agent_backend_config": {"model": "claude-sonnet-4", "session_key": "k"},
     }
-    settings_routes._normalize_agent_backend_config_model("claude-code", payload)
+    validation._normalize_agent_backend_config_model("claude-code", payload)
     config = payload["agent_backend_config"]
     # "model" is kept (not popped) so un-restarted bridges still see it for
     # session resume-vs-reset; new bridge code drops it on first persist.
@@ -452,92 +433,86 @@ def test_normalize_mirrors_model_to_session_model():
 
 def test_normalize_drops_empty_model_key():
     payload = {"slug": "loopy", "agent_backend_config": {"model": ""}}
-    settings_routes._normalize_agent_backend_config_model("claude-code", payload)
+    validation._normalize_agent_backend_config_model("claude-code", payload)
     assert payload["agent_backend_config"] == {}
 
 
 def test_normalize_openclaw_untouched():
     payload = {"slug": "vex", "agent_backend_config": {"model": "anything"}}
-    settings_routes._normalize_agent_backend_config_model("openclaw", payload)
+    validation._normalize_agent_backend_config_model("openclaw", payload)
     assert payload["agent_backend_config"] == {"model": "anything"}
 
 
-def test_validate_missing_default_model_422():
+def test_validate_openclaw_nulls_endpoint():
+    # Openclaw owns its model: endpoint_id/default_model are cleared and the
+    # backend is canonicalized — no catalog lookup required.
+    payload = {
+        "slug": "vex",
+        "agent_backend": "openclaw",
+        "endpoint_id": 99,
+        "default_model": "stale",
+    }
+    validation._validate_model_endpoint(payload)
+    assert payload["endpoint_id"] is None
+    assert payload["default_model"] is None
+    assert payload["agent_backend"] == "openclaw"
+    assert payload["harness"] == "openclaw"
+
+
+def test_validate_missing_endpoint_id_422():
     with pytest.raises(HTTPException) as exc:
-        settings_routes._validate_agent_default_model(
-            "claude-code", {"slug": "loopy", "default_model": None}
+        validation._validate_model_endpoint(
+            {"slug": "loopy", "harness": "claude-code"}
         )
     assert exc.value.status_code == 422
-    assert "default_model" in exc.value.detail
+    assert "endpoint_id" in exc.value.detail
 
 
-def test_validate_unknown_alias_422(monkeypatch):
-    _patch_catalog_row(monkeypatch, None)
+def test_validate_unknown_endpoint_422(monkeypatch):
+    _patch_catalog(monkeypatch, _validation_catalog())
     with pytest.raises(HTTPException) as exc:
-        settings_routes._validate_agent_default_model(
-            "claude-code", {"slug": "loopy", "default_model": "nope"}
+        validation._validate_model_endpoint(
+            {"slug": "loopy", "harness": "claude-code", "endpoint_id": 999}
         )
     assert exc.value.status_code == 422
-    assert "not a known model" in exc.value.detail
 
 
-def test_validate_backend_mismatch_422(monkeypatch):
-    _patch_catalog_row(monkeypatch, ("grok", "grok-4-fast", ""))
+def test_validate_incompatible_harness_422(monkeypatch):
+    _patch_catalog(monkeypatch, _validation_catalog())
+    # endpoint 20 is a codex/responses endpoint; claude-code needs
+    # anthropic-messages, so the harness/endpoint pair is rejected.
     with pytest.raises(HTTPException) as exc:
-        settings_routes._validate_agent_default_model(
-            "claude-code", {"slug": "loopy", "default_model": "grok-4-fast"}
+        validation._validate_model_endpoint(
+            {"slug": "loopy", "harness": "claude-code", "endpoint_id": 20}
         )
     assert exc.value.status_code == 422
-    assert "not compatible" in exc.value.detail
 
 
-def test_validate_missing_model_id_422(monkeypatch):
-    _patch_catalog_row(monkeypatch, ("claude-code", "", ""))
-    with pytest.raises(HTTPException) as exc:
-        settings_routes._validate_agent_default_model(
-            "claude-code", {"slug": "loopy", "default_model": "opus-4-7"}
-        )
-    assert exc.value.status_code == 422
-    assert "model_id" in exc.value.detail
+def test_validate_claude_code_sets_backend(monkeypatch):
+    _patch_catalog(monkeypatch, _validation_catalog())
+    payload = {"slug": "loopy", "harness": "claude-code", "endpoint_id": 10}
+    validation._validate_model_endpoint(payload)
+    assert payload["default_model"] == "opus-4-7"
+    assert payload["agent_backend"] == "claude-code"
 
 
-def test_validate_compatible_entry_passes(monkeypatch):
-    _patch_catalog_row(monkeypatch, ("claude-code", "claude-opus-4-7", ""))
-    settings_routes._validate_agent_default_model(
-        "claude-code", {"slug": "loopy", "default_model": "opus-4-7"}
-    )
+def test_validate_codex_sets_backend(monkeypatch):
+    _patch_catalog(monkeypatch, _validation_catalog())
+    payload = {"slug": "byte", "harness": "codex", "endpoint_id": 20}
+    validation._validate_model_endpoint(payload)
+    assert payload["default_model"] == "gpt-5-5"
+    assert payload["agent_backend"] == "codex"
 
 
-def test_validate_codex_agent_backend_shape_passes(monkeypatch):
-    _patch_catalog_row(monkeypatch, ("agent_backend", "gpt-5.5", "codex"))
-    settings_routes._validate_agent_default_model(
-        "codex", {"slug": "byte", "default_model": "codex-gpt-5-5"}
-    )
-
-
-def test_validate_openclaw_exempt():
-    # No DB patching needed: must return before any lookup.
-    settings_routes._validate_agent_default_model(
-        "openclaw", {"slug": "vex", "default_model": None}
-    )
-
-
-def test_validate_db_lookup_failure_does_not_gate(monkeypatch):
-    class _BrokenEngine:
-        def connect(self):
-            raise RuntimeError("db down")
-
-    monkeypatch.setattr(
-        settings_routes, "get_service", lambda: SimpleNamespace(config=None)
-    )
-    monkeypatch.setattr(
-        settings_routes,
-        "get_bot_profile_store",
-        lambda _cfg: SimpleNamespace(engine=_BrokenEngine()),
-    )
-    settings_routes._validate_agent_default_model(
-        "claude-code", {"slug": "loopy", "default_model": "opus-4-7"}
-    )
+def test_validate_chat_defaults_harness_and_null_backend(monkeypatch):
+    _patch_catalog(monkeypatch, _validation_catalog())
+    # No harness/backend given → derives "chat"; a chat-completions endpoint
+    # canonicalizes to a null (direct-LLM) backend.
+    payload = {"slug": "nova", "endpoint_id": 30}
+    validation._validate_model_endpoint(payload)
+    assert payload["harness"] == "chat"
+    assert payload["default_model"] == "grok-4"
+    assert payload["agent_backend"] is None
 
 
 def test_resolve_chat_bot_unchanged(monkeypatch):

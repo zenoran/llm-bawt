@@ -925,12 +925,6 @@ from .schemas_models import (  # noqa: E402,F401
     ModelSwitchRequest,
     ModelSwitchResponse,
     ModelDetail,
-    ModelDefinitionResponse,
-    ModelDefinitionListResponse,
-    ModelDefinitionUpsertRequest,
-    ModelDefinitionDeleteResponse,
-    ModelDefinitionSeedRequest,
-    ModelDefinitionSeedResponse,
 )
 from .schemas_history_memory import (  # noqa: E402,F401
     HistoryMessage,

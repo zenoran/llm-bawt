@@ -29,11 +29,8 @@ from ..schemas import (
     RuntimeSettingUpsertRequest,
 )
 from .bot_profile_validation import (
-    _CATALOG_MODEL_BACKENDS,
     _humanize_bot_constraint_error,
-    _normalize_agent_backend_config_model,
     _request_to_profile_payload,
-    _validate_agent_default_model,
     _validate_profile_payload,
 )
 

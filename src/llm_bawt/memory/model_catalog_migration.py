@@ -1,10 +1,16 @@
-"""TASK-548: normalize models, access paths, endpoints, and bot harnesses.
+"""Normalized model catalog bootstrap, repair, and legacy-table removal.
 
-This is deliberately an additive cutover.  ``model_definitions`` remains the
-writable legacy table until the resolver and CRUD API tasks move all callers to
-the normalized catalog.  ``model_definitions_compat`` proves that the new
-catalog can reproduce the legacy read shape without making the current runtime
-depend on a multi-table view prematurely.
+The normalized catalog (``models`` -> ``model_endpoints`` -> ``access_paths``)
+is the only model authority.  This migration is intentionally idempotent:
+
+* create the normalized schema and standard access paths on a fresh install;
+* preserve every valid bot endpoint assignment exactly as stored;
+* deterministically repair only invalid/unresolved bot assignments from the
+  normalized tables;
+* install the canonical bot endpoint trigger; and
+* remove the obsolete flat model table/view and endpoint ``legacy_type`` shim.
+
+No normalized row is ever reconstructed from the removed flat catalog.
 """
 
 from __future__ import annotations
@@ -13,18 +19,15 @@ import argparse
 import json
 import logging
 from dataclasses import dataclass
-from typing import Any, Mapping
+from typing import Any
 
 from sqlalchemy import Engine, text
 
 logger = logging.getLogger(__name__)
 
-PROTOCOLS = ("chat-completions", "responses", "anthropic-messages")
-HARNESSES = ("chat", "claude-code", "codex", "claude-proxy", "openclaw")
-
 
 @dataclass(frozen=True)
-class AccessPathSpec:
+class AccessPathSeed:
     key: str
     vendor: str
     protocol: str
@@ -33,246 +36,21 @@ class AccessPathSpec:
     engine_kind: str | None = None
 
 
-@dataclass(frozen=True)
-class CatalogMapping:
-    model_key: str
-    model_vendor: str
-    display_name: str
-    description: str | None
-    access_path: AccessPathSpec
-    upstream_model_id: str | None
-    serving_config: dict[str, Any]
-    context_window_override: int | None
-    tool_support_override: str | None
-    pricing: dict[str, Any] | None
-    legacy_type: str
-    created_at: Any
-    updated_at: Any
-
-
-ACCESS_PATHS: dict[str, AccessPathSpec] = {
-    "openai-api": AccessPathSpec(
-        "openai-api",
-        "openai",
-        "chat-completions",
-        "https://api.openai.com/v1",
-        "api-key",
-    ),
-    "openai-oauth": AccessPathSpec(
-        "openai-oauth",
-        "openai",
-        "responses",
-        "https://chatgpt.com/backend-api/codex",
-        "oauth",
-    ),
-    "anthropic-api": AccessPathSpec(
-        "anthropic-api",
-        "anthropic",
-        "anthropic-messages",
-        "https://api.anthropic.com",
-        "api-key",
-    ),
-    "anthropic-oauth": AccessPathSpec(
-        "anthropic-oauth",
-        "anthropic",
-        "anthropic-messages",
-        "https://api.anthropic.com",
-        "oauth",
-    ),
-    "xai-chat": AccessPathSpec(
-        "xai-chat",
-        "xai",
-        "chat-completions",
-        "https://api.x.ai/v1",
-        "api-key",
-    ),
-    "xai-responses": AccessPathSpec(
-        "xai-responses",
-        "xai",
-        "responses",
-        "https://api.x.ai/v1",
-        "api-key",
-    ),
-    "zai-anthropic": AccessPathSpec(
-        "zai-anthropic",
-        "zai",
-        "anthropic-messages",
-        "https://api.z.ai/api/anthropic",
-        "api-key",
-    ),
-    "moonshot-anthropic": AccessPathSpec(
-        "moonshot-anthropic",
-        "moonshot",
-        "anthropic-messages",
-        "https://api.moonshot.ai/anthropic",
-        "api-key",
-    ),
-    "kimi-coding-chat": AccessPathSpec(
-        "kimi-coding-chat",
-        "kimi",
-        "chat-completions",
-        "https://api.kimi.com/coding/v1",
-        "api-key",
-    ),
-    "local-llamacpp": AccessPathSpec(
-        "local-llamacpp",
-        "local",
-        "chat-completions",
-        None,
-        "none",
-        "llama-cpp",
-    ),
-    "local-vllm": AccessPathSpec(
-        "local-vllm",
-        "local",
-        "chat-completions",
-        None,
-        "none",
-        "vllm",
-    ),
-    "ollama": AccessPathSpec(
-        "ollama",
-        "local",
-        "chat-completions",
-        None,
-        "none",
-        "ollama",
-    ),
-    "openai-compatible": AccessPathSpec(
-        "openai-compatible",
-        "custom",
-        "chat-completions",
-        None,
-        "configured",
-    ),
-}
-
-
-def _as_dict(value: Any) -> dict[str, Any]:
-    if value is None:
-        return {}
-    if isinstance(value, dict):
-        return dict(value)
-    if isinstance(value, str):
-        parsed = json.loads(value)
-        return dict(parsed) if isinstance(parsed, dict) else {}
-    return dict(value)
-
-
-def _strip_provider_prefix(model_id: str | None) -> tuple[str | None, str | None]:
-    if not model_id:
-        return None, None
-    for prefix, provider in (
-        ("openai_chatgpt/", "openai_chatgpt"),
-        ("xai/", "xai"),
-        ("zai/", "zai"),
-        ("moonshot/", "moonshot"),
-        ("kimi_coding/", "kimi_coding"),
-    ):
-        if model_id.startswith(prefix):
-            return model_id[len(prefix) :], provider
-    return model_id, None
-
-
-def _access_path_for(
-    legacy_type: str, model_id: str | None, extra: Mapping[str, Any]
-) -> AccessPathSpec:
-    kind = (legacy_type or "").strip().lower()
-    upstream, prefix_provider = _strip_provider_prefix(model_id)
-    provider = str(extra.get("provider") or prefix_provider or "").lower()
-    backend = str(extra.get("backend") or "").lower()
-
-    if kind in {"codex"} or (kind == "agent_backend" and backend == "codex"):
-        return ACCESS_PATHS["openai-oauth"]
-    if kind == "claude-code":
-        if provider == "openai_chatgpt":
-            return ACCESS_PATHS["openai-oauth"]
-        if provider == "xai":
-            return ACCESS_PATHS["xai-responses"]
-        if provider == "zai":
-            return ACCESS_PATHS["zai-anthropic"]
-        if provider == "moonshot":
-            return ACCESS_PATHS["moonshot-anthropic"]
-        if provider in {"kimi_coding", "kimi", "kimi-code"}:
-            return ACCESS_PATHS["kimi-coding-chat"]
-        return ACCESS_PATHS["anthropic-oauth"]
-    if kind == "openai":
-        return ACCESS_PATHS["openai-api"]
-    if kind in {"grok", "xai"}:
-        return ACCESS_PATHS["xai-chat"]
-    if kind == "gguf":
-        return ACCESS_PATHS["local-llamacpp"]
-    if kind == "vllm":
-        return ACCESS_PATHS["local-vllm"]
-    if kind == "ollama":
-        return ACCESS_PATHS["ollama"]
-    if kind in {"openai-compatible", "openai_compatible"}:
-        return ACCESS_PATHS["openai-compatible"]
-    # Unknown legacy types stay reachable through the generic access path.
-    return ACCESS_PATHS["openai-compatible"]
-
-
-def _model_vendor(alias: str, access: AccessPathSpec, model_id: str | None) -> str:
-    probe = f"{alias} {model_id or ''}".lower()
-    if "claude" in probe or access.vendor == "anthropic":
-        return "anthropic"
-    if "gpt" in probe or access.vendor == "openai":
-        return "openai"
-    if "grok" in probe or access.vendor == "xai":
-        return "xai"
-    if access.vendor == "zai" or "glm" in probe:
-        return "zai"
-    if access.vendor == "local":
-        return "community"
-    return access.vendor
-
-
-def map_legacy_definition(row: Mapping[str, Any]) -> CatalogMapping:
-    """Pure mapping used by both the migration and focused unit tests."""
-    alias = str(row["alias"]).strip()
-    legacy_type = str(row["type"]).strip().lower()
-    model_id = row.get("model_id")
-    extra = _as_dict(row.get("extra"))
-    access = _access_path_for(legacy_type, model_id, extra)
-    stripped_model_id, _ = _strip_provider_prefix(model_id)
-    upstream = extra.get("upstream_model") or stripped_model_id
-
-    context_window = extra.get("context_window")
-    if context_window is not None:
-        context_window = int(context_window)
-    tool_support = extra.get("tool_support")
-    pricing = extra.get("pricing") if isinstance(extra.get("pricing"), dict) else None
-
-    serving_config: dict[str, Any] = {}
-    # psycopg decodes both SQL NULL and JSONB ``null`` as Python None.  The
-    # explicit flag from the migration query preserves that distinction so the
-    # compatibility view is byte-for-byte faithful to the legacy JSON shape.
-    extra_is_sql_null = row.get("extra_is_sql_null", row.get("extra") is None)
-    if not extra_is_sql_null:
-        serving_config["compat_extra"] = None if row.get("extra") is None else extra
-    for key in ("repo_id", "filename"):
-        if row.get(key) is not None:
-            serving_config[key] = row[key]
-    for key in ("chat_format", "n_gpu_layers", "tensor_split", "gpu_layers"):
-        if key in extra:
-            serving_config[key] = extra[key]
-
-    description = row.get("description")
-    return CatalogMapping(
-        model_key=alias,
-        model_vendor=_model_vendor(alias, access, model_id),
-        display_name=str(description or alias),
-        description=description,
-        access_path=access,
-        upstream_model_id=upstream,
-        serving_config=serving_config,
-        context_window_override=context_window,
-        tool_support_override=str(tool_support) if tool_support is not None else None,
-        pricing=pricing,
-        legacy_type=legacy_type,
-        created_at=row.get("created_at"),
-        updated_at=row.get("updated_at"),
-    )
+STANDARD_ACCESS_PATHS = (
+    AccessPathSeed("openai-api", "openai", "chat-completions", "https://api.openai.com/v1", "api-key"),
+    AccessPathSeed("openai-oauth", "openai", "responses", "https://chatgpt.com/backend-api/codex", "oauth"),
+    AccessPathSeed("anthropic-api", "anthropic", "anthropic-messages", "https://api.anthropic.com", "api-key"),
+    AccessPathSeed("anthropic-oauth", "anthropic", "anthropic-messages", "https://api.anthropic.com", "oauth"),
+    AccessPathSeed("xai-chat", "xai", "chat-completions", "https://api.x.ai/v1", "api-key"),
+    AccessPathSeed("xai-responses", "xai", "responses", "https://api.x.ai/v1", "api-key"),
+    AccessPathSeed("zai-anthropic", "zai", "anthropic-messages", "https://api.z.ai/api/anthropic", "api-key"),
+    AccessPathSeed("moonshot-anthropic", "moonshot", "anthropic-messages", "https://api.moonshot.ai/anthropic", "api-key"),
+    AccessPathSeed("kimi-coding-chat", "kimi", "chat-completions", "https://api.kimi.com/coding/v1", "api-key"),
+    AccessPathSeed("local-llamacpp", "local", "chat-completions", None, "none", "llama-cpp"),
+    AccessPathSeed("local-vllm", "local", "chat-completions", None, "none", "vllm"),
+    AccessPathSeed("ollama", "local", "chat-completions", None, "none", "ollama"),
+    AccessPathSeed("openai-compatible", "custom", "chat-completions", None, "configured"),
+)
 
 
 _CREATE_SCHEMA_SQL = """
@@ -282,10 +60,11 @@ CREATE TABLE IF NOT EXISTS models (
     vendor VARCHAR(64) NOT NULL,
     display_name VARCHAR(256) NOT NULL,
     description TEXT,
-    default_context_window INTEGER,
+    default_context_window INTEGER NOT NULL,
     default_tool_support VARCHAR(64),
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    CONSTRAINT models_context_window_positive CHECK (default_context_window > 0)
 );
 
 CREATE TABLE IF NOT EXISTS access_paths (
@@ -312,7 +91,6 @@ CREATE TABLE IF NOT EXISTS model_endpoints (
     context_window_override INTEGER,
     tool_support_override VARCHAR(64),
     pricing JSONB,
-    legacy_type VARCHAR(64),
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     CONSTRAINT model_endpoints_model_access_key UNIQUE (model_id, access_path_id)
@@ -323,8 +101,7 @@ CREATE INDEX IF NOT EXISTS idx_model_endpoints_access_path_id ON model_endpoints
 
 ALTER TABLE access_paths
     ADD COLUMN IF NOT EXISTS system_prompt_overrides JSONB NOT NULL DEFAULT '{}'::jsonb;
-UPDATE access_paths
-   SET system_prompt_overrides = '{}'::jsonb
+UPDATE access_paths SET system_prompt_overrides = '{}'::jsonb
  WHERE system_prompt_overrides IS NULL;
 ALTER TABLE access_paths
     ALTER COLUMN system_prompt_overrides SET DEFAULT '{}'::jsonb,
@@ -333,86 +110,23 @@ ALTER TABLE access_paths
 
 
 _BOT_TRIGGER_SQL = """
-CREATE OR REPLACE FUNCTION bot_profiles_check_model_backend()
+CREATE OR REPLACE FUNCTION bot_profiles_check_model_endpoint()
 RETURNS TRIGGER AS $$
 DECLARE
     endpoint_protocol TEXT;
     endpoint_vendor TEXT;
     endpoint_model_key TEXT;
 BEGIN
-    -- Legacy callers still write (agent_backend, default_model). Resolve those
-    -- writes onto the canonical (harness, endpoint_id) pair during cutover.
-    IF TG_OP = 'INSERT'
-       OR NEW.default_model IS DISTINCT FROM OLD.default_model
-       OR NEW.agent_backend IS DISTINCT FROM OLD.agent_backend THEN
-        IF NEW.default_model IS NOT NULL THEN
-            SELECT e.id
-              INTO NEW.endpoint_id
-              FROM model_endpoints e
-              JOIN models m ON m.id = e.model_id
-              JOIN access_paths a ON a.id = e.access_path_id
-             WHERE m.key = NEW.default_model
-             ORDER BY
-               CASE
-                 WHEN NEW.agent_backend = 'codex' AND a.protocol = 'responses' THEN 0
-                 WHEN NEW.agent_backend = 'claude-code' AND a.protocol = 'anthropic-messages' THEN 0
-                 WHEN NEW.agent_backend = 'claude-code' AND a.protocol IN ('responses', 'chat-completions') THEN 1
-                 WHEN NEW.agent_backend IS NULL AND a.protocol = 'chat-completions' THEN 0
-                 ELSE 2
-               END,
-               e.id
-             LIMIT 1;
-            IF NEW.endpoint_id IS NULL THEN
-                RAISE EXCEPTION 'bot %: default_model % has no normalized endpoint',
-                    NEW.slug, NEW.default_model
-                USING ERRCODE = 'foreign_key_violation';
-            END IF;
-        ELSE
-            NEW.endpoint_id := NULL;
+    IF NEW.harness = 'openclaw' THEN
+        IF NEW.endpoint_id IS NOT NULL THEN
+            RAISE EXCEPTION 'bot %: openclaw owns its model and cannot pin endpoint_id', NEW.slug
+            USING ERRCODE = 'check_violation';
         END IF;
-
-        IF NEW.agent_backend = 'codex' THEN
-            NEW.harness := 'codex';
-        ELSIF NEW.agent_backend = 'openclaw' THEN
-            NEW.harness := 'openclaw';
-        ELSIF NEW.agent_backend = 'claude-code' THEN
-            SELECT a.protocol, a.vendor
-              INTO endpoint_protocol, endpoint_vendor
-              FROM model_endpoints e JOIN access_paths a ON a.id = e.access_path_id
-             WHERE e.id = NEW.endpoint_id;
-            IF endpoint_vendor = 'anthropic'
-               AND endpoint_protocol = 'anthropic-messages' THEN
-                NEW.harness := 'claude-code';
-            ELSE
-                NEW.harness := 'claude-proxy';
-            END IF;
-        ELSE
-            NEW.harness := 'chat';
-        END IF;
-    ELSE
-        -- New callers write the normalized pair. Mirror it into the legacy
-        -- fields until TASK-549/550 remove their runtime use.
-        IF NEW.endpoint_id IS DISTINCT FROM OLD.endpoint_id
-           OR NEW.harness IS DISTINCT FROM OLD.harness THEN
-            IF NEW.endpoint_id IS NOT NULL THEN
-                SELECT m.key INTO endpoint_model_key
-                  FROM model_endpoints e JOIN models m ON m.id = e.model_id
-                 WHERE e.id = NEW.endpoint_id;
-                NEW.default_model := endpoint_model_key;
-            ELSE
-                NEW.default_model := NULL;
-            END IF;
-            NEW.agent_backend := CASE NEW.harness
-                WHEN 'chat' THEN NULL
-                WHEN 'claude-proxy' THEN 'claude-code'
-                ELSE NEW.harness
-            END;
-        END IF;
-    END IF;
-
-    IF NEW.harness = 'openclaw' AND NEW.endpoint_id IS NULL THEN
+        NEW.default_model := NULL;
+        NEW.agent_backend := 'openclaw';
         RETURN NEW;
     END IF;
+
     IF NEW.endpoint_id IS NULL THEN
         RAISE EXCEPTION 'bot %: harness % requires endpoint_id', NEW.slug, NEW.harness
         USING ERRCODE = 'not_null_violation';
@@ -424,6 +138,7 @@ BEGIN
       JOIN access_paths a ON a.id = e.access_path_id
       JOIN models m ON m.id = e.model_id
      WHERE e.id = NEW.endpoint_id;
+
     IF endpoint_protocol IS NULL THEN
         RAISE EXCEPTION 'bot %: endpoint_id % does not exist', NEW.slug, NEW.endpoint_id
         USING ERRCODE = 'foreign_key_violation';
@@ -436,430 +151,288 @@ BEGIN
         RAISE EXCEPTION 'bot %: codex harness requires responses endpoint, got %',
             NEW.slug, endpoint_protocol USING ERRCODE = 'check_violation';
     ELSIF NEW.harness = 'claude-code'
-          AND (endpoint_protocol <> 'anthropic-messages'
-               OR endpoint_vendor <> 'anthropic') THEN
-        RAISE EXCEPTION 'bot %: claude-code harness requires an Anthropic anthropic-messages endpoint',
+          AND (endpoint_protocol <> 'anthropic-messages' OR endpoint_vendor <> 'anthropic') THEN
+        RAISE EXCEPTION 'bot %: claude-code requires an Anthropic Messages endpoint',
             NEW.slug USING ERRCODE = 'check_violation';
     ELSIF NEW.harness = 'claude-proxy'
-          AND (endpoint_protocol NOT IN ('anthropic-messages', 'responses', 'chat-completions')
-               OR endpoint_vendor = 'anthropic') THEN
-        RAISE EXCEPTION 'bot %: claude-proxy requires a non-Anthropic endpoint supported by the bridge proxy',
+          AND (endpoint_vendor = 'anthropic'
+               OR endpoint_protocol NOT IN ('anthropic-messages', 'responses', 'chat-completions')) THEN
+        RAISE EXCEPTION 'bot %: claude-proxy requires a non-Anthropic proxy endpoint',
             NEW.slug USING ERRCODE = 'check_violation';
+    ELSIF NEW.harness NOT IN ('chat', 'codex', 'claude-code', 'claude-proxy') THEN
+        RAISE EXCEPTION 'bot %: unknown harness %', NEW.slug, NEW.harness
+        USING ERRCODE = 'check_violation';
     END IF;
 
+    -- The normalized pair is canonical. These two columns are derived mirrors
+    -- retained for existing bot/runtime interfaces, never independent inputs.
+    NEW.default_model := endpoint_model_key;
+    NEW.agent_backend := CASE NEW.harness
+        WHEN 'chat' THEN NULL
+        WHEN 'claude-proxy' THEN 'claude-code'
+        ELSE NEW.harness
+    END;
     RETURN NEW;
 END;
 $$ LANGUAGE plpgsql;
 
 DROP TRIGGER IF EXISTS bot_profiles_model_backend_check ON bot_profiles;
-CREATE TRIGGER bot_profiles_model_backend_check
+DROP TRIGGER IF EXISTS bot_profiles_model_endpoint_check ON bot_profiles;
+CREATE TRIGGER bot_profiles_model_endpoint_check
 BEFORE INSERT OR UPDATE ON bot_profiles
-FOR EACH ROW EXECUTE FUNCTION bot_profiles_check_model_backend();
+FOR EACH ROW EXECUTE FUNCTION bot_profiles_check_model_endpoint();
+
+DROP FUNCTION IF EXISTS bot_profiles_check_model_backend();
 """
 
 
-_COMPAT_VIEW_SQL = """
-CREATE OR REPLACE VIEW model_definitions_compat AS
-SELECT
-    e.id::INTEGER AS id,
-    m.key::VARCHAR(128) AS alias,
-    e.legacy_type::VARCHAR(64) AS type,
-    CASE
-      WHEN e.legacy_type = 'claude-code' AND a.key = 'openai-oauth'
-        THEN 'openai_chatgpt/' || e.upstream_model_id
-      WHEN e.legacy_type = 'claude-code' AND a.key = 'xai-responses'
-        THEN 'xai/' || e.upstream_model_id
-      WHEN e.legacy_type = 'claude-code' AND a.key = 'zai-anthropic'
-        THEN 'zai/' || e.upstream_model_id
-      WHEN e.legacy_type = 'claude-code' AND a.key = 'moonshot-anthropic'
-        THEN 'moonshot/' || e.upstream_model_id
-      WHEN e.legacy_type = 'claude-code' AND a.key = 'kimi-coding-chat'
-        THEN 'kimi_coding/' || e.upstream_model_id
-      ELSE e.upstream_model_id
-    END::VARCHAR(512) AS model_id,
-    (e.serving_config->>'repo_id')::VARCHAR(512) AS repo_id,
-    (e.serving_config->>'filename')::VARCHAR(512) AS filename,
-    m.description,
-    e.serving_config->'compat_extra' AS extra,
-    e.created_at,
-    e.updated_at
-FROM model_endpoints e
-JOIN models m ON m.id = e.model_id
-JOIN access_paths a ON a.id = e.access_path_id;
-"""
+def _compatible(harness: str, vendor: str, protocol: str) -> bool:
+    if harness == "openclaw":
+        return True
+    if harness == "chat":
+        return protocol == "chat-completions"
+    if harness == "codex":
+        return protocol == "responses"
+    if harness == "claude-code":
+        return vendor == "anthropic" and protocol == "anthropic-messages"
+    if harness == "claude-proxy":
+        return vendor != "anthropic" and protocol in {
+            "anthropic-messages",
+            "responses",
+            "chat-completions",
+        }
+    return False
 
 
-def _row_mapping(row: Any) -> dict[str, Any]:
-    return dict(row._mapping if hasattr(row, "_mapping") else row)
-
-
-def _derive_harness(agent_backend: str | None, access: AccessPathSpec | None) -> str:
+def _derive_harness(agent_backend: str | None, vendor: str, protocol: str) -> str:
     backend = (agent_backend or "").strip().lower()
-    if backend == "codex":
-        return "codex"
     if backend == "openclaw":
         return "openclaw"
+    if backend == "codex":
+        return "codex"
     if backend == "claude-code":
-        if (
-            access
-            and access.vendor == "anthropic"
-            and access.protocol == "anthropic-messages"
-        ):
+        if vendor == "anthropic" and protocol == "anthropic-messages":
             return "claude-code"
         return "claude-proxy"
     return "chat"
 
 
-def migrate_model_catalog(engine: Engine, dry_run: bool = False) -> dict[str, Any]:
-    """Create and backfill the normalized model catalog in one transaction."""
-    with engine.connect() as conn:
-        legacy_exists = bool(
-            conn.execute(
-                text("""
-            SELECT 1 FROM information_schema.tables
-             WHERE table_schema = 'public' AND table_name = 'model_definitions'
-               AND table_type = 'BASE TABLE'
-        """)
-            ).fetchone()
+def _endpoint_preference(agent_backend: str | None, vendor: str, protocol: str) -> int:
+    backend = (agent_backend or "").strip().lower()
+    if backend == "codex":
+        return 0 if protocol == "responses" else 10
+    if backend == "claude-code":
+        if vendor == "anthropic" and protocol == "anthropic-messages":
+            return 0
+        if vendor != "anthropic" and protocol in {
+            "anthropic-messages",
+            "responses",
+            "chat-completions",
+        }:
+            return 1
+        return 10
+    if backend == "openclaw":
+        return 0
+    return 0 if protocol == "chat-completions" else 10
+
+
+def _seed_access_paths(conn) -> None:
+    sql = text("""
+        INSERT INTO access_paths
+            (key, vendor, protocol, base_url, auth_mechanism, engine_kind)
+        VALUES (:key, :vendor, :protocol, :base_url, :auth_mechanism, :engine_kind)
+        ON CONFLICT (key) DO NOTHING
+    """)
+    for path in STANDARD_ACCESS_PATHS:
+        conn.execute(
+            sql,
+            {
+                "key": path.key,
+                "vendor": path.vendor,
+                "protocol": path.protocol,
+                "base_url": path.base_url,
+                "auth_mechanism": path.auth_mechanism,
+                "engine_kind": path.engine_kind,
+            },
         )
-        bots_exist = bool(
-            conn.execute(
-                text("""
+
+
+def _repair_bot_assignments(conn) -> list[str]:
+    table_exists = conn.execute(
+        text("""
             SELECT 1 FROM information_schema.tables
              WHERE table_schema = 'public' AND table_name = 'bot_profiles'
-               AND table_type = 'BASE TABLE'
         """)
-            ).fetchone()
-        )
-        if not legacy_exists:
-            return {
-                "skipped": True,
-                "reason": "model_definitions base table not present",
-            }
+    ).fetchone()
+    if not table_exists:
+        return []
 
-        legacy_rows = [
-            _row_mapping(row)
-            for row in conn.execute(
-                text(
-                    "SELECT id, alias, type, model_id, repo_id, filename, description, "
-                    "extra, extra IS NULL AS extra_is_sql_null, created_at, updated_at "
-                    "FROM model_definitions ORDER BY id"
-                )
-            ).fetchall()
-        ]
-        mappings = [map_legacy_definition(row) for row in legacy_rows]
-        bot_rows = []
-        if bots_exist:
-            bot_rows = [
-                _row_mapping(row)
-                for row in conn.execute(
-                    text(
-                        "SELECT slug, agent_backend, default_model FROM bot_profiles ORDER BY slug"
-                    )
-                ).fetchall()
-            ]
+    conn.execute(text("ALTER TABLE bot_profiles ADD COLUMN IF NOT EXISTS harness VARCHAR(32)"))
+    conn.execute(text("ALTER TABLE bot_profiles ADD COLUMN IF NOT EXISTS endpoint_id BIGINT"))
+    conn.execute(text("ALTER TABLE bot_profiles DROP CONSTRAINT IF EXISTS bot_profiles_default_model_fk"))
+    conn.execute(text("ALTER TABLE bot_profiles DROP CONSTRAINT IF EXISTS bot_profiles_harness_check"))
+    conn.execute(text("ALTER TABLE bot_profiles DROP CONSTRAINT IF EXISTS bot_profiles_endpoint_fk"))
+    conn.execute(text("DROP TRIGGER IF EXISTS bot_profiles_model_backend_check ON bot_profiles"))
+    conn.execute(text("DROP TRIGGER IF EXISTS bot_profiles_model_endpoint_check ON bot_profiles"))
 
-        preview = {
-            "legacy_definitions": len(legacy_rows),
-            "bots": len(bot_rows),
-            "models": len({item.model_key for item in mappings}),
-            "endpoints": len(
-                {(item.model_key, item.access_path.key) for item in mappings}
-            ),
-            "access_paths": sorted({item.access_path.key for item in mappings}),
-        }
-        if dry_run:
-            return {"dry_run": True, **preview}
+    endpoint_rows = conn.execute(text("""
+        SELECT e.id, m.key, a.vendor, a.protocol
+          FROM model_endpoints e
+          JOIN models m ON m.id = e.model_id
+          JOIN access_paths a ON a.id = e.access_path_id
+         ORDER BY m.key, e.id
+    """)).mappings().all()
+    endpoints_by_id = {int(row["id"]): row for row in endpoint_rows}
+    endpoints_by_model: dict[str, list[Any]] = {}
+    for row in endpoint_rows:
+        endpoints_by_model.setdefault(row["key"], []).append(row)
 
-        # Serialize startup/manual invocations without holding a global lock.
-        conn.execute(
-            text("SELECT pg_advisory_xact_lock(hashtext('task-548-model-catalog'))")
-        )
-        conn.execute(text(_CREATE_SCHEMA_SQL))
+    repaired: list[str] = []
+    bots = conn.execute(text("""
+        SELECT slug, agent_backend, default_model, harness, endpoint_id
+          FROM bot_profiles ORDER BY slug FOR UPDATE
+    """)).mappings().all()
+    for bot in bots:
+        slug = str(bot["slug"])
+        backend = (bot["agent_backend"] or "").strip().lower()
+        harness = (bot["harness"] or "").strip().lower()
+        endpoint = endpoints_by_id.get(int(bot["endpoint_id"])) if bot["endpoint_id"] is not None else None
 
-        endpoint_by_alias: dict[str, tuple[int, AccessPathSpec]] = {}
-        skipped_windowless: list[str] = []
-        for item in mappings:
-            access_id = conn.execute(
+        if backend == "openclaw" or harness == "openclaw":
+            if harness == "openclaw" and endpoint is None and bot["default_model"] is None:
+                continue
+            conn.execute(
                 text("""
-                INSERT INTO access_paths
-                    (key, vendor, protocol, base_url, auth_mechanism, engine_kind)
-                VALUES (:key, :vendor, :protocol, :base_url, :auth, :engine)
-                ON CONFLICT (key) DO UPDATE SET
-                    key = EXCLUDED.key
-                RETURNING id
-            """),
-                {
-                    "key": item.access_path.key,
-                    "vendor": item.access_path.vendor,
-                    "protocol": item.access_path.protocol,
-                    "base_url": item.access_path.base_url,
-                    "auth": item.access_path.auth_mechanism,
-                    "engine": item.access_path.engine_kind,
-                },
-            ).scalar_one()
-            # TASK-616: the models.default_context_window NOT NULL constraint
-            # (applied below) is checked against the VALUES tuple of this
-            # INSERT ... ON CONFLICT *before* the DO UPDATE COALESCE runs, so a
-            # NULL legacy window crashes boot even for an already-backfilled
-            # row. When the legacy source has no window, reuse the model's
-            # current catalog window (keeps the ON CONFLICT metadata refresh and
-            # COALESCE intact). If no window exists anywhere — a genuinely
-            # incomplete new model — skip it loudly rather than bake in a fake
-            # default; the catalog API is the way to add its window.
-            context_window_value = item.context_window_override
-            if context_window_value is None:
-                existing = conn.execute(
-                    text(
-                        "SELECT default_context_window FROM models WHERE key = :key"
-                    ),
-                    {"key": item.model_key},
-                ).fetchone()
-                if existing is None or existing[0] is None:
-                    skipped_windowless.append(item.model_key)
-                    logger.warning(
-                        "Skipping windowless legacy model %r: no context_window. "
-                        "Add it via PUT /v1/models/catalog/models/%s with "
-                        "default_context_window set.",
-                        item.model_key,
-                        item.model_key,
-                    )
-                    continue
-                context_window_value = existing[0]
-            model_id = conn.execute(
-                text("""
-                INSERT INTO models
-                    (key, vendor, display_name, description, default_context_window,
-                     default_tool_support, created_at, updated_at)
-                VALUES (:key, :vendor, :display, :description, :context_window,
-                        :tool_support, COALESCE(:created_at, NOW()), COALESCE(:updated_at, NOW()))
-                ON CONFLICT (key) DO UPDATE SET
-                    vendor = CASE WHEN EXCLUDED.updated_at >= models.updated_at THEN EXCLUDED.vendor ELSE models.vendor END,
-                    display_name = CASE WHEN EXCLUDED.updated_at >= models.updated_at THEN EXCLUDED.display_name ELSE models.display_name END,
-                    description = CASE WHEN EXCLUDED.updated_at >= models.updated_at THEN EXCLUDED.description ELSE models.description END,
-                    default_context_window = CASE WHEN EXCLUDED.updated_at >= models.updated_at THEN COALESCE(models.default_context_window, EXCLUDED.default_context_window) ELSE models.default_context_window END,
-                    default_tool_support = CASE WHEN EXCLUDED.updated_at >= models.updated_at THEN COALESCE(models.default_tool_support, EXCLUDED.default_tool_support) ELSE models.default_tool_support END,
-                    updated_at = GREATEST(models.updated_at, EXCLUDED.updated_at)
-                RETURNING id
-            """),
-                {
-                    "key": item.model_key,
-                    "vendor": item.model_vendor,
-                    "display": item.display_name,
-                    "description": item.description,
-                    "context_window": context_window_value,
-                    "tool_support": item.tool_support_override,
-                    "created_at": item.created_at,
-                    "updated_at": item.updated_at,
-                },
-            ).scalar_one()
-            endpoint_id = conn.execute(
-                text("""
-                INSERT INTO model_endpoints
-                    (model_id, access_path_id, upstream_model_id, serving_config,
-                     context_window_override, tool_support_override, pricing,
-                     legacy_type, created_at, updated_at)
-                VALUES (:model_id, :access_id, :upstream, CAST(:serving AS JSONB),
-                        :context_window, :tool_support, CAST(:pricing AS JSONB),
-                        :legacy_type, COALESCE(:created_at, NOW()), COALESCE(:updated_at, NOW()))
-                ON CONFLICT (model_id, access_path_id) DO UPDATE SET
-                    upstream_model_id = CASE WHEN EXCLUDED.updated_at >= model_endpoints.updated_at THEN EXCLUDED.upstream_model_id ELSE model_endpoints.upstream_model_id END,
-                    serving_config = CASE WHEN EXCLUDED.updated_at >= model_endpoints.updated_at THEN EXCLUDED.serving_config ELSE model_endpoints.serving_config END,
-                    context_window_override = CASE WHEN EXCLUDED.updated_at >= model_endpoints.updated_at THEN EXCLUDED.context_window_override ELSE model_endpoints.context_window_override END,
-                    tool_support_override = CASE WHEN EXCLUDED.updated_at >= model_endpoints.updated_at THEN EXCLUDED.tool_support_override ELSE model_endpoints.tool_support_override END,
-                    pricing = CASE WHEN EXCLUDED.updated_at >= model_endpoints.updated_at THEN EXCLUDED.pricing ELSE model_endpoints.pricing END,
-                    legacy_type = CASE WHEN EXCLUDED.updated_at >= model_endpoints.updated_at THEN EXCLUDED.legacy_type ELSE model_endpoints.legacy_type END,
-                    updated_at = GREATEST(model_endpoints.updated_at, EXCLUDED.updated_at)
-                RETURNING id
-            """),
-                {
-                    "model_id": model_id,
-                    "access_id": access_id,
-                    "upstream": item.upstream_model_id,
-                    "serving": json.dumps(item.serving_config),
-                    "context_window": item.context_window_override,
-                    "tool_support": item.tool_support_override,
-                    "pricing": json.dumps(item.pricing)
-                    if item.pricing is not None
-                    else None,
-                    "legacy_type": item.legacy_type,
-                    "created_at": item.created_at,
-                    "updated_at": item.updated_at,
-                },
-            ).scalar_one()
-            endpoint_by_alias[item.model_key] = (endpoint_id, item.access_path)
-
-        if bots_exist:
-            conn.execute(
-                text(
-                    "ALTER TABLE bot_profiles ADD COLUMN IF NOT EXISTS harness VARCHAR(32)"
-                )
-            )
-            conn.execute(
-                text(
-                    "ALTER TABLE bot_profiles ADD COLUMN IF NOT EXISTS endpoint_id BIGINT"
-                )
-            )
-            conn.execute(
-                text(
-                    "ALTER TABLE bot_profiles DROP CONSTRAINT IF EXISTS bot_profiles_default_model_fk"
-                )
-            )
-            conn.execute(
-                text(
-                    "ALTER TABLE bot_profiles DROP CONSTRAINT IF EXISTS bot_profiles_harness_check"
-                )
-            )
-            conn.execute(
-                text(
-                    "ALTER TABLE bot_profiles DROP CONSTRAINT IF EXISTS bot_profiles_endpoint_fk"
-                )
-            )
-            # The legacy trigger rejects precisely the claude-proxy/codex alias
-            # collision this migration is fixing, so remove it before backfill.
-            conn.execute(
-                text(
-                    "DROP TRIGGER IF EXISTS bot_profiles_model_backend_check ON bot_profiles"
-                )
-            )
-
-            for bot in bot_rows:
-                endpoint = endpoint_by_alias.get(bot["default_model"])
-                endpoint_id = endpoint[0] if endpoint else None
-                access = endpoint[1] if endpoint else None
-                harness = _derive_harness(bot["agent_backend"], access)
-                conn.execute(
-                    text("""
                     UPDATE bot_profiles
-                       SET harness = :harness, endpoint_id = :endpoint_id
+                       SET harness = 'openclaw', endpoint_id = NULL, default_model = NULL,
+                           agent_backend = 'openclaw'
                      WHERE slug = :slug
                 """),
-                    {
-                        "harness": harness,
-                        "endpoint_id": endpoint_id,
-                        "slug": bot["slug"],
-                    },
-                )
+                {"slug": slug},
+            )
+            repaired.append(slug)
+            continue
 
-            conn.execute(
-                text("""
-                ALTER TABLE bot_profiles
-                    ALTER COLUMN harness SET DEFAULT 'chat',
-                    ALTER COLUMN harness SET NOT NULL,
-                    ADD CONSTRAINT bot_profiles_harness_check
-                        CHECK (harness IN ('chat','claude-code','codex','claude-proxy','openclaw')),
-                    ADD CONSTRAINT bot_profiles_endpoint_fk
-                        FOREIGN KEY (endpoint_id) REFERENCES model_endpoints(id)
-                        ON UPDATE CASCADE ON DELETE SET NULL DEFERRABLE INITIALLY DEFERRED
-            """)
-            )
-            conn.execute(
-                text(
-                    "CREATE INDEX IF NOT EXISTS idx_bot_profiles_endpoint_id ON bot_profiles(endpoint_id)"
-                )
-            )
-            conn.execute(text(_BOT_TRIGGER_SQL))
-
-        # TASK-616: enforce catalog completeness for context windows. The
-        # positive CHECK is always (re)applied (DROP-then-ADD, matching the
-        # bot_profiles pattern above). NOT NULL is only enforced once the table
-        # is clean — an incomplete tenant with leftover NULL windows degrades
-        # gracefully (warn + read-path global-default fallback) instead of
-        # crashing boot. The skip guard above keeps the migration itself from
-        # ever inserting a fresh NULL, so once backfilled this stays enforced.
-        null_windows = conn.execute(
-            text("SELECT COUNT(*) FROM models WHERE default_context_window IS NULL")
-        ).scalar_one()
-        conn.execute(
-            text(
-                "ALTER TABLE models "
-                "DROP CONSTRAINT IF EXISTS models_context_window_positive"
-            )
+        valid = (
+            endpoint is not None
+            and _compatible(harness, endpoint["vendor"], endpoint["protocol"])
+            and bot["default_model"] == endpoint["key"]
         )
-        conn.execute(
-            text(
-                "ALTER TABLE models ADD CONSTRAINT models_context_window_positive "
-                "CHECK (default_context_window > 0)"
+        if valid:
+            continue
+
+        candidates = endpoints_by_model.get(str(bot["default_model"] or ""), [])
+        if not candidates:
+            raise RuntimeError(
+                f"bot {slug}: model {bot['default_model']!r} has no normalized endpoint"
             )
+        endpoint = min(
+            candidates,
+            key=lambda row: (
+                _endpoint_preference(backend or None, row["vendor"], row["protocol"]),
+                int(row["id"]),
+            ),
         )
-        if null_windows:
-            logger.warning(
-                "models: %d row(s) have NULL default_context_window; NOT NULL "
-                "not enforced. Backfill via the catalog API so the window is "
-                "the source of truth, not the global default.",
-                null_windows,
+        repaired_harness = _derive_harness(
+            backend or None,
+            endpoint["vendor"],
+            endpoint["protocol"],
+        )
+        if not _compatible(repaired_harness, endpoint["vendor"], endpoint["protocol"]):
+            raise RuntimeError(
+                f"bot {slug}: no endpoint compatible with backend={backend or 'chat'}"
             )
-        else:
-            already_not_null = conn.execute(
-                text(
-                    "SELECT is_nullable = 'NO' FROM information_schema.columns "
-                    "WHERE table_name = 'models' "
-                    "AND column_name = 'default_context_window'"
-                )
-            ).scalar_one()
-            if not already_not_null:
-                conn.execute(
-                    text(
-                        "ALTER TABLE models "
-                        "ALTER COLUMN default_context_window SET NOT NULL"
-                    )
-                )
-        if skipped_windowless:
-            logger.warning(
-                "Skipped %d windowless legacy model(s): %s",
-                len(skipped_windowless),
-                ", ".join(sorted(skipped_windowless)),
-            )
-
-        conn.execute(text(_COMPAT_VIEW_SQL))
-        conn.commit()
-
-    with engine.connect() as verify:
-        compat_count = verify.execute(
-            text("SELECT COUNT(*) FROM model_definitions_compat")
-        ).scalar_one()
-        endpoint_count = verify.execute(
-            text("SELECT COUNT(*) FROM model_endpoints")
-        ).scalar_one()
-        shared_gpt_endpoint_count = verify.execute(
+        conn.execute(
             text("""
-            SELECT COUNT(*) FROM model_endpoints e
-            JOIN models m ON m.id = e.model_id
-            JOIN access_paths a ON a.id = e.access_path_id
-            WHERE m.key = 'gpt-5.6-sol' AND a.key = 'openai-oauth'
-        """)
-        ).scalar_one()
-        compat_mismatches = verify.execute(
-            text("""
-            SELECT COUNT(*)
-              FROM model_definitions legacy
-              FULL JOIN model_definitions_compat compat USING (alias)
-             WHERE legacy.alias IS NULL OR compat.alias IS NULL
-                OR legacy.type IS DISTINCT FROM compat.type
-                OR legacy.model_id IS DISTINCT FROM compat.model_id
-                OR legacy.repo_id IS DISTINCT FROM compat.repo_id
-                OR legacy.filename IS DISTINCT FROM compat.filename
-                OR legacy.description IS DISTINCT FROM compat.description
-                OR legacy.extra IS DISTINCT FROM compat.extra
-        """)
-        ).scalar_one()
-        unresolved_bots = 0
-        if bots_exist:
-            unresolved_bots = verify.execute(
-                text("""
-                SELECT COUNT(*) FROM bot_profiles
-                 WHERE harness <> 'openclaw' AND endpoint_id IS NULL
-            """)
-            ).scalar_one()
+                UPDATE bot_profiles
+                   SET harness = :harness, endpoint_id = :endpoint_id,
+                       default_model = :model_key,
+                       agent_backend = CASE :harness
+                           WHEN 'chat' THEN NULL
+                           WHEN 'claude-proxy' THEN 'claude-code'
+                           ELSE :harness
+                       END
+                 WHERE slug = :slug
+            """),
+            {
+                "slug": slug,
+                "harness": repaired_harness,
+                "endpoint_id": int(endpoint["id"]),
+                "model_key": endpoint["key"],
+            },
+        )
+        repaired.append(slug)
+
+    conn.execute(text("""
+        ALTER TABLE bot_profiles
+            ALTER COLUMN harness SET DEFAULT 'chat',
+            ALTER COLUMN harness SET NOT NULL,
+            ADD CONSTRAINT bot_profiles_harness_check
+                CHECK (harness IN ('chat','claude-code','codex','claude-proxy','openclaw')),
+            ADD CONSTRAINT bot_profiles_endpoint_fk
+                FOREIGN KEY (endpoint_id) REFERENCES model_endpoints(id)
+                ON UPDATE CASCADE ON DELETE RESTRICT DEFERRABLE INITIALLY DEFERRED
+    """))
+    conn.execute(text("CREATE INDEX IF NOT EXISTS idx_bot_profiles_endpoint_id ON bot_profiles(endpoint_id)"))
+    conn.execute(text(_BOT_TRIGGER_SQL))
+
+    invalid = conn.execute(text("""
+        SELECT b.slug
+          FROM bot_profiles b
+          LEFT JOIN model_endpoints e ON e.id = b.endpoint_id
+          LEFT JOIN access_paths a ON a.id = e.access_path_id
+         WHERE (b.harness <> 'openclaw' AND b.endpoint_id IS NULL)
+            OR (b.harness = 'openclaw' AND b.endpoint_id IS NOT NULL)
+            OR (b.harness = 'chat' AND a.protocol IS DISTINCT FROM 'chat-completions')
+            OR (b.harness = 'codex' AND a.protocol IS DISTINCT FROM 'responses')
+            OR (b.harness = 'claude-code'
+                AND (a.vendor IS DISTINCT FROM 'anthropic'
+                     OR a.protocol IS DISTINCT FROM 'anthropic-messages'))
+            OR (b.harness = 'claude-proxy'
+                AND (a.vendor IS NULL OR a.vendor = 'anthropic'
+                     OR a.protocol NOT IN ('anthropic-messages','responses','chat-completions')))
+    """)).scalars().all()
+    if invalid:
+        raise RuntimeError(f"unresolved or incompatible bot endpoint assignments: {', '.join(invalid)}")
+    return repaired
+
+
+def migrate_model_catalog(engine: Engine, dry_run: bool = False) -> dict[str, Any]:
+    """Install/repair the normalized catalog and delete obsolete flat storage."""
+    if dry_run:
+        with engine.connect() as conn:
+            tables = {
+                row[0]
+                for row in conn.execute(text("""
+                    SELECT table_name FROM information_schema.tables
+                     WHERE table_schema = 'public'
+                       AND table_name IN ('models','model_endpoints','access_paths','bot_profiles')
+                """))
+            }
+        return {"dry_run": True, "tables": sorted(tables)}
+
+    with engine.begin() as conn:
+        conn.execute(text("SELECT pg_advisory_xact_lock(hashtext('normalized-model-catalog'))"))
+        conn.execute(text(_CREATE_SCHEMA_SQL))
+        _seed_access_paths(conn)
+        repaired_bots = _repair_bot_assignments(conn)
+
+        # Remove compatibility objects only after normalized repair and strict
+        # validation succeed; any exception above rolls the whole transaction back.
+        conn.execute(text("DROP VIEW IF EXISTS model_definitions_compat"))
+        conn.execute(text("DROP TABLE IF EXISTS model_definitions CASCADE"))
+        conn.execute(text("ALTER TABLE model_endpoints DROP COLUMN IF EXISTS legacy_type"))
+
+        model_count = conn.execute(text("SELECT COUNT(*) FROM models")).scalar_one()
+        endpoint_count = conn.execute(text("SELECT COUNT(*) FROM model_endpoints")).scalar_one()
+        access_count = conn.execute(text("SELECT COUNT(*) FROM access_paths")).scalar_one()
+
     return {
-        **preview,
-        "compat_rows": compat_count,
-        "endpoint_rows": endpoint_count,
-        "compat_mismatches": compat_mismatches,
-        "gpt_5_6_sol_openai_oauth_endpoints": shared_gpt_endpoint_count,
-        "unresolved_bots": unresolved_bots,
-        "null_context_windows": null_windows,
-        "skipped_windowless_models": skipped_windowless,
+        "models": model_count,
+        "endpoints": endpoint_count,
+        "access_paths": access_count,
+        "repaired_bots": repaired_bots,
+        "legacy_catalog_removed": True,
     }
 
 
@@ -867,21 +440,15 @@ def main() -> None:
     from ..utils.config import Config
     from ..utils.db import get_shared_engine
 
-    parser = argparse.ArgumentParser(
-        description="Normalize the model catalog (TASK-548)"
-    )
+    parser = argparse.ArgumentParser(description="Install normalized model catalog")
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--verbose", "-v", action="store_true")
     args = parser.parse_args()
     logging.basicConfig(level=logging.DEBUG if args.verbose else logging.INFO)
     engine = get_shared_engine(Config())
     if engine is None:
-        raise SystemExit("database unavailable")
-    print(
-        json.dumps(
-            migrate_model_catalog(engine, dry_run=args.dry_run), indent=2, default=str
-        )
-    )
+        raise RuntimeError("Database unavailable")
+    print(json.dumps(migrate_model_catalog(engine, dry_run=args.dry_run), indent=2))
 
 
 if __name__ == "__main__":

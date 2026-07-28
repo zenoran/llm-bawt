@@ -38,7 +38,6 @@ from llm_bawt.utils.config import (
     PROVIDER_OPENAI,
     PROVIDER_UNKNOWN,
 )
-from .runtime_settings import ModelDefinitionStore
 from .utils.config import Config
 
 
@@ -171,28 +170,9 @@ class ModelManager:
         self.models_data: Dict[str, Any] = {}
         self.load_config()
         if not local_only:
-            self._merge_db_models()
-
-    def _merge_db_models(self) -> None:
-        """Overlay DB model definitions so CLI view matches service catalog.
-
-        DB remains source-of-truth when available; YAML entries remain for
-        file-backed portability and are shown unless overridden by DB aliases.
-        """
-        try:
-            store = ModelDefinitionStore(self.config)
-            if store.engine is None:
-                return
-            db_models = store.to_config_dict()
-            if not db_models:
-                return
-            models = dict(self.models_data.get("models", {}))
-            models.update(db_models)
-            self.models_data["models"] = models
-            # Keep config resolver in sync for availability markers.
-            self.config.merge_db_models(db_models)
-        except Exception:
-            return
+            catalog = self.config.ensure_model_catalog()
+            if catalog is not None:
+                self.models_data = {"models": catalog.compatibility_mapping()}
 
     def load_config(self) -> bool:
         if not self.config_path.is_file():
@@ -241,8 +221,6 @@ class ModelManager:
                 console.print(f"[bold green]Successfully processed config: {', '.join(messages)}.[/bold green]")
             else:
                 console.print(f"[green]Config saved to {self.config_path}.[/green]")
-            # Re-merge DB models so config.defined_models stays in sync
-            self._merge_db_models()
             return True
         except Exception as e:
             console.print(f"[bold red]Error saving configuration to {self.config_path}:[/bold red] {e}")
@@ -257,7 +235,7 @@ class ModelManager:
             entry = models.get(alias)
             if entry is None:
                 continue
-            resp = self.service_client.upsert_model_definition(alias, entry)
+            resp = self.service_client.upsert_catalog_model(alias, entry)
             if resp:
                 ok += 1
             else:
@@ -354,7 +332,7 @@ class ModelManager:
         del models[alias]
 
         if self.service_client:
-            resp = self.service_client.delete_model_definition(alias)
+            resp = self.service_client.delete_catalog_model(alias)
             if resp:
                 console.print(f"[bold green]Deleted '{alias}' from service.[/bold green]")
                 return True
@@ -362,17 +340,8 @@ class ModelManager:
                 console.print(f"[red]Failed to delete '{alias}' from service.[/red]")
                 return False
 
-        # Local mode: delete from DB directly + YAML
-        db_deleted = False
-        try:
-            store = ModelDefinitionStore(self.config)
-            if store.engine is not None:
-                db_deleted = store.delete(alias)
-                if db_deleted:
-                    console.print(f"[dim]Removed '{alias}' from model_definitions DB.[/dim]")
-        except Exception as e:
-            console.print(f"[yellow]Warning:[/yellow] Could not delete from DB: {e}")
-
+        # Local mode is deliberately file-only. Database catalog management is
+        # available through the normalized service API / Models admin UI.
         return self.save_config(deleted=1)
 
     def update_models(self, provider_type: Optional[str] = None):
@@ -421,7 +390,6 @@ class ModelManager:
         if updated_count or added_count:
             save_ok = self.save_config(added=added_count, updated=updated_count)
             if save_ok:
-                self._merge_db_models()
                 if provider_type == PROVIDER_OLLAMA:
                     self.config.force_ollama_check()
             return save_ok
@@ -995,7 +963,6 @@ def delete_model(alias: str, config: Config, service_client=None) -> bool:
 
     delete_ok = manager.delete_model_alias(alias)
     if delete_ok:
-        manager._merge_db_models()
         # Avoid probing Ollama during unrelated operations.
         # Ollama connectivity/model checks happen only when explicitly refreshing Ollama models.
         

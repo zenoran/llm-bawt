@@ -15,8 +15,6 @@ keeps working:
 
     migrations_memory     — memory/history schema (tags, meaning embeddings,
                             recalled_history column, sessions backfill)
-    migrations_bot_model  — bot_profiles ↔ model_definitions FK/trigger +
-                            agent_backend_config.model consolidation
     migrations_media      — media_assets table + messages.attachments column
 """
 
@@ -31,11 +29,6 @@ from .migrations_memory import (
     add_recalled_history_column,
     backfill_sessions,
 )
-from .migrations_bot_model import (
-    add_bot_model_constraints,
-    migrate_agent_backend_config_model,
-    _derive_model_alias,
-)
 from .migrations_media import (
     add_media_assets_table,
     drop_media_assets_table,
@@ -49,9 +42,6 @@ __all__ = [
     "backfill_meaning_embeddings",
     "add_recalled_history_column",
     "backfill_sessions",
-    "add_bot_model_constraints",
-    "migrate_agent_backend_config_model",
-    "_derive_model_alias",
     "add_media_assets_table",
     "drop_media_assets_table",
     "add_attachments_to_messages",
@@ -76,12 +66,6 @@ def run_all_migrations(backend, dry_run: bool = False) -> dict:
     logger.debug("Running sessions backfill...")
     results["sessions"] = backfill_sessions(backend, dry_run=dry_run)
 
-    logger.debug("Consolidating agent_backend_config.model onto default_model...")
-    results["agent_config_model"] = migrate_agent_backend_config_model(backend, dry_run=dry_run)
-
-    logger.debug("Adding bot/model constraints...")
-    results["bot_model_constraints"] = add_bot_model_constraints(backend, dry_run=dry_run)
-
     logger.debug("Creating media_assets table...")
     results["media_assets_table"] = add_media_assets_table(backend, dry_run=dry_run)
 
@@ -104,8 +88,6 @@ def main():
             "backfill_tags",
             "backfill_meaning",
             "backfill_sessions",
-            "bot_model_constraints",
-            "agent_config_model",
             "media_assets_up",
             "media_assets_down",
             "messages_attachments",
@@ -129,10 +111,6 @@ def main():
         result = backfill_meaning_embeddings(backend, dry_run=args.dry_run)
     elif args.command == "backfill_sessions":
         result = backfill_sessions(backend, dry_run=args.dry_run)
-    elif args.command == "bot_model_constraints":
-        result = add_bot_model_constraints(backend, dry_run=args.dry_run)
-    elif args.command == "agent_config_model":
-        result = migrate_agent_backend_config_model(backend, dry_run=args.dry_run)
     elif args.command == "media_assets_up":
         result = add_media_assets_table(backend, dry_run=args.dry_run)
     elif args.command == "media_assets_down":
