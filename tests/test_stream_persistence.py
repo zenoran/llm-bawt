@@ -54,7 +54,7 @@ def test_finalize_turn_saves_history() -> None:
     )
 
     llm_bawt.finalize_response.assert_called_once_with(
-        "hello world", "", attachments=None, reasoning=None
+        "hello world", "", attachments=None, reasoning=None, message_id=None
     )
     service._update_turn_log.assert_called_once()
     kwargs = service._update_turn_log.call_args.kwargs
