@@ -238,6 +238,16 @@ def list_turn_logs(
     # canonical store) for every turn — the tool_calls_json blob is retired.
     live_tool_counts = _live_tool_call_counts(store, [row.id for row in rows])
 
+    # TASK-661: batch-fetch per-turn changed-file summaries so history
+    # hydration can graft file links via the existing turn-log backfill.
+    changed_files_by_turn: dict[str, dict] = {}
+    try:
+        changed_files_by_turn = store.changed_files_summaries_for_turns(
+            [row.id for row in rows]
+        )
+    except Exception:
+        changed_files_by_turn = {}
+
     # TASK-269: embed the persisted question for turns that ended on one, so the
     # UI can render a QuestionMessage straight from history hydration.
     pq_store = getattr(service, "_pending_question_store", None)
@@ -289,6 +299,7 @@ def list_turn_logs(
                 parent_turn_id=getattr(row, "parent_turn_id", None),
                 ended_at=getattr(row, "ended_at", None),
                 question=questions_by_turn.get(row.id),
+                changed_files=changed_files_by_turn.get(row.id),
             )
         )
 
@@ -713,3 +724,60 @@ def download_tool_call_result(
         status_code=status_code,
         headers=headers,
     )
+
+
+# ---------------------------------------------------------------------------
+# TASK-661: per-turn changed files
+# ---------------------------------------------------------------------------
+
+
+@router.get("/v1/turn-changed-files", tags=["Debug"])
+def get_turn_changed_files(
+    message_id: str | None = Query(None, description="Single trigger message ID"),
+    message_ids: list[str] | None = Query(None, description="Trigger message IDs (repeat or CSV)"),
+    turn_id: str | None = Query(None, description="Resolve a single turn directly"),
+):
+    """Changed-file summaries keyed by trigger message ID for history hydration.
+
+    Mirrors ``/v1/tool-calls``: the chat UI keys per-turn changed files by the
+    user message that triggered the turn, so live-stream and hard-refresh render
+    the identical summary shape.
+    """
+    service = get_service()
+    store = service._turn_log_store
+    if store.engine is None:
+        raise HTTPException(status_code=503, detail="Turn logs DB unavailable")
+    if turn_id:
+        return {"by_message": {}, "turn": store.changed_files_summary(turn_id)}
+    target_ids = parse_message_filters(message_id, message_ids)
+    by_message = store.changed_files_summaries_for_triggers(list(target_ids)) if target_ids else {}
+    return {"by_message": by_message}
+
+
+@router.get("/v1/turn-changed-files/{turn_id}/content", tags=["Debug"])
+def get_turn_changed_file_content(
+    turn_id: str,
+    repo_key: str = Query(..., description="Workspace identity of the changed file"),
+    path: str = Query(..., description="Repo-relative path of the changed file"),
+):
+    """Persisted before/after bytes for one changed file, as they existed for
+    this turn. Returns the FileDiffContent shape the shared viewer consumes.
+
+    This is deliberately NOT the live repos diff endpoint — it serves the bytes
+    frozen at turn time, which stay correct after the worktree changes again.
+    """
+    service = get_service()
+    store = service._turn_log_store
+    if store.engine is None:
+        raise HTTPException(status_code=503, detail="Turn logs DB unavailable")
+    resolved = store.changed_file_content(turn_id=turn_id, repo_key=repo_key, path=path)
+    if resolved is None:
+        raise HTTPException(status_code=404, detail="Changed file not found for turn")
+    before, after = resolved
+    binary = before.binary or after.binary
+    return {
+        "oldText": before.text,
+        "newText": after.text,
+        "binary": binary,
+        "truncated": before.truncated or after.truncated,
+    }

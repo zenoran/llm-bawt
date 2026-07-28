@@ -5,6 +5,7 @@ import json
 import logging
 from datetime import datetime
 
+from agent_bridge.changed_file_lifecycle import ChangedFileLifecycleMixin
 from agent_bridge.events import AgentEvent, AgentEventKind
 from agent_bridge.publisher import COMMANDS_STREAM, RedisPublisher
 from agent_bridge.session_queue import SessionQueue
@@ -15,7 +16,7 @@ from .ws_client import OpenClawWsClient
 logger = logging.getLogger(__name__)
 
 
-class SessionBridge:
+class SessionBridge(ChangedFileLifecycleMixin):
     def __init__(
         self,
         ws_client: OpenClawWsClient,
@@ -29,6 +30,7 @@ class SessionBridge:
         self._ingest = ingest
         self._store = store
         self._publisher = publisher
+        self._backend_name = "openclaw"
         self._run_buffers: dict[str, list[str]] = {}  # run_id -> text deltas
         self._run_tool_calls: dict[str, list[dict]] = {}  # run_id -> tool calls
         self._session_to_bot: dict[str, str] = session_to_bot or {}
@@ -232,6 +234,8 @@ class SessionBridge:
                 return
 
         async with self._session_queue.lock(session_key):
+            changed_file_tracker = await self._arm_changed_file_tracker()
+            event_seq = 0
             try:
                 # Clear any previous cancel signal before starting a new send
                 self._ws_client.clear_session_cancel(session_key)
@@ -251,6 +255,10 @@ class SessionBridge:
                         # bucket tool activity without turn_id guessing.
                         if trigger_message_id and not event.trigger_message_id:
                             event.trigger_message_id = trigger_message_id
+                        if isinstance(event.seq, int):
+                            event_seq = max(event_seq, event.seq)
+                        else:
+                            event_seq += 1
                         if event.kind == AgentEventKind.ASSISTANT_DELTA and event.text:
                             saw_assistant_text = True
 
@@ -309,6 +317,13 @@ class SessionBridge:
                             ),
                         )
 
+                event_seq = await self._publish_changed_files(
+                    changed_file_tracker,
+                    request_id=request_id,
+                    session_key=session_key,
+                    seq=event_seq,
+                    trigger_message_id=trigger_message_id,
+                )
                 self._publisher.publish_run_done(request_id)
                 logger.info("Send command completed: request_id=%s", request_id)
 
@@ -325,6 +340,13 @@ class SessionBridge:
                     trigger_message_id=trigger_message_id,
                 )
                 self._publisher.publish_run_event(request_id, err_event)
+                event_seq = await self._publish_changed_files(
+                    changed_file_tracker,
+                    request_id=request_id,
+                    session_key=session_key,
+                    seq=event_seq,
+                    trigger_message_id=trigger_message_id,
+                )
                 self._publisher.publish_run_done(request_id)
             finally:
                 await async_redis.xack(COMMANDS_STREAM, "bridge", msg_id)

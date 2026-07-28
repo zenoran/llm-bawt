@@ -204,6 +204,10 @@ class ClaudeSendMixin(ClaudeStreamMixin, ClaudeUsageMixin):
             # during this turn; stamped onto the terminal ASSISTANT_DONE event so
             # the app can attach them to the bot's reply message.
             turn_screenshot_assets: list[dict] = []
+            # TASK-661: snapshot the git workspaces so we can report exactly
+            # what this turn changed. Published just before run_done on every
+            # exit path below (the app persists it before turn_complete).
+            changed_file_tracker = await self._arm_changed_file_tracker()
 
             try:
                 # Inject MCP tool context so Claude passes the right identifiers.
@@ -917,6 +921,12 @@ class ClaudeSendMixin(ClaudeStreamMixin, ClaudeUsageMixin):
                         except Exception:
                             logger.debug("Failed to publish ASSISTANT_DONE on cancel", exc_info=True)
                         try:
+                            seq = await self._publish_changed_files(
+                                changed_file_tracker,
+                                request_id=request_id,
+                                session_key=session_key,
+                                seq=seq,
+                            )
                             self._publisher.publish_run_done(request_id)
                         except Exception:
                             logger.debug("Failed to publish run_done on cancel", exc_info=True)
@@ -1001,6 +1011,12 @@ class ClaudeSendMixin(ClaudeStreamMixin, ClaudeUsageMixin):
                                     "sdk_client.disconnect() raised", exc_info=True,
                                 )
 
+                seq = await self._publish_changed_files(
+                    changed_file_tracker,
+                    request_id=request_id,
+                    session_key=session_key,
+                    seq=seq,
+                )
                 self._publisher.publish_run_done(request_id)
                 if aborted:
                     logger.info(
@@ -1024,6 +1040,12 @@ class ClaudeSendMixin(ClaudeStreamMixin, ClaudeUsageMixin):
                     request_id, session_key, seq,
                     kind=AgentEventKind.ERROR,
                     text=_classify_send_error(str(e)),
+                )
+                seq = await self._publish_changed_files(
+                    changed_file_tracker,
+                    request_id=request_id,
+                    session_key=session_key,
+                    seq=seq,
                 )
                 self._publisher.publish_run_done(request_id)
             finally:

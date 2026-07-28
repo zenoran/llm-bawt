@@ -183,6 +183,7 @@ class AgentBridgeBackend(AgentBackend):
                     from agent_bridge.subscriber import RedisSubscriber
                     local_sub = RedisSubscriber(redis_url)
                     await local_sub.connect()
+                    pending_error: RuntimeError | None = None
                     try:
                         await local_sub.send_command(
                             session_key=session_key,
@@ -515,10 +516,35 @@ class AgentBridgeBackend(AgentBackend):
                                     "trigger_message_id": event.trigger_message_id,
                                 })
 
+                            elif event.kind == AgentEventKind.CHANGED_FILES:
+                                # TASK-661: the bridge git-diffed its workspaces
+                                # for this turn (the app can't — it doesn't mount
+                                # them). Forward the manifest so the worker can
+                                # persist it before publishing turn_complete.
+                                meta = event.raw if isinstance(event.raw, dict) else {}
+                                files = meta.get("files")
+                                if isinstance(files, list) and files:
+                                    result_queue.put({
+                                        "event": "changed_files",
+                                        "files": files,
+                                        "overlapping_repos": meta.get("overlapping_repos") or [],
+                                        "truncated": bool(meta.get("truncated")),
+                                        "trigger_message_id": event.trigger_message_id,
+                                    })
+
                             elif event.kind == AgentEventKind.ERROR:
-                                raise RuntimeError(f"{self.name} error: {event.text}")
+                                # Do not abort the run subscription immediately.
+                                # Bridges may publish terminal metadata (notably
+                                # CHANGED_FILES) after ERROR but before run_done.
+                                # Remember the failure, drain the run stream, then
+                                # raise so that metadata is persisted first.
+                                pending_error = RuntimeError(
+                                    f"{self.name} error: {event.text}"
+                                )
                     finally:
                         await local_sub.close()
+                    if pending_error is not None:
+                        raise pending_error
 
                 try:
                     asyncio.run(_worker())

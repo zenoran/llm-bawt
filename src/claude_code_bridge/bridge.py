@@ -33,6 +33,7 @@ from claude_agent_sdk.types import (
     UserMessage,
 )
 
+from agent_bridge.changed_file_lifecycle import ChangedFileLifecycleMixin
 from agent_bridge.approval import (
     ApprovalDecision,
     PolicyAction,
@@ -73,7 +74,14 @@ from .send_handler import ClaudeSendMixin
 logger = logging.getLogger(__name__)
 
 
-class ClaudeCodeBridge(ClaudeSessionMixin, ClaudeApprovalMixin, ClaudeEventMixin, ClaudeCommandMixin, ClaudeSendMixin):
+class ClaudeCodeBridge(
+    ChangedFileLifecycleMixin,
+    ClaudeSessionMixin,
+    ClaudeApprovalMixin,
+    ClaudeEventMixin,
+    ClaudeCommandMixin,
+    ClaudeSendMixin,
+):
     """Reads chat.send commands from Redis, runs them through the Claude Agent
     SDK, and publishes AgentEvent-formatted results back to Redis."""
 

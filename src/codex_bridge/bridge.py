@@ -21,6 +21,7 @@ from pathlib import Path
 from typing import Any
 
 import httpx
+from agent_bridge.changed_file_lifecycle import ChangedFileLifecycleMixin
 from agent_bridge.events import AgentEvent, AgentEventKind, synthesize_event_id
 from agent_bridge.publisher import COMMANDS_STREAM, RedisPublisher
 from agent_bridge.session_queue import SessionQueue
@@ -48,7 +49,12 @@ logger = logging.getLogger(__name__)
 # --- Bridge -----------------------------------------------------------------
 
 
-class CodexBridge(CodexSessionMixin, CodexCommandMixin, CodexEventMixin):
+class CodexBridge(
+    ChangedFileLifecycleMixin,
+    CodexSessionMixin,
+    CodexCommandMixin,
+    CodexEventMixin,
+):
     """Reads chat.send commands from Redis, runs them through the Codex
     SDK, and publishes AgentEvent-formatted results back to Redis."""
 

@@ -164,6 +164,9 @@ class TurnLogStore:
             return
         SQLModel.metadata.create_all(self.engine, tables=[TurnLog.__table__])
         ToolCallStore(self.engine).ensure_schema()
+        # TASK-661: per-turn changed-file tracking shares the turn_logs lifecycle.
+        from .changed_files_store import ChangedFilesStore
+        ChangedFilesStore(self.engine).ensure_schema()
         # Add columns that may not exist on older tables.
         with self.engine.connect() as conn:
             try:
@@ -827,6 +830,55 @@ class TurnLogStore:
             payload=ToolResultPayload.from_value(result),
             ended_at=ended_at,
             is_error=is_error,
+        )
+
+    # ---- Changed files (TASK-661) ----
+
+    def _changed_files_store(self):
+        from .changed_files_store import ChangedFilesStore
+        return ChangedFilesStore(self.engine)
+
+    def save_changed_files(
+        self,
+        *,
+        turn_id: str,
+        bot_id: str | None,
+        user_id: str | None,
+        trigger_message_id: str | None,
+        files: list,
+    ) -> int:
+        """Persist a turn's changed files (list of ChangedFileInput). Returns count."""
+        if self.engine is None:
+            return 0
+        return self._changed_files_store().save_turn_files(
+            turn_id=turn_id,
+            bot_id=bot_id,
+            user_id=user_id,
+            trigger_message_id=trigger_message_id,
+            files=files,
+        )
+
+    def changed_files_summary(self, turn_id: str) -> dict:
+        if self.engine is None:
+            from .changed_files_store import build_turn_summary
+            return build_turn_summary(turn_id, [])
+        return self._changed_files_store().summary_for_turn(turn_id)
+
+    def changed_files_summaries_for_triggers(self, message_ids: list[str]) -> dict:
+        if self.engine is None:
+            return {}
+        return self._changed_files_store().summaries_for_triggers(message_ids)
+
+    def changed_files_summaries_for_turns(self, turn_ids: list[str]) -> dict:
+        if self.engine is None:
+            return {}
+        return self._changed_files_store().summaries_for_turns(turn_ids)
+
+    def changed_file_content(self, *, turn_id: str, repo_key: str, path: str):
+        if self.engine is None:
+            return None
+        return self._changed_files_store().get_file_content(
+            turn_id=turn_id, repo_key=repo_key, path=path
         )
 
     def get_tool_calls_for_turn(self, turn_id: str) -> list[ToolCallRecord]:

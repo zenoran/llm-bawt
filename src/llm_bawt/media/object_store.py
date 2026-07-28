@@ -763,6 +763,7 @@ _S3_KEY_PREFIXES: dict[str, str] = {
     "media_store": "blobs/",     # chat upload variants (originals, thumb_256, preview_1024)
     "media_storage": "media/",   # generated media (videos, thumbnails, images)
     "tool_results": "toolblobs/",  # TASK-594: overflow tool-call results (content-addressed, transient)
+    "turn_diffs": "diffs/",  # TASK-661: per-turn changed-file before/after bytes (content-addressed)
 }
 
 #: Recognized values for ``LLM_BAWT_STORAGE_BACKEND``.

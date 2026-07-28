@@ -155,6 +155,59 @@ class TestTransport:
         )
         assert captured["disallowed_tools"] == ["EnterPlanMode"]
 
+    def test_agent_bridge_drains_changed_files_after_error(self, monkeypatch):
+        from agent_bridge.events import AgentEvent, AgentEventKind
+        from llm_bawt.agent_backends import agent_bridge as module
+
+        class FakeRedisSubscriber:
+            def __init__(self, _url):
+                self._redis = SimpleNamespace(
+                    connection_pool=SimpleNamespace(
+                        connection_kwargs={"url": "redis://localhost:6379/0"}
+                    )
+                )
+
+            async def connect(self):
+                return None
+
+            async def send_command(self, **_kwargs):
+                return None
+
+            async def subscribe_run(self, *_args, **_kwargs):
+                yield AgentEvent(
+                    event_id="err", session_key="s", run_id="run",
+                    kind=AgentEventKind.ERROR, origin="system", text="boom",
+                )
+                yield AgentEvent(
+                    event_id="files", session_key="s", run_id="run",
+                    kind=AgentEventKind.CHANGED_FILES, origin="system",
+                    raw={"files": [{"repo_key": "r", "path": "a.py"}]},
+                )
+
+            async def close(self):
+                return None
+
+        root_subscriber = SimpleNamespace(
+            _redis=SimpleNamespace(
+                connection_pool=SimpleNamespace(
+                    connection_kwargs={"url": "redis://localhost:6379/0"}
+                )
+            )
+        )
+        monkeypatch.setattr(module, "get_agent_subscriber", lambda: root_subscriber)
+        monkeypatch.setattr(
+            "agent_bridge.subscriber.RedisSubscriber", FakeRedisSubscriber
+        )
+
+        backend = module.AgentBridgeBackend()
+        iterator = iter(backend.stream_raw(
+            "hello", {"bot_id": "test", "timeout_seconds": 1}
+        ))
+        changed = next(iterator)
+        assert changed["event"] == "changed_files"
+        with pytest.raises(RuntimeError, match="boom"):
+            next(iterator)
+
 
 class TestClaudeBackendResolution:
     def test_claude_backend_adds_resolved_policy_before_dispatch(self):

@@ -78,6 +78,16 @@ class AgentEventKind(str, Enum):
     SUBAGENT_STARTED = "subagent_started"
     SUBAGENT_PROGRESS = "subagent_progress"
     SUBAGENT_DONE = "subagent_done"
+    # TASK-661: per-turn changed-file manifest. The app container doesn't mount
+    # the agent workspace, so only a bridge can git-diff it — this is how that
+    # capture reaches the app. Emitted from the bridge's per-turn `finally` (so
+    # it covers success, abort, failure, and deferred turns alike) BEFORE
+    # run_done, letting the app persist rows before it publishes turn_complete.
+    # ``raw`` carries {files: [...], overlapping_repos: [...], truncated: bool};
+    # each file mirrors ``changed_files_store.ChangedFileInput`` with the
+    # before/after bytes base64-encoded for JSON transport. Additive: older
+    # consumers degrade it to SYSTEM_NOTE and ignore it (see from_dict).
+    CHANGED_FILES = "changed_files"
 
 
 @dataclass

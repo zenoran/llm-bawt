@@ -23,6 +23,50 @@ from .turn_stream_publish import TurnStreamPublishMixin
 log = get_service_logger(__name__)
 
 
+def _persist_changed_files(
+    *,
+    store,
+    turn_id: str,
+    bot_id: str | None,
+    user_id: str | None,
+    trigger_message_id: str | None,
+    item: dict,
+) -> None:
+    """Persist one bridge changed-file manifest (TASK-661).
+
+    Never raises: the file list is a nice-to-have on top of the reply, so a
+    storage failure logs and the turn finishes normally.
+    """
+    try:
+        from .changed_files_store import decode_manifest_files
+
+        files = decode_manifest_files(
+            item.get("files") or [],
+            overlapping_repos=item.get("overlapping_repos") or [],
+            manifest_truncated=bool(item.get("truncated")),
+        )
+        if not files:
+            return
+        saved = store.save_changed_files(
+            turn_id=turn_id,
+            bot_id=bot_id,
+            user_id=user_id,
+            trigger_message_id=trigger_message_id,
+            files=files,
+        )
+        overlapping = item.get("overlapping_repos") or []
+        log.info(
+            "TASK-661 persisted %d changed file(s) for turn=%s%s%s",
+            saved, turn_id,
+            " [truncated]" if item.get("truncated") else "",
+            f" [overlapping: {', '.join(overlapping)}]" if overlapping else "",
+        )
+    except Exception:
+        log.warning(
+            "TASK-661 changed-file persist failed for turn=%s", turn_id, exc_info=True
+        )
+
+
 class TurnStreamWorker(TurnStreamPublishMixin):
     """Owns the worker-thread streaming + finalize for one chat turn."""
 
@@ -768,6 +812,22 @@ class TurnStreamWorker(TurnStreamPublishMixin):
                                     r for r in refs if isinstance(r, dict)
                                 )
                             continue
+                        if evt == "changed_files":
+                            # TASK-661: the bridge captured what this turn
+                            # changed on disk. Persist here — before the
+                            # turn_complete publish below reads the summary
+                            # back — so live and hard-refresh agree.
+                            _persist_changed_files(
+                                store=self._turn_log_store,
+                                turn_id=turn_log_id,
+                                bot_id=bot_id,
+                                user_id=user_id,
+                                trigger_message_id=(
+                                    item.get("trigger_message_id") or trigger_message_id
+                                ),
+                                item=item,
+                            )
+                            continue
                         if evt in ("subagent_started", "subagent_progress", "subagent_done"):
                             # TASK-344: sub-agent lifecycle events. Publish
                             # to unified stream for cross-tab visibility, then
@@ -1182,6 +1242,13 @@ class TurnStreamWorker(TurnStreamPublishMixin):
                                 turn_log_id,
                                 _tts_order_err,
                             )
+            # TASK-661: attach the canonical changed-file summary so a live turn
+            # renders file links without waiting on a history refetch. Empty when
+            # nothing was captured; never allowed to block turn_complete.
+            try:
+                changed_files = self._turn_log_store.changed_files_summary(turn_log_id)
+            except Exception:
+                changed_files = None
             _publish_event_direct({
                 "_type": "turn_complete",
                 "turn_id": turn_log_id,
@@ -1194,6 +1261,7 @@ class TurnStreamWorker(TurnStreamPublishMixin):
                 "approval_persist_failed": approval_persist_failed,
                 "animation": animation_holder[0],
                 "token_usage": token_usage_holder[0],
+                "changed_files": changed_files,
                 # Catalog alias for this turn (matches the persisted turn-log
                 # `model` and the /v1/models pricing key) so the client can
                 # cost a live turn without waiting on the turn-log backfill.

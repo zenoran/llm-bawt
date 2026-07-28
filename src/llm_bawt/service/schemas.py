@@ -382,6 +382,11 @@ class TurnLogListItem(BaseModel):
     # ended with end_reason="question" — lets the UI render a QuestionMessage
     # straight from history hydration without a second fetch.
     question: dict[str, Any] | None = None
+    # TASK-661: per-turn changed-file summary (same shape the live
+    # turn_complete.changed_files event carries). None/omitted when the turn
+    # changed no files. Lets the chat UI hydrate file links on refresh via the
+    # existing turn-log backfill graft.
+    changed_files: dict[str, Any] | None = None
 
 
 class TurnLogListResponse(BaseModel):
