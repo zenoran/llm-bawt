@@ -593,4 +593,3 @@ class _ContentBudget:
             return False
         self.remaining -= size
         return True
-
