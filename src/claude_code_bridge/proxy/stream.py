@@ -74,6 +74,23 @@ def _ping() -> bytes:
     return _sse("ping", {"type": "ping"})
 
 
+def _stream_error_type(exc: BaseException) -> str:
+    """Map a mid-stream failure onto a canonical Anthropic error type.
+
+    Only types in Anthropic's canonical set are recognized by the Claude CLI's
+    retry classifier; anything else ends the turn outright. Transient upstream
+    faults (the provider accepted the request, then injected an error into the
+    already-committed SSE body — which ``AsyncOpenAI(max_retries=...)`` cannot
+    cover, since retries only guard the initial request) are reported as
+    ``overloaded_error`` so the CLI retries. A genuine bug in our own
+    translation logic is reported as ``api_error``.
+    """
+    module = type(exc).__module__.split(".", 1)[0]
+    if module in ("openai", "httpx", "httpcore") or isinstance(exc, (OSError, TimeoutError)):
+        return "overloaded_error"
+    return "api_error"
+
+
 # Responses ``status`` / ``incomplete reason`` → Anthropic stop_reason.
 _STOP_REASON_MAP = {
     "stop": "end_turn",
@@ -577,12 +594,18 @@ async def responses_to_anthropic_sse(
                 yield _stop_frame(open_block["index"])
             except Exception:  # noqa: BLE001
                 pass
+        # The error `type` MUST come from Anthropic's canonical set — the
+        # Claude CLI switches on it to decide retryability (it matches the
+        # literal `"type":"overloaded_error"` substring to classify a
+        # retryable server overload). A non-canonical type matches no branch,
+        # so the CLI treats the turn as terminally failed and stops mid-work.
+        # See errors.py for the same contract on the non-streaming path.
         yield _sse(
             "error",
             {
                 "type": "error",
                 "error": {
-                    "type": "proxy_stream_error",
+                    "type": _stream_error_type(exc),
                     "message": f"Proxy stream translation failed: {exc}",
                 },
             },
