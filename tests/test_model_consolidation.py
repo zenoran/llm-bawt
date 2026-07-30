@@ -10,6 +10,9 @@ Covers:
 
 from types import SimpleNamespace
 
+import pytest
+from fastapi import HTTPException
+
 from llm_bawt.bot_types import agent_backend_for_model_def
 from llm_bawt.model_catalog import (
     AccessPath,
@@ -20,6 +23,7 @@ from llm_bawt.model_catalog import (
 )
 from llm_bawt.service.core import ServiceLLMBawt
 from llm_bawt.service.instance_manager import InstanceManagerMixin
+from llm_bawt.service.routes import bot_profile_validation as validation
 
 
 # ---------------------------------------------------------------------------
@@ -380,12 +384,6 @@ def test_resolve_openclaw_bot_keeps_virtual_alias(monkeypatch):
 # settings-route config-time validation — normalized endpoint model (TASK-616)
 # ---------------------------------------------------------------------------
 
-import pytest
-from fastapi import HTTPException
-
-from llm_bawt.service.routes import bot_profile_validation as validation
-
-
 def _validation_catalog():
     """Catalog with one endpoint per harness family for validation tests."""
     anthropic = ModelEndpoint(
@@ -479,13 +477,35 @@ def test_validate_unknown_endpoint_422(monkeypatch):
 
 def test_validate_incompatible_harness_422(monkeypatch):
     _patch_catalog(monkeypatch, _validation_catalog())
-    # endpoint 20 is a codex/responses endpoint; claude-code needs
-    # anthropic-messages, so the harness/endpoint pair is rejected.
+    # endpoint 10 is Anthropic Messages; the chat harness needs
+    # chat-completions and has no sibling to fall back to, so it's rejected.
     with pytest.raises(HTTPException) as exc:
         validation._validate_model_endpoint(
-            {"slug": "loopy", "harness": "claude-code", "endpoint_id": 20}
+            {"slug": "mira", "harness": "chat", "endpoint_id": 10}
         )
     assert exc.value.status_code == 422
+
+
+def test_validate_claude_harness_heals_to_proxy(monkeypatch):
+    _patch_catalog(monkeypatch, _validation_catalog())
+    # Picking a non-Anthropic model on a native Claude bot is a routing
+    # change, not a reconfiguration: the harness flips to claude-proxy so the
+    # bridge tunnels the turn through the Anthropic-compat proxy.
+    payload = {"slug": "snark", "harness": "claude-code", "endpoint_id": 20}
+    validation._validate_model_endpoint(payload)
+    assert payload["harness"] == "claude-proxy"
+    assert payload["agent_backend"] == "claude-code"
+    assert payload["default_model"] == "gpt-5-5"
+
+
+def test_validate_claude_harness_heals_to_native(monkeypatch):
+    _patch_catalog(monkeypatch, _validation_catalog())
+    # ...and back: a proxy bot picking real Claude drops to the native path.
+    payload = {"slug": "nova", "harness": "claude-proxy", "endpoint_id": 10}
+    validation._validate_model_endpoint(payload)
+    assert payload["harness"] == "claude-code"
+    assert payload["agent_backend"] == "claude-code"
+    assert payload["default_model"] == "opus-4-7"
 
 
 def test_validate_claude_code_sets_backend(monkeypatch):

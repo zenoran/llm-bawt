@@ -114,6 +114,20 @@ def _normalize_agent_backend_config_model(
     payload["agent_backend_config"] = config
 
 
+#: The Claude Code harness drives BOTH native Anthropic endpoints
+#: (``claude-code``) and third-party ones tunnelled through the bridge's
+#: Anthropic-compat proxy (``claude-proxy``). Same SDK, same bridge, same
+#: session store — ``send_stream._build_sdk_env`` picks native-vs-proxy per
+#: turn from the resolved model string alone. So the pair is a routing
+#: DETAIL of the chosen endpoint, not an independent user setting: when a
+#: caller changes only the endpoint, heal the harness to its sibling instead
+#: of rejecting the write (the DB trigger would reject it too).
+_CLAUDE_HARNESS_SIBLING = {
+    "claude-code": "claude-proxy",
+    "claude-proxy": "claude-code",
+}
+
+
 def _validate_model_endpoint(payload: dict[str, object]) -> None:
     """Validate and canonicalize the bot's normalized model assignment."""
     from ...model_catalog import (
@@ -145,18 +159,31 @@ def _validate_model_endpoint(payload: dict[str, object]) -> None:
     catalog = service.config.ensure_model_catalog()
     if catalog is None:
         raise HTTPException(status_code=503, detail="Model catalog unavailable")
+    # Resolve by id WITHOUT the harness filter: an int ref is unambiguous, so
+    # the harness would only gate compatibility — which is checked (and, for
+    # the Claude pair, healed) explicitly below.
     try:
-        endpoint = catalog.resolve_endpoint(endpoint_id, harness=harness)
+        endpoint = catalog.resolve_endpoint(endpoint_id)
     except ModelNotFoundError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
-    except IncompatibleModelError as exc:
+    except IncompatibleModelError as exc:  # pragma: no cover - defensive
         raise HTTPException(status_code=422, detail=str(exc)) from exc
 
     if not ProtocolCompatibility.is_compatible(harness, endpoint.access_path):
-        raise HTTPException(
-            status_code=422,
-            detail=f"endpoint_id={endpoint_id} is incompatible with harness={harness}",
-        )
+        sibling = _CLAUDE_HARNESS_SIBLING.get(harness)
+        if sibling and ProtocolCompatibility.is_compatible(sibling, endpoint.access_path):
+            logger.info(
+                "bot %s: endpoint %s is %s — switching harness %s -> %s",
+                payload.get("slug"), endpoint_id, endpoint.access_path.key,
+                harness, sibling,
+            )
+            harness = sibling
+            payload["harness"] = sibling
+        else:
+            raise HTTPException(
+                status_code=422,
+                detail=f"endpoint_id={endpoint_id} is incompatible with harness={harness}",
+            )
 
     expected_backend = {
         "chat": None,
