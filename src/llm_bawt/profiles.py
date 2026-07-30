@@ -17,6 +17,7 @@ from urllib.parse import quote_plus
 from pydantic import ConfigDict
 from sqlalchemy import Column, JSON, text
 from sqlmodel import Field, Session, SQLModel, create_engine, select
+from .utils.schema import SchemaBootstrapGuard
 
 logger = logging.getLogger(__name__)
 
@@ -111,6 +112,8 @@ class ProfileManager:
     ``llm_bawt.service.dependencies.get_profile_manager``).
     """
 
+    _schema_guard = SchemaBootstrapGuard()
+
     def __init__(self, config: Any):
         self.config = config
         from .utils.db import get_shared_engine
@@ -130,9 +133,11 @@ class ProfileManager:
     
     def _ensure_tables_exist(self) -> None:
         """Create tables if they don't exist, and run incremental column migrations."""
-        SQLModel.metadata.create_all(self.engine)
-
-        with self.engine.connect() as conn:
+        def bootstrap(conn) -> None:
+            SQLModel.metadata.create_all(
+                bind=conn,
+                tables=[EntityProfile.__table__, ProfileAttribute.__table__],
+            )
             # ---- column migrations (idempotent) ----
             conn.execute(text("""
                 ALTER TABLE entity_profiles
@@ -157,9 +162,8 @@ class ProfileManager:
                 CREATE UNIQUE INDEX IF NOT EXISTS idx_entity_profile_unique 
                 ON entity_profiles (entity_type, entity_id)
             """))
-            conn.commit()
 
-        logger.debug("Ensured profile tables exist")
+        self._schema_guard.run(self.engine, "profile-manager", bootstrap)
     
     # =========================================================================
     # Profile CRUD

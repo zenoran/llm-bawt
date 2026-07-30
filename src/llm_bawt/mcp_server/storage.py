@@ -11,6 +11,7 @@ The actual implementation delegates to the battle-tested postgresql.py backend.
 from __future__ import annotations
 
 import logging
+import threading
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -86,20 +87,26 @@ class MemoryStorage:
     Each bot_id gets isolated tables automatically.
     """
 
-    _backends: dict[str, PostgreSQLMemoryBackend] = {}
-    _short_term_managers: dict[str, "PostgreSQLShortTermManager"] = {}
-
     def __init__(self, config: Config | None = None):
         self.config = config or Config()
+        self._backends: dict[str, PostgreSQLMemoryBackend] = {}
+        self._short_term_managers: dict[str, "PostgreSQLShortTermManager"] = {}
+        self._cache_lock = threading.Lock()
 
     def _get_backend(self, bot_id: str) -> PostgreSQLMemoryBackend:
         """Get or create a backend for the given bot."""
-        if bot_id not in self._backends:
+        cached = self._backends.get(bot_id)
+        if cached is not None:
+            return cached
+        with self._cache_lock:
+            cached = self._backends.get(bot_id)
+            if cached is not None:
+                return cached
             self._backends[bot_id] = PostgreSQLMemoryBackend(
                 config=self.config,
                 bot_id=bot_id,
             )
-        return self._backends[bot_id]
+            return self._backends[bot_id]
 
     def get_backend(self, bot_id: str) -> PostgreSQLMemoryBackend:
         """Public access to get or create a backend for the given bot.
@@ -113,13 +120,19 @@ class MemoryStorage:
         
         The short-term manager handles session messages for HistoryManager.
         """
-        if bot_id not in self._short_term_managers:
+        cached = self._short_term_managers.get(bot_id)
+        if cached is not None:
+            return cached
+        with self._cache_lock:
+            cached = self._short_term_managers.get(bot_id)
+            if cached is not None:
+                return cached
             from llm_bawt.memory.postgresql import PostgreSQLShortTermManager
             self._short_term_managers[bot_id] = PostgreSQLShortTermManager(
                 config=self.config,
                 bot_id=bot_id,
             )
-        return self._short_term_managers[bot_id]
+            return self._short_term_managers[bot_id]
 
     # =========================================================================
     # Memory Operations
@@ -835,7 +848,11 @@ class MemoryStorage:
                 return int(getattr(res, "rowcount", 0) or 0)
         except Exception as e:
             logger.error("Failed to clear messages: %s", e)
-            return 0
+            raise
+
+    async def clear_memories(self, bot_id: str = "default") -> bool:
+        """Delete all distilled memories for a bot through its cached backend."""
+        return bool(self._get_backend(bot_id).clear())
 
     async def remove_last_message_if_partial(self, bot_id: str = "default", role: str = "assistant") -> bool:
         """Remove the most recent message if it matches role."""
@@ -1503,11 +1520,16 @@ class MemoryStorage:
 
 # Singleton instance
 _storage: MemoryStorage | None = None
+_storage_lock = threading.Lock()
 
 
 def get_storage() -> MemoryStorage:
     """Get the singleton storage instance."""
     global _storage
-    if _storage is None:
-        _storage = MemoryStorage()
-    return _storage
+    cached = _storage
+    if cached is not None:
+        return cached
+    with _storage_lock:
+        if _storage is None:
+            _storage = MemoryStorage()
+        return _storage

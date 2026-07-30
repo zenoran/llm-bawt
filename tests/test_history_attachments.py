@@ -95,9 +95,8 @@ class FakeService:
     def __init__(self, client: FakeMemoryClient, *, default_bot: str = "nova"):
         self._client = client
         self._default_bot = default_bot
-        # ``MediaAssetStore(service.config)`` is invoked by the route, but
-        # we monkeypatch the constructor in fixtures below — config itself
-        # never gets touched.
+        # The cached media accessor is patched in fixtures below, so config
+        # itself is never inspected.
         self.config = object()
 
     def get_memory_client(self, bot_id: str | None = None) -> FakeMemoryClient:
@@ -148,10 +147,9 @@ def app_factory(monkeypatch):
 
         fake_store = FakeMediaAssetStore(asset_rows or {})
 
-        # The route imports MediaAssetStore lazily inside the helper, so
-        # we patch the module it's imported from.
         monkeypatch.setattr(
-            "llm_bawt.media.assets.MediaAssetStore",
+            history_routes,
+            "get_media_asset_store",
             lambda *a, **kw: fake_store,
         )
 

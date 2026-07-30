@@ -5,9 +5,13 @@ from contextlib import asynccontextmanager
 
 from ..utils.config import Config
 from .background_service import BackgroundService, _ensure_mcp_server
-from .dependencies import get_service, set_service
+from .dependencies import (
+    get_media_asset_store,
+    get_media_generation_store,
+    get_profile_manager,
+    set_service,
+)
 from .logging import get_service_logger, setup_service_logging
-from .schemas import ChatCompletionRequest, ChatMessage
 
 log = get_service_logger(__name__)
 
@@ -53,8 +57,7 @@ async def lifespan(app):
 
     # Ensure media_generations table exists
     try:
-        from ..media.db import MediaGenerationStore
-        _media_store = MediaGenerationStore(config)
+        get_media_generation_store(config)
         log.info("media_generations table ready")
     except Exception as e:
         log.warning("Failed to initialise media_generations table: %s", e)
@@ -64,8 +67,7 @@ async def lifespan(app):
     # generation jobs; this one is the canonical registry for normalized
     # chat-upload / tool-output / agent-attachment blobs).
     try:
-        from ..media.assets import MediaAssetStore
-        _media_asset_store = MediaAssetStore(config)
+        get_media_asset_store(config)
         log.info("media_assets table ready")
     except Exception as e:
         log.warning("Failed to initialise media_assets table: %s", e)
@@ -96,11 +98,10 @@ async def lifespan(app):
     # Start job scheduler if enabled
     scheduler = None
     if config.SCHEDULER_ENABLED:
-        from ..profiles import ProfileManager
         from .scheduler import JobScheduler, create_scheduler_tables, init_default_jobs
 
         # Get engine from profile manager (reuse existing connection)
-        pm = ProfileManager(config)
+        pm = get_profile_manager(config)
         create_scheduler_tables(pm.engine)
         init_default_jobs(pm.engine, config)
 

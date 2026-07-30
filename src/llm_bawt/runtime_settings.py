@@ -19,6 +19,7 @@ from sqlalchemy.dialects.postgresql import JSONB
 from sqlmodel import Field, Session, SQLModel, create_engine, select
 
 from .utils.config import Config, has_database_credentials
+from .utils.schema import SchemaBootstrapGuard
 from .bot_types import normalize_bot_type
 
 if TYPE_CHECKING:
@@ -104,6 +105,8 @@ class BotProfile(SQLModel, table=True):
 class BotProfileStore:
     """DB access for bot personality profiles."""
 
+    _schema_guard = SchemaBootstrapGuard()
+
     def __init__(self, config: Config):
         self.config = config
         self.engine = None
@@ -123,16 +126,14 @@ class BotProfileStore:
     def _ensure_tables_exist(self) -> None:
         if self.engine is None:
             return
-        SQLModel.metadata.create_all(self.engine, tables=[BotProfile.__table__])
-        # Add columns that may be missing on older schemas
-        self._migrate_add_columns()
+        def bootstrap(conn) -> None:
+            SQLModel.metadata.create_all(bind=conn, tables=[BotProfile.__table__])
+            self._migrate_add_columns(conn)
 
-    def _migrate_add_columns(self) -> None:
+        self._schema_guard.run(self.engine, "bot-profile-store", bootstrap)
+
+    def _migrate_add_columns(self, conn) -> None:
         """Add columns introduced after initial schema creation."""
-        if self.engine is None:
-            return
-        from sqlalchemy import text
-
         migrations = [
             "ALTER TABLE bot_profiles ADD COLUMN IF NOT EXISTS color VARCHAR(64)",
             "ALTER TABLE bot_profiles ADD COLUMN IF NOT EXISTS bot_type VARCHAR(32)",
@@ -146,13 +147,8 @@ class BotProfileStore:
             "ALTER TABLE bot_profiles ADD COLUMN IF NOT EXISTS avatar_render TEXT",
             "ALTER TABLE bot_profiles ADD COLUMN IF NOT EXISTS prompt_override_id INTEGER",
         ]
-        try:
-            with self.engine.connect() as conn:
-                for stmt in migrations:
-                    conn.execute(text(stmt))
-                conn.commit()
-        except Exception as e:
-            logger.debug("Column migration skipped: %s", e)
+        for stmt in migrations:
+            conn.execute(text(stmt))
 
     def get(self, slug: str) -> BotProfile | None:
         if self.engine is None:
@@ -660,6 +656,8 @@ def cleanup_orphaned_bot_data(config: Config, dry_run: bool = False) -> dict[str
 class RuntimeSettingsStore:
     """Low-level DB access for runtime settings."""
 
+    _schema_guard = SchemaBootstrapGuard()
+
     def __init__(self, config: Config):
         self.config = config
         self.engine = None
@@ -685,11 +683,11 @@ class RuntimeSettingsStore:
     def _ensure_tables_exist(self) -> None:
         if self.engine is None:
             return
-        SQLModel.metadata.create_all(
-            self.engine,
-            tables=[RuntimeSetting.__table__, BotProfile.__table__],
-        )
-        with self.engine.connect() as conn:
+        def bootstrap(conn) -> None:
+            SQLModel.metadata.create_all(
+                bind=conn,
+                tables=[RuntimeSetting.__table__, BotProfile.__table__],
+            )
             conn.execute(
                 text(
                     """
@@ -698,7 +696,8 @@ class RuntimeSettingsStore:
                     """
                 )
             )
-            conn.commit()
+
+        self._schema_guard.run(self.engine, "runtime-settings-store", bootstrap)
 
     def get_scope_settings(self, scope_type: str, scope_id: str) -> dict[str, Any]:
         """Return all settings for a scope."""

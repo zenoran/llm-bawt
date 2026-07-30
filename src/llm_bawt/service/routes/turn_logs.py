@@ -7,7 +7,7 @@ from fastapi.responses import Response
 from sqlalchemy import func
 from sqlmodel import Session, select
 
-from ..dependencies import get_service
+from ..dependencies import get_service, get_turn_log_store
 from ..schemas import (
     RecentBotTurn,
     RecentByBotsResponse,
@@ -216,7 +216,7 @@ def list_turn_logs(
 ):
     """List persisted turn logs (24h TTL by default)."""
     service = get_service()
-    store = TurnLogStore(service.config)
+    store = get_turn_log_store()
     if store.engine is None:
         raise HTTPException(status_code=503, detail="Turn logs DB unavailable")
 
@@ -361,8 +361,7 @@ def recent_turns_by_bot(
     from the response — callers detect "no activity" by checking which slugs
     are missing from the returned ``turns`` list.
     """
-    service = get_service()
-    store = TurnLogStore(service.config)
+    store = get_turn_log_store()
     if store.engine is None:
         raise HTTPException(status_code=503, detail="Turn logs DB unavailable")
 
@@ -429,8 +428,7 @@ def bot_in_turn(
     inside the window — the same single source of truth for streaming and
     non-streaming, local and agent-backend turns.
     """
-    service = get_service()
-    store = TurnLogStore(service.config)
+    store = get_turn_log_store()
     if store.engine is None:
         raise HTTPException(status_code=503, detail="Turn logs DB unavailable")
 
@@ -480,7 +478,7 @@ async def bot_latest_activity(
 def get_turn_log(turn_id: str):
     """Get one persisted turn log by ID."""
     service = get_service()
-    store = TurnLogStore(service.config)
+    store = get_turn_log_store()
     if store.engine is None:
         raise HTTPException(status_code=503, detail="Turn logs DB unavailable")
 
@@ -548,8 +546,7 @@ def get_tool_call_events(
     limit: int = Query(200, ge=1, le=1000, description="Max tool-call events to return"),
 ):
     """List tool-call events keyed by trigger message ID for history annotation."""
-    service = get_service()
-    store = TurnLogStore(service.config)
+    store = get_turn_log_store()
     if store.engine is None:
         raise HTTPException(status_code=503, detail="Turn logs DB unavailable")
 

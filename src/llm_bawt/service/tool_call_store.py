@@ -18,6 +18,7 @@ from sqlalchemy import BigInteger, Boolean, Column, DateTime, Float, Integer, St
 from sqlmodel import Field, SQLModel, Session, select
 
 from agent_bridge.tool_results import ToolResultPayload
+from ..utils.schema import SchemaBootstrapGuard
 
 if TYPE_CHECKING:
     from ..media.object_store import BlobBackend
@@ -152,32 +153,40 @@ class ToolResultBlob:
 
 
 class ToolCallStore:
+    _schema_guard = SchemaBootstrapGuard()
+
     def __init__(self, engine) -> None:
         self.engine = engine
 
     def ensure_schema(self) -> None:
         if self.engine is None:
             return
-        SQLModel.metadata.create_all(
-            self.engine,
-            tables=[ToolCallRecord.__table__, ToolCallResultPayloadRecord.__table__],
-        )
-        statements = (
-            "ALTER TABLE tool_call_records ADD COLUMN IF NOT EXISTS result_total_chars INTEGER",
-            "ALTER TABLE tool_call_records ADD COLUMN IF NOT EXISTS result_total_bytes BIGINT",
-            "ALTER TABLE tool_call_records ADD COLUMN IF NOT EXISTS result_sha256 VARCHAR(64)",
-            "ALTER TABLE tool_call_records ADD COLUMN IF NOT EXISTS result_content_type VARCHAR(128)",
-            "ALTER TABLE tool_call_records ADD COLUMN IF NOT EXISTS result_complete BOOLEAN",
-            "ALTER TABLE tool_call_records ADD COLUMN IF NOT EXISTS result_payload_available BOOLEAN NOT NULL DEFAULT FALSE",
-            # TASK-594: object-store key for overflow tool-result bytes.
-            "ALTER TABLE tool_call_records ADD COLUMN IF NOT EXISTS result_blob_key VARCHAR(128)",
-            "CREATE INDEX IF NOT EXISTS ix_tool_call_records_turn_call ON tool_call_records (turn_id, call_id)",
-            # TASK-594: content-addressed lookup for the TTL prune keep-set.
-            "CREATE INDEX IF NOT EXISTS ix_tool_call_records_blob_key ON tool_call_records (result_blob_key)",
-        )
-        with self.engine.begin() as conn:
+
+        def bootstrap(conn) -> None:
+            SQLModel.metadata.create_all(
+                bind=conn,
+                tables=[
+                    ToolCallRecord.__table__,
+                    ToolCallResultPayloadRecord.__table__,
+                ],
+            )
+            statements = (
+                "ALTER TABLE tool_call_records ADD COLUMN IF NOT EXISTS result_total_chars INTEGER",
+                "ALTER TABLE tool_call_records ADD COLUMN IF NOT EXISTS result_total_bytes BIGINT",
+                "ALTER TABLE tool_call_records ADD COLUMN IF NOT EXISTS result_sha256 VARCHAR(64)",
+                "ALTER TABLE tool_call_records ADD COLUMN IF NOT EXISTS result_content_type VARCHAR(128)",
+                "ALTER TABLE tool_call_records ADD COLUMN IF NOT EXISTS result_complete BOOLEAN",
+                "ALTER TABLE tool_call_records ADD COLUMN IF NOT EXISTS result_payload_available BOOLEAN NOT NULL DEFAULT FALSE",
+                # TASK-594: object-store key for overflow tool-result bytes.
+                "ALTER TABLE tool_call_records ADD COLUMN IF NOT EXISTS result_blob_key VARCHAR(128)",
+                "CREATE INDEX IF NOT EXISTS ix_tool_call_records_turn_call ON tool_call_records (turn_id, call_id)",
+                # TASK-594: content-addressed lookup for the TTL prune keep-set.
+                "CREATE INDEX IF NOT EXISTS ix_tool_call_records_blob_key ON tool_call_records (result_blob_key)",
+            )
             for statement in statements:
                 conn.execute(sa_text(statement))
+
+        self._schema_guard.run(self.engine, "tool-call-store", bootstrap)
 
     def save_start(
         self,

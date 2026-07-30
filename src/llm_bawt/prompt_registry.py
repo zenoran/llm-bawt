@@ -14,6 +14,7 @@ from sqlalchemy import Column, DateTime, String, Text, UniqueConstraint
 from sqlmodel import Field, SQLModel, Session, create_engine, select
 
 from .utils.config import Config, has_database_credentials
+from .utils.schema import SchemaBootstrapGuard
 
 logger = logging.getLogger(__name__)
 
@@ -613,6 +614,7 @@ class PromptTemplateStore:
     """Database access for prompt templates."""
 
     _seeded_urls: set[str] = set()
+    _schema_guard = SchemaBootstrapGuard()
 
     def __init__(self, config: Config):
         self.config = config
@@ -641,10 +643,16 @@ class PromptTemplateStore:
     def _ensure_tables_exist(self) -> None:
         if self.engine is None:
             return
-        SQLModel.metadata.create_all(
-            self.engine,
-            tables=[PromptTemplate.__table__, PromptTemplateVersion.__table__],
-        )
+        def bootstrap(conn) -> None:
+            SQLModel.metadata.create_all(
+                bind=conn,
+                tables=[
+                    PromptTemplate.__table__,
+                    PromptTemplateVersion.__table__,
+                ],
+            )
+
+        self._schema_guard.run(self.engine, "prompt-template-store", bootstrap)
 
     def _seed_defaults_once(self) -> None:
         if self.engine is None or not self.connection_url:

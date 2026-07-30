@@ -137,8 +137,9 @@ class BackgroundService(
         self._generation_done: threading.Event | None = None  # Signals when generation finishes
         self._cancel_lock = threading.Lock()
 
-        # Memory client cache keyed by bot_id
-        self._memory_clients: dict[tuple[str, str], Any] = {}
+        # Memory client cache keyed by (bot_id, user_id).
+        self._memory_clients: dict[tuple[str, str | None], Any] = {}
+        self._memory_clients_lock = threading.Lock()
         from .turn_logs import TurnLogStore
         self._turn_log_store = TurnLogStore(config)
         # Persistent registry of in-flight AskUserQuestion pauses.  Lets the

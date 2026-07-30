@@ -280,7 +280,13 @@ class InstanceManagerMixin:
         """Get or create memory client for a bot/user pair."""
         cache_key = (bot_id, user_id)
 
-        if cache_key not in self._memory_clients:
+        cached = self._memory_clients.get(cache_key)
+        if cache_key in self._memory_clients:
+            return cached
+
+        with self._memory_clients_lock:
+            if cache_key in self._memory_clients:
+                return self._memory_clients[cache_key]
             try:
                 from ..mcp_server.client import get_memory_client
                 self._memory_clients[cache_key] = get_memory_client(
@@ -293,7 +299,7 @@ class InstanceManagerMixin:
             except Exception as e:
                 log.warning(f"Memory client unavailable for {bot_id}: {e}")
                 self._memory_clients[cache_key] = None
-        return self._memory_clients.get(cache_key)
+            return self._memory_clients[cache_key]
 
     def _get_llm_bawt(self, model_alias: str, bot_id: str, user_id: str, local_mode: bool = False):
         """Get or create an LLMBawt instance with caching.

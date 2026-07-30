@@ -16,7 +16,11 @@ import time
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field
 
-from ..dependencies import get_service, get_tool_approval_policy_store
+from ..dependencies import (
+    get_service,
+    get_tool_approval_policy_store,
+    get_turn_log_store,
+)
 from ...approval_policies import (
     REQ_APPROVED,
     REQ_CANCELLED,
@@ -236,8 +240,7 @@ async def resolve_approval(request_id: str, body: ResolveRequest):
 
     # TASK-305: stamp the tool_call_record so the approval card survives reload.
     try:
-        from ..turn_logs import TurnLogStore
-        turn_log_store = TurnLogStore(get_service().config)
+        turn_log_store = get_turn_log_store()
         turn_log_store.set_approval_status(
             tool_use_id=request_id,  # approval request id == gated call's tool_use_id
             approval_request_id=request_id,

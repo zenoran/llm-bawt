@@ -47,6 +47,7 @@ from sqlalchemy import (
     text as sa_text,
 )
 from sqlmodel import Field, SQLModel, Session, select
+from ..utils.schema import SchemaBootstrapGuard
 
 if TYPE_CHECKING:
     from ..media.object_store import BlobBackend
@@ -338,6 +339,8 @@ class FileContent:
 class ChangedFilesStore:
     """DB access + blob offload for per-turn changed files."""
 
+    _schema_guard = SchemaBootstrapGuard()
+
     def __init__(self, engine: Any):
         self.engine = engine
 
@@ -346,31 +349,30 @@ class ChangedFilesStore:
     def ensure_schema(self) -> None:
         if self.engine is None:
             return
-        SQLModel.metadata.create_all(
-            self.engine,
-            tables=[TurnChangedFile.__table__, TurnDiffPayloadRecord.__table__],
-        )
-        with self.engine.connect() as conn:
-            try:
-                conn.execute(sa_text(
-                    "CREATE UNIQUE INDEX IF NOT EXISTS ux_turn_changed_files_turn_repo_path"
-                    " ON turn_changed_files (turn_id, repo_key, path)"
-                ))
-                conn.execute(sa_text(
-                    "CREATE INDEX IF NOT EXISTS ix_turn_changed_files_owner_created"
-                    " ON turn_changed_files (bot_id, user_id, created_at)"
-                ))
-                conn.execute(sa_text(
-                    "ALTER TABLE turn_changed_files ADD COLUMN IF NOT EXISTS"
-                    " overlapping BOOLEAN NOT NULL DEFAULT FALSE"
-                ))
-                conn.execute(sa_text(
-                    "ALTER TABLE turn_changed_files ADD COLUMN IF NOT EXISTS"
-                    " manifest_truncated BOOLEAN NOT NULL DEFAULT FALSE"
-                ))
-                conn.commit()
-            except Exception:
-                pass
+
+        def bootstrap(conn) -> None:
+            SQLModel.metadata.create_all(
+                bind=conn,
+                tables=[TurnChangedFile.__table__, TurnDiffPayloadRecord.__table__],
+            )
+            conn.execute(sa_text(
+                "CREATE UNIQUE INDEX IF NOT EXISTS ux_turn_changed_files_turn_repo_path"
+                " ON turn_changed_files (turn_id, repo_key, path)"
+            ))
+            conn.execute(sa_text(
+                "CREATE INDEX IF NOT EXISTS ix_turn_changed_files_owner_created"
+                " ON turn_changed_files (bot_id, user_id, created_at)"
+            ))
+            conn.execute(sa_text(
+                "ALTER TABLE turn_changed_files ADD COLUMN IF NOT EXISTS"
+                " overlapping BOOLEAN NOT NULL DEFAULT FALSE"
+            ))
+            conn.execute(sa_text(
+                "ALTER TABLE turn_changed_files ADD COLUMN IF NOT EXISTS"
+                " manifest_truncated BOOLEAN NOT NULL DEFAULT FALSE"
+            ))
+
+        self._schema_guard.run(self.engine, "changed-files-store", bootstrap)
 
     # -- write ------------------------------------------------------------
 

@@ -2,7 +2,7 @@
 
 from fastapi import APIRouter, HTTPException, Query
 
-from ..dependencies import get_service
+from ..dependencies import get_media_asset_store, get_service
 from ..logging import get_service_logger
 from ..schemas import (
     DeleteSummaryResponse,
@@ -106,7 +106,6 @@ def _hydrate_attachments_for_page(
     # the shape stays in lockstep with /v1/uploads and the chat-streaming
     # persistence path (TASK-225). The serializer mutates the wrapper
     # dicts in place; we use throwaway shells then extract.
-    from ...media.assets import MediaAssetStore
     from ...media.serializers import enrich_attachments_for_messages
 
     shells: list[dict] = [
@@ -114,7 +113,7 @@ def _hydrate_attachments_for_page(
         for mid in message_ids
     ]
     try:
-        asset_store = MediaAssetStore(service.config)
+        asset_store = get_media_asset_store(service.config)
         enrich_attachments_for_messages(shells, asset_store)
     except Exception as e:
         log.warning("Attachment enrichment failed: %s", e)
@@ -1422,8 +1421,10 @@ def clear_history(
     effective_bot_id = bot_id or service._default_bot
 
     try:
-        # Try the fast path: clear directly via DB backend (no model loading needed)
-        cleared = _clear_history_direct(service.config, effective_bot_id)
+        # Try the fast path through the service-owned memory client (no model
+        # loading and no request-local backend/schema bootstrap).
+        client = service.get_memory_client(effective_bot_id)
+        cleared = _clear_history_direct(client, effective_bot_id)
 
         if not cleared:
             # Fallback: use the full LLMBawt instance
@@ -1449,32 +1450,30 @@ def clear_history(
         raise HTTPException(status_code=500, detail=str(e))
 
 
-def _clear_history_direct(config, bot_id: str) -> bool:
-    """Clear history directly via PostgreSQL without loading a model.
+def _clear_history_direct(client, bot_id: str) -> bool:
+    """Clear messages and distilled memories without loading a model.
 
-    Returns True if cleared successfully, False if DB is unavailable.
-
-    NOTE on connection pooling (TASK-202): ``PostgreSQLMemoryBackend``
-    instances now share a process-wide engine (see
-    ``llm_bawt.memory.postgresql._get_shared_memory_engine``), so do NOT
-    call ``backend.engine.dispose()`` here — that would tear down the
-    pool used by every other bot.
+    Returns True only when both MemoryClient operations satisfy their
+    contracts. A zero message count is still a successful idempotent clear.
     """
+    if client is None:
+        return False
     try:
-        from llm_bawt.memory.postgresql import PostgreSQLMemoryBackend
-        backend = PostgreSQLMemoryBackend(config, bot_id=bot_id)
-        # Clear messages table
-        from sqlalchemy.orm import Session as SASession
-        from sqlalchemy import delete as sa_delete
-        with SASession(backend.engine) as session:
-            session.execute(sa_delete(backend.messages_table))
-            session.commit()
-        # Clear memories table
-        backend.clear()
-        log.info("History cleared directly for bot '%s'", bot_id)
-        return True
+        deleted_messages = client.clear_messages()
+        messages_cleared = type(deleted_messages) is int and deleted_messages >= 0
+        memories_cleared = client.clear_memories()
+        if messages_cleared and memories_cleared is True:
+            log.info("History cleared through cached client for bot '%s'", bot_id)
+            return True
+        log.warning(
+            "Cached history clear incomplete for '%s': messages=%r memories=%r",
+            bot_id,
+            deleted_messages,
+            memories_cleared,
+        )
+        return False
     except Exception as e:
-        log.warning("Direct history clear failed for '%s': %s", bot_id, e)
+        log.warning("Cached history clear failed for '%s': %s", bot_id, e)
         return False
 
 
@@ -1499,9 +1498,10 @@ def delete_message(
     effective_bot_id = bot_id or service._default_bot
 
     try:
-        from llm_bawt.memory.postgresql import PostgreSQLMemoryBackend
-        backend = PostgreSQLMemoryBackend(service.config, bot_id=effective_bot_id)
-        forgotten = backend.ignore_message_by_id(message_id)
+        client = service.get_memory_client(effective_bot_id)
+        if client is None:
+            raise RuntimeError("Memory service unavailable")
+        forgotten = client.ignore_message_by_id(message_id)
 
         if not forgotten:
             raise HTTPException(

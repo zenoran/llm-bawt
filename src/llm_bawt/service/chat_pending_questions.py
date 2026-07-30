@@ -31,6 +31,7 @@ from sqlalchemy import Column, DateTime, Text, text as sa_text
 from sqlmodel import Field, SQLModel, Session, select
 
 from ..utils.config import Config
+from ..utils.schema import SchemaBootstrapGuard
 
 logger = logging.getLogger(__name__)
 
@@ -83,6 +84,8 @@ class PendingQuestionStore:
     shared SQLAlchemy engine, graceful degradation when Postgres is missing.
     """
 
+    _schema_guard = SchemaBootstrapGuard()
+
     def __init__(self, config: Config) -> None:
         self.config = config
         self.engine = None
@@ -99,30 +102,29 @@ class PendingQuestionStore:
     def _ensure_tables_exist(self) -> None:
         if self.engine is None:
             return
-        SQLModel.metadata.create_all(
-            self.engine, tables=[PendingQuestion.__table__],
-        )
-        # Additive index + TASK-269 canonical columns — safe to re-apply.
-        with self.engine.connect() as conn:
-            try:
-                conn.execute(sa_text(
-                    "CREATE INDEX IF NOT EXISTS ix_pending_questions_bot_status_created"
-                    " ON chat_pending_questions (bot_id, user_id, status, created_at DESC)"
-                ))
-                conn.execute(sa_text(
-                    "ALTER TABLE chat_pending_questions ADD COLUMN IF NOT EXISTS"
-                    " origin_harness VARCHAR(32) DEFAULT 'claude'"
-                ))
-                conn.execute(sa_text(
-                    "ALTER TABLE chat_pending_questions ADD COLUMN IF NOT EXISTS answer_json TEXT"
-                ))
-                conn.execute(sa_text(
-                    "ALTER TABLE chat_pending_questions ADD COLUMN IF NOT EXISTS"
-                    " answered_turn_id VARCHAR(128)"
-                ))
-                conn.commit()
-            except Exception:
-                pass
+
+        def bootstrap(conn) -> None:
+            SQLModel.metadata.create_all(
+                bind=conn, tables=[PendingQuestion.__table__],
+            )
+            # Additive index + TASK-269 canonical columns — safe to re-apply.
+            conn.execute(sa_text(
+                "CREATE INDEX IF NOT EXISTS ix_pending_questions_bot_status_created"
+                " ON chat_pending_questions (bot_id, user_id, status, created_at DESC)"
+            ))
+            conn.execute(sa_text(
+                "ALTER TABLE chat_pending_questions ADD COLUMN IF NOT EXISTS"
+                " origin_harness VARCHAR(32) DEFAULT 'claude'"
+            ))
+            conn.execute(sa_text(
+                "ALTER TABLE chat_pending_questions ADD COLUMN IF NOT EXISTS answer_json TEXT"
+            ))
+            conn.execute(sa_text(
+                "ALTER TABLE chat_pending_questions ADD COLUMN IF NOT EXISTS"
+                " answered_turn_id VARCHAR(128)"
+            ))
+
+        self._schema_guard.run(self.engine, "pending-question-store", bootstrap)
 
     # ----- writes -----
 

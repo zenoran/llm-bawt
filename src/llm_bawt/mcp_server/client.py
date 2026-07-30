@@ -681,6 +681,14 @@ class MemoryClient:
         storage = self._get_storage()
         return int(_run_async(storage.clear_messages(bot_id=self.bot_id)))
 
+    def clear_memories(self) -> bool:
+        """Delete all distilled memories for this bot."""
+        self._ensure_initialized()
+        if self.server_url:
+            return bool(self._call_server("memory_clear", {"bot_id": self.bot_id}))
+        storage = self._get_storage()
+        return bool(_run_async(storage.clear_memories(bot_id=self.bot_id)))
+
     def remove_last_message_if_partial(self, role: str) -> bool:
         self._ensure_initialized()
         if self.server_url:

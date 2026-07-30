@@ -38,7 +38,10 @@ from .logging import generate_request_id as _generate_request_id
 from .schemas import UserProfileAttribute
 
 if TYPE_CHECKING:
+    from ..media.assets import MediaAssetStore
+    from ..media.db import MediaGenerationStore
     from .background_service import BackgroundService
+    from .turn_logs import TurnLogStore
 
 _service: "BackgroundService | None" = None
 
@@ -135,6 +138,24 @@ def get_prompt_template_store(config: Any):
     )
 
 
+def get_media_asset_store(config: Any) -> "MediaAssetStore":
+    """Process-wide ``MediaAssetStore`` singleton for a config generation."""
+    from ..media.assets import MediaAssetStore
+
+    return _get_or_build_store(
+        "media_asset_store", config, lambda: MediaAssetStore(config)
+    )
+
+
+def get_media_generation_store(config: Any) -> "MediaGenerationStore":
+    """Process-wide ``MediaGenerationStore`` singleton for a config generation."""
+    from ..media.db import MediaGenerationStore
+
+    return _get_or_build_store(
+        "media_generation_store", config, lambda: MediaGenerationStore(config)
+    )
+
+
 def get_tool_approval_policy_store(config: Any):
     """Process-wide ``ToolApprovalPolicyStore`` singleton (TASK-290)."""
     from ..approval_policies import ToolApprovalPolicyStore
@@ -155,6 +176,11 @@ def get_service() -> "BackgroundService":
     if _service is None:
         raise RuntimeError("Service not initialized")
     return _service
+
+
+def get_turn_log_store() -> "TurnLogStore":
+    """Return the service-owned store shared by streaming writers and readers."""
+    return get_service()._turn_log_store
 
 
 def get_effective_bot_id(bot_id: str | None = None) -> str:

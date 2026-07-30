@@ -47,6 +47,7 @@ from sqlalchemy.orm import Session
 from sqlalchemy.exc import IntegrityError
 
 from .base import MemoryBackend
+from ..utils.schema import SchemaBootstrapGuard
 
 if TYPE_CHECKING:
     from ..models.message import Message as MessageModel
@@ -85,9 +86,6 @@ def partition_name(base: str, bot_id: str) -> str:
     """
     return f"{base}_p_{_sanitize_table_name(bot_id)}"
 
-
-# Process-wide guard: parent DDL only needs to run once per process.
-_parent_tables_initialized = False
 
 # Set to True when hnsw-on-partitioned-parent turned out to be unsupported by
 # the installed pgvector build; ensure_bot_partitions then creates the vector
@@ -358,10 +356,6 @@ sessions_table = Table(
 )
 
 
-# Module-level guard so we only run the shared sessions DDL once per process.
-_sessions_table_initialized = False
-
-
 def get_message_table_pg(bot_id: str) -> Table:
     """Get or create a message Table for a specific bot (PostgreSQL version).
 
@@ -492,6 +486,7 @@ class PostgreSQLMemoryBackend(MemoryBackend):
     
     # Embedding dimension (matches sentence-transformers all-MiniLM-L6-v2)
     EMBEDDING_DIM = 384
+    _schema_guard = SchemaBootstrapGuard()
     
     def __init__(self, config: Any, bot_id: str = "nova", embedding_dim: int | None = None):
         super().__init__(config, bot_id=bot_id)
@@ -539,46 +534,23 @@ class PostgreSQLMemoryBackend(MemoryBackend):
     def _ensure_tables_exist(self) -> None:
         """Ensure the partitioned parents + this bot's partitions exist.
 
-        TASK-571: replaces the legacy per-bot ``CREATE TABLE <bot>_messages``
-        blocks. Parent DDL runs once per process (module guard); the bot's
-        partitions are ensured on every backend init — the same seam the
-        shard tables used, so a brand-new bot is provisioned transparently.
+        Shared parents/extensions/sessions are guarded per engine and embedding
+        dimension. Bot partitions are guarded separately by sanitized storage
+        identity so distinct bots still provision independently.
 
         The legacy column-migration ALTERs are gone: the parents are created
         with the full current schema, and pre-existing data was carried over
         by the one-shot copy in ``migrations_partition.py``.
         """
-        global _parent_tables_initialized
-        with self.engine.connect() as conn:
-            # Ensure pgvector extension is available
-            try:
-                conn.execute(text("CREATE EXTENSION IF NOT EXISTS vector"))
-                conn.commit()
-            except Exception as e:
-                logger.debug(f"pgvector extension check: {e}")
-
-            # Ensure pg_trgm extension is available — backs the trigram GIN
-            # index on messages.content (templated from the parent). Powers
-            # the Spotlight "Exact / substring" search mode
-            # (search_all_messages_trgm) which is the right path for IDs,
-            # file paths, and other tokens the english FTS config would
-            # shred. Idempotent.
-            try:
-                conn.execute(text("CREATE EXTENSION IF NOT EXISTS pg_trgm"))
-                conn.commit()
-            except Exception as e:
-                logger.debug(f"pg_trgm extension check: {e}")
-
-            if not _parent_tables_initialized:
-                ensure_parent_tables(conn, self.embedding_dim)
-            ensure_bot_partitions(conn, self.bot_id)
-            conn.commit()
-            _parent_tables_initialized = True
+        def bootstrap_shared(conn) -> None:
+            conn.execute(text("CREATE EXTENSION IF NOT EXISTS vector"))
+            conn.execute(text("CREATE EXTENSION IF NOT EXISTS pg_trgm"))
+            ensure_parent_tables(conn, self.embedding_dim)
 
             # Shared sessions table (TASK-183). One row per session across
             # all bots; promotes session_id from a bare UUID to a first-class
             # entity with start/end timestamps and a status.
-            sessions_sql = text("""
+            conn.execute(text("""
                 CREATE TABLE IF NOT EXISTS sessions (
                     id VARCHAR(36) PRIMARY KEY,
                     bot_id VARCHAR(64) NOT NULL,
@@ -589,67 +561,64 @@ class PostgreSQLMemoryBackend(MemoryBackend):
                     status VARCHAR(16) NOT NULL DEFAULT 'active',
                     session_metadata JSONB
                 )
-            """)
+            """))
             # TASK-284: add the user dimension to pre-existing sessions tables.
-            sessions_user_col_sql = text("""
+            conn.execute(text("""
                 ALTER TABLE sessions
                 ADD COLUMN IF NOT EXISTS user_id VARCHAR(64)
-            """)
+            """))
             # TASK-250 gap (caught in review): pre-existing tables bootstrapped
             # before the status-lifecycle migration lack archived_at.
-            sessions_archived_col_sql = text("""
+            conn.execute(text("""
                 ALTER TABLE sessions
                 ADD COLUMN IF NOT EXISTS archived_at TIMESTAMP
-            """)
+            """))
             # Idempotent legacy-data migration: retire the pre-TASK-250
             # 'completed' status and stamp archived_at on any archived row
             # still missing it (backfilled from ended_at). Zero rows touched
             # on an already-migrated deployment.
-            sessions_legacy_status_sql = text("""
+            conn.execute(text("""
                 UPDATE sessions
                 SET status = 'archived',
                     archived_at = COALESCE(archived_at, ended_at)
                 WHERE status = 'completed'
-            """)
-            sessions_archived_backfill_sql = text("""
+            """))
+            conn.execute(text("""
                 UPDATE sessions
                 SET archived_at = ended_at
                 WHERE status = 'archived'
                   AND archived_at IS NULL
                   AND ended_at IS NOT NULL
-            """)
-            sessions_idx_sql = text("""
+            """))
+            conn.execute(text("""
                 CREATE INDEX IF NOT EXISTS idx_sessions_bot_started
                 ON sessions(bot_id, started_at)
-            """)
-            sessions_status_idx_sql = text("""
+            """))
+            conn.execute(text("""
                 CREATE INDEX IF NOT EXISTS idx_sessions_status
                 ON sessions(status)
-            """)
+            """))
             # TASK-284: the active-session lookup is keyed (bot_id, user_id) and
             # filtered to the live thread — index that access path.
-            sessions_active_idx_sql = text("""
+            conn.execute(text("""
                 CREATE INDEX IF NOT EXISTS idx_sessions_bot_user_active
                 ON sessions(bot_id, user_id, status, started_at)
-            """)
+            """))
 
-            try:
-                conn.execute(sessions_sql)
-                try:
-                    conn.execute(sessions_user_col_sql)
-                    conn.execute(sessions_archived_col_sql)
-                    conn.execute(sessions_legacy_status_sql)
-                    conn.execute(sessions_archived_backfill_sql)
-                    conn.execute(sessions_idx_sql)
-                    conn.execute(sessions_status_idx_sql)
-                    conn.execute(sessions_active_idx_sql)
-                except Exception as e:
-                    logger.debug(f"sessions index creation: {e}")
-                conn.commit()
-                logger.debug(f"Ensured partitions exist for bot {self.bot_id}")
-            except Exception as e:
-                logger.error(f"Failed to create tables: {e}")
-                raise
+        self._schema_guard.run(
+            self.engine,
+            ("memory-shared", self.embedding_dim),
+            bootstrap_shared,
+        )
+
+        def bootstrap_partitions(conn) -> None:
+            ensure_bot_partitions(conn, self.bot_id_sanitized)
+
+        self._schema_guard.run(
+            self.engine,
+            ("memory-partitions", self.bot_id_sanitized),
+            bootstrap_partitions,
+        )
 
     # =========================================================================
     # Message Storage (permanent conversation history)

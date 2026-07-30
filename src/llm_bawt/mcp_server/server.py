@@ -541,6 +541,14 @@ async def delete_memory(
     return result
 
 
+@mcp.tool(name="memory_clear")
+async def clear_memories(bot_id: str = "default") -> bool:
+    """Delete all distilled memories for a bot."""
+    logger.debug("MCP tool invoked: tools/clear_memories bot_id=%s", bot_id)
+    storage = _get_storage()
+    return await storage.clear_memories(bot_id=bot_id)
+
+
 @mcp.tool(name="memory_supersede")
 async def supersede_memory(
     old_memory_id: str,

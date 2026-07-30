@@ -22,7 +22,7 @@ import uuid
 from datetime import datetime, timezone
 from typing import Any
 
-from sqlalchemy import Boolean, Column, DateTime, Integer, String, Text, text
+from sqlalchemy import Boolean, Column, DateTime, Integer, String, Text
 from sqlmodel import Field, Session, SQLModel, select
 
 from agent_bridge.approval import (
@@ -36,6 +36,7 @@ from agent_bridge.approval import (
 )
 
 from .utils.config import Config, has_database_credentials
+from .utils.schema import SchemaBootstrapGuard
 
 logger = logging.getLogger(__name__)
 
@@ -235,6 +236,8 @@ _POLICY_WRITABLE = {
 class ToolApprovalPolicyStore:
     """DB access for approval policies + request audit log."""
 
+    _schema_guard = SchemaBootstrapGuard()
+
     def __init__(self, config: Config):
         self.config = config
         self.engine = None
@@ -254,10 +257,16 @@ class ToolApprovalPolicyStore:
     def _ensure_tables_exist(self) -> None:
         if self.engine is None:
             return
-        SQLModel.metadata.create_all(
-            self.engine,
-            tables=[ToolApprovalPolicy.__table__, ToolApprovalRequest.__table__],
-        )
+        def bootstrap(conn) -> None:
+            SQLModel.metadata.create_all(
+                bind=conn,
+                tables=[
+                    ToolApprovalPolicy.__table__,
+                    ToolApprovalRequest.__table__,
+                ],
+            )
+
+        self._schema_guard.run(self.engine, "tool-approval-policy-store", bootstrap)
 
     # ---- policy CRUD -------------------------------------------------------
 

@@ -12,6 +12,7 @@ from ...bot_types import normalize_bot_type
 from ...runtime_settings import RuntimeSetting, purge_bot_data, cleanup_orphaned_bot_data
 from ..dependencies import (
     get_bot_profile_store,
+    get_prompt_template_store,
     get_runtime_settings_store,
     get_service,
 )
@@ -89,9 +90,9 @@ def _resolve_effective_bot_prompt(config, profile) -> str:
     if not override_id:
         return base
     try:
-        from ...prompt_registry import PERSONA_CATEGORY, PromptTemplateStore
+        from ...prompt_registry import PERSONA_CATEGORY
 
-        row = PromptTemplateStore(config).get_by_id(int(override_id))
+        row = get_prompt_template_store(config).get_by_id(int(override_id))
         if row is not None and row.category == PERSONA_CATEGORY and (row.body or "").strip():
             return row.body
     except Exception as e:

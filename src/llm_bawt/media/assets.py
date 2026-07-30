@@ -29,6 +29,7 @@ from sqlalchemy import Column, DateTime, Integer, Text, text
 from sqlmodel import Field, SQLModel
 
 from ..utils.config import Config
+from ..utils.schema import SchemaBootstrapGuard
 
 logger = logging.getLogger(__name__)
 
@@ -121,6 +122,8 @@ class MediaAssetStore:
     every Store via ``get_shared_engine`` so this is cheap.
     """
 
+    _schema_guard = SchemaBootstrapGuard()
+
     def __init__(self, config: Config):
         self.engine = _build_engine(config)
         if self.engine is not None:
@@ -136,19 +139,12 @@ class MediaAssetStore:
 
     def _ensure_table(self) -> None:
         """Create the ``media_assets`` table + indexes if missing."""
-        with self.engine.connect() as conn:
-            try:
-                conn.execute(text(CREATE_TABLE_SQL))
-                for idx_sql in CREATE_INDEXES_SQL:
-                    try:
-                        conn.execute(text(idx_sql))
-                    except Exception as e:
-                        logger.debug("Index creation (may exist): %s", e)
-                conn.commit()
-                logger.debug("Ensured media_assets table exists")
-            except Exception as e:
-                logger.error("Failed to create media_assets table: %s", e)
-                raise
+        def bootstrap(conn) -> None:
+            conn.execute(text(CREATE_TABLE_SQL))
+            for idx_sql in CREATE_INDEXES_SQL:
+                conn.execute(text(idx_sql))
+
+        self._schema_guard.run(self.engine, "media-assets-store", bootstrap)
 
     # ------------------------------------------------------------------
     # Insert

@@ -12,6 +12,7 @@ from sqlalchemy import Boolean, Column, DateTime, String, Text, exists as sa_exi
 from sqlmodel import Field, SQLModel, Session, delete, select
 
 from ..utils.config import Config, has_database_credentials
+from ..utils.schema import SchemaBootstrapGuard
 from .tool_call_store import ToolCallRecord, ToolCallStore
 
 logger = logging.getLogger(__name__)
@@ -136,6 +137,7 @@ class TurnLogStore:
     _last_cleanup_at: float = 0.0
     _cleanup_interval_seconds: float = 300.0
     _backfill_done: bool = False
+    _schema_guard = SchemaBootstrapGuard()
 
     def __init__(self, config: Config, ttl_hours: int | None = None):
         self.config = config
@@ -162,13 +164,15 @@ class TurnLogStore:
     def _ensure_tables_exist(self) -> None:
         if self.engine is None:
             return
-        SQLModel.metadata.create_all(self.engine, tables=[TurnLog.__table__])
+        # Keep orchestration here while each nested store remains independently
+        # guarded for direct callers.
         ToolCallStore(self.engine).ensure_schema()
-        # TASK-661: per-turn changed-file tracking shares the turn_logs lifecycle.
         from .changed_files_store import ChangedFilesStore
         ChangedFilesStore(self.engine).ensure_schema()
-        # Add columns that may not exist on older tables.
-        with self.engine.connect() as conn:
+
+        def bootstrap(conn) -> None:
+            SQLModel.metadata.create_all(bind=conn, tables=[TurnLog.__table__])
+            # Add columns that may not exist on older tables.
             try:
                 conn.execute(sa_text(
                     "ALTER TABLE turn_logs ADD COLUMN IF NOT EXISTS"
@@ -287,9 +291,11 @@ class TurnLogStore:
                     " AND (status IN ('ok','completed','error','timeout','cancelled','aborted')"
                     "      OR end_reason IS NOT NULL)"
                 ))
-                conn.commit()
             except Exception:
-                pass
+                logger.exception("Turn-log additive schema migration failed")
+                raise
+
+        self._schema_guard.run(self.engine, "turn-log-store", bootstrap)
 
     def _backfill_trigger_message_ids(self) -> None:
         """One-time backfill: populate trigger_message_id for existing rows."""

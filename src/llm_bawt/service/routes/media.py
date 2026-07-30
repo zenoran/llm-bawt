@@ -30,14 +30,13 @@ from ...media.schemas import (
     MediaOutput,
 )
 from ...media.storage import MediaStorage
-from ...utils.config import Config
+from ..dependencies import get_media_generation_store, get_service
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter(tags=["Media"])
 
-# Module-level singletons initialised lazily
-_store: MediaGenerationStore | None = None
+# Module-level non-DB helpers initialised lazily
 _storage: MediaStorage | None = None
 _grok_client: GrokMediaClient | None = None
 # Track active polling tasks so they can be cancelled on shutdown
@@ -45,10 +44,8 @@ _poll_tasks: dict[str, asyncio.Task] = {}
 
 
 def _get_store() -> MediaGenerationStore:
-    global _store
-    if _store is None:
-        _store = MediaGenerationStore(Config())
-    return _store
+    service = get_service()
+    return get_media_generation_store(service.config)
 
 
 def _get_storage() -> MediaStorage:
