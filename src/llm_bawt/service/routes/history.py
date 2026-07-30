@@ -1893,12 +1893,20 @@ def maybe_build_session_seed(
             seed = build_context_seed(bot_id, model, service, session_id=_thread_id)
             return seed.get("messages") or None
         bc = getattr(llm_bawt.bot, "agent_backend_config", None) or {}
+        # Derive continuity from history_scope directly — NOT from the
+        # separate session_memory_continuity mirror. The UI writes
+        # history_scope FIRST; reading the mirror (written second) created
+        # a race where /new arrived between the two writes and saw the old
+        # "false" value. scope != "none" is the canonical truth; the mirror
+        # is kept for legacy readers but no longer gates the seed.
         try:
-            continuity_on = bool(
-                llm_bawt.config_resolver.resolve_config_setting(
-                    "session_memory_continuity"
-                ).value
+            from ...utils.history import scope_flags
+            _scope_rv = llm_bawt.config_resolver.resolve_config_setting(
+                "history_scope"
             )
+            _scope = str(_scope_rv.value or "inline+summaries")
+            _inc_hist, _inc_summ = scope_flags(_scope)
+            continuity_on = _inc_hist or _inc_summ
         except Exception:
             continuity_on = False
         if not continuity_on:
