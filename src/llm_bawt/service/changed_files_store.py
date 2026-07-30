@@ -303,6 +303,12 @@ def build_turn_summary(turn_id: str, rows: list[TurnChangedFile]) -> dict[str, A
     overlapping_repos = sorted({
         r.repo_label or r.repo_key for r in rows if r.overlapping
     })
+    # All-overlapping: every file in the manifest came from a workspace where
+    # another turn was also running.  Without tool-call cross-referencing we
+    # cannot attribute any of these changes to THIS turn.  The flag lets
+    # callers decide whether to suppress the manifest entirely (e.g. when the
+    # turn had no file-modifying tool calls).
+    all_overlapping = bool(rows) and all(r.overlapping for r in rows)
     return {
         "turn_id": turn_id,
         "files": files,
@@ -311,6 +317,7 @@ def build_turn_summary(turn_id: str, rows: list[TurnChangedFile]) -> dict[str, A
         "total_deletions": total_del,
         "overlapping_repos": overlapping_repos,
         "truncated": any(r.manifest_truncated for r in rows),
+        "all_overlapping": all_overlapping,
     }
 
 
@@ -480,6 +487,68 @@ class ChangedFilesStore:
 
     # -- read -------------------------------------------------------------
 
+    # Tool names that can plausibly modify workspace files.  If an
+    # all-overlapping turn has NONE of these, the manifest was captured from
+    # a concurrent turn and should be suppressed.
+    _FILE_MODIFYING_TOOLS = frozenset({
+        "Edit", "Write", "Bash", "NotebookEdit",
+    })
+
+    def _turns_with_file_tools(self, turn_ids: list[str]) -> set[str]:
+        """Return the subset of *turn_ids* that have file-modifying tool calls.
+
+        Runs one lightweight EXISTS-per-turn query; never raises — falls back to
+        "assume they all have tools" so a query failure never suppresses data.
+        """
+        if not turn_ids:
+            return set()
+        try:
+            from .tool_call_store import ToolCallRecord
+
+            with Session(self.engine) as session:
+                rows = session.exec(
+                    select(ToolCallRecord.turn_id)
+                    .where(ToolCallRecord.turn_id.in_(turn_ids))  # type: ignore[attr-defined]
+                    .where(ToolCallRecord.tool_name.in_(self._FILE_MODIFYING_TOOLS))  # type: ignore[attr-defined]
+                    .distinct()
+                ).all()
+            return set(rows)
+        except Exception:
+            logger.debug(
+                "file-modifying tool check failed; keeping all manifests",
+                exc_info=True,
+            )
+            return set(turn_ids)
+
+    def _suppress_unattributable(
+        self, summaries: dict[str, dict[str, Any]]
+    ) -> dict[str, dict[str, Any]]:
+        """Drop all-overlapping summaries from turns that had no file-modifying
+        tool calls.
+
+        When every file in a manifest came from an overlapping workspace AND the
+        turn never ran Edit / Write / Bash / NotebookEdit, the changes were made
+        by a concurrent turn — showing them here is a false attribution.
+
+        Summaries that are NOT all-overlapping, or whose turns DO have file tools,
+        are kept untouched.
+        """
+        maybe_spurious = [
+            tid for tid, s in summaries.items() if s.get("all_overlapping")
+        ]
+        if not maybe_spurious:
+            return summaries
+        has_tools = self._turns_with_file_tools(maybe_spurious)
+        to_drop = set(maybe_spurious) - has_tools
+        if not to_drop:
+            return summaries
+        logger.info(
+            "Suppressing all-overlapping changed-file manifests for turns "
+            "with no file-modifying tools: %s",
+            ", ".join(sorted(to_drop)),
+        )
+        return {tid: s for tid, s in summaries.items() if tid not in to_drop}
+
     def summaries_for_turns(self, turn_ids: list[str]) -> dict[str, dict[str, Any]]:
         """Return {turn_id: summary} for the given turns (empty if none)."""
         if self.engine is None or not turn_ids:
@@ -497,7 +566,8 @@ class ChangedFilesStore:
         except Exception:
             logger.exception("changed-file summary query failed turns=%s", turn_ids)
             return {}
-        return {tid: build_turn_summary(tid, rws) for tid, rws in out.items()}
+        raw = {tid: build_turn_summary(tid, rws) for tid, rws in out.items()}
+        return self._suppress_unattributable(raw)
 
     def summaries_for_triggers(self, message_ids: list[str]) -> dict[str, dict[str, Any]]:
         """Return {trigger_message_id: summary} keyed by user message id."""
@@ -519,10 +589,15 @@ class ChangedFilesStore:
             return {}
         # One trigger message maps to one turn, so use that turn's real id for
         # the summary; per-file entries carry it too.
-        return {
+        raw = {
             mid: build_turn_summary(rws[0].turn_id, rws)
             for mid, rws in out.items()
         }
+        # Re-key for suppression (which works by turn_id), then map back.
+        turn_to_mid = {rws[0].turn_id: mid for mid, rws in out.items()}
+        by_turn = {rws[0].turn_id: raw[mid] for mid, rws in out.items()}
+        filtered = self._suppress_unattributable(by_turn)
+        return {turn_to_mid[tid]: s for tid, s in filtered.items()}
 
     def summary_for_turn(self, turn_id: str) -> dict[str, Any]:
         return self.summaries_for_turns([turn_id]).get(

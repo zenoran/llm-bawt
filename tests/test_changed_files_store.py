@@ -21,6 +21,7 @@ from llm_bawt.service.changed_files_store import (
     build_turn_summary,
     reset_diff_blob_backend,
 )
+from llm_bawt.service.tool_call_store import ToolCallRecord
 
 
 @pytest.fixture
@@ -32,7 +33,12 @@ def store(tmp_path, monkeypatch):
     reset_diff_blob_backend()
     engine = create_engine("sqlite://")
     SQLModel.metadata.create_all(
-        engine, tables=[TurnChangedFile.__table__, TurnDiffPayloadRecord.__table__]
+        engine,
+        tables=[
+            TurnChangedFile.__table__,
+            TurnDiffPayloadRecord.__table__,
+            ToolCallRecord.__table__,
+        ],
     )
     s = ChangedFilesStore(engine)
     yield s
@@ -47,6 +53,19 @@ def _mod(path, before, after, **kw):
         after=after.encode() if after is not None else None,
         **kw,
     )
+
+
+def _seed_tool_call(engine, turn_id: str, tool_name: str) -> None:
+    """Insert a minimal ToolCallRecord for testing the suppression filter."""
+    from sqlmodel import Session as S
+    with S(engine) as session:
+        session.add(ToolCallRecord(
+            turn_id=turn_id,
+            tool_name=tool_name,
+            bot_id="b",
+            user_id="u",
+        ))
+        session.commit()
 
 
 def test_save_and_read_roundtrip(store):
@@ -156,6 +175,9 @@ def test_summary_preserves_manifest_overlap_and_truncation(store):
             overlapping=True, manifest_truncated=True,
         )],
     )
+    # Seed a file-modifying tool so the all-overlapping suppression doesn't
+    # hide the manifest — this test checks shape, not the suppression logic.
+    _seed_tool_call(store.engine, "turn-meta", "Edit")
     summary = store.summary_for_turn("turn-meta")
     assert summary["overlapping_repos"] == ["llm-bawt"]
     assert summary["truncated"] is True
@@ -193,4 +215,91 @@ def test_empty_summary_shape():
         "turn_id": "turn-x", "files": [],
         "total_files": 0, "total_additions": 0, "total_deletions": 0,
         "overlapping_repos": [], "truncated": False,
+        "all_overlapping": False,
     }
+
+
+def test_all_overlapping_flag_set_when_every_file_overlaps():
+    """build_turn_summary sets all_overlapping=True when every row has overlapping=True."""
+    rows = [
+        TurnChangedFile(turn_id="t", repo_key="r", repo_label="llm-bawt",
+                        path="a.py", overlapping=True, change_kind="modified"),
+        TurnChangedFile(turn_id="t", repo_key="r", repo_label="llm-bawt",
+                        path="b.py", overlapping=True, change_kind="modified"),
+    ]
+    summary = build_turn_summary("t", rows)
+    assert summary["all_overlapping"] is True
+
+
+def test_all_overlapping_false_when_mixed():
+    """build_turn_summary sets all_overlapping=False when some rows aren't overlapping."""
+    rows = [
+        TurnChangedFile(turn_id="t", repo_key="r", repo_label="llm-bawt",
+                        path="a.py", overlapping=True, change_kind="modified"),
+        TurnChangedFile(turn_id="t", repo_key="rB", repo_label="other",
+                        path="c.py", overlapping=False, change_kind="added"),
+    ]
+    summary = build_turn_summary("t", rows)
+    assert summary["all_overlapping"] is False
+
+
+def test_all_overlapping_suppressed_without_file_tools(store):
+    """An all-overlapping manifest is suppressed when the turn has no file-modifying tools."""
+    store.save_turn_files(
+        turn_id="turn-no-tools", bot_id="b", user_id="u", trigger_message_id="msg-no",
+        files=[_mod("a.py", "x", "y", overlapping=True)],
+    )
+    # No tool calls inserted → summary should be suppressed (empty default).
+    summary = store.summary_for_turn("turn-no-tools")
+    assert summary["total_files"] == 0, "All-overlapping manifest without file tools should be suppressed"
+
+
+def test_all_overlapping_kept_with_file_tools(store):
+    """An all-overlapping manifest is kept when the turn has file-modifying tools."""
+    store.save_turn_files(
+        turn_id="turn-has-tools", bot_id="b", user_id="u", trigger_message_id="msg-ht",
+        files=[_mod("a.py", "x", "y", overlapping=True)],
+    )
+    # Insert a file-modifying tool call.
+    _seed_tool_call(store.engine, "turn-has-tools", "Edit")
+    summary = store.summary_for_turn("turn-has-tools")
+    assert summary["total_files"] == 1, "All-overlapping manifest WITH file tools should be kept"
+    assert summary["all_overlapping"] is True
+
+
+def test_all_overlapping_kept_with_bash_tool(store):
+    """Bash counts as file-modifying since it can modify workspace files."""
+    store.save_turn_files(
+        turn_id="turn-bash", bot_id="b", user_id="u", trigger_message_id="msg-bash",
+        files=[_mod("a.py", "x", "y", overlapping=True)],
+    )
+    _seed_tool_call(store.engine, "turn-bash", "Bash")
+    summary = store.summary_for_turn("turn-bash")
+    assert summary["total_files"] == 1
+
+
+def test_non_overlapping_kept_without_tools(store):
+    """Non-overlapping manifests are never suppressed, even without tools."""
+    store.save_turn_files(
+        turn_id="turn-clean", bot_id="b", user_id="u", trigger_message_id="msg-clean",
+        files=[_mod("a.py", "x", "y", overlapping=False)],
+    )
+    summary = store.summary_for_turn("turn-clean")
+    assert summary["total_files"] == 1
+    assert summary["all_overlapping"] is False
+
+
+def test_suppression_in_summaries_for_triggers(store):
+    """summaries_for_triggers also suppresses all-overlapping without file tools."""
+    store.save_turn_files(
+        turn_id="turn-trig", bot_id="b", user_id="u", trigger_message_id="msg-trig",
+        files=[_mod("a.py", "x", "y", overlapping=True)],
+    )
+    out = store.summaries_for_triggers(["msg-trig"])
+    assert "msg-trig" not in out, "Should be suppressed — no file-modifying tools"
+
+    # Now add a tool and re-check.
+    _seed_tool_call(store.engine, "turn-trig", "Write")
+    out = store.summaries_for_triggers(["msg-trig"])
+    assert "msg-trig" in out
+    assert out["msg-trig"]["total_files"] == 1
