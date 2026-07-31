@@ -111,6 +111,7 @@ class ClaudeSendMixin(ClaudeStreamMixin, ClaudeUsageMixin, ClaudeResultMixin):
         bot_max_turns = req.bot_max_turns
         subagent_model = req.subagent_model
         bot_context_window = req.bot_context_window
+        mcp_tool_timeout_ms = req.mcp_tool_timeout_ms
         configured_disallowed_tools = req.configured_disallowed_tools
         attachments = req.attachments
         thread_session_id = req.thread_session_id
@@ -330,6 +331,10 @@ class ClaudeSendMixin(ClaudeStreamMixin, ClaudeUsageMixin, ClaudeResultMixin):
                         subagent_model=subagent_model,
                         force_refresh=auth_retry.attempted,
                     )
+                    if mcp_tool_timeout_ms:
+                        # TASK-618: DB-backed app policy, delivered per turn so
+                        # runtime-setting edits require no bridge recreation.
+                        sdk_env["MCP_TOOL_TIMEOUT"] = str(mcp_tool_timeout_ms)
 
                     # Pass `seq` to the can_use_tool factory by reference so it
                     # can keep the AWAIT_TOOL_RESULT event ordered in the same

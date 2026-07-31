@@ -217,6 +217,10 @@ class AgentBridgeBackend(AgentBackend):
                                 int(config.get("context_window"))
                                 if config.get("context_window") else None
                             ),
+                            mcp_tool_timeout_ms=(
+                                int(config.get("mcp_tool_timeout_ms"))
+                                if config.get("mcp_tool_timeout_ms") else None
+                            ),
                             thread_session_id=(
                                 str(config.get("thread_session_id") or "").strip()
                                 or None

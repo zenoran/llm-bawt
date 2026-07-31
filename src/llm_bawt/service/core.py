@@ -69,6 +69,19 @@ class ServiceLLMBawt(BaseLLMBawt):
             existing_client=existing_client,
         )
         self._last_history_load_at: float = time.time()
+        from ..clients.agent_backend_client import AgentBackendClient
+        if isinstance(self.client, AgentBackendClient):
+            # TASK-618: one DB-backed global controls both the MCP tool's
+            # synchronous wait and Claude's client-side MCP timeout. Add 30s of
+            # transport/cleanup headroom before sending milliseconds downstream.
+            from ..runtime_setting_resolution import resolve_global_runtime_setting
+
+            bot_wait_seconds = int(resolve_global_runtime_setting(
+                self.config, "bot_send_wait_seconds", fallback=300,
+            ) or 300)
+            self.client._bot_config["mcp_tool_timeout_ms"] = (
+                max(1, bot_wait_seconds) + 30
+            ) * 1000
 
     def _init_bot(self, config: Config):
         """Initialize bot, then patch AgentBackendClient with bot-specific config."""

@@ -205,6 +205,18 @@ SETTING_DEFINITIONS: dict[str, SettingDefinition] = {
             "proxy turns additionally disable WebSearch and WebFetch."
         ),
     ),
+    "bot_send_wait_seconds": SettingDefinition(
+        key="bot_send_wait_seconds",
+        type="int",
+        default=300,
+        applies_to=(),
+        storage=STORAGE_RUNTIME_SETTING,
+        label="Synchronous bot reply wait (s)",
+        help=(
+            "Global maximum wait for bots_send_message(wait_for_reply=true). "
+            "Claude MCP calls receive 30 seconds of extra client-side headroom."
+        ),
+    ),
     "timeout_seconds": SettingDefinition(
         key="timeout_seconds",
         type="int",

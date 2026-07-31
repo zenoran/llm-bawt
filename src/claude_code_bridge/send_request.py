@@ -37,6 +37,7 @@ class SendRequest:
     bot_max_turns: int | None
     subagent_model: str | None
     bot_context_window: int | None
+    mcp_tool_timeout_ms: int | None
     configured_disallowed_tools: object
     attachments: list[dict] = field(default_factory=list)
     # Per-thread SDK binding. The app resolves the durable thread (explicit
@@ -124,6 +125,20 @@ class SendRequest:
                     cw_raw, bot_slug,
                 )
 
+        # TASK-618: app-resolved DB setting plus 30s headroom, expressed in the
+        # milliseconds the Claude CLI expects. Invalid/absent -> CLI default.
+        mcp_timeout_raw = (fields.get("mcp_tool_timeout_ms") or "").strip()
+        mcp_tool_timeout_ms: int | None = None
+        if mcp_timeout_raw:
+            try:
+                parsed_timeout = int(mcp_timeout_raw)
+                mcp_tool_timeout_ms = parsed_timeout if parsed_timeout > 0 else None
+            except ValueError:
+                logger.warning(
+                    "Ignoring invalid mcp_tool_timeout_ms=%r for %s",
+                    mcp_timeout_raw, bot_slug,
+                )
+
         # TASK-593: app-resolved, DB-managed base SDK tool policy. Keep the raw
         # field until proxy routing is known; the pure resolver below decodes it,
         # falls back safely, and adds proxy-only exclusions.
@@ -162,6 +177,7 @@ class SendRequest:
             bot_max_turns=bot_max_turns,
             subagent_model=subagent_model,
             bot_context_window=bot_context_window,
+            mcp_tool_timeout_ms=mcp_tool_timeout_ms,
             configured_disallowed_tools=configured_disallowed_tools,
             attachments=attachments,
             thread_session_id=thread_session_id,

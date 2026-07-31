@@ -942,24 +942,31 @@ async def rotate_session(bot_id: str = "default", user_id: str | None = None) ->
 _inflight_bot_sends: set = set()
 
 
-# TASK-618: cap the effective `wait_for_reply` wait below the MCP client's
-# per-tool-call timeout. The Claude Agent SDK (and other MCP clients) impose a
-# tool-call timeout that is INDEPENDENT of — and, at its 60s default (env
-# MCP_TOOL_TIMEOUT, in ms), lower than — this tool's own `timeout_seconds`
-# argument. A waited send that exceeds that ceiling gets guillotined
-# client-side with a bare "The operation timed out.": the graceful timeout
-# branch in `_dispatch_bot_message` never fires, and the caller sees a FALSE
-# failure for a send that actually succeeded server-side. (Live case: a
-# snark→gavel verdict handoff — gavel's turn took 63s, snark's 180s wait was
-# killed at 60s.) So we clamp the effective wait to a value guaranteed to sit
-# below the client kill, leaving margin. If an operator raises MCP_TOOL_TIMEOUT
-# on the bridge, raise LLM_BAWT_BOT_SEND_WAIT_CEILING_S in tandem. For replies
-# that legitimately take longer, use an async send (omit wait_for_reply) — the
-# target bot answers back via its own async bots_send_message, which has no
-# such ceiling.
-_BOT_SEND_WAIT_CEILING_S = float(
-    os.getenv("LLM_BAWT_BOT_SEND_WAIT_CEILING_S", "55")
-)
+# TASK-618: the synchronous inter-bot wait is DB-backed. Claude receives the
+# same value plus 30 seconds of MCP transport/cleanup headroom in every Redis
+# dispatch, preventing its client from aborting before the graceful in-flight
+# warning can return.
+_BOT_SEND_WAIT_SETTING = "bot_send_wait_seconds"
+_bot_send_settings_resolver = None
+
+
+def _bot_send_wait_ceiling_seconds() -> float:
+    global _bot_send_settings_resolver
+
+    try:
+        if _bot_send_settings_resolver is None:
+            from llm_bawt.runtime_settings import RuntimeSettingsResolver
+
+            _bot_send_settings_resolver = RuntimeSettingsResolver(
+                config=_get_storage().config, bot=None,
+            )
+        value = float(_bot_send_settings_resolver.resolve(
+            _BOT_SEND_WAIT_SETTING, fallback=300,
+        ))
+        return value if value > 0 else 300.0
+    except Exception:
+        logger.warning("Could not resolve %s; using 300s", _BOT_SEND_WAIT_SETTING)
+        return 300.0
 
 
 async def _dispatch_bot_message(
@@ -1098,12 +1105,11 @@ async def send_message_to_bot(
             honored: `fire_and_forget=True` forces async, and the legacy
             `fire_and_forget=False` is treated as `wait_for_reply=True`.
         timeout_seconds: How long to wait for a response when
-            `wait_for_reply=True`. Defaults to 300s, but the effective wait is
-            CLAMPED to `LLM_BAWT_BOT_SEND_WAIT_CEILING_S` (default 55s) because
-            the MCP client aborts any tool call past ~60s. Requesting more than
-            the ceiling is honored only up to it; for replies that take longer,
-            use an async send (omit `wait_for_reply`) and let the target reply
-            back via its own async `bots_send_message`.
+            `wait_for_reply=True`. Defaults to 300s and is clamped to the global
+            DB runtime setting `bot_send_wait_seconds` (also 300s by default).
+            Claude MCP calls receive 30s of client-side transport/cleanup
+            headroom. Larger waits are capped; use an async send for work that
+            legitimately needs more than five minutes.
         force: If True, send even when the target bot is mid-turn.
 
     Returns:
@@ -1231,20 +1237,20 @@ async def send_message_to_bot(
             "note": note,
         }
 
-    # Reaching here means do_wait is True (the async path returned above). Clamp
-    # the wait below the MCP client's per-tool-call ceiling so a legitimately
-    # slow reply doesn't get killed client-side with a false timeout. See the
-    # _BOT_SEND_WAIT_CEILING_S note above (TASK-618).
+    # Reaching here means do_wait is True (the async path returned above).
+    # Clamp to the configured synchronous ceiling; the Claude bridge's MCP tool
+    # timeout intentionally sits 30 seconds above the default. See TASK-618.
+    ceiling_seconds = _bot_send_wait_ceiling_seconds()
     effective_timeout = timeout_seconds
-    clamped = timeout_seconds > _BOT_SEND_WAIT_CEILING_S
+    clamped = timeout_seconds > ceiling_seconds
     if clamped:
         logger.warning(
-            "wait_for_reply send to %s requested %.0fs but the MCP client "
-            "tool-call timeout caps it at ~60s; clamping to %.0fs to avoid a "
-            "false client-side timeout. Use an async send for longer replies.",
-            target_bot_id, timeout_seconds, _BOT_SEND_WAIT_CEILING_S,
+            "wait_for_reply send to %s requested %.0fs; clamping to the "
+            "DB-configured %.0fs synchronous ceiling. Use an async send for "
+            "longer work.",
+            target_bot_id, timeout_seconds, ceiling_seconds,
         )
-        effective_timeout = _BOT_SEND_WAIT_CEILING_S
+        effective_timeout = ceiling_seconds
 
     result = await _dispatch_bot_message(
         payload, target_bot_id, sender_bot_id, effective_timeout
@@ -1259,10 +1265,9 @@ async def send_message_to_bot(
             result["note"] = (
                 (result.get("warning") or result.get("note") or "").strip()
                 + f" NOTE: your requested {timeout_seconds:.0f}s wait was "
-                f"capped at {effective_timeout:.0f}s because the MCP client "
-                "aborts tool calls past ~60s. The target may still be working "
-                "and can reply via an async send. DO NOT retry — that risks a "
-                "duplicate turn."
+                f"capped at the configured {effective_timeout:.0f}s synchronous "
+                "ceiling. The target may still be working and can reply via an "
+                "async send. DO NOT retry — that risks a duplicate turn."
             ).strip()
     return result
 

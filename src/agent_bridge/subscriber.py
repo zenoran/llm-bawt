@@ -154,6 +154,7 @@ class RedisSubscriber:
         disallowed_tools: list[str] | None = None,
         inject_messages: list | None = None,
         context_window: int | None = None,
+        mcp_tool_timeout_ms: int | None = None,
         thread_session_id: str | None = None,
         thread_resume_id: str | None = None,
         explicit_thread: bool = False,
@@ -209,6 +210,10 @@ class RedisSubscriber:
             # consumes it to report the true context window for proxy-routed
             # models the CLI defaults to 200k. Other bridges ignore it.
             fields["context_window"] = str(context_window)
+        if mcp_tool_timeout_ms is not None and mcp_tool_timeout_ms > 0:
+            # TASK-618: app-resolved, DB-backed Claude MCP client timeout.
+            # Other bridges safely ignore this field.
+            fields["mcp_tool_timeout_ms"] = str(mcp_tool_timeout_ms)
         if disallowed_tools is not None:
             fields["disallowed_tools"] = json.dumps(
                 disallowed_tools, ensure_ascii=False
