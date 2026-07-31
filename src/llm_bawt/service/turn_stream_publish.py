@@ -80,15 +80,18 @@ class TurnStreamPublishMixin:
             log.debug("Direct event publish failed: %s", pub_err)
             return None
 
-    def _enrich_turn_start_attachments(self):
+    def _enrich_attachment_refs(self, refs):
+        """Expand tiny media refs into the canonical live/history envelope."""
         ctx = self.ctx
-        attachments_to_persist = ctx.attachments_to_persist
-        self = ctx.svc
-        shell = [{"attachments": list(attachments_to_persist)}]
+        svc = ctx.svc
+        shell = [{"attachments": list(refs)}]
         enrich_attachments_for_messages(
-            shell, MediaAssetStore(self.config)
+            shell, MediaAssetStore(svc.config)
         )
         return shell[0].get("attachments") or []
+
+    def _enrich_turn_start_attachments(self):
+        return self._enrich_attachment_refs(self.ctx.attachments_to_persist)
 
     def _persist_publish_approval(self, chunk: dict) -> None:
         ctx = self.ctx

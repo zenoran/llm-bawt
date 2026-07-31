@@ -162,15 +162,70 @@ class ClaudeEventMixin:
             return None
         return data, (mime or "image/png")
 
-    async def _persist_screenshot_blocks(
+    @staticmethod
+    def _tool_response_content(tool_response: object) -> list:
+        """Return MCP content blocks from a PostToolUse response payload."""
+        if isinstance(tool_response, list):
+            return tool_response
+        if isinstance(tool_response, dict):
+            content = tool_response.get("content")
+            if isinstance(content, list):
+                return content
+        return []
+
+    @staticmethod
+    def _artifact_refs(artifacts: list[dict]) -> list[dict]:
+        """Reduce canonical upload envelopes to persisted attachment refs."""
+        refs: list[dict] = []
+        seen: set[str] = set()
+        for artifact in artifacts:
+            asset_id = artifact.get("asset_id") if isinstance(artifact, dict) else None
+            if isinstance(asset_id, str) and asset_id and asset_id not in seen:
+                seen.add(asset_id)
+                refs.append({"asset_id": asset_id, "kind": "image"})
+        return refs
+
+    def _absolute_artifact_url(self, path: object) -> str | None:
+        if not isinstance(path, str) or not path:
+            return None
+        if path.startswith(("http://", "https://")):
+            return path
+        if not self._app_api_url:
+            return path
+        return f"{self._app_api_url.rstrip('/')}/{path.lstrip('/')}"
+
+    def _format_screenshot_artifacts(self, artifacts: list[dict]) -> str:
+        """Render canonical upload envelopes as model-visible curlable URLs."""
+        lines = [
+            "[Playwright Screenshot Artifact] The screenshot is stored durably. "
+            "Use these URLs with curl if you need the raw artifact:",
+        ]
+        rendered = 0
+        for artifact in artifacts:
+            if not isinstance(artifact, dict) or not artifact.get("asset_id"):
+                continue
+            rendered += 1
+            meta = [
+                f"asset_id={artifact['asset_id']}",
+                f"type={artifact.get('mime_type') or 'image'}",
+            ]
+            if artifact.get("width") and artifact.get("height"):
+                meta.append(f"{artifact['width']}x{artifact['height']}")
+            lines.append(f"{rendered}. " + "  ".join(meta))
+            urls = artifact.get("urls") if isinstance(artifact.get("urls"), dict) else {}
+            for label in ("original", "preview", "thumb"):
+                absolute = self._absolute_artifact_url(urls.get(label))
+                if absolute:
+                    lines.append(f"   {label}: {absolute}")
+        return "\n".join(lines) if rendered else ""
+
+    async def _persist_screenshot_artifacts(
         self, content: list, session_key: str, tool_use_id: str | None,
     ) -> list[dict]:
-        """Upload each image block in a screenshot tool-result to the media
-        store; return ``{asset_id, kind}`` refs. Best-effort — logs and skips
-        anything it can't parse or upload."""
-        refs: list[dict] = []
+        """Upload image blocks and return canonical upload-response envelopes."""
+        artifacts: list[dict] = []
         if not self._app_api_url:
-            return refs
+            return artifacts
         user_id = session_key.split(":", 1)[1] if ":" in session_key else "nick"
         for block in content:
             img = self._extract_image_block(block)
@@ -182,17 +237,26 @@ class ClaudeEventMixin:
                     )
                 continue
             data_b64, mime = img
-            asset_id = await self._upload_data_url(
+            artifact = await self._upload_data_url(
                 f"data:{mime};base64,{data_b64}", user_id, tool_use_id,
             )
-            if asset_id:
-                refs.append({"asset_id": asset_id, "kind": "image"})
-        return refs
+            if artifact:
+                artifacts.append(artifact)
+        return artifacts
+
+    async def _persist_screenshot_blocks(
+        self, content: list, session_key: str, tool_use_id: str | None,
+    ) -> list[dict]:
+        """Compatibility wrapper returning tiny refs for UI/history rails."""
+        artifacts = await self._persist_screenshot_artifacts(
+            content, session_key, tool_use_id,
+        )
+        return self._artifact_refs(artifacts)
 
     async def _upload_data_url(
         self, data_url: str, user_id: str, tool_use_id: str | None,
-    ) -> str | None:
-        """POST a ``data:`` URL to /v1/uploads as an agent attachment; return asset_id."""
+    ) -> dict | None:
+        """POST image bytes and return the canonical upload-response envelope."""
         import httpx
         try:
             async with httpx.AsyncClient(timeout=15) as client:
@@ -211,10 +275,60 @@ class ClaudeEventMixin:
                         resp.status_code, resp.text[:200],
                     )
                     return None
-                return (resp.json() or {}).get("asset_id")
+                payload = resp.json() or {}
+                if not isinstance(payload, dict) or not payload.get("asset_id"):
+                    logger.warning("Screenshot upload returned no asset_id")
+                    return None
+                return payload
         except Exception:
             logger.warning("Screenshot upload error", exc_info=True)
             return None
+
+    def _make_post_tool_use_hook(
+        self,
+        *,
+        session_key: str,
+        screenshot_artifacts_by_tool_use_id: dict[str, list[dict]],
+    ):
+        """Persist Playwright images before the SDK resumes model reasoning.
+
+        ``additionalContext`` is appended to the original MCP tool result, so the
+        model keeps the inline image for vision and also receives durable Garage
+        URLs it can curl later in the same turn.
+        """
+
+        async def post_tool_use(input_data, tool_use_id, context):
+            del context
+            tool_name = input_data.get("tool_name") or ""
+            if tool_name.split("__")[-1] != "browser_take_screenshot":
+                return {}
+            tuid = (tool_use_id or input_data.get("tool_use_id") or "").strip()
+            if not tuid:
+                return {}
+            cached = screenshot_artifacts_by_tool_use_id.get(tuid)
+            if cached is None:
+                content = self._tool_response_content(input_data.get("tool_response"))
+                if not any(self._extract_image_block(block) for block in content):
+                    return {}
+                cached = await self._persist_screenshot_artifacts(
+                    content, session_key, tuid,
+                )
+                screenshot_artifacts_by_tool_use_id[tuid] = cached
+            additional_context = self._format_screenshot_artifacts(cached)
+            if not additional_context:
+                additional_context = (
+                    "[Playwright Screenshot Artifact] The screenshot is visible "
+                    "inline, but durable artifact persistence failed; no Garage URL "
+                    "is available for this screenshot."
+                )
+            return {
+                "hookSpecificOutput": {
+                    "hookEventName": "PostToolUse",
+                    "additionalContext": additional_context,
+                }
+            }
+
+        return post_tool_use
 
     def _publish_event(
         self,

@@ -3,6 +3,7 @@
 from sqlmodel import SQLModel, create_engine
 
 from llm_bawt.prompt_registry import (
+    AGENT_GLOBAL_PROMPT,
     PromptResolver,
     PromptTemplate,
     PromptTemplateStore,
@@ -44,6 +45,12 @@ def test_prompt_resolver_renders_memory_maintenance_prompt() -> None:
     )
     assert "User prefers compact summaries" in rendered
     assert "intent phrase" in rendered
+
+
+def test_agent_global_prompt_explains_playwright_artifact_workflow() -> None:
+    assert "browser_take_screenshot` without `filename`" in AGENT_GLOBAL_PROMPT
+    assert "returned `original`, `preview`, or `thumb` URL" in AGENT_GLOBAL_PROMPT
+    assert "suppresses the inline-image/Garage attachment path" in AGENT_GLOBAL_PROMPT
 
 
 def test_prompt_store_seed_defaults_is_idempotent() -> None:

@@ -297,7 +297,17 @@ AGENT_GLOBAL_PROMPT = (
     "finished steps.\n"
     "- A task in BUG status is locked for human review. Do not try to move it "
     "out of BUG — the system will reject it. Leave it as-is and continue with "
-    "other work."
+    "other work.\n\n"
+    "PLAYWRIGHT SCREENSHOTS:\n"
+    "- For normal verification, visual inspection, and BawtHub display, call "
+    "`browser_take_screenshot` without `filename`. The normal result gives you "
+    "the image for immediate interpretation and a durable Garage artifact "
+    "reference after persistence.\n"
+    "- If you need the raw bytes later, use `curl` with the returned `original`, "
+    "`preview`, or `thumb` URL.\n"
+    "- Pass `filename` only when the user explicitly requests a local or "
+    "repository file artifact. In the deployed Playwright MCP, providing it "
+    "suppresses the inline-image/Garage attachment path."
 )
 
 

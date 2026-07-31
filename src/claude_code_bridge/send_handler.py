@@ -204,6 +204,11 @@ class ClaudeSendMixin(ClaudeStreamMixin, ClaudeUsageMixin):
             # during this turn; stamped onto the terminal ASSISTANT_DONE event so
             # the app can attach them to the bot's reply message.
             turn_screenshot_assets: list[dict] = []
+            # Canonical upload-response envelopes keyed by SDK tool_use_id. The
+            # PostToolUse hook fills this before the model resumes so it receives
+            # curlable Garage URLs; the later UserMessage observer reuses the same
+            # upload for TOOL_END/history instead of uploading duplicate bytes.
+            screenshot_artifacts_by_tool_use_id: dict[str, list[dict]] = {}
             # TASK-661: snapshot the git workspaces so we can report exactly
             # what this turn changed. Published just before run_done on every
             # exit path below (the app persists it before turn_complete).
@@ -342,6 +347,7 @@ class ClaudeSendMixin(ClaudeStreamMixin, ClaudeUsageMixin):
                     # counting an earlier attempt's uploads on the final DONE event.
                     tool_names_by_id.clear()
                     turn_screenshot_assets.clear()
+                    screenshot_artifacts_by_tool_use_id.clear()
 
                     def _log_stderr(line: str) -> None:
                         line = line.rstrip()
@@ -401,6 +407,12 @@ class ClaudeSendMixin(ClaudeStreamMixin, ClaudeUsageMixin):
                         session_key=session_key,
                         seq_holder=seq_holder,
                     )
+                    post_tool_use_cb = self._make_post_tool_use_hook(
+                        session_key=session_key,
+                        screenshot_artifacts_by_tool_use_id=(
+                            screenshot_artifacts_by_tool_use_id
+                        ),
+                    )
 
                     # TASK-288 observability: log the system_prompt value AS SENT
                     # to the SDK, paired with resume state. This is the only place
@@ -426,6 +438,7 @@ class ClaudeSendMixin(ClaudeStreamMixin, ClaudeUsageMixin):
                         bot_max_turns=bot_max_turns,
                         can_use_tool_cb=can_use_tool_cb,
                         pre_tool_use_cb=pre_tool_use_cb,
+                        post_tool_use_cb=post_tool_use_cb,
                         stderr=_log_stderr,
                     )
 
@@ -722,6 +735,9 @@ class ClaudeSendMixin(ClaudeStreamMixin, ClaudeUsageMixin):
                                     seq=seq,
                                     tool_names_by_id=tool_names_by_id,
                                     turn_screenshot_assets=turn_screenshot_assets,
+                                    screenshot_artifacts_by_tool_use_id=(
+                                        screenshot_artifacts_by_tool_use_id
+                                    ),
                                 )
 
                             elif isinstance(msg, ResultMessage):

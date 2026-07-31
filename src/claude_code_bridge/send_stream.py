@@ -113,6 +113,7 @@ class ClaudeStreamMixin:
         bot_max_turns: int | None,
         can_use_tool_cb,
         pre_tool_use_cb,
+        post_tool_use_cb,
         stderr,
     ) -> ClaudeAgentOptions:
         """Construct the per-attempt ``ClaudeAgentOptions`` (verbatim move)."""
@@ -154,6 +155,15 @@ class ClaudeStreamMixin:
             hooks={
                 "PreToolUse": [
                     HookMatcher(matcher=None, hooks=[pre_tool_use_cb]),
+                ],
+                "PostToolUse": [
+                    HookMatcher(
+                        matcher=(
+                            "mcp__playwright__browser_take_screenshot|"
+                            "browser_take_screenshot"
+                        ),
+                        hooks=[post_tool_use_cb],
+                    ),
                 ],
             },
             # The SDK's stdio reader defaults to a 1 MiB JSON buffer
@@ -345,6 +355,7 @@ class ClaudeStreamMixin:
         seq: int,
         tool_names_by_id: dict,
         turn_screenshot_assets: list[dict],
+        screenshot_artifacts_by_tool_use_id: dict[str, list[dict]],
     ) -> int:
         """Handle a UserMessage's tool_result blocks (TOOL_END); return ``seq``."""
         # Mirror of the AssistantMessage path: a sub-agent's
@@ -373,10 +384,26 @@ class ClaudeStreamMixin:
                     tool_names_by_id.get(block.tool_use_id or "")
                 ):
                     try:
-                        refs = await self._persist_screenshot_blocks(
-                            result_content, session_key, block.tool_use_id,
+                        tuid = block.tool_use_id or ""
+                        cached_artifacts = screenshot_artifacts_by_tool_use_id.get(tuid)
+                        if not cached_artifacts:
+                            # A failed PostToolUse upload caches an empty list so
+                            # the model gets an honest failure note. Retry here:
+                            # Garage may have recovered before TOOL_END, and the
+                            # existing UI/history path should still get its image.
+                            cached_artifacts = await self._persist_screenshot_artifacts(
+                                result_content, session_key, block.tool_use_id,
+                            )
+                            if tuid:
+                                screenshot_artifacts_by_tool_use_id[tuid] = cached_artifacts
+                        refs = self._artifact_refs(cached_artifacts)
+                        known_ids = {
+                            ref.get("asset_id") for ref in turn_screenshot_assets
+                            if isinstance(ref, dict)
+                        }
+                        turn_screenshot_assets.extend(
+                            ref for ref in refs if ref.get("asset_id") not in known_ids
                         )
-                        turn_screenshot_assets.extend(refs)
                         tool_end_attachments = refs or None
                     except Exception:
                         logger.warning(

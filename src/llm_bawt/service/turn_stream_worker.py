@@ -78,6 +78,7 @@ class TurnStreamWorker(TurnStreamPublishMixin):
         _persist_publish_approval = self._persist_publish_approval
         _persist_publish_await = self._persist_publish_await
         _publish_event_direct = self._publish_event_direct
+        _enrich_attachment_refs = self._enrich_attachment_refs
         _redis_sub = ctx._redis_sub
         _upstream_model = ctx._upstream_model
         agent_attachments_holder = ctx.agent_attachments_holder
@@ -1249,6 +1250,19 @@ class TurnStreamWorker(TurnStreamPublishMixin):
                 changed_files = self._turn_log_store.changed_files_summary(turn_log_id)
             except Exception:
                 changed_files = None
+            # Live agent turns intentionally skip the final history refresh. Carry
+            # the same canonical attachment envelope on turn_complete so the
+            # already-rendered assistant bubble can graft screenshots immediately.
+            try:
+                completed_attachments = _enrich_attachment_refs(
+                    agent_attachments_holder
+                ) if agent_attachments_holder else None
+            except Exception as _attachment_err:
+                completed_attachments = None
+                log.warning(
+                    "turn_complete attachment enrichment failed: %s",
+                    _attachment_err,
+                )
             _publish_event_direct({
                 "_type": "turn_complete",
                 "turn_id": turn_log_id,
@@ -1262,6 +1276,7 @@ class TurnStreamWorker(TurnStreamPublishMixin):
                 "animation": animation_holder[0],
                 "token_usage": token_usage_holder[0],
                 "changed_files": changed_files,
+                "attachments": completed_attachments,
                 # Catalog alias for this turn (matches the persisted turn-log
                 # `model` and the /v1/models pricing key) so the client can
                 # cost a live turn without waiting on the turn-log backfill.
