@@ -1087,8 +1087,7 @@ class MemoryStorage:
     ) -> bool:
         """Shallow-merge ``patch`` into a session row's ``session_metadata``.
 
-        TASK-284 step 15: records provider session identity on the durable
-        thread (``provider``/``provider_session_id``/``provider_session_model``).
+        Records canonical per-backend SDK key/model maps on the durable thread.
         """
         manager = self.get_short_term_manager(bot_id)
         return manager.update_session_metadata(session_id, patch)

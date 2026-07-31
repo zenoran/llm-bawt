@@ -43,6 +43,54 @@ class ClaudeSendMixin(ClaudeStreamMixin, ClaudeUsageMixin, ClaudeResultMixin):
     on the assembled instance.
     """
 
+    async def _preprocess_new_command(
+        self,
+        message: str,
+        *,
+        explicit_thread: bool,
+        bot_slug: str,
+        session_key: str,
+        request_id: str,
+        model: str,
+        inject_messages: list | None,
+        thread_session_id: str | None,
+        msg_id: str,
+        async_redis,
+    ) -> str | None:
+        """Handle bridge-owned ``/new`` setup and return the remaining prompt.
+
+        ``None`` means a bare ``/new`` was fully acknowledged and the caller
+        must stop. ``/new <message>`` returns only the trailing message; its
+        normal cold-start path creates exactly one SDK session. Explicit-thread
+        turns pass through unchanged because opening an old thread must never
+        rotate it.
+        """
+        if explicit_thread or not message.lstrip().startswith("/new"):
+            return message
+
+        self._publish_session_reset_unified(
+            bot_slug or session_key, session_key, had_session=True,
+        )
+        remaining = message.lstrip().removeprefix("/new").strip()
+        if remaining:
+            return remaining
+
+        # Bare /new has no normal send path to create the fresh SDK session,
+        # so seed it here before acknowledging.
+        seed_stats = await self._seed_new_session(
+            bot_slug, model, injected=inject_messages,
+            thread_session_id=thread_session_id,
+        )
+        self._publish_event(
+            request_id, session_key, 1,
+            kind=AgentEventKind.ASSISTANT_DONE,
+            text=self._format_seed_ack(seed_stats),
+            model=model,
+        )
+        self._publisher.publish_run_done(request_id)
+        await async_redis.xack(COMMANDS_STREAM, "claude-code-bridge", msg_id)
+        return None
+
     async def _handle_send(
         self, fields: dict, msg_id: str, async_redis,
     ) -> None:
@@ -65,10 +113,8 @@ class ClaudeSendMixin(ClaudeStreamMixin, ClaudeUsageMixin, ClaudeResultMixin):
         bot_context_window = req.bot_context_window
         configured_disallowed_tools = req.configured_disallowed_tools
         attachments = req.attachments
-        # TASK-252: explicit-thread (scoped) turn — resume/persist the SDK
-        # session PER THREAD; never touch the bot's scalar session_key.
         thread_session_id = req.thread_session_id
-        thread_scoped = bool(thread_session_id)
+        explicit_thread = req.explicit_thread
 
         if not request_id or not message:
             logger.warning("Invalid send command: missing request_id or message")
@@ -97,34 +143,28 @@ class ClaudeSendMixin(ClaudeStreamMixin, ClaudeUsageMixin, ClaudeResultMixin):
         if trigger_message_id:
             self._trigger_message_ids[request_id] = trigger_message_id
 
-        # /new resets the session — strip it and start fresh. A thread-scoped
-        # turn never takes this branch (TASK-252): "/new" inside an opened old
-        # thread must not clear the bot's scalar (continuous) session.
-        if message.lstrip().startswith("/new") and not thread_scoped:
-            cleared = await self._clear_session(bot_slug or session_key)
-            logger.info("Session reset via /new: %s (had_session=%s)", bot_slug or session_key, cleared)
-            # Publish a deterministic SESSION_RESET unified event so the
-            # frontend can clear its visible buffer without racing
-            # turn_complete timing.  See TASK-249.
-            self._publish_session_reset_unified(
-                bot_slug or session_key, session_key, had_session=cleared,
-            )
-            # TASK-445: optionally seed the fresh session from chat summary
-            # history. Persists the minted session id so a trailing message
-            # below resumes the seeded transcript (no double-seed).
-            seed_stats = await self._seed_new_session(bot_slug, model, injected=inject_messages)
-            message = message.lstrip().removeprefix("/new").strip()
-            if not message:
-                # Just "/new" with no follow-up — acknowledge and done
-                self._publish_event(
-                    request_id, session_key, 1,
-                    kind=AgentEventKind.ASSISTANT_DONE,
-                    text=self._format_seed_ack(seed_stats),
-                    model=model,
-                )
-                self._publisher.publish_run_done(request_id)
-                await async_redis.xack(COMMANDS_STREAM, "claude-code-bridge", msg_id)
-                return
+        # The app normally rotates unscoped /new turns to a fresh durable
+        # thread. Force cold-start independently of that best-effort DB step:
+        # even if rotation failed, /new must never resume the old SDK transcript.
+        reset_requested = (
+            not explicit_thread and message.lstrip().startswith("/new")
+        )
+        # Bare /new is fully handled here; /new <message> returns the trailing
+        # prompt and enters the normal one-time cold-start path.
+        message = await self._preprocess_new_command(
+            message,
+            explicit_thread=explicit_thread,
+            bot_slug=bot_slug,
+            session_key=session_key,
+            request_id=request_id,
+            model=model,
+            inject_messages=inject_messages,
+            thread_session_id=thread_session_id,
+            msg_id=msg_id,
+            async_redis=async_redis,
+        )
+        if message is None:
+            return
 
         if self._session_queue.is_busy(session_key):
             logger.info(
@@ -176,38 +216,23 @@ class ClaudeSendMixin(ClaudeStreamMixin, ClaudeUsageMixin, ClaudeResultMixin):
                     mcp_ctx = await self._get_mcp_tool_context(bot_slug)
                     system_prompt += f"\n\n{mcp_ctx}"
 
-                # Reuse SDK session for conversation continuity.
-                # If the model changed, start a fresh session.
-                resume_id = None
-                if thread_scoped:
-                    # TASK-252: the app resolved this thread's stored SDK
-                    # session (canonical agent_session_keys, model-checked).
-                    # None -> cold-start below, seeded from the thread's own
-                    # scoped context via inject_messages; the minted id is
-                    # written back to the THREAD, not the scalar.
-                    resume_id = req.thread_resume_id
+                # Session resolution: the app resolved the thread's stored
+                # SDK session id (model-checked). None → cold-start.
+                resume_id = None if reset_requested else req.thread_resume_id
+                if resume_id:
                     logger.info(
-                        "Thread-scoped turn: thread=%s resume=%s",
-                        thread_session_id, resume_id or "none (cold-start)",
+                        "Resuming thread: thread=%s resume=%s",
+                        thread_session_id or "(active)", resume_id,
                     )
                 else:
-                    existing = await self._get_session(bot_slug)
-                    if existing:
-                        prev_sid, prev_model = existing
-                        if prev_model == model:
-                            resume_id = prev_sid
-                        else:
-                            logger.info(
-                                "Model changed (%s -> %s), starting new session for %s",
-                                prev_model, model, bot_slug or session_key,
-                            )
-                            await self._clear_session(bot_slug or session_key)
+                    logger.info(
+                        "No resume key for thread=%s (cold-start)",
+                        thread_session_id or "(active)",
+                    )
 
-                # TASK-445: cold start with no session to resume — first-ever
-                # run or post-model-switch. Seed from summary history so the new
-                # SDK session opens with continuity. A /new above that already
-                # seeded will have persisted a session, so _get_session found it
-                # and resume_id is set — this block is skipped (no double-seed).
+                # Cold start with no session to resume — first-ever run,
+                # post-model-switch, or post-/new. Seed from the app-injected
+                # history so the new SDK session opens with continuity.
                 if resume_id is None:
                     cold_seed = await self._seed_new_session(
                         bot_slug, model, injected=inject_messages,
@@ -479,17 +504,12 @@ class ClaudeSendMixin(ClaudeStreamMixin, ClaudeUsageMixin, ClaudeResultMixin):
                                         logger.info("Actual model: %s", actual_model)
                                     if not resume_id:
                                         sid = data.get("session_id")
-                                        if sid:
-                                            # TASK-252: scoped turns persist to
-                                            # the thread, never the scalar.
-                                            if thread_scoped:
-                                                await self._set_thread_session(
-                                                    thread_session_id,
-                                                    bot_slug or session_key,
-                                                    sid, model,
-                                                )
-                                            else:
-                                                await self._set_session(bot_slug or session_key, sid, model)
+                                        if sid and thread_session_id:
+                                            await self._set_thread_session(
+                                                thread_session_id,
+                                                bot_slug or session_key,
+                                                sid, model,
+                                            )
                                     session_persisted = True
                                 # Track the session_id for this turn regardless of
                                 # resume state — used to read the compaction result
@@ -834,11 +854,8 @@ class ClaudeSendMixin(ClaudeStreamMixin, ClaudeUsageMixin, ClaudeResultMixin):
                             )
                             if stderr_lines:
                                 logger.warning("Captured stderr before retry: %s", stderr_lines)
-                            # TASK-252: scoped turns never clear the scalar —
-                            # the wedged session belongs to the THREAD; a
-                            # fresh sid gets written back to it on retry.
-                            if not thread_scoped:
-                                await self._clear_session(bot_slug or session_key)
+                            # Retry without the wedged SDK session. The next init
+                            # persists its replacement to the same durable thread.
                             resume_id = None
                             continue
 

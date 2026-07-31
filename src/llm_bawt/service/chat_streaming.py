@@ -453,22 +453,17 @@ class ChatStreamingMixin(ChatStreamingBridgeMixin):
             else:
                 oc_session_key = bc.get("session_key")
 
-            # TASK-252: resolve the turn's explicit-thread binding (if any)
-            # BEFORE the seed decision — the scoped seed branch consumes it.
-            # REQUEST-LOCAL: passed by value down the kwarg channel, never
-            # stored on the shared cached client (no cross-turn bind leaks).
+            # Resolve the request-local thread binding BEFORE the seed
+            # decision. Explicit selection wins; otherwise bind the current
+            # ACTIVE thread so seed/resume decisions use canonical per-thread
+            # metadata rather than the retired bot scalar.
             thread_binding = self._bind_agent_thread(llm_bawt, request)
+            if thread_binding is None:
+                thread_binding = self._resolve_active_thread_binding(llm_bawt)
 
-            # TASK-501: pre-assemble the session seed app-side and push it to
-            # the bridge (inject_messages) so the bridge need not call back to
-            # /v1/history/context-seed. Shared decision helper — SAME logic the
-            # non-streaming path uses (background_service.chat_completion) so the
-            # two dispatch routes stay consistent.
-            # TASK-641: on /new, summarize the OUTGOING thread FIRST so the
-            # seed below finds a fresh summary of the ending conversation in
-            # its summary bucket (bounded; no-op unless /new + scope carries
-            # summaries). Shared helper — same gate + same per-thread unit on
-            # both dispatch paths.
+            # Summarize the OUTGOING thread on /new BEFORE the seed builds
+            # so the seed's summary bucket includes a fresh summary of the
+            # ending conversation (TASK-641).
             self._maybe_summarize_on_new(
                 llm_bawt, bot_id, user_prompt, thread_binding=thread_binding
             )
@@ -478,13 +473,21 @@ class ChatStreamingMixin(ChatStreamingBridgeMixin):
                 llm_bawt, bot_id, model_alias, user_prompt, get_service(),
                 thread_binding=thread_binding,
             )
-            # TASK-284 step 15: rotate the durable DB thread on /new — AFTER
-            # the seed is built so the seed captured the outgoing thread's
-            # raw messages (the session-scoped load reads the active thread;
-            # rotating first made every inline-history seed come up empty).
+            # Rotate the durable DB thread on /new — AFTER the seed is built
+            # so the seed captured the outgoing thread's raw messages.
             self._maybe_rotate_agent_session(
                 llm_bawt, bot_id, user_prompt, thread_binding=thread_binding
             )
+
+            # A successful unscoped /new rotation invalidates the outgoing
+            # binding. Resolve the fresh active thread (no SDK key yet) so the
+            # bridge cold-starts and writes its minted key there.
+            if (
+                thread_binding
+                and not thread_binding.get("explicit_thread")
+                and (user_prompt or "").lstrip().startswith("/new")
+            ):
+                thread_binding = self._resolve_active_thread_binding(llm_bawt)
 
         # Persist turn log immediately so the user's prompt is recorded
         # even if the backend times out or errors before responding.

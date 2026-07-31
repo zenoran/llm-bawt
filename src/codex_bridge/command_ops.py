@@ -151,18 +151,22 @@ class CodexCommandMixin:
         if trigger_message_id:
             self._trigger_message_ids[request_id] = trigger_message_id
 
-        # /new resets the session (TASK-206)
-        if message.lstrip().startswith("/new"):
-            cleared = await self._clear_session(bot_slug or session_key)
-            logger.info(
-                "Session reset via /new: %s (had_session=%s)",
-                bot_slug or session_key, cleared,
-            )
-            # Deterministic SESSION_RESET unified event for the frontend
-            # (TASK-249) — clears the visible buffer without racing
-            # turn_complete timing.
+        # Parse per-thread binding fields (TASK-638).
+        thread_session_id = (fields.get("thread_session_id") or "").strip() or None
+        thread_resume_id = (fields.get("thread_resume_id") or "").strip() or None
+        if thread_resume_id and ":" in thread_resume_id:
+            logger.warning("Ignoring routing-key thread_resume_id for %s: %s", bot_slug, thread_resume_id)
+            thread_resume_id = None
+        explicit_thread = (fields.get("explicit_thread") or "").strip() in ("1", "true")
+
+        # /new resets the session — strip and start fresh. Explicit-thread
+        # turns never process /new (message passes through as literal text).
+        reset_requested = (
+            not explicit_thread and message.lstrip().startswith("/new")
+        )
+        if reset_requested:
             self._publish_session_reset_unified(
-                bot_slug or session_key, session_key, had_session=cleared,
+                bot_slug or session_key, session_key, had_session=True,
             )
             message = message.lstrip().removeprefix("/new").strip()
             if not message:
@@ -203,19 +207,21 @@ class CodexCommandMixin:
                     mcp_ctx = await self._get_mcp_tool_context(bot_slug)
                     system_prompt += f"\n\n{mcp_ctx}"
 
-                # Resolve resume vs fresh thread (TASK-206)
-                existing = await self._get_session(bot_slug)
-                resume_id: str | None = None
-                if existing:
-                    prev_sid, prev_model = existing
-                    if prev_model == model:
-                        resume_id = prev_sid
-                    else:
-                        logger.info(
-                            "Model changed (%s -> %s), starting new thread for %s",
-                            prev_model, model, bot_slug or session_key,
-                        )
-                        await self._clear_session(bot_slug or session_key)
+                # Session resolution: the app resolved the thread's stored
+                # SDK session id (model-checked). None → cold-start.
+                resume_id: str | None = (
+                    None if reset_requested else thread_resume_id
+                )
+                if resume_id:
+                    logger.info(
+                        "Resuming thread: thread=%s resume=%s",
+                        thread_session_id or "(active)", resume_id,
+                    )
+                else:
+                    logger.info(
+                        "No resume key for thread=%s (cold-start)",
+                        thread_session_id or "(active)",
+                    )
 
                 # Cooperative cancel event for chat.abort (TASK-205)
                 cancel_event = (
@@ -338,6 +344,7 @@ class CodexCommandMixin:
                                 session_persisted=session_persisted,
                                 item_buffers=item_buffers,
                                 thread=thread,
+                                thread_session_id=thread_session_id,
                             )
                             if persisted_now:
                                 session_persisted = True
@@ -350,9 +357,13 @@ class CodexCommandMixin:
                             not session_persisted
                             and not resume_id
                             and bot_slug
+                            and thread_session_id
                             and getattr(thread, "id", None)
                         ):
-                            await self._set_session(bot_slug, str(thread.id), model)
+                            await self._set_thread_session(
+                                thread_session_id, bot_slug,
+                                str(thread.id), model,
+                            )
                             session_persisted = True
 
                         if not aborted and not self._already_sent_done(seq, item_buffers):
@@ -463,10 +474,9 @@ class CodexCommandMixin:
                         ):
                             fresh_session_retry = True
                             logger.warning(
-                                "Recoverable session error for %s: %s — clearing session and retrying fresh",
+                                "Recoverable session error for %s: %s — retrying fresh",
                                 request_id, e,
                             )
-                            await self._clear_session(bot_slug or session_key)
                             resume_id = None
                             continue
 
@@ -545,41 +555,24 @@ class CodexCommandMixin:
         try:
             if method == "session.reset":
                 session_key = params.get("sessionKey", "")
-                # TASK-257 (Gavel recheck): app-scoped reset — emit on the
-                # caller's user stream; only clear the bot-global provider
-                # session when the app says so (DEFAULT_USER's continuous
-                # conversation owns it). Legacy callers (no params) keep the
-                # old behavior exactly.
+                # The app handles thread rotation; the bridge just publishes
+                # the SESSION_RESET event so the frontend clears its buffer.
+                # The scalar agent_backend_config.session_key is retired
+                # (TASK-638); no _clear_session call needed.
                 reset_user = (params.get("userId") or "").strip() or "nick"
-                clear_provider = params.get("clearProviderSession", True)
                 target = _bot_slug_from_session_key(session_key) or session_key
                 if target:
-                    cleared = False
-                    if clear_provider:
-                        cleared = await self._clear_session(target)
-                    else:
-                        logger.info(
-                            "session.reset for non-default user=%s — "
-                            "skipping bot-global provider session clear for %s",
-                            reset_user, target,
-                        )
-                    logger.info(
-                        "Session reset: %s (had_session=%s)", target, cleared,
-                    )
-                    # SESSION_RESET unified event so any active frontend SSE
-                    # consumer for this bot clears its visible buffer.
-                    # TASK-249.
+                    logger.info("Session reset: %s", target)
                     self._publish_session_reset_unified(
                         target, session_key or target,
-                        had_session=cleared, user_id=reset_user,
+                        had_session=True, user_id=reset_user,
                     )
                     self._publisher.publish_rpc_result(
                         request_id,
                         {
                             "ok": True,
                             "reset": target,
-                            "had_session": cleared,
-                            "cleared_provider": bool(clear_provider),
+                            "had_session": True,
                         },
                     )
                 else:

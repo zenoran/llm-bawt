@@ -427,9 +427,10 @@ class SessionResetResponse(BaseModel):
 async def session_reset(request: SessionResetRequest) -> SessionResetResponse:
     """Reset the agent backend session for a bot.
 
-    Sends a session.reset RPC to the bridge, which clears the stored
-    conversation and starts fresh on the next message. Works for any
-    agent backend that supports the RPC.
+    Sends a session.reset RPC for frontend/provider reset signaling, then
+    rotates the durable DB thread. Claude/Codex continuity is per-thread, so
+    the fresh thread naturally cold-starts on the next message; OpenClaw keeps
+    its gateway-owned routing session behavior.
     """
     service = get_service()
     from ...bots import BotManager
@@ -443,12 +444,9 @@ async def session_reset(request: SessionResetRequest) -> SessionResetResponse:
         raise HTTPException(status_code=400, detail=f"Bot '{request.bot_id}' is not an agent backend bot")
 
     bc = getattr(bot, "agent_backend_config", {}) or {}
-    # claude-code and codex bridges route session.reset by parsing the bot
-    # slug out of the sessionKey param (split on ':' or use as-is). Their
-    # persisted ``session_key`` in agent_backend_config is the SDK-internal
-    # thread id, not a routing key — sending it here means the bridge tries
-    # to PATCH /v1/bots/<thread_id>/profile and silently fails. Always send
-    # the bot slug for these backends.
+    # Claude/Codex route RPCs by bot:user and persist SDK continuity on the
+    # durable thread, not in agent_backend_config. The bot slug is sufficient
+    # for reset signaling; OpenClaw still uses its gateway routing key.
     if backend_name in ("claude-code", "codex"):
         session_key = request.bot_id
     else:
@@ -460,17 +458,12 @@ async def session_reset(request: SessionResetRequest) -> SessionResetResponse:
     if not subscriber:
         raise HTTPException(status_code=503, detail="Redis subscriber not available")
 
-    # TASK-257 (Gavel recheck): resolve the caller's user BEFORE the RPC so
-    # the bridge can scope its side too. The bot-global provider session
-    # (agent_backend_config.session_key / gateway context) belongs to the
-    # DEFAULT_USER's continuous conversation — a reset issued for any OTHER
-    # user must NOT clear it, and the bridge's session_reset unified event
-    # must publish on the CALLER's stream, not DEFAULT_USER's. Policy lives
-    # here (app = intelligence, bridge = hands): the bridge just honors
-    # userId + clearProviderSession.
+    # Resolve the caller before the RPC so reset signaling lands on that
+    # user's unified stream. ``clearProviderSession`` remains meaningful only
+    # for gateway-owned OpenClaw sessions; Claude/Codex reset by thread rotation.
     default_user = (getattr(service.config, "DEFAULT_USER", "") or "").strip()
     user_id = (request.user_id or "").strip() or default_user
-    clear_provider = bool(user_id) and (not default_user or user_id == default_user)
+    clear_provider = backend_name == "openclaw"
 
     rpc_req_id = f"reset_{uuid.uuid4().hex}"
     try:

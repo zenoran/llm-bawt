@@ -1,23 +1,13 @@
-"""TASK-252 (M1c) — per-thread SDK session keys.
+"""TASK-638 — per-thread SDK session keys are canonical everywhere.
 
-Design (locked in TASK-252):
-    Each durable thread records which SDK/provider session hydrates it in
-    ``sessions.session_metadata.agent_session_keys = {<backend>: sdk-id}``
-    (canonical home). The bot's scalar ``agent_backend_config.session_key``
-    remains the continuous conversation's pointer — a thread-scoped turn
-    must NEVER touch it.
+Each durable thread records backend-specific SDK identity and model metadata in
+``agent_session_keys`` + ``agent_session_key_models``. Every Claude/Codex turn
+binds either the user-selected thread or the active thread; the retired bot
+scalar is never read or written.
 
-Coverage:
-    - resolver: canonical-first, legacy TASK-284 mirror fallback, routing-key
-      guard, model-change gate
-    - bridge SendRequest: thread field parsing + routing-key guard
-    - dispatch binding: set fresh per turn, cleared on unscoped turns,
-      claude-code only
-    - /new rotation guard: a thread-bound turn never rotates the active thread
-    - seed decision: thread with a stored key → no seed (bridge resumes);
-      thread without → scoped seed
-    - live-DB: PUT /v1/sessions/{id}/agent-session-key merge semantics +
-      normalized read + resolver round-trip
+Coverage includes resolver/model gates, Redis field parsing, explicit + active
+binding, first-turn thread creation, `/new` rotation/seed behavior, request-local
+wire plumbing, MCP adapter parity, and live-DB merge semantics.
 """
 
 from __future__ import annotations
@@ -53,21 +43,10 @@ class TestResolveAgentSessionKey:
         meta = {"agent_session_keys": {"claude_code": "sid-123"}}
         assert resolve_agent_session_key(meta, "claude-code") == "sid-123"
 
-    def test_legacy_mirror_fallback(self):
+    def test_legacy_mirror_keys_no_longer_fall_back(self):
+        # TASK-638: legacy provider/provider_session_id fallback removed.
         meta = {"provider": "claude-code", "provider_session_id": "sid-legacy"}
-        assert resolve_agent_session_key(meta, "claude-code") == "sid-legacy"
-
-    def test_legacy_fallback_requires_provider_match(self):
-        meta = {"provider": "codex", "provider_session_id": "sid-legacy"}
         assert resolve_agent_session_key(meta, "claude-code") is None
-
-    def test_canonical_wins_over_legacy(self):
-        meta = {
-            "agent_session_keys": {"claude_code": "sid-new"},
-            "provider": "claude-code",
-            "provider_session_id": "sid-old",
-        }
-        assert resolve_agent_session_key(meta, "claude-code") == "sid-new"
 
     def test_routing_key_guard(self):
         meta = {"agent_session_keys": {"claude_code": "byte:nick"}}
@@ -76,23 +55,18 @@ class TestResolveAgentSessionKey:
     def test_model_change_gate_blocks(self):
         meta = {
             "agent_session_keys": {"claude_code": "sid-1"},
-            "provider": "claude-code",
-            "provider_session_model": "model-a",
+            "agent_session_key_models": {"claude_code": "model-a"},
         }
         assert resolve_agent_session_key(meta, "claude-code", "model-b") is None
 
     def test_model_match_passes(self):
         meta = {
             "agent_session_keys": {"claude_code": "sid-1"},
-            "provider": "claude-code",
-            "provider_session_model": "model-a",
+            "agent_session_key_models": {"claude_code": "model-a"},
         }
         assert resolve_agent_session_key(meta, "claude-code", "model-a") == "sid-1"
 
-    def test_other_backends_model_never_vetoes(self):
-        # Gavel review finding 2: provider_session_model is scalar (last
-        # writer) while keys are per-backend — a codex-written model note
-        # must not veto the claude-code key.
+    def test_legacy_model_scalar_only_applies_to_matching_provider(self):
         meta = {
             "agent_session_keys": {"claude_code": "sid-cc", "codex": "sid-cx"},
             "provider": "codex",
@@ -102,6 +76,7 @@ class TestResolveAgentSessionKey:
             resolve_agent_session_key(meta, "claude-code", "claude-model")
             == "sid-cc"
         )
+        assert resolve_agent_session_key(meta, "codex", "other-model") is None
 
     def test_no_stored_model_passes(self):
         meta = {"agent_session_keys": {"claude_code": "sid-1"}}
@@ -156,6 +131,105 @@ class TestSendRequestThreadFields:
 
 
 # ──────────────────────────────────────────────────────────────────────────
+# Claude /new preprocessing — one fresh SDK session, never two
+# ──────────────────────────────────────────────────────────────────────────
+class TestClaudeNewPreprocessing:
+    @staticmethod
+    def _harness():
+        from claude_code_bridge.send_handler import ClaudeSendMixin
+
+        class _Publisher:
+            def __init__(self):
+                self.done = []
+
+            def publish_run_done(self, request_id):
+                self.done.append(request_id)
+
+        class _Harness(ClaudeSendMixin):
+            def __init__(self):
+                self.resets = []
+                self.seeds = []
+                self.events = []
+                self._publisher = _Publisher()
+
+            def _publish_session_reset_unified(self, *args, **kwargs):
+                self.resets.append((args, kwargs))
+
+            async def _seed_new_session(self, *args, **kwargs):
+                self.seeds.append((args, kwargs))
+                return {"seeded": True, "session_id": "sdk-new"}
+
+            @staticmethod
+            def _format_seed_ack(seed_stats):
+                return f"seeded:{seed_stats['session_id']}"
+
+            def _publish_event(self, *args, **kwargs):
+                self.events.append((args, kwargs))
+
+        class _Redis:
+            def __init__(self):
+                self.acks = []
+
+            async def xack(self, *args):
+                self.acks.append(args)
+
+        return _Harness(), _Redis()
+
+    @staticmethod
+    def _run(harness, redis, message, *, explicit_thread=False):
+        return asyncio.run(harness._preprocess_new_command(
+            message,
+            explicit_thread=explicit_thread,
+            bot_slug="snark",
+            session_key="snark:nick",
+            request_id="req-1",
+            model="model-1",
+            inject_messages=[{"role": "summary", "content": "prior"}],
+            thread_session_id="thread-new",
+            msg_id="redis-1",
+            async_redis=redis,
+        ))
+
+    def test_new_with_message_defers_the_only_seed_to_cold_start(self):
+        harness, redis = self._harness()
+
+        remaining = self._run(harness, redis, "/new continue here")
+
+        assert remaining == "continue here"
+        assert len(harness.resets) == 1
+        assert harness.seeds == []
+        assert harness.events == []
+        assert harness._publisher.done == []
+        assert redis.acks == []
+
+    def test_bare_new_seeds_once_and_finishes(self):
+        harness, redis = self._harness()
+
+        remaining = self._run(harness, redis, "  /new")
+
+        assert remaining is None
+        assert len(harness.resets) == 1
+        assert len(harness.seeds) == 1
+        assert harness.seeds[0][1]["thread_session_id"] == "thread-new"
+        assert len(harness.events) == 1
+        assert harness._publisher.done == ["req-1"]
+        assert redis.acks == [("agent:commands", "claude-code-bridge", "redis-1")]
+
+    def test_explicit_thread_treats_new_as_literal_text(self):
+        harness, redis = self._harness()
+
+        remaining = self._run(
+            harness, redis, "/new do not rotate this old thread",
+            explicit_thread=True,
+        )
+
+        assert remaining == "/new do not rotate this old thread"
+        assert harness.resets == []
+        assert harness.seeds == []
+        assert redis.acks == []
+
+
+# ──────────────────────────────────────────────────────────────────────────
 # Dispatch binding (_bind_agent_thread) — hermetic fakes
 # ──────────────────────────────────────────────────────────────────────────
 from llm_bawt.service.chat_streaming_bridge import ChatStreamingBridgeMixin
@@ -169,11 +243,19 @@ def _fake_llm_bawt(
     backend: str = "claude-code",
     bot_config: dict | None = None,
     session_row: dict | None = None,
+    *,
+    active_row: dict | None = None,
+    created_session_id: str = "fresh-thread",
 ):
     bc = bot_config if bot_config is not None else {}
-    db_backend = SimpleNamespace(get_session=lambda sid: session_row)
+    db_backend = SimpleNamespace(
+        get_session=lambda sid: session_row,
+        get_active_session=lambda **kwargs: active_row,
+        get_or_create_active_session=lambda **kwargs: created_session_id,
+    )
     return SimpleNamespace(
-        bot=SimpleNamespace(agent_backend=backend),
+        bot=SimpleNamespace(agent_backend=backend, slug="byte"),
+        user_id="nick",
         client=SimpleNamespace(_bot_config=bc),
         history_manager=SimpleNamespace(_db_backend=db_backend),
     )
@@ -196,12 +278,12 @@ class TestBindAgentThread:
         }
         lb = _fake_llm_bawt(session_row=row)
         out = _Bridge()._bind_agent_thread(lb, SimpleNamespace(session_id="t-1"))
-        assert out == {"thread_session_id": "t-1", "thread_resume_id": "sid-42"}
+        assert out == {"thread_session_id": "t-1", "thread_resume_id": "sid-42", "explicit_thread": True}
 
     def test_scoped_turn_without_stored_key_binds_thread_only(self):
         lb = _fake_llm_bawt(session_row={"session_metadata": {}})
         out = _Bridge()._bind_agent_thread(lb, SimpleNamespace(session_id="t-1"))
-        assert out == {"thread_session_id": "t-1"}
+        assert out == {"thread_session_id": "t-1", "explicit_thread": True}
 
     def test_model_mismatch_forces_cold_start(self):
         row = {
@@ -213,7 +295,7 @@ class TestBindAgentThread:
         }
         lb = _fake_llm_bawt(bot_config={"model": "new-model"}, session_row=row)
         out = _Bridge()._bind_agent_thread(lb, SimpleNamespace(session_id="t-1"))
-        assert out == {"thread_session_id": "t-1"}
+        assert out == {"thread_session_id": "t-1", "explicit_thread": True}
 
     def test_binding_is_request_local_not_instance_state(self):
         # Gavel review finding 1: the binding must never be written to the
@@ -233,28 +315,74 @@ class TestBindAgentThread:
             history_manager=SimpleNamespace(_db_backend=None),
         )
         out = _Bridge()._bind_agent_thread(lb, SimpleNamespace(session_id="t-1"))
-        assert out == {"thread_session_id": "t-1"}
+        assert out == {"thread_session_id": "t-1", "explicit_thread": True}
+
+
+class TestMCPShortTermSessionContract:
+    def test_active_session_methods_delegate_to_bound_memory_client(self):
+        from llm_bawt.mcp_server.client import _MCPShortTermManager
+
+        calls = []
+        memory = SimpleNamespace(
+            get_active_session=lambda: calls.append("get") or {"id": "active-1"},
+            get_or_create_active_session=lambda: calls.append("create") or "active-1",
+        )
+        manager = _MCPShortTermManager(memory)
+
+        assert manager.get_active_session(bot_id="byte", user_id="nick") == {
+            "id": "active-1",
+        }
+        assert manager.get_or_create_active_session(
+            bot_id="byte", user_id="nick",
+        ) == "active-1"
+        assert calls == ["get", "create"]
+
+
+class TestResolveActiveThreadBinding:
+    def test_existing_active_thread_resumes_its_backend_key(self):
+        row = {
+            "id": "active-thread",
+            "session_metadata": {
+                "agent_session_keys": {"claude_code": "sdk-active"},
+            },
+        }
+        lb = _fake_llm_bawt(session_row=row, active_row=row)
+
+        assert _Bridge()._resolve_active_thread_binding(lb) == {
+            "thread_session_id": "active-thread",
+            "thread_resume_id": "sdk-active",
+        }
+
+    def test_first_turn_creates_thread_for_sdk_writeback(self):
+        lb = _fake_llm_bawt(active_row=None, created_session_id="thread-first")
+
+        assert _Bridge()._resolve_active_thread_binding(lb) == {
+            "thread_session_id": "thread-first",
+        }
 
 
 class TestRotationScopedGuard:
-    def test_bound_turn_never_rotates(self):
+    def test_explicit_thread_never_rotates(self):
         lb = _fake_llm_bawt()
         # _rotate_chat_session would need a real backend; the guard must
         # return False BEFORE reaching it.
         assert (
             _Bridge()._maybe_rotate_agent_session(
-                lb, "byte", "/new", thread_binding={"thread_session_id": "t-1"}
+                lb, "byte", "/new",
+                thread_binding={"thread_session_id": "t-1", "explicit_thread": True},
             )
             is False
         )
 
-    def test_unbound_new_still_reaches_rotation(self):
+    def test_active_thread_new_still_reaches_rotation(self):
         lb = _fake_llm_bawt()
         called = []
 
         b = _Bridge()
         b._rotate_chat_session = lambda *a, **k: called.append(1) or True
-        assert b._maybe_rotate_agent_session(lb, "byte", "/new") is True
+        assert b._maybe_rotate_agent_session(
+            lb, "byte", "/new", thread_binding={"thread_session_id": "active"},
+        ) is True
         assert called
 
 
@@ -262,10 +390,13 @@ class TestRotationScopedGuard:
 # Seed decision (maybe_build_session_seed scoped branch) — hermetic
 # ──────────────────────────────────────────────────────────────────────────
 class TestScopedSeedDecision:
-    def _llm_bawt(self):
+    def _llm_bawt(self, scope="inline+summaries"):
         return SimpleNamespace(
             bot=SimpleNamespace(agent_backend="claude-code", agent_backend_config={}),
             client=SimpleNamespace(_bot_config={}),
+            config_resolver=SimpleNamespace(
+                resolve_config_setting=lambda key: SimpleNamespace(value=scope),
+            ),
         )
 
     def test_thread_with_stored_key_gets_no_seed(self):
@@ -274,7 +405,11 @@ class TestScopedSeedDecision:
         assert (
             maybe_build_session_seed(
                 self._llm_bawt(), "byte", "m", "hello", None,
-                thread_binding={"thread_session_id": "t-1", "thread_resume_id": "sid-1"},
+                thread_binding={
+                    "thread_session_id": "t-1",
+                    "thread_resume_id": "sid-1",
+                    "explicit_thread": True,
+                },
             )
             is None
         )
@@ -291,10 +426,38 @@ class TestScopedSeedDecision:
         monkeypatch.setattr(history_routes, "build_context_seed", _fake_seed)
         out = history_routes.maybe_build_session_seed(
             self._llm_bawt(), "byte", "m", "hello", None,
-            thread_binding={"thread_session_id": "t-1"},
+            thread_binding={"thread_session_id": "t-1", "explicit_thread": True},
         )
         assert out == [{"role": "user", "content": "x"}]
         assert captured["session_id"] == "t-1"
+
+    def test_cold_active_thread_builds_seed(self, monkeypatch):
+        from llm_bawt.service.routes import history as history_routes
+
+        captured = {}
+
+        def _fake_seed(bot_id, model, service, session_id=None):
+            captured["session_id"] = session_id
+            return {"messages": [{"role": "summary", "content": "prior"}]}
+
+        monkeypatch.setattr(history_routes, "build_context_seed", _fake_seed)
+        out = history_routes.maybe_build_session_seed(
+            self._llm_bawt(), "byte", "m", "hello", None,
+            thread_binding={"thread_session_id": "active-1"},
+        )
+        assert out == [{"role": "summary", "content": "prior"}]
+        assert captured["session_id"] == "active-1"
+
+    def test_warm_active_thread_does_not_double_seed(self):
+        from llm_bawt.service.routes.history import maybe_build_session_seed
+
+        assert maybe_build_session_seed(
+            self._llm_bawt(), "byte", "m", "hello", None,
+            thread_binding={
+                "thread_session_id": "active-1",
+                "thread_resume_id": "sdk-active",
+            },
+        ) is None
 
     def test_unbound_turn_ignores_scoped_branch(self):
         from llm_bawt.service.routes.history import maybe_build_session_seed
@@ -386,14 +549,15 @@ class TestAgentKeyEndpointLiveDB:
             )
         )
 
-    def test_put_stores_canonical_and_legacy_keys(self, live_thread):
+    def test_put_stores_canonical_key_and_model(self, live_thread):
         out = self._put(live_thread)
         assert out["stored"] is True
         row = live_thread.manager.get_session(live_thread.thread_id)
         meta = row["session_metadata"]
         assert meta["agent_session_keys"]["claude_code"] == "sid-live-1"
-        assert meta["provider_session_id"] == "sid-live-1"
-        assert meta["provider_session_model"] == "m1"
+        assert meta["agent_session_key_models"]["claude_code"] == "m1"
+        assert "provider_session_id" not in meta
+        assert "provider_session_model" not in meta
 
     def test_resolver_round_trip(self, live_thread):
         self._put(live_thread, key="sid-live-2")
@@ -403,13 +567,38 @@ class TestAgentKeyEndpointLiveDB:
             == "sid-live-2"
         )
 
-    def test_second_backend_merges_not_replaces(self, live_thread):
-        self._put(live_thread, key="sid-cc")
-        self._put(live_thread, backend="codex", key="sid-cx")
+    def test_second_backend_merges_keys_and_models(self, live_thread):
+        self._put(live_thread, key="sid-cc", model="claude-model")
+        self._put(
+            live_thread, backend="codex", key="sid-cx", model="codex-model"
+        )
         row = live_thread.manager.get_session(live_thread.thread_id)
-        keys = row["session_metadata"]["agent_session_keys"]
-        assert keys["claude_code"] == "sid-cc"
-        assert keys["codex"] == "sid-cx"
+        meta = row["session_metadata"]
+        assert meta["agent_session_keys"] == {
+            "claude_code": "sid-cc",
+            "codex": "sid-cx",
+        }
+        assert meta["agent_session_key_models"] == {
+            "claude_code": "claude-model",
+            "codex": "codex-model",
+        }
+        assert (
+            resolve_agent_session_key(meta, "claude-code", "claude-model")
+            == "sid-cc"
+        )
+        assert resolve_agent_session_key(meta, "codex", "codex-model") == "sid-cx"
+
+    def test_replacing_key_without_model_clears_old_model_gate(self, live_thread):
+        self._put(live_thread, key="sid-modeled", model="model-a")
+        self._put(live_thread, key="sid-unmodeled", model="")
+        row = live_thread.manager.get_session(live_thread.thread_id)
+        meta = row["session_metadata"]
+        assert meta["agent_session_keys"]["claude_code"] == "sid-unmodeled"
+        assert "claude_code" not in meta["agent_session_key_models"]
+        assert (
+            resolve_agent_session_key(meta, "claude-code", "other-model")
+            == "sid-unmodeled"
+        )
 
     def test_routing_key_rejected(self, live_thread):
         from fastapi import HTTPException

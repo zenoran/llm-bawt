@@ -2643,10 +2643,9 @@ class PostgreSQLShortTermManager:
     def update_session_metadata(self, session_id: str, patch: dict) -> bool:
         """Merge ``patch`` into a session row's ``session_metadata`` (jsonb).
 
-        TASK-284 step 15: backs the provider↔thread mirror — the durable DB
-        thread records which provider/SDK session hydrates it (e.g.
-        ``provider_session_id``). Shallow jsonb merge (``||``): existing keys
-        not in ``patch`` are preserved. Returns ``False`` when the row doesn't
+        Backs canonical per-thread SDK identity/model maps. Shallow jsonb
+        merge (``||``): existing top-level keys not in ``patch`` are preserved.
+        Returns ``False`` when the row doesn't
         exist or the update fails; never raises.
         """
         if not session_id or not patch:

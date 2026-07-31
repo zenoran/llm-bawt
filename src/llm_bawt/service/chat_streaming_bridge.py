@@ -196,58 +196,124 @@ class ChatStreamingBridgeMixin:
             log.warning("thread_switched publish failed for %s: %s", bot_id, e)
 
     def _bind_agent_thread(self, llm_bawt, request) -> dict | None:
-        """TASK-252: resolve the per-thread SDK binding for an explicit-thread turn.
+        """Resolve the per-thread SDK binding for an explicit-thread turn.
 
-        When a claude-code agent turn carries an explicit ``session_id`` (a
-        thread the user opened in the UI), resolve THAT thread's stored SDK
-        session key so the bridge resumes the thread's own transcript instead
-        of the bot's scalar (active) session. Returns a REQUEST-LOCAL dict
-        (never stored on the shared cached client — concurrent turns must not
-        cross-bind):
+        When a claude-code/codex agent turn carries an explicit ``session_id``
+        (a thread the user opened in the UI), resolve THAT thread's stored SDK
+        session key so the bridge resumes the thread's own transcript.
+
+        Returns a REQUEST-LOCAL dict (never stored on the shared cached client
+        — concurrent turns must not cross-bind):
 
         - ``thread_session_id``: the durable bawthub thread id;
         - ``thread_resume_id``: the SDK session id stored for it (absent when
           the thread has none — the bridge then cold-starts + seeds and writes
-          the minted id back via PUT /v1/sessions/{id}/agent-session-key).
+          the minted id back via PUT /v1/sessions/{id}/agent-session-key);
+        - ``explicit_thread``: True — the user chose this thread in the UI.
 
-        Returns None for unscoped turns and non-claude-code bots. Shared by
+        Returns None for unscoped turns and non-agent bots. Shared by
         BOTH dispatch paths so they cannot drift. Never raises.
         """
         try:
-            if (getattr(llm_bawt.bot, "agent_backend", "") or "") != "claude-code":
+            backend_name = (getattr(llm_bawt.bot, "agent_backend", "") or "").strip()
+            if backend_name not in ("claude-code", "codex"):
                 return None
             sid = getattr(request, "session_id", None)
             sid = sid.strip() if isinstance(sid, str) and sid.strip() else None
             if not sid:
                 return None
-            binding: dict = {"thread_session_id": sid}
-            backend = getattr(llm_bawt.history_manager, "_db_backend", None)
-            get_sess = getattr(backend, "get_session", None) if backend else None
-            row = get_sess(sid) if callable(get_sess) else None
-            if not row:
-                # Route-level validation already proved the thread exists; a
-                # miss here (backend without get_session) just means no
-                # resume — the bridge cold-starts + seeds scoped context.
-                log.warning("Thread binding: no session row for %s (cold-start)", sid)
-                return binding
-            from .routes.sessions import resolve_agent_session_key
-
-            bc = getattr(getattr(llm_bawt, "client", None), "_bot_config", None) or {}
-            resume = resolve_agent_session_key(
-                row.get("session_metadata") or {},
-                "claude-code",
-                str(bc.get("model") or "").strip() or None,
-            )
-            if resume:
-                binding["thread_resume_id"] = resume
-            log.info(
-                "Agent thread bound: thread=%s resume=%s",
-                sid, resume or "none (cold-start)",
-            )
-            return binding
+            binding: dict = {"thread_session_id": sid, "explicit_thread": True}
+            return self._resolve_thread_sdk_key(llm_bawt, binding, backend_name)
         except Exception as e:
             log.warning("Agent thread binding failed: %s", e)
             return None
+
+    def _resolve_active_thread_binding(self, llm_bawt) -> dict | None:
+        """Resolve the ACTIVE thread's SDK binding for an unscoped turn.
+
+        TASK-638: per-thread keys are canonical — every turn (not just
+        explicit-thread ones) resolves its SDK session from the thread, never
+        from the bot's scalar ``agent_backend_config.session_key``. Called
+        AFTER ``_maybe_rotate_agent_session`` so a ``/new`` rotation has
+        already landed and the active thread is the correct (possibly fresh)
+        one.
+
+        Returns a binding dict with ``thread_session_id`` +
+        ``thread_resume_id`` (if the thread has one), or None on error.
+        ``explicit_thread`` is absent (falsy) — the bridge uses this to gate
+        ``/new`` processing (explicit threads never process ``/new``).
+        """
+        try:
+            backend_name = (getattr(llm_bawt.bot, "agent_backend", "") or "").strip()
+            if backend_name not in ("claude-code", "codex"):
+                return None
+            bot_id = getattr(llm_bawt.bot, "slug", None) or getattr(llm_bawt.bot, "name", "")
+            user_id = getattr(llm_bawt, "user_id", None) or ""
+            db_backend = getattr(llm_bawt.history_manager, "_db_backend", None)
+            get_active = getattr(db_backend, "get_active_session", None) if db_backend else None
+            if not callable(get_active):
+                log.warning("Active-thread binding: no get_active_session on backend")
+                return None
+            row = get_active(bot_id=bot_id, user_id=user_id)
+            if not row:
+                # Binding is resolved before the worker persists the user row.
+                # On a first-ever turn there is therefore no active thread yet,
+                # but the bridge still needs a durable write-back target for the
+                # SDK session it is about to mint. Create that target now.
+                get_or_create = getattr(
+                    db_backend, "get_or_create_active_session", None
+                )
+                if not callable(get_or_create):
+                    log.warning(
+                        "Active-thread binding: no active thread or creator for %s/%s",
+                        bot_id, user_id,
+                    )
+                    return None
+                sid = get_or_create(bot_id=bot_id, user_id=user_id)
+                if not sid:
+                    return None
+                log.info(
+                    "Active-thread binding: created fresh thread %s for %s/%s",
+                    sid, bot_id, user_id,
+                )
+                return {"thread_session_id": str(sid)}
+            sid = row.get("id")
+            if not sid:
+                return None
+            binding: dict = {"thread_session_id": str(sid)}
+            return self._resolve_thread_sdk_key(llm_bawt, binding, backend_name)
+        except Exception as e:
+            log.warning("Active-thread binding failed: %s", e)
+            return None
+
+    def _resolve_thread_sdk_key(
+        self, llm_bawt, binding: dict, backend_name: str,
+    ) -> dict:
+        """Populate ``thread_resume_id`` on a binding dict from the thread's
+        stored ``agent_session_keys``. Shared by explicit and active paths."""
+        sid = binding["thread_session_id"]
+        db_backend = getattr(llm_bawt.history_manager, "_db_backend", None)
+        get_sess = getattr(db_backend, "get_session", None) if db_backend else None
+        row = get_sess(sid) if callable(get_sess) else None
+        if not row:
+            log.warning("Thread SDK key resolve: no session row for %s (cold-start)", sid)
+            return binding
+        from .routes.sessions import resolve_agent_session_key
+
+        bc = getattr(getattr(llm_bawt, "client", None), "_bot_config", None) or {}
+        resume = resolve_agent_session_key(
+            row.get("session_metadata") or {},
+            backend_name,
+            str(bc.get("model") or "").strip() or None,
+        )
+        if resume:
+            binding["thread_resume_id"] = resume
+        log.info(
+            "Agent thread bound: thread=%s resume=%s explicit=%s",
+            sid, resume or "none (cold-start)",
+            bool(binding.get("explicit_thread")),
+        )
+        return binding
 
     def _maybe_summarize_on_new(
         self, llm_bawt, bot_id: str, user_prompt: str,
@@ -276,8 +342,8 @@ class ChatStreamingBridgeMixin:
         try:
             if not (user_prompt or "").lstrip().startswith("/new"):
                 return False
-            if thread_binding and thread_binding.get("thread_session_id"):
-                log.info("/new summarize skipped: thread-bound turn (bot=%s)", bot_id)
+            if thread_binding and thread_binding.get("explicit_thread"):
+                log.info("/new summarize skipped: explicit-thread turn (bot=%s)", bot_id)
                 return False
             from ..utils.history import scope_flags
             try:
@@ -298,7 +364,11 @@ class ChatStreamingBridgeMixin:
             if backend is None:
                 log.info("/new summarize skipped: no db backend (bot=%s)", bot_id)
                 return False
-            session_id = str(getattr(backend, "_current_session_id", "") or "")
+            session_id = str(
+                (thread_binding or {}).get("thread_session_id")
+                or getattr(backend, "_current_session_id", "")
+                or ""
+            )
             if not session_id:
                 # MCP server mode: _db_backend is the _MCPShortTermManager
                 # proxy, which keeps no local session cache — resolve the
@@ -390,10 +460,10 @@ class ChatStreamingBridgeMixin:
         try:
             if not (user_prompt or "").lstrip().startswith("/new"):
                 return False
-            # TASK-252: a turn explicitly bound to a thread never rotates —
-            # "/new" inside an opened old thread is treated as plain text
-            # rather than silently rotating the user's ACTIVE thread.
-            if thread_binding and thread_binding.get("thread_session_id"):
+            # A turn explicitly bound to a user-selected thread never rotates —
+            # "/new" inside an opened old thread is treated as plain text.
+            # Active-thread bindings are normal and MUST still rotate.
+            if thread_binding and thread_binding.get("explicit_thread"):
                 log.warning(
                     "Skipping /new rotation: turn is bound to thread %s",
                     thread_binding.get("thread_session_id"),

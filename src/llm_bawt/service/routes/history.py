@@ -1873,26 +1873,30 @@ def maybe_build_session_seed(
     the bridge via ``inject_messages``, or None when no seed should attach:
     non-claude-code backend, continuity off, or a warm session that isn't a
     ``/new``. Never raises — any failure yields None. This is the SOLE seed
-    authority (TASK-615/501 Phase 2): the bridge no longer self-fetches a seed,
-    so None here means the fresh session simply opens unseeded.
+    payload authority (TASK-615/501 Phase 2): the app decides what continuity
+    context is injected; the bridge only hydrates the fresh SDK transcript.
     """
     try:
         if (getattr(llm_bawt.bot, "agent_backend", "") or "") != "claude-code":
             return None
-        # TASK-252: explicit-thread turn (user opened a past conversation).
-        # Orthogonal to the continuity toggle — this is hydration of a
-        # selected thread, not cross-session carry. ``thread_binding`` is the
-        # REQUEST-LOCAL dict the dispatch's _bind_agent_thread resolved.
         _binding = thread_binding or {}
         _thread_id = str(_binding.get("thread_session_id") or "").strip()
-        if _thread_id:
-            if str(_binding.get("thread_resume_id") or "").strip():
-                # Thread has its own SDK session — the bridge resumes it;
-                # seeding too would double-inject the transcript.
+        _resume_id = str(_binding.get("thread_resume_id") or "").strip()
+        _explicit = bool(_binding.get("explicit_thread"))
+        _is_new = (user_prompt or "").lstrip().startswith("/new")
+
+        # A user-opened historical thread is hydration, not cross-session
+        # carry. Resume its SDK transcript when present; otherwise seed from
+        # that thread regardless of the active conversation's continuity
+        # setting.
+        if _explicit:
+            if _resume_id:
+                return None
+            if not _thread_id:
                 return None
             seed = build_context_seed(bot_id, model, service, session_id=_thread_id)
             return seed.get("messages") or None
-        bc = getattr(llm_bawt.bot, "agent_backend_config", None) or {}
+
         # Derive continuity from history_scope directly — NOT from the
         # separate session_memory_continuity mirror. The UI writes
         # history_scope FIRST; reading the mirror (written second) created
@@ -1911,14 +1915,18 @@ def maybe_build_session_seed(
             continuity_on = False
         if not continuity_on:
             return None
-        # Mirror bridge _get_session: a value with ":" is a legacy routing key,
-        # not a real SDK session id.
-        _sk = bc.get("session_key") or ""
-        _has_session = bool(_sk) and ":" not in _sk
-        _is_new = (user_prompt or "").lstrip().startswith("/new")
-        if not (_is_new or not _has_session):
+
+        # Warm active thread: the bridge resumes its canonical per-thread SDK
+        # transcript, so injecting history again would duplicate context.
+        if _resume_id and not _is_new:
             return None
-        seed = build_context_seed(bot_id, model, service)
+
+        # Cold active thread (first turn/model switch) or /new: seed from the
+        # outgoing/current durable thread. The app rotates /new only AFTER this
+        # payload is built, then rebinds the bridge command to the fresh thread.
+        seed = build_context_seed(
+            bot_id, model, service, session_id=_thread_id or None,
+        )
         return seed.get("messages") or None
     except Exception:
         return None

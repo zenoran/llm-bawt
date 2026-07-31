@@ -75,78 +75,15 @@ class ClaudeSessionMixin:
     on the assembled instance.
     """
 
-    async def _get_session(self, bot_id: str) -> tuple[str, str] | None:
-        """Get (sdk_session_id, model) from bot's agent_backend_config."""
-        if not self._app_api_url:
-            return None
-        import httpx
-        try:
-            async with httpx.AsyncClient(timeout=5) as client:
-                resp = await client.get(f"{self._app_api_url}/v1/bots")
-                resp.raise_for_status()
-                for bot in resp.json().get("data", []):
-                    if bot.get("slug") == bot_id:
-                        bc = bot.get("agent_backend_config") or {}
-                        sk = bc.get("session_key")
-                        # session_model = bridge-owned record of which model
-                        # the persisted SDK session was created with (drives
-                        # resume-vs-reset). "model" is the pre-migration key.
-                        model = bc.get("session_model") or bc.get("model", "")
-                        if sk:
-                            sk = str(sk).strip()
-                            # Guard against legacy bug where routing keys
-                            # like "snark:nick" were stored as SDK session ids.
-                            if ":" in sk:
-                                logger.warning("Ignoring invalid persisted session_key for %s: %s", bot_id, sk)
-                                return None
-                            return (sk, model)
-                        return None
-        except Exception as e:
-            logger.warning("Failed to get session for %s: %s", bot_id, e)
-        return None
-
-    async def _set_session(self, bot_id: str, sdk_session_id: str, model: str) -> None:
-        """Write SDK session_id back to bot's agent_backend_config via PATCH."""
-        if not self._app_api_url:
-            logger.warning("No API URL — session not persisted for %s", bot_id)
-            return
-        import httpx
-        try:
-            async with httpx.AsyncClient(timeout=5) as client:
-                # Fetch current config to merge session_key in
-                resp = await client.get(f"{self._app_api_url}/v1/bots")
-                resp.raise_for_status()
-                bc = {}
-                for bot in resp.json().get("data", []):
-                    if bot.get("slug") == bot_id:
-                        bc = dict(bot.get("agent_backend_config") or {})
-                        break
-                bc["session_key"] = sdk_session_id
-                # Bridge-owned session metadata. The user-facing model lives
-                # on the bot's default_model (catalog alias); "model" is no
-                # longer accepted in agent_backend_config by the profile API.
-                bc.pop("model", None)
-                bc["session_model"] = model
-
-                patch_response = await client.patch(
-                    f"{self._app_api_url}/v1/bots/{bot_id}/profile",
-                    json={"agent_backend_config": bc},
-                )
-                patch_response.raise_for_status()
-            logger.info("Session persisted: %s -> %s", bot_id, sdk_session_id)
-        except Exception as e:
-            logger.warning("Failed to persist session for %s: %s", bot_id, e)
-
     async def _set_thread_session(
         self, thread_session_id: str, bot_id: str, sdk_session_id: str, model: str,
     ) -> None:
-        """TASK-252: persist an SDK session id onto its bawthub thread.
+        """Persist an SDK session id onto its bawthub thread.
 
-        Per-thread write-back for explicit-thread (scoped) turns — the
-        counterpart of ``_set_session``, targeting
-        ``sessions.session_metadata.agent_session_keys`` instead of the bot's
-        scalar ``agent_backend_config.session_key`` (which belongs to the
-        continuous conversation and must never be clobbered by a scoped turn).
+        Writes to ``sessions.session_metadata.agent_session_keys`` via the
+        app's ``PUT /v1/sessions/{id}/agent-session-key`` endpoint. This is
+        the ONLY session-key write path (TASK-638); the scalar
+        ``agent_backend_config.session_key`` is retired.
         """
         if not self._app_api_url:
             logger.warning(
@@ -175,35 +112,6 @@ class ClaudeSessionMixin:
                 "Failed to persist thread session for %s/%s: %s",
                 bot_id, thread_session_id, e,
             )
-
-    async def _clear_session(self, bot_id: str) -> bool:
-        """Remove session_key from bot's agent_backend_config via PATCH."""
-        if not self._app_api_url:
-            return False
-        import httpx
-        try:
-            async with httpx.AsyncClient(timeout=5) as client:
-                resp = await client.get(f"{self._app_api_url}/v1/bots")
-                resp.raise_for_status()
-                bc = {}
-                had_session = False
-                for bot in resp.json().get("data", []):
-                    if bot.get("slug") == bot_id:
-                        bc = dict(bot.get("agent_backend_config") or {})
-                        had_session = "session_key" in bc
-                        bc.pop("session_key", None)
-                        break
-
-                patch_response = await client.patch(
-                    f"{self._app_api_url}/v1/bots/{bot_id}/profile",
-                    json={"agent_backend_config": bc},
-                )
-                patch_response.raise_for_status()
-                logger.info("Session cleared: %s (had_session=%s)", bot_id, had_session)
-                return had_session
-        except Exception as e:
-            logger.warning("Failed to clear session for %s: %s", bot_id, e)
-            return False
 
     async def _get_mcp_tool_context(self, bot_slug: str) -> str:
         """Return the MCP tool context block for a bot (TASK-490).
@@ -396,15 +304,11 @@ class ClaudeSessionMixin:
         try:
             session_id = str(uuid.uuid4())
             self._write_seed_transcript(session_id, messages)
-            # TASK-252: a scoped (explicit-thread) seed persists to the
-            # thread's own key map; the bot's scalar session_key stays
-            # untouched so the continuous conversation is unharmed.
+            # Persist the minted SDK session id onto the thread.
             if thread_session_id:
                 await self._set_thread_session(
                     thread_session_id, bot_id, session_id, model,
                 )
-            else:
-                await self._set_session(bot_id, session_id, model)
         except Exception as e:
             logger.warning("Seed write/persist failed for %s: %s", bot_id, e)
             return {"seeded": False, "reason": f"seed write failed: {e}"}

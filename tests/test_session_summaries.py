@@ -177,8 +177,30 @@ class TestMaybeSummarizeOnNew:
     def test_thread_bound_turn_is_noop(self):
         assert _Bridge()._maybe_summarize_on_new(
             _llm(), "byte", "/new",
-            thread_binding={"thread_session_id": "old-thread"},
+            thread_binding={
+                "thread_session_id": "old-thread", "explicit_thread": True,
+            },
         ) is False
+
+    def test_active_thread_binding_still_summarizes_that_thread(self, monkeypatch):
+        calls = {}
+
+        class _FakeSummarizer:
+            def __init__(self, config, bot_id, summarize_fn=None, **kw):
+                pass
+
+            def summarize_thread(self, session_id, protect_recent_turns=False, **kw):
+                calls["session_id"] = session_id
+                return {"summaries_created": 1, "messages_summarized": 2, "errors": []}
+
+        import llm_bawt.memory.summarization as summod
+        monkeypatch.setattr(summod, "HistorySummarizer", _FakeSummarizer)
+
+        assert _Bridge()._maybe_summarize_on_new(
+            _llm(), "byte", "/new",
+            thread_binding={"thread_session_id": "active-bound-thread"},
+        ) is True
+        assert calls == {"session_id": "active-bound-thread"}
 
     @pytest.mark.parametrize("scope", ["inline", "none"])
     def test_summaryless_scope_is_noop(self, scope):

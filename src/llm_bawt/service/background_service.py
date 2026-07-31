@@ -361,13 +361,14 @@ class BackgroundService(
                     _sid.strip() if isinstance(_sid, str) and _sid.strip() else None
                 )
 
-                # TASK-252: resolve the turn's explicit-thread binding (if
-                # any) BEFORE the seed decision — the scoped seed branch
-                # consumes it. REQUEST-LOCAL (kwarg channel, never shared
-                # instance state). SAME shared helper as the streaming path.
-                thread_binding = (
-                    self._bind_agent_thread(llm_bawt, request) if _is_agent else None
-                )
+                # Resolve the request-local thread binding before seed
+                # assembly. Explicit selection wins; otherwise bind the current
+                # ACTIVE thread so all resume decisions use canonical metadata.
+                thread_binding = None
+                if _is_agent:
+                    thread_binding = self._bind_agent_thread(llm_bawt, request)
+                    if thread_binding is None:
+                        thread_binding = self._resolve_active_thread_binding(llm_bawt)
 
                 # Prepare messages with history and memory context
                 prepared_messages = llm_bawt.prepare_messages_for_query(user_prompt, message_id=trigger_message_id)
@@ -375,13 +376,7 @@ class BackgroundService(
                 # Log what we're sending to the LLM (verbose mode)
                 log.llm_context(prepared_messages)
 
-                # TASK-501: pre-assemble the fresh-session seed and push it to
-                # the bridge (inject_messages) — SAME shared helper the streaming
-                # path uses, so non-streaming stays consistent (no callback).
-                # TASK-641: on /new, summarize the OUTGOING thread FIRST so
-                # the seed below carries a fresh summary of the ending
-                # conversation (bounded; no-op unless /new + scope carries
-                # summaries). SAME shared helper as the streaming path.
+                # Summarize outgoing thread on /new, build seed, rotate.
                 self._maybe_summarize_on_new(
                     llm_bawt, bot_id, user_prompt, thread_binding=thread_binding
                 )
@@ -390,16 +385,20 @@ class BackgroundService(
                     llm_bawt, bot_id, model_alias, user_prompt, self,
                     thread_binding=thread_binding,
                 )
-                # TASK-284: an agent /new rotates the durable DB thread —
-                # AFTER the seed is built so the seed captured the outgoing
-                # thread's raw messages (session-scoped load reads the active
-                # thread; rotating first emptied every inline-history seed).
-                # SAME shared helper as the streaming path so the two
-                # dispatch routes stay consistent.
                 if _is_agent:
                     self._maybe_rotate_agent_session(
                         llm_bawt, bot_id, user_prompt, thread_binding=thread_binding
                     )
+
+                # An unscoped /new rotated away from the outgoing binding.
+                # Rebind to the fresh active thread for bridge write-back.
+                if (
+                    _is_agent
+                    and thread_binding
+                    and not thread_binding.get("explicit_thread")
+                    and (user_prompt or "").lstrip().startswith("/new")
+                ):
+                    thread_binding = self._resolve_active_thread_binding(llm_bawt)
 
                 # Execute the query with prepared messages
                 response, tool_context, tool_call_details = llm_bawt.execute_llm_query(

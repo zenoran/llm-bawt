@@ -76,91 +76,43 @@ class CodexSessionMixin:
         cache[bot_slug] = rendered
         return rendered
 
-    async def _get_session(self, bot_id: str) -> tuple[str, str] | None:
-        """Get (thread_id, model) from the bot's agent_backend_config."""
-        if not self._app_api_url or not bot_id:
-            return None
-        try:
-            async with httpx.AsyncClient(timeout=5) as client:
-                resp = await client.get(f"{self._app_api_url}/v1/bots")
-                resp.raise_for_status()
-                for bot in resp.json().get("data", []):
-                    if bot.get("slug") == bot_id:
-                        bc = bot.get("agent_backend_config") or {}
-                        sk = bc.get("session_key")
-                        # session_model = bridge-owned record of which model
-                        # the persisted thread was created with (drives
-                        # resume-vs-reset). "model" is the pre-migration key.
-                        model = bc.get("session_model") or bc.get("model", "")
-                        if sk:
-                            sk = str(sk).strip()
-                            if ":" in sk:
-                                # Legacy bug: routing keys like "snark:nick"
-                                # were once stored as session ids. Reject.
-                                logger.warning(
-                                    "Ignoring invalid persisted session_key for %s: %s",
-                                    bot_id, sk,
-                                )
-                                return None
-                            return (sk, model)
-                        return None
-        except Exception as e:
-            logger.warning("Failed to get session for %s: %s", bot_id, e)
-        return None
+    async def _set_thread_session(
+        self, thread_session_id: str, bot_id: str, sdk_session_id: str, model: str,
+    ) -> None:
+        """Persist an SDK session id onto its bawthub thread.
 
-    async def _set_session(self, bot_id: str, thread_id: str, model: str) -> None:
-        if not self._app_api_url or not bot_id:
-            logger.warning("No API URL or bot_id — session not persisted")
+        Writes to ``sessions.session_metadata.agent_session_keys`` via the
+        app's ``PUT /v1/sessions/{id}/agent-session-key`` endpoint. This is
+        the ONLY session-key write path (TASK-638); the scalar
+        ``agent_backend_config.session_key`` is retired.
+        """
+        if not self._app_api_url:
+            logger.warning(
+                "No API URL — thread session not persisted for %s/%s",
+                bot_id, thread_session_id,
+            )
             return
         try:
             async with httpx.AsyncClient(timeout=5) as client:
-                resp = await client.get(f"{self._app_api_url}/v1/bots")
-                resp.raise_for_status()
-                bc: dict = {}
-                for bot in resp.json().get("data", []):
-                    if bot.get("slug") == bot_id:
-                        bc = dict(bot.get("agent_backend_config") or {})
-                        break
-                bc["session_key"] = thread_id
-                # Bridge-owned session metadata. The user-facing model lives
-                # on the bot's default_model (catalog alias); "model" is no
-                # longer accepted in agent_backend_config by the profile API.
-                bc.pop("model", None)
-                bc["session_model"] = model
-                patch_response = await client.patch(
-                    f"{self._app_api_url}/v1/bots/{bot_id}/profile",
-                    json={"agent_backend_config": bc},
+                resp = await client.put(
+                    f"{self._app_api_url}/v1/sessions/{thread_session_id}/agent-session-key",
+                    params={"bot_id": bot_id},
+                    json={
+                        "backend": "codex",
+                        "session_key": sdk_session_id,
+                        "model": model,
+                    },
                 )
-                patch_response.raise_for_status()
-            logger.info("Session persisted: %s -> %s", bot_id, thread_id)
-        except Exception as e:
-            logger.warning("Failed to persist session for %s: %s", bot_id, e)
-
-    async def _clear_session(self, bot_id: str) -> bool:
-        if not self._app_api_url or not bot_id:
-            return False
-        try:
-            async with httpx.AsyncClient(timeout=5) as client:
-                resp = await client.get(f"{self._app_api_url}/v1/bots")
                 resp.raise_for_status()
-                bc: dict = {}
-                had_session = False
-                for bot in resp.json().get("data", []):
-                    if bot.get("slug") == bot_id:
-                        bc = dict(bot.get("agent_backend_config") or {})
-                        had_session = "session_key" in bc
-                        bc.pop("session_key", None)
-                        break
-                patch_response = await client.patch(
-                    f"{self._app_api_url}/v1/bots/{bot_id}/profile",
-                    json={"agent_backend_config": bc},
-                )
-                patch_response.raise_for_status()
-                logger.info("Session cleared: %s (had_session=%s)", bot_id, had_session)
-                return had_session
+            logger.info(
+                "Thread session persisted: %s thread=%s -> %s",
+                bot_id, thread_session_id, sdk_session_id,
+            )
         except Exception as e:
-            logger.warning("Failed to clear session for %s: %s", bot_id, e)
-            return False
+            logger.warning(
+                "Failed to persist thread session for %s/%s: %s",
+                bot_id, thread_session_id, e,
+            )
 
     async def _bot_uses_codex(self, bot_id: str) -> bool:
         """Look up a bot's agent_backend; return True only if it's codex.
@@ -171,9 +123,6 @@ class CodexSessionMixin:
         claude-code / openclaw bots — a cross-backend interference bug.
         """
         if not self._app_api_url or not bot_id:
-            # No way to verify — fall through to legacy behavior. The
-            # operations the RPC triggers (clear_session, signal_cancel)
-            # are no-ops on unknown bots/sessions anyway.
             return True
         try:
             async with httpx.AsyncClient(timeout=5) as client:
@@ -184,8 +133,6 @@ class CodexSessionMixin:
                         return (bot.get("agent_backend") or "") == self._backend_name
         except Exception as e:
             logger.debug("agent_backend lookup failed for %s: %s", bot_id, e)
-            # On lookup failure, default to True so we don't drop our own
-            # RPCs because the API blipped.
             return True
         # Bot not found — definitely not ours.
         return False

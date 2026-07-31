@@ -898,6 +898,25 @@ async def get_active_session(
     return await storage.get_active_session(bot_id=bot_id, user_id=user_id)
 
 
+@mcp.tool(name="sessions_get_or_create_active")
+async def get_or_create_active_session(
+    bot_id: str = "default", user_id: str | None = None,
+) -> str:
+    """Return the active thread id for a (bot, user), creating one if absent.
+
+    Used by agent dispatch before bridge execution so a first-ever SDK session
+    has a durable thread target for its write-back.
+    """
+    logger.debug(
+        "MCP tool invoked: sessions_get_or_create_active bot_id=%s user_id=%s",
+        bot_id, user_id,
+    )
+    storage = _get_storage()
+    return await storage.get_or_create_active_session(
+        bot_id=bot_id, user_id=user_id,
+    )
+
+
 @mcp.tool(name="sessions_rotate")
 async def rotate_session(bot_id: str = "default", user_id: str | None = None) -> str:
     """Non-destructively rotate the active thread for a (bot, user).

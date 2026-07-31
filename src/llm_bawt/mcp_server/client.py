@@ -658,6 +658,19 @@ class MemoryClient:
         storage = self._get_storage()
         return _run_async(storage.get_session(session_id, bot_id=self.bot_id))
 
+    def get_or_create_active_session(self) -> str:
+        """Return this (bot, user)'s active thread id, creating one if absent."""
+        self._ensure_initialized()
+        if self.server_url:
+            return str(self._call_server(
+                "sessions_get_or_create_active",
+                {"bot_id": self.bot_id, "user_id": self.user_id},
+            ))
+        storage = self._get_storage()
+        return str(_run_async(storage.get_or_create_active_session(
+            bot_id=self.bot_id, user_id=self.user_id,
+        )))
+
     def rotate_session(self) -> str | None:
         """Non-destructively rotate this (bot, user)'s active thread.
 
@@ -1430,8 +1443,25 @@ class _MCPShortTermManager:
         return merged
 
     def get_session(self, session_id: str) -> dict | None:
-        """TASK-252: one session row by id (per-thread SDK-key resolution)."""
+        """Return one session row by id for per-thread SDK-key resolution."""
         return self._memory_client.get_session(session_id)
+
+    def get_active_session(
+        self, bot_id: str | None = None, user_id: str | None = None,
+    ) -> dict | None:
+        """Return this adapter's active thread.
+
+        Optional arguments keep parity with the embedded manager; ownership is
+        already bound into ``MemoryClient`` and mismatched overrides are not
+        used by the app's request-local history manager.
+        """
+        return self._memory_client.get_active_session()
+
+    def get_or_create_active_session(
+        self, bot_id: str | None = None, user_id: str | None = None,
+    ) -> str:
+        """Return/create this adapter's active thread for SDK write-back."""
+        return self._memory_client.get_or_create_active_session()
 
     def rotate_session(self) -> str | None:
         """TASK-284 step 14: rotate the active thread (backs v2 chatbot /new)."""

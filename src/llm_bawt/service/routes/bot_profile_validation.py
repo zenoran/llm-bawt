@@ -79,20 +79,12 @@ def _normalize_agent_backend_config_model(
     agent_backend: str,
     payload: dict[str, object],
 ) -> None:
-    """Mirror the legacy ``agent_backend_config.model`` key on save.
+    """Mirror a legacy ``agent_backend_config.model`` key on profile save.
 
-    ``default_model`` is the single canonical model reference; the bridges
-    persist their session metadata under ``session_model``. Any ``model``
-    key arriving here is either a stale UI payload or an old (pre-rename)
-    bridge ``_set_session`` PATCH — in both cases the value is session
-    metadata, so it's MIRRORED to ``session_model`` rather than rejected.
-
-    The legacy ``model`` key is deliberately KEPT (not popped): bridges that
-    haven't been restarted onto the renamed key still read it to decide
-    session resume-vs-reset, so stripping it here would reset every agent
-    session on the next turn. New (post-rename) bridge code pops ``model``
-    on its first ``_set_session`` persist, so the key self-cleans once each
-    bridge restarts. Empty/non-string values ARE dropped.
+    ``default_model`` is canonical. Historical UI/config payloads may still
+    carry ``model``; preserve compatibility by mirroring a non-empty value to
+    ``session_model`` rather than rejecting the whole profile. Empty/non-string
+    values are dropped. Agent bridges no longer read or write this metadata.
     """
     if agent_backend not in _CATALOG_MODEL_BACKENDS:
         return
@@ -105,7 +97,7 @@ def _normalize_agent_backend_config_model(
         config["session_model"] = legacy.strip()
         logger.warning(
             "bot %s: mirrored legacy agent_backend_config.model=%r to "
-            "session_model (kept for un-restarted bridges) — the bot's "
+            "session_model for profile compatibility — the bot's "
             "model is configured via default_model",
             payload.get("slug"), legacy,
         )

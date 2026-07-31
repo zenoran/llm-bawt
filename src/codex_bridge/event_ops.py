@@ -235,6 +235,7 @@ class CodexEventMixin:
         session_persisted: bool,
         item_buffers: dict[str, dict[str, Any]],
         thread: Any,
+        thread_session_id: str | None = None,
     ) -> tuple[int, bool, Any]:
         """Translate a single ``ThreadEvent`` into OpenClawEvents.
 
@@ -252,8 +253,11 @@ class CodexEventMixin:
                     or self._dig(event, "thread", "id")
                     or getattr(thread, "id", None)
                 )
-                if thread_id:
-                    await self._set_session(bot_slug, str(thread_id), model)
+                if thread_id and thread_session_id:
+                    await self._set_thread_session(
+                        thread_session_id, bot_slug,
+                        str(thread_id), model,
+                    )
                     return seq, True, None
             return seq, False, None
 
@@ -598,6 +602,7 @@ class CodexEventMixin:
                     request_id, session_key, seq,
                     kind=AgentEventKind.TOOL_END,
                     tool_name="file_change",
+                    tool_arguments=_entry.get("args") or {},
                     tool_result=str(status),
                 )
             return seq

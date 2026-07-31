@@ -162,65 +162,50 @@ def agent_key_name(backend: str) -> str:
 def resolve_agent_session_key(
     meta: dict, backend: str, current_model: str | None = None
 ) -> str | None:
-    """Resolve the SDK session id stored for a thread + backend (TASK-252).
+    """Resolve the SDK session id stored for a thread + backend.
 
-    Read order:
-    1. canonical ``session_metadata.agent_session_keys[<backend>]``;
-    2. legacy TASK-284 mirror keys (``provider``/``provider_session_id``) when
-       the provider matches — one-release fallback, removal tracked separately.
+    Reads from ``session_metadata.agent_session_keys[<backend>]``.
 
     Guards: a value containing ``:`` is a routing key (openclaw / legacy bug),
-    never an SDK session id. When ``current_model`` is given and the thread
-    recorded a different ``provider_session_model``, returns None so the
-    caller cold-starts instead of resuming a transcript minted under another
-    model (mirrors the bridge's scalar model-change reset).
+    never an SDK session id. When ``current_model`` is given, the model stored
+    alongside this backend's key in ``agent_session_key_models`` is checked; a
+    mismatch returns None so the caller cold-starts instead of resuming a
+    transcript minted under another model.
     """
     meta = meta or {}
+    key_name = agent_key_name(backend)
     keys = meta.get("agent_session_keys") or {}
-    val = str(keys.get(agent_key_name(backend)) or "").strip()
-    if not val and str(meta.get("provider") or "").strip() == (backend or "").strip():
-        val = str(meta.get("provider_session_id") or "").strip()
+    val = str(keys.get(key_name) or "").strip()
     if not val or ":" in val:
         return None
-    # Model gate: provider_session_model is a SCALAR describing the provider
-    # named in meta["provider"] — apply it only when it describes THIS
-    # backend, or a second backend's model would wrongly veto the first's
-    # key (keys are per-backend; the model note is not).
-    stored_model = str(meta.get("provider_session_model") or "").strip()
-    if (
-        current_model
-        and stored_model
-        and stored_model != current_model
-        and str(meta.get("provider") or "").strip() == (backend or "").strip()
-    ):
-        return None
+    if current_model:
+        key_models = meta.get("agent_session_key_models") or {}
+        stored_model = str(key_models.get(key_name) or "").strip()
+        # One-release compatibility for rows written before model metadata
+        # became per-backend. The scalar describes only meta["provider"];
+        # never let another backend's model veto this key.
+        if not stored_model and str(meta.get("provider") or "").strip() == (backend or "").strip():
+            stored_model = str(meta.get("provider_session_model") or "").strip()
+        if stored_model and stored_model != current_model:
+            return None
     return val
 
 
 def _normalize_metadata(row: dict) -> dict:
     """Backfill-on-read: coerce ``session_metadata`` to the standard shape
-    (TASK-250) without force-writing anything back.
+    without force-writing anything back.
 
     Target shape::
 
         {title, title_source: user|auto|default,
-         agent_session_keys: {<provider>: sdk-id},
+         agent_session_keys: {<backend>: sdk-id},
          forked_from: {session_id, at_message_id} | None,
          archived_at}
-
-    Legacy keys (``provider``/``provider_session_id``/``provider_session_model``
-    from the TASK-284 mirror) are preserved verbatim alongside the derived
-    ``agent_session_keys`` view until TASK-252 makes the new home canonical.
     """
     meta = dict(row.get("session_metadata") or {})
     meta.setdefault("title", None)
     meta.setdefault("title_source", "user" if meta.get("title") else "default")
-    if "agent_session_keys" not in meta:
-        provider = str(meta.get("provider") or "").strip()
-        sid = str(meta.get("provider_session_id") or "").strip()
-        meta["agent_session_keys"] = (
-            {provider.replace("-", "_"): sid} if provider and sid else {}
-        )
+    meta.setdefault("agent_session_keys", {})
     meta.setdefault("forked_from", None)
     meta.setdefault("archived_at", row.get("archived_at"))
     return meta
@@ -397,12 +382,6 @@ async def create_session(
     if meta:
         await storage.update_session_metadata(new_id, meta, bot_id=effective_bot)
 
-    # TASK-284 step 15: for agent bots a fresh thread must not resume the OLD
-    # provider transcript — clear the stored provider session so the bridge
-    # cold-starts and re-seeds ("reseed"). No-op for chat bots.
-    _coordinate_agent_provider_on_activate(
-        effective_bot, {"id": new_id, "session_metadata": {}}
-    )
     return CreateSessionResponse(
         session_id=new_id, bot_id=effective_bot, user_id=user_id
     )
@@ -496,16 +475,15 @@ async def put_agent_session_key(
 ):
     """Persist an SDK session id onto its thread (TASK-252, bridge write-back).
 
-    Writes the canonical ``session_metadata.agent_session_keys[<backend>]``
-    entry (merged — other backends' keys preserved) plus the legacy TASK-284
-    mirror keys (``provider*``) for one release of read-side compat.
+    Writes the canonical per-backend entries in
+    ``session_metadata.agent_session_keys`` and
+    ``session_metadata.agent_session_key_models``. Both maps merge so one
+    backend can never overwrite another backend's resume metadata.
 
     Bot-scoped, not user-scoped: the caller is a trusted bridge on the LAN
     that knows the thread id from the dispatch command; the originating turn
     already passed user-ownership validation at /v1/chat/completions.
     """
-    import time as _time
-
     effective_bot = get_effective_bot_id(bot_id)
     backend = (body.backend or "").strip()
     session_key = (body.session_key or "").strip()
@@ -521,16 +499,21 @@ async def put_agent_session_key(
     if not row or row.get("bot_id") != effective_bot:
         raise HTTPException(status_code=404, detail="Session not found")
 
-    keys = dict((row.get("session_metadata") or {}).get("agent_session_keys") or {})
-    keys[agent_key_name(backend)] = session_key
+    meta = row.get("session_metadata") or {}
+    key_name = agent_key_name(backend)
+    keys = dict(meta.get("agent_session_keys") or {})
+    keys[key_name] = session_key
+    models = dict(meta.get("agent_session_key_models") or {})
+    if body.model:
+        models[key_name] = body.model
+    else:
+        # A replaced key must not inherit stale model metadata from its
+        # predecessor. No model means resume without a model gate.
+        models.pop(key_name, None)
     patch: dict = {
         "agent_session_keys": keys,
-        "provider": backend,
-        "provider_session_id": session_key,
-        "provider_session_updated_at": _time.time(),
+        "agent_session_key_models": models,
     }
-    if body.model:
-        patch["provider_session_model"] = body.model
     ok = await storage.update_session_metadata(session_id, patch, bot_id=effective_bot)
     if not ok:
         raise HTTPException(status_code=500, detail="Metadata update failed")
@@ -567,76 +550,14 @@ async def activate_session(
     )
     if not ok:
         raise HTTPException(status_code=404, detail="Session not found")
-    provider_session = _coordinate_agent_provider_on_activate(effective_bot, row)
+    # TASK-638: the scalar agent_backend_config.session_key is retired.
+    # The bridge now resolves per-thread SDK keys directly from the thread's
+    # agent_session_keys. Thread activation just switches which thread is
+    # active; the next turn's _resolve_active_thread_binding picks it up.
     return ActivateSessionResponse(
         session_id=session_id,
         bot_id=effective_bot,
         user_id=user_id,
         activated=True,
-        provider_session=provider_session,
+        provider_session=None,
     )
-
-
-def _coordinate_agent_provider_on_activate(bot_id: str, session_row: dict) -> str | None:
-    """TASK-284 step 15: point an agent bot's provider at the activated thread.
-
-    Provider hydration stays bridge-owned; this only sets WHICH provider
-    session the bridge resumes next turn:
-
-    - thread metadata carries ``provider_session_id`` (mirrored when the
-      bridge persisted it) → restore it into ``agent_backend_config.
-      session_key`` so the SDK resumes that transcript → returns "resumed";
-    - no stored provider id → clear ``session_key`` so the bridge cold-starts
-      and re-seeds from this thread's context via the shared assembler →
-      returns "reseed".
-
-    Applies only to claude-code/codex (openclaw's session_key is a routing
-    key, never per-thread). Best-effort: any failure leaves the profile
-    untouched and returns None — the DB-side activation already succeeded.
-    """
-    try:
-        service = get_service()
-        from ...bots import BotManager, invalidate_bots_cache
-
-        bot = BotManager(service.config).get_bot(bot_id)
-        backend = (getattr(bot, "agent_backend", None) or "").strip() if bot else ""
-        if backend not in ("claude-code", "codex"):
-            return None
-
-        meta = session_row.get("session_metadata") or {}
-        # TASK-252: canonical agent_session_keys first, legacy mirror keys as
-        # fallback (resolver applies the routing-key guard internally).
-        provider_sid = resolve_agent_session_key(meta, backend) or ""
-
-        from ..dependencies import get_bot_profile_store
-
-        store = get_bot_profile_store(service.config)
-        profile = store.get(bot_id)
-        if profile is None:
-            return None
-        bc = dict(profile.agent_backend_config or {})
-        if provider_sid and ":" not in provider_sid:
-            bc["session_key"] = provider_sid
-            if meta.get("provider_session_model"):
-                bc["session_model"] = meta["provider_session_model"]
-            outcome = "resumed"
-        else:
-            bc.pop("session_key", None)
-            outcome = "reseed"
-        profile.agent_backend_config = bc
-        store.upsert(profile)
-        # Cached Bot/instance state must see the new session_key (the bridge
-        # reads it live over HTTP, but the app-side seed decision reads the
-        # cached bot).
-        invalidate_bots_cache()
-        invalidate = getattr(service, "invalidate_bot_instances", None)
-        if callable(invalidate):
-            invalidate(bot_id)
-        log.info(
-            "Agent thread activate: bot=%s thread=%s provider_session=%s",
-            bot_id, session_row.get("id"), outcome,
-        )
-        return outcome
-    except Exception as e:
-        log.warning("Agent provider coordination failed for %s: %s", bot_id, e)
-        return None
