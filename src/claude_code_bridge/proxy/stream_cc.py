@@ -15,6 +15,7 @@ from collections.abc import AsyncIterator
 from typing import Any
 
 from .stream import _sse
+from .tool_sanitizers import recover_trailing_json, sanitize_tool_arguments
 
 logger = logging.getLogger(__name__)
 
@@ -48,12 +49,20 @@ def _clean_tool_arguments(
     tool_name: str,
     required_by_tool: dict[str, frozenset[str]],
 ) -> str:
-    """Remove invalid optional empty strings without changing required values."""
+    """Remove invalid optional empty strings, strip leaked reasoning tokens."""
     raw = raw or "{}"
     try:
         parsed = json.loads(raw)
     except (json.JSONDecodeError, TypeError):
-        return raw
+        # Try to recover valid JSON with trailing leaked reasoning.
+        recovered = recover_trailing_json(raw)
+        if recovered is not None:
+            try:
+                parsed = json.loads(recovered)
+            except (json.JSONDecodeError, TypeError):
+                return raw
+        else:
+            return raw
     if not isinstance(parsed, dict):
         return json.dumps(parsed, separators=(",", ":"))
 
@@ -66,6 +75,8 @@ def _clean_tool_arguments(
         }
     if parsed.get("isolation") == "worktree":
         del parsed["isolation"]
+    # Tool-specific sanitizers (JS trailing-token strip, etc.)
+    parsed = sanitize_tool_arguments(parsed, tool_name)
     return json.dumps(parsed, separators=(",", ":"))
 
 

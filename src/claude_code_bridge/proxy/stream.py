@@ -60,6 +60,8 @@ import logging
 import uuid
 from typing import Any, AsyncIterator
 
+from .tool_sanitizers import recover_trailing_json, sanitize_tool_arguments
+
 logger = logging.getLogger(__name__)
 
 
@@ -483,6 +485,7 @@ async def responses_to_anthropic_sse(
                 item_id = getattr(event, "item_id", "") or ""
                 block = blocks_by_item.get(item_id) or open_block
                 raw = tool_arg_buffers.pop(item_id, "{}")
+                tool_name = block.get("name", "") if block else ""
                 # Sanitize tool arguments before the SDK sees them. GPT fills
                 # optional params with empty strings (pages: ""), but empty
                 # strings can also be intentional required values (notably
@@ -491,7 +494,6 @@ async def responses_to_anthropic_sse(
                 try:
                     parsed = json.loads(raw)
                     if isinstance(parsed, dict):
-                        tool_name = block.get("name", "") if block else ""
                         if tool_name in required_args_by_tool:
                             required_args = required_args_by_tool[tool_name]
                             parsed = {
@@ -503,9 +505,13 @@ async def responses_to_anthropic_sse(
                         # is not a git repo, so it always fails.
                         if parsed.get("isolation") == "worktree":
                             del parsed["isolation"]
+                        # Tool-specific sanitizers (JS trailing-token strip, etc.)
+                        parsed = sanitize_tool_arguments(parsed, tool_name)
                     cleaned = json.dumps(parsed, separators=(",", ":"))
                 except (json.JSONDecodeError, TypeError):
-                    cleaned = raw  # forward as-is if unparseable
+                    # Try to recover valid JSON with trailing leaked reasoning.
+                    recovered = recover_trailing_json(raw)
+                    cleaned = recovered if recovered is not None else raw
                 if block is not None and cleaned:
                     yield _sse(
                         "content_block_delta",
