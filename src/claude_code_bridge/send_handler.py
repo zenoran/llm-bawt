@@ -1,91 +1,41 @@
 from __future__ import annotations
 
 import asyncio
-import json
 import logging
-import os
-import re
-import time
-import uuid
-from collections.abc import AsyncIterable
-from datetime import datetime, timezone
 from pathlib import Path
 
-import httpx
-from claude_agent_sdk import ClaudeAgentOptions, ClaudeSDKClient, StreamEvent
+from claude_agent_sdk import ClaudeSDKClient, StreamEvent
 from claude_agent_sdk.types import (
     AssistantMessage,
-    HookMatcher,
     MirrorErrorMessage,
-    PermissionResultAllow,
-    PermissionResultDeny,
     ResultMessage,
     SystemMessage,
-    TaskNotificationMessage,
-    TaskProgressMessage,
-    TaskStartedMessage,
-    TaskUpdatedMessage,
-    ToolPermissionContext,
-    ToolResultBlock,
-    ToolUseBlock,
     UserMessage,
 )
 
-from agent_bridge.approval import (
-    ApprovalDecision,
-    PolicyAction,
-    PolicyBundle,
-    evaluate as evaluate_policies,
-)
-from agent_bridge.events import AgentEvent, AgentEventKind, synthesize_event_id
-from agent_bridge.publisher import COMMANDS_STREAM, RedisPublisher
-from agent_bridge.session_queue import SessionQueue
-from claude_code_bridge.tool_events import normalize_tool_result
+from agent_bridge.events import AgentEventKind
+from agent_bridge.publisher import COMMANDS_STREAM
 from claude_code_bridge.tool_policy import effective_disallowed_tools
 
 from ._bridge_helpers import (
-    SESSION_PREFIX,
-    MCP_TOOL_CONTEXT_KEY,
-    _MCP_TOOL_CONTEXT_FALLBACK,
-    _SEED_CLI_VERSION,
-    _SEED_SANITIZE_RE,
-    _XAI_RATES,
-    _XAI_DEFAULT_RATES,
-    _REFRESH_BUFFER_MS,
-    _bot_slug_from_session_key,
-    _fmt_tokens,
-    _usage_input_total,
-    _estimate_proxy_cost_usd,
-    _pick_iteration_usage,
-    _read_latest_compact_metadata,
-    _token_expired_or_stale,
-    _get_fresh_oauth_token,
     _is_cli_crash,
     _is_auth_failure,
 )
+from .send_errors import (
+    AuthRetryPolicy,
+    TerminalSDKResultError,
+    classify_terminal_error,
+    result_message_error,
+)
 from .send_request import SendRequest
+from .send_result import ClaudeResultMixin
 from .send_stream import ClaudeStreamMixin
 from .send_usage import ClaudeUsageMixin
 
 logger = logging.getLogger("claude_code_bridge.bridge")
 
 
-def _classify_send_error(exc_text: str) -> str:
-    """TASK-637: tag credential-death errors with a structured marker.
-
-    A turn that dies on an expired/revoked Claude credential (after the
-    one-shot auth-retry above has already failed) gets a
-    ``[credential_expired:claude]`` prefix so the chat UI can deterministically
-    render the inline Reconnect flow (frontend: chat/CredentialErrorCard.tsx)
-    instead of a dead error bubble. Reuses the same matcher the auth-retry
-    path uses — one definition of "auth failure".
-    """
-    if _is_auth_failure(Exception(exc_text), []):
-        return f"[credential_expired:claude] {exc_text}"
-    return exc_text
-
-
-class ClaudeSendMixin(ClaudeStreamMixin, ClaudeUsageMixin):
+class ClaudeSendMixin(ClaudeStreamMixin, ClaudeUsageMixin, ClaudeResultMixin):
     """Claude agent send-path (TASK-555 quarantine; see TASK-622-style follow-up).
 
     Split out of ``ClaudeCodeBridge`` (TASK-555); composed back via
@@ -209,6 +159,10 @@ class ClaudeSendMixin(ClaudeStreamMixin, ClaudeUsageMixin):
             # curlable Garage URLs; the later UserMessage observer reuses the same
             # upload for TOOL_END/history instead of uploading duplicate bytes.
             screenshot_artifacts_by_tool_use_id: dict[str, list[dict]] = {}
+            direct_anthropic = not (
+                self._proxy_base_url is not None
+                and self._model_provider_prefix(model) is not None
+            )
             # TASK-661: snapshot the git workspaces so we can report exactly
             # what this turn changed. Published just before run_done on every
             # exit path below (the app persists it before turn_complete).
@@ -292,36 +246,7 @@ class ClaudeSendMixin(ClaudeStreamMixin, ClaudeUsageMixin):
                 else:
                     user_content = message
 
-                # The prompt MUST be an AsyncIterable: can_use_tool only works in
-                # the SDK's streaming-input mode (a plain str raises "can_use_tool
-                # callback requires streaming mode").
-                #
-                # Critically, the generator must stay OPEN for the whole turn.
-                # Returning right after the single yield closes the subprocess
-                # input stream, which tears down the bidirectional control channel
-                # that can_use_tool (AskUserQuestion) rides on — the pending
-                # permission request then dies with "Tool permission request
-                # failed: Error: Stream closed", and the half-finished turn leaves
-                # a dangling tool_use that makes the resumed session un-replayable
-                # (it wedges every subsequent message on that session).
-                #
-                # So: yield the user message, then block on `done_event` until the
-                # response loop signals the turn is complete (ResultMessage), and
-                # only then return — letting the SDK close input and end the
-                # output stream via StopAsyncIteration cleanly.
-                def _make_prompt_input(done_event: asyncio.Event) -> AsyncIterable:
-                    async def _prompt():
-                        yield {
-                            "type": "user",
-                            "message": {"role": "user", "content": user_content},
-                            "parent_tool_use_id": None,
-                            "session_id": "default",
-                        }
-                        await done_event.wait()
-
-                    return _prompt()
-
-                auth_retry_attempted = False
+                auth_retry = AuthRetryPolicy()
                 fresh_session_retry = False
                 # Pull (or create) the cooperative cancel event for this session so a
                 # chat.abort that arrives mid-loop is observed at the next message
@@ -339,8 +264,7 @@ class ClaudeSendMixin(ClaudeStreamMixin, ClaudeUsageMixin):
                     # completion gate per attempt.  turn_done releases the prompt
                     # generator (closing SDK input) only once the turn finishes —
                     # see _make_prompt_input for why it must stay open until then.
-                    turn_done = asyncio.Event()
-                    prompt_input = _make_prompt_input(turn_done)
+                    prompt_input, turn_done = self._make_prompt_input(user_content)
                     stderr_lines: list[str] = []
                     # Per-attempt: the auth/session retry paths re-run the turn
                     # from scratch, so reset screenshot tracking to avoid double-
@@ -379,7 +303,7 @@ class ClaudeSendMixin(ClaudeStreamMixin, ClaudeUsageMixin):
                         use_proxy=use_proxy,
                         model=model,
                         subagent_model=subagent_model,
-                        force_refresh=auth_retry_attempted,
+                        force_refresh=auth_retry.attempted,
                     )
 
                     # Pass `seq` to the can_use_tool factory by reference so it
@@ -486,6 +410,9 @@ class ClaudeSendMixin(ClaudeStreamMixin, ClaudeUsageMixin):
                     api_retry_count = 0
                     api_last_error: str | None = None
                     api_retry_surfaced = False  # True once we've pushed a delta
+                    # Retry safety is based on model/tool side effects, not status
+                    # text emitted by the bridge itself (e.g. api_retry notices).
+                    model_side_effects = False
 
                     sdk_client = None
                     msg_stream = None
@@ -600,28 +527,19 @@ class ClaudeSendMixin(ClaudeStreamMixin, ClaudeUsageMixin):
                                 # the retry to the UI as a live status delta so
                                 # the user sees feedback instead of a dead bubble.
                                 if data.get("subtype") == "api_retry":
-                                    attempt = data.get("attempt", 0)
-                                    max_retries = data.get("max_retries", 10)
-                                    err_status = data.get("error_status", "?")
-                                    err_text = data.get("error", "unknown")
-                                    api_retry_count = attempt
-                                    api_last_error = f"HTTP {err_status}: {err_text}"
-                                    logger.warning(
-                                        "API retry %d/%d: status=%s error=%s session=%s",
-                                        attempt, max_retries, err_status, err_text, session_key,
+                                    (
+                                        seq,
+                                        api_retry_count,
+                                        api_last_error,
+                                        api_retry_surfaced,
+                                    ) = self._on_api_retry_status(
+                                        data,
+                                        request_id=request_id,
+                                        session_key=session_key,
+                                        seq=seq,
+                                        text_parts=text_parts,
+                                        already_surfaced=api_retry_surfaced,
                                     )
-                                    # Push a live status on first retry so the
-                                    # user immediately sees something.
-                                    if not api_retry_surfaced:
-                                        api_retry_surfaced = True
-                                        seq += 1
-                                        note = f"⏳ Upstream unavailable ({err_text}), retrying…"
-                                        text_parts.append(note)
-                                        self._publish_event(
-                                            request_id, session_key, seq,
-                                            kind=AgentEventKind.ASSISTANT_DELTA,
-                                            text=note,
-                                        )
                                 # TASK-623: sub-agent (Task*) lifecycle event
                                 # emission extracted into _emit_subagent_task_events.
                                 seq = self._emit_subagent_task_events(
@@ -650,6 +568,7 @@ class ClaudeSendMixin(ClaudeStreamMixin, ClaudeUsageMixin):
                                     if delta.get("type") == "text_delta":
                                         text = delta.get("text", "")
                                         if text:
+                                            model_side_effects = True
                                             seq += 1
                                             text_parts.append(text)
                                             self._publish_event(
@@ -666,6 +585,7 @@ class ClaudeSendMixin(ClaudeStreamMixin, ClaudeUsageMixin):
                                         # body (TASK-301).
                                         thinking = delta.get("thinking", "")
                                         if thinking:
+                                            model_side_effects = True
                                             seq += 1
                                             self._publish_event(
                                                 request_id, session_key, seq,
@@ -682,6 +602,7 @@ class ClaudeSendMixin(ClaudeStreamMixin, ClaudeUsageMixin):
                                 elif event_type == "content_block_start":
                                     block = event.get("content_block", {})
                                     if block.get("type") == "tool_use":
+                                        model_side_effects = True
                                         current_tool_name = block.get("name", "unknown")
                                         current_tool_input = ""
                                     elif block.get("type") == "text":
@@ -713,6 +634,8 @@ class ClaudeSendMixin(ClaudeStreamMixin, ClaudeUsageMixin):
                             elif isinstance(msg, AssistantMessage):
                                 # TASK-623: AssistantMessage tool_use / snapshot
                                 # handling extracted into _on_assistant_message.
+                                prior_seq = seq
+                                prior_snapshot = assistant_snapshot_text
                                 seq, latest_assistant_usage, assistant_snapshot_text = (
                                     self._on_assistant_message(
                                         msg,
@@ -724,6 +647,8 @@ class ClaudeSendMixin(ClaudeStreamMixin, ClaudeUsageMixin):
                                         assistant_snapshot_text=assistant_snapshot_text,
                                     )
                                 )
+                                if seq != prior_seq or assistant_snapshot_text != prior_snapshot:
+                                    model_side_effects = True
 
                             elif isinstance(msg, UserMessage):
                                 # TASK-623: UserMessage tool_result (TOOL_END)
@@ -741,127 +666,38 @@ class ClaudeSendMixin(ClaudeStreamMixin, ClaudeUsageMixin):
                                 )
 
                             elif isinstance(msg, ResultMessage):
-                                full_text = "".join(text_parts)
-                                if not full_text:
-                                    result_text = getattr(msg, "text", "") or ""
-                                    if not result_text:
-                                        for block in getattr(msg, "content", []):
-                                            if isinstance(block, dict) and block.get("type") == "text":
-                                                result_text += block.get("text", "")
-                                    full_text = result_text
-                                    if not full_text and assistant_snapshot_text:
-                                        full_text = assistant_snapshot_text
-                                # If no text and retries happened, surface the error
-                                if not full_text and api_retry_count > 0:
-                                    error_note = (
-                                        f"\n\n❌ Upstream error after {api_retry_count} "
-                                        f"retries: {api_last_error or 'unknown'}. "
-                                        f"Try again in a moment."
-                                    )
-                                    if api_retry_surfaced:
-                                        # Already pushed "⏳ retrying" — append the outcome
-                                        full_text = "".join(text_parts) + error_note
-                                    else:
-                                        full_text = error_note.lstrip()
-
-                                # TASK-623: token-usage / context-window
-                                # extraction moved to _compute_result_usage
-                                # (behavior-identical; returns partial ctx_window/
-                                # max_output on internal failure just as before).
-                                token_usage_payload, ctx_window, max_output = (
-                                    self._compute_result_usage(
-                                        msg,
-                                        actual_model=actual_model,
-                                        model=model,
-                                        bot_context_window=bot_context_window,
-                                        latest_assistant_usage=latest_assistant_usage,
-                                        latest_stream_usage=latest_stream_usage,
-                                    )
+                                terminal_error = result_message_error(
+                                    msg,
+                                    fallback=api_last_error,
                                 )
+                                if terminal_error is not None:
+                                    raise terminal_error
 
-                                # Compaction outcome. The /compact ResultMessage
-                                # usage is all-zeros and the new resident size lives
-                                # only in the transcript, so on success we read back
-                                # compactMetadata.postTokens to (a) append a human
-                                # summary to the reply and (b) OVERRIDE the usage
-                                # gauge so the UI drops to the post-compaction size
-                                # immediately instead of showing the stale
-                                # pre-compaction number (the "reported context is
-                                # exactly the same" symptom). On failure we explain
-                                # why (e.g. "Not enough messages to compact.") so a
-                                # no-op /compact isn't silent.
-                                if compact_status == "success":
-                                    cm = await asyncio.to_thread(
-                                        _read_latest_compact_metadata, turn_session_id
-                                    )
-                                    pre = (cm or {}).get("preTokens")
-                                    post = (cm or {}).get("postTokens")
-                                    if post is not None:
-                                        freed = (
-                                            f" ({round(100 * (pre - post) / pre)}% freed)"
-                                            if pre
-                                            else ""
-                                        )
-                                        note = (
-                                            f"\n\n✅ Compacted: {_fmt_tokens(pre)} → "
-                                            f"{_fmt_tokens(post)} tokens{freed}."
-                                        )
-                                        token_usage_payload = {
-                                            "input_tokens": int(post),
-                                            "cache_read_tokens": 0,
-                                            "cache_creation_tokens": 0,
-                                            "output_tokens": 0,
-                                            "context_window": ctx_window,
-                                            "max_output_tokens": max_output,
-                                            "total_cost_usd": getattr(msg, "total_cost_usd", None),
-                                        }
-                                    else:
-                                        note = "\n\n✅ Conversation compacted."
-                                    seq += 1
-                                    text_parts.append(note)
-                                    self._publish_event(
-                                        request_id, session_key, seq,
-                                        kind=AgentEventKind.ASSISTANT_DELTA,
-                                        text=note,
-                                    )
-                                    full_text = "".join(text_parts)
-                                elif compact_status == "failed":
-                                    note = f"\n\nℹ️ Nothing to compact — {compact_error_msg}"
-                                    seq += 1
-                                    text_parts.append(note)
-                                    self._publish_event(
-                                        request_id, session_key, seq,
-                                        kind=AgentEventKind.ASSISTANT_DELTA,
-                                        text=note,
-                                    )
-                                    full_text = "".join(text_parts)
-
-                                seq += 1
-                                self._publish_event(
-                                    request_id, session_key, seq,
-                                    kind=AgentEventKind.ASSISTANT_DONE,
-                                    text=full_text,
-                                    model=actual_model,
-                                    token_usage=token_usage_payload,
-                                    attachments=turn_screenshot_assets or None,
+                                seq = await self._finalize_result_message(
+                                    msg,
+                                    request_id=request_id,
+                                    session_key=session_key,
+                                    seq=seq,
+                                    text_parts=text_parts,
+                                    assistant_snapshot_text=assistant_snapshot_text,
+                                    api_retry_count=api_retry_count,
+                                    api_last_error=api_last_error,
+                                    api_retry_surfaced=api_retry_surfaced,
+                                    actual_model=actual_model,
+                                    model=model,
+                                    bot_context_window=bot_context_window,
+                                    latest_assistant_usage=latest_assistant_usage,
+                                    latest_stream_usage=latest_stream_usage,
+                                    compact_status=compact_status,
+                                    compact_error_msg=compact_error_msg,
+                                    turn_session_id=turn_session_id,
+                                    turn_screenshot_assets=turn_screenshot_assets,
                                 )
                                 assistant_done_emitted = True
                                 # Turn complete — release the prompt generator so
-                                # the SDK closes its input stream.  Kept open until
-                                # now so the can_use_tool control channel survived
-                                # any AskUserQuestion pause earlier in the turn.
+                                # the SDK closes its input stream. Kept open until
+                                # now so the can_use_tool control channel survived.
                                 turn_done.set()
-                                # ResultMessage is terminal for this send (one user
-                                # message -> one assistant turn), so stop iterating
-                                # NOW instead of looping back to await a trailing
-                                # StopAsyncIteration. After a deferred
-                                # AskUserQuestion the streaming-input session stays
-                                # alive — heartbeat/stream events keep re-arming the
-                                # per-message timeout — so that await can block
-                                # indefinitely while STILL holding the per-session
-                                # lock, deadlocking the next continuation turn on the
-                                # same session (TASK-269). The `finally` below closes
-                                # the stream and kills the subprocess cleanly.
                                 break
                         if aborted:
                             # Cooperative abort fired — fall straight through to
@@ -964,17 +800,23 @@ class ClaudeSendMixin(ClaudeStreamMixin, ClaudeUsageMixin):
                             assistant_done_emitted = True
                             break
 
-                        # 1) Auth failure → refresh token and retry once
-                        if (
-                            not auth_retry_attempted
-                            and not text_parts
-                            and _is_auth_failure(e, stderr_lines)
+                        # 1) Direct-Claude auth failure with no model/tool side
+                        #    effects → force-fetch the app broker and retry once.
+                        auth_failure = (
+                            e.credential_error
+                            if isinstance(e, TerminalSDKResultError)
+                            else _is_auth_failure(e, stderr_lines)
+                        )
+                        if auth_retry.claim(
+                            is_auth_failure=auth_failure,
+                            direct_anthropic=not use_proxy,
+                            model_side_effects=model_side_effects,
                         ):
-                            auth_retry_attempted = True
                             logger.warning(
-                                "Auth failure for %s; refreshing token and retrying",
+                                "Auth failure for %s; force-fetching broker token and retrying once",
                                 request_id,
                             )
+                            text_parts.clear()
                             continue
 
                         # 2) CLI crash or timeout before any text streamed →
@@ -1051,11 +893,16 @@ class ClaudeSendMixin(ClaudeStreamMixin, ClaudeUsageMixin):
                 raise
             except Exception as e:
                 logger.exception("Send failed: request_id=%s", request_id)
+                error_text, error_raw = classify_terminal_error(
+                    e,
+                    direct_anthropic=direct_anthropic,
+                )
                 seq += 1
                 self._publish_event(
                     request_id, session_key, seq,
                     kind=AgentEventKind.ERROR,
-                    text=_classify_send_error(str(e)),
+                    text=error_text,
+                    extra_raw=error_raw,
                 )
                 seq = await self._publish_changed_files(
                     changed_file_tracker,

@@ -18,7 +18,9 @@ instance.
 
 from __future__ import annotations
 
+import asyncio
 import logging
+from collections.abc import AsyncIterable
 
 from agent_bridge.events import AgentEventKind
 from claude_agent_sdk import ClaudeAgentOptions
@@ -35,12 +37,63 @@ from claude_agent_sdk.types import (
 from claude_code_bridge.tool_events import normalize_tool_result
 
 from ._bridge_helpers import _get_fresh_oauth_token
+from .send_errors import is_auth_failure_text
 
 logger = logging.getLogger("claude_code_bridge.bridge")
 
 
 class ClaudeStreamMixin:
     """SDK env construction + per-message tool-loop handlers."""
+
+    @staticmethod
+    def _make_prompt_input(user_content) -> tuple[AsyncIterable, asyncio.Event]:
+        """Create one streaming SDK prompt and its completion gate."""
+        turn_done = asyncio.Event()
+
+        async def _prompt():
+            yield {
+                "type": "user",
+                "message": {"role": "user", "content": user_content},
+                "parent_tool_use_id": None,
+                "session_id": "default",
+            }
+            await turn_done.wait()
+
+        return _prompt(), turn_done
+
+    def _on_api_retry_status(
+        self,
+        data: dict,
+        *,
+        request_id: str,
+        session_key: str,
+        seq: int,
+        text_parts: list[str],
+        already_surfaced: bool,
+    ) -> tuple[int, int, str, bool]:
+        """Record one SDK API retry status and surface its first live notice."""
+        attempt = data.get("attempt", 0)
+        max_retries = data.get("max_retries", 10)
+        err_status = data.get("error_status", "?")
+        err_text = data.get("error", "unknown")
+        last_error = f"HTTP {err_status}: {err_text}"
+        logger.warning(
+            "API retry %d/%d: status=%s error=%s session=%s",
+            attempt, max_retries, err_status, err_text, session_key,
+        )
+        status_int = err_status if isinstance(err_status, int) else None
+        is_auth_retry = is_auth_failure_text(str(err_text), status=status_int)
+        if not already_surfaced and not is_auth_retry:
+            already_surfaced = True
+            seq += 1
+            note = f"⏳ Upstream unavailable ({err_text}), retrying…"
+            text_parts.append(note)
+            self._publish_event(
+                request_id, session_key, seq,
+                kind=AgentEventKind.ASSISTANT_DELTA,
+                text=note,
+            )
+        return seq, attempt, last_error, already_surfaced
 
     def _build_sdk_env(
         self,

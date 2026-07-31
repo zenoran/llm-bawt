@@ -201,26 +201,21 @@ def _read_latest_compact_metadata(session_id: str | None) -> dict | None:
 # failure this design removes).
 #
 # TASK-636: the bind mount is GONE. The DB row (not a host file) is the source
-# of truth; this bridge reaches it via the broker endpoint, with a small
-# in-memory cache so we don't hit the app on every turn.
+# of truth; this bridge reaches it via the broker endpoint.
+#
+# TASK-671: resolve the broker token on every direct-Anthropic turn. App-owned
+# proactive refresh rotates and immediately revokes the prior access token, so
+# a bridge cache cannot safely infer validity from the old token's expiry.
 #
 # Resolution order:
-#   1. in-memory cache (hits the broker only when near-expiry or forced)
-#   2. broker endpoint GET /v1/providers/claude/token (?force=true post-401)
-#   3. the legacy self-owned bundle at ~/.claude/.credentials.json (read-only
+#   1. broker endpoint GET /v1/providers/claude/token (?force=true post-401)
+#   2. the legacy self-owned bundle at ~/.claude/.credentials.json (read-only
 #      fallback — the ~/.claude dir mount is harness session state, not a
 #      credential mount; explicitly out of scope for TASK-636)
 #   4. env CLAUDE_CODE_OAUTH_TOKEN (long-lived setup-token)
 
 _LEGACY_CREDENTIALS_PATH = Path.home() / ".claude" / ".credentials.json"
 _REFRESH_BUFFER_MS = 5 * 60 * 1000
-
-# In-memory token cache — avoids a broker round-trip on every turn. The app's
-# proactive loop refreshes at expiresAt−20min, and our buffer is 5min, so we
-# only fetch when there's genuine headroom to gain.
-_cached_token: str | None = None
-_cached_expires_at: int | None = None
-
 
 def _read_oauth_bundle(path: Path) -> dict | None:
     """Read a claudeAiOauth bundle (wrapper or bare form). Never writes."""
@@ -284,28 +279,21 @@ def _fetch_broker_token(*, force: bool = False) -> tuple[str | None, int | None]
 
 
 def _get_fresh_oauth_token(*, force_refresh: bool = False) -> str | None:
-    """Return a valid Claude OAuth access token WITHOUT ever refreshing.
+    """Return the app-owned Claude token without ever refreshing locally.
 
-    ``force_refresh`` (post-401 retry) bypasses the in-memory cache and asks
-    the broker to force an upstream refresh.
+    Every call consults the broker because the app's proactive OAuth rotation
+    revokes the previous access token before its advertised expiry. ``force``
+    asks the app to refresh upstream after a confirmed 401; the bridge remains
+    read-only in both cases.
     """
-    global _cached_token, _cached_expires_at
     stale_candidate: str | None = None
 
-    # 1. In-memory cache (fast path — avoids a broker round-trip per turn).
-    if not force_refresh and _cached_token and not _token_expired_or_stale(_cached_expires_at):
-        return _cached_token
-    if _cached_token:
-        stale_candidate = _cached_token
-
-    # 2. Broker endpoint — the app owns the refresh chain (DB row is truth).
-    token, expires_at = _fetch_broker_token(force=force_refresh)
+    # 1. Broker endpoint — the app owns the refresh chain (DB row is truth).
+    token, _expires_at = _fetch_broker_token(force=force_refresh)
     if token:
-        _cached_token = token
-        _cached_expires_at = expires_at
         return token
 
-    # 3. Legacy self-owned bundle at ~/.claude/.credentials.json, READ-ONLY
+    # 2. Legacy self-owned bundle at ~/.claude/.credentials.json, READ-ONLY
     #    (interactive TUI login fallback — the ~/.claude dir mount is harness
     #    session state, not a credential bind mount).
     bundle = _read_oauth_bundle(_LEGACY_CREDENTIALS_PATH)
@@ -315,7 +303,7 @@ def _get_fresh_oauth_token(*, force_refresh: bool = False) -> str | None:
             return token
         stale_candidate = stale_candidate or token
 
-    # 4. Long-lived setup-token from env.
+    # 3. Long-lived setup-token from env.
     env_token = os.environ.get("CLAUDE_CODE_OAUTH_TOKEN")
     if env_token:
         return env_token
