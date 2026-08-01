@@ -21,6 +21,7 @@ from ._bridge_helpers import (
     _is_cli_crash,
     _is_auth_failure,
 )
+from .active_run import ClaudeActiveRun
 from .send_errors import (
     AuthRetryPolicy,
     TerminalSDKResultError,
@@ -445,20 +446,22 @@ class ClaudeSendMixin(ClaudeStreamMixin, ClaudeUsageMixin, ClaudeResultMixin):
                     model_side_effects = False
 
                     sdk_client = None
+                    active_run = None
                     msg_stream = None
                     try:
                         sdk_client = ClaudeSDKClient(options=options)
                         await sdk_client.connect(prompt_input)
+                        active_run = ClaudeActiveRun(
+                            client=sdk_client,
+                            request_id=request_id,
+                        )
                         msg_stream = sdk_client.receive_messages()
-                        # Register the live client so `chat.abort` can call
-                        # `disconnect()` on it — that closes the SDK Query and
-                        # drives the subprocess transport through EOF/SIGTERM/
-                        # SIGKILL teardown even mid-tool-call. `task.cancel()`
-                        # alone is insufficient because CancelledError only fires
-                        # at the next `await`, and the SDK is awaiting on subprocess
-                        # output that doesn't arrive until the running tool exits.
+                        # Register one live run controller for both control paths:
+                        # chat.abort calls disconnect(), while chat.steer performs
+                        # SDK interrupt -> replacement query on this same client.
+                        # A single response consumer remains here in _handle_send.
                         if session_key:
-                            self._session_queue.set_active_client(session_key, sdk_client)
+                            self._session_queue.set_active_client(session_key, active_run)
                         while True:
                             # Cooperative abort check — runs before every SDK
                             # `__anext__`, so an abort signalled by chat.abort is
@@ -691,6 +694,38 @@ class ClaudeSendMixin(ClaudeStreamMixin, ClaudeUsageMixin, ClaudeResultMixin):
                                 )
 
                             elif isinstance(msg, ResultMessage):
+                                if (
+                                    active_run is not None
+                                    and active_run.consume_replaced_result(msg)
+                                ):
+                                    # Tools still open at the interrupt boundary
+                                    # will never receive SDK tool_result blocks.
+                                    # Close their UI cards honestly before the
+                                    # replacement query starts emitting events.
+                                    for tool_use_id, tool_name in list(
+                                        tool_names_by_id.items()
+                                    ):
+                                        seq += 1
+                                        self._publish_event(
+                                            request_id,
+                                            session_key,
+                                            seq,
+                                            kind=AgentEventKind.TOOL_END,
+                                            tool_name=tool_name,
+                                            tool_arguments={},
+                                            tool_use_id=tool_use_id,
+                                            tool_result="Interrupted by user steering",
+                                            tool_error=True,
+                                        )
+                                    tool_names_by_id.clear()
+                                    logger.info(
+                                        "Drained steer interrupt boundary: request_id=%s "
+                                        "session=%s",
+                                        request_id,
+                                        session_key,
+                                    )
+                                    continue
+
                                 terminal_error = result_message_error(
                                     msg,
                                     fallback=api_last_error,
@@ -880,7 +915,7 @@ class ClaudeSendMixin(ClaudeStreamMixin, ClaudeUsageMixin, ClaudeResultMixin):
                         # aborts may have already popped it to disconnect().
                         if session_key and sdk_client is not None:
                             current = self._session_queue.get_active_client(session_key)
-                            if current is sdk_client:
+                            if current is active_run:
                                 self._session_queue.pop_active_client(session_key)
                             try:
                                 await asyncio.wait_for(sdk_client.disconnect(), timeout=20.0)

@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import uuid
 from typing import AsyncIterator
 
 import redis.asyncio as aioredis
@@ -236,6 +237,58 @@ class RedisSubscriber:
             "Sent command: request_id=%s session=%s attachments=%d",
             request_id, session_key, len(attachments or []),
         )
+
+    async def send_steer(
+        self,
+        *,
+        session_key: str,
+        message: str,
+        message_id: str,
+        backend: str,
+        target_request_id: str | None = None,
+        timeout_s: float = 10,
+    ) -> dict:
+        """Interrupt and redirect the active agent run without opening a new turn."""
+        request_id = f"steer_{uuid.uuid4().hex}"
+        fields: dict[str, str] = {
+            "action": "chat.steer",
+            "session_key": session_key,
+            "message": message,
+            "message_id": message_id,
+            "backend": backend,
+            "request_id": request_id,
+        }
+        if target_request_id:
+            fields["target_request_id"] = target_request_id
+
+        await self._pub_redis.xadd(
+            COMMANDS_STREAM,
+            fields,
+            maxlen=1000,
+            approximate=True,
+        )
+
+        stream_key = f"agent:rpc:{request_id}"
+        deadline = asyncio.get_event_loop().time() + timeout_s
+        last_id = "0-0"
+        while asyncio.get_event_loop().time() < deadline:
+            remaining_ms = int(
+                (deadline - asyncio.get_event_loop().time()) * 1000
+            )
+            if remaining_ms <= 0:
+                break
+            results = await self._redis.xread(
+                {stream_key: last_id},
+                count=1,
+                block=min(remaining_ms, 2000),
+            )
+            if results:
+                for _stream, messages in results:
+                    for msg_id, response_fields in messages:
+                        last_id = msg_id
+                        payload_raw = response_fields.get("payload", "{}")
+                        return json.loads(payload_raw)
+        raise TimeoutError(f"chat.steer timed out after {timeout_s}s")
 
     async def send_tool_result(
         self,

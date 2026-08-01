@@ -15,6 +15,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from agent_bridge.session_queue import SessionQueue
+from claude_code_bridge.active_run import ClaudeActiveRun
 from llm_bawt.integrations.agent_bridge_events import (
     AgentEvent,
     AgentEventKind,
@@ -47,6 +48,41 @@ class TestSessionQueue:
 
         assert queue.pop_active_client("main") is client
         assert queue.pop_active_client("main") is None
+
+
+class TestClaudeActiveRun:
+    @pytest.mark.anyio
+    async def test_steer_interrupts_then_queries_same_client(self):
+        client = AsyncMock()
+        run = ClaudeActiveRun(client=client, request_id="req-1")
+
+        await run.steer("change direction")
+
+        client.interrupt.assert_awaited_once_with()
+        client.query.assert_awaited_once_with("change direction")
+        interrupted = MagicMock(subtype="error_during_execution")
+        assert run.consume_replaced_result(interrupted) is True
+        assert run.consume_replaced_result(interrupted) is False
+
+    @pytest.mark.anyio
+    async def test_steer_failure_does_not_hide_next_error_result(self):
+        client = AsyncMock()
+        client.query.side_effect = RuntimeError("closed")
+        run = ClaudeActiveRun(client=client, request_id="req-1")
+
+        with pytest.raises(RuntimeError, match="closed"):
+            await run.steer("change direction")
+
+        client.disconnect.assert_awaited_once_with()
+        interrupted = MagicMock(subtype="error_during_execution")
+        assert run.consume_replaced_result(interrupted) is False
+
+    def test_success_result_in_interrupt_race_is_still_replaced(self):
+        run = ClaudeActiveRun(client=AsyncMock(), request_id="req-1")
+        run._expected_interrupt_results = 1
+
+        assert run.consume_replaced_result(MagicMock(subtype="success")) is True
+        assert run.consume_replaced_result(MagicMock(subtype="success")) is False
 
 
 # ---------------------------------------------------------------------------

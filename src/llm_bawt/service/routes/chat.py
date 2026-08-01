@@ -1,5 +1,6 @@
 """OpenAI-compatible chat completion route."""
 
+import asyncio
 import json
 import time
 import uuid
@@ -119,6 +120,125 @@ async def chat_abort(request: ChatAbortRequest) -> ChatAbortResponse:
         detail=(f"aborted:{gateway_detail}" if gateway_detail else "aborted"),
         turn_id=turn.id,
     )
+
+class ChatSteerRequest(BaseModel):
+    """Redirect an in-flight Claude agent turn without creating another turn."""
+
+    turn_id: str = Field(..., description="Active llm-bawt turn log ID")
+    message: str = Field(..., min_length=1, description="User correction/instruction")
+    message_id: str = Field(..., description="Frontend-generated user message UUID")
+    bot_id: str = Field(..., description="Bot slug owning the active turn")
+    user_id: str = Field("nick", description="User namespace owning the turn")
+
+
+class ChatSteerResponse(BaseModel):
+    ok: bool
+    detail: str
+    turn_id: str
+    message_id: str
+    persisted: bool = False
+
+
+@router.post("/v1/chat/steer", tags=["Agent Backends"])
+async def chat_steer(request: ChatSteerRequest) -> ChatSteerResponse:
+    """Interrupt and redirect one active Claude SDK run in place.
+
+    This is deliberately not another chat completion: the existing bridge
+    subprocess, response stream, assistant bubble, and turn log remain active.
+    The SDK emits an interrupted ResultMessage boundary which the bridge drains
+    before continuing with this replacement user instruction.
+    """
+    service = get_service()
+    turn = service._turn_log_store.get_turn(request.turn_id)
+    if turn is None:
+        raise HTTPException(status_code=404, detail="Turn not found")
+    if turn.ended_at is not None or turn.status not in ("streaming", "pending"):
+        raise HTTPException(status_code=409, detail="Turn is no longer active")
+
+    bot_id = request.bot_id.strip().lower()
+    user_id = request.user_id.strip().lower() or "nick"
+    if turn.bot_id != bot_id or (turn.user_id or "").lower() != user_id:
+        raise HTTPException(status_code=409, detail="Turn ownership mismatch")
+    if not turn.agent_session_key:
+        raise HTTPException(status_code=409, detail="Active bridge run is not ready")
+
+    from ...agent_backends.agent_bridge import get_agent_subscriber
+    from ...bots import BotManager
+
+    bot = BotManager(service.config).get_bot(bot_id)
+    backend_name = (getattr(bot, "agent_backend", None) or "").strip()
+    if backend_name != "claude-code":
+        raise HTTPException(
+            status_code=409,
+            detail="Mid-turn steering is currently supported only by claude-code",
+        )
+
+    message = request.message.strip()
+    subscriber = get_agent_subscriber()
+    if subscriber is None:
+        raise HTTPException(status_code=503, detail="Agent bridge unavailable")
+
+    result: dict = {"ok": False, "error": "no_active_run"}
+    try:
+        for attempt in range(8):
+            result = await subscriber.send_steer(
+                session_key=turn.agent_session_key,
+                message=message,
+                message_id=request.message_id,
+                backend=backend_name,
+                target_request_id=turn.agent_request_id,
+            )
+            if result.get("ok") or result.get("error") != "no_active_run":
+                break
+            if attempt < 7:
+                await asyncio.sleep(0.25)
+    except TimeoutError as exc:
+        raise HTTPException(status_code=504, detail=str(exc)) from exc
+    if not result.get("ok"):
+        detail = str(result.get("error") or result.get("detail") or "steer failed")
+        status = 409 if detail in {"no_active_run", "active_run_mismatch"} else 502
+        raise HTTPException(status_code=status, detail=detail)
+
+    persisted = False
+    try:
+        memory_client = service.get_memory_client(bot_id, user_id)
+        if memory_client is None:
+            raise RuntimeError("Memory client unavailable")
+        if not turn.trigger_message_id:
+            raise RuntimeError("Active turn has no trigger message id")
+        trigger = await asyncio.to_thread(
+            memory_client.get_message_by_id,
+            turn.trigger_message_id,
+        )
+        if not isinstance(trigger, dict):
+            raise RuntimeError("Active turn trigger message was not found")
+        session_id = trigger.get("session_id")
+        if not session_id:
+            raise RuntimeError("Active turn trigger message has no session id")
+        await asyncio.to_thread(
+            memory_client.add_message,
+            "user",
+            message,
+            session_id,
+            None,
+            request.message_id,
+        )
+        persisted = True
+    except Exception:
+        log.exception(
+            "chat.steer accepted but persistence failed: turn=%s message=%s",
+            turn.id,
+            request.message_id,
+        )
+
+    return ChatSteerResponse(
+        ok=True,
+        detail="steered" if persisted else "steered_persistence_failed",
+        turn_id=turn.id,
+        message_id=request.message_id,
+        persisted=persisted,
+    )
+
 
 class ToolResultRequest(BaseModel):
     """Answer to a paused AskUserQuestion tool call.

@@ -142,6 +142,13 @@ class ClaudeCommandMixin:
                             asyncio.create_task(
                                 self._handle_rpc(fields, msg_id, async_redis)
                             )
+                        elif action == "chat.steer":
+                            # Side-channel into the live ClaudeSDKClient. Never
+                            # take the per-session send lock: _handle_send owns it
+                            # for the entire run and is the sole response consumer.
+                            asyncio.create_task(
+                                self._handle_steer(fields, msg_id, async_redis)
+                            )
                         elif action == "chat.tool_result":
                             # Resolves a pending AskUserQuestion Future so the
                             # paused SDK turn can continue.  Deliberately NOT
@@ -172,6 +179,63 @@ class ClaudeCommandMixin:
             except Exception:
                 logger.exception("Command listener error")
                 await asyncio.sleep(2)
+
+    async def _handle_steer(
+        self, fields: dict, msg_id: str, async_redis,
+    ) -> None:
+        """Interrupt and redirect one active Claude SDK run in place."""
+        backend = (fields.get("backend") or "").strip()
+        if backend and backend != self._backend_name:
+            await async_redis.xack(COMMANDS_STREAM, "claude-code-bridge", msg_id)
+            return
+
+        request_id = (fields.get("request_id") or "").strip()
+        session_key = (fields.get("session_key") or "").strip()
+        message = (fields.get("message") or "").strip()
+        try:
+            if not session_key or not message:
+                raise ValueError("chat.steer requires session_key and message")
+            active_run = self._session_queue.get_active_client(session_key)
+            if active_run is None or not hasattr(active_run, "steer"):
+                raise RuntimeError("no_active_run")
+            active_request_id = getattr(active_run, "request_id", "")
+            target_request_id = (fields.get("target_request_id") or "").strip()
+            if target_request_id and target_request_id != active_request_id:
+                raise RuntimeError("active_run_mismatch")
+
+            await active_run.steer(message)
+            message_id = (fields.get("message_id") or "").strip()
+            if message_id and active_request_id:
+                self._trigger_message_ids[active_request_id] = message_id
+            logger.info(
+                "chat.steer accepted: session=%s active_request=%s chars=%d",
+                session_key,
+                active_request_id or "?",
+                len(message),
+            )
+            if request_id:
+                self._publisher.publish_rpc_result(
+                    request_id,
+                    {
+                        "ok": True,
+                        "detail": "steered",
+                        "active_request_id": active_request_id or None,
+                    },
+                )
+        except Exception as exc:
+            logger.warning(
+                "chat.steer failed: session=%s request=%s error=%s",
+                session_key,
+                request_id,
+                exc,
+            )
+            if request_id:
+                self._publisher.publish_rpc_result(
+                    request_id,
+                    {"ok": False, "error": str(exc)},
+                )
+        finally:
+            await async_redis.xack(COMMANDS_STREAM, "claude-code-bridge", msg_id)
 
     async def _handle_tool_result(
         self, fields: dict, msg_id: str, async_redis,
