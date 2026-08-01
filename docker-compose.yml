@@ -105,7 +105,7 @@ services:
   redis:
     image: redis:7-alpine
     container_name: llm-bawt-redis
-    command: ["redis-server", "--maxmemory", "128mb", "--maxmemory-policy", "allkeys-lru"]
+    command: ["redis-server", "--maxmemory", "1gb", "--maxmemory-policy", "allkeys-lru"]
     ports:
       - "${REDIS_PORT:-6379}:6379"
     volumes:
