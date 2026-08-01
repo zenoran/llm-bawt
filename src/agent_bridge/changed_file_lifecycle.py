@@ -1,97 +1,95 @@
-"""Shared bridge lifecycle for per-turn changed-file manifests (TASK-661)."""
+"""Shared bridge hooks for tool-call-based changed-file attribution."""
 
 from __future__ import annotations
 
 import logging
-from datetime import datetime, timezone
-from typing import Any
 
-from .changed_files import ChangedFileTracker
-from .events import AgentEvent, AgentEventKind, synthesize_event_id
+from .changed_files import ToolChangedFileCapture
+from .events import AgentEvent, AgentEventKind
 
 logger = logging.getLogger(__name__)
 
 
 class ChangedFileLifecycleMixin:
-    """Arm, finalize, and publish changed-file manifests for any bridge.
+    """Attach per-tool file capture to standardized bridge events.
 
-    Concrete bridges provide ``self._publisher`` and may provide
-    ``self._backend_name`` plus ``self._trigger_message_ids``. Keeping the git
-    lifecycle here makes provider coverage additive without copy-pasting the
-    failure-tolerant capture contract into every command handler.
+    Concrete bridges keep publishing TOOL_START/TOOL_END normally.  This mixin
+    snapshots only the declared ``file_path`` and emits a FILE_CHANGED event as
+    soon as that specific tool completes.  No workspace-wide turn snapshots,
+    overlap registry, or finalize phase are involved.
     """
 
-    @staticmethod
-    async def _arm_changed_file_tracker() -> ChangedFileTracker | None:
-        if ChangedFileTracker.disabled():
-            return None
-        try:
-            tracker = ChangedFileTracker()
-            await tracker.start()
-            return tracker
-        except Exception:
-            logger.debug("changed-file tracker failed to arm", exc_info=True)
-            return None
+    def _changed_file_capture(self) -> ToolChangedFileCapture:
+        capture = getattr(self, "_tool_changed_file_capture", None)
+        if capture is None:
+            capture = ToolChangedFileCapture(cwd=getattr(self, "_cwd", "/app"))
+            self._tool_changed_file_capture = capture
+        return capture
 
-    async def _publish_changed_files(
+    def _capture_changed_file_event(
         self,
-        tracker: ChangedFileTracker | None,
+        event: AgentEvent,
         *,
+        request_id: str | None = None,
+    ) -> AgentEvent | None:
+        try:
+            capture = self._changed_file_capture()
+            capture_request_id = request_id or event.run_id or ""
+            if event.kind == AgentEventKind.TOOL_START:
+                capture.start(
+                    request_id=capture_request_id,
+                    tool_use_id=event.tool_use_id,
+                    tool_name=event.tool_name,
+                    arguments=event.tool_arguments,
+                )
+                return None
+            if event.kind != AgentEventKind.TOOL_END:
+                return None
+            finished = capture.finish(
+                request_id=capture_request_id,
+                tool_use_id=event.tool_use_id,
+                tool_name=event.tool_name,
+            )
+            if finished is None:
+                return None
+            tool_name, arguments, file_data = finished
+            return AgentEvent(
+                event_id=f"{event.event_id}:file-changed",
+                session_key=event.session_key,
+                run_id=event.run_id,
+                kind=AgentEventKind.FILE_CHANGED,
+                origin="system",
+                tool_name=tool_name,
+                tool_arguments=arguments,
+                tool_use_id=event.tool_use_id,
+                parent_tool_use_id=event.parent_tool_use_id,
+                seq=event.seq,
+                timestamp=event.timestamp,
+                raw={"file": file_data},
+                provider=event.provider,
+                trigger_message_id=event.trigger_message_id,
+            )
+        except Exception:
+            logger.debug("changed-file tool attribution failed", exc_info=True)
+            return None
+
+    def _publish_run_event_with_changed_file(
+        self,
         request_id: str,
-        session_key: str,
-        seq: int,
-        trigger_message_id: str | None = None,
-    ) -> int:
-        """Finalize and publish a manifest, returning the next event sequence.
-
-        Idempotence lives in :meth:`ChangedFileTracker.finalize`, so provider
-        handlers can safely call this from more than one terminal path.
-        """
-        if tracker is None:
-            return seq
-        try:
-            manifest = await tracker.finalize()
-        except Exception:
-            logger.debug("changed-file finalize failed", exc_info=True)
-            return seq
-        if not manifest:
-            return seq
-
-        seq += 1
-        active_triggers: Any = getattr(self, "_trigger_message_ids", None)
-        if trigger_message_id is None and isinstance(active_triggers, dict):
-            trigger_message_id = active_triggers.get(request_id)
-        backend_name = str(getattr(self, "_backend_name", "agent-bridge"))
-        event = AgentEvent(
-            event_id=synthesize_event_id(
-                session_key,
-                AgentEventKind.CHANGED_FILES.value,
-                {"files": manifest.get("files"), "seq": seq},
-                seq,
-            ),
-            session_key=session_key,
-            run_id=request_id,
-            kind=AgentEventKind.CHANGED_FILES,
-            origin="system",
-            seq=seq,
-            timestamp=datetime.now(timezone.utc),
-            raw=manifest,
-            provider=backend_name,
-            trigger_message_id=trigger_message_id,
-        )
-        try:
+        event: AgentEvent,
+    ) -> None:
+        """Capture before TOOL_START; publish FILE_CHANGED after TOOL_END."""
+        if event.kind == AgentEventKind.TOOL_START:
+            self._capture_changed_file_event(event, request_id=request_id)
             self._publisher.publish_run_event(request_id, event)
-        except Exception:
-            logger.debug("changed-file publish failed", exc_info=True)
-            return seq
+            return
+        self._publisher.publish_run_event(request_id, event)
+        file_event = self._capture_changed_file_event(event, request_id=request_id)
+        if file_event is not None:
+            self._publisher.publish_run_event(request_id, file_event)
 
-        overlapped = manifest.get("overlapping_repos") or []
-        logger.info(
-            "Changed files: %d file(s)%s%s request_id=%s provider=%s",
-            len(manifest.get("files") or []),
-            " [truncated]" if manifest.get("truncated") else "",
-            f" [overlapping: {', '.join(overlapped)}]" if overlapped else "",
-            request_id,
-            backend_name,
-        )
-        return seq
+    def _discard_changed_file_request(self, request_id: str) -> None:
+        try:
+            self._changed_file_capture().discard_request(request_id)
+        except Exception:
+            logger.debug("changed-file request cleanup failed", exc_info=True)

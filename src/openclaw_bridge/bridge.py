@@ -234,7 +234,6 @@ class SessionBridge(ChangedFileLifecycleMixin):
                 return
 
         async with self._session_queue.lock(session_key):
-            changed_file_tracker = await self._arm_changed_file_tracker()
             event_seq = 0
             try:
                 # Clear any previous cancel signal before starting a new send
@@ -289,7 +288,7 @@ class SessionBridge(ChangedFileLifecycleMixin):
                                 ),
                             )
 
-                        self._publisher.publish_run_event(request_id, event)
+                        self._publish_run_event_with_changed_file(request_id, event)
 
                         # Tool events are published to the unified stream by
                         # chat_streaming.py (with proper call_id and user_id).
@@ -317,13 +316,6 @@ class SessionBridge(ChangedFileLifecycleMixin):
                             ),
                         )
 
-                event_seq = await self._publish_changed_files(
-                    changed_file_tracker,
-                    request_id=request_id,
-                    session_key=session_key,
-                    seq=event_seq,
-                    trigger_message_id=trigger_message_id,
-                )
                 self._publisher.publish_run_done(request_id)
                 logger.info("Send command completed: request_id=%s", request_id)
 
@@ -340,15 +332,9 @@ class SessionBridge(ChangedFileLifecycleMixin):
                     trigger_message_id=trigger_message_id,
                 )
                 self._publisher.publish_run_event(request_id, err_event)
-                event_seq = await self._publish_changed_files(
-                    changed_file_tracker,
-                    request_id=request_id,
-                    session_key=session_key,
-                    seq=event_seq,
-                    trigger_message_id=trigger_message_id,
-                )
                 self._publisher.publish_run_done(request_id)
             finally:
+                self._discard_changed_file_request(request_id)
                 await async_redis.xack(COMMANDS_STREAM, "bridge", msg_id)
 
     async def _handle_rpc_command(

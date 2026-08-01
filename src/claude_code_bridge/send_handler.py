@@ -192,6 +192,7 @@ class ClaudeSendMixin(ClaudeStreamMixin, ClaudeUsageMixin, ClaudeResultMixin):
             # result and persist its image instead of letting the inline base64
             # ride in the model context forever.
             tool_names_by_id: dict[str, str] = {}
+            tool_arguments_by_id: dict[str, dict] = {}
             # {asset_id, kind} refs for screenshots persisted to the media store
             # during this turn; stamped onto the terminal ASSISTANT_DONE event so
             # the app can attach them to the bot's reply message.
@@ -205,11 +206,6 @@ class ClaudeSendMixin(ClaudeStreamMixin, ClaudeUsageMixin, ClaudeResultMixin):
                 self._proxy_base_url is not None
                 and self._model_provider_prefix(model) is not None
             )
-            # TASK-661: snapshot the git workspaces so we can report exactly
-            # what this turn changed. Published just before run_done on every
-            # exit path below (the app persists it before turn_complete).
-            changed_file_tracker = await self._arm_changed_file_tracker()
-
             try:
                 # Inject MCP tool context so Claude passes the right identifiers.
                 # Body comes from the registry (TASK-490) with a byte-identical
@@ -297,6 +293,7 @@ class ClaudeSendMixin(ClaudeStreamMixin, ClaudeUsageMixin, ClaudeResultMixin):
                     # from scratch, so reset screenshot tracking to avoid double-
                     # counting an earlier attempt's uploads on the final DONE event.
                     tool_names_by_id.clear()
+                    tool_arguments_by_id.clear()
                     turn_screenshot_assets.clear()
                     screenshot_artifacts_by_tool_use_id.clear()
 
@@ -671,6 +668,7 @@ class ClaudeSendMixin(ClaudeStreamMixin, ClaudeUsageMixin, ClaudeResultMixin):
                                         session_key=session_key,
                                         seq=seq,
                                         tool_names_by_id=tool_names_by_id,
+                                        tool_arguments_by_id=tool_arguments_by_id,
                                         latest_assistant_usage=latest_assistant_usage,
                                         assistant_snapshot_text=assistant_snapshot_text,
                                     )
@@ -687,6 +685,7 @@ class ClaudeSendMixin(ClaudeStreamMixin, ClaudeUsageMixin, ClaudeResultMixin):
                                     session_key=session_key,
                                     seq=seq,
                                     tool_names_by_id=tool_names_by_id,
+                                    tool_arguments_by_id=tool_arguments_by_id,
                                     turn_screenshot_assets=turn_screenshot_assets,
                                     screenshot_artifacts_by_tool_use_id=(
                                         screenshot_artifacts_by_tool_use_id
@@ -712,12 +711,15 @@ class ClaudeSendMixin(ClaudeStreamMixin, ClaudeUsageMixin, ClaudeResultMixin):
                                             seq,
                                             kind=AgentEventKind.TOOL_END,
                                             tool_name=tool_name,
-                                            tool_arguments={},
+                                            tool_arguments=tool_arguments_by_id.get(
+                                                tool_use_id, {}
+                                            ),
                                             tool_use_id=tool_use_id,
                                             tool_result="Interrupted by user steering",
                                             tool_error=True,
                                         )
                                     tool_names_by_id.clear()
+                                    tool_arguments_by_id.clear()
                                     logger.info(
                                         "Drained steer interrupt boundary: request_id=%s "
                                         "session=%s",
@@ -755,9 +757,21 @@ class ClaudeSendMixin(ClaudeStreamMixin, ClaudeUsageMixin, ClaudeResultMixin):
                                 )
                                 assistant_done_emitted = True
                                 # Turn complete — release the prompt generator so
-                                # the SDK closes its input stream. Kept open until
-                                # now so the can_use_tool control channel survived.
+                                # the SDK closes its input stream.  Kept open until
+                                # now so the can_use_tool control channel survived
+                                # any AskUserQuestion pause earlier in the turn.
                                 turn_done.set()
+                                # ResultMessage is terminal for this send (one user
+                                # message -> one assistant turn), so stop iterating
+                                # NOW instead of looping back to await a trailing
+                                # StopAsyncIteration. After a deferred
+                                # AskUserQuestion the streaming-input session stays
+                                # alive — heartbeat/stream events keep re-arming the
+                                # per-message timeout — so that await can block
+                                # indefinitely while STILL holding the per-session
+                                # lock, deadlocking the next continuation turn on the
+                                # same session (TASK-269). The `finally` below closes
+                                # the stream and kills the subprocess cleanly.
                                 break
                         if aborted:
                             # Cooperative abort fired — fall straight through to
@@ -833,12 +847,6 @@ class ClaudeSendMixin(ClaudeStreamMixin, ClaudeUsageMixin, ClaudeResultMixin):
                         except Exception:
                             logger.debug("Failed to publish ASSISTANT_DONE on cancel", exc_info=True)
                         try:
-                            seq = await self._publish_changed_files(
-                                changed_file_tracker,
-                                request_id=request_id,
-                                session_key=session_key,
-                                seq=seq,
-                            )
                             self._publisher.publish_run_done(request_id)
                         except Exception:
                             logger.debug("Failed to publish run_done on cancel", exc_info=True)
@@ -876,6 +884,9 @@ class ClaudeSendMixin(ClaudeStreamMixin, ClaudeUsageMixin, ClaudeResultMixin):
                                 "Auth failure for %s; force-fetching broker token and retrying once",
                                 request_id,
                             )
+                            # The first attempt may have emitted only a bridge-owned
+                            # retry notice. It is not assistant content and must not
+                            # survive into the successful retry's final message.
                             text_parts.clear()
                             continue
 
@@ -926,12 +937,6 @@ class ClaudeSendMixin(ClaudeStreamMixin, ClaudeUsageMixin, ClaudeResultMixin):
                                     "sdk_client.disconnect() raised", exc_info=True,
                                 )
 
-                seq = await self._publish_changed_files(
-                    changed_file_tracker,
-                    request_id=request_id,
-                    session_key=session_key,
-                    seq=seq,
-                )
                 self._publisher.publish_run_done(request_id)
                 if aborted:
                     logger.info(
@@ -961,14 +966,9 @@ class ClaudeSendMixin(ClaudeStreamMixin, ClaudeUsageMixin, ClaudeResultMixin):
                     text=error_text,
                     extra_raw=error_raw,
                 )
-                seq = await self._publish_changed_files(
-                    changed_file_tracker,
-                    request_id=request_id,
-                    session_key=session_key,
-                    seq=seq,
-                )
                 self._publisher.publish_run_done(request_id)
             finally:
+                self._discard_changed_file_request(request_id)
                 # Drop the per-run trigger_message_id mapping so we don't leak.
                 self._trigger_message_ids.pop(request_id, None)
                 await async_redis.xack(COMMANDS_STREAM, "claude-code-bridge", msg_id)

@@ -1,44 +1,59 @@
-"""Bridge-neutral changed-file lifecycle coverage (TASK-661)."""
-
 from __future__ import annotations
 
-import asyncio
+from pathlib import Path
 from unittest.mock import MagicMock
 
 from agent_bridge.changed_file_lifecycle import ChangedFileLifecycleMixin
-from agent_bridge.events import AgentEventKind
+from agent_bridge.events import AgentEvent, AgentEventKind
 from codex_bridge.bridge import CodexBridge
 from openclaw_bridge.bridge import SessionBridge
 
 
-class _Tracker:
-    async def finalize(self):
-        return {
-            "files": [{"repo_key": "r", "path": "a.py"}],
-            "overlapping_repos": ["r"],
-            "truncated": True,
-        }
-
-
 class _Bridge(ChangedFileLifecycleMixin):
-    def __init__(self):
+    def __init__(self, cwd: Path):
         self._publisher = MagicMock()
         self._backend_name = "test-bridge"
-        self._trigger_message_ids = {"req": "msg"}
+        self._cwd = str(cwd)
 
 
-def test_shared_lifecycle_publishes_manifest_event():
-    bridge = _Bridge()
-    seq = asyncio.run(bridge._publish_changed_files(
-        _Tracker(), request_id="req", session_key="s", seq=7,
-    ))
-    assert seq == 8
-    event = bridge._publisher.publish_run_event.call_args.args[1]
-    assert event.kind is AgentEventKind.CHANGED_FILES
-    assert event.raw["overlapping_repos"] == ["r"]
-    assert event.raw["truncated"] is True
-    assert event.provider == "test-bridge"
-    assert event.trigger_message_id == "msg"
+def _event(kind: AgentEventKind, *, tool_use_id: str, path: Path) -> AgentEvent:
+    return AgentEvent(
+        event_id=f"e-{kind.value}",
+        session_key="s",
+        run_id="req",
+        kind=kind,
+        origin="system",
+        tool_name="Edit",
+        tool_arguments={"file_path": str(path)},
+        tool_use_id=tool_use_id,
+        provider="test-bridge",
+        trigger_message_id="msg",
+    )
+
+
+def test_shared_lifecycle_publishes_incremental_file_event(tmp_path: Path):
+    path = tmp_path / "a.py"
+    path.write_text("before\n")
+    bridge = _Bridge(tmp_path)
+
+    bridge._publish_run_event_with_changed_file(
+        "req", _event(AgentEventKind.TOOL_START, tool_use_id="tool-1", path=path)
+    )
+    path.write_text("after\n")
+    bridge._publish_run_event_with_changed_file(
+        "req", _event(AgentEventKind.TOOL_END, tool_use_id="tool-1", path=path)
+    )
+
+    events = [call.args[1] for call in bridge._publisher.publish_run_event.call_args_list]
+    assert [event.kind for event in events] == [
+        AgentEventKind.TOOL_START,
+        AgentEventKind.TOOL_END,
+        AgentEventKind.FILE_CHANGED,
+    ]
+    file_event = events[-1]
+    assert file_event.raw["file"]["path"] == str(path)
+    assert file_event.provider == "test-bridge"
+    assert file_event.trigger_message_id == "msg"
 
 
 def test_active_bridge_classes_share_the_lifecycle_contract():

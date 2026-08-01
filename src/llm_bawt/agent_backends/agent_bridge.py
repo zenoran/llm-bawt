@@ -371,6 +371,7 @@ class AgentBridgeBackend(AgentBackend):
                                     result_queue.put({
                                         "event": "tool_result",
                                         "name": matched_call.display_name,
+                                        "arguments": matched_call.arguments,
                                         "result": result,
                                         "tool_result_payload": event.tool_result_payload,
                                         "provider": event.provider,
@@ -519,28 +520,23 @@ class AgentBridgeBackend(AgentBackend):
                                     "trigger_message_id": event.trigger_message_id,
                                 })
 
-                            elif event.kind == AgentEventKind.CHANGED_FILES:
-                                # TASK-661: the bridge git-diffed its workspaces
-                                # for this turn (the app can't — it doesn't mount
-                                # them). Forward the manifest so the worker can
-                                # persist it before publishing turn_complete.
+                            elif event.kind == AgentEventKind.FILE_CHANGED:
                                 meta = event.raw if isinstance(event.raw, dict) else {}
-                                files = meta.get("files")
-                                if isinstance(files, list) and files:
+                                file_data = meta.get("file")
+                                if isinstance(file_data, dict):
                                     result_queue.put({
-                                        "event": "changed_files",
-                                        "files": files,
-                                        "overlapping_repos": meta.get("overlapping_repos") or [],
-                                        "truncated": bool(meta.get("truncated")),
+                                        "event": "file_changed",
+                                        "file": file_data,
+                                        "tool_name": event.tool_name,
+                                        "arguments": event.tool_arguments or {},
+                                        "tool_use_id": event.tool_use_id,
                                         "trigger_message_id": event.trigger_message_id,
                                     })
 
                             elif event.kind == AgentEventKind.ERROR:
                                 # Do not abort the run subscription immediately.
-                                # Bridges may publish terminal metadata (notably
-                                # CHANGED_FILES) after ERROR but before run_done.
-                                # Remember the failure, drain the run stream, then
-                                # raise so that metadata is persisted first.
+                                # Drain through run_done so any already-completed
+                                # tool/file events queued before the error persist.
                                 pending_error = RuntimeError(
                                     f"{self.name} error: {event.text}"
                                 )

@@ -198,7 +198,6 @@ class CodexCommandMixin:
             text_parts: list[str] = []
             actual_model: str = model
             tmp_image_paths: list[str] = []
-            changed_file_tracker = await self._arm_changed_file_tracker()
 
             try:
                 # MCP context injection (matches claude bridge). Body from the
@@ -242,12 +241,6 @@ class CodexCommandMixin:
                             kind=AgentEventKind.ERROR,
                             text=f"Codex OAuth failed — {auth_err}",
                             model=model,
-                        )
-                        seq = await self._publish_changed_files(
-                            changed_file_tracker,
-                            request_id=request_id,
-                            session_key=session_key,
-                            seq=seq,
                         )
                         self._publisher.publish_run_done(request_id)
                         return
@@ -410,12 +403,6 @@ class CodexCommandMixin:
                         except Exception:
                             pass
                         try:
-                            seq = await self._publish_changed_files(
-                                changed_file_tracker,
-                                request_id=request_id,
-                                session_key=session_key,
-                                seq=seq,
-                            )
                             self._publisher.publish_run_done(request_id)
                         except Exception:
                             pass
@@ -457,12 +444,6 @@ class CodexCommandMixin:
                                 text="Codex OAuth failed — re-run codex login on echo",
                                 model=model,
                             )
-                            seq = await self._publish_changed_files(
-                                changed_file_tracker,
-                                request_id=request_id,
-                                session_key=session_key,
-                                seq=seq,
-                            )
                             self._publisher.publish_run_done(request_id)
                             return
 
@@ -487,12 +468,6 @@ class CodexCommandMixin:
                             if current is controller:
                                 self._session_queue.pop_active_client(session_key)
 
-                seq = await self._publish_changed_files(
-                    changed_file_tracker,
-                    request_id=request_id,
-                    session_key=session_key,
-                    seq=seq,
-                )
                 self._publisher.publish_run_done(request_id)
                 if aborted:
                     logger.info(
@@ -516,14 +491,9 @@ class CodexCommandMixin:
                     text=str(e),
                     model=model,
                 )
-                seq = await self._publish_changed_files(
-                    changed_file_tracker,
-                    request_id=request_id,
-                    session_key=session_key,
-                    seq=seq,
-                )
                 self._publisher.publish_run_done(request_id)
             finally:
+                self._discard_changed_file_request(request_id)
                 self._cleanup_tmp_files(tmp_image_paths)
                 # Drop the per-run trigger_message_id mapping so we don't leak.
                 self._trigger_message_ids.pop(request_id, None)

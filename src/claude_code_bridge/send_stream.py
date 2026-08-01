@@ -47,7 +47,11 @@ class ClaudeStreamMixin:
 
     @staticmethod
     def _make_prompt_input(user_content) -> tuple[AsyncIterable, asyncio.Event]:
-        """Create one streaming SDK prompt and its completion gate."""
+        """Create one streaming SDK prompt and its completion gate.
+
+        The input generator must remain open until the response loop finishes so
+        the SDK's bidirectional tool-permission channel stays available.
+        """
         turn_done = asyncio.Event()
 
         async def _prompt():
@@ -82,6 +86,9 @@ class ClaudeStreamMixin:
             attempt, max_retries, err_status, err_text, session_key,
         )
         status_int = err_status if isinstance(err_status, int) else None
+        # A direct credential 401 gets one silent force-fetch/retry. Streaming a
+        # scary auth notice before that self-heal succeeds leaves an indelible,
+        # false failure in the live bubble. Generic 429/5xx retries remain visible.
         is_auth_retry = is_auth_failure_text(str(err_text), status=status_int)
         if not already_surfaced and not is_auth_retry:
             already_surfaced = True
@@ -322,6 +329,7 @@ class ClaudeStreamMixin:
         session_key: str,
         seq: int,
         tool_names_by_id: dict,
+        tool_arguments_by_id: dict,
         latest_assistant_usage: dict | None,
         assistant_snapshot_text: str,
     ) -> tuple[int, dict | None, str]:
@@ -347,6 +355,9 @@ class ClaudeStreamMixin:
                 tu_id = getattr(block, "id", None)
                 if tu_id:
                     tool_names_by_id[tu_id] = block.name
+                    tool_arguments_by_id[tu_id] = (
+                        dict(block.input) if isinstance(block.input, dict) else {}
+                    )
                 # QDIAG (TASK-413): record when the MODEL
                 # actually emits an AskUserQuestion tool_use
                 # block. Pair this with the "QDIAG can_use_tool
@@ -409,6 +420,7 @@ class ClaudeStreamMixin:
         tool_names_by_id: dict,
         turn_screenshot_assets: list[dict],
         screenshot_artifacts_by_tool_use_id: dict[str, list[dict]],
+        tool_arguments_by_id: dict | None = None,
     ) -> int:
         """Handle a UserMessage's tool_result blocks (TOOL_END); return ``seq``."""
         # Mirror of the AssistantMessage path: a sub-agent's
@@ -500,7 +512,12 @@ class ClaudeStreamMixin:
                     # both: tool_use_id in its proper
                     # field, and a placeholder name so
                     # legacy consumers still see something.
-                    tool_name=block.tool_use_id or "unknown",
+                    tool_name=tool_names_by_id.get(
+                        block.tool_use_id or "", block.tool_use_id or "unknown"
+                    ),
+                    tool_arguments=(tool_arguments_by_id or {}).get(
+                        block.tool_use_id or "", {}
+                    ),
                     tool_use_id=block.tool_use_id,
                     parent_tool_use_id=parent_tuid,
                     tool_result=result_payload.preview,
@@ -516,4 +533,8 @@ class ClaudeStreamMixin:
                     # flushes on ASSISTANT_DONE for history.
                     attachments=tool_end_attachments,
                 )
+                if block.tool_use_id:
+                    tool_names_by_id.pop(block.tool_use_id, None)
+                    if tool_arguments_by_id is not None:
+                        tool_arguments_by_id.pop(block.tool_use_id, None)
         return seq

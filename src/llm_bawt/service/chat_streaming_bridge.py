@@ -526,7 +526,9 @@ class ChatStreamingBridgeMixin:
         # Accumulate response data outside try so the finally block can
         # always access them (including on GeneratorExit from client disconnect).
         from .tool_event_coordinator import ToolEventCoordinator
+        from .tool_changed_files import ToolChangedFilesCoordinator
         tool_events = ToolEventCoordinator(self._turn_log_store.engine)
+        changed_files = ToolChangedFilesCoordinator(self._turn_log_store.engine)
         full_text_parts: list[str] = []
         tool_call_details: list[dict] = []
         # Captures upstream SDK token usage (bridge sends it on ASSISTANT_DONE)
@@ -708,27 +710,77 @@ class ChatStreamingBridgeMixin:
                         matched["result"] = tool_result
                         matched["is_error"] = tool_failed
                         end_call_id = matched.get("call_id", end_call_id)
-                    # Publish tool_end to unified event stream
+                    _tool_end_event = {
+                        "_type": "tool_event",
+                        "event": "tool_end",
+                        "turn_id": turn_log_id,
+                        "trigger_message_id": trigger_message_id,
+                        "bot_id": bot_id,
+                        "user_id": user_id,
+                        "tool_name": event.tool_name or "unknown",
+                        "arguments": (
+                            matched.get("parameters", {}) if matched is not None
+                            else (event.tool_arguments or {})
+                        ),
+                        "call_id": end_call_id,
+                        "tool_use_id": getattr(event, "tool_use_id", None),
+                        "parent_tool_use_id": getattr(event, "parent_tool_use_id", None),
+                        "iteration": _tool_call_index,
+                        "provider": event.provider,
+                        "result": tool_result,
+                        "tool_result_payload": getattr(event, "tool_result_payload", None),
+                        "is_error": tool_failed,
+                        "ts": time.time(),
+                    }
+                    # Publish tool_end to unified event stream, then its durable
+                    # app-attributed file_changed companion when applicable.
                     if redis_sub:
                         try:
-                            await redis_sub.publish_tool_event(bot_id, user_id, tool_events.end({
-                                "_type": "tool_event",
-                                "event": "tool_end",
+                            await redis_sub.publish_tool_event(
+                                bot_id, user_id, tool_events.end(_tool_end_event)
+                            )
+                            if not tool_failed:
+                                _metadata_change = changed_files.persist(_tool_end_event)
+                                if _metadata_change is not None:
+                                    await redis_sub.publish_tool_event(bot_id, user_id, {
+                                        "_type": "file_changed",
+                                        "turn_id": turn_log_id,
+                                        "trigger_message_id": trigger_message_id,
+                                        "bot_id": bot_id,
+                                        "user_id": user_id,
+                                        "tool_name": _tool_end_event["tool_name"],
+                                        "tool_use_id": getattr(event, "tool_use_id", None),
+                                        "file": _metadata_change["file"],
+                                        "summary": _metadata_change["summary"],
+                                        "ts": time.time(),
+                                    })
+                        except Exception:
+                            pass
+
+                elif event.kind == AgentEventKind.FILE_CHANGED:
+                    file_data = event.raw.get("file") if isinstance(event.raw, dict) else None
+                    persisted = changed_files.persist({
+                        "turn_id": turn_log_id,
+                        "bot_id": bot_id,
+                        "user_id": user_id,
+                        "trigger_message_id": trigger_message_id,
+                        "tool_use_id": event.tool_use_id,
+                        "file": file_data,
+                    })
+                    if redis_sub and persisted is not None:
+                        try:
+                            await redis_sub.publish_tool_event(bot_id, user_id, {
+                                "_type": "file_changed",
                                 "turn_id": turn_log_id,
                                 "trigger_message_id": trigger_message_id,
                                 "bot_id": bot_id,
                                 "user_id": user_id,
-                                "tool_name": event.tool_name or "unknown",
-                                "call_id": end_call_id,
-                                "tool_use_id": getattr(event, "tool_use_id", None),
-                                "parent_tool_use_id": getattr(event, "parent_tool_use_id", None),
-                                "iteration": _tool_call_index,
-                                "provider": event.provider,
-                                "result": tool_result,
-                                "tool_result_payload": getattr(event, "tool_result_payload", None),
-                                "is_error": tool_failed,
+                                "tool_name": event.tool_name,
+                                "tool_use_id": event.tool_use_id,
+                                "file": persisted["file"],
+                                "summary": persisted["summary"],
                                 "ts": time.time(),
-                            }))
+                            })
                         except Exception:
                             pass
 

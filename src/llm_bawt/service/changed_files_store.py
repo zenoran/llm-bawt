@@ -1,26 +1,13 @@
-"""Per-turn changed-file tracking and content-addressed diff persistence.
+"""Tool-attributed changed-file persistence and lazy diff storage.
 
-TASK-661. A turn (chat or agent) may mutate files in one or more git
-workspaces. This store records one row per changed repository/path for a turn
-and persists the exact before/after *bytes* as they existed for that turn, so
-the chat UI can show a diff of what a turn changed even after the worktree
-moves on.
+TASK-664. Completed file-modifying tool calls upsert one row per
+``(turn_id, repo_key, path)`` immediately, making the file list durable before
+the turn finishes. Optional bridge-captured before/after bytes enrich that same
+row and are stored content-addressed for the existing lazy diff viewer.
 
-Design (mirrors ``tool_call_store``):
-
-* Metadata lives in the ``turn_changed_files`` table (small rows, dedup/upsert
-  keyed by ``(turn_id, repo_key, path)``).
-* Diff bytes are offloaded to the shared object store, **content-addressed by
-  sha256** so identical content dedupes to one object. Binary files store no
-  content (metadata + flag only). A bounded Postgres fallback is used when no
-  object store is configured.
-* ONE serializer (:func:`serialize_changed_file` / :func:`build_turn_summary`)
-  feeds BOTH the live ``turn_complete.changed_files`` event and the DB-backed
-  read API, so streaming and hard-refresh render the identical shape.
-
-Capture (the git snapshot/diff that produces :class:`ChangedFileInput`) is
-provider-neutral and lives in the agent bridge; this module is purely the
-app-side persistence + read model and never touches a git workspace.
+The app never infers attribution from a shared workspace diff. One serializer
+feeds incremental ``file_changed`` events, terminal ``turn_complete`` metadata,
+and DB-backed history so live and refreshed views converge on the same shape.
 """
 
 from __future__ import annotations
@@ -44,6 +31,7 @@ from sqlalchemy import (
     Integer,
     String,
     Text,
+    inspect,
     text as sa_text,
 )
 from sqlmodel import Field, SQLModel, Session, select
@@ -139,13 +127,6 @@ class TurnChangedFile(SQLModel, table=True):
     deletions: int | None = Field(default=None, sa_column=Column(Integer, nullable=True))
     binary: bool = Field(default=False, sa_column=Column(Boolean, nullable=False))
     truncated: bool = Field(default=False, sa_column=Column(Boolean, nullable=False))
-    # Manifest-level provenance copied onto each row so the canonical summary can
-    # reconstruct honest concurrency/truncation warnings without a second table.
-    overlapping: bool = Field(default=False, sa_column=Column(Boolean, nullable=False))
-    manifest_truncated: bool = Field(
-        default=False, sa_column=Column(Boolean, nullable=False)
-    )
-
     # Content-addressed object-store keys (sha256) for each side; NULL when that
     # side is absent (added file has no before; deleted file has no after) or
     # the file is binary (no content stored).
@@ -201,30 +182,19 @@ class ChangedFileInput:
     deletions: int | None = None
     binary: bool = False
     truncated: bool = False
-    overlapping: bool = False
-    manifest_truncated: bool = False
     content_type: str | None = None
     before: bytes | None = None
     after: bytes | None = None
     source_tool_call_ids: list[str] = field(default_factory=list)
 
 
-def decode_manifest_files(
-    files: list[Any],
-    *,
-    overlapping_repos: list[str] | None = None,
-    manifest_truncated: bool = False,
-) -> list[ChangedFileInput]:
-    """Decode a bridge changed-file manifest into store inputs (TASK-661).
+def decode_file_changes(files: list[Any]) -> list[ChangedFileInput]:
+    """Decode tool-attributed file events into store inputs.
 
-    The manifest arrives as JSON over Redis, so each side's bytes ride as
-    base64 (``before_b64`` / ``after_b64``). Malformed entries are skipped
-    rather than raising — a bad row must not cost the turn its whole file list.
-    Manifest-level overlap/truncation provenance is copied onto each row so the
-    canonical summary can reproduce it on live events and hard refreshes.
+    Before/after bytes ride as base64 because the bridge and app communicate via
+    JSON. Malformed entries are skipped rather than failing the owning turn.
     """
     out: list[ChangedFileInput] = []
-    overlapping_keys = {str(key) for key in (overlapping_repos or []) if key}
     for raw in files or []:
         if not isinstance(raw, dict):
             continue
@@ -243,8 +213,6 @@ def decode_manifest_files(
             deletions=raw.get("deletions"),
             binary=bool(raw.get("binary")),
             truncated=bool(raw.get("truncated")),
-            overlapping=str(repo_key) in overlapping_keys,
-            manifest_truncated=bool(manifest_truncated),
             content_type=raw.get("content_type"),
             before=_decode_b64(raw.get("before_b64")),
             after=_decode_b64(raw.get("after_b64")),
@@ -258,7 +226,7 @@ def _decode_b64(value: Any) -> bytes | None:
     try:
         return base64.b64decode(value, validate=True)
     except (ValueError, binascii.Error):
-        logger.debug("changed-file manifest carried undecodable base64")
+        logger.debug("changed-file event carried undecodable base64")
         return None
 
 
@@ -301,24 +269,12 @@ def build_turn_summary(turn_id: str, rows: list[TurnChangedFile]) -> dict[str, A
     files = [serialize_changed_file(r) for r in rows]
     total_add = sum(f["additions"] or 0 for f in files)
     total_del = sum(f["deletions"] or 0 for f in files)
-    overlapping_repos = sorted({
-        r.repo_label or r.repo_key for r in rows if r.overlapping
-    })
-    # All-overlapping: every file in the manifest came from a workspace where
-    # another turn was also running.  Without tool-call cross-referencing we
-    # cannot attribute any of these changes to THIS turn.  The flag lets
-    # callers decide whether to suppress the manifest entirely (e.g. when the
-    # turn had no file-modifying tool calls).
-    all_overlapping = bool(rows) and all(r.overlapping for r in rows)
     return {
         "turn_id": turn_id,
         "files": files,
         "total_files": len(files),
         "total_additions": total_add,
         "total_deletions": total_del,
-        "overlapping_repos": overlapping_repos,
-        "truncated": any(r.manifest_truncated for r in rows),
-        "all_overlapping": all_overlapping,
     }
 
 
@@ -355,6 +311,15 @@ class ChangedFilesStore:
                 bind=conn,
                 tables=[TurnChangedFile.__table__, TurnDiffPayloadRecord.__table__],
             )
+            legacy_columns = {
+                column["name"]
+                for column in inspect(conn).get_columns("turn_changed_files")
+            }
+            for obsolete in ("overlapping", "manifest_truncated"):
+                if obsolete in legacy_columns:
+                    conn.execute(sa_text(
+                        f"ALTER TABLE turn_changed_files DROP COLUMN {obsolete}"
+                    ))
             conn.execute(sa_text(
                 "CREATE UNIQUE INDEX IF NOT EXISTS ux_turn_changed_files_turn_repo_path"
                 " ON turn_changed_files (turn_id, repo_key, path)"
@@ -362,14 +327,6 @@ class ChangedFilesStore:
             conn.execute(sa_text(
                 "CREATE INDEX IF NOT EXISTS ix_turn_changed_files_owner_created"
                 " ON turn_changed_files (bot_id, user_id, created_at)"
-            ))
-            conn.execute(sa_text(
-                "ALTER TABLE turn_changed_files ADD COLUMN IF NOT EXISTS"
-                " overlapping BOOLEAN NOT NULL DEFAULT FALSE"
-            ))
-            conn.execute(sa_text(
-                "ALTER TABLE turn_changed_files ADD COLUMN IF NOT EXISTS"
-                " manifest_truncated BOOLEAN NOT NULL DEFAULT FALSE"
             ))
 
         self._schema_guard.run(self.engine, "changed-files-store", bootstrap)
@@ -416,6 +373,7 @@ class ChangedFilesStore:
                         .where(TurnChangedFile.repo_key == f.repo_key)
                         .where(TurnChangedFile.path == f.path)
                     ).first()
+                    is_new = row is None
                     if row is None:
                         row = TurnChangedFile(turn_id=turn_id, repo_key=f.repo_key, path=f.path)
                         session.add(row)
@@ -424,24 +382,54 @@ class ChangedFilesStore:
                     row.trigger_message_id = trigger_message_id
                     row.repo_label = f.repo_label
                     row.old_path = f.old_path
-                    row.change_kind = kind
-                    row.additions = f.additions
-                    row.deletions = f.deletions
-                    row.binary = bool(f.binary)
-                    row.truncated = bool(f.truncated or trunc_b or trunc_a)
-                    row.overlapping = bool(f.overlapping)
-                    row.manifest_truncated = bool(f.manifest_truncated)
-                    row.content_type = f.content_type
-                    row.before_blob_key = before_key
-                    row.before_sha256 = before_sha
-                    row.before_bytes = before_n
-                    row.after_blob_key = after_key
-                    row.after_sha256 = after_sha
-                    row.after_bytes = after_n
+                    has_detail = bool(
+                        f.binary
+                        or f.before is not None
+                        or f.after is not None
+                        or f.additions is not None
+                        or f.deletions is not None
+                        or f.content_type is not None
+                        or kind != "modified"
+                    )
+                    if is_new or kind in {"added", "deleted"}:
+                        row.change_kind = kind
+                    elif has_detail and row.change_kind not in {"added", "deleted"}:
+                        row.change_kind = "modified"
+                    if is_new or f.additions is not None:
+                        row.additions = f.additions
+                    if is_new or f.deletions is not None:
+                        row.deletions = f.deletions
+                    if is_new or has_detail:
+                        row.binary = bool(f.binary)
+                        row.truncated = bool(f.truncated or trunc_b or trunc_a)
+                    if is_new or f.content_type is not None:
+                        row.content_type = f.content_type
+                    # Multiple Edit/Write calls may target the same path in one
+                    # turn. Keep the FIRST before-side and the LATEST after-side
+                    # so the diff represents the whole turn, not only its last
+                    # tool call.
+                    if is_new or (row.before_sha256 is None and before_sha is not None):
+                        row.before_blob_key = before_key
+                        row.before_sha256 = before_sha
+                        row.before_bytes = before_n
+                    if is_new or after_sha is not None or kind == "deleted":
+                        row.after_blob_key = after_key
+                        row.after_sha256 = after_sha
+                        row.after_bytes = after_n
+                    existing_sources: list[str] = []
+                    if row.source_tool_call_ids:
+                        try:
+                            decoded_sources = json.loads(row.source_tool_call_ids)
+                            if isinstance(decoded_sources, list):
+                                existing_sources = [str(value) for value in decoded_sources]
+                        except (TypeError, ValueError):
+                            existing_sources = []
+                    combined_sources = list(dict.fromkeys([
+                        *existing_sources,
+                        *(str(value) for value in f.source_tool_call_ids),
+                    ]))
                     row.source_tool_call_ids = (
-                        json.dumps(f.source_tool_call_ids)
-                        if f.source_tool_call_ids
-                        else None
+                        json.dumps(combined_sources) if combined_sources else None
                     )
                     session.add(row)
                     saved += 1
@@ -489,68 +477,6 @@ class ChangedFilesStore:
 
     # -- read -------------------------------------------------------------
 
-    # Tool names that can plausibly modify workspace files.  If an
-    # all-overlapping turn has NONE of these, the manifest was captured from
-    # a concurrent turn and should be suppressed.
-    _FILE_MODIFYING_TOOLS = frozenset({
-        "Edit", "Write", "Bash", "NotebookEdit",
-    })
-
-    def _turns_with_file_tools(self, turn_ids: list[str]) -> set[str]:
-        """Return the subset of *turn_ids* that have file-modifying tool calls.
-
-        Runs one lightweight EXISTS-per-turn query; never raises — falls back to
-        "assume they all have tools" so a query failure never suppresses data.
-        """
-        if not turn_ids:
-            return set()
-        try:
-            from .tool_call_store import ToolCallRecord
-
-            with Session(self.engine) as session:
-                rows = session.exec(
-                    select(ToolCallRecord.turn_id)
-                    .where(ToolCallRecord.turn_id.in_(turn_ids))  # type: ignore[attr-defined]
-                    .where(ToolCallRecord.tool_name.in_(self._FILE_MODIFYING_TOOLS))  # type: ignore[attr-defined]
-                    .distinct()
-                ).all()
-            return set(rows)
-        except Exception:
-            logger.debug(
-                "file-modifying tool check failed; keeping all manifests",
-                exc_info=True,
-            )
-            return set(turn_ids)
-
-    def _suppress_unattributable(
-        self, summaries: dict[str, dict[str, Any]]
-    ) -> dict[str, dict[str, Any]]:
-        """Drop all-overlapping summaries from turns that had no file-modifying
-        tool calls.
-
-        When every file in a manifest came from an overlapping workspace AND the
-        turn never ran Edit / Write / Bash / NotebookEdit, the changes were made
-        by a concurrent turn — showing them here is a false attribution.
-
-        Summaries that are NOT all-overlapping, or whose turns DO have file tools,
-        are kept untouched.
-        """
-        maybe_spurious = [
-            tid for tid, s in summaries.items() if s.get("all_overlapping")
-        ]
-        if not maybe_spurious:
-            return summaries
-        has_tools = self._turns_with_file_tools(maybe_spurious)
-        to_drop = set(maybe_spurious) - has_tools
-        if not to_drop:
-            return summaries
-        logger.info(
-            "Suppressing all-overlapping changed-file manifests for turns "
-            "with no file-modifying tools: %s",
-            ", ".join(sorted(to_drop)),
-        )
-        return {tid: s for tid, s in summaries.items() if tid not in to_drop}
-
     def summaries_for_turns(self, turn_ids: list[str]) -> dict[str, dict[str, Any]]:
         """Return {turn_id: summary} for the given turns (empty if none)."""
         if self.engine is None or not turn_ids:
@@ -568,8 +494,7 @@ class ChangedFilesStore:
         except Exception:
             logger.exception("changed-file summary query failed turns=%s", turn_ids)
             return {}
-        raw = {tid: build_turn_summary(tid, rws) for tid, rws in out.items()}
-        return self._suppress_unattributable(raw)
+        return {tid: build_turn_summary(tid, rws) for tid, rws in out.items()}
 
     def summaries_for_triggers(self, message_ids: list[str]) -> dict[str, dict[str, Any]]:
         """Return {trigger_message_id: summary} keyed by user message id."""
@@ -591,15 +516,10 @@ class ChangedFilesStore:
             return {}
         # One trigger message maps to one turn, so use that turn's real id for
         # the summary; per-file entries carry it too.
-        raw = {
+        return {
             mid: build_turn_summary(rws[0].turn_id, rws)
             for mid, rws in out.items()
         }
-        # Re-key for suppression (which works by turn_id), then map back.
-        turn_to_mid = {rws[0].turn_id: mid for mid, rws in out.items()}
-        by_turn = {rws[0].turn_id: raw[mid] for mid, rws in out.items()}
-        filtered = self._suppress_unattributable(by_turn)
-        return {turn_to_mid[tid]: s for tid, s in filtered.items()}
 
     def summary_for_turn(self, turn_id: str) -> dict[str, Any]:
         return self.summaries_for_turns([turn_id]).get(

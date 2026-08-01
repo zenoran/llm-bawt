@@ -388,7 +388,7 @@ class ClaudeEventMixin:
             parent_tool_use_id=parent_tool_use_id,
             attachments=attachments,
         )
-        self._publisher.publish_run_event(request_id, event)
+        self._publish_run_event_with_changed_file(request_id, event)
 
     def _publish_session_reset_unified(
         self,

@@ -23,50 +23,6 @@ from .turn_stream_publish import TurnStreamPublishMixin
 log = get_service_logger(__name__)
 
 
-def _persist_changed_files(
-    *,
-    store,
-    turn_id: str,
-    bot_id: str | None,
-    user_id: str | None,
-    trigger_message_id: str | None,
-    item: dict,
-) -> None:
-    """Persist one bridge changed-file manifest (TASK-661).
-
-    Never raises: the file list is a nice-to-have on top of the reply, so a
-    storage failure logs and the turn finishes normally.
-    """
-    try:
-        from .changed_files_store import decode_manifest_files
-
-        files = decode_manifest_files(
-            item.get("files") or [],
-            overlapping_repos=item.get("overlapping_repos") or [],
-            manifest_truncated=bool(item.get("truncated")),
-        )
-        if not files:
-            return
-        saved = store.save_changed_files(
-            turn_id=turn_id,
-            bot_id=bot_id,
-            user_id=user_id,
-            trigger_message_id=trigger_message_id,
-            files=files,
-        )
-        overlapping = item.get("overlapping_repos") or []
-        log.info(
-            "TASK-661 persisted %d changed file(s) for turn=%s%s%s",
-            saved, turn_id,
-            " [truncated]" if item.get("truncated") else "",
-            f" [overlapping: {', '.join(overlapping)}]" if overlapping else "",
-        )
-    except Exception:
-        log.warning(
-            "TASK-661 changed-file persist failed for turn=%s", turn_id, exc_info=True
-        )
-
-
 class TurnStreamWorker(TurnStreamPublishMixin):
     """Owns the worker-thread streaming + finalize for one chat turn."""
 
@@ -78,6 +34,8 @@ class TurnStreamWorker(TurnStreamPublishMixin):
         _persist_publish_approval = self._persist_publish_approval
         _persist_publish_await = self._persist_publish_await
         _publish_event_direct = self._publish_event_direct
+        from .tool_changed_files import ToolChangedFilesCoordinator
+        _changed_files = ToolChangedFilesCoordinator(ctx.svc._turn_log_store.engine)
         _enrich_attachment_refs = self._enrich_attachment_refs
         _redis_sub = ctx._redis_sub
         _upstream_model = ctx._upstream_model
@@ -813,21 +771,35 @@ class TurnStreamWorker(TurnStreamPublishMixin):
                                     r for r in refs if isinstance(r, dict)
                                 )
                             continue
-                        if evt == "changed_files":
-                            # TASK-661: the bridge captured what this turn
-                            # changed on disk. Persist here — before the
-                            # turn_complete publish below reads the summary
-                            # back — so live and hard-refresh agree.
-                            _persist_changed_files(
-                                store=self._turn_log_store,
-                                turn_id=turn_log_id,
-                                bot_id=bot_id,
-                                user_id=user_id,
-                                trigger_message_id=(
+                        if evt == "file_changed":
+                            # TASK-664: one completed Edit/Write/NotebookEdit.
+                            # Persist before publication so reconnect/history can
+                            # never observe an event whose durable row is missing.
+                            persisted = _changed_files.persist({
+                                "turn_id": turn_log_id,
+                                "bot_id": bot_id,
+                                "user_id": user_id,
+                                "trigger_message_id": (
                                     item.get("trigger_message_id") or trigger_message_id
                                 ),
-                                item=item,
-                            )
+                                "tool_use_id": item.get("tool_use_id"),
+                                "file": item.get("file"),
+                            })
+                            if persisted is not None:
+                                _publish_event_direct({
+                                    "_type": "file_changed",
+                                    "turn_id": turn_log_id,
+                                    "trigger_message_id": (
+                                        item.get("trigger_message_id") or trigger_message_id
+                                    ),
+                                    "bot_id": bot_id,
+                                    "user_id": user_id,
+                                    "tool_name": item.get("tool_name"),
+                                    "tool_use_id": item.get("tool_use_id"),
+                                    "file": persisted["file"],
+                                    "summary": persisted["summary"],
+                                    "ts": time.time(),
+                                })
                             continue
                         if evt in ("subagent_started", "subagent_progress", "subagent_done"):
                             # TASK-344: sub-agent lifecycle events. Publish
@@ -974,7 +946,7 @@ class TurnStreamWorker(TurnStreamPublishMixin):
                                         "enrichment failed: %s",
                                         _enrich_err,
                                     )
-                            _publish_event_direct({
+                            _tool_end_event = {
                                 "_type": "tool_event",
                                 "event": "tool_end",
                                 "turn_id": turn_log_id,
@@ -983,6 +955,7 @@ class TurnStreamWorker(TurnStreamPublishMixin):
                                 "bot_id": bot_id,
                                 "user_id": user_id,
                                 "tool_name": _result_name or "unknown",
+                                "arguments": item.get("arguments", {}),
                                 "call_id": _end_cid,
                                 "result": item.get("result", ""),
                                 "tool_result_payload": item.get("tool_result_payload"),
@@ -1002,7 +975,33 @@ class TurnStreamWorker(TurnStreamPublishMixin):
                                 # the live tool card (TASK-483). None when the
                                 # tool produced no media.
                                 "attachments": _tool_end_attachments,
-                            })
+                            }
+                            _tool_end_future = _publish_event_direct(_tool_end_event)
+                            if not item.get("is_error"):
+                                _metadata_change = _changed_files.persist(_tool_end_event)
+                                if _metadata_change is not None:
+                                    # Preserve public ordering: tool_end first,
+                                    # then the lightweight file_changed row.
+                                    if _tool_end_future is not None:
+                                        try:
+                                            _tool_end_future.result(timeout=5)
+                                        except Exception as _order_err:
+                                            log.debug(
+                                                "tool_end ordering wait failed turn=%s: %s",
+                                                turn_log_id, _order_err,
+                                            )
+                                    _publish_event_direct({
+                                        "_type": "file_changed",
+                                        "turn_id": turn_log_id,
+                                        "trigger_message_id": _tool_end_event["trigger_message_id"],
+                                        "bot_id": bot_id,
+                                        "user_id": user_id,
+                                        "tool_name": _tool_end_event["tool_name"],
+                                        "tool_use_id": item.get("tool_use_id"),
+                                        "file": _metadata_change["file"],
+                                        "summary": _metadata_change["summary"],
+                                        "ts": time.time(),
+                                    })
                             # Update the matching detail entry with result +
                             # failure flag so the finalized tool_calls_json
                             # (read on reload for completed turns) keeps the
@@ -1243,7 +1242,7 @@ class TurnStreamWorker(TurnStreamPublishMixin):
                                 turn_log_id,
                                 _tts_order_err,
                             )
-            # TASK-661: attach the canonical changed-file summary so a live turn
+            # TASK-664: attach the canonical changed-file summary so a live turn
             # renders file links without waiting on a history refetch. Empty when
             # nothing was captured; never allowed to block turn_complete.
             try:

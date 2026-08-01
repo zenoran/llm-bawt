@@ -155,7 +155,7 @@ class TestTransport:
         )
         assert captured["disallowed_tools"] == ["EnterPlanMode"]
 
-    def test_agent_bridge_drains_changed_files_after_error(self, monkeypatch):
+    def test_agent_bridge_drains_file_changed_after_error(self, monkeypatch):
         from agent_bridge.events import AgentEvent, AgentEventKind
         from llm_bawt.agent_backends import agent_bridge as module
 
@@ -179,9 +179,11 @@ class TestTransport:
                     kind=AgentEventKind.ERROR, origin="system", text="boom",
                 )
                 yield AgentEvent(
-                    event_id="files", session_key="s", run_id="run",
-                    kind=AgentEventKind.CHANGED_FILES, origin="system",
-                    raw={"files": [{"repo_key": "r", "path": "a.py"}]},
+                    event_id="file", session_key="s", run_id="run",
+                    kind=AgentEventKind.FILE_CHANGED, origin="system",
+                    tool_name="Edit", tool_arguments={"file_path": "/r/a.py"},
+                    tool_use_id="tool-1",
+                    raw={"file": {"repo_key": "r", "path": "a.py"}},
                 )
 
             async def close(self):
@@ -204,7 +206,8 @@ class TestTransport:
             "hello", {"bot_id": "test", "timeout_seconds": 1}
         ))
         changed = next(iterator)
-        assert changed["event"] == "changed_files"
+        assert changed["event"] == "file_changed"
+        assert changed["file"]["path"] == "a.py"
         with pytest.raises(RuntimeError, match="boom"):
             next(iterator)
 

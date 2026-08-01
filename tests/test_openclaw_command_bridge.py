@@ -62,8 +62,6 @@ def test_handle_send_command_recovers_reply_from_history_after_empty_stream():
     publisher = MagicMock()
     bridge = SessionBridge(ws_client, ingest, store, publisher)
     bridge._history_reply_timeout_s = 0.05
-    bridge._arm_changed_file_tracker = AsyncMock(return_value=None)
-    bridge._publish_changed_files = AsyncMock(return_value=2)
     bridge._history_reply_poll_interval_s = 0.0
 
     async_redis = MagicMock()
@@ -93,6 +91,5 @@ def test_handle_send_command_recovers_reply_from_history_after_empty_stream():
     ]
 
     assert recovered, "expected synthetic assistant delta recovered from chat history"
-    bridge._publish_changed_files.assert_awaited_once()
     publisher.publish_run_done.assert_called_once_with("req_123")
     async_redis.xack.assert_awaited_once()
