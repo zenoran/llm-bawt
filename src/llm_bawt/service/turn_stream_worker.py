@@ -17,6 +17,7 @@ import uuid
 from ..media.serializers import build_agent_image_manifest
 from .chat_stream_worker import consume_stream_chunks, put_queue_item_threadsafe
 from .logging import get_service_logger
+from .pending_tool_calls import PendingToolCallCorrelator
 from .turn_stream_context import TurnStreamContext, _TEXT_DELTA_FLUSH_CHARS
 from .turn_stream_publish import TurnStreamPublishMixin
 
@@ -534,10 +535,10 @@ class TurnStreamWorker(TurnStreamPublishMixin):
             # Wrap stream to publish tool events directly to Redis
             # from this thread (survives SSE generator cancellation).
             _oc_call_index = [0]
-            # Stack of (call_id, tool_name) for in-flight OpenClaw tool
-            # calls.  Each tool_result pops by name match so nested calls
-            # (Agent → Grep → Read) pair correctly with their tool_call.
-            _oc_call_stack: list[tuple[str, str]] = []
+            # Stable correlator for in-flight agent tool calls. Claude's
+            # tool_use_id is authoritative; name/LIFO fallback covers providers
+            # that do not expose one.
+            _oc_tool_calls = PendingToolCallCorrelator()
 
             _oc_request_id_captured = [False]
             # Fires once, on the SDK/bridge-CONFIRMED first output of this
@@ -832,7 +833,11 @@ class TurnStreamWorker(TurnStreamPublishMixin):
                             _oc_call_index[0] += 1
                             cid = f"call_{uuid.uuid4().hex[:8]}"
                             _oc_tool_name = item.get("name", "unknown")
-                            _oc_call_stack.append((cid, _oc_tool_name))
+                            _oc_tool_calls.start(
+                                call_id=cid,
+                                tool_name=_oc_tool_name,
+                                tool_use_id=item.get("tool_use_id"),
+                            )
                             # Inject call_id into the dict so the queue consumer
                             # uses the same ID as the SSE event (no double-ID).
                             item["_call_id"] = cid
@@ -895,22 +900,13 @@ class TurnStreamWorker(TurnStreamPublishMixin):
                                 "text_offset": _text_chars[0],
                             })
                         elif evt == "tool_result":
-                            # Pair tool_result with its in-flight tool_call.
-                            # Match by tool_name (handles nested calls
-                            # finishing out of declared order); fall back
-                            # to popping the innermost entry.
+                            # Pair by the bridge's stable tool_use_id first.
+                            # Name/LIFO fallback remains for providers that omit it.
                             _result_name = item.get("name") or ""
-                            _end_cid = ""
-                            if _oc_call_stack:
-                                _matched_idx = -1
-                                for _i in range(len(_oc_call_stack) - 1, -1, -1):
-                                    _cid_i, _name_i = _oc_call_stack[_i]
-                                    if _name_i == _result_name:
-                                        _matched_idx = _i
-                                        break
-                                if _matched_idx < 0:
-                                    _matched_idx = len(_oc_call_stack) - 1
-                                _end_cid, _ = _oc_call_stack.pop(_matched_idx)
+                            _end_cid = _oc_tool_calls.finish(
+                                tool_name=_result_name,
+                                tool_use_id=item.get("tool_use_id"),
+                            )
                             item["_call_id"] = _end_cid
                             # TASK-483: enrich this call's screenshot refs
                             # ({asset_id, kind}, bridge-stamped on TOOL_END)
