@@ -58,7 +58,7 @@ from __future__ import annotations
 import json
 import logging
 import uuid
-from typing import Any, AsyncIterator
+from typing import Any, AsyncIterator, Callable
 
 from .tool_sanitizers import recover_trailing_json, sanitize_tool_arguments
 
@@ -160,6 +160,7 @@ async def responses_to_anthropic_sse(
     upstream_stream: AsyncIterator[Any],
     anthropic_model: str,
     tool_schemas: list[dict] | None = None,
+    on_usage: Callable[[int, int, int, int], None] | None = None,
 ) -> AsyncIterator[bytes]:
     """Translate a Responses API event stream into Anthropic SSE bytes."""
 
@@ -436,6 +437,8 @@ async def responses_to_anthropic_sse(
                 resp = getattr(event, "response", None)
                 if resp is not None:
                     input_tokens, output_tokens, cache_read, cache_create = _extract_usage(resp)
+                    if on_usage is not None:
+                        on_usage(input_tokens, output_tokens, cache_read, cache_create)
                     logger.info(
                         "Responses usage: input=%d cached=%d uncached=%d output=%d cache_hit=%.1f%%",
                         input_tokens, cache_read,
@@ -455,6 +458,8 @@ async def responses_to_anthropic_sse(
                 resp = getattr(event, "response", None)
                 if resp is not None:
                     input_tokens, output_tokens, cache_read, cache_create = _extract_usage(resp)
+                    if on_usage is not None:
+                        on_usage(input_tokens, output_tokens, cache_read, cache_create)
                     details = getattr(resp, "incomplete_details", None)
                     reason = getattr(details, "reason", "") if details else ""
                     explicit_stop = _STOP_REASON_MAP.get(reason, "max_tokens")

@@ -7,6 +7,8 @@ OpenAI ChatGPT adapter so callers only need to import this package.
 
 from __future__ import annotations
 
+import asyncio
+
 from .base import ProviderAdapter
 from .kimi_coding import KimiCodingAdapter
 from .moonshot import MoonshotAdapter
@@ -25,6 +27,16 @@ def lookup(name: str) -> ProviderAdapter | None:
     return REGISTRY.get(name)
 
 
+async def start_all() -> None:
+    """Start every registered adapter's reusable connection pool."""
+    await asyncio.gather(*(adapter.start() for adapter in REGISTRY.values()))
+
+
+async def close_all() -> None:
+    """Close every registered adapter exactly once during proxy shutdown."""
+    await asyncio.gather(*(adapter.close() for adapter in REGISTRY.values()))
+
+
 # Default registrations. Adding a new provider = create the adapter file,
 # import it here, and register an instance.
 register(OpenAIChatGPTAdapter())
@@ -33,4 +45,6 @@ register(ZaiAdapter())
 register(MoonshotAdapter())
 register(KimiCodingAdapter())
 
-__all__ = ["ProviderAdapter", "REGISTRY", "register", "lookup"]
+__all__ = [
+    "ProviderAdapter", "REGISTRY", "register", "lookup", "start_all", "close_all",
+]

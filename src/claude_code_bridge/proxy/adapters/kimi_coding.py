@@ -18,6 +18,7 @@ import httpx
 
 from ..stream_cc import chat_completions_to_anthropic_sse
 from ..translate_cc import anthropic_to_chat_completions
+from ..request_context import ProxyRequestContext
 from .base import ProviderAdapter
 
 logger = logging.getLogger(__name__)
@@ -54,6 +55,7 @@ class KimiCodingAdapter(ProviderAdapter):
         self,
         anthropic_body: dict,
         upstream_model: str,
+        context: ProxyRequestContext | None = None,
     ) -> AsyncIterator[bytes]:
         key, base_url = await self.authorize()
         body = anthropic_to_chat_completions(anthropic_body, upstream_model)
@@ -73,16 +75,18 @@ class KimiCodingAdapter(ProviderAdapter):
             len(body.get("messages") or []),
         )
 
-        async with httpx.AsyncClient(timeout=_TIMEOUT) as client:
-            async with client.stream("POST", url, json=body, headers=headers) as resp:
-                if resp.status_code >= 400:
-                    detail = (await resp.aread()).decode("utf-8", "replace")
-                    raise RuntimeError(
-                        f"Kimi For Coding upstream {resp.status_code}: {detail[:500]}"
-                    )
-                async for frame in chat_completions_to_anthropic_sse(
-                    resp.aiter_lines(),
-                    anthropic_model=anthropic_body.get("model", upstream_model),
-                    tool_schemas=anthropic_body.get("tools"),
-                ):
-                    yield frame
+        client = await self.http_client()
+        async with client.stream(
+            "POST", url, json=body, headers=headers, timeout=_TIMEOUT
+        ) as resp:
+            if resp.status_code >= 400:
+                detail = (await resp.aread()).decode("utf-8", "replace")
+                raise RuntimeError(
+                    f"Kimi For Coding upstream {resp.status_code}: {detail[:500]}"
+                )
+            async for frame in chat_completions_to_anthropic_sse(
+                resp.aiter_lines(),
+                anthropic_model=anthropic_body.get("model", upstream_model),
+                tool_schemas=anthropic_body.get("tools"),
+            ):
+                yield frame

@@ -37,6 +37,11 @@ from claude_agent_sdk.types import (
 from claude_code_bridge.tool_events import normalize_tool_result
 
 from ._bridge_helpers import _get_fresh_oauth_token
+from .proxy.request_context import (
+    ProxyRequestContext,
+    custom_header_env,
+    durable_conversation_identity,
+)
 from .send_errors import is_auth_failure_text
 
 logger = logging.getLogger("claude_code_bridge.bridge")
@@ -109,6 +114,10 @@ class ClaudeStreamMixin:
         model: str,
         subagent_model: str | None,
         force_refresh: bool,
+        bot_id: str,
+        session_key: str,
+        thread_session_id: str | None,
+        request_id: str,
     ) -> dict:
         """Build the environment dict handed to ``ClaudeAgentOptions(env=...)``."""
         sdk_env = {}
@@ -136,6 +145,22 @@ class ClaudeStreamMixin:
             # ANTHROPIC_AUTH_TOKEN inside the CLI; clear it so
             # the SDK doesn't fall back to api.anthropic.com.
             sdk_env["CLAUDE_CODE_OAUTH_TOKEN"] = ""
+            # The durable DB thread is the canonical conversation boundary.
+            # Normal app dispatch always supplies it; the request id is a
+            # non-prompt fallback for legacy/direct bridge commands.
+            conversation_id = durable_conversation_identity(
+                bot_id=bot_id,
+                session_key=session_key,
+                thread_session_id=thread_session_id or request_id,
+            )
+            sdk_env["ANTHROPIC_CUSTOM_HEADERS"] = custom_header_env(
+                ProxyRequestContext(
+                    request_id=request_id,
+                    provider=model.partition("/")[0],
+                    bot_id=bot_id,
+                    conversation_id=conversation_id,
+                )
+            )
             # TASK-546: Override the small/fast (Haiku) and subagent
             # models so Claude Code's internal background calls
             # (title gen, tool-use summaries, API verification) and

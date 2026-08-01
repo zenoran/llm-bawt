@@ -16,6 +16,7 @@ from typing import Optional
 import uvicorn
 from fastapi import FastAPI
 
+from .adapters import close_all, start_all
 from .routes import router as messages_router
 
 logger = logging.getLogger(__name__)
@@ -24,9 +25,11 @@ logger = logging.getLogger(__name__)
 @asynccontextmanager
 async def _lifespan(app: FastAPI):
     logger.info("Proxy app starting")
+    await start_all()
     try:
         yield
     finally:
+        await close_all()
         logger.info("Proxy app shutting down")
 
 

@@ -11,6 +11,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import time
 import uuid
 from typing import Any, AsyncIterator
@@ -21,6 +22,14 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from .adapters import lookup
 from .errors import anthropic_error, auth_failed_error
 from .heartbeat import DEFAULT_INTERVAL, with_heartbeat
+from .observability import OBSERVABILITY
+from .request_context import (
+    BOT_HEADER,
+    CONVERSATION_HEADER,
+    REQUEST_HEADER,
+    ProxyRequestContext,
+    valid_conversation_identity,
+)
 
 # Seconds of upstream silence before the proxy injects a keepalive ping.
 # Override with CLAUDE_CODE_BRIDGE_PROXY_PING_INTERVAL (0 disables).
@@ -69,21 +78,42 @@ def _error_status(error_type: str | None) -> int:
     }.get((error_type or "").strip(), 500)
 
 
+def _upstream_error_type(message: str, status_code: int | None) -> str:
+    lowered = message.lower()
+    if status_code in (401, 403) or "auth" in lowered:
+        return "authentication_error"
+    if status_code == 429 or "rate" in lowered:
+        return "rate_limit_error"
+    if (
+        (status_code is not None and 500 <= status_code <= 599)
+        or "overloaded" in lowered
+    ):
+        return "overloaded_error"
+    return "api_error"
+
+
 async def _proxy_iter(
     adapter,
     body: dict[str, Any],
     upstream_model: str,
     *,
     provider: str,
+    context: ProxyRequestContext,
 ) -> AsyncIterator[bytes]:
     """Run one proxy request, surfacing adapter failures as Anthropic SSE."""
     started = time.perf_counter()
+    account_scope = adapter.account_hash()
+    context.account_hash = account_scope
+    context.active_provider, context.active_account = OBSERVABILITY.begin(
+        provider, account_scope
+    )
+    status_code: int | None = None
     try:
         # Heartbeat-wrap every adapter so neither the OpenAI translate path
         # nor the Z.AI passthrough can go silent long enough to read as a
         # dead connection (covers the reasoning-window stall).
         async for chunk in with_heartbeat(
-            adapter.call(body, upstream_model), interval=_PING_INTERVAL
+            adapter.call(body, upstream_model, context), interval=_PING_INTERVAL
         ):
             yield chunk
     except RuntimeError as e:
@@ -91,14 +121,12 @@ async def _proxy_iter(
         # surface as RuntimeError. Classify them so the SDK handles
         # retries appropriately instead of treating all as auth errors.
         msg = str(e)
-        if "401" in msg or "403" in msg or "auth" in msg.lower():
-            etype = "authentication_error"
-        elif "429" in msg or "rate" in msg.lower():
-            etype = "rate_limit_error"
-        elif "overloaded" in msg.lower() or "503" in msg or "529" in msg:
-            etype = "overloaded_error"
-        else:
-            etype = "api_error"
+        status_match = re.search(r"\b([45]\d\d)\b", msg)
+        status_code = int(status_match.group(1)) if status_match else None
+        if status_code is None:
+            status_code = 500
+        OBSERVABILITY.record_error(provider, status_code)
+        etype = _upstream_error_type(msg, status_code)
         logger.warning("Adapter error (type=%s): %s", etype, e)
         err_payload = {
             "type": "error",
@@ -112,21 +140,46 @@ async def _proxy_iter(
             b"data: " + json.dumps(err_payload).encode() + b"\n\n"
         )
     except Exception as e:  # noqa: BLE001
+        status_code = getattr(e, "status_code", None) or 500
+        OBSERVABILITY.record_error(provider, status_code)
         logger.exception("Unexpected adapter failure")
+        etype = _upstream_error_type(str(e), status_code)
         err_payload = {
             "type": "error",
-            "error": {"type": "api_error", "message": f"Proxy error: {e}"},
+            "error": {"type": etype, "message": f"Proxy error: {e}"},
         }
         yield (
             b"event: error\n"
             b"data: " + json.dumps(err_payload).encode() + b"\n\n"
         )
     finally:
+        OBSERVABILITY.end(provider, account_scope)
+        errors_429, errors_5xx = OBSERVABILITY.error_totals(provider)
         logger.info(
-            "Proxy /v1/messages completed provider=%s upstream_model=%s elapsed_ms=%.1f",
+            "proxy_stream_complete request_id=%s provider=%s account=%s bot=%s "
+            "session_hash=%s active_provider=%d active_account=%d queue_ms=%.1f "
+            "setup_ms=%s upstream_ttfb_ms=%s stream_ms=%.1f input=%d cached=%d "
+            "output=%d cache_hit=%.1f%% status=%s errors_429_total=%d "
+            "errors_5xx_total=%d upstream_model=%s",
+            context.request_id,
             provider,
-            upstream_model,
+            context.account_hash,
+            context.bot_id or "unknown",
+            context.session_hash,
+            context.active_provider,
+            context.active_account,
+            context.queue_wait_ms,
+            f"{context.local_setup_ms:.1f}" if context.local_setup_ms is not None else "na",
+            f"{context.upstream_ttfb_ms:.1f}" if context.upstream_ttfb_ms is not None else "na",
             (time.perf_counter() - started) * 1000,
+            context.input_tokens,
+            context.cached_tokens,
+            context.output_tokens,
+            context.cache_hit_pct,
+            status_code or 200,
+            errors_429,
+            errors_5xx,
+            upstream_model,
         )
 
 
@@ -307,9 +360,23 @@ async def messages(request: Request) -> JSONResponse | StreamingResponse:
     # and returns the assembled JSON body.
     stream_requested = bool(body.get("stream"))
 
+    request_headers = getattr(request, "headers", {})
+    context = ProxyRequestContext(
+        request_id=(request_headers.get(REQUEST_HEADER) or uuid.uuid4().hex).strip(),
+        provider=provider,
+        bot_id=(request_headers.get(BOT_HEADER) or "").strip() or None,
+        conversation_id=valid_conversation_identity(
+            request_headers.get(CONVERSATION_HEADER)
+        ),
+    )
+
     logger.info(
-        "Proxy /v1/messages provider=%s upstream_model=%s messages=%d tools=%d",
+        "proxy_stream_start request_id=%s provider=%s bot=%s session_hash=%s "
+        "upstream_model=%s messages=%d tools=%d",
+        context.request_id,
         provider,
+        context.bot_id or "unknown",
+        context.session_hash,
         upstream_model,
         len(body.get("messages") or []),
         len(body.get("tools") or []),
@@ -324,7 +391,13 @@ async def messages(request: Request) -> JSONResponse | StreamingResponse:
 
     if not stream_requested:
         message, error_payload = await _anthropic_sse_to_message(
-            _proxy_iter(adapter, body_for_adapter, upstream_model, provider=provider),
+            _proxy_iter(
+                adapter,
+                body_for_adapter,
+                upstream_model,
+                provider=provider,
+                context=context,
+            ),
             fallback_model=body.get("model") or upstream_model,
         )
         if error_payload is not None:
@@ -333,7 +406,13 @@ async def messages(request: Request) -> JSONResponse | StreamingResponse:
         return JSONResponse(message)
 
     return StreamingResponse(
-        _proxy_iter(adapter, body_for_adapter, upstream_model, provider=provider),
+        _proxy_iter(
+            adapter,
+            body_for_adapter,
+            upstream_model,
+            provider=provider,
+            context=context,
+        ),
         media_type="text/event-stream",
         headers={
             "Cache-Control": "no-cache",

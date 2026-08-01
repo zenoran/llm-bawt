@@ -24,7 +24,10 @@ def test_non_streaming_route_buffers_sse_into_message(monkeypatch) -> None:
     from claude_code_bridge.proxy import routes as proxy_routes
 
     class FakeAdapter:
-        async def call(self, anthropic_body: dict, upstream_model: str):
+        def account_hash(self) -> str:
+            return "fake"
+
+        async def call(self, anthropic_body: dict, upstream_model: str, context=None):
             assert anthropic_body["stream"] is True
             yield b'event: message_start\ndata: {"type":"message_start","message":{"id":"msg_1","type":"message","role":"assistant","content":[],"model":"zai/glm-5.2","stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":0,"output_tokens":0,"cache_creation_input_tokens":0,"cache_read_input_tokens":0}}}\n\n'
             yield b'event: content_block_start\ndata: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}\n\n'

@@ -32,6 +32,7 @@ from typing import AsyncIterator, ClassVar
 import httpx
 
 from .base import ProviderAdapter
+from ..request_context import ProxyRequestContext
 
 logger = logging.getLogger(__name__)
 
@@ -100,6 +101,7 @@ class AnthropicPassthroughAdapter(ProviderAdapter):
         self,
         anthropic_body: dict,
         upstream_model: str,
+        context: ProxyRequestContext | None = None,
     ) -> AsyncIterator[bytes]:
         """Stream the Anthropic request straight upstream, relay SSE back."""
         api_key = self._api_key()
@@ -128,41 +130,43 @@ class AnthropicPassthroughAdapter(ProviderAdapter):
             len(body.get("messages") or []),
         )
 
-        async with httpx.AsyncClient(timeout=_TIMEOUT) as client:
-            async with client.stream("POST", url, json=body, headers=headers) as resp:
-                if resp.status_code >= 400:
-                    detail = (await resp.aread()).decode("utf-8", "replace")
-                    raise RuntimeError(
-                        f"{self.LABEL} upstream {resp.status_code}: {detail[:500]}"
+        client = await self.http_client()
+        async with client.stream(
+            "POST", url, json=body, headers=headers, timeout=_TIMEOUT
+        ) as resp:
+            if resp.status_code >= 400:
+                detail = (await resp.aread()).decode("utf-8", "replace")
+                raise RuntimeError(
+                    f"{self.LABEL} upstream {resp.status_code}: {detail[:500]}"
+                )
+            # Best-effort usage tap: relay raw bytes untouched (the SDK
+            # consumes them), and on the side accumulate a decoded copy
+            # to extract the `message_start` usage block so we can see
+            # whether the upstream's context cache is actually hitting.
+            buf = ""
+            usage_logged = False
+            # The upstream echoes the bare model name ("glm-5.2") in
+            # message_start. The SDK CLI validates that the response
+            # model matches what it sent ("zai/glm-5.2"). Rewrite the
+            # model field in the raw SSE so the CLI doesn't reject the
+            # response as malformed.
+            bare_model_bytes = f'"model": "{upstream_model}"'.encode()
+            full_model_bytes = f'"model": "{original_model}"'.encode()
+            async for chunk in resp.aiter_raw():
+                if not chunk:
+                    continue
+                if bare_model_bytes in chunk:
+                    chunk = chunk.replace(bare_model_bytes, full_model_bytes)
+                yield chunk
+                if usage_logged:
+                    continue
+                try:
+                    buf += chunk.decode("utf-8", "ignore")
+                    buf, usage_logged = self._tap_usage(
+                        buf, upstream_model, usage_logged
                     )
-                # Best-effort usage tap: relay raw bytes untouched (the SDK
-                # consumes them), and on the side accumulate a decoded copy
-                # to extract the `message_start` usage block so we can see
-                # whether the upstream's context cache is actually hitting.
-                buf = ""
-                usage_logged = False
-                # The upstream echoes the bare model name ("glm-5.2") in
-                # message_start. The SDK CLI validates that the response
-                # model matches what it sent ("zai/glm-5.2"). Rewrite the
-                # model field in the raw SSE so the CLI doesn't reject the
-                # response as malformed.
-                bare_model_bytes = f'"model": "{upstream_model}"'.encode()
-                full_model_bytes = f'"model": "{original_model}"'.encode()
-                async for chunk in resp.aiter_raw():
-                    if not chunk:
-                        continue
-                    if bare_model_bytes in chunk:
-                        chunk = chunk.replace(bare_model_bytes, full_model_bytes)
-                    yield chunk
-                    if usage_logged:
-                        continue
-                    try:
-                        buf += chunk.decode("utf-8", "ignore")
-                        buf, usage_logged = self._tap_usage(
-                            buf, upstream_model, usage_logged
-                        )
-                    except Exception:  # noqa: BLE001 — logging must never break the stream
-                        usage_logged = True
+                except Exception:  # noqa: BLE001 — logging must never break the stream
+                    usage_logged = True
 
     @classmethod
     def _tap_usage(

@@ -202,6 +202,10 @@ async def claude_access_token(request: Request, force: bool = False):
 async def chatgpt_access_token(request: Request, force: bool = False):
     """Internal: hand a reader the current app-owned ChatGPT/codex access token.
 
+    ``expires_at`` is the access-token JWT ``exp`` as Unix epoch **seconds**.
+    Consumers must compare it directly with ``time.time()``; it is not epoch
+    milliseconds. This matches :class:`CodexToken` and ``_bundle_expires_at``.
+
     The proxy adapter (claude-code-bridge) and the codex-bridge call this to
     resolve tokens without reading a bind-mounted file. The app is the SOLE
     refresher — readers never refresh. Same trust model as the Claude broker

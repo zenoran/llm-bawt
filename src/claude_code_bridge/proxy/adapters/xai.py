@@ -32,6 +32,7 @@ import os
 from typing import ClassVar
 
 from .base import ProviderAdapter
+from ..request_context import ProxyRequestContext
 
 logger = logging.getLogger(__name__)
 
@@ -75,7 +76,11 @@ class XaiAdapter(ProviderAdapter):
         """
         return self._api_key(), self._base_url()
 
-    def prepare_request(self, responses_body: dict) -> dict:
+    def prepare_request(
+        self,
+        responses_body: dict,
+        context: ProxyRequestContext | None = None,
+    ) -> dict:
         """Inject xAI's native **server-side** search tools so Grok can search
         the live web inside its own turn.
 

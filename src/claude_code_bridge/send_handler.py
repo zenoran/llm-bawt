@@ -328,6 +328,10 @@ class ClaudeSendMixin(ClaudeStreamMixin, ClaudeUsageMixin, ClaudeResultMixin):
                         model=model,
                         subagent_model=subagent_model,
                         force_refresh=auth_retry.attempted,
+                        bot_id=bot_slug,
+                        session_key=session_key,
+                        thread_session_id=thread_session_id,
+                        request_id=request_id,
                     )
                     if mcp_tool_timeout_ms:
                         # TASK-618: DB-backed app policy, delivered per turn so

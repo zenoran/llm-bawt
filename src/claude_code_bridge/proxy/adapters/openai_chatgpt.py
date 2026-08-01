@@ -13,16 +13,17 @@ defaults) is unchanged from the TASK-270 live-smoke verification.
 from __future__ import annotations
 
 import hashlib
+import asyncio
 import json
 import logging
 import os
 import time
-import uuid
 from typing import ClassVar
 
 import httpx
 
 from .base import ProviderAdapter
+from ..request_context import ProxyRequestContext
 
 logger = logging.getLogger(__name__)
 
@@ -86,18 +87,24 @@ class OpenAIChatGPTAdapter(ProviderAdapter):
     name: ClassVar[str] = "openai_chatgpt"
 
     def __init__(self) -> None:
+        super().__init__()
         self._cached_token: str | None = None
         self._cached_account_id: str | None = None
         self._cached_expires_at: float | None = None
-        # Stable per-process session id (telemetry only).
-        self._session_id = uuid.uuid4().hex
-        self._account_id: str | None = None
+        self._authorize_lock = asyncio.Lock()
 
     # ── broker token resolution ──────────────────────────────────────────
     def _cache_valid(self) -> bool:
         if not self._cached_token or self._cached_expires_at is None:
             return False
         return (self._cached_expires_at - time.time()) > _CACHE_BUFFER_S
+
+    def account_hash(self) -> str:
+        if not self._cached_account_id:
+            return "pending"
+        return hashlib.sha256(
+            self._cached_account_id.encode("utf-8")
+        ).hexdigest()[:12]
 
     def _fetch_broker_token(self, *, force: bool = False) -> tuple[str, str | None, float | None]:
         """Ask the app for the current ChatGPT access token.
@@ -152,36 +159,64 @@ class OpenAIChatGPTAdapter(ProviderAdapter):
         The app's proactive loop keeps the token fresh, so the broker almost
         always returns without doing an upstream refresh.
         """
-        import asyncio  # noqa: PLC0415
-
         if not self._cache_valid():
-            token, account_id, expires_at = await asyncio.to_thread(
-                self._fetch_broker_token
-            )
-            self._cached_token = token
-            self._cached_account_id = account_id
-            # Broker returns expires_at as epoch-ms (or None if unknown).
-            self._cached_expires_at = (
-                expires_at / 1000.0 if isinstance(expires_at, (int, float)) else None
-            )
+            # Single-flight cold/near-expiry resolution. Re-check after taking
+            # the lock so a burst of parallel streams performs one broker call.
+            async with self._authorize_lock:
+                if not self._cache_valid():
+                    token, account_id, expires_at = await asyncio.to_thread(
+                        self._fetch_broker_token
+                    )
+                    self._cached_token = token
+                    self._cached_account_id = account_id
+                    # Broker contract: Unix epoch SECONDS. Be tolerant of an
+                    # accidental millisecond producer at this boundary while
+                    # keeping seconds as the explicit canonical unit.
+                    if isinstance(expires_at, (int, float)):
+                        value = float(expires_at)
+                        if value >= 100_000_000_000:
+                            logger.warning(
+                                "ChatGPT broker expires_at looked like epoch-ms; normalizing"
+                            )
+                            value /= 1000.0
+                        self._cached_expires_at = value
+                    else:
+                        self._cached_expires_at = None
 
-        self._account_id = self._cached_account_id
         base_url = os.getenv(API_BASE_ENV) or DEFAULT_API_BASE
+        assert self._cached_token is not None
         return self._cached_token, base_url
 
     # ── upstream quirks (unchanged from TASK-270) ────────────────────────
-    def extra_headers(self) -> dict[str, str]:
+    def extra_headers(
+        self,
+        responses_body: dict,
+        context: ProxyRequestContext | None = None,
+    ) -> dict[str, str]:
         """Headers the ChatGPT codex backend requires/expects."""
+        # Real bridge traffic always carries the durable identity. The
+        # deterministic opening-prefix fallback preserves compatibility for
+        # direct proxy callers without reintroducing bridge-global affinity.
+        session_id = (
+            context.conversation_id if context and context.conversation_id
+            else _prompt_cache_key(responses_body)
+        )
         headers = {
             "OpenAI-Beta": "responses=experimental",
             "originator": "codex_cli_rs",
-            "session_id": self._session_id,
+            "session_id": session_id,
         }
-        if self._account_id:
-            headers["chatgpt-account-id"] = self._account_id
+        if self._cached_account_id:
+            headers["chatgpt-account-id"] = self._cached_account_id
+            if context is not None:
+                context.account_hash = self.account_hash()
         return headers
 
-    def prepare_request(self, responses_body: dict) -> dict:
+    def prepare_request(
+        self,
+        responses_body: dict,
+        context: ProxyRequestContext | None = None,
+    ) -> dict:
         """Adapt the translated Responses body to the codex backend's quirks."""
         for key in _UNSUPPORTED_PARAMS:
             responses_body.pop(key, None)
@@ -189,7 +224,10 @@ class OpenAIChatGPTAdapter(ProviderAdapter):
         responses_body["store"] = False
         if not responses_body.get("instructions"):
             responses_body["instructions"] = _FALLBACK_INSTRUCTIONS
-        responses_body["prompt_cache_key"] = _prompt_cache_key(responses_body)
+        responses_body["prompt_cache_key"] = (
+            context.conversation_id if context and context.conversation_id
+            else _prompt_cache_key(responses_body)
+        )
         if "reasoning" not in responses_body:
             effort = (os.getenv(REASONING_EFFORT_ENV) or "").strip().lower()
             if effort not in _VALID_EFFORT:
