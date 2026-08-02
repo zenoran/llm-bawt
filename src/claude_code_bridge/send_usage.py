@@ -12,6 +12,7 @@ assembled-instance state resolve normally.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 
 from ._bridge_helpers import (
@@ -25,6 +26,18 @@ logger = logging.getLogger("claude_code_bridge.bridge")
 
 class ClaudeUsageMixin:
     """Token-usage / context-window extraction for a completed turn."""
+
+    @staticmethod
+    async def _read_native_context_usage(sdk_client) -> dict | None:
+        if sdk_client is None:
+            return None
+        try:
+            return dict(await asyncio.wait_for(
+                sdk_client.get_context_usage(), timeout=5.0
+            ))
+        except Exception as context_error:
+            logger.debug("Native context usage unavailable: %s", context_error)
+            return None
 
     def _compute_result_usage(
         self,
@@ -74,6 +87,15 @@ class ClaudeUsageMixin:
                 latest_stream_usage,
                 cumulative_usage,
                 proxy_model=proxy_model,
+            )
+            # Only an actual AssistantMessage/message_delta snapshot represents
+            # one model invocation's resident prompt. ResultMessage.usage is a
+            # turn-wide aggregate across tool iterations and must never become a
+            # context gauge merely because it was the only available fallback.
+            has_iteration_snapshot = any(
+                iter_usage is candidate
+                for candidate in (latest_assistant_usage, latest_stream_usage)
+                if isinstance(candidate, dict)
             )
             model_usage = getattr(msg, "model_usage", None) or {}
             ctx_window = None
@@ -199,6 +221,13 @@ class ClaudeUsageMixin:
                     "max_output_tokens": max_output,
                     "total_cost_usd": cost,
                 }
+                if has_iteration_snapshot:
+                    token_usage_payload["resident_tokens"] = (
+                        _input_tokens + _cache_read + _cache_create
+                    )
+                    token_usage_payload["resident_source"] = (
+                        "final_iteration_total_input"
+                    )
                 if actual_model and str(actual_model).startswith(
                     ("zai/", "xai/", "moonshot/", "kimi_coding/")
                 ):

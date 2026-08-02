@@ -21,6 +21,8 @@ from .approval_policies import router as approval_policies_router
 from .tasks import router as tasks_router
 from .ha_weather import router as ha_weather_router
 from .turn_logs import router as turn_logs_router
+from .inter_bot_deliveries import router as inter_bot_deliveries_router
+from .agent_context import router as agent_context_router
 from .usage import router as usage_router
 # TASK-214: avatar_animations CRUD moved to bawthub Prisma.
 # /v1/avatar/animations routes were deleted; admin lives at
@@ -39,6 +41,8 @@ all_routers = [
     chat_router,
     tasks_router,
     turn_logs_router,
+    inter_bot_deliveries_router,
+    agent_context_router,
     usage_router,
     jobs_router,
     history_router,

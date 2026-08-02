@@ -29,6 +29,7 @@ class ClaudeResultMixin:
         bot_context_window: int | None,
         latest_assistant_usage: dict | None,
         latest_stream_usage: dict | None,
+        native_context_usage: dict | None,
         compact_status: str | None,
         compact_error_msg: str | None,
         turn_session_id: str | None,
@@ -64,6 +65,24 @@ class ClaudeResultMixin:
             latest_assistant_usage=latest_assistant_usage,
             latest_stream_usage=latest_stream_usage,
         )
+        if native_context_usage:
+            native_total = int(native_context_usage.get("totalTokens") or 0)
+            native_max = int(native_context_usage.get("maxTokens") or 0)
+            if native_total or native_max:
+                token_usage_payload = dict(token_usage_payload or {})
+                token_usage_payload["resident_tokens"] = native_total or None
+                token_usage_payload["resident_source"] = "claude_sdk_context"
+                token_usage_payload["context_window"] = native_max or ctx_window
+                token_usage_payload["context_percentage"] = native_context_usage.get(
+                    "percentage"
+                )
+                token_usage_payload["auto_compact_enabled"] = native_context_usage.get(
+                    "isAutoCompactEnabled"
+                )
+                token_usage_payload["auto_compact_threshold"] = native_context_usage.get(
+                    "autoCompactThreshold"
+                )
+                ctx_window = native_max or ctx_window
 
         if compact_status == "success":
             cm = await asyncio.to_thread(
@@ -82,13 +101,20 @@ class ClaudeResultMixin:
                     f"{_fmt_tokens(post)} tokens{freed}."
                 )
                 token_usage_payload = {
+                    **(token_usage_payload or {}),
                     "input_tokens": int(post),
                     "cache_read_tokens": 0,
                     "cache_creation_tokens": 0,
                     "output_tokens": 0,
+                    "resident_tokens": int(post),
+                    "resident_source": "claude_compact_metadata",
                     "context_window": ctx_window,
                     "max_output_tokens": max_output,
                     "total_cost_usd": getattr(msg, "total_cost_usd", None),
+                    "context_action": "compact",
+                    "context_action_outcome": "success",
+                    "context_action_pre_tokens": pre,
+                    "context_action_post_tokens": post,
                 }
             else:
                 note = "\n\n✅ Conversation compacted."
@@ -101,6 +127,12 @@ class ClaudeResultMixin:
             )
             full_text = "".join(text_parts)
         elif compact_status == "failed":
+            token_usage_payload = {
+                **(token_usage_payload or {}),
+                "context_action": "compact",
+                "context_action_outcome": "failed",
+                "context_action_error": compact_error_msg,
+            }
             note = f"\n\nℹ️ Nothing to compact — {compact_error_msg}"
             seq += 1
             text_parts.append(note)

@@ -547,6 +547,9 @@ class ServiceLLMBawt(BaseLLMBawt):
         stream: bool = False,
         inject_messages: list | None = None,
         thread_binding: dict | None = None,
+        bridge_request_id: str | None = None,
+        bridge_timeout_seconds: float | None = None,
+        bridge_event_callback=None,
     ) -> tuple[str, str, list[dict]]:
         """Execute the LLM query and return response.
         
@@ -571,6 +574,12 @@ class ServiceLLMBawt(BaseLLMBawt):
         # never leak between concurrent turns via shared instance state.
         if thread_binding:
             _q_kwargs["thread_binding"] = thread_binding
+        if bridge_request_id:
+            _q_kwargs["bridge_request_id"] = bridge_request_id
+        if bridge_timeout_seconds:
+            _q_kwargs["bridge_timeout_seconds"] = bridge_timeout_seconds
+        if bridge_event_callback is not None:
+            _q_kwargs["bridge_event_callback"] = bridge_event_callback
 
         # Agent backends (claude-code/openclaw) execute tools in their OWN
         # bridge/runtime — they must NOT go through llm-bawt's tool loop. The

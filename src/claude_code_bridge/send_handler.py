@@ -752,6 +752,9 @@ class ClaudeSendMixin(ClaudeStreamMixin, ClaudeUsageMixin, ClaudeResultMixin):
                                 if terminal_error is not None:
                                     raise terminal_error
 
+                                native_context_usage = await self._read_native_context_usage(
+                                    sdk_client
+                                )
                                 seq = await self._finalize_result_message(
                                     msg,
                                     request_id=request_id,
@@ -767,6 +770,7 @@ class ClaudeSendMixin(ClaudeStreamMixin, ClaudeUsageMixin, ClaudeResultMixin):
                                     bot_context_window=bot_context_window,
                                     latest_assistant_usage=latest_assistant_usage,
                                     latest_stream_usage=latest_stream_usage,
+                                    native_context_usage=native_context_usage,
                                     compact_status=compact_status,
                                     compact_error_msg=compact_error_msg,
                                     turn_session_id=turn_session_id,

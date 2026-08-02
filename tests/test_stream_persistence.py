@@ -5,10 +5,11 @@ from __future__ import annotations
 import asyncio
 import threading
 from types import SimpleNamespace
-from unittest.mock import Mock
+from unittest.mock import AsyncMock, Mock
 
 from llm_bawt.service.background_service import BackgroundService
 from llm_bawt.service.chat_stream_worker import consume_stream_chunks
+from llm_bawt.service.schemas import ChatCompletionRequest, ChatMessage
 
 
 class _ClosedLoop:
@@ -30,6 +31,120 @@ def _build_service_for_finalize() -> BackgroundService:
     service.config = SimpleNamespace(DEBUG_TURN_LOG=False)
     service._update_turn_log = Mock()
     return service
+
+
+def test_inter_bot_nonstream_turn_publishes_visible_lifecycle(monkeypatch) -> None:
+    service = BackgroundService.__new__(BackgroundService)
+    service.config = SimpleNamespace(DEFAULT_BOT="nova", DEFAULT_USER="nick")
+    service._inter_bot_dispatcher = SimpleNamespace(
+        store=SimpleNamespace(validate_claim=Mock(return_value=True))
+    )
+    subscriber = SimpleNamespace(publish_tool_event=AsyncMock())
+    service._redis_subscriber = subscriber
+    service._resolve_request_model = Mock(return_value=("test-model", []))
+    service._persist_turn_log = Mock()
+    service._update_turn_log = Mock()
+    service._end_generation = Mock()
+    service._bind_agent_thread = Mock(return_value=None)
+    service._resolve_active_thread_binding = Mock(return_value=None)
+    service._maybe_summarize_on_new = Mock()
+    service._maybe_rotate_agent_session = Mock()
+    service._finalize_turn = Mock()
+    service._turn_log_store = SimpleNamespace(engine=object())
+
+    coordinated: list[dict] = []
+
+    class FakeCoordinator:
+        def __init__(self, _engine):
+            pass
+
+        def start(self, event):
+            coordinated.append(event)
+            return {**event, "_tool_persisted": True}
+
+        def end(self, event):
+            coordinated.append(event)
+            return {**event, "_tool_persisted": True}
+
+    monkeypatch.setattr(
+        "llm_bawt.service.tool_event_coordinator.ToolEventCoordinator",
+        FakeCoordinator,
+    )
+
+    client = SimpleNamespace(
+        model_definition={"type": "claude-code"},
+        get_token_usage=Mock(return_value={"input_tokens": 12}),
+    )
+    def execute_llm_query(*_args, **kwargs):
+        callback = kwargs["bridge_event_callback"]
+        callback({
+            "event": "tool_call",
+            "name": "Read",
+            "arguments": {"file_path": "x.py"},
+            "provider": "claude-code",
+            "tool_use_id": "tool-1",
+        })
+        callback({
+            "event": "tool_result",
+            "name": "Read",
+            "arguments": {"file_path": "x.py"},
+            "result": "contents",
+            "provider": "claude-code",
+            "tool_use_id": "tool-1",
+        })
+        return "visible reply", "", []
+
+    llm_bawt = SimpleNamespace(
+        client=client,
+        bot=SimpleNamespace(tts_mode=False),
+        prepare_messages_for_query=Mock(return_value=[]),
+        execute_llm_query=execute_llm_query,
+    )
+    service._get_llm_bawt = Mock(return_value=llm_bawt)
+    monkeypatch.setattr(
+        "llm_bawt.service.background_service.get_bot", lambda _bot_id: None
+    )
+    monkeypatch.setattr(
+        "llm_bawt.service.routes.history.maybe_build_session_seed",
+        lambda *_args, **_kwargs: None,
+    )
+
+    request = ChatCompletionRequest(
+        model="test-model",
+        messages=[ChatMessage(role="user", content="background prompt")],
+        bot_id="loopy",
+        user="nick",
+        stream=False,
+        user_message_id="user-visible",
+        inter_bot_delivery_id="delivery-visible",
+        inter_bot_turn_id="turn-visible",
+        inter_bot_bridge_request_id="req-visible",
+        inter_bot_claim_token="claim-visible",
+    )
+
+    response = asyncio.run(service.chat_completion(request))
+
+    assert response.choices[0].message.content == "visible reply"
+    events = [call.args[2] for call in subscriber.publish_tool_event.await_args_list]
+    assert [event.get("event") or event["_type"] for event in events] == [
+        "turn_start",
+        "tool_start",
+        "tool_end",
+        "text_delta",
+        "turn_complete",
+    ]
+    assert events[0]["trigger_message_id"] == "user-visible"
+    assert events[1]["tool_name"] == "Read"
+    assert events[1]["call_id"] == events[2]["call_id"]
+    assert events[2]["result"] == "contents"
+    assert coordinated == [
+        {key: value for key, value in events[1].items() if key != "_tool_persisted"},
+        {key: value for key, value in events[2].items() if key != "_tool_persisted"},
+    ]
+    assert events[3]["delta"] == "visible reply"
+    assert events[4]["status"] == "completed"
+    assert events[4]["assistant_message_id"] == events[0]["assistant_message_id"]
+    assert service._finalize_turn.call_args.kwargs["assistant_message_id"] == events[0]["assistant_message_id"]
 
 
 def test_finalize_turn_saves_history() -> None:
@@ -61,6 +176,86 @@ def test_finalize_turn_saves_history() -> None:
     assert kwargs["turn_id"] == "turn-1"
     assert kwargs["status"] == "ok"
     assert kwargs["response_text"] == "hello world"
+
+
+def test_finalize_turn_persists_non_streaming_agent_usage(monkeypatch) -> None:
+    service = _build_service_for_finalize()
+
+    class FakeAgentBackendClient:
+        def get_token_usage(self):
+            return {
+                "resident_tokens": 16475,
+                "resident_source": "claude_sdk_context",
+                "context_window": 372000,
+            }
+
+        def get_tool_calls(self):
+            return []
+
+    from llm_bawt.service import turn_lifecycle as tl_module
+
+    monkeypatch.setattr(tl_module, "AgentBackendClient", FakeAgentBackendClient)
+    llm_bawt = SimpleNamespace(
+        finalize_response=Mock(), adapter=None, client=FakeAgentBackendClient()
+    )
+
+    service._finalize_turn(
+        llm_bawt=llm_bawt,
+        turn_id="turn-agent-usage",
+        response_text="done",
+        tool_context="",
+        tool_call_details=[],
+        prepared_messages=[],
+        user_prompt="prompt",
+        model="test-model",
+        bot_id="proto",
+        user_id="nick",
+        elapsed_ms=20.0,
+        stream=False,
+    )
+
+    assert service._update_turn_log.call_args.kwargs["token_usage"] == {
+        "resident_tokens": 16475,
+        "resident_source": "claude_sdk_context",
+        "context_window": 372000,
+    }
+
+
+def test_finalize_turn_prefers_explicit_streaming_usage(monkeypatch) -> None:
+    service = _build_service_for_finalize()
+
+    class FakeAgentBackendClient:
+        def get_token_usage(self):
+            return {"resident_tokens": 1}
+
+        def get_tool_calls(self):
+            return []
+
+    from llm_bawt.service import turn_lifecycle as tl_module
+
+    monkeypatch.setattr(tl_module, "AgentBackendClient", FakeAgentBackendClient)
+    llm_bawt = SimpleNamespace(
+        finalize_response=Mock(), adapter=None, client=FakeAgentBackendClient()
+    )
+    explicit = {"resident_tokens": 99, "resident_source": "stream"}
+
+    service._finalize_turn(
+        llm_bawt=llm_bawt,
+        turn_id="turn-stream-usage",
+        response_text="done",
+        tool_context="",
+        tool_call_details=[],
+        prepared_messages=[],
+        user_prompt="prompt",
+        model="test-model",
+        bot_id="proto",
+        user_id="nick",
+        elapsed_ms=20.0,
+        stream=True,
+        token_usage=explicit,
+    )
+
+    assert service._update_turn_log.call_args.kwargs["token_usage"] == explicit
 
 
 def test_finalize_turn_extracts_agent_backend_tools(monkeypatch) -> None:

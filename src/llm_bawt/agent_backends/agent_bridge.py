@@ -138,7 +138,8 @@ class AgentBridgeBackend(AgentBackend):
 
         session_key = self._resolve_session_key(config)
         timeout = int(config.get("timeout_seconds", 600))
-        request_id = f"req_{uuid.uuid4().hex}"
+        configured_request_id = str(config.get("request_id") or "").strip()
+        request_id = configured_request_id or f"req_{uuid.uuid4().hex}"
         self._active_request_id = request_id
         # Fall back to config so callers that thread it through agent_backend_config
         # (rather than as a kwarg) still propagate.
@@ -152,7 +153,17 @@ class AgentBridgeBackend(AgentBackend):
         tool_calls: list[AgentToolCall] = []
         text_parts: list[str] = []
         upstream_model: str = ""
+        token_usage: dict[str, Any] = {}
         termination_reason = "completed"
+        event_callback = config.get("event_callback")
+
+        def _notify_event(item: dict[str, Any]) -> None:
+            if not callable(event_callback):
+                return
+            try:
+                event_callback(item)
+            except Exception:
+                logger.debug("agent event callback failed", exc_info=True)
 
         import queue as queue_mod
 
@@ -268,6 +279,8 @@ class AgentBridgeBackend(AgentBackend):
                                 # SSE generator can surface it on turn_complete
                                 # for the chat UI's per-bubble usage pill.
                                 if event.token_usage:
+                                    token_usage.clear()
+                                    token_usage.update(event.token_usage)
                                     result_queue.put({
                                         "event": "token_usage",
                                         "token_usage": event.token_usage,
@@ -331,7 +344,7 @@ class AgentBridgeBackend(AgentBackend):
                                 )
                                 tool_calls.append(tc)
                                 logger.info("%s tool event: %s", self.name, tc.display_name)
-                                result_queue.put({
+                                tool_item = {
                                     "event": "tool_call",
                                     "name": tc.display_name,
                                     "arguments": tc.arguments,
@@ -351,7 +364,9 @@ class AgentBridgeBackend(AgentBackend):
                                     # is a sub-agent's inner activity — lets the UI nest
                                     # it under the parent card (TASK-344). None otherwise.
                                     "parent_tool_use_id": event.parent_tool_use_id,
-                                })
+                                }
+                                _notify_event(tool_item)
+                                result_queue.put(tool_item)
 
                             elif event.kind == AgentEventKind.TOOL_END:
                                 if tool_calls:
@@ -368,7 +383,7 @@ class AgentBridgeBackend(AgentBackend):
                                                 matched_call = candidate
                                                 break
                                     matched_call.result = result
-                                    result_queue.put({
+                                    tool_item = {
                                         "event": "tool_result",
                                         "name": matched_call.display_name,
                                         "arguments": matched_call.arguments,
@@ -394,7 +409,9 @@ class AgentBridgeBackend(AgentBackend):
                                         # ASSISTANT_DONE attachments flush is
                                         # unchanged and still backs history/reload.
                                         "attachments": event.attachments or None,
-                                    })
+                                    }
+                                    _notify_event(tool_item)
+                                    result_queue.put(tool_item)
 
                             elif event.kind == AgentEventKind.AWAIT_TOOL_RESULT:
                                 # Claude-code bridge has paused the SDK on an
@@ -592,6 +609,7 @@ class AgentBridgeBackend(AgentBackend):
                 provider=self.name,
                 duration_ms=int((end_time - request_started) * 1000),
                 tool_calls=tool_calls,
+                usage=dict(token_usage),
                 raw={"request_id": request_id, "termination_reason": termination_reason},
             )
             self._thread_local.last_stream_result = result

@@ -17,6 +17,11 @@ from .tool_call_store import ToolCallRecord, ToolCallStore
 
 logger = logging.getLogger(__name__)
 
+
+class DeliveryTargetBusy(RuntimeError):
+    """A durable inter-bot reservation won the target's idle race."""
+
+
 # Terminal turn statuses — a turn in any of these is finished and no longer
 # "in turn".  Non-terminal (in-progress) statuses are "streaming" (streaming
 # path) and "pending" (non-streaming path).  Kept in ONE place so the
@@ -381,6 +386,113 @@ class TurnLogStore:
             trigger_message_id = _extract_trigger_id(request_payload)
 
         created_at = datetime.now(timezone.utc)
+
+        # Durable inter-bot callbacks reserve their deterministic turn under the
+        # same per-target advisory lock used by the outbox claim. Normal turn
+        # creation also takes that lock: if any OTHER recent turn is open, the
+        # reservation lost its idle race and the dispatcher receives a typed
+        # busy signal instead of forcing concurrency. Reusing the reserved id is
+        # an atomic upsert, so target acceptance cannot create two turn rows.
+        delivery_id = None
+        if request_payload:
+            raw_delivery = request_payload.get("inter_bot_delivery_id")
+            if isinstance(raw_delivery, str) and raw_delivery.strip():
+                delivery_id = raw_delivery.strip()
+        if bot_id:
+            with self.engine.begin() as conn:
+                conn.execute(
+                    sa_text("SELECT pg_advisory_xact_lock(hashtext(:target))"),
+                    {"target": bot_id},
+                )
+                other_open = conn.execute(
+                    sa_text(
+                        "SELECT id, status FROM turn_logs WHERE bot_id=:target"
+                        " AND ended_at IS NULL AND id != :turn_id"
+                        " ORDER BY created_at DESC LIMIT 1"
+                    ),
+                    {"target": bot_id, "turn_id": turn_id},
+                ).mappings().first()
+                if other_open and (delivery_id or other_open["status"] == "reserved"):
+                    if delivery_id:
+                        conn.execute(
+                            sa_text("DELETE FROM turn_logs WHERE id=:id AND status='reserved'"),
+                            {"id": turn_id},
+                        )
+                    raise DeliveryTargetBusy(
+                        f"target '{bot_id}' became busy with turn {other_open['id']}"
+                    )
+                existing_status = conn.execute(
+                    sa_text("SELECT status FROM turn_logs WHERE id=:id FOR UPDATE"),
+                    {"id": turn_id},
+                ).scalar_one_or_none()
+                if existing_status is not None:
+                    if existing_status != "reserved":
+                        raise RuntimeError(f"turn id already exists: {turn_id}")
+                    conn.execute(
+                        sa_text(
+                            "UPDATE turn_logs SET request_id=:request_id, path=:path,"
+                            " stream=:stream, model=:model, bot_id=:bot_id, user_id=:user_id,"
+                            " status=:status, latency_ms=:latency_ms, user_prompt=:user_prompt,"
+                            " request_json=:request_json, response_text=:response_text,"
+                            " error_text=:error_text, trigger_message_id=:trigger_message_id,"
+                            " agent_session_key=:agent_session_key,"
+                            " agent_request_id=:agent_request_id, animation=:animation,"
+                            " token_usage_json=:token_usage_json, parent_turn_id=:parent_turn_id"
+                            " WHERE id=:turn_id"
+                        ),
+                        {
+                            "turn_id": turn_id,
+                            "request_id": request_id,
+                            "path": path,
+                            "stream": stream,
+                            "model": model,
+                            "bot_id": bot_id,
+                            "user_id": user_id,
+                            "status": status,
+                            "latency_ms": latency_ms,
+                            "user_prompt": user_prompt,
+                            "request_json": json.dumps(request_payload, ensure_ascii=False, default=str) if request_payload else None,
+                            "response_text": response_text,
+                            "error_text": error_text,
+                            "trigger_message_id": trigger_message_id,
+                            "agent_session_key": agent_session_key,
+                            "agent_request_id": agent_request_id,
+                            "animation": animation,
+                            "token_usage_json": json.dumps(token_usage, ensure_ascii=False, default=str) if isinstance(token_usage, dict) else None,
+                            "parent_turn_id": parent_turn_id,
+                        },
+                    )
+                    return
+
+                # Ordinary turn insert stays inside the advisory-lock transaction
+                # so it cannot cross a delivery claim between check and commit.
+                conn.execute(
+                    TurnLog.__table__.insert().values(
+                        id=turn_id,
+                        created_at=created_at,
+                        request_id=request_id,
+                        path=path,
+                        stream=stream,
+                        model=model,
+                        bot_id=(bot_id or None),
+                        user_id=(user_id or None),
+                        status=status,
+                        latency_ms=latency_ms,
+                        user_prompt=user_prompt,
+                        request_json=json.dumps(request_payload, ensure_ascii=False, default=str) if request_payload else None,
+                        response_text=response_text,
+                        error_text=error_text,
+                        trigger_message_id=trigger_message_id,
+                        agent_session_key=agent_session_key,
+                        agent_request_id=agent_request_id,
+                        animation=animation,
+                        token_usage_json=(json.dumps(token_usage, ensure_ascii=False, default=str) if isinstance(token_usage, dict) else None),
+                        parent_turn_id=parent_turn_id,
+                        ended_at=(_terminal_ended_at(created_at, latency_ms) if _is_terminal(status, None) else None),
+                    )
+                )
+                return
+
         row = TurnLog(
             id=turn_id,
             created_at=created_at,

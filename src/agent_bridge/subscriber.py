@@ -219,7 +219,7 @@ class RedisSubscriber:
             fields["disallowed_tools"] = json.dumps(
                 disallowed_tools, ensure_ascii=False
             )
-        if inject_messages:
+        if inject_messages is not None:
             fields["inject_messages"] = json.dumps(inject_messages, ensure_ascii=False)
         if thread_session_id:
             fields["thread_session_id"] = thread_session_id
@@ -227,15 +227,49 @@ class RedisSubscriber:
                 fields["thread_resume_id"] = thread_resume_id
             if explicit_thread:
                 fields["explicit_thread"] = "1"
-        await self._pub_redis.xadd(
-            COMMANDS_STREAM,
-            fields,
-            maxlen=1000,
-            approximate=True,
-        )
+        # Stable request ids make bridge transport retries idempotent. The Lua
+        # script atomically records the request id and appends the command; a
+        # duplicate caller simply subscribes to the existing agent:run stream.
+        # All ordinary calls already mint unique req_* ids, so applying this
+        # universally changes no normal semantics and covers every bridge.
+        dedupe_key = f"agent:command:request:{request_id}"
+        flat_fields: list[str] = []
+        for key, value in fields.items():
+            flat_fields.extend((str(key), str(value)))
+        script = """
+            local prior = redis.call('GET', KEYS[1])
+            if prior then return {0, prior} end
+            local args = {}
+            for i = 3, #ARGV do table.insert(args, ARGV[i]) end
+            local stream_id = redis.call(
+                'XADD', KEYS[2], 'MAXLEN', '~', ARGV[1], '*', unpack(args)
+            )
+            local ttl = 86400
+            if string.sub(ARGV[2], 1, 13) == 'req_delivery_' then ttl = 604800 end
+            redis.call('SET', KEYS[1], stream_id, 'EX', ttl)
+            return {1, stream_id}
+        """
+        import inspect
+        eval_fn = getattr(self._pub_redis, "eval", None)
+        if callable(eval_fn):
+            eval_result = eval_fn(
+                script, 2, dedupe_key, COMMANDS_STREAM, "1000", request_id, *flat_fields
+            )
+            if inspect.isawaitable(eval_result):
+                published, stream_id = await eval_result
+            else:
+                published, stream_id = eval_result
+        else:
+            # Compatibility for lightweight Redis test doubles that implement
+            # only xadd. Production redis.asyncio always provides async eval.
+            stream_id = await self._pub_redis.xadd(
+                COMMANDS_STREAM, fields, maxlen=1000, approximate=True
+            )
+            published = 1
         logger.debug(
-            "Sent command: request_id=%s session=%s attachments=%d",
-            request_id, session_key, len(attachments or []),
+            "%s command: request_id=%s stream_id=%s session=%s attachments=%d",
+            "Sent" if int(published) else "Reused",
+            request_id, stream_id, session_key, len(attachments or []),
         )
 
     async def send_steer(
@@ -247,9 +281,10 @@ class RedisSubscriber:
         backend: str,
         target_request_id: str | None = None,
         timeout_s: float = 10,
+        request_id: str | None = None,
     ) -> dict:
-        """Interrupt and redirect the active agent run without opening a new turn."""
-        request_id = f"steer_{uuid.uuid4().hex}"
+        """Interrupt an active run once and await its idempotent RPC result."""
+        request_id = request_id or f"steer_{uuid.uuid4().hex}"
         fields: dict[str, str] = {
             "action": "chat.steer",
             "session_key": session_key,
@@ -261,11 +296,23 @@ class RedisSubscriber:
         if target_request_id:
             fields["target_request_id"] = target_request_id
 
-        await self._pub_redis.xadd(
-            COMMANDS_STREAM,
-            fields,
-            maxlen=1000,
-            approximate=True,
+        dedupe_key = f"agent:steer:request:{request_id}"
+        flat_fields: list[str] = []
+        for key, value in fields.items():
+            flat_fields.extend((str(key), str(value)))
+        script = """
+            local prior = redis.call('GET', KEYS[1])
+            if prior then return {0, prior} end
+            local args = {}
+            for i = 2, #ARGV do table.insert(args, ARGV[i]) end
+            local stream_id = redis.call(
+                'XADD', KEYS[2], 'MAXLEN', '~', ARGV[1], '*', unpack(args)
+            )
+            redis.call('SET', KEYS[1], stream_id, 'EX', 604800)
+            return {1, stream_id}
+        """
+        await self._pub_redis.eval(
+            script, 2, dedupe_key, COMMANDS_STREAM, "1000", *flat_fields
         )
 
         stream_key = f"agent:rpc:{request_id}"
@@ -451,7 +498,9 @@ class RedisSubscriber:
             remaining = deadline - loop_time()
             if remaining <= 0:
                 logger.warning("subscribe_run inactivity timeout for request_id=%s", request_id)
-                return
+                raise TimeoutError(
+                    f"bridge run {request_id} produced no event for {timeout_s:.0f}s"
+                )
 
             block_ms = min(int(remaining * 1000), 2000)
             try:

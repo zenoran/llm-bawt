@@ -113,10 +113,12 @@ async def lifespan(app):
         await scheduler.start()
         log.info(f"📅 Scheduler started (interval={config.SCHEDULER_CHECK_INTERVAL_SECONDS}s)")
 
-    # Start OpenClaw integration (Redis subscriber or in-process bridge)
+    # Start the shared Redis agent transport for every bridge harness. OpenClaw,
+    # Claude Code, and Codex all depend on this subscriber; OpenClaw-specific
+    # session mapping remains optional inside the shared setup.
     redis_subscriber = None
     history_drain_task = None
-    if config.OPENCLAW_WS_ENABLED and config.OPENCLAW_WS_URL:
+    if config.REDIS_URL:
         try:
             # Build session_key -> bot_id mapping from openclaw bots
             from ..bots import BotManager
@@ -134,168 +136,157 @@ async def lifespan(app):
             if session_to_bot:
                 log.info("OpenClaw session->bot mapping: %s", session_to_bot)
 
-            if not config.REDIS_URL:
-                log.error(
-                    "OpenClaw WS is enabled but REDIS_URL is not set. "
-                    "The bridge requires Redis for command/event transport."
-                )
-            else:
-                from agent_bridge.subscriber import RedisSubscriber
-                from ..agent_backends.agent_bridge import set_agent_subscriber
+            from agent_bridge.subscriber import RedisSubscriber
+            from ..agent_backends.agent_bridge import set_agent_subscriber
 
-                redis_subscriber = RedisSubscriber(config.REDIS_URL)
-                await redis_subscriber.connect()
-                service._redis_subscriber = redis_subscriber
+            redis_subscriber = RedisSubscriber(config.REDIS_URL)
+            await redis_subscriber.connect()
+            service._redis_subscriber = redis_subscriber
 
-                # Make subscriber available to OpenClawBackend instances
-                set_agent_subscriber(redis_subscriber)
+            # Make subscriber available to every Redis-backed agent backend.
+            set_agent_subscriber(redis_subscriber)
 
-                # DEACTIVATED: passive history drain causes duplicates with
-                # finalize_response().  The active chat.send path persists via
-                # finalize_response() and does not need this consumer.
-                # Re-enable when async/cron traffic persistence is redesigned.
-                #
-                # def _history_sink(bot_id: str, role: str, content: str) -> None:
-                #     client = service.get_memory_client(bot_id)
-                #     if client:
-                #         client.add_message(role=role, content=content)
-                #
-                # import asyncio
-                # history_drain_task = asyncio.create_task(
-                #     redis_subscriber.drain_history(_history_sink)
-                # )
-                # service._history_drain_task = history_drain_task
+            # DEACTIVATED: passive history drain causes duplicates with
+            # finalize_response().  The active chat.send path persists via
+            # finalize_response() and does not need this consumer.
 
-                # Start background task to clean up stale consumer groups
-                async def _cleanup_stale_groups():
-                    """Periodically destroy idle ui:* consumer groups."""
-                    import asyncio as _asyncio
-                    while True:
-                        await _asyncio.sleep(300)  # every 5 minutes
-                        try:
-                            streams = await redis_subscriber.list_unified_streams()
-                            total = 0
-                            for stream_key in streams:
-                                total += await redis_subscriber.cleanup_stale_groups(stream_key)
-                            if total:
-                                log.info("Cleaned up %d stale consumer groups", total)
-                        except Exception:
-                            log.debug("Stale group cleanup error", exc_info=True)
+            # Start background task to clean up stale consumer groups
+            async def _cleanup_stale_groups():
+                """Periodically destroy idle ui:* consumer groups."""
+                import asyncio as _asyncio
+                while True:
+                    await _asyncio.sleep(300)
+                    try:
+                        streams = await redis_subscriber.list_unified_streams()
+                        total = 0
+                        for stream_key in streams:
+                            total += await redis_subscriber.cleanup_stale_groups(stream_key)
+                        if total:
+                            log.info("Cleaned up %d stale consumer groups", total)
+                    except Exception:
+                        log.debug("Stale group cleanup error", exc_info=True)
 
-                import asyncio
-                service._group_cleanup_task = asyncio.create_task(_cleanup_stale_groups())
+            import asyncio
+            service._group_cleanup_task = asyncio.create_task(_cleanup_stale_groups())
 
-                # Start persistence consumer for tool events → Postgres.
-                # TASK-286: also accumulates assistant text deltas per turn so a
-                # COLD reload (and a turn that completes after the client
-                # disconnects) recovers the response TEXT, not just tool calls.
-                _partial_text: dict[str, str] = {}
-                # TASK-360 (P4): accumulate per-turn reasoning ("thinking") the
-                # same way, flushed to turn_logs.reasoning so a COLD reload
-                # mid-turn recovers already-produced reasoning, not just text.
-                _partial_reasoning: dict[str, str] = {}
+            # Start persistence consumer for tool events → Postgres.
+            # TASK-286: also accumulates assistant text deltas per turn so a
+            # COLD reload (and a turn that completes after the client
+            # disconnects) recovers the response TEXT, not just tool calls.
+            _partial_text: dict[str, str] = {}
+            # TASK-360 (P4): accumulate per-turn reasoning ("thinking") the
+            # same way, flushed to turn_logs.reasoning so a COLD reload
+            # mid-turn recovers already-produced reasoning, not just text.
+            _partial_reasoning: dict[str, str] = {}
 
-                def _tool_event_sink(event_data: dict) -> None:
-                    """Persist tool_start/tool_end + text_delta + reasoning_delta events to Postgres."""
-                    store = service._turn_log_store
-                    _type = event_data.get("_type")
-                    if _type == "reasoning_delta":
-                        turn_id = event_data.get("turn_id")
-                        if not turn_id:
-                            return
-                        delta = event_data.get("delta", "") or ""
-                        rbuf = _partial_reasoning.get(turn_id, "") + delta
-                        _partial_reasoning[turn_id] = rbuf
-                        # Pass the current text buffer too so the write never
-                        # clobbers already-flushed partial text (reasoning
-                        # usually precedes text, so the buffer is often "").
-                        store.update_partial_response(
-                            turn_id=turn_id,
-                            response_text=_partial_text.get(turn_id, ""),
-                            reasoning=rbuf,
+            def _tool_event_sink(event_data: dict) -> None:
+                """Persist tool_start/tool_end + text_delta + reasoning_delta events to Postgres."""
+                store = service._turn_log_store
+                _type = event_data.get("_type")
+                if _type == "reasoning_delta":
+                    turn_id = event_data.get("turn_id")
+                    if not turn_id:
+                        return
+                    delta = event_data.get("delta", "") or ""
+                    rbuf = _partial_reasoning.get(turn_id, "") + delta
+                    _partial_reasoning[turn_id] = rbuf
+                    # Pass the current text buffer too so the write never
+                    # clobbers already-flushed partial text (reasoning
+                    # usually precedes text, so the buffer is often "").
+                    store.update_partial_response(
+                        turn_id=turn_id,
+                        response_text=_partial_text.get(turn_id, ""),
+                        reasoning=rbuf,
+                    )
+                    return
+                if _type == "text_delta":
+                    turn_id = event_data.get("turn_id")
+                    if not turn_id:
+                        return
+                    delta = event_data.get("delta", "") or ""
+                    offset = event_data.get("text_offset")
+                    buf = _partial_text.get(turn_id, "")
+                    # Offset-aware splice: contiguous deltas append; an
+                    # overlapping/replayed delta rewrites in place rather
+                    # than duplicating; a gap (offset past the buffer) falls
+                    # back to append (best effort — finalize fixes the rest).
+                    if isinstance(offset, int) and 0 <= offset <= len(buf):
+                        buf = buf[:offset] + delta
+                    else:
+                        buf = buf + delta
+                    _partial_text[turn_id] = buf
+                    store.update_partial_response(turn_id=turn_id, response_text=buf)
+                    return
+                if _type == "turn_complete":
+                    tid = event_data.get("turn_id")
+                    if tid:
+                        _partial_text.pop(tid, None)
+                        _partial_reasoning.pop(tid, None)
+                    return
+                event_type = event_data.get("event", "")
+                # Active chat turns persist synchronously through
+                # ToolEventCoordinator before public publication. The drain
+                # remains the compatibility path for passive/legacy producers.
+                if event_data.get("_tool_persisted"):
+                    return
+                if event_type == "tool_start":
+                    store.save_tool_call(
+                        turn_id=event_data.get("turn_id"),
+                        bot_id=event_data.get("bot_id"),
+                        user_id=event_data.get("user_id"),
+                        call_id=event_data.get("call_id"),
+                        tool_name=event_data.get("tool_name", "unknown"),
+                        arguments=event_data.get("arguments"),
+                        iteration=event_data.get("iteration", 1),
+                        started_at=event_data.get("ts"),
+                        text_offset=event_data.get("text_offset"),
+                        tool_use_id=event_data.get("tool_use_id"),
+                        parent_tool_use_id=event_data.get("parent_tool_use_id"),
+                    )
+                elif event_type == "tool_end":
+                    call_id = event_data.get("call_id")
+                    if call_id:
+                        store.update_tool_call_result(
+                            call_id=call_id,
+                            result=event_data.get("result", ""),
+                            ended_at=event_data.get("ts"),
+                            is_error=event_data.get("is_error"),
                         )
-                        return
-                    if _type == "text_delta":
-                        turn_id = event_data.get("turn_id")
-                        if not turn_id:
-                            return
-                        delta = event_data.get("delta", "") or ""
-                        offset = event_data.get("text_offset")
-                        buf = _partial_text.get(turn_id, "")
-                        # Offset-aware splice: contiguous deltas append; an
-                        # overlapping/replayed delta rewrites in place rather
-                        # than duplicating; a gap (offset past the buffer) falls
-                        # back to append (best effort — finalize fixes the rest).
-                        if isinstance(offset, int) and 0 <= offset <= len(buf):
-                            buf = buf[:offset] + delta
-                        else:
-                            buf = buf + delta
-                        _partial_text[turn_id] = buf
-                        store.update_partial_response(turn_id=turn_id, response_text=buf)
-                        return
-                    if _type == "turn_complete":
-                        tid = event_data.get("turn_id")
-                        if tid:
-                            _partial_text.pop(tid, None)
-                            _partial_reasoning.pop(tid, None)
-                        return
-                    event_type = event_data.get("event", "")
-                    # Active chat turns persist synchronously through
-                    # ToolEventCoordinator before public publication. The drain
-                    # remains the compatibility path for passive/legacy producers.
-                    if event_data.get("_tool_persisted"):
-                        return
-                    if event_type == "tool_start":
+                    else:
+                        # No call_id — save as complete record
                         store.save_tool_call(
                             turn_id=event_data.get("turn_id"),
                             bot_id=event_data.get("bot_id"),
                             user_id=event_data.get("user_id"),
-                            call_id=event_data.get("call_id"),
+                            call_id=None,
                             tool_name=event_data.get("tool_name", "unknown"),
-                            arguments=event_data.get("arguments"),
+                            result=event_data.get("result", ""),
                             iteration=event_data.get("iteration", 1),
-                            started_at=event_data.get("ts"),
-                            text_offset=event_data.get("text_offset"),
+                            ended_at=event_data.get("ts"),
+                            is_error=event_data.get("is_error"),
                             tool_use_id=event_data.get("tool_use_id"),
                             parent_tool_use_id=event_data.get("parent_tool_use_id"),
                         )
-                    elif event_type == "tool_end":
-                        call_id = event_data.get("call_id")
-                        if call_id:
-                            store.update_tool_call_result(
-                                call_id=call_id,
-                                result=event_data.get("result", ""),
-                                ended_at=event_data.get("ts"),
-                                is_error=event_data.get("is_error"),
-                            )
-                        else:
-                            # No call_id — save as complete record
-                            store.save_tool_call(
-                                turn_id=event_data.get("turn_id"),
-                                bot_id=event_data.get("bot_id"),
-                                user_id=event_data.get("user_id"),
-                                call_id=None,
-                                tool_name=event_data.get("tool_name", "unknown"),
-                                result=event_data.get("result", ""),
-                                iteration=event_data.get("iteration", 1),
-                                ended_at=event_data.get("ts"),
-                                is_error=event_data.get("is_error"),
-                                tool_use_id=event_data.get("tool_use_id"),
-                                parent_tool_use_id=event_data.get("parent_tool_use_id"),
-                            )
 
-                service._tool_persist_task = asyncio.create_task(
-                    redis_subscriber.drain_tool_events(_tool_event_sink)
-                )
+            service._tool_persist_task = asyncio.create_task(
+                redis_subscriber.drain_tool_events(_tool_event_sink)
+            )
 
-                log.info(
-                    "OpenClaw Redis subscriber started (redis=%s, sessions=%s)",
-                    config.REDIS_URL,
-                    list(session_to_bot.keys()),
-                )
+            log.info(
+                "Shared agent Redis subscriber started (redis=%s, openclaw_sessions=%s)",
+                config.REDIS_URL,
+                list(session_to_bot.keys()),
+            )
         except Exception:
-            log.exception("Failed to start OpenClaw integration")
+            log.exception("Failed to start shared agent Redis transport")
             redis_subscriber = None
+
+    # Durable callbacks target agent harnesses and require the shared Redis
+    # transport. Start recovery only after subscriber initialization; when Redis
+    # is unavailable rows remain QUEUED and no retry attempt is consumed.
+    from .inter_bot_dispatcher import InterBotDeliveryDispatcher
+    service._inter_bot_dispatcher = InterBotDeliveryDispatcher(service)
+    service._inter_bot_dispatcher.start()
 
     # Log startup with rich formatting
     log.startup(
@@ -335,6 +326,12 @@ async def lifespan(app):
         #         await history_drain_task
         #     except (asyncio.CancelledError, Exception):
         #         pass
+        # Stop durable claims first while Redis is still available. Cancellation
+        # leaves the claim leased; the next singleton dispatcher recovers it
+        # after the short lease rather than counting orderly shutdown as failure.
+        if service._inter_bot_dispatcher is not None:
+            await service._inter_bot_dispatcher.stop()
+
         # Cancel background tasks
         for task_attr in ("_group_cleanup_task", "_tool_persist_task", "_claude_refresh_task", "_codex_refresh_task"):
             task = getattr(service, task_attr, None)

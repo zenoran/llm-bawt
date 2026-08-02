@@ -1,0 +1,71 @@
+"""Agent context-health inspection and safe idle reset API."""
+
+from __future__ import annotations
+
+from fastapi import APIRouter, HTTPException, Query
+from pydantic import BaseModel, Field
+
+from ...agent_context import AgentContextStore, normalize_session_policy
+from ...bots import BotManager
+from ..dependencies import get_service
+
+router = APIRouter()
+
+
+class ContextResetRequest(BaseModel):
+    bot_id: str
+    user: str | None = None
+    session_policy: str = Field(
+        description="reset_retain_history or reset_without_history"
+    )
+    reason: str = Field(default="agent-requested context maintenance", max_length=1000)
+
+
+def _resolve(bot_id: str, user: str | None):
+    service = get_service()
+    slug = (bot_id or "").strip().lower()
+    if not slug:
+        raise HTTPException(status_code=422, detail="bot_id is required")
+    bot = BotManager(service.config).get_bot(slug)
+    if bot is None:
+        raise HTTPException(status_code=404, detail="Bot not found")
+    user_id = (user or getattr(service.config, "DEFAULT_USER", "nick") or "nick").strip()
+    backend = bot.agent_backend or bot.harness
+    model_alias = bot.default_model
+    ceiling = service.config.get_model_context_window(model_alias) if model_alias else None
+    return service, bot, user_id, backend, ceiling
+
+
+@router.get("/v1/agent-context/health", tags=["Agent Context"])
+def get_agent_context_health(
+    bot_id: str = Query(...),
+    user: str | None = Query(None),
+):
+    service, bot, user_id, backend, ceiling = _resolve(bot_id, user)
+    return AgentContextStore(service.config).health(
+        bot_id=bot.slug,
+        user_id=user_id,
+        backend=backend,
+        configured_ceiling=ceiling,
+    )
+
+
+@router.post("/v1/agent-context/reset", tags=["Agent Context"])
+def reset_agent_context(body: ContextResetRequest):
+    service, bot, user_id, backend, _ = _resolve(body.bot_id, body.user)
+    try:
+        policy = normalize_session_policy(body.session_policy)
+        result = AgentContextStore(service.config).reset_idle_session(
+            bot_id=bot.slug,
+            user_id=user_id,
+            backend=backend,
+            policy=policy,
+            reason=body.reason.strip() or "agent-requested context maintenance",
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except RuntimeError as exc:
+        if "active in turn" in str(exc):
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    return result

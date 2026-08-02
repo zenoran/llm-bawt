@@ -215,12 +215,15 @@ class TurnLifecycleMixin:
         agent_request_id: str | None = None,
         trigger_message_id: str | None = None,
         parent_turn_id: str | None = None,
+        request_extensions: dict | None = None,
     ) -> None:
         """Persist one turn record to short-lived DB storage."""
         try:
             request_payload = {
                 "messages": [_message_to_dict(msg) for msg in prepared_messages],
             }
+            if request_extensions:
+                request_payload.update(request_extensions)
             self._turn_log_store.save_turn(
                 turn_id=turn_id,
                 request_id=request_id,
@@ -242,6 +245,9 @@ class TurnLifecycleMixin:
                 parent_turn_id=parent_turn_id,
             )
         except Exception as e:
+            from .turn_logs import DeliveryTargetBusy
+            if isinstance(e, DeliveryTargetBusy):
+                raise
             log.debug("Failed to persist turn log: %s", e)
 
     def _update_turn_log(
@@ -281,6 +287,10 @@ class TurnLifecycleMixin:
                 token_usage=token_usage,
                 end_reason=end_reason,
             )
+            if (status in {"ok", "completed", "error", "timeout", "cancelled", "aborted"} or end_reason is not None):
+                dispatcher = getattr(self, "_inter_bot_dispatcher", None)
+                if dispatcher is not None:
+                    dispatcher.wake()
         except Exception as e:
             log.debug("Failed to update turn log: %s", e)
 
@@ -340,6 +350,20 @@ class TurnLifecycleMixin:
         while preserving the aborted terminal state (TASK-286).
         """
         if not response_text:
+            # Empty responses still end the turn. Without this, non-streaming
+            # callbacks that are cancelled or legitimately return no text leave
+            # ended_at NULL forever and block every queued successor.
+            self._update_turn_log(
+                turn_id=turn_id,
+                status=status,
+                latency_ms=elapsed_ms,
+                prepared_messages=prepared_messages,
+                response_text="",
+                tool_calls=tool_call_details,
+                animation=animation,
+                token_usage=token_usage,
+                end_reason=end_reason or ("aborted" if status in {"cancelled", "aborted"} else "stop"),
+            )
             return
 
         # Safety-net output cleaning in case adapter-level cleanup did not run upstream.
@@ -354,6 +378,11 @@ class TurnLifecycleMixin:
                     len(cleaned),
                 )
                 response_text = cleaned
+
+        client = getattr(llm_bawt, "client", None)
+        get_token_usage = getattr(client, "get_token_usage", None)
+        if token_usage is None and isinstance(client, AgentBackendClient) and callable(get_token_usage):
+            token_usage = get_token_usage()
 
         extracted_tool_calls = self._extract_agent_backend_tool_calls(llm_bawt=llm_bawt)
         if extracted_tool_calls and not tool_call_details:

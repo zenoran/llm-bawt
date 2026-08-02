@@ -67,7 +67,7 @@ class SendRequest:
         # /v1/history/context-seed. JSON-encoded list of {role, content} dicts.
         inject_messages = None
         _raw_inject = fields.get("inject_messages")
-        if _raw_inject:
+        if _raw_inject is not None:
             try:
                 inject_messages = json.loads(_raw_inject)
             except (ValueError, TypeError) as _e:

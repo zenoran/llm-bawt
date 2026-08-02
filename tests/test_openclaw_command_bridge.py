@@ -55,6 +55,31 @@ class _StubWsClient:
         ]
 
 
+def test_explicit_backend_prevents_cross_bridge_command_claim():
+    bridge = SessionBridge(
+        _StubWsClient(), EventIngestPipeline(), MagicMock(), MagicMock()
+    )
+    bridge._session_to_bot = {}
+
+    assert bridge._owns_command({
+        "action": "chat.send",
+        "backend": "claude-code",
+        "session_key": "loopy:nick",
+    }) is False
+    assert bridge._owns_command({
+        "action": "chat.send",
+        "backend": "codex",
+        "session_key": "codex:nick",
+    }) is False
+    assert bridge._owns_command({
+        "action": "chat.send",
+        "backend": "openclaw",
+        "session_key": "agent:main:main",
+    }) is True
+    # Legacy commands retain session-map routing behavior.
+    assert bridge._owns_command({"session_key": "unknown"}) is True
+
+
 def test_handle_send_command_recovers_reply_from_history_after_empty_stream():
     ws_client = _StubWsClient()
     ingest = EventIngestPipeline()

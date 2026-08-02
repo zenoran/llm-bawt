@@ -132,9 +132,10 @@ class RedisPublisher:
                 maxlen=RUN_STREAM_MAXLEN,
                 approximate=True,
             )
-            # Sliding TTL: keep a live stream alive while events flow, but let
-            # an abandoned run (client gone, run_done never published) expire.
-            self._redis.expire(stream_key, RUN_STREAM_TTL_SECONDS)
+            # Durable callback streams must survive app restarts and silent long
+            # turns; ordinary interactive streams retain the short runaway TTL.
+            ttl = 604800 if request_id.startswith("req_delivery_") else RUN_STREAM_TTL_SECONDS
+            self._redis.expire(stream_key, ttl)
             return stream_id
         except Exception:
             logger.exception("Failed to publish run event to %s", stream_key)
@@ -148,19 +149,25 @@ class RedisPublisher:
         try:
             fields = {"payload": json.dumps(result, ensure_ascii=False, default=str)}
             self._redis.xadd(stream_key, fields, maxlen=10)
-            self._redis.expire(stream_key, 60)
+            ttl = 604800 if request_id.startswith("steer_delivery_") else 60
+            self._redis.expire(stream_key, ttl)
         except Exception:
             logger.exception("Failed to publish RPC result to %s", stream_key)
 
     def publish_run_done(self, request_id: str) -> None:
-        """Signal that a run is complete by writing a sentinel entry."""
+        """Signal that a run is complete by writing a sentinel entry.
+
+        Durable inter-bot callbacks may need to reattach after an app restart,
+        so their deterministic ``req_delivery_*`` run streams are retained for
+        seven days. Ordinary interactive runs keep the existing five-minute TTL.
+        """
         if not self._connected:
             return
         stream_key = f"{RUN_STREAM_PREFIX}{request_id}"
         try:
             self._redis.xadd(stream_key, {"done": "1"}, maxlen=RUN_STREAM_MAXLEN, approximate=True)
-            # Expire the run stream after 5 minutes (cleanup)
-            self._redis.expire(stream_key, 300)
+            ttl = 604800 if request_id.startswith("req_delivery_") else 300
+            self._redis.expire(stream_key, ttl)
         except Exception:
             logger.exception("Failed to publish run done to %s", stream_key)
 

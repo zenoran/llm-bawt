@@ -1,5 +1,7 @@
 """Tests for prompt registry defaults and validation."""
 
+from pathlib import Path
+
 from sqlmodel import SQLModel, create_engine
 
 from llm_bawt.prompt_registry import (
@@ -51,6 +53,29 @@ def test_agent_global_prompt_explains_playwright_artifact_workflow() -> None:
     assert "browser_take_screenshot` without `filename`" in AGENT_GLOBAL_PROMPT
     assert "returned `original`, `preview`, or `thumb` URL" in AGENT_GLOBAL_PROMPT
     assert "suppresses the inline-image/Garage attachment path" in AGENT_GLOBAL_PROMPT
+
+
+def test_agent_global_prompt_requires_durable_manager_callbacks() -> None:
+    assert "default asynchronous bots_send_message mode; it is durable" in AGENT_GLOBAL_PROMPT
+    assert "redirects that SAME turn" in AGENT_GLOBAL_PROMPT
+    assert "delivery='when_idle' only when steering is intentionally undesired" in AGENT_GLOBAL_PROMPT
+    assert "force=true never authorizes concurrent agent turns" in AGENT_GLOBAL_PROMPT
+    assert "Never poll as the primary scheduler" in AGENT_GLOBAL_PROMPT
+
+
+def test_inter_bot_docs_do_not_restore_queue_only_contract() -> None:
+    repo = Path(__file__).resolve().parents[1]
+    authoritative = [
+        repo / "docs" / "INTER_BOT_COMMUNICATION.md",
+        repo / "docs" / "MCP_SERVER.md",
+    ]
+    combined = "\n".join(path.read_text() for path in authoritative)
+
+    assert "steers an active Claude Code turn in place" in combined
+    assert "force=true` never authorizes concurrent agent turns" in combined
+    assert "default immediate async" not in combined
+    assert "may overlap the manager" not in combined
+    assert "wakes one fresh manager turn after idle" not in combined
 
 
 def test_prompt_store_seed_defaults_is_idempotent() -> None:

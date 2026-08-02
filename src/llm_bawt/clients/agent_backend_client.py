@@ -117,6 +117,9 @@ class AgentBackendClient(LLMClient):
         inject_messages = kwargs.pop("inject_messages", None)
         # TASK-252: request-local per-thread SDK binding (explicit-thread turn).
         thread_binding = kwargs.pop("thread_binding", None)
+        bridge_request_id = kwargs.pop("bridge_request_id", None)
+        bridge_timeout_seconds = kwargs.pop("bridge_timeout_seconds", None)
+        bridge_event_callback = kwargs.pop("bridge_event_callback", None)
 
         # Run the async backend call synchronously.
         # If there's already a running loop we schedule via run_in_executor.
@@ -131,11 +134,25 @@ class AgentBackendClient(LLMClient):
             with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
                 result = pool.submit(
                     asyncio.run,
-                    self._chat_full(prompt, inject_messages, thread_binding),
+                    self._chat_full(
+                        prompt,
+                        inject_messages,
+                        thread_binding,
+                        bridge_request_id,
+                        bridge_timeout_seconds,
+                        bridge_event_callback,
+                    ),
                 ).result()
         else:
             result = asyncio.run(
-                self._chat_full(prompt, inject_messages, thread_binding)
+                self._chat_full(
+                    prompt,
+                    inject_messages,
+                    thread_binding,
+                    bridge_request_id,
+                    bridge_timeout_seconds,
+                    bridge_event_callback,
+                )
             )
 
         self.last_result = result
@@ -207,7 +224,7 @@ class AgentBackendClient(LLMClient):
                 system_parts.append(msg.content if isinstance(msg.content, str) else "")
         if system_parts:
             config["system_prompt"] = "\n\n".join(p for p in system_parts if p)
-        if inject_messages:
+        if inject_messages is not None:
             config["inject_messages"] = inject_messages
         if thread_binding:
             config.update(thread_binding)
@@ -273,6 +290,12 @@ class AgentBackendClient(LLMClient):
             return self._backend_name
         return getattr(result, "model", "") or self._backend_name
 
+    def get_token_usage(self) -> dict[str, Any] | None:
+        """Return normalized usage from the last structured backend result."""
+        result = self.last_result
+        usage = getattr(result, "usage", None) if result is not None else None
+        return dict(usage) if isinstance(usage, dict) and usage else None
+
     # ------------------------------------------------------------------
     # Internal
     # ------------------------------------------------------------------
@@ -282,6 +305,9 @@ class AgentBackendClient(LLMClient):
         prompt: str,
         inject_messages: list | None = None,
         thread_binding: dict | None = None,
+        bridge_request_id: str | None = None,
+        bridge_timeout_seconds: float | None = None,
+        bridge_event_callback=None,
     ) -> Any:
         """Call the backend's ``chat_full`` (or fall back to ``chat``)."""
         # TASK-501: merge the seed into the config the backend forwards to the
@@ -290,12 +316,24 @@ class AgentBackendClient(LLMClient):
         # TASK-252: thread_binding rides the same copy — request-local, never
         # written to the shared _bot_config.
         config = self._bot_config
-        if inject_messages or thread_binding:
+        if (
+            inject_messages is not None
+            or thread_binding
+            or bridge_request_id
+            or bridge_timeout_seconds
+            or bridge_event_callback is not None
+        ):
             config = {**self._bot_config}
-            if inject_messages:
+            if inject_messages is not None:
                 config["inject_messages"] = inject_messages
             if thread_binding:
                 config.update(thread_binding)
+            if bridge_request_id:
+                config["request_id"] = bridge_request_id
+            if bridge_timeout_seconds:
+                config["timeout_seconds"] = max(1, int(bridge_timeout_seconds))
+            if bridge_event_callback is not None:
+                config["event_callback"] = bridge_event_callback
         if hasattr(self._backend, "chat_full"):
             return await self._backend.chat_full(prompt, config)
         # Fallback for backends that only implement chat()

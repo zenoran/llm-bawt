@@ -142,6 +142,7 @@ class BackgroundService(
         self._memory_clients_lock = threading.Lock()
         from .turn_logs import TurnLogStore
         self._turn_log_store = TurnLogStore(config)
+        self._inter_bot_dispatcher: Any | None = None
         # Persistent registry of in-flight AskUserQuestion pauses.  Lets the
         # chat UI hydrate open pickers on page load / second tab / after a
         # bridge restart instead of relying solely on the live SSE event.
@@ -191,6 +192,22 @@ class BackgroundService(
         """Get the model lifecycle manager for tool access."""
         return self._model_lifecycle
 
+    async def _publish_nonstream_turn_event(
+        self,
+        *,
+        bot_id: str,
+        user_id: str,
+        event: dict[str, Any],
+    ) -> None:
+        """Publish one non-streaming turn event to the unified UI stream."""
+        subscriber = getattr(self, "_redis_subscriber", None)
+        if subscriber is None:
+            return
+        try:
+            await subscriber.publish_tool_event(bot_id, user_id, event)
+        except Exception as exc:
+            log.debug("Non-streaming unified event publish failed: %s", exc)
+
     # ---- Non-streaming chat completion ----
 
     async def chat_completion(
@@ -206,6 +223,33 @@ class BackgroundService(
         3. Runs blocking LLM calls in a thread pool
         4. Stores messages and extracts memories for future use
         """
+        # Durable-delivery correlation fields are accepted only from a live
+        # dispatcher claim. Ordinary public chat callers cannot spoof a reserved
+        # turn or bridge request ID merely by supplying schema fields.
+        if getattr(request, "inter_bot_delivery_id", None):
+            dispatcher = getattr(self, "_inter_bot_dispatcher", None)
+            if dispatcher is None or not dispatcher.store.validate_claim(
+                delivery_id=request.inter_bot_delivery_id,
+                claim_token=request.inter_bot_claim_token or "",
+                target_bot_id=(request.bot_id or self._default_bot),
+                turn_id=request.inter_bot_turn_id or "",
+                user_message_id=request.user_message_id or "",
+                bridge_request_id=request.inter_bot_bridge_request_id or "",
+            ):
+                raise ValueError("invalid or stale inter-bot delivery claim")
+        elif any(
+            getattr(request, field, None)
+            for field in (
+                "inter_bot_turn_id",
+                "inter_bot_bridge_request_id",
+                "inter_bot_claim_token",
+                "inter_bot_timeout_seconds",
+                "inter_bot_session_policy",
+                "inter_bot_seed_session_id",
+            )
+        ):
+            raise ValueError("inter-bot correlation fields require a valid delivery claim")
+
         # Create request context for logging
         if request.client_system_context is not None:
             req_path = f"/v1/botchat/{request.bot_id}/{request.user}/chat/completions"
@@ -297,7 +341,12 @@ class BackgroundService(
         else:
             # Cancels previous generation for the SAME bot only.
             cancel_event, done_event = await self._start_generation(bot_id)
-        turn_log_id = f"turn-{uuid.uuid4().hex}"
+        _reserved_turn_id = getattr(request, "inter_bot_turn_id", None)
+        turn_log_id = (
+            _reserved_turn_id.strip()
+            if isinstance(_reserved_turn_id, str) and _reserved_turn_id.strip()
+            else f"turn-{uuid.uuid4().hex}"
+        )
 
         # TASK-303: Extract or generate a stable user-message id so the
         # persisted user message and the turn log share the same identity.
@@ -306,8 +355,18 @@ class BackgroundService(
         # Canonical assistant-row id (frontend-minted) so live bubble == reloaded
         # row (single bubble). None on server-originated turns → server mints one.
         _amid = getattr(request, "assistant_message_id", None)
-        assistant_message_id = _amid.strip() if isinstance(_amid, str) and _amid.strip() else None
+        assistant_message_id = (
+            _amid.strip()
+            if isinstance(_amid, str) and _amid.strip()
+            else str(uuid.uuid4())
+        )
 
+        # Background/durable callers have no originating HTTP stream. Publish the
+        # same canonical turn lifecycle the chat UI already consumes so the target
+        # transcript is visible live instead of appearing only after a reload.
+        publish_nonstream_lifecycle = bool(
+            getattr(request, "inter_bot_delivery_id", None)
+        )
         # Persist turn log immediately so the user's prompt is recorded
         # even if the backend times out or errors before responding.
         self._persist_turn_log(
@@ -324,13 +383,110 @@ class BackgroundService(
             prepared_messages=[],
             response_text="",
             trigger_message_id=trigger_message_id,
+            request_extensions={
+                key: value
+                for key, value in {
+                    "inter_bot_delivery_id": getattr(request, "inter_bot_delivery_id", None),
+                    "inter_bot_turn_id": getattr(request, "inter_bot_turn_id", None),
+                    "inter_bot_bridge_request_id": getattr(request, "inter_bot_bridge_request_id", None),
+                    "inter_bot_timeout_seconds": getattr(request, "inter_bot_timeout_seconds", None),
+                    "inter_bot_session_policy": getattr(request, "inter_bot_session_policy", None),
+                    "inter_bot_seed_session_id": getattr(request, "inter_bot_seed_session_id", None),
+                }.items()
+                if value
+            },
         )
+
+        if publish_nonstream_lifecycle:
+            await self._publish_nonstream_turn_event(
+                bot_id=bot_id,
+                user_id=user_id,
+                event={
+                    "_type": "turn_start",
+                    "turn_id": turn_log_id,
+                    "trigger_message_id": trigger_message_id,
+                    "assistant_message_id": assistant_message_id,
+                    "bot_id": bot_id,
+                    "user_id": user_id,
+                    "role": "user",
+                    "content": user_prompt,
+                    "attachments": [],
+                    "ts": time.time(),
+                },
+            )
 
         try:
             # Run the blocking query in single-thread executor
             loop = asyncio.get_event_loop()
             llm_start_time = time.time()
             cancelled = False
+            bridge_event_callback = None
+            if publish_nonstream_lifecycle:
+                from .tool_event_coordinator import ToolEventCoordinator
+
+                tool_events = ToolEventCoordinator(self._turn_log_store.engine)
+                tool_call_ids: dict[str, str] = {}
+                tool_iteration = 0
+
+                def _bridge_event_callback(item: dict[str, Any]) -> None:
+                    nonlocal tool_iteration
+                    event_type = item.get("event")
+                    if event_type not in {"tool_call", "tool_result"}:
+                        return
+                    tool_use_id = str(item.get("tool_use_id") or "").strip() or None
+                    call_key = tool_use_id or f"iteration-{tool_iteration + 1}"
+                    if event_type == "tool_call":
+                        tool_iteration += 1
+                        call_id = tool_use_id or f"call-{uuid.uuid4().hex}"
+                        tool_call_ids[call_key] = call_id
+                        public = tool_events.start({
+                            "_type": "tool_event",
+                            "event": "tool_start",
+                            "turn_id": turn_log_id,
+                            "trigger_message_id": trigger_message_id,
+                            "bot_id": bot_id,
+                            "user_id": user_id,
+                            "tool_name": item.get("name") or "unknown",
+                            "arguments": item.get("arguments") or {},
+                            "call_id": call_id,
+                            "tool_use_id": tool_use_id,
+                            "parent_tool_use_id": item.get("parent_tool_use_id"),
+                            "iteration": tool_iteration,
+                            "provider": item.get("provider"),
+                            "ts": time.time(),
+                        })
+                    else:
+                        call_id = tool_call_ids.get(call_key)
+                        public = tool_events.end({
+                            "_type": "tool_event",
+                            "event": "tool_end",
+                            "turn_id": turn_log_id,
+                            "trigger_message_id": trigger_message_id,
+                            "bot_id": bot_id,
+                            "user_id": user_id,
+                            "tool_name": item.get("name") or "unknown",
+                            "arguments": item.get("arguments") or {},
+                            "call_id": call_id,
+                            "tool_use_id": tool_use_id,
+                            "parent_tool_use_id": item.get("parent_tool_use_id"),
+                            "iteration": tool_iteration or 1,
+                            "provider": item.get("provider"),
+                            "result": item.get("result", ""),
+                            "tool_result_payload": item.get("tool_result_payload"),
+                            "is_error": item.get("is_error"),
+                            "ts": time.time(),
+                        })
+                    publish_future = asyncio.run_coroutine_threadsafe(
+                        self._publish_nonstream_turn_event(
+                            bot_id=bot_id, user_id=user_id, event=public
+                        ),
+                        loop,
+                    )
+                    # Preserve bridge event order: a fast final tool must reach
+                    # Redis before the worker can publish turn_complete.
+                    publish_future.result(timeout=5)
+
+                bridge_event_callback = _bridge_event_callback
 
             def _do_query():
                 nonlocal cancelled
@@ -376,16 +532,32 @@ class BackgroundService(
                 # Log what we're sending to the LLM (verbose mode)
                 log.llm_context(prepared_messages)
 
-                # Summarize outgoing thread on /new, build seed, rotate.
+                # Summarize outgoing thread on /new, build seed, rotate. Durable
+                # inter-bot resets already rotated atomically during claim; they
+                # provide a server-resolved archived seed source and must never
+                # rotate a second time here.
+                reset_policy = getattr(request, "inter_bot_session_policy", None)
+                seed_source = getattr(request, "inter_bot_seed_session_id", None)
                 self._maybe_summarize_on_new(
                     llm_bawt, bot_id, user_prompt, thread_binding=thread_binding
                 )
                 from .routes.history import maybe_build_session_seed
-                inject_seed_messages = maybe_build_session_seed(
-                    llm_bawt, bot_id, model_alias, user_prompt, self,
-                    thread_binding=thread_binding,
-                )
-                if _is_agent:
+                if reset_policy == "reset_retain_history":
+                    from .routes.history import build_context_seed
+                    seed = build_context_seed(
+                        bot_id, model_alias, self, session_id=seed_source
+                    ) if seed_source else {"messages": []}
+                    inject_seed_messages = seed.get("messages", [])
+                elif reset_policy == "reset_without_history":
+                    # An explicit empty list means "cold-start with no history";
+                    # None means no seed decision. Preserve that distinction.
+                    inject_seed_messages = []
+                else:
+                    inject_seed_messages = maybe_build_session_seed(
+                        llm_bawt, bot_id, model_alias, user_prompt, self,
+                        thread_binding=thread_binding,
+                    )
+                if _is_agent and not reset_policy:
                     self._maybe_rotate_agent_session(
                         llm_bawt, bot_id, user_prompt, thread_binding=thread_binding
                     )
@@ -407,6 +579,9 @@ class BackgroundService(
                     stream=False,
                     inject_messages=inject_seed_messages,
                     thread_binding=thread_binding,
+                    bridge_request_id=getattr(request, "inter_bot_bridge_request_id", None),
+                    bridge_timeout_seconds=getattr(request, "inter_bot_timeout_seconds", None),
+                    bridge_event_callback=bridge_event_callback,
                 )
 
                 # Splice the injected seed into the logged prompt so the turn
@@ -455,11 +630,50 @@ class BackgroundService(
                     latency_ms=elapsed_ms,
                     error_text=str(e),
                 )
+                if publish_nonstream_lifecycle:
+                    await self._publish_nonstream_turn_event(
+                        bot_id=bot_id,
+                        user_id=user_id,
+                        event={
+                            "_type": "turn_complete",
+                            "turn_id": turn_log_id,
+                            "assistant_message_id": assistant_message_id,
+                            "bot_id": bot_id,
+                            "user_id": user_id,
+                            "status": "cancelled",
+                            "end_reason": "error",
+                            "model": model_alias,
+                            "ts": time.time(),
+                        },
+                    )
                 raise
             llm_elapsed_ms = (time.time() - llm_start_time) * 1000
 
             # If cancelled, return empty response (the new request will handle it)
             if cancelled:
+                self._update_turn_log(
+                    turn_id=turn_log_id,
+                    status="cancelled",
+                    latency_ms=llm_elapsed_ms,
+                    response_text="",
+                    end_reason="aborted",
+                )
+                if publish_nonstream_lifecycle:
+                    await self._publish_nonstream_turn_event(
+                        bot_id=bot_id,
+                        user_id=user_id,
+                        event={
+                            "_type": "turn_complete",
+                            "turn_id": turn_log_id,
+                            "assistant_message_id": assistant_message_id,
+                            "bot_id": bot_id,
+                            "user_id": user_id,
+                            "status": "cancelled",
+                            "end_reason": "aborted",
+                            "model": model_alias,
+                            "ts": time.time(),
+                        },
+                    )
                 return ChatCompletionResponse(
                     model=model_alias,
                     choices=[
@@ -470,6 +684,43 @@ class BackgroundService(
                         )
                     ],
                     usage=UsageInfo(prompt_tokens=0, completion_tokens=0, total_tokens=0),
+                )
+
+            if publish_nonstream_lifecycle:
+                token_usage = None
+                get_token_usage = getattr(llm_bawt.client, "get_token_usage", None)
+                if callable(get_token_usage):
+                    token_usage = get_token_usage()
+                if response_text:
+                    await self._publish_nonstream_turn_event(
+                        bot_id=bot_id,
+                        user_id=user_id,
+                        event={
+                            "_type": "text_delta",
+                            "turn_id": turn_log_id,
+                            "trigger_message_id": trigger_message_id,
+                            "bot_id": bot_id,
+                            "user_id": user_id,
+                            "delta": response_text,
+                            "text_offset": 0,
+                            "ts": time.time(),
+                        },
+                    )
+                await self._publish_nonstream_turn_event(
+                    bot_id=bot_id,
+                    user_id=user_id,
+                    event={
+                        "_type": "turn_complete",
+                        "turn_id": turn_log_id,
+                        "assistant_message_id": assistant_message_id,
+                        "bot_id": bot_id,
+                        "user_id": user_id,
+                        "status": "completed",
+                        "end_reason": "stop",
+                        "token_usage": token_usage,
+                        "model": model_alias,
+                        "ts": time.time(),
+                    },
                 )
         finally:
             self._end_generation(cancel_event, done_event, bot_id)

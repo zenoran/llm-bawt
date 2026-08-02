@@ -205,6 +205,37 @@ SETTING_DEFINITIONS: dict[str, SettingDefinition] = {
             "proxy turns additionally disable WebSearch and WebFetch."
         ),
     ),
+    "agent_context_warning_percent": SettingDefinition(
+        key="agent_context_warning_percent",
+        type="int",
+        default=75,
+        applies_to=("agent",),
+        storage=STORAGE_RUNTIME_SETTING,
+        label="Agent context warning (%)",
+        help="Resident prompt percentage that marks context health as warning.",
+    ),
+    "agent_context_critical_percent": SettingDefinition(
+        key="agent_context_critical_percent",
+        type="int",
+        default=90,
+        applies_to=("agent",),
+        storage=STORAGE_RUNTIME_SETTING,
+        label="Agent context critical (%)",
+        help="Resident prompt percentage that triggers preventive maintenance before autonomous delivery.",
+    ),
+    "agent_context_critical_policy": SettingDefinition(
+        key="agent_context_critical_policy",
+        type="str",
+        default="reset_retain_history",
+        applies_to=("agent",),
+        storage=STORAGE_RUNTIME_SETTING,
+        label="Agent critical-context action",
+        help=(
+            "Preventive action for a critical agent context before durable delivery. "
+            "Capability-gated per backend; unsupported retained reset falls back to "
+            "reset_without_history only when that backend supports it."
+        ),
+    ),
     "bot_send_wait_seconds": SettingDefinition(
         key="bot_send_wait_seconds",
         type="int",

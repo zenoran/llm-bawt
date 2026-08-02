@@ -296,11 +296,15 @@ class ClaudeSessionMixin:
             {seeded: True, session_id, summary_count, message_count,
              approx_tokens, oldest_timestamp, newest_timestamp}
         """
-        if not injected:
+        if injected is None:
             return None
-        # llm-bawt authorized this seed by sending it. No bridge-side re-check.
+        # llm-bawt authorized this seed by sending it. An explicit empty list is
+        # a clean-session decision: keep resume=None so the real first query mints
+        # the provider session, then persist that actual SDK id through write-back.
         messages = injected
         stats = self._stats_from_messages(messages)
+        if not messages:
+            return {**stats, "seeded": False, "clean_start": True}
         try:
             session_id = str(uuid.uuid4())
             self._write_seed_transcript(session_id, messages)
@@ -314,6 +318,7 @@ class ClaudeSessionMixin:
             return {"seeded": False, "reason": f"seed write failed: {e}"}
         stats = dict(stats)
         stats["seeded"] = True
+        stats["clean_start"] = False
         stats["session_id"] = session_id
         return stats
 

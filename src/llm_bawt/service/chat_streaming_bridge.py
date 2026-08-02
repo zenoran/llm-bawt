@@ -300,14 +300,24 @@ class ChatStreamingBridgeMixin:
             return binding
         from .routes.sessions import resolve_agent_session_key
 
+        metadata = row.get("session_metadata") or {}
         bc = getattr(getattr(llm_bawt, "client", None), "_bot_config", None) or {}
         resume = resolve_agent_session_key(
-            row.get("session_metadata") or {},
+            metadata,
             backend_name,
             str(bc.get("model") or "").strip() or None,
         )
         if resume:
             binding["thread_resume_id"] = resume
+        else:
+            lifecycle = metadata.get("context_lifecycle")
+            if isinstance(lifecycle, dict):
+                action = str(lifecycle.get("action") or "")
+                old_session_id = str(lifecycle.get("old_session_id") or "")
+                if action in {"reset_retain_history", "reset_without_history"}:
+                    binding["session_policy"] = action
+                    if old_session_id:
+                        binding["seed_session_id"] = old_session_id
         log.info(
             "Agent thread bound: thread=%s resume=%s explicit=%s",
             sid, resume or "none (cold-start)",

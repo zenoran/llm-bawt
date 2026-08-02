@@ -86,6 +86,22 @@ class ChatCompletionRequest(BaseModel):
     ha_mode: bool = Field(default=False, description="HA-mode: cap history, force tool_choice=required on first call (set by routes)", exclude=True)
     user_message_id: str | None = Field(default=None, description="Frontend-generated UUID for the user message (used as trigger_message_id in turn logs)")
     assistant_message_id: str | None = Field(default=None, description="Frontend-generated UUID for the ASSISTANT reply row. Persisted as the assistant message id so the live streaming bubble and the reloaded history row share one id (single bubble). None → server mints one. Closes the EPIC TASK-217 assistant-identity gap.")
+    # Durable inter-bot delivery correlation. These are server/MCP-generated,
+    # optional for every ordinary chat caller, and deliberately ride the normal
+    # chat path rather than creating a second execution mechanism.
+    inter_bot_delivery_id: str | None = Field(default=None, description="Durable inter-bot delivery id (server-generated and claim-validated).")
+    inter_bot_turn_id: str | None = Field(default=None, description="Deterministic reserved turn id for a durable delivery.")
+    inter_bot_bridge_request_id: str | None = Field(default=None, description="Deterministic bridge run id used to deduplicate transport retries.")
+    inter_bot_claim_token: str | None = Field(default=None, description="Private dispatcher claim token; rejected unless it matches the durable delivery row.")
+    inter_bot_timeout_seconds: float | None = Field(default=None, ge=1.0, le=86400.0, description="Request-local bridge inactivity timeout for a durable delivery.")
+    inter_bot_session_policy: Literal["continue", "reset_retain_history", "reset_without_history"] | None = Field(
+        default=None,
+        description="Validated dispatcher-owned pre-delivery session policy.",
+    )
+    inter_bot_seed_session_id: str | None = Field(
+        default=None,
+        description="Dispatcher-resolved archived thread used only for retained-history reset seeding.",
+    )
     # TASK-269: continuation-turn linkage.  Set when this turn is answering a
     # prior deferred AskUserQuestion.  parent_turn_id threads the chain (and
     # drives cross-tab resolution via turn_start{parent_turn_id}); when

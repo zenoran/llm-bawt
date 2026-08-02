@@ -139,20 +139,19 @@ class ChatSteerResponse(BaseModel):
     persisted: bool = False
 
 
-@router.post("/v1/chat/steer", tags=["Agent Backends"])
-async def chat_steer(request: ChatSteerRequest) -> ChatSteerResponse:
-    """Interrupt and redirect one active Claude SDK run in place.
-
-    This is deliberately not another chat completion: the existing bridge
-    subprocess, response stream, assistant bubble, and turn log remain active.
-    The SDK emits an interrupted ResultMessage boundary which the bridge drains
-    before continuing with this replacement user instruction.
-    """
-    service = get_service()
+async def steer_active_turn(
+    service,
+    request: ChatSteerRequest,
+    *,
+    steer_request_id: str | None = None,
+) -> ChatSteerResponse:
+    """Shared steer implementation for public chat and durable inter-bot work."""
     turn = service._turn_log_store.get_turn(request.turn_id)
     if turn is None:
         raise HTTPException(status_code=404, detail="Turn not found")
-    if turn.ended_at is not None or turn.status not in ("streaming", "pending"):
+    if (
+        turn.ended_at is not None or turn.status not in ("streaming", "pending")
+    ) and not steer_request_id:
         raise HTTPException(status_code=409, detail="Turn is no longer active")
 
     bot_id = request.bot_id.strip().lower()
@@ -160,6 +159,12 @@ async def chat_steer(request: ChatSteerRequest) -> ChatSteerResponse:
     if turn.bot_id != bot_id or (turn.user_id or "").lower() != user_id:
         raise HTTPException(status_code=409, detail="Turn ownership mismatch")
     if not turn.agent_session_key:
+        # A deterministic delivery retry may inspect the original target after it
+        # ended. If the run never registered a bridge session, no steer RPC could
+        # possibly have been submitted; report a definitive rejection so the
+        # dispatcher can clear stale steer intent and choose one safe fallback.
+        if steer_request_id and turn.ended_at is not None:
+            raise HTTPException(status_code=409, detail="no_active_run")
         raise HTTPException(status_code=409, detail="Active bridge run is not ready")
 
     from ...agent_backends.agent_bridge import get_agent_subscriber
@@ -187,6 +192,7 @@ async def chat_steer(request: ChatSteerRequest) -> ChatSteerResponse:
                 message_id=request.message_id,
                 backend=backend_name,
                 target_request_id=turn.agent_request_id,
+                request_id=steer_request_id,
             )
             if result.get("ok") or result.get("error") != "no_active_run":
                 break
@@ -238,6 +244,16 @@ async def chat_steer(request: ChatSteerRequest) -> ChatSteerResponse:
         message_id=request.message_id,
         persisted=persisted,
     )
+
+
+@router.post("/v1/chat/steer", tags=["Agent Backends"])
+async def chat_steer(request: ChatSteerRequest) -> ChatSteerResponse:
+    """Interrupt and redirect one active Claude SDK run in place.
+
+    This is deliberately not another chat completion: the existing bridge
+    subprocess, response stream, assistant bubble, and turn log remain active.
+    """
+    return await steer_active_turn(get_service(), request)
 
 
 class ToolResultRequest(BaseModel):

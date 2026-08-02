@@ -1884,6 +1884,19 @@ def maybe_build_session_seed(
         _resume_id = str(_binding.get("thread_resume_id") or "").strip()
         _explicit = bool(_binding.get("explicit_thread"))
         _is_new = (user_prompt or "").lstrip().startswith("/new")
+        _reset_policy = str(_binding.get("session_policy") or "")
+        _seed_session_id = str(_binding.get("seed_session_id") or "").strip()
+
+        # A manual context reset is recorded on the fresh durable thread. Until
+        # its provider key exists, honor the receipt exactly once: retained mode
+        # seeds from the archived predecessor; clean mode explicitly seeds [].
+        if not _resume_id and _reset_policy == "reset_without_history":
+            return []
+        if not _resume_id and _reset_policy == "reset_retain_history":
+            seed = build_context_seed(
+                bot_id, model, service, session_id=_seed_session_id or None,
+            )
+            return seed.get("messages", [])
 
         # A user-opened historical thread is hydration, not cross-session
         # carry. Resume its SDK transcript when present; otherwise seed from

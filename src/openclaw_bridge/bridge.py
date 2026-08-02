@@ -128,9 +128,7 @@ class SessionBridge(ChangedFileLifecycleMixin):
                     for msg_id, fields in messages:
                         action = fields.get("action", "")
                         session_key = fields.get("session_key", "")
-
-                        # Skip commands for sessions this bridge doesn't own
-                        if session_key and not self._resolve_bot_id(session_key):
+                        if not self._owns_command(fields):
                             await async_redis.xack(COMMANDS_STREAM, "bridge", msg_id)
                             continue
 
@@ -789,6 +787,14 @@ class SessionBridge(ChangedFileLifecycleMixin):
 
         # Publish to Redis Stream for consumers
         self._publisher.publish_event(event)
+
+    def _owns_command(self, fields: dict) -> bool:
+        """Return whether this bridge is authoritative for one command."""
+        target_backend = (fields.get("backend") or "").strip()
+        if target_backend:
+            return target_backend == self._backend_name
+        session_key = (fields.get("session_key") or "").strip()
+        return not session_key or self._resolve_bot_id(session_key) is not None
 
     def _resolve_bot_id(self, session_key: str) -> str | None:
         if not self._session_to_bot:
