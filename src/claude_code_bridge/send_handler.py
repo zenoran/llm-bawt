@@ -22,6 +22,7 @@ from ._bridge_helpers import (
     _is_auth_failure,
 )
 from .active_run import ClaudeActiveRun
+from .send_boundaries import separator_before_new_block
 from .send_errors import (
     AuthRetryPolicy,
     TerminalSDKResultError,
@@ -184,6 +185,7 @@ class ClaudeSendMixin(ClaudeStreamMixin, ClaudeUsageMixin, ClaudeResultMixin):
 
             seq = 0
             text_parts: list[str] = []
+            reasoning_tail = ""
             current_tool_name: str | None = None
             current_tool_input: str = ""
             actual_model: str = model  # updated from SystemMessage if available
@@ -616,6 +618,7 @@ class ClaudeSendMixin(ClaudeStreamMixin, ClaudeUsageMixin, ClaudeResultMixin):
                                         if thinking:
                                             model_side_effects = True
                                             seq += 1
+                                            reasoning_tail = thinking
                                             self._publish_event(
                                                 request_id, session_key, seq,
                                                 kind=AgentEventKind.REASONING_DELTA,
@@ -630,7 +633,17 @@ class ClaudeSendMixin(ClaudeStreamMixin, ClaudeUsageMixin, ClaudeResultMixin):
 
                                 elif event_type == "content_block_start":
                                     block = event.get("content_block", {})
-                                    if block.get("type") == "tool_use":
+                                    if block.get("type") == "thinking":
+                                        separator = separator_before_new_block(reasoning_tail)
+                                        if separator:
+                                            seq += 1
+                                            reasoning_tail += separator
+                                            self._publish_event(
+                                                request_id, session_key, seq,
+                                                kind=AgentEventKind.REASONING_DELTA,
+                                                text=separator,
+                                            )
+                                    elif block.get("type") == "tool_use":
                                         model_side_effects = True
                                         current_tool_name = block.get("name", "unknown")
                                         current_tool_input = ""
