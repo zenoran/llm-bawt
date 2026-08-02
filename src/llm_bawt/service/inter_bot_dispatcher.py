@@ -266,20 +266,33 @@ class InterBotDeliveryDispatcher:
             name=f"inter-bot-heartbeat:{record.id}",
         )
         try:
-            payload = {**payload, "inter_bot_claim_token": claim_token}
+            payload = {
+                **payload,
+                "inter_bot_claim_token": claim_token,
+                "stream": True,
+            }
             request = ChatCompletionRequest.model_validate(payload)
             if not self.store.mark_transport_accepted(record.id, claim_token):
                 return
-            response = await self.service.chat_completion(request)
-            choices = getattr(response, "choices", None) or []
-            content = ""
-            if choices:
-                message = getattr(choices[0], "message", None)
-                content = getattr(message, "content", "") or ""
+            async for _chunk in self.service.chat_completion_stream(request):
+                # Durable fallback has no originating HTTP consumer. Draining the
+                # canonical generator starts/joins TurnStreamWorker; live text,
+                # reasoning, tools, offsets, persistence, and turn_complete are
+                # published independently through the unified Redis stream.
+                pass
+            turn = self.service._turn_log_store.get_turn(record.turn_id)
+            if turn is None or turn.ended_at is None:
+                raise RuntimeError("streamed durable turn did not finalize")
+            if turn.status not in {"ok", "completed"} or turn.error_text:
+                raise RuntimeError(
+                    turn.error_text
+                    or f"streamed durable turn ended with status={turn.status}"
+                )
+            content = turn.response_text or ""
             delivered = self.store.mark_delivered(
                 record.id,
                 claim_token,
-                response_model=getattr(response, "model", None),
+                response_model=turn.model,
                 response_chars=len(content),
             )
             if delivered:
@@ -292,6 +305,8 @@ class InterBotDeliveryDispatcher:
             error = str(exc) or exc.__class__.__name__
             current = self.store.get(record.id) or record
             turn_status, turn_ended_at = self.store.turn_state(record.id)
+            turn = self.service._turn_log_store.get_turn(record.turn_id)
+            turn_error = getattr(turn, "error_text", None) if turn else None
             if self._is_context_overflow(error):
                 from ..bots import BotManager
 
@@ -327,7 +342,11 @@ class InterBotDeliveryDispatcher:
                 isinstance(payload.get("inter_bot_bridge_request_id"), str)
                 and payload["inter_bot_bridge_request_id"].startswith("req_delivery_")
             )
-            if turn_ended_at is not None and turn_status in {"ok", "completed"}:
+            if (
+                turn_ended_at is not None
+                and turn_status in {"ok", "completed"}
+                and not turn_error
+            ):
                 delivered = self.store.mark_delivered(
                     record.id,
                     claim_token,

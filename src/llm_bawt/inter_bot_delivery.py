@@ -407,6 +407,9 @@ class InterBotDeliveryStore:
         delivery_id, message_id, turn_id = self.stable_ids()
         payload = dict(payload)
         payload["user_message_id"] = message_id
+        payload["assistant_message_id"] = str(
+            uuid.uuid5(uuid.NAMESPACE_URL, f"inter-bot-assistant:{message_id}")
+        )
         payload["inter_bot_delivery_id"] = delivery_id
         payload["inter_bot_turn_id"] = turn_id
         payload["inter_bot_bridge_request_id"] = (
@@ -944,7 +947,8 @@ class InterBotDeliveryStore:
         recovered: list[DeliveryRecord] = []
         with self.engine.begin() as conn:
             rows = conn.execute(sa_text("""
-                SELECT d.*, t.status AS turn_status, t.ended_at AS turn_ended_at
+                SELECT d.*, t.status AS turn_status, t.ended_at AS turn_ended_at,
+                       t.error_text AS turn_error_text
                 FROM inter_bot_deliveries d
                 LEFT JOIN turn_logs t ON t.id=d.turn_id
                 WHERE d.status IN ('STEERING','DISPATCHING')
@@ -954,7 +958,10 @@ class InterBotDeliveryStore:
             for row in rows:
                 is_turn = row.get("delivery_mode") != "steer"
                 if is_turn and row.get("turn_ended_at") is not None:
-                    success = row.get("turn_status") in ("ok", "completed")
+                    success = (
+                        row.get("turn_status") in ("ok", "completed")
+                        and not row.get("turn_error_text")
+                    )
                     assignments = (
                         "status='DELIVERED', delivered_at=COALESCE(delivered_at, now()), claim_token=NULL, claim_owner=NULL, lease_expires_at=NULL, last_error=NULL"
                         if success else

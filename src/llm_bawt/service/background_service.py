@@ -20,6 +20,7 @@ from ..bots import get_bot, strip_emotes
 from ..utils.config import Config
 from .background_tasks import BackgroundTasksMixin
 from .chat_streaming import ChatStreamingMixin
+from .inter_bot_claims import validate_inter_bot_claim
 from .instance_manager import InstanceManagerMixin
 from .logging import RequestContext, generate_request_id, get_service_logger
 from .schemas import (
@@ -223,32 +224,7 @@ class BackgroundService(
         3. Runs blocking LLM calls in a thread pool
         4. Stores messages and extracts memories for future use
         """
-        # Durable-delivery correlation fields are accepted only from a live
-        # dispatcher claim. Ordinary public chat callers cannot spoof a reserved
-        # turn or bridge request ID merely by supplying schema fields.
-        if getattr(request, "inter_bot_delivery_id", None):
-            dispatcher = getattr(self, "_inter_bot_dispatcher", None)
-            if dispatcher is None or not dispatcher.store.validate_claim(
-                delivery_id=request.inter_bot_delivery_id,
-                claim_token=request.inter_bot_claim_token or "",
-                target_bot_id=(request.bot_id or self._default_bot),
-                turn_id=request.inter_bot_turn_id or "",
-                user_message_id=request.user_message_id or "",
-                bridge_request_id=request.inter_bot_bridge_request_id or "",
-            ):
-                raise ValueError("invalid or stale inter-bot delivery claim")
-        elif any(
-            getattr(request, field, None)
-            for field in (
-                "inter_bot_turn_id",
-                "inter_bot_bridge_request_id",
-                "inter_bot_claim_token",
-                "inter_bot_timeout_seconds",
-                "inter_bot_session_policy",
-                "inter_bot_seed_session_id",
-            )
-        ):
-            raise ValueError("inter-bot correlation fields require a valid delivery claim")
+        validate_inter_bot_claim(self, request)
 
         # Create request context for logging
         if request.client_system_context is not None:

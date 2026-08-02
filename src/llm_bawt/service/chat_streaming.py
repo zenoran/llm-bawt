@@ -19,15 +19,13 @@ from ..bots import (
     StreamingTTSScrubber,
     should_scrub_for_tts,
 )
-# TASK-225: MediaStore is used to (a) resolve new-style ``attachment_ids``
-# into inline image bytes for the LLM call and (b) auto-upload legacy
-# inline ``image_url`` base64 so the asset gets a persistent id.
-from ..media import MediaAssetNotFound, get_media_store
 from ..media.serializers import build_agent_image_manifest
 from .chat_stream_worker import consume_stream_chunks, put_queue_item_threadsafe
 from .chat_streaming_bridge import ChatStreamingBridgeMixin
+from .inter_bot_claims import validate_inter_bot_claim
 from .logging import RequestContext, generate_request_id, get_service_logger
 from .schemas import ChatCompletionRequest
+from .stream_request_attachments import prepare_stream_request_attachments
 from .tool_event_coordinator import ToolEventCoordinator
 from .turn_stream_context import TurnStreamContext
 from .turn_stream_worker import TurnStreamWorker
@@ -68,6 +66,8 @@ class ChatStreamingMixin(ChatStreamingBridgeMixin):
         # SSE spec and are ignored by every consumer — browser EventSource and
         # our own reader (ChatStreamContext skips lines starting with ":").
         yield ": connected\n\n"
+
+        validate_inter_bot_claim(self, request)
 
         # Create request context for logging
         if request.client_system_context is not None:
@@ -124,171 +124,13 @@ class ChatStreamingMixin(ChatStreamingBridgeMixin):
             yield "data: [DONE]\n\n"
             return
 
-        # Get the user's prompt (last user message).
-        #
-        # TASK-225: attachment handling has two input shapes that converge
-        # on the same in-memory ``user_attachments`` list (the LLM-call
-        # form, ``{mimeType, content=naked-b64}``) and on a tiny
-        # ``attachments_to_persist`` list (the JSONB row form,
-        # ``{asset_id, kind}``):
-        #
-        #   1. NEW STYLE — ``attachment_ids: ["ma_xxx", ...]`` references
-        #      ``media_assets`` rows.  Resolved via
-        #      ``MediaStore.read_original_as_data_url`` (cap-bounded WebP).
-        #
-        #   2. LEGACY STYLE — ``content: [{type:"image_url", image_url:
-        #      {url:"data:..."}}]`` (OpenAI multimodal).  Bytes go to the
-        #      LLM exactly as before.  Additionally the server uploads
-        #      them to MediaStore so legacy clients get persisted
-        #      attachments "for free" — a rolling deploy never regresses
-        #      to "image dropped".
-        #
-        # Only the trailing user message is examined; both shapes can
-        # appear on the same message — order is preserved (legacy inline
-        # parts first, then new-style attachment_ids).
-        user_prompt = ""
-        user_attachments: list[dict] = []
-        attachments_to_persist: list[dict] = []
-        # A degraded MediaStore (stale NFS handle, DB outage) must never
-        # kill the chat stream — attachments are dropped for the turn
-        # instead.
-        try:
-            media_store = get_media_store()
-        except Exception as e:
-            media_store = None
-            log.error(
-                "MediaStore unavailable — attachments disabled for this turn: %s",
-                e,
+        user_prompt, user_attachments, attachments_to_persist, media_store = (
+            await prepare_stream_request_attachments(
+                request,
+                user_id=user_id,
+                log=log,
             )
-
-        for m in reversed(request.messages):
-            if m.role != "user":
-                continue
-
-            # ---- Resolve text + legacy inline images from content shape ----
-            if isinstance(m.content, list):
-                for part in m.content:
-                    if not isinstance(part, dict):
-                        continue
-                    if part.get("type") == "text":
-                        user_prompt += part.get("text", "")
-                    elif part.get("type") == "image_url":
-                        url = (part.get("image_url") or {}).get("url", "")
-                        if not url.startswith("data:"):
-                            continue
-                        try:
-                            header, data = url.split(",", 1)
-                            mime = header.split(":")[1].split(";")[0]
-                        except Exception:
-                            continue
-
-                        # Feed the LLM exactly as before — bytes are
-                        # already inline, no point re-reading from disk.
-                        user_attachments.append({"mimeType": mime, "content": data})
-
-                        # Back-compat auto-upload so the inline image
-                        # gets a persistent asset_id.  Failures are
-                        # non-fatal: a degraded MediaStore must not
-                        # break an otherwise-valid chat — the LLM still
-                        # sees the image; we just won't persist a ref.
-                        try:
-                            if media_store is None:
-                                raise RuntimeError("MediaStore unavailable")
-                            import base64 as _b64
-
-                            raw_bytes = _b64.b64decode(data, validate=False)
-                            asset = media_store.upload(
-                                raw_bytes=raw_bytes,
-                                original_mime=mime,
-                                source="chat_upload",
-                                owner_user_id=user_id,
-                            )
-                            attachments_to_persist.append(
-                                {"asset_id": asset.id, "kind": "image"}
-                            )
-                        except Exception as e:
-                            log.warning(
-                                "TASK-225: failed to auto-upload legacy inline image: %s",
-                                e,
-                            )
-            else:
-                user_prompt = m.content or ""
-
-            # ---- Resolve new-style attachment_ids ----
-            requested_ids = list(getattr(m, "attachment_ids", None) or [])
-            for asset_id in requested_ids:
-                if not isinstance(asset_id, str) or not asset_id.strip():
-                    continue
-                asset_id = asset_id.strip()
-                if media_store is None:
-                    log.error(
-                        "TASK-225: dropping attachment_id %s — MediaStore unavailable",
-                        asset_id,
-                    )
-                    continue
-                try:
-                    # Off-load to a thread: read_preview_as_data_url is a
-                    # SYNCHRONOUS object-store fetch (Garage/S3) + base64
-                    # encode.  Calling it inline blocked the event loop for the
-                    # whole download — stalling every other in-flight turn and
-                    # padding this turn's time-to-first-byte enough to trip the
-                    # reverse proxy (the image-paste 502).
-                    #
-                    # Inline the 1024px PREVIEW (not the 1568px original): ~55%
-                    # fewer pixels at Q82 cuts the per-image vision-token bill
-                    # with only a modest fidelity loss. The full-res original
-                    # stays available via the asset_id for anything that needs
-                    # it (lightbox, download).
-                    data_url = await asyncio.to_thread(
-                        media_store.read_preview_as_data_url, asset_id
-                    )
-                except MediaAssetNotFound:
-                    log.warning(
-                        "TASK-225: attachment_id not found in media_assets: %s",
-                        asset_id,
-                    )
-                    continue
-                except FileNotFoundError as e:
-                    # Preview blob missing (older asset predating preview
-                    # generation, or a failed derive) — fall back to the
-                    # full-res original so we degrade to "bigger image"
-                    # rather than silently dropping the attachment.
-                    log.warning(
-                        "TASK-225: preview blob missing for asset_id=%s, "
-                        "falling back to original: %s",
-                        asset_id, e,
-                    )
-                    try:
-                        data_url = await asyncio.to_thread(
-                            media_store.read_original_as_data_url, asset_id
-                        )
-                    except Exception as e2:
-                        log.error(
-                            "TASK-225: original fallback also failed for "
-                            "asset_id=%s: %s",
-                            asset_id, e2,
-                        )
-                        continue
-                except Exception as e:
-                    log.warning(
-                        "TASK-225: MediaStore.read_preview failed for asset_id=%s: %s",
-                        asset_id, e,
-                    )
-                    continue
-
-                # The ``user_attachments`` contract is {mimeType, content
-                # = naked-b64} — strip the ``data:<mime>;base64,`` prefix
-                # here.  The prefix is re-added at the LLM boundary
-                # inside :meth:`prepare_messages_for_query`.
-                try:
-                    header, payload = data_url.split(",", 1)
-                    mime = header.split(":")[1].split(";")[0]
-                except Exception:
-                    continue
-                user_attachments.append({"mimeType": mime, "content": payload})
-                attachments_to_persist.append({"asset_id": asset_id, "kind": "image"})
-
-            break
+        )
 
         # Extract the user message ID so tool-call events and turn logs are
         # joinable with the frontend's history rendering.  Prefer the explicit
@@ -408,7 +250,12 @@ class ChatStreamingMixin(ChatStreamingBridgeMixin):
             done_event = threading.Event()
         else:
             cancel_event, done_event = await self._start_generation(bot_id)
-        turn_log_id = f"turn-{uuid.uuid4().hex}"
+        _reserved_turn_id = getattr(request, "inter_bot_turn_id", None)
+        turn_log_id = (
+            _reserved_turn_id.strip()
+            if isinstance(_reserved_turn_id, str) and _reserved_turn_id.strip()
+            else f"turn-{uuid.uuid4().hex}"
+        )
 
         # Resolve agent session_key for abort support.
         #
@@ -512,6 +359,28 @@ class ChatStreamingMixin(ChatStreamingBridgeMixin):
             agent_session_key=oc_session_key,
             trigger_message_id=trigger_message_id,
             parent_turn_id=parent_turn_id,
+            request_extensions={
+                key: value
+                for key, value in {
+                    "inter_bot_delivery_id": getattr(
+                        request, "inter_bot_delivery_id", None
+                    ),
+                    "inter_bot_turn_id": getattr(request, "inter_bot_turn_id", None),
+                    "inter_bot_bridge_request_id": getattr(
+                        request, "inter_bot_bridge_request_id", None
+                    ),
+                    "inter_bot_timeout_seconds": getattr(
+                        request, "inter_bot_timeout_seconds", None
+                    ),
+                    "inter_bot_session_policy": getattr(
+                        request, "inter_bot_session_policy", None
+                    ),
+                    "inter_bot_seed_session_id": getattr(
+                        request, "inter_bot_seed_session_id", None
+                    ),
+                }.items()
+                if value
+            },
         )
         # Record which continuation turn carried the answer back to the agent.
         if answered_question_id:

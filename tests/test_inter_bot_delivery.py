@@ -98,6 +98,10 @@ def test_duplicate_idempotency_key_returns_one_stable_delivery(delivery_store):
     assert second.user_message_id == first.user_message_id
     assert second.turn_id == first.turn_id
     assert second.message == "TASK-700 READY"
+    first_payload = store.payload(first.id)
+    second_payload = store.payload(second.id)
+    assert first_payload["assistant_message_id"] == second_payload["assistant_message_id"]
+    assert str(uuid.UUID(first_payload["assistant_message_id"])) == first_payload["assistant_message_id"]
     assert str(uuid.UUID(first.user_message_id)) == first.user_message_id
     assert len(first.user_message_id) == 36
     rows = store.list(sender_bot_id=sender)
@@ -366,6 +370,7 @@ def test_restart_recovery_reuses_same_delivery_turn_and_message_ids(delivery_sto
     assert recovered[0].status == QUEUED
     assert recovered[0].user_message_id == original.user_message_id
     assert recovered[0].turn_id == original.turn_id
+    original_payload = store.payload(original.id)
 
     reclaimed = store.claim_next(target, claim_owner="test-owner", steer_capable=False)
     assert reclaimed and reclaimed.id == original.id
@@ -374,6 +379,32 @@ def test_restart_recovery_reuses_same_delivery_turn_and_message_ids(delivery_sto
     assert reclaimed.attempt_count == 2
     payload = store.payload(original.id)
     assert payload["inter_bot_bridge_request_id"].startswith("req_delivery_")
+    assert payload["assistant_message_id"] == original_payload["assistant_message_id"]
+
+
+def test_restart_recovery_does_not_deliver_ok_row_with_error_text(delivery_store):
+    store, sender, target = delivery_store
+    original, _ = _enqueue(store, sender, target, "partial failure")
+    claimed = store.claim_next(
+        target, claim_owner="old-owner", steer_capable=False, lease_seconds=60
+    )
+    assert claimed
+
+    with store.engine.begin() as conn:
+        conn.execute(sa_text("""
+            UPDATE turn_logs SET status='ok', end_reason='stop', ended_at=now(),
+                error_text='upstream exploded'
+            WHERE id=:turn_id
+        """), {"turn_id": original.turn_id})
+        conn.execute(sa_text("""
+            UPDATE inter_bot_deliveries
+            SET lease_expires_at=now() - interval '1 second'
+            WHERE id=:id
+        """), {"id": original.id})
+
+    recovered = store.recover_expired()[0]
+    assert recovered.status == FAILED
+    assert recovered.last_error == "target turn ended unsuccessfully"
 
 
 def test_retry_then_dead_letter_is_inspectable(delivery_store):

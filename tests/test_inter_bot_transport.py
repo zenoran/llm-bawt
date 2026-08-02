@@ -245,6 +245,160 @@ def test_spoofed_delivery_correlation_is_rejected_before_turn_start():
         raise AssertionError("spoofed delivery claim was accepted")
 
 
+def test_spoofed_delivery_correlation_is_rejected_on_stream_path():
+    from llm_bawt.service.background_service import BackgroundService
+    from llm_bawt.service.schemas import ChatCompletionRequest, ChatMessage
+
+    service = BackgroundService.__new__(BackgroundService)
+    service._default_bot = "snark"
+    service._inter_bot_dispatcher = SimpleNamespace(
+        store=SimpleNamespace(validate_claim=lambda **_kwargs: False)
+    )
+    request = ChatCompletionRequest(
+        bot_id="snark",
+        messages=[ChatMessage(role="user", content="spoof")],
+        user_message_id="interbot-msg",
+        inter_bot_delivery_id="delivery-spoof",
+        inter_bot_turn_id="turn-delivery-spoof",
+        inter_bot_bridge_request_id="req_delivery_spoof",
+        inter_bot_claim_token="claim-spoof",
+    )
+
+    async def consume():
+        chunks = []
+        async for chunk in service.chat_completion_stream(request):
+            chunks.append(chunk)
+        return chunks
+
+    try:
+        _run(consume())
+    except ValueError as exc:
+        assert "invalid or stale" in str(exc)
+    else:
+        raise AssertionError("spoofed streaming delivery claim was accepted")
+
+
+def test_durable_dispatch_drains_stream_and_uses_persisted_outcome():
+    from datetime import datetime, timezone
+
+    record = SimpleNamespace(
+        id="delivery-1",
+        turn_id="turn-delivery-1",
+        claim_token="claim-1",
+        target_bot_id="loopy",
+    )
+    marked = []
+    emitted = []
+    payload = {
+        "messages": [{"role": "user", "content": "work"}],
+        "bot_id": "loopy",
+        "user_message_id": "00000000-0000-4000-8000-000000000001",
+        "assistant_message_id": "00000000-0000-4000-8000-000000000002",
+        "inter_bot_delivery_id": "delivery-1",
+        "inter_bot_turn_id": "turn-delivery-1",
+        "inter_bot_bridge_request_id": "req_delivery_1",
+    }
+    turn = SimpleNamespace(
+        ended_at=datetime.now(timezone.utc),
+        status="ok",
+        error_text=None,
+        response_text="streamed reply",
+        model="test-model",
+    )
+    store = SimpleNamespace(
+        payload=lambda _id: payload,
+        mark_transport_accepted=lambda *_args: True,
+        mark_delivered=lambda *args, **kwargs: (
+            marked.append((args, kwargs)) or SimpleNamespace(status="DELIVERED")
+        ),
+        renew_lease=lambda *_args: False,
+    )
+
+    async def stream(request):
+        assert request.stream is True
+        assert request.inter_bot_turn_id == record.turn_id
+        yield ": connected\n\n"
+        yield "data: [DONE]\n\n"
+
+    dispatcher = InterBotDeliveryDispatcher.__new__(InterBotDeliveryDispatcher)
+    dispatcher.store = store
+    dispatcher.service = SimpleNamespace(
+        chat_completion_stream=stream,
+        _turn_log_store=SimpleNamespace(get_turn=lambda _id: turn),
+    )
+    dispatcher._heartbeat = lambda *_args: asyncio.sleep(3600)
+
+    async def emit(value):
+        emitted.append(value)
+
+    dispatcher._emit = emit
+    _run(dispatcher._dispatch(record))
+
+    assert marked[0][1] == {
+        "response_model": "test-model",
+        "response_chars": len("streamed reply"),
+    }
+    assert emitted[0].status == "DELIVERED"
+
+
+def test_durable_dispatch_rejects_ok_turn_with_persisted_error():
+    from datetime import datetime, timezone
+
+    record = SimpleNamespace(
+        id="delivery-err",
+        turn_id="turn-delivery-err",
+        claim_token="claim-err",
+        target_bot_id="loopy",
+        attempt_count=1,
+        max_attempts=1,
+        overflow_recovery_count=0,
+    )
+    payload = {
+        "messages": [{"role": "user", "content": "work"}],
+        "bot_id": "loopy",
+        "user_message_id": "00000000-0000-4000-8000-000000000003",
+        "assistant_message_id": "00000000-0000-4000-8000-000000000004",
+        "inter_bot_delivery_id": "delivery-err",
+        "inter_bot_turn_id": "turn-delivery-err",
+        "inter_bot_bridge_request_id": "req_delivery_err",
+    }
+    turn = SimpleNamespace(
+        ended_at=datetime.now(timezone.utc),
+        status="ok",
+        error_text="upstream exploded",
+        response_text="partial",
+        model="test-model",
+    )
+    failed = []
+    store = SimpleNamespace(
+        payload=lambda _id: payload,
+        mark_transport_accepted=lambda *_args: True,
+        get=lambda _id: record,
+        turn_state=lambda _id: ("ok", turn.ended_at),
+        fail_claim=lambda *args: (
+            failed.append(args) or SimpleNamespace(status="FAILED")
+        ),
+        renew_lease=lambda *_args: False,
+    )
+
+    async def stream(_request):
+        yield "data: [DONE]\n\n"
+
+    dispatcher = InterBotDeliveryDispatcher.__new__(InterBotDeliveryDispatcher)
+    dispatcher.store = store
+    dispatcher.service = SimpleNamespace(
+        config=SimpleNamespace(),
+        chat_completion_stream=stream,
+        _turn_log_store=SimpleNamespace(get_turn=lambda _id: turn),
+    )
+    dispatcher._heartbeat = lambda *_args: asyncio.sleep(3600)
+    dispatcher._emit = lambda _value: asyncio.sleep(0)
+    _run(dispatcher._dispatch(record))
+
+    assert failed
+    assert "upstream exploded" in failed[0][2]
+
+
 def test_passive_dispatcher_retries_and_acquires_leadership(monkeypatch):
     attempts = iter([None, object()])
     stop_event = asyncio.Event()
