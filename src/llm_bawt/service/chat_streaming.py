@@ -768,6 +768,15 @@ class ChatStreamingMixin(ChatStreamingBridgeMixin):
                     # via _publish_tool_event_direct — just skip.
                     continue
 
+                if isinstance(chunk, dict) and chunk.get("_type") == "turn_usage":
+                    usage_chunk = {
+                        "id": response_id,
+                        "created": created,
+                        **{key: value for key, value in chunk.items() if key != "_type"},
+                    }
+                    yield f"data: {json.dumps(usage_chunk)}\n\n"
+                    continue
+
                 # Model reasoning ("thinking") → OpenAI-compat reasoning lane.
                 # Emitted as choices[].delta.reasoning_content so it lands in a
                 # separate UI channel, never in delta.content / the saved

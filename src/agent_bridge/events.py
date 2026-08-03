@@ -10,6 +10,9 @@ from typing import Any
 class AgentEventKind(str, Enum):
     ASSISTANT_DELTA = "assistant_delta"
     ASSISTANT_DONE = "assistant_done"
+    # Provider-reported usage snapshot for the current model/API iteration.
+    # Partial by definition; ASSISTANT_DONE remains the terminal authority.
+    USAGE_UPDATE = "usage_update"
     TOOL_START = "tool_start"
     TOOL_END = "tool_end"
     USER_MESSAGE = "user_message"

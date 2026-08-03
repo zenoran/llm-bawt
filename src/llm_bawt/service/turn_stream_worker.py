@@ -20,6 +20,7 @@ from .pending_tool_calls import PendingToolCallCorrelator
 from .turn_stream_context import TurnStreamContext, _TEXT_DELTA_FLUSH_CHARS
 from .turn_stream_finalize import TurnStreamFinalizer
 from .turn_stream_publish import TurnStreamPublishMixin
+from .turn_usage import TurnUsageCoordinator
 
 log = get_service_logger(__name__)
 
@@ -37,6 +38,7 @@ class TurnStreamWorker(TurnStreamPublishMixin):
         _publish_event_direct = self._publish_event_direct
         from .tool_changed_files import ToolChangedFilesCoordinator
         _changed_files = ToolChangedFilesCoordinator(ctx.svc._turn_log_store.engine)
+        _turn_usage = TurnUsageCoordinator(ctx.svc._turn_log_store)
         _enrich_attachment_refs = self._enrich_attachment_refs
         _redis_sub = ctx._redis_sub
         _upstream_model = ctx._upstream_model
@@ -761,6 +763,23 @@ class TurnStreamWorker(TurnStreamPublishMixin):
                         if evt == "metadata":
                             if item.get("upstream_model"):
                                 _upstream_model[0] = item["upstream_model"]
+                            continue
+                        if evt == "live_usage":
+                            usage_event = _turn_usage.capture(
+                                turn_id=turn_log_id,
+                                trigger_message_id=trigger_message_id,
+                                bot_id=bot_id,
+                                user_id=user_id,
+                                model=item.get("model") or model_alias,
+                                token_usage=item.get("token_usage"),
+                            )
+                            if usage_event is not None:
+                                token_usage_holder[0] = usage_event["token_usage"]
+                                _publish_event_direct(usage_event)
+                                yield {
+                                    "_type": "turn_usage",
+                                    **_turn_usage.http_chunk(usage_event),
+                                }
                             continue
                         if evt == "token_usage":
                             # Capture for turn_complete payload — frontend

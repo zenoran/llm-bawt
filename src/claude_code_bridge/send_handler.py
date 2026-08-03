@@ -32,7 +32,7 @@ from .send_errors import (
 from .send_request import SendRequest
 from .send_result import ClaudeResultMixin
 from .send_stream import ClaudeStreamMixin
-from .send_usage import ClaudeUsageMixin
+from .send_usage import ClaudeUsageMixin, LiveUsagePublisher
 
 logger = logging.getLogger("claude_code_bridge.bridge")
 
@@ -412,13 +412,12 @@ class ClaudeSendMixin(ClaudeStreamMixin, ClaudeUsageMixin, ClaudeResultMixin):
                     # AssistantMessage's usage reflects the actual final API
                     # call's view of the context.
                     latest_assistant_usage: dict | None = None
-                    # Some synthetic Anthropic streams (notably the
-                    # Responses-backed ChatGPT proxy) surface final input/cache
-                    # usage only on StreamEvent(message_delta), while the
-                    # AssistantMessage snapshot can remain at message_start's
-                    # zeroed input fields. Track the last stream-level usage as
-                    # a fallback so turn_logs get the real pill numbers.
-                    latest_stream_usage: dict | None = None
+                    # One request-local publisher merges sparse message_delta
+                    # frames and de-duplicates AssistantMessage echoes.
+                    live_usage = LiveUsagePublisher(
+                        self, request_id, session_key, actual_model, model,
+                        bot_context_window,
+                    )
                     # /compact lifecycle tracking for this turn. The SDK reports
                     # compaction via SystemMessage(subtype="status") — never a
                     # compact_boundary on the wire — so we watch the status
@@ -457,7 +456,7 @@ class ClaudeSendMixin(ClaudeStreamMixin, ClaudeUsageMixin, ClaudeResultMixin):
                             text=text, actual_model=actual_model, model=model,
                             bot_context_window=bot_context_window,
                             latest_assistant_usage=latest_assistant_usage,
-                            latest_stream_usage=latest_stream_usage,
+                            latest_stream_usage=live_usage.stream_usage,
                             attachments=attachments,
                         )
 
@@ -525,6 +524,7 @@ class ClaudeSendMixin(ClaudeStreamMixin, ClaudeUsageMixin, ClaudeResultMixin):
                                 if not session_persisted:
                                     if data.get("model"):
                                         actual_model = data["model"]
+                                        live_usage.actual_model = actual_model
                                         logger.info("Actual model: %s", actual_model)
                                     if not resume_id:
                                         sid = data.get("session_id")
@@ -603,9 +603,11 @@ class ClaudeSendMixin(ClaudeStreamMixin, ClaudeUsageMixin, ClaudeResultMixin):
                                 event = msg.event
                                 event_type = event.get("type", "")
                                 if event_type == "message_delta":
-                                    ev_usage = event.get("usage")
-                                    if isinstance(ev_usage, dict) and ev_usage:
-                                        latest_stream_usage = ev_usage
+                                    seq = live_usage.publish(
+                                        seq,
+                                        assistant_usage=latest_assistant_usage,
+                                        stream_usage=event.get("usage"),
+                                    )
 
                                 if event_type == "content_block_delta":
                                     delta = event.get("delta", {})
@@ -705,6 +707,10 @@ class ClaudeSendMixin(ClaudeStreamMixin, ClaudeUsageMixin, ClaudeResultMixin):
                                 )
                                 if seq != prior_seq or assistant_snapshot_text != prior_snapshot:
                                     model_side_effects = True
+                                seq = live_usage.publish(
+                                    seq,
+                                    assistant_usage=latest_assistant_usage,
+                                )
 
                             elif isinstance(msg, UserMessage):
                                 # TASK-623: UserMessage tool_result (TOOL_END)
@@ -782,7 +788,7 @@ class ClaudeSendMixin(ClaudeStreamMixin, ClaudeUsageMixin, ClaudeResultMixin):
                                     model=model,
                                     bot_context_window=bot_context_window,
                                     latest_assistant_usage=latest_assistant_usage,
-                                    latest_stream_usage=latest_stream_usage,
+                                    latest_stream_usage=live_usage.stream_usage,
                                     native_context_usage=native_context_usage,
                                     compact_status=compact_status,
                                     compact_error_msg=compact_error_msg,
@@ -883,7 +889,7 @@ class ClaudeSendMixin(ClaudeStreamMixin, ClaudeUsageMixin, ClaudeResultMixin):
                             model=model,
                             bot_context_window=bot_context_window,
                             latest_assistant_usage=latest_assistant_usage,
-                            latest_stream_usage=latest_stream_usage,
+                            latest_stream_usage=live_usage.stream_usage,
                         )
 
                         # 1) Direct-Claude auth failure with no model/tool side

@@ -266,6 +266,14 @@ class AgentBridgeBackend(AgentBackend):
                                     text_parts.append(delta)
                                     result_queue.put(delta)
 
+                            elif event.kind == AgentEventKind.USAGE_UPDATE:
+                                if event.token_usage:
+                                    result_queue.put({
+                                        "event": "live_usage",
+                                        "token_usage": event.token_usage,
+                                        "model": event.model,
+                                    })
+
                             elif event.kind == AgentEventKind.ASSISTANT_DONE:
                                 # Capture actual upstream model if provided
                                 if event.model:

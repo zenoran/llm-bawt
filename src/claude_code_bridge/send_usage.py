@@ -14,6 +14,8 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from dataclasses import dataclass
+from typing import Any
 
 from ._bridge_helpers import (
     _estimate_proxy_cost_usd,
@@ -24,8 +26,93 @@ from ._bridge_helpers import (
 logger = logging.getLogger("claude_code_bridge.bridge")
 
 
+@dataclass
+class LiveUsagePublisher:
+    """Per-turn merge and dedupe state for provider usage snapshots."""
+
+    bridge: Any
+    request_id: str
+    session_key: str
+    actual_model: str
+    requested_model: str
+    context_window: int | None
+    stream_usage: dict | None = None
+    last_signature: tuple | None = None
+
+    def publish(
+        self,
+        seq: int,
+        *,
+        assistant_usage: dict | None,
+        stream_usage: dict | None = None,
+    ) -> int:
+        """Merge a sparse stream frame and publish a changed live snapshot."""
+        if isinstance(stream_usage, dict) and stream_usage:
+            self.stream_usage = {**(self.stream_usage or {}), **stream_usage}
+        usage = self.bridge._compute_live_usage(
+            actual_model=self.actual_model,
+            model=self.requested_model,
+            bot_context_window=self.context_window,
+            latest_assistant_usage=assistant_usage,
+            latest_stream_usage=self.stream_usage,
+        )
+        if usage is None:
+            return seq
+        signature = tuple(
+            usage.get(key)
+            for key in (
+                "input_tokens",
+                "cache_read_tokens",
+                "cache_creation_tokens",
+                "output_tokens",
+                "resident_tokens",
+                "context_window",
+            )
+        )
+        if signature == self.last_signature:
+            return seq
+        self.last_signature = signature
+        from agent_bridge.events import AgentEventKind
+
+        seq += 1
+        self.bridge._publish_event(
+            self.request_id,
+            self.session_key,
+            seq,
+            kind=AgentEventKind.USAGE_UPDATE,
+            model=self.actual_model or self.requested_model,
+            token_usage=usage,
+        )
+        return seq
+
+
 class ClaudeUsageMixin:
     """Token-usage / context-window extraction for completed and interrupted turns."""
+
+    def _compute_live_usage(
+        self,
+        *,
+        actual_model: str,
+        model: str,
+        bot_context_window: int | None,
+        latest_assistant_usage: dict | None,
+        latest_stream_usage: dict | None,
+    ) -> dict | None:
+        """Build a provider-neutral usage snapshot for one live model iteration."""
+        usage = self._compute_interrupted_usage(
+            actual_model=actual_model,
+            model=model,
+            bot_context_window=bot_context_window,
+            latest_assistant_usage=latest_assistant_usage,
+            latest_stream_usage=latest_stream_usage,
+        )
+        if usage is None or int(usage.get("resident_tokens", 0) or 0) <= 0:
+            return None
+        return {
+            **usage,
+            "resident_source": "live_iteration_total_input",
+            "usage_status": "partial",
+        }
 
     def _compute_interrupted_usage(
         self,
