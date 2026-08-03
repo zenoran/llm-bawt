@@ -10,7 +10,6 @@ from :class:`TurnStreamPublishMixin`).
 from __future__ import annotations
 
 import asyncio
-import json
 import time
 import uuid
 
@@ -19,6 +18,7 @@ from .chat_stream_worker import consume_stream_chunks, put_queue_item_threadsafe
 from .logging import get_service_logger
 from .pending_tool_calls import PendingToolCallCorrelator
 from .turn_stream_context import TurnStreamContext, _TEXT_DELTA_FLUSH_CHARS
+from .turn_stream_finalize import TurnStreamFinalizer
 from .turn_stream_publish import TurnStreamPublishMixin
 
 log = get_service_logger(__name__)
@@ -1072,227 +1072,13 @@ class TurnStreamWorker(TurnStreamPublishMixin):
                     token_usage=_usage_so_far(),
                 )
         finally:
-            end_time = timing_holder[1] or time.time()
-            start_time = timing_holder[0] or end_time
-            elapsed_ms = (end_time - start_time) * 1000
-            externally_aborted = _turn_was_aborted()
-            if externally_aborted:
-                cancelled_holder[0] = True
-
-            # Wrap finalization in try/except so that the sentinel,
-            # turn_complete event, and generation cleanup always fire
-            # even if persistence raises (e.g. database failure).
-            try:
-                if externally_aborted:
-                    # /v1/chat/abort owns this terminal state. Do not let
-                    # worker cleanup overwrite it as completed/timeout.
-                    #
-                    # TASK-286: a Stop must NOT delete the in-progress reply.
-                    # If any assistant text streamed before the abort, COMMIT
-                    # it to history (so it stays in the chat as a truncated
-                    # turn) — _finalize_turn writes the assistant row +
-                    # response_text. Pass status="aborted" so it keeps the
-                    # aborted terminal state instead of flipping to "ok".
-                    # With no partial text, just stamp the turn log aborted.
-                    if full_response_holder[0]:
-                        self._finalize_turn(
-                            llm_bawt=llm_bawt,
-                            turn_id=turn_log_id,
-                            response_text=full_response_holder[0],
-                            tool_context=tool_context_holder[0],
-                            tool_call_details=tool_call_details_holder,
-                            prepared_messages=_logged_messages if "_logged_messages" in locals() else (messages if "messages" in locals() else []),
-                            user_prompt=user_prompt,
-                            model=model_alias,
-                            bot_id=bot_id,
-                            user_id=user_id,
-                            elapsed_ms=elapsed_ms,
-                            stream=True,
-                            animation=animation_holder[0],
-                            token_usage=token_usage_holder[0],
-                            attachments=agent_attachments_holder or None,
-                            reasoning=reasoning_holder[0] or None,
-                            status="aborted",
-                            end_reason="aborted",
-                            assistant_message_id=assistant_message_id,
-                        )
-                    else:
-                        self._update_turn_log(
-                            turn_id=turn_log_id,
-                            latency_ms=elapsed_ms,
-                            tool_calls=tool_call_details_holder or None,
-                            end_reason="aborted",
-                        )
-                elif full_response_holder[0]:
-                    self._finalize_turn(
-                        llm_bawt=llm_bawt,
-                        turn_id=turn_log_id,
-                        response_text=full_response_holder[0],
-                        tool_context=tool_context_holder[0],
-                        tool_call_details=tool_call_details_holder,
-                        prepared_messages=_logged_messages if "_logged_messages" in locals() else (messages if "messages" in locals() else []),
-                        user_prompt=user_prompt,
-                        model=model_alias,
-                        bot_id=bot_id,
-                        user_id=user_id,
-                        elapsed_ms=elapsed_ms,
-                        stream=True,
-                        animation=animation_holder[0],
-                        token_usage=token_usage_holder[0],
-                        attachments=agent_attachments_holder or None,
-                        reasoning=reasoning_holder[0] or None,
-                        assistant_message_id=assistant_message_id,
-                    )
-                else:
-                    # No response received — mark as timeout so turn doesn't
-                    # stay stuck at status='streaming' forever.
-                    # Persist any tool_call_details that were collected before
-                    # the follow-up model call failed.
-                    self._update_turn_log(
-                        turn_id=turn_log_id,
-                        status="timeout",
-                        latency_ms=elapsed_ms,
-                        tool_calls=tool_call_details_holder or None,
-                        token_usage=_usage_so_far(),
-                    )
-            except Exception as fin_err:
-                log.error("Finalization failed (turn %s): %s", turn_log_id, fin_err)
-                try:
-                    self._update_turn_log(
-                        turn_id=turn_log_id,
-                        status="error",
-                        latency_ms=elapsed_ms,
-                        response_text=full_response_holder[0] or None,
-                        error_text=f"finalize_error: {fin_err}",
-                        token_usage=_usage_so_far(),
-                    )
-                except Exception:
-                    pass
-
-            # Notify SSE consumers that the turn is done so they
-            # can finalize without polling the turn-log API.
-            status = "completed" if full_response_holder[0] else "timeout"
-            if cancelled_holder[0]:
-                status = "cancelled"
-            # TASK-269: classify why the turn ended.  A deferred
-            # AskUserQuestion ends the turn cleanly with end_reason
-            # "question" — the persisted question stays "awaiting" (NOT
-            # abandoned; the user answers later via a continuation turn).
-            question_id = question_id_holder[0]
-            approval_id = approval_id_holder[0]
-            approval_persist_failed = approval_persist_failed_holder[0]
-            if question_id:
-                end_reason = "question"
-            elif approval_id:
-                # TASK-292: gated tool awaiting approval — same clean-end
-                # semantics as a question; the request stays "pending" and
-                # the user resolves it via a continuation turn.
-                end_reason = "approval"
-            elif approval_persist_failed:
-                # TASK-306 Section A: a gated tool required approval but the
-                # row could not be durably committed. End honestly so the
-                # turn record reflects that the gate never reached the user.
-                end_reason = "approval_persist_failed"
-            elif cancelled_holder[0]:
-                end_reason = "aborted"
-            elif status == "timeout":
-                end_reason = "error"
-            else:
-                end_reason = "stop"
-            # Stamp the turn log so hydration/turn-log APIs can render a
-            # first-class QuestionMessage for end_reason="question" turns.
-            # For a persist failure, record the structured reason as
-            # error_text so the agent (on continuation) and history see the
-            # truth instead of a phantom success.
-            try:
-                self._turn_log_store.update_turn(
-                    turn_id=turn_log_id,
-                    end_reason=end_reason,
-                    question_id=question_id,
-                    error_text=(
-                        json.dumps(approval_persist_failed)
-                        if approval_persist_failed else None
-                    ),
-                    tts_scrubbed=tts_scrub,
-                )
-            except Exception as _er_err:
-                log.debug("update_turn end_reason failed for %s: %s", turn_log_id, _er_err)
-            # Voice-optimized turns: flush the scrubber's final (partial)
-            # block as one last tts_delta BEFORE turn_complete, so the TTS
-            # driver speaks the tail then hits EOS. Skipped on cancel/abort.
-            if tts_scrubber is not None and status not in ("cancelled", "aborted"):
-                _tts_tail = tts_scrubber.flush()
-                if _tts_tail:
-                    _tts_tail_future = _publish_event_direct({
-                        "_type": "tts_delta",
-                        "turn_id": turn_log_id,
-                        "bot_id": bot_id,
-                        "user_id": user_id,
-                        "delta": _tts_tail,
-                        "ts": time.time(),
-                    })
-                    # The TTS consumer closes its text input as soon as it
-                    # receives turn_complete. Ensure Redis has committed the
-                    # final scrubber tail first; otherwise these independent
-                    # cross-thread publishes may arrive in reverse order and
-                    # consistently drop the response's last sentence.
-                    if _tts_tail_future is not None:
-                        try:
-                            _tts_tail_future.result(timeout=5)
-                        except Exception as _tts_order_err:
-                            log.warning(
-                                "Final tts_delta publish did not complete before "
-                                "turn_complete for turn %s: %s",
-                                turn_log_id,
-                                _tts_order_err,
-                            )
-            # TASK-664: attach the canonical changed-file summary so a live turn
-            # renders file links without waiting on a history refetch. Empty when
-            # nothing was captured; never allowed to block turn_complete.
-            try:
-                changed_files = self._turn_log_store.changed_files_summary(turn_log_id)
-            except Exception:
-                changed_files = None
-            # Live agent turns intentionally skip the final history refresh. Carry
-            # the same canonical attachment envelope on turn_complete so the
-            # already-rendered assistant bubble can graft screenshots immediately.
-            try:
-                completed_attachments = _enrich_attachment_refs(
-                    agent_attachments_holder
-                ) if agent_attachments_holder else None
-            except Exception as _attachment_err:
-                completed_attachments = None
-                log.warning(
-                    "turn_complete attachment enrichment failed: %s",
-                    _attachment_err,
-                )
-            _publish_event_direct({
-                "_type": "turn_complete",
-                "turn_id": turn_log_id,
-                "bot_id": bot_id,
-                "user_id": user_id,
-                "status": status,
-                "end_reason": end_reason,
-                "question_id": question_id,
-                "approval_id": approval_id,
-                "approval_persist_failed": approval_persist_failed,
-                "animation": animation_holder[0],
-                "token_usage": _usage_so_far(),
-                "changed_files": changed_files,
-                "attachments": completed_attachments,
-                # Catalog alias for this turn (matches the persisted turn-log
-                # `model` and the /v1/models pricing key) so the client can
-                # cost a live turn without waiting on the turn-log backfill.
-                "model": model_alias,
-                "ts": time.time(),
-            })
-
-            put_queue_item_threadsafe(loop, chunk_queue, None)  # Sentinel
-
-            # Signal generation complete from the worker thread so
-            # that _start_generation() properly waits for us before
-            # starting a new generation for the same bot.
-            if is_agent_backend:
-                done_event.set()
-            else:
-                self._end_generation(cancel_event, done_event, bot_id)
+            prepared_messages = (
+                _logged_messages
+                if "_logged_messages" in locals()
+                else (messages if "messages" in locals() else [])
+            )
+            TurnStreamFinalizer(
+                ctx,
+                publish_event_direct=_publish_event_direct,
+                enrich_attachment_refs=_enrich_attachment_refs,
+            ).finalize(prepared_messages=prepared_messages)
