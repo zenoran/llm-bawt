@@ -10,7 +10,42 @@ from ._bridge_helpers import _fmt_tokens, _read_latest_compact_metadata
 
 
 class ClaudeResultMixin:
-    """Normalize successful terminal results and publish ``ASSISTANT_DONE``."""
+    """Normalize successful and interrupted terminal results."""
+
+    def _publish_interrupted_done(
+        self,
+        *,
+        request_id: str,
+        session_key: str,
+        seq: int,
+        text: str,
+        actual_model: str,
+        model: str,
+        bot_context_window: int | None,
+        latest_assistant_usage: dict | None,
+        latest_stream_usage: dict | None,
+        attachments: list[dict] | None = None,
+    ) -> tuple[int, dict | None]:
+        """Publish one partial terminal event and return its usage snapshot."""
+        usage = self._compute_interrupted_usage(
+            actual_model=actual_model,
+            model=model,
+            bot_context_window=bot_context_window,
+            latest_assistant_usage=latest_assistant_usage,
+            latest_stream_usage=latest_stream_usage,
+        )
+        seq += 1
+        self._publish_event(
+            request_id,
+            session_key,
+            seq,
+            kind=AgentEventKind.ASSISTANT_DONE,
+            text=text,
+            model=actual_model,
+            token_usage=usage,
+            attachments=attachments,
+        )
+        return seq, usage
 
     async def _finalize_result_message(
         self,

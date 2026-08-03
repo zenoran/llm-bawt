@@ -551,6 +551,16 @@ class AgentBridgeBackend(AgentBackend):
                                     })
 
                             elif event.kind == AgentEventKind.ERROR:
+                                # Terminal failures can still carry a provider-reported
+                                # last-iteration usage snapshot (TASK-304). Preserve it
+                                # before raising so the app can persist usage-so-far.
+                                if event.token_usage:
+                                    token_usage.clear()
+                                    token_usage.update(event.token_usage)
+                                    result_queue.put({
+                                        "event": "token_usage",
+                                        "token_usage": event.token_usage,
+                                    })
                                 # Do not abort the run subscription immediately.
                                 # Drain through run_done so any already-completed
                                 # tool/file events queued before the error persist.

@@ -25,7 +25,72 @@ logger = logging.getLogger("claude_code_bridge.bridge")
 
 
 class ClaudeUsageMixin:
-    """Token-usage / context-window extraction for a completed turn."""
+    """Token-usage / context-window extraction for completed and interrupted turns."""
+
+    def _compute_interrupted_usage(
+        self,
+        *,
+        actual_model: str,
+        model: str,
+        bot_context_window: int | None,
+        latest_assistant_usage: dict | None,
+        latest_stream_usage: dict | None,
+    ) -> dict | None:
+        """Build an honest usage-so-far payload from the latest model iteration.
+
+        Interrupted turns have no cumulative ``ResultMessage``. The latest
+        AssistantMessage/message_delta snapshot is still provider-reported usage,
+        so preserve it for the context pill while explicitly labelling the scope
+        partial. No snapshot means no payload; this never invents token counts.
+        """
+        proxy_model = self._model_provider_prefix(actual_model or model) is not None
+        snapshot = _pick_iteration_usage(
+            latest_assistant_usage,
+            latest_stream_usage,
+            None,
+            proxy_model=proxy_model,
+        )
+        if not snapshot:
+            return None
+
+        input_tokens = int(snapshot.get("input_tokens", 0) or 0)
+        cache_read_tokens = int(
+            snapshot.get("cache_read_input_tokens", 0)
+            or snapshot.get("cache_read_tokens", 0)
+            or 0
+        )
+        cache_creation_tokens = int(
+            snapshot.get("cache_creation_input_tokens", 0)
+            or snapshot.get("cache_creation_tokens", 0)
+            or 0
+        )
+        output_tokens = int(snapshot.get("output_tokens", 0) or 0)
+        resident_tokens = input_tokens + cache_read_tokens + cache_creation_tokens
+        if resident_tokens == 0 and output_tokens == 0:
+            return None
+
+        usage_for_cost = {
+            "input_tokens": input_tokens,
+            "cache_read_input_tokens": cache_read_tokens,
+            "cache_creation_input_tokens": cache_creation_tokens,
+            "output_tokens": output_tokens,
+        }
+        cost = (
+            _estimate_proxy_cost_usd(actual_model or model, usage_for_cost)
+            if proxy_model
+            else None
+        )
+        return {
+            "input_tokens": input_tokens,
+            "cache_read_tokens": cache_read_tokens,
+            "cache_creation_tokens": cache_creation_tokens,
+            "output_tokens": output_tokens,
+            "resident_tokens": resident_tokens,
+            "resident_source": "interrupted_iteration_total_input",
+            "context_window": bot_context_window,
+            "total_cost_usd": cost,
+            "usage_status": "partial",
+        }
 
     @staticmethod
     async def _read_native_context_usage(sdk_client) -> dict | None:

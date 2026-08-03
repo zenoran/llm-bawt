@@ -111,11 +111,12 @@ class AgentEvent:
     timestamp: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
     raw: dict = field(default_factory=dict)
     db_id: int | None = None  # populated after store
-    # Per-turn token accounting from the upstream SDK's ResultMessage.
-    # Populated on ASSISTANT_DONE for backends that expose usage info
-    # (e.g. claude_code_bridge surfaces Claude Code SDK usage + modelUsage).
-    # Shape: {input_tokens, cache_read_tokens, cache_creation_tokens,
-    #         output_tokens, context_window, total_cost_usd}.
+    # Per-turn token accounting from the upstream SDK. Successful turns carry
+    # final ResultMessage-derived usage on ASSISTANT_DONE; interrupted/error
+    # terminals may carry the latest provider-reported iteration snapshot with
+    # usage_status="partial" (TASK-304). Shape: {input_tokens,
+    # cache_read_tokens, cache_creation_tokens, output_tokens, context_window,
+    # total_cost_usd, ...}.
     token_usage: dict | None = None
     # Identifies which agent backend produced this event ("claude-code",
     # "codex", "openclaw"). Lets the UI dispatch tool rendering by

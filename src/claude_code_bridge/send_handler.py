@@ -208,6 +208,7 @@ class ClaudeSendMixin(ClaudeStreamMixin, ClaudeUsageMixin, ClaudeResultMixin):
                 self._proxy_base_url is not None
                 and self._model_provider_prefix(model) is not None
             )
+            interrupted_usage: dict | None = None
             try:
                 # Inject MCP tool context so Claude passes the right identifiers.
                 # Body comes from the registry (TASK-490) with a byte-identical
@@ -284,6 +285,7 @@ class ClaudeSendMixin(ClaudeStreamMixin, ClaudeUsageMixin, ClaudeResultMixin):
                     # Stale signal from a previous run — clear so this turn can proceed.
                     cancel_event.clear()
                 while True:
+                    interrupted_usage = None
                     # An async generator is single-use and the auth/session retry
                     # paths below re-enter this loop, so build a fresh prompt +
                     # completion gate per attempt.  turn_done releases the prompt
@@ -447,6 +449,17 @@ class ClaudeSendMixin(ClaudeStreamMixin, ClaudeUsageMixin, ClaudeResultMixin):
                     # Retry safety is based on model/tool side effects, not status
                     # text emitted by the bridge itself (e.g. api_retry notices).
                     model_side_effects = False
+
+                    def _publish_partial(text: str, *, attachments=None) -> None:
+                        nonlocal seq, interrupted_usage
+                        seq, interrupted_usage = self._publish_interrupted_done(
+                            request_id=request_id, session_key=session_key, seq=seq,
+                            text=text, actual_model=actual_model, model=model,
+                            bot_context_window=bot_context_window,
+                            latest_assistant_usage=latest_assistant_usage,
+                            latest_stream_usage=latest_stream_usage,
+                            attachments=attachments,
+                        )
 
                     sdk_client = None
                     active_run = None
@@ -795,16 +808,9 @@ class ClaudeSendMixin(ClaudeStreamMixin, ClaudeUsageMixin, ClaudeResultMixin):
                                 # the stream and kills the subprocess cleanly.
                                 break
                         if aborted:
-                            # Cooperative abort fired — fall straight through to
-                            # publish_run_done without retry. We deliberately drop
-                            # any partial response: the user explicitly cancelled.
-                            seq += 1
-                            self._publish_event(
-                                request_id, session_key, seq,
-                                kind=AgentEventKind.ASSISTANT_DONE,
-                                text="".join(text_parts),
-                                model=actual_model,
-                            )
+                            # Cooperative abort fired — publish the partial text +
+                            # provider-reported usage accumulated before cancellation.
+                            _publish_partial("".join(text_parts))
                             assistant_done_emitted = True
                         elif not assistant_done_emitted:
                             # Clean EOF without a ResultMessage. z.ai / GLM via
@@ -833,13 +839,8 @@ class ClaudeSendMixin(ClaudeStreamMixin, ClaudeUsageMixin, ClaudeResultMixin):
                             # Always publish — even if full_text is empty.
                             # An empty ASSISTANT_DONE is far better than no
                             # DONE at all, which causes timeout + vanishing bubble.
-                            seq += 1
-                            self._publish_event(
-                                request_id, session_key, seq,
-                                kind=AgentEventKind.ASSISTANT_DONE,
-                                text=full_text,
-                                model=actual_model,
-                                attachments=turn_screenshot_assets or None,
+                            _publish_partial(
+                                full_text, attachments=turn_screenshot_assets or None,
                             )
                             assistant_done_emitted = True
                             logger.info(
@@ -856,14 +857,8 @@ class ClaudeSendMixin(ClaudeStreamMixin, ClaudeUsageMixin, ClaudeResultMixin):
                             "Send cancelled via task.cancel: request_id=%s session=%s",
                             request_id, session_key,
                         )
-                        seq += 1
                         try:
-                            self._publish_event(
-                                request_id, session_key, seq,
-                                kind=AgentEventKind.ASSISTANT_DONE,
-                                text="".join(text_parts),
-                                model=actual_model,
-                            )
+                            _publish_partial("".join(text_parts))
                             assistant_done_emitted = True
                         except Exception:
                             logger.debug("Failed to publish ASSISTANT_DONE on cancel", exc_info=True)
@@ -879,15 +874,17 @@ class ClaudeSendMixin(ClaudeStreamMixin, ClaudeUsageMixin, ClaudeResultMixin):
                                 e, session_key,
                             )
                             aborted = True
-                            seq += 1
-                            self._publish_event(
-                                request_id, session_key, seq,
-                                kind=AgentEventKind.ASSISTANT_DONE,
-                                text="".join(text_parts),
-                                model=actual_model,
-                            )
+                            _publish_partial("".join(text_parts))
                             assistant_done_emitted = True
                             break
+
+                        interrupted_usage = self._compute_interrupted_usage(
+                            actual_model=actual_model,
+                            model=model,
+                            bot_context_window=bot_context_window,
+                            latest_assistant_usage=latest_assistant_usage,
+                            latest_stream_usage=latest_stream_usage,
+                        )
 
                         # 1) Direct-Claude auth failure with no model/tool side
                         #    effects → force-fetch the app broker and retry once.
@@ -985,6 +982,7 @@ class ClaudeSendMixin(ClaudeStreamMixin, ClaudeUsageMixin, ClaudeResultMixin):
                     request_id, session_key, seq,
                     kind=AgentEventKind.ERROR,
                     text=error_text,
+                    token_usage=interrupted_usage,
                     extra_raw=error_raw,
                 )
                 self._publisher.publish_run_done(request_id)

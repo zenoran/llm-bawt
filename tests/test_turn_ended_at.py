@@ -8,6 +8,7 @@ stamping behavior without needing a live Postgres engine.
 """
 
 from datetime import datetime, timedelta, timezone
+import json
 
 from sqlmodel import Session, SQLModel, create_engine, select
 
@@ -87,6 +88,36 @@ def test_update_turn_stamps_ended_at_from_created_at_plus_latency():
     assert row.status == "ok"
     assert row.end_reason == "stop"
     assert row.ended_at == _naive(created_at + timedelta(milliseconds=1250))
+
+
+def test_timeout_transition_persists_partial_token_usage():
+    store = _store()
+    with Session(store.engine) as session:
+        session.add(TurnLog(
+            id="turn-partial-usage",
+            bot_id="snark",
+            user_id="nick",
+            status="streaming",
+        ))
+        session.commit()
+
+    usage = {
+        "resident_tokens": 139613,
+        "resident_source": "interrupted_iteration_total_input",
+        "usage_status": "partial",
+    }
+    store.update_turn(
+        turn_id="turn-partial-usage",
+        status="timeout",
+        end_reason="error",
+        token_usage=usage,
+    )
+
+    row = _row(store, "turn-partial-usage")
+    assert row.status == "timeout"
+    assert row.end_reason == "error"
+    assert json.loads(row.token_usage_json) == usage
+    assert row.ended_at is not None
 
 
 def test_successful_late_completion_repairs_stale_timeout_ended_at():

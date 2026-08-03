@@ -37,7 +37,10 @@ def test_inter_bot_nonstream_turn_publishes_visible_lifecycle(monkeypatch) -> No
     service = BackgroundService.__new__(BackgroundService)
     service.config = SimpleNamespace(DEFAULT_BOT="nova", DEFAULT_USER="nick")
     service._inter_bot_dispatcher = SimpleNamespace(
-        store=SimpleNamespace(validate_claim=Mock(return_value=True))
+        store=SimpleNamespace(
+            validate_claim=Mock(return_value=True),
+            get=Mock(return_value=SimpleNamespace(sender_bot_id="snark")),
+        )
     )
     subscriber = SimpleNamespace(publish_tool_event=AsyncMock())
     service._redis_subscriber = subscriber
@@ -221,6 +224,29 @@ def test_finalize_turn_persists_non_streaming_agent_usage(monkeypatch) -> None:
     }
 
 
+def test_resolve_turn_usage_recovers_partial_backend_result(monkeypatch) -> None:
+    service = _build_service_for_finalize()
+
+    class FakeAgentBackendClient:
+        def get_token_usage(self):
+            return {
+                "resident_tokens": 139613,
+                "resident_source": "interrupted_iteration_total_input",
+                "usage_status": "partial",
+            }
+
+    from llm_bawt.service import turn_lifecycle as tl_module
+
+    monkeypatch.setattr(tl_module, "AgentBackendClient", FakeAgentBackendClient)
+    llm_bawt = SimpleNamespace(client=FakeAgentBackendClient())
+
+    assert service._resolve_turn_token_usage(llm_bawt, None) == {
+        "resident_tokens": 139613,
+        "resident_source": "interrupted_iteration_total_input",
+        "usage_status": "partial",
+    }
+
+
 def test_finalize_turn_prefers_explicit_streaming_usage(monkeypatch) -> None:
     service = _build_service_for_finalize()
 
@@ -335,6 +361,37 @@ def test_stream_persists_on_cancellation() -> None:
 
     assert cancelled is True
     assert full_response_holder[0] == "abc"
+
+
+def test_agent_client_keeps_partial_result_when_stream_raises() -> None:
+    from llm_bawt.clients.agent_backend_client import AgentBackendClient
+    from llm_bawt.models.message import Message
+
+    usage = {"resident_tokens": 50, "usage_status": "partial"}
+
+    class Backend:
+        def stream_raw(self, *_args, **_kwargs):
+            yield {"event": "token_usage", "token_usage": usage}
+            raise RuntimeError("interrupted")
+
+        def get_last_stream_result(self):
+            return SimpleNamespace(usage=usage)
+
+    client = AgentBackendClient.__new__(AgentBackendClient)
+    client._backend = Backend()
+    client._bot_config = {}
+    client.last_result = None
+
+    iterator = client.stream_raw([Message(role="user", content="hello")])
+    assert next(iterator)["token_usage"] == usage
+    try:
+        next(iterator)
+    except RuntimeError as exc:
+        assert str(exc) == "interrupted"
+    else:
+        raise AssertionError("stream should raise")
+
+    assert client.get_token_usage() == usage
 
 
 def test_stream_accumulates_only_str_chunks() -> None:

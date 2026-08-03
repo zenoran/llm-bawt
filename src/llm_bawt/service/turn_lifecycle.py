@@ -118,6 +118,19 @@ def _normalize_tool_call_details(tool_calls: list[dict] | None) -> list[dict]:
 
 
 class TurnLifecycleMixin:
+    @staticmethod
+    def _resolve_turn_token_usage(llm_bawt: Any, explicit_usage: dict | None) -> dict | None:
+        """Prefer streamed usage, then the agent backend's last partial/final result."""
+        if isinstance(explicit_usage, dict) and explicit_usage:
+            return explicit_usage
+        client = getattr(llm_bawt, "client", None)
+        get_token_usage = getattr(client, "get_token_usage", None)
+        if isinstance(client, AgentBackendClient) and callable(get_token_usage):
+            usage = get_token_usage()
+            if isinstance(usage, dict) and usage:
+                return usage
+        return None
+
     """Mixin providing turn persistence and generation lifecycle for BackgroundService."""
 
     # ---- Generation cancellation ----
@@ -214,6 +227,7 @@ class TurnLifecycleMixin:
         agent_session_key: str | None = None,
         agent_request_id: str | None = None,
         trigger_message_id: str | None = None,
+        assistant_message_id: str | None = None,
         parent_turn_id: str | None = None,
         request_extensions: dict | None = None,
     ) -> None:
@@ -242,6 +256,7 @@ class TurnLifecycleMixin:
                 agent_session_key=agent_session_key,
                 agent_request_id=agent_request_id,
                 trigger_message_id=trigger_message_id,
+                assistant_message_id=assistant_message_id,
                 parent_turn_id=parent_turn_id,
             )
         except Exception as e:
@@ -260,6 +275,7 @@ class TurnLifecycleMixin:
         prepared_messages: list | None = None,
         tool_calls: list[dict] | None = None,
         error_text: str | None = None,
+        assistant_message_id: str | None = None,
         agent_session_key: str | None = None,
         agent_request_id: str | None = None,
         animation: str | None = None,
@@ -281,6 +297,7 @@ class TurnLifecycleMixin:
                 request_payload=request_payload,
                 tool_calls=_normalize_tool_call_details(tool_calls) if tool_calls is not None else None,
                 error_text=error_text,
+                assistant_message_id=assistant_message_id,
                 agent_session_key=agent_session_key,
                 agent_request_id=agent_request_id,
                 animation=animation,
@@ -360,6 +377,7 @@ class TurnLifecycleMixin:
                 prepared_messages=prepared_messages,
                 response_text="",
                 tool_calls=tool_call_details,
+                assistant_message_id=assistant_message_id,
                 animation=animation,
                 token_usage=token_usage,
                 end_reason=end_reason or ("aborted" if status in {"cancelled", "aborted"} else "stop"),
@@ -379,10 +397,7 @@ class TurnLifecycleMixin:
                 )
                 response_text = cleaned
 
-        client = getattr(llm_bawt, "client", None)
-        get_token_usage = getattr(client, "get_token_usage", None)
-        if token_usage is None and isinstance(client, AgentBackendClient) and callable(get_token_usage):
-            token_usage = get_token_usage()
+        token_usage = self._resolve_turn_token_usage(llm_bawt, token_usage)
 
         extracted_tool_calls = self._extract_agent_backend_tool_calls(llm_bawt=llm_bawt)
         if extracted_tool_calls and not tool_call_details:
@@ -433,6 +448,7 @@ class TurnLifecycleMixin:
             prepared_messages=prepared_messages,
             response_text=response_text,
             tool_calls=tool_call_details,
+            assistant_message_id=assistant_message_id,
             animation=animation,
             token_usage=token_usage,
             end_reason=end_reason,

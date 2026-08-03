@@ -70,6 +70,7 @@ class TurnStreamWorker(TurnStreamPublishMixin):
         tts_scrubber = ctx.tts_scrubber
         turn_log_id = ctx.turn_log_id
         user_attachments = ctx.user_attachments
+        user_author = ctx.user_author
         user_id = ctx.user_id
         user_prompt = ctx.user_prompt
         self = ctx.svc
@@ -80,6 +81,9 @@ class TurnStreamWorker(TurnStreamPublishMixin):
                 return current_turn is not None and current_turn.status == "aborted"
             except Exception:
                 return False
+
+        def _usage_so_far() -> dict | None:
+            return self._resolve_turn_token_usage(llm_bawt, token_usage_holder[0])
 
         try:
             # Check if already cancelled before starting
@@ -181,6 +185,7 @@ class TurnStreamWorker(TurnStreamPublishMixin):
                 message_id=trigger_message_id,
                 attachments=attachments_to_persist or None,
                 context_suffix=agent_context_suffix,
+                author=user_author,
             )
 
             # TASK-215: the "AVATAR ANIMATION: You MUST call trigger_animation"
@@ -1064,6 +1069,7 @@ class TurnStreamWorker(TurnStreamPublishMixin):
                     latency_ms=elapsed_ms,
                     response_text=full_response_holder[0] or None,
                     error_text=str(e),
+                    token_usage=_usage_so_far(),
                 )
         finally:
             end_time = timing_holder[1] or time.time()
@@ -1147,6 +1153,7 @@ class TurnStreamWorker(TurnStreamPublishMixin):
                         status="timeout",
                         latency_ms=elapsed_ms,
                         tool_calls=tool_call_details_holder or None,
+                        token_usage=_usage_so_far(),
                     )
             except Exception as fin_err:
                 log.error("Finalization failed (turn %s): %s", turn_log_id, fin_err)
@@ -1157,6 +1164,7 @@ class TurnStreamWorker(TurnStreamPublishMixin):
                         latency_ms=elapsed_ms,
                         response_text=full_response_holder[0] or None,
                         error_text=f"finalize_error: {fin_err}",
+                        token_usage=_usage_so_far(),
                     )
                 except Exception:
                     pass
@@ -1269,7 +1277,7 @@ class TurnStreamWorker(TurnStreamPublishMixin):
                 "approval_id": approval_id,
                 "approval_persist_failed": approval_persist_failed,
                 "animation": animation_holder[0],
-                "token_usage": token_usage_holder[0],
+                "token_usage": _usage_so_far(),
                 "changed_files": changed_files,
                 "attachments": completed_attachments,
                 # Catalog alias for this turn (matches the persisted turn-log

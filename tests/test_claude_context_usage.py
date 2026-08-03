@@ -59,6 +59,48 @@ def test_proxy_iteration_usage_reports_total_resident_prompt():
     assert usage["cache_read_tokens"] == 9_728
 
 
+def test_interrupted_usage_preserves_latest_iteration_snapshot():
+    harness = _Harness()
+
+    usage = harness._compute_interrupted_usage(
+        actual_model="openai_chatgpt/gpt",
+        model="openai_chatgpt/gpt",
+        bot_context_window=372000,
+        latest_assistant_usage={
+            "input_tokens": 1885,
+            "cache_read_input_tokens": 137728,
+            "cache_creation_input_tokens": 0,
+            "output_tokens": 14479,
+        },
+        latest_stream_usage=None,
+    )
+
+    assert usage == {
+        "input_tokens": 1885,
+        "cache_read_tokens": 137728,
+        "cache_creation_tokens": 0,
+        "output_tokens": 14479,
+        "resident_tokens": 139613,
+        "resident_source": "interrupted_iteration_total_input",
+        "context_window": 372000,
+        "total_cost_usd": usage["total_cost_usd"],
+        "usage_status": "partial",
+    }
+    assert usage["total_cost_usd"] is None
+
+
+def test_interrupted_usage_without_provider_snapshot_stays_empty():
+    harness = _Harness()
+
+    assert harness._compute_interrupted_usage(
+        actual_model="openai_chatgpt/gpt",
+        model="openai_chatgpt/gpt",
+        bot_context_window=372000,
+        latest_assistant_usage=None,
+        latest_stream_usage=None,
+    ) is None
+
+
 def test_cumulative_only_usage_does_not_claim_resident_context():
     harness = _Harness()
     msg = SimpleNamespace(
@@ -86,6 +128,34 @@ def test_cumulative_only_usage_does_not_claim_resident_context():
 
     assert "resident_tokens" not in usage
     assert "resident_source" not in usage
+
+
+def test_interrupted_done_event_carries_partial_usage():
+    harness = _Harness()
+
+    seq, usage = harness._publish_interrupted_done(
+        request_id="req-interrupted",
+        session_key="snark:nick",
+        seq=7,
+        text="partial answer",
+        actual_model="openai_chatgpt/gpt",
+        model="openai_chatgpt/gpt",
+        bot_context_window=372000,
+        latest_assistant_usage={
+            "input_tokens": 10,
+            "cache_read_input_tokens": 90,
+            "output_tokens": 4,
+        },
+        latest_stream_usage=None,
+    )
+
+    assert seq == 8
+    event = harness.events[-1][3]
+    assert event["kind"] == AgentEventKind.ASSISTANT_DONE
+    assert event["text"] == "partial answer"
+    assert event["token_usage"] == usage
+    assert usage["resident_tokens"] == 100
+    assert usage["usage_status"] == "partial"
 
 
 def test_native_context_usage_overrides_resident_not_cost_accounting():

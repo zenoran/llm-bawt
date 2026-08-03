@@ -242,10 +242,15 @@ class AgentBackendClient(LLMClient):
                 # Builtins / C-extensions may not have a signature; pass it
                 # anyway and let the backend ignore unknown kwargs if it can.
                 backend_kwargs["trigger_message_id"] = trigger_message_id
-            for item in self._backend.stream_raw(prompt, config, **backend_kwargs):
-                yield item
-            if hasattr(self._backend, "get_last_stream_result"):
-                self.last_result = self._backend.get_last_stream_result()
+            try:
+                for item in self._backend.stream_raw(prompt, config, **backend_kwargs):
+                    yield item
+            finally:
+                # Interrupted/error streams still finalize a structured backend
+                # result with usage-so-far. Preserve it even when iteration raises
+                # before the normal post-loop assignment (TASK-304).
+                if hasattr(self._backend, "get_last_stream_result"):
+                    self.last_result = self._backend.get_last_stream_result()
             return
 
         response = self.query(messages, plaintext_output=True, **kwargs)

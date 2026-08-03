@@ -279,6 +279,62 @@ class TestTransport:
         assert {"event": "token_usage", "token_usage": usage} in streamed
         assert backend.get_last_stream_result().usage == usage
 
+    def test_agent_bridge_preserves_usage_from_terminal_error(self, monkeypatch):
+        from agent_bridge.events import AgentEvent, AgentEventKind
+        from llm_bawt.agent_backends import agent_bridge as module
+
+        usage = {
+            "input_tokens": 10,
+            "cache_read_tokens": 90,
+            "output_tokens": 4,
+            "usage_status": "partial",
+        }
+
+        class FakeRedisSubscriber:
+            def __init__(self, _url):
+                self._redis = SimpleNamespace(
+                    connection_pool=SimpleNamespace(
+                        connection_kwargs={"url": "redis://localhost:6379/0"}
+                    )
+                )
+
+            async def connect(self):
+                return None
+
+            async def send_command(self, **_kwargs):
+                return None
+
+            async def subscribe_run(self, *_args, **_kwargs):
+                yield AgentEvent(
+                    event_id="err", session_key="s", run_id="run",
+                    kind=AgentEventKind.ERROR, origin="system", text="boom",
+                    token_usage=usage,
+                )
+
+            async def close(self):
+                return None
+
+        root_subscriber = SimpleNamespace(
+            _redis=SimpleNamespace(
+                connection_pool=SimpleNamespace(
+                    connection_kwargs={"url": "redis://localhost:6379/0"}
+                )
+            )
+        )
+        monkeypatch.setattr(module, "get_agent_subscriber", lambda: root_subscriber)
+        monkeypatch.setattr(
+            "agent_bridge.subscriber.RedisSubscriber", FakeRedisSubscriber
+        )
+
+        backend = module.AgentBridgeBackend()
+        iterator = iter(backend.stream_raw(
+            "hello", {"bot_id": "test", "timeout_seconds": 1}
+        ))
+        assert next(iterator) == {"event": "token_usage", "token_usage": usage}
+        with pytest.raises(RuntimeError, match="boom"):
+            next(iterator)
+        assert backend.get_last_stream_result().usage == usage
+
     def test_agent_bridge_drains_file_changed_after_error(self, monkeypatch):
         from agent_bridge.events import AgentEvent, AgentEventKind
         from llm_bawt.agent_backends import agent_bridge as module
