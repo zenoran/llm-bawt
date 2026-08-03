@@ -59,7 +59,11 @@ class TestClaudeActiveRun:
         await run.steer("change direction")
 
         client.interrupt.assert_awaited_once_with()
-        client.query.assert_awaited_once_with("change direction")
+        replacement = client.query.await_args.args[0]
+        assert "[Mid-turn user interruption]" in replacement
+        assert "change direction" in replacement
+        assert "continue the unfinished task" in replacement
+        assert "explicitly asks you to stop" in replacement
         interrupted = MagicMock(subtype="error_during_execution")
         assert run.consume_replaced_result(interrupted) is True
         assert run.consume_replaced_result(interrupted) is False

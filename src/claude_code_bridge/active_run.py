@@ -29,13 +29,29 @@ class ClaudeActiveRun:
         if not text:
             raise ValueError("Steering message must not be empty")
 
+        # ``interrupt()`` terminates the SDK's current task; ``query()`` starts a
+        # replacement task on the same session. The session retains all prior
+        # context, but a bare status question ("how's it going?") naturally gets
+        # answered and then ends. Frame the replacement as an interruption of
+        # unfinished work so it resumes by default. Explicit stop/pause/abandon
+        # requests remain authoritative — the model must honor them instead.
+        replacement_prompt = (
+            "[Mid-turn user interruption]\n"
+            f"{text}\n\n"
+            "Respond to this interruption as needed, then continue the unfinished "
+            "task from the interrupted turn, incorporating the user's new direction. "
+            "Do not conclude the turn merely because this was a status question. "
+            "If the user explicitly asks you to stop, pause, abandon, or only report "
+            "status without continuing, honor that instruction instead."
+        )
+
         async with self._steer_lock:
             self._expected_interrupt_results += 1
             interrupted = False
             try:
                 await self.client.interrupt()
                 interrupted = True
-                await self.client.query(text)
+                await self.client.query(replacement_prompt)
             except BaseException:
                 # If the replacement query was not accepted, do not hide the
                 # interrupted result as though a continuation were coming. Once
