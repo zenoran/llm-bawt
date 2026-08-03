@@ -33,6 +33,9 @@ def _get_profile_detail(manager, entity_type_enum, entity_type: str, entity_id: 
         email=profile.email,
         display_name=profile.display_name,
         description=profile.description,
+        color=profile.color,
+        avatar=profile.avatar,
+        avatar_render=profile.avatar_render,
         summary=profile.summary,
         summary_updated_at=profile.summary_updated_at.isoformat() if profile.summary_updated_at else None,
         attributes=[attribute_to_response(attr) for attr in attributes],
@@ -279,6 +282,11 @@ def update_typed_profile(entity_type: str, entity_id: str, request: ProfileUpdat
 
         target_type = EntityType.USER if normalized_entity_type == "user" else EntityType.BOT
         manager = get_profile_manager(service.config)
+        avatar_render = None
+        if request.avatar is not None:
+            from ...media.avatar import resolve_avatar_render
+
+            avatar_render = resolve_avatar_render(request.avatar)
 
         profile = manager.update_profile(
             target_type,
@@ -287,6 +295,9 @@ def update_typed_profile(entity_type: str, entity_id: str, request: ProfileUpdat
             description=request.description,
             summary=request.summary,
             email=request.email,
+            color=request.color,
+            avatar=request.avatar,
+            avatar_render=avatar_render,
         )
 
         if not profile:
@@ -298,6 +309,9 @@ def update_typed_profile(entity_type: str, entity_id: str, request: ProfileUpdat
                 description=request.description,
                 summary=request.summary,
                 email=request.email,
+                color=request.color,
+                avatar=request.avatar,
+                avatar_render=avatar_render,
             )
 
         if not profile:

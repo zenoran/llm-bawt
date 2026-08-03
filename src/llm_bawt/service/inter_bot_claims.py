@@ -15,8 +15,10 @@ _CORRELATION_FIELDS = (
 )
 
 
-def validate_inter_bot_claim(service: Any, request: Any) -> None:
-    """Reject spoofed or stale durable-delivery authority on every chat path."""
+def validate_inter_bot_claim(service: Any, request: Any):
+    """Reject spoofed durable authority and return its trusted bot author."""
+    from ..message_authorship import AuthorReference
+
     delivery_id = getattr(request, "inter_bot_delivery_id", None)
     if delivery_id:
         dispatcher = getattr(service, "_inter_bot_dispatcher", None)
@@ -31,9 +33,13 @@ def validate_inter_bot_claim(service: Any, request: Any) -> None:
             ),
         ):
             raise ValueError("invalid or stale inter-bot delivery claim")
-        return
+        record = dispatcher.store.get(delivery_id)
+        if record is None:
+            raise ValueError("inter-bot delivery claim disappeared")
+        return AuthorReference.bot(record.sender_bot_id)
 
     if any(getattr(request, field, None) for field in _CORRELATION_FIELDS):
         raise ValueError(
             "inter-bot correlation fields require a valid delivery claim"
         )
+    return None

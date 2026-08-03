@@ -5,8 +5,8 @@ Each durable thread records backend-specific SDK identity and model metadata in
 binds either the user-selected thread or the active thread; the retired bot
 scalar is never read or written.
 
-Coverage includes resolver/model gates, Redis field parsing, explicit + active
-binding, first-turn thread creation, `/new` rotation/seed behavior, request-local
+Coverage includes model-agnostic resolution, Redis field parsing, explicit +
+active binding, first-turn thread creation, `/new` rotation/seed behavior, request-local
 wire plumbing, MCP adapter parity, and live-DB merge semantics.
 """
 
@@ -52,19 +52,21 @@ class TestResolveAgentSessionKey:
         meta = {"agent_session_keys": {"claude_code": "byte:nick"}}
         assert resolve_agent_session_key(meta, "claude-code") is None
 
-    def test_model_change_gate_blocks(self):
+    def test_claude_model_metadata_does_not_block_resume(self):
         meta = {
             "agent_session_keys": {"claude_code": "sid-1"},
             "agent_session_key_models": {"claude_code": "model-a"},
         }
-        assert resolve_agent_session_key(meta, "claude-code", "model-b") is None
+        assert (
+            resolve_agent_session_key(meta, "claude-code", "model-b") == "sid-1"
+        )
 
-    def test_model_match_passes(self):
+    def test_other_backend_model_mismatch_still_blocks_resume(self):
         meta = {
-            "agent_session_keys": {"claude_code": "sid-1"},
-            "agent_session_key_models": {"claude_code": "model-a"},
+            "agent_session_keys": {"codex": "sid-cx"},
+            "agent_session_key_models": {"codex": "codex-model"},
         }
-        assert resolve_agent_session_key(meta, "claude-code", "model-a") == "sid-1"
+        assert resolve_agent_session_key(meta, "codex", "other-model") is None
 
     def test_legacy_model_scalar_only_applies_to_matching_provider(self):
         meta = {
@@ -285,17 +287,20 @@ class TestBindAgentThread:
         out = _Bridge()._bind_agent_thread(lb, SimpleNamespace(session_id="t-1"))
         assert out == {"thread_session_id": "t-1", "explicit_thread": True}
 
-    def test_model_mismatch_forces_cold_start(self):
+    def test_model_mismatch_resumes_same_transcript(self):
         row = {
             "session_metadata": {
                 "agent_session_keys": {"claude_code": "sid-42"},
-                "provider": "claude-code",
-                "provider_session_model": "old-model",
+                "agent_session_key_models": {"claude_code": "old-model"},
             }
         }
         lb = _fake_llm_bawt(bot_config={"model": "new-model"}, session_row=row)
         out = _Bridge()._bind_agent_thread(lb, SimpleNamespace(session_id="t-1"))
-        assert out == {"thread_session_id": "t-1", "explicit_thread": True}
+        assert out == {
+            "thread_session_id": "t-1",
+            "thread_resume_id": "sid-42",
+            "explicit_thread": True,
+        }
 
     def test_binding_is_request_local_not_instance_state(self):
         # Gavel review finding 1: the binding must never be written to the

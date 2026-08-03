@@ -395,6 +395,8 @@ async def add_message(
     attachments: list[dict] | None = None,
     reasoning: str | None = None,
     user_id: str | None = None,
+    author_entity_type: str | None = None,
+    author_entity_id: str | None = None,
 ) -> dict:
     """Add a message to conversation history.
 
@@ -426,6 +428,8 @@ async def add_message(
         attachments=attachments,
         reasoning=reasoning,
         user_id=user_id,
+        author_entity_type=author_entity_type,
+        author_entity_id=author_entity_id,
     )
     return message.to_dict()
 

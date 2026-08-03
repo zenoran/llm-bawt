@@ -58,6 +58,7 @@ class TurnStreamContext:
     tts_scrubber: Any
     turn_log_id: Any
     user_attachments: Any
+    user_author: Any
     user_id: Any
     user_prompt: Any
     # TASK-252: request-local explicit-thread SDK binding

@@ -144,6 +144,7 @@ async def steer_active_turn(
     request: ChatSteerRequest,
     *,
     steer_request_id: str | None = None,
+    author=None,
 ) -> ChatSteerResponse:
     """Shared steer implementation for public chat and durable inter-bot work."""
     turn = service._turn_log_store.get_turn(request.turn_id)
@@ -228,6 +229,10 @@ async def steer_active_turn(
             session_id,
             None,
             request.message_id,
+            None,
+            None,
+            (author.entity_type if author else None),
+            (author.entity_id if author else None),
         )
         persisted = True
     except Exception:

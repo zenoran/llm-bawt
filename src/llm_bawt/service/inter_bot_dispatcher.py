@@ -165,6 +165,8 @@ class InterBotDeliveryDispatcher:
             name=f"inter-bot-steer-heartbeat:{record.id}",
         )
         try:
+            from ..message_authorship import AuthorReference
+
             response = await steer_active_turn(
                 self.service,
                 ChatSteerRequest(
@@ -177,6 +179,7 @@ class InterBotDeliveryDispatcher:
                 steer_request_id=(
                     f"steer_delivery_{record.id.removeprefix('delivery-')}"
                 ),
+                author=AuthorReference.bot(record.sender_bot_id),
             )
             if response.ok:
                 self.store.mark_transport_accepted(record.id, claim_token)

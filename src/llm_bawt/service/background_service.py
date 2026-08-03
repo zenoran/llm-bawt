@@ -224,7 +224,7 @@ class BackgroundService(
         3. Runs blocking LLM calls in a thread pool
         4. Stores messages and extracts memories for future use
         """
-        validate_inter_bot_claim(self, request)
+        inter_bot_author = validate_inter_bot_claim(self, request)
 
         # Create request context for logging
         if request.client_system_context is not None:
@@ -246,6 +246,8 @@ class BackgroundService(
 
         bot_id = request.bot_id or self._default_bot
         user_id = request.user or self.config.DEFAULT_USER
+        from ..message_authorship import AuthorReference
+        user_author = inter_bot_author or AuthorReference.user(user_id)
         local_mode = not request.augment_memory
 
         # Resolve model using shared bot/config logic
@@ -359,6 +361,7 @@ class BackgroundService(
             prepared_messages=[],
             response_text="",
             trigger_message_id=trigger_message_id,
+            assistant_message_id=assistant_message_id,
             request_extensions={
                 key: value
                 for key, value in {
@@ -374,6 +377,12 @@ class BackgroundService(
         )
 
         if publish_nonstream_lifecycle:
+            from ..entity_presentation import EntityPresentationResolver
+
+            assistant_author = AuthorReference.bot(bot_id)
+            author_presentations = EntityPresentationResolver(
+                self._turn_log_store.engine
+            ).resolve_many_safe([user_author, assistant_author])
             await self._publish_nonstream_turn_event(
                 bot_id=bot_id,
                 user_id=user_id,
@@ -386,6 +395,12 @@ class BackgroundService(
                     "user_id": user_id,
                     "role": "user",
                     "content": user_prompt,
+                    "author": author_presentations[
+                        (user_author.entity_type, user_author.entity_id)
+                    ],
+                    "assistant_author": author_presentations[
+                        (assistant_author.entity_type, assistant_author.entity_id)
+                    ],
                     "attachments": [],
                     "ts": time.time(),
                 },
@@ -503,7 +518,11 @@ class BackgroundService(
                         thread_binding = self._resolve_active_thread_binding(llm_bawt)
 
                 # Prepare messages with history and memory context
-                prepared_messages = llm_bawt.prepare_messages_for_query(user_prompt, message_id=trigger_message_id)
+                prepared_messages = llm_bawt.prepare_messages_for_query(
+                    user_prompt,
+                    message_id=trigger_message_id,
+                    author=user_author,
+                )
 
                 # Log what we're sending to the LLM (verbose mode)
                 log.llm_context(prepared_messages)

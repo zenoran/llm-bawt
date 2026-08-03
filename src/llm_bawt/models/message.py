@@ -26,6 +26,8 @@ class Message:
         # through hydration so the read path can scope context to one thread.
         # Internal metadata only — deliberately NOT emitted by to_api_format().
         session_id: str | None = None,
+        author_entity_type: str | None = None,
+        author_entity_id: str | None = None,
     ):
         self.role = role
         self.content = content if content is not None else ""
@@ -35,6 +37,8 @@ class Message:
         self.db_id = db_id  # Primary key from the database (when loaded from PostgreSQL)
         self.content_parts = content_parts  # Extra multimodal parts (image_url, etc.)
         self.session_id = session_id  # TASK-284 durable thread id (internal only)
+        self.author_entity_type = author_entity_type
+        self.author_entity_id = author_entity_id
 
     @classmethod
     def from_dict(cls, data: dict) -> 'Message':
@@ -46,7 +50,12 @@ class Message:
         tool_call_id = data.get("tool_call_id")
         db_id = data.get("db_id")
         session_id = data.get("session_id")
-        return cls(role, content, timestamp, tool_calls, tool_call_id, db_id=db_id, session_id=session_id)
+        return cls(
+            role, content, timestamp, tool_calls, tool_call_id, db_id=db_id,
+            session_id=session_id,
+            author_entity_type=data.get("author_entity_type"),
+            author_entity_id=data.get("author_entity_id"),
+        )
 
     @staticmethod
     def _extract_content(data: dict) -> str:
@@ -67,6 +76,10 @@ class Message:
             d["db_id"] = self.db_id
         if self.session_id:
             d["session_id"] = self.session_id
+        if self.author_entity_type:
+            d["author_entity_type"] = self.author_entity_type
+        if self.author_entity_id:
+            d["author_entity_id"] = self.author_entity_id
         return d
 
     def to_api_format(self) -> dict:

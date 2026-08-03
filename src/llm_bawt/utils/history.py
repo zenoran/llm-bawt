@@ -754,7 +754,7 @@ class HistoryManager:
                 return [Message(role="system", content=self.config.SYSTEM_MESSAGE)]
 
     def add_message(self, role, content, message_id=None, attachments=None,
-                    reasoning=None, session_id=None):
+                    reasoning=None, session_id=None, author=None):
         """Append a message to history and save.
 
         If ``message_id`` is provided, it is used as the persistent ID so
@@ -790,6 +790,8 @@ class HistoryManager:
             # continuous default path; a scoped write against such a backend
             # fails loudly instead of silently landing on the wrong thread.
             _extra = {"session_id": session_id} if session_id else {}
+            if author is not None:
+                _extra["author"] = author
             persisted_id = self._db_backend.add_message(
                 role, content, message.timestamp,
                 message_id=provided_id,

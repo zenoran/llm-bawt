@@ -20,6 +20,7 @@ from typing import Any, TYPE_CHECKING
 
 from llm_bawt.memory.postgresql import PostgreSQLMemoryBackend
 from llm_bawt.memory.embeddings import generate_embedding
+from llm_bawt.message_authorship import AuthorReference, normalize_author
 from llm_bawt.utils.config import Config
 
 if TYPE_CHECKING:
@@ -69,6 +70,7 @@ class Message:
     content: str
     timestamp: float
     session_id: str | None = None
+    author: AuthorReference | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -77,6 +79,7 @@ class Message:
             "content": self.content,
             "timestamp": self.timestamp,
             "session_id": self.session_id,
+            "author": self.author.to_dict() if self.author else None,
         }
 
 
@@ -114,6 +117,31 @@ class MemoryStorage:
         Used by MemoryClient for raw backend access.
         """
         return self._get_backend(bot_id)
+
+    def hydrate_message_authors(
+        self,
+        messages: list[dict[str, Any]],
+        *,
+        bot_id: str,
+    ) -> list[dict[str, Any]]:
+        """Attach canonical, deterministic-legacy, or unknown author envelopes."""
+        from llm_bawt.message_authorship import LegacyAuthorResolver
+
+        backend = self._get_backend(bot_id)
+        authors = LegacyAuthorResolver(backend.engine).resolve(messages, bot_id=bot_id)
+        references = [authors[str(message.get("id") or "")] for message in messages]
+        from llm_bawt.entity_presentation import EntityPresentationResolver
+
+        presentation = EntityPresentationResolver(backend.engine).resolve_many_safe(
+            references
+        )
+        return [
+            {
+                **message,
+                "author": presentation[(author.entity_type, author.entity_id)],
+            }
+            for message, author in zip(messages, references, strict=True)
+        ]
 
     def get_short_term_manager(self, bot_id: str) -> "PostgreSQLShortTermManager":
         """Get a short-term memory manager for conversation history.
@@ -346,6 +374,8 @@ class MemoryStorage:
         attachments: list[dict] | None = None,
         reasoning: str | None = None,
         user_id: str | None = None,
+        author_entity_type: str | None = None,
+        author_entity_id: str | None = None,
     ) -> Message:
         """Add a message to conversation history.
 
@@ -367,6 +397,7 @@ class MemoryStorage:
         provided = (str(message_id).strip() if message_id else "") or None
         message_id_final = provided or str(uuid.uuid4())
         ts = timestamp if timestamp is not None else time.time()
+        author = normalize_author(author_entity_type, author_entity_id)
 
         # TASK-284: stamp the live thread's session_id on every insert. Resolve
         # from the sessions table (DB-derived source of truth) so all workers /
@@ -392,6 +423,7 @@ class MemoryStorage:
             session_id=session_id,
             attachments=attachments,
             reasoning=reasoning,
+            author=author,
         )
 
         # TASK-256: cheap auto-title from the first user message on a thread
@@ -410,6 +442,7 @@ class MemoryStorage:
             content=content,
             timestamp=ts,
             session_id=session_id,
+            author=author,
         )
 
     async def get_recent_messages(
@@ -529,7 +562,19 @@ class MemoryStorage:
         before: int = 0, after: int = 0,
     ) -> dict | None:
         backend = self._get_backend(bot_id)
-        return backend.get_message_by_id(message_id, before=before, after=after)
+        result = backend.get_message_by_id(message_id, before=before, after=after)
+        if result is None:
+            return None
+        if "message" in result:
+            combined = [*result.get("before", []), result["message"], *result.get("after", [])]
+            hydrated = self.hydrate_message_authors(combined, bot_id=bot_id)
+            offset = len(result.get("before", []))
+            return {
+                "before": hydrated[:offset],
+                "message": hydrated[offset],
+                "after": hydrated[offset + 1 :],
+            }
+        return self.hydrate_message_authors([result], bot_id=bot_id)[0]
 
     async def ignore_message_by_id(self, bot_id: str = "default", message_id: str = "") -> bool:
         backend = self._get_backend(bot_id)
@@ -715,7 +760,7 @@ class MemoryStorage:
             if limit is not None and limit >= 0:
                 messages = messages[-limit:]
 
-            return [
+            rows = [
                 {
                     "id": msg.db_id,
                     "role": msg.role,
@@ -724,9 +769,12 @@ class MemoryStorage:
                     # TASK-284: preserve the durable thread id instead of dropping
                     # it — getattr keeps this safe for any Message-like without it.
                     "session_id": getattr(msg, "session_id", None),
+                    "author_entity_type": getattr(msg, "author_entity_type", None),
+                    "author_entity_id": getattr(msg, "author_entity_id", None),
                 }
                 for msg in messages
             ]
+            return self.hydrate_message_authors(rows, bot_id=bot_id)
         except Exception as e:
             logger.error("Failed to get messages: %s", e)
             return []
@@ -770,7 +818,8 @@ class MemoryStorage:
             clauses.append("timestamp >= :cutoff")
         where = " AND ".join(clauses)
         sql = f"""
-            SELECT id, role, content, timestamp, session_id
+            SELECT id, role, content, timestamp, session_id,
+                   author_entity_type, author_entity_id
             FROM {backend._messages_table_name}
             WHERE {where}
             ORDER BY timestamp ASC
@@ -785,12 +834,14 @@ class MemoryStorage:
                     "content": r.content,
                     "timestamp": r.timestamp,
                     "session_id": r.session_id,
+                    "author_entity_type": r.author_entity_type,
+                    "author_entity_id": r.author_entity_id,
                 }
                 for r in rows
             ]
             if limit is not None and limit >= 0:
                 out = out[-limit:]
-            return out
+            return self.hydrate_message_authors(out, bot_id=bot_id)
         except Exception as e:
             logger.error("Failed to get raw messages: %s", e)
             return []
@@ -811,7 +862,8 @@ class MemoryStorage:
 
         backend = self._get_backend(bot_id)
         sql = f"""
-            SELECT id, role, content, timestamp, session_id
+            SELECT id, role, content, timestamp, session_id,
+                   author_entity_type, author_entity_id
             FROM {backend._messages_table_name}
             WHERE role = 'summary'
             ORDER BY timestamp ASC
@@ -826,12 +878,14 @@ class MemoryStorage:
                     "content": r.content,
                     "timestamp": r.timestamp,
                     "session_id": r.session_id,
+                    "author_entity_type": r.author_entity_type,
+                    "author_entity_id": r.author_entity_id,
                 }
                 for r in rows
             ]
             if limit is not None and limit >= 0:
                 out = out[-limit:]
-            return out
+            return self.hydrate_message_authors(out, bot_id=bot_id)
         except Exception as e:
             logger.error("Failed to get summary husks: %s", e)
             return []
@@ -1266,7 +1320,8 @@ class MemoryStorage:
         # count them — fine for tens of thousands, watch if we ever hit
         # very common short tokens.
         full_sql = text(f"""
-            SELECT id, role, content, timestamp,
+            SELECT id, role, content, timestamp, session_id,
+                   author_entity_type, author_entity_id,
                    bot_id AS source,
                    ts_rank(to_tsvector('english', content),
                            to_tsquery('english', :query)) AS rank,
@@ -1293,18 +1348,33 @@ class MemoryStorage:
         try:
             with backend.engine.connect() as conn:
                 rows = conn.execute(full_sql, params).fetchall()
-                return [
-                    {
+                grouped: dict[str, list[dict[str, Any]]] = {}
+                order: dict[tuple[str, str], int] = {}
+                for index, row in enumerate(rows):
+                    source = str(row.source)
+                    message_id = str(row.id)
+                    order[(source, message_id)] = index
+                    grouped.setdefault(source, []).append({
                         "id": row.id,
                         "role": row.role,
                         "content": row.content,
                         "timestamp": row.timestamp,
+                        "session_id": row.session_id,
+                        "author_entity_type": row.author_entity_type,
+                        "author_entity_id": row.author_entity_id,
                         "source": row.source,
                         "rank": row.rank,
                         "total": int(row.total),
-                    }
-                    for row in rows
-                ]
+                    })
+                hydrated: list[dict[str, Any]] = []
+                for source, source_rows in grouped.items():
+                    hydrated.extend(
+                        self.hydrate_message_authors(source_rows, bot_id=source)
+                    )
+                hydrated.sort(
+                    key=lambda row: order[(str(row["source"]), str(row["id"]))]
+                )
+                return hydrated
         except Exception as e:
             logger.error("search_all_messages failed: %s", e)
             return []
@@ -1381,7 +1451,8 @@ class MemoryStorage:
         # similarity() only runs on rows that survived the ILIKE filter.
         # Window COUNT(*) for the unbounded total — see the FTS sibling.
         full_sql = text(f"""
-            SELECT id, role, content, timestamp,
+            SELECT id, role, content, timestamp, session_id,
+                   author_entity_type, author_entity_id,
                    bot_id AS source,
                    similarity(content, :query) AS rank,
                    COUNT(*) OVER () AS total
@@ -1407,18 +1478,33 @@ class MemoryStorage:
         try:
             with backend.engine.connect() as conn:
                 rows = conn.execute(full_sql, params).fetchall()
-                return [
-                    {
+                grouped: dict[str, list[dict[str, Any]]] = {}
+                order: dict[tuple[str, str], int] = {}
+                for index, row in enumerate(rows):
+                    source = str(row.source)
+                    message_id = str(row.id)
+                    order[(source, message_id)] = index
+                    grouped.setdefault(source, []).append({
                         "id": row.id,
                         "role": row.role,
                         "content": row.content,
                         "timestamp": row.timestamp,
+                        "session_id": row.session_id,
+                        "author_entity_type": row.author_entity_type,
+                        "author_entity_id": row.author_entity_id,
                         "source": row.source,
                         "rank": row.rank,
                         "total": int(row.total),
-                    }
-                    for row in rows
-                ]
+                    })
+                hydrated: list[dict[str, Any]] = []
+                for source, source_rows in grouped.items():
+                    hydrated.extend(
+                        self.hydrate_message_authors(source_rows, bot_id=source)
+                    )
+                hydrated.sort(
+                    key=lambda row: order[(str(row["source"]), str(row["id"]))]
+                )
+                return hydrated
         except Exception as e:
             logger.error("search_all_messages_trgm failed: %s", e)
             return []

@@ -453,6 +453,7 @@ class ServiceLLMBawt(BaseLLMBawt):
         message_id: str | None = None,
         attachments: list[dict] | None = None,
         context_suffix: str | None = None,
+        author=None,
     ) -> list[Message]:
         """Prepare messages for query including history and memory context.
 
@@ -502,7 +503,7 @@ class ServiceLLMBawt(BaseLLMBawt):
         # Add user message to history first (with optional attachment refs).
         self.history_manager.add_message(
             "user", prompt, message_id=message_id, attachments=attachments,
-            session_id=_thread_override,
+            session_id=_thread_override, author=author,
         )
 
         # Build context with system prompt, memory, and history. context_suffix
@@ -684,10 +685,13 @@ class ServiceLLMBawt(BaseLLMBawt):
             )
 
         if response:
+            from ..message_authorship import AuthorReference
+
             self.history_manager.add_message(
                 "assistant", response, message_id=message_id,
                 attachments=attachments, reasoning=reasoning,
                 session_id=_thread_override,
+                author=AuthorReference.bot(self.bot_id),
             )
     
     def refine_prompt(self, prompt: str, history: list | None = None) -> str:

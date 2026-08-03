@@ -382,6 +382,7 @@ class TurnLogListItem(BaseModel):
     agent_session_key: str | None = None
     agent_request_id: str | None = None
     trigger_message_id: str | None = None
+    assistant_message_id: str | None = None
     # Per-turn token accounting from the upstream SDK (claude_code, etc.).
     # Shape: {input_tokens, cache_read_tokens, cache_creation_tokens,
     #         output_tokens, context_window, max_output_tokens, total_cost_usd}.
@@ -667,6 +668,9 @@ class ProfileDetail(BaseModel):
     email: str | None = None
     display_name: str | None = None
     description: str | None = None
+    color: str | None = None
+    avatar: str | None = None
+    avatar_render: str | None = None
     summary: str | None = None
     summary_updated_at: str | None = None
     attributes: list[UserProfileAttribute] = []
@@ -679,6 +683,8 @@ class ProfileUpdateRequest(BaseModel):
     description: str | None = None
     summary: str | None = None
     email: str | None = None
+    color: str | None = None
+    avatar: str | None = None
 
 
 class ProfileListResponse(BaseModel):

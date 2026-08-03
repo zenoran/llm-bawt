@@ -47,6 +47,16 @@ from sqlalchemy.orm import Session
 from sqlalchemy.exc import IntegrityError
 
 from .base import MemoryBackend
+from ..message_authorship import AuthorReference
+from .message_store import (
+    FORGOTTEN_PARENT,
+    MESSAGES_PARENT,
+    MessageRowStore,
+    ensure_message_parent_tables,
+    get_forgotten_message_table,
+    get_message_table,
+    message_parent_indexes,
+)
 from ..utils.schema import SchemaBootstrapGuard
 
 if TYPE_CHECKING:
@@ -70,11 +80,9 @@ def _sanitize_table_name(bot_id: str) -> str:
 # Partitioned parent tables (TASK-571)
 # ---------------------------------------------------------------------------
 
-# Parent table names. Every bot's data lives in a LIST partition of these.
-MESSAGES_PARENT = "messages"
+# Parent table names. Message parents are owned by message_store and re-exported
+# here for compatibility with existing migrations/routes.
 MEMORIES_PARENT = "memories"
-FORGOTTEN_PARENT = "forgotten_messages"
-
 PARENT_TABLES = (MESSAGES_PARENT, MEMORIES_PARENT, FORGOTTEN_PARENT)
 
 
@@ -109,39 +117,7 @@ def ensure_parent_tables(conn, embedding_dim: int = 384) -> None:
     """
     global _hnsw_parent_unsupported
 
-    messages_sql = text(f"""
-        CREATE TABLE IF NOT EXISTS {MESSAGES_PARENT} (
-            bot_id VARCHAR(64) NOT NULL,
-            id VARCHAR(36) NOT NULL,
-            role VARCHAR(20) NOT NULL,
-            content TEXT NOT NULL,
-            timestamp DOUBLE PRECISION NOT NULL,
-            session_id VARCHAR(36),
-            processed BOOLEAN DEFAULT FALSE,
-            summarized BOOLEAN DEFAULT FALSE,
-            summary_metadata JSONB,
-            recalled_history BOOLEAN DEFAULT FALSE,
-            attachments JSONB NOT NULL DEFAULT '[]'::jsonb,
-            reasoning TEXT,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            PRIMARY KEY (bot_id, id)
-        ) PARTITION BY LIST (bot_id)
-    """)
-
-    forgotten_sql = text(f"""
-        CREATE TABLE IF NOT EXISTS {FORGOTTEN_PARENT} (
-            bot_id VARCHAR(64) NOT NULL,
-            id VARCHAR(36) NOT NULL,
-            role VARCHAR(20) NOT NULL,
-            content TEXT NOT NULL,
-            timestamp DOUBLE PRECISION NOT NULL,
-            session_id VARCHAR(36),
-            processed BOOLEAN DEFAULT FALSE,
-            created_at TIMESTAMP,
-            forgotten_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            PRIMARY KEY (bot_id, id)
-        ) PARTITION BY LIST (bot_id)
-    """)
+    ensure_message_parent_tables(conn)
 
     memories_sql = text(f"""
         CREATE TABLE IF NOT EXISTS {MEMORIES_PARENT} (
@@ -166,21 +142,11 @@ def ensure_parent_tables(conn, embedding_dim: int = 384) -> None:
         ) PARTITION BY LIST (bot_id)
     """)
 
-    conn.execute(messages_sql)
-    conn.execute(forgotten_sql)
     conn.execute(memories_sql)
 
     # Parent-level btree/gin indexes — template to every partition.
     parent_indexes = [
-        f"CREATE INDEX IF NOT EXISTS idx_{MESSAGES_PARENT}_timestamp ON {MESSAGES_PARENT}(timestamp)",
-        # TASK-252: composite — serves both equality-only session lookups and
-        # the ordered scoped-transcript read (no sort node). Replaces the old
-        # single-column idx_messages_session (dropped live 2026-07-22).
-        f"CREATE INDEX IF NOT EXISTS idx_{MESSAGES_PARENT}_session_ts ON {MESSAGES_PARENT}(session_id, timestamp DESC)",
-        f"CREATE INDEX IF NOT EXISTS idx_{MESSAGES_PARENT}_processed ON {MESSAGES_PARENT}(processed)",
-        # GIN trigram index on message content — backs the Spotlight
-        # substring/fuzzy mode (search_all_messages_trgm / ILIKE '%..%').
-        f"CREATE INDEX IF NOT EXISTS {MESSAGES_PARENT}_content_trgm_idx ON {MESSAGES_PARENT} USING gin (content gin_trgm_ops)",
+        *message_parent_indexes(),
         f"CREATE INDEX IF NOT EXISTS idx_{MEMORIES_PARENT}_importance ON {MEMORIES_PARENT}(importance)",
         f"CREATE INDEX IF NOT EXISTS idx_{MEMORIES_PARENT}_accessed ON {MEMORIES_PARENT}(last_accessed)",
         f"CREATE INDEX IF NOT EXISTS idx_{MEMORIES_PARENT}_tags_gin ON {MEMORIES_PARENT} USING gin (tags)",
@@ -322,9 +288,9 @@ def build_fts_query(query: str) -> str | None:
 # Shared metadata for table definitions
 metadata = MetaData()
 
-# Cache for table objects
+# Cache for non-message table objects. Message table caches live in
+# message_store alongside their definitions.
 _memory_table_cache: dict[str, Table] = {}
-_message_table_cache: dict[str, Table] = {}
 
 # Shared sessions table (not per-bot — sessions are first-class entities,
 # scoped by bot_id column rather than a separate table per bot).
@@ -357,79 +323,21 @@ sessions_table = Table(
 
 
 def get_message_table_pg(bot_id: str) -> Table:
-    """Get or create a message Table for a specific bot (PostgreSQL version).
-
-    Points at the bot's PARTITION of the ``messages`` parent (TASK-571).
-    The Table object deliberately omits ``bot_id`` — the partition's column
-    DEFAULT fills it on insert, and partition-direct reads don't need it.
-    """
-    table_name = partition_name(MESSAGES_PARENT, bot_id)
-
-    if table_name in _message_table_cache:
-        return _message_table_cache[table_name]
-
-    table = Table(
-        table_name,
+    """Compatibility wrapper for one bot's canonical message partition."""
+    return get_message_table(
         metadata,
-        Column("id", String(36), primary_key=True),  # UUID
-        Column("role", String(20), nullable=False),
-        Column("content", Text, nullable=False),
-        Column("timestamp", Float, nullable=False),
-        Column("session_id", String(36), nullable=True),  # For grouping conversations
-        Column("processed", Boolean, default=False),  # Whether memory extraction has run
-        Column("summarized", Boolean, default=False),  # Whether this message is included in a summary
-        Column("recalled_history", Boolean, default=False),  # Whether this message was re-inserted via recall tool
-        Column("summary_metadata", JSON, nullable=True),  # For role='summary' rows only
-        # TASK-222: chat-message image attachments.
-        # JSONB array of {"asset_id": "ma_...", "kind": "image"} refs. The
-        # actual blobs + metadata live in the `media_assets` table — kept
-        # tiny here so history renders don't fan out per-row by default.
-        Column("attachments", JSON, nullable=False, server_default=text("'[]'::jsonb"), default=list),
-        # TASK-301: persisted model reasoning ("thinking") for assistant rows.
-        # Display-only — NEVER read back into LLM context (kept out of the
-        # canonical get_messages path; the /v1/history route hydrates it by id).
-        Column("reasoning", Text, nullable=True),
-        Column("created_at", DateTime, default=_utcnow),
-        extend_existing=True
+        partition_name(MESSAGES_PARENT, bot_id),
+        _utcnow,
     )
-
-    _message_table_cache[table_name] = table
-    return table
-
-
-# Cache for forgotten message tables
-_forgotten_table_cache: dict[str, Table] = {}
 
 
 def get_forgotten_table_pg(bot_id: str) -> Table:
-    """Get or create a forgotten messages Table for a specific bot (PostgreSQL version).
-    
-    This table stores messages that have been 'forgotten' (soft-deleted).
-    They can be restored later if needed.
-
-    Points at the bot's PARTITION of ``forgotten_messages`` (TASK-571).
-    """
-    table_name = partition_name(FORGOTTEN_PARENT, bot_id)
-    
-    if table_name in _forgotten_table_cache:
-        return _forgotten_table_cache[table_name]
-    
-    table = Table(
-        table_name,
+    """Compatibility wrapper for one bot's forgotten message partition."""
+    return get_forgotten_message_table(
         metadata,
-        Column("id", String(36), primary_key=True),  # UUID
-        Column("role", String(20), nullable=False),
-        Column("content", Text, nullable=False),
-        Column("timestamp", Float, nullable=False),
-        Column("session_id", String(36), nullable=True),
-        Column("processed", Boolean, default=False),
-        Column("created_at", DateTime, default=_utcnow),
-        Column("forgotten_at", DateTime, default=_utcnow),  # When it was forgotten
-        extend_existing=True
+        partition_name(FORGOTTEN_PARENT, bot_id),
+        _utcnow,
     )
-    
-    _forgotten_table_cache[table_name] = table
-    return table
 
 
 def get_memory_table_pg(bot_id: str) -> Table:
@@ -527,6 +435,11 @@ class PostgreSQLMemoryBackend(MemoryBackend):
             raise RuntimeError(
                 "PostgreSQLMemoryBackend requires Postgres credentials"
             )
+        self._message_rows = MessageRowStore(
+            self.engine,
+            self.messages_table,
+            self._messages_table_name,
+        )
 
         self._ensure_tables_exist()
         logger.debug(f"Connected to PostgreSQL at {host}:{port}/{database} (bot: {bot_id})")
@@ -633,70 +546,19 @@ class PostgreSQLMemoryBackend(MemoryBackend):
         session_id: str | None = None,
         attachments: list[dict] | None = None,
         reasoning: str | None = None,
+        author: AuthorReference | None = None,
     ) -> None:
-        """Add a message to permanent storage.
-
-        Messages are NEVER deleted - they form the complete conversation history.
-
-        ``attachments`` (TASK-222): optional tiny JSONB payload written to the
-        ``attachments`` column — a list of ``{"asset_id": "ma_...", "kind":
-        "image"}`` refs. ``None`` is treated as the column default ``[]``.
-        Updates to existing rows leave the column untouched when ``attachments``
-        is ``None`` (don't clobber prior refs on a re-upsert).
-        """
-        if not content or content.isspace():
-            logger.warning(f"Skipping empty content for message ID: {message_id}")
-            return
-
-        with Session(self.engine) as session:
-            try:
-                # Check if exists (upsert)
-                stmt = select(self.messages_table).where(
-                    self.messages_table.c.id == message_id
-                )
-                existing = session.execute(stmt).first()
-
-                if existing:
-                    values: dict = {"content": content, "timestamp": timestamp}
-                    if attachments is not None:
-                        values["attachments"] = attachments
-                    if reasoning is not None:
-                        values["reasoning"] = reasoning
-                    stmt = (
-                        update(self.messages_table)
-                        .where(self.messages_table.c.id == message_id)
-                        .values(**values)
-                    )
-                    session.execute(stmt)
-                else:
-                    stmt = insert(self.messages_table).values(
-                        id=message_id,
-                        role=role,
-                        content=content,
-                        timestamp=timestamp,
-                        session_id=session_id,
-                        attachments=attachments if attachments is not None else [],
-                        reasoning=reasoning,
-                        processed=False,
-                        created_at=datetime.now(timezone.utc),
-                    )
-                    session.execute(stmt)
-
-                session.commit()
-                logger.debug(f"Added message {message_id} to {self._messages_table_name}")
-            except Exception as e:
-                # EPIC TASK-217 / TASK-357: do NOT silently swallow a failed
-                # INSERT. Previously this rolled back + logged + returned None,
-                # while the PostgreSQLShortTermManager adapter (below) returned
-                # the message id REGARDLESS — so the caller got a valid-looking
-                # id for a row that never committed, leaving turn_logs pointing
-                # at an uncommitted (orphan) {bot}_messages row. Roll back, log,
-                # then RE-RAISE so the failure is loud and the caller can abort
-                # the turn instead of recording a ghost reference. The happy
-                # path is byte-identical (commit succeeds -> returns None).
-                session.rollback()
-                logger.error(f"Failed to add message {message_id}: {e}")
-                raise
+        """Add a message through the extracted permanent-row store."""
+        self._message_rows.upsert(
+            message_id=message_id,
+            role=role,
+            content=content,
+            timestamp=timestamp,
+            session_id=session_id,
+            attachments=attachments,
+            reasoning=reasoning,
+            author=author,
+        )
     
     def get_unprocessed_messages(self, limit: int = 100) -> list[dict]:
         """Get messages that haven't been processed for memory extraction."""
@@ -1620,7 +1482,8 @@ class PostgreSQLMemoryBackend(MemoryBackend):
             try:
                 # Get IDs of last N messages
                 select_sql = text(f"""
-                    SELECT id, role, content, timestamp, session_id, processed, created_at
+                    SELECT id, role, content, timestamp, session_id, processed, created_at,
+                           author_entity_type, author_entity_id
                     FROM {self._messages_table_name}
                     ORDER BY timestamp DESC
                     LIMIT :count
@@ -1636,8 +1499,10 @@ class PostgreSQLMemoryBackend(MemoryBackend):
                 for row in rows:
                     insert_sql = text(f"""
                         INSERT INTO {self._forgotten_table_name}
-                        (id, role, content, timestamp, session_id, processed, created_at, forgotten_at)
-                        VALUES (:id, :role, :content, :timestamp, :session_id, :processed, :created_at, CURRENT_TIMESTAMP)
+                        (id, role, content, timestamp, session_id, processed, created_at,
+                         author_entity_type, author_entity_id, forgotten_at)
+                        VALUES (:id, :role, :content, :timestamp, :session_id, :processed, :created_at,
+                                :author_entity_type, :author_entity_id, CURRENT_TIMESTAMP)
                         ON CONFLICT (bot_id, id) DO NOTHING
                     """)
                     conn.execute(insert_sql, {
@@ -1648,6 +1513,8 @@ class PostgreSQLMemoryBackend(MemoryBackend):
                         "session_id": row.session_id,
                         "processed": row.processed,
                         "created_at": row.created_at,
+                        "author_entity_type": row.author_entity_type,
+                        "author_entity_id": row.author_entity_id,
                     })
                 
                 # Delete from messages table
@@ -1675,7 +1542,8 @@ class PostgreSQLMemoryBackend(MemoryBackend):
             try:
                 # Get messages to forget
                 select_sql = text(f"""
-                    SELECT id, role, content, timestamp, session_id, processed, created_at
+                    SELECT id, role, content, timestamp, session_id, processed, created_at,
+                           author_entity_type, author_entity_id
                     FROM {self._messages_table_name}
                     WHERE timestamp >= :cutoff
                     ORDER BY timestamp ASC
@@ -1691,8 +1559,10 @@ class PostgreSQLMemoryBackend(MemoryBackend):
                 for row in rows:
                     insert_sql = text(f"""
                         INSERT INTO {self._forgotten_table_name}
-                        (id, role, content, timestamp, session_id, processed, created_at, forgotten_at)
-                        VALUES (:id, :role, :content, :timestamp, :session_id, :processed, :created_at, CURRENT_TIMESTAMP)
+                        (id, role, content, timestamp, session_id, processed, created_at,
+                         author_entity_type, author_entity_id, forgotten_at)
+                        VALUES (:id, :role, :content, :timestamp, :session_id, :processed, :created_at,
+                                :author_entity_type, :author_entity_id, CURRENT_TIMESTAMP)
                         ON CONFLICT (bot_id, id) DO NOTHING
                     """)
                     conn.execute(insert_sql, {
@@ -1703,6 +1573,8 @@ class PostgreSQLMemoryBackend(MemoryBackend):
                         "session_id": row.session_id,
                         "processed": row.processed,
                         "created_at": row.created_at,
+                        "author_entity_type": row.author_entity_type,
+                        "author_entity_id": row.author_entity_id,
                     })
                 
                 # Delete from messages table
@@ -1746,7 +1618,8 @@ class PostgreSQLMemoryBackend(MemoryBackend):
                 # Find the message (support prefix matching)
                 if len(message_id) < 36:
                     select_sql = text(f"""
-                        SELECT id, role, content, timestamp, session_id, processed, created_at, summary_metadata
+                        SELECT id, role, content, timestamp, session_id, processed, created_at,
+                           author_entity_type, author_entity_id, summary_metadata
                         FROM {self._messages_table_name}
                         WHERE id LIKE :id_pattern
                         LIMIT 1
@@ -1754,7 +1627,8 @@ class PostgreSQLMemoryBackend(MemoryBackend):
                     row = conn.execute(select_sql, {"id_pattern": f"{message_id}%"}).fetchone()
                 else:
                     select_sql = text(f"""
-                        SELECT id, role, content, timestamp, session_id, processed, created_at, summary_metadata
+                        SELECT id, role, content, timestamp, session_id, processed, created_at,
+                           author_entity_type, author_entity_id, summary_metadata
                         FROM {self._messages_table_name}
                         WHERE id = :id
                     """)
@@ -1772,6 +1646,8 @@ class PostgreSQLMemoryBackend(MemoryBackend):
                         "session_id": r.session_id,
                         "processed": r.processed,
                         "created_at": str(r.created_at) if r.created_at else None,
+                        "author_entity_type": r.author_entity_type,
+                        "author_entity_id": r.author_entity_id,
                         "summary_metadata": r.summary_metadata,
                     }
 
@@ -1786,7 +1662,8 @@ class PostgreSQLMemoryBackend(MemoryBackend):
 
                 if before > 0:
                     before_sql = text(f"""
-                        SELECT id, role, content, timestamp, session_id, processed, created_at, summary_metadata
+                        SELECT id, role, content, timestamp, session_id, processed, created_at,
+                           author_entity_type, author_entity_id, summary_metadata
                         FROM {self._messages_table_name}
                         WHERE (timestamp < :ts OR (timestamp = :ts AND id < :tid))
                           AND role != 'system'
@@ -1798,7 +1675,8 @@ class PostgreSQLMemoryBackend(MemoryBackend):
 
                 if after > 0:
                     after_sql = text(f"""
-                        SELECT id, role, content, timestamp, session_id, processed, created_at, summary_metadata
+                        SELECT id, role, content, timestamp, session_id, processed, created_at,
+                           author_entity_type, author_entity_id, summary_metadata
                         FROM {self._messages_table_name}
                         WHERE (timestamp > :ts OR (timestamp = :ts AND id > :tid))
                           AND role != 'system'
@@ -1828,7 +1706,8 @@ class PostgreSQLMemoryBackend(MemoryBackend):
                 # Find the message (support prefix matching)
                 if len(message_id) < 36:
                     select_sql = text(f"""
-                        SELECT id, role, content, timestamp, session_id, processed, created_at
+                        SELECT id, role, content, timestamp, session_id, processed, created_at,
+                           author_entity_type, author_entity_id
                         FROM {self._messages_table_name}
                         WHERE id LIKE :id_pattern
                         LIMIT 1
@@ -1836,7 +1715,8 @@ class PostgreSQLMemoryBackend(MemoryBackend):
                     row = conn.execute(select_sql, {"id_pattern": f"{message_id}%"}).fetchone()
                 else:
                     select_sql = text(f"""
-                        SELECT id, role, content, timestamp, session_id, processed, created_at
+                        SELECT id, role, content, timestamp, session_id, processed, created_at,
+                           author_entity_type, author_entity_id
                         FROM {self._messages_table_name}
                         WHERE id = :id
                     """)
@@ -1846,11 +1726,13 @@ class PostgreSQLMemoryBackend(MemoryBackend):
                     logger.debug(f"Message {message_id} not found")
                     return False
                 
-                # Insert into forgotten table
+                # Insert into forgotten table, preserving canonical authorship.
                 insert_sql = text(f"""
                     INSERT INTO {self._forgotten_table_name}
-                    (id, role, content, timestamp, session_id, processed, created_at, forgotten_at)
-                    VALUES (:id, :role, :content, :timestamp, :session_id, :processed, :created_at, CURRENT_TIMESTAMP)
+                    (id, role, content, timestamp, session_id, processed, created_at,
+                     author_entity_type, author_entity_id, forgotten_at)
+                    VALUES (:id, :role, :content, :timestamp, :session_id, :processed, :created_at,
+                            :author_entity_type, :author_entity_id, CURRENT_TIMESTAMP)
                     ON CONFLICT (bot_id, id) DO NOTHING
                 """)
                 conn.execute(insert_sql, {
@@ -1861,6 +1743,8 @@ class PostgreSQLMemoryBackend(MemoryBackend):
                     "session_id": row.session_id,
                     "processed": row.processed,
                     "created_at": row.created_at,
+                    "author_entity_type": row.author_entity_type,
+                    "author_entity_id": row.author_entity_id,
                 })
                 
                 # Delete from messages table
@@ -1887,7 +1771,8 @@ class PostgreSQLMemoryBackend(MemoryBackend):
             try:
                 # Get all forgotten messages
                 select_sql = text(f"""
-                    SELECT id, role, content, timestamp, session_id, processed, created_at
+                    SELECT id, role, content, timestamp, session_id, processed, created_at,
+                           author_entity_type, author_entity_id
                     FROM {self._forgotten_table_name}
                     ORDER BY timestamp ASC
                 """)
@@ -1898,12 +1783,14 @@ class PostgreSQLMemoryBackend(MemoryBackend):
                 
                 ids_to_restore = [row.id for row in rows]
                 
-                # Insert back into messages table
+                # Insert back into messages table with the original author.
                 for row in rows:
                     insert_sql = text(f"""
                         INSERT INTO {self._messages_table_name}
-                        (id, role, content, timestamp, session_id, processed, created_at)
-                        VALUES (:id, :role, :content, :timestamp, :session_id, :processed, :created_at)
+                        (id, role, content, timestamp, session_id, processed, created_at,
+                         author_entity_type, author_entity_id)
+                        VALUES (:id, :role, :content, :timestamp, :session_id, :processed, :created_at,
+                                :author_entity_type, :author_entity_id)
                         ON CONFLICT (bot_id, id) DO NOTHING
                     """)
                     conn.execute(insert_sql, {
@@ -1914,6 +1801,8 @@ class PostgreSQLMemoryBackend(MemoryBackend):
                         "session_id": row.session_id,
                         "processed": row.processed,
                         "created_at": row.created_at,
+                        "author_entity_type": row.author_entity_type,
+                        "author_entity_id": row.author_entity_id,
                     })
                 
                 # Delete from forgotten table
@@ -2707,6 +2596,7 @@ class PostgreSQLShortTermManager:
         attachments: list[dict] | None = None,
         reasoning: str | None = None,
         session_id: str | None = None,
+        author: AuthorReference | None = None,
     ) -> str:
         """Add a message to the current session.
 
@@ -2737,6 +2627,7 @@ class PostgreSQLShortTermManager:
             session_id=session_id or self._current_session_id,
             attachments=attachments,
             reasoning=reasoning,
+            author=author,
         )
 
         return mid
@@ -2775,7 +2666,8 @@ class PostgreSQLShortTermManager:
         with self._backend.engine.connect() as conn:
             raw_rows = conn.execute(
                 text(f"""
-                    SELECT id, role, content, timestamp, session_id
+                    SELECT id, role, content, timestamp, session_id,
+                           author_entity_type, author_entity_id
                     FROM {self._backend._messages_table_name}
                     WHERE {' AND '.join(raw_clauses)}
                     ORDER BY timestamp ASC
@@ -2784,7 +2676,8 @@ class PostgreSQLShortTermManager:
             ).fetchall()
             summary_rows = conn.execute(
                 text(f"""
-                    SELECT id, role, content, timestamp, session_id
+                    SELECT id, role, content, timestamp, session_id,
+                           author_entity_type, author_entity_id
                     FROM {self._backend._messages_table_name}
                     WHERE role = 'summary'
                     ORDER BY timestamp ASC
@@ -2798,6 +2691,8 @@ class PostgreSQLShortTermManager:
                 timestamp=r.timestamp or 0.0,
                 db_id=r.id,
                 session_id=r.session_id,
+                author_entity_type=r.author_entity_type,
+                author_entity_id=r.author_entity_id,
             )
             for r in (list(raw_rows) + list(summary_rows))
         ]
@@ -2887,7 +2782,8 @@ class PostgreSQLShortTermManager:
             if include_summaries:
                 # Smart filtering: summaries + unsummarized messages
                 sql = f"""
-                    SELECT id, role, content, timestamp, session_id
+                    SELECT id, role, content, timestamp, session_id,
+                           author_entity_type, author_entity_id
                     FROM {self._backend._messages_table_name}
                     WHERE
                         (role = 'summary')
@@ -2905,7 +2801,15 @@ class PostgreSQLShortTermManager:
                 rows = conn.execute(text(sql), params).fetchall()
 
                 return [
-                    Message(role=row.role, content=row.content, timestamp=row.timestamp, db_id=row.id, session_id=row.session_id)
+                    Message(
+                        role=row.role,
+                        content=row.content,
+                        timestamp=row.timestamp,
+                        db_id=row.id,
+                        session_id=row.session_id,
+                        author_entity_type=row.author_entity_type,
+                        author_entity_id=row.author_entity_id,
+                    )
                     for row in rows
                 ]
             else:
@@ -2923,7 +2827,15 @@ class PostgreSQLShortTermManager:
                     rows = session.execute(stmt).fetchall()
 
                     return [
-                        Message(role=row.role, content=row.content, timestamp=row.timestamp, db_id=row.id, session_id=row.session_id)
+                        Message(
+                            role=row.role,
+                            content=row.content,
+                            timestamp=row.timestamp,
+                            db_id=row.id,
+                            session_id=row.session_id,
+                            author_entity_type=row.author_entity_type,
+                            author_entity_id=row.author_entity_id,
+                        )
                         for row in rows
                     ]
 

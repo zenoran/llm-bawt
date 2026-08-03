@@ -96,6 +96,7 @@ class TurnLog(SQLModel, table=True):
     tool_calls_json: str | None = Field(default=None, sa_column=Column(Text, nullable=True))
     error_text: str | None = Field(default=None, sa_column=Column(Text, nullable=True))
     trigger_message_id: str | None = Field(default=None, index=True)
+    assistant_message_id: str | None = Field(default=None, index=True)
     agent_session_key: str | None = Field(default=None, max_length=128, index=True)
     agent_request_id: str | None = Field(default=None, max_length=128, index=True)
     animation: str | None = Field(default=None, sa_column=Column(String(255), nullable=True))
@@ -186,6 +187,14 @@ class TurnLogStore:
                 conn.execute(sa_text(
                     "CREATE INDEX IF NOT EXISTS ix_turn_logs_trigger_message_id"
                     " ON turn_logs (trigger_message_id)"
+                ))
+                conn.execute(sa_text(
+                    "ALTER TABLE turn_logs ADD COLUMN IF NOT EXISTS"
+                    " assistant_message_id VARCHAR"
+                ))
+                conn.execute(sa_text(
+                    "CREATE INDEX IF NOT EXISTS ix_turn_logs_assistant_message_id"
+                    " ON turn_logs (assistant_message_id)"
                 ))
                 conn.execute(sa_text(
                     "ALTER TABLE turn_logs ADD COLUMN IF NOT EXISTS"
@@ -369,6 +378,7 @@ class TurnLogStore:
         tool_calls: list[dict] | None,
         error_text: str | None = None,
         trigger_message_id: str | None = None,
+        assistant_message_id: str | None = None,
         agent_session_key: str | None = None,
         agent_request_id: str | None = None,
         animation: str | None = None,
@@ -435,6 +445,7 @@ class TurnLogStore:
                             " status=:status, latency_ms=:latency_ms, user_prompt=:user_prompt,"
                             " request_json=:request_json, response_text=:response_text,"
                             " error_text=:error_text, trigger_message_id=:trigger_message_id,"
+                            " assistant_message_id=:assistant_message_id,"
                             " agent_session_key=:agent_session_key,"
                             " agent_request_id=:agent_request_id, animation=:animation,"
                             " token_usage_json=:token_usage_json, parent_turn_id=:parent_turn_id"
@@ -455,6 +466,7 @@ class TurnLogStore:
                             "response_text": response_text,
                             "error_text": error_text,
                             "trigger_message_id": trigger_message_id,
+                            "assistant_message_id": assistant_message_id,
                             "agent_session_key": agent_session_key,
                             "agent_request_id": agent_request_id,
                             "animation": animation,
@@ -483,6 +495,7 @@ class TurnLogStore:
                         response_text=response_text,
                         error_text=error_text,
                         trigger_message_id=trigger_message_id,
+                        assistant_message_id=assistant_message_id,
                         agent_session_key=agent_session_key,
                         agent_request_id=agent_request_id,
                         animation=animation,
@@ -541,6 +554,7 @@ class TurnLogStore:
         request_payload: dict | None = None,
         tool_calls: list[dict] | None = None,
         error_text: str | None = None,
+        assistant_message_id: str | None = None,
         agent_session_key: str | None = None,
         agent_request_id: str | None = None,
         animation: str | None = None,
@@ -577,6 +591,8 @@ class TurnLogStore:
             # TASK-364: tool_calls_json retired (tombstoned) — no longer written.
             if error_text is not None:
                 row.error_text = error_text
+            if assistant_message_id is not None:
+                row.assistant_message_id = assistant_message_id
             if agent_session_key is not None:
                 row.agent_session_key = agent_session_key
             if agent_request_id is not None:

@@ -151,6 +151,47 @@ def _fetch_reasoning_via_shared_engine(
     return result
 
 
+def _hydrate_reply_links_for_page(
+    service,
+    bot_id: str,
+    page_messages: list[dict],
+) -> dict[str, str]:
+    """Map assistant message UUIDs to their canonical triggering user UUIDs."""
+    assistant_ids = [
+        str(message.get("id"))
+        for message in page_messages
+        if message.get("role") == "assistant" and message.get("id")
+    ]
+    if not assistant_ids:
+        return {}
+
+    store = getattr(service, "_turn_log_store", None)
+    engine = getattr(store, "engine", None)
+    if engine is None:
+        return {}
+
+    try:
+        from sqlalchemy import text
+
+        with engine.connect() as conn:
+            rows = conn.execute(
+                text(
+                    "SELECT assistant_message_id, trigger_message_id FROM turn_logs "
+                    "WHERE bot_id=:bot_id AND assistant_message_id = ANY(:assistant_ids) "
+                    "AND trigger_message_id IS NOT NULL"
+                ),
+                {"bot_id": bot_id, "assistant_ids": assistant_ids},
+            ).mappings().all()
+        return {
+            str(row["assistant_message_id"]): str(row["trigger_message_id"])
+            for row in rows
+            if row.get("assistant_message_id") and row.get("trigger_message_id")
+        }
+    except Exception as exc:
+        log.warning("Failed to load history reply links: %s", exc)
+        return {}
+
+
 def _hydrate_reasoning_for_page(
     service,
     bot_id: str,
@@ -598,6 +639,14 @@ def _search_visible_messages(
     ]
 
 
+def _message_author_payload(message: dict) -> dict:
+    """Return the hydrated author or an explicit unresolved fallback."""
+    author = message.get("author")
+    if isinstance(author, dict):
+        return author
+    return {"entity_type": None, "entity_id": None, "status": "unknown"}
+
+
 def _build_history_search_response(
     service,
     effective_bot_id: str,
@@ -614,6 +663,9 @@ def _build_history_search_response(
     reasoning_by_id = _hydrate_reasoning_for_page(
         service, effective_bot_id, page_messages
     )
+    reply_links_by_id = _hydrate_reply_links_for_page(
+        service, effective_bot_id, page_messages
+    )
     history_messages = [
         HistoryMessage(
             id=msg.get("id"),
@@ -622,6 +674,8 @@ def _build_history_search_response(
             timestamp=msg.get("timestamp", 0.0),
             attachments=attachments_by_id.get(str(msg.get("id") or ""), []),
             reasoning=reasoning_by_id.get(str(msg.get("id") or "")),
+            reply_to_message_id=reply_links_by_id.get(str(msg.get("id") or "")),
+            author=_message_author_payload(msg),
         )
         for msg in page_messages
     ]
@@ -972,7 +1026,8 @@ def _load_all_messages_via_sql(
     table = partition_name(MESSAGES_PARENT, bot_id)
     sql = text(
         f"""
-        SELECT id, role, content, timestamp
+        SELECT id, role, content, timestamp, session_id,
+               author_entity_type, author_entity_id
         FROM {table}
         WHERE role NOT IN ('system', 'summary')
         ORDER BY timestamp ASC, id ASC
@@ -986,15 +1041,21 @@ def _load_all_messages_via_sql(
         log.warning(f"_load_all_messages_via_sql failed for {bot_id}: {e}")
         return None
 
-    return [
+    raw_rows = [
         {
             "id": str(row["id"] or ""),
             "role": str(row["role"] or ""),
             "content": str(row["content"] or ""),
             "timestamp": float(row["timestamp"] or 0.0),
+            "session_id": row.get("session_id"),
+            "author_entity_type": row.get("author_entity_type"),
+            "author_entity_id": row.get("author_entity_id"),
         }
         for row in rows
     ]
+    from ...mcp_server.storage import get_storage
+
+    return get_storage().hydrate_message_authors(raw_rows, bot_id=bot_id)
 
 
 def _build_history_response(
@@ -1021,6 +1082,9 @@ def _build_history_response(
     reasoning_by_id = _hydrate_reasoning_for_page(
         service, effective_bot_id, page_messages
     )
+    reply_links_by_id = _hydrate_reply_links_for_page(
+        service, effective_bot_id, page_messages
+    )
     history_messages = [
         HistoryMessage(
             id=msg.get("id"),
@@ -1029,6 +1093,8 @@ def _build_history_response(
             timestamp=msg.get("timestamp", 0.0),
             attachments=attachments_by_id.get(str(msg.get("id") or ""), []),
             reasoning=reasoning_by_id.get(str(msg.get("id") or "")),
+            reply_to_message_id=reply_links_by_id.get(str(msg.get("id") or "")),
+            author=_message_author_payload(msg),
         )
         for msg in page_messages
     ]
@@ -1393,6 +1459,7 @@ async def search_all_history(
                 timestamp=float(row.get("timestamp", 0.0) or 0.0),
                 bot_id=str(row.get("source", "")),
                 rank=float(row.get("rank", 0.0) or 0.0),
+                author=_message_author_payload(row),
             )
             for row in rows
         ]

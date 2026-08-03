@@ -67,7 +67,7 @@ class ChatStreamingMixin(ChatStreamingBridgeMixin):
         # our own reader (ChatStreamContext skips lines starting with ":").
         yield ": connected\n\n"
 
-        validate_inter_bot_claim(self, request)
+        inter_bot_author = validate_inter_bot_claim(self, request)
 
         # Create request context for logging
         if request.client_system_context is not None:
@@ -89,6 +89,8 @@ class ChatStreamingMixin(ChatStreamingBridgeMixin):
 
         bot_id = request.bot_id or self._default_bot
         user_id = request.user or self.config.DEFAULT_USER
+        from ..message_authorship import AuthorReference
+        user_author = inter_bot_author or AuthorReference.user(user_id)
         local_mode = not request.augment_memory
 
         # Resolve model using shared bot/config logic
@@ -358,6 +360,7 @@ class ChatStreamingMixin(ChatStreamingBridgeMixin):
             response_text="",
             agent_session_key=oc_session_key,
             trigger_message_id=trigger_message_id,
+            assistant_message_id=assistant_message_id,
             parent_turn_id=parent_turn_id,
             request_extensions={
                 key: value
@@ -418,6 +421,7 @@ class ChatStreamingMixin(ChatStreamingBridgeMixin):
             model_alias=model_alias,
             user_prompt=user_prompt,
             user_attachments=user_attachments,
+            user_author=user_author,
             attachments_to_persist=attachments_to_persist,
             media_store=media_store,
             trigger_message_id=trigger_message_id,
@@ -489,6 +493,12 @@ class ChatStreamingMixin(ChatStreamingBridgeMixin):
                 )
                 turn_start_attachments = []
 
+        from ..entity_presentation import EntityPresentationResolver
+        assistant_author = AuthorReference.bot(bot_id)
+        author_presentations = EntityPresentationResolver(
+            self._turn_log_store.engine
+        ).resolve_many_safe([user_author, assistant_author])
+
         await _turn_worker._publish_unified({
             "_type": "turn_start",
             "turn_id": turn_log_id,
@@ -502,6 +512,12 @@ class ChatStreamingMixin(ChatStreamingBridgeMixin):
             "parent_turn_id": parent_turn_id,
             "role": "user",
             "content": user_prompt,
+            "author": author_presentations[
+                (user_author.entity_type, user_author.entity_id)
+            ],
+            "assistant_author": author_presentations[
+                (assistant_author.entity_type, assistant_author.entity_id)
+            ],
             "attachments": turn_start_attachments,
             # TTS consumers (chat_tts_driver): when true, IGNORE raw text_delta
             # and synthesize the scrubbed `tts_delta` events instead. Markdown

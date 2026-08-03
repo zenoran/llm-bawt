@@ -22,6 +22,7 @@ from pydantic import BaseModel, Field
 from ...mcp_server.storage import get_storage
 from ..dependencies import get_effective_bot_id, get_service
 from ..logging import get_service_logger
+from ..schemas_history_memory import MessageAuthor
 
 router = APIRouter()
 log = get_service_logger(__name__)
@@ -54,6 +55,7 @@ class SessionMessage(BaseModel):
     content: str
     timestamp: float | None = None
     session_id: str | None = None
+    author: MessageAuthor
 
 
 class SessionTranscriptResponse(BaseModel):
@@ -164,13 +166,12 @@ def resolve_agent_session_key(
 ) -> str | None:
     """Resolve the SDK session id stored for a thread + backend.
 
-    Reads from ``session_metadata.agent_session_keys[<backend>]``.
+    Reads from ``session_metadata.agent_session_keys[<backend>]``. Claude SDK
+    transcripts are model-agnostic, so Claude model metadata is informational
+    and never blocks resume. Other backends retain their existing model guard.
 
-    Guards: a value containing ``:`` is a routing key (openclaw / legacy bug),
-    never an SDK session id. When ``current_model`` is given, the model stored
-    alongside this backend's key in ``agent_session_key_models`` is checked; a
-    mismatch returns None so the caller cold-starts instead of resuming a
-    transcript minted under another model.
+    A value containing ``:`` is a routing key (openclaw / legacy bug), never an
+    SDK session id.
     """
     meta = meta or {}
     key_name = agent_key_name(backend)
@@ -178,13 +179,12 @@ def resolve_agent_session_key(
     val = str(keys.get(key_name) or "").strip()
     if not val or ":" in val:
         return None
-    if current_model:
+    if current_model and key_name != "claude_code":
         key_models = meta.get("agent_session_key_models") or {}
         stored_model = str(key_models.get(key_name) or "").strip()
-        # One-release compatibility for rows written before model metadata
-        # became per-backend. The scalar describes only meta["provider"];
-        # never let another backend's model veto this key.
-        if not stored_model and str(meta.get("provider") or "").strip() == (backend or "").strip():
+        if not stored_model and str(meta.get("provider") or "").strip() == (
+            backend or ""
+        ).strip():
             stored_model = str(meta.get("provider_session_model") or "").strip()
         if stored_model and stored_model != current_model:
             return None
@@ -336,6 +336,10 @@ async def get_session_messages(
                 content=r.get("content", ""),
                 timestamp=r.get("timestamp"),
                 session_id=r.get("session_id"),
+                author=(
+                    r.get("author")
+                    or {"entity_type": None, "entity_id": None, "status": "unknown"}
+                ),
             )
             for r in rows
         ],

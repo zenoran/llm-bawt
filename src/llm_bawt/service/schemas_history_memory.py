@@ -11,6 +11,18 @@ from typing import Any, Literal
 from pydantic import BaseModel, Field
 
 
+class MessageAuthor(BaseModel):
+    """Canonical message author, independent from protocol role."""
+
+    entity_type: Literal["user", "bot"] | None = None
+    entity_id: str | None = None
+    status: Literal["canonical", "legacy", "unknown"] = "canonical"
+    display_name: str = "Unknown participant"
+    color: str = "slate"
+    avatar: str | None = None
+    avatar_render: str | None = None
+
+
 class HistoryMessage(BaseModel):
     """A message in the conversation history.
 
@@ -30,6 +42,10 @@ class HistoryMessage(BaseModel):
     # /v1/history route only (display-only; never in LLM context). None when the
     # row carried no reasoning (user rows, pre-feature assistant rows).
     reasoning: str | None = None
+    # Canonical reply edge for assistant rows. This is the originating user
+    # message UUID from turn_logs, not an adjacency guess.
+    reply_to_message_id: str | None = None
+    author: MessageAuthor
 
 class HistoryResponse(BaseModel):
     """Response for conversation history.
@@ -85,6 +101,7 @@ class HistorySearchAllMessage(BaseModel):
     timestamp: float
     bot_id: str
     rank: float
+    author: MessageAuthor
 
 class HistorySearchAllResponse(BaseModel):
     """Response for cross-bot history search.

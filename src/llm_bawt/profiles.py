@@ -15,7 +15,7 @@ from typing import Any
 from urllib.parse import quote_plus
 
 from pydantic import ConfigDict
-from sqlalchemy import Column, JSON, text
+from sqlalchemy import Column, JSON, String, Text, text
 from sqlmodel import Field, Session, SQLModel, create_engine, select
 from .utils.schema import SchemaBootstrapGuard
 
@@ -78,6 +78,15 @@ class EntityProfile(SQLModel, table=True):
     # Basic identity
     display_name: str | None = Field(default=None, max_length=100)
     description: str | None = Field(default=None, max_length=500)
+    color: str | None = Field(
+        default=None, sa_column=Column(String(64), nullable=True)
+    )
+    avatar: str | None = Field(
+        default=None, sa_column=Column(String(512), nullable=True)
+    )
+    avatar_render: str | None = Field(
+        default=None, sa_column=Column(Text, nullable=True)
+    )
     
     # Pre-computed summary for system prompt injection (set by maintenance job)
     summary: str | None = Field(default=None)
@@ -146,6 +155,18 @@ class ProfileManager:
             conn.execute(text("""
                 ALTER TABLE entity_profiles
                 ADD COLUMN IF NOT EXISTS summary_updated_at TIMESTAMP
+            """))
+            conn.execute(text("""
+                ALTER TABLE entity_profiles
+                ADD COLUMN IF NOT EXISTS color VARCHAR(64)
+            """))
+            conn.execute(text("""
+                ALTER TABLE entity_profiles
+                ADD COLUMN IF NOT EXISTS avatar VARCHAR(512)
+            """))
+            conn.execute(text("""
+                ALTER TABLE entity_profiles
+                ADD COLUMN IF NOT EXISTS avatar_render TEXT
             """))
             conn.execute(text("""
                 CREATE INDEX IF NOT EXISTS idx_entity_profiles_email
@@ -260,6 +281,9 @@ class ProfileManager:
         description: str | None = None,
         summary: str | None = None,
         email: str | None = None,
+        color: str | None = None,
+        avatar: str | None = None,
+        avatar_render: str | None = None,
     ) -> EntityProfile | None:
         """Update basic profile info."""
         entity_id = entity_id.lower().strip()
@@ -283,6 +307,12 @@ class ProfileManager:
                 profile.summary_updated_at = datetime.now(timezone.utc)
             if email is not None:
                 profile.email = email.lower().strip() if email else None
+            if color is not None:
+                profile.color = color.strip() or None
+            if avatar is not None:
+                profile.avatar = avatar.strip() or None
+            if avatar_render is not None:
+                profile.avatar_render = avatar_render or None
             profile.updated_at = datetime.now(timezone.utc)
 
             session.add(profile)

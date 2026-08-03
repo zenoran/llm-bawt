@@ -822,6 +822,8 @@ class MemoryClient:
         message_id: str | None = None,
         attachments: list[dict] | None = None,
         reasoning: str | None = None,
+        author_entity_type: str | None = None,
+        author_entity_id: str | None = None,
     ) -> MessageResult:
         """Add a message to conversation history.
 
@@ -851,6 +853,8 @@ class MemoryClient:
                 "message_id": message_id,
                 "attachments": attachments,
                 "reasoning": reasoning,
+                "author_entity_type": author_entity_type,
+                "author_entity_id": author_entity_id,
                 # TASK-284: carry the user dimension so the server resolves the
                 # active thread per (bot_id, user_id) when session_id is None.
                 "user_id": self.user_id,
@@ -870,6 +874,8 @@ class MemoryClient:
                 attachments=attachments,
                 reasoning=reasoning,
                 user_id=self.user_id,
+                author_entity_type=author_entity_type,
+                author_entity_id=author_entity_id,
             )
         )
         return MessageResult.from_dict(result.to_dict())
@@ -1361,6 +1367,7 @@ class _MCPShortTermManager:
         attachments: list[dict] | None = None,
         reasoning: str | None = None,
         session_id: str | None = None,
+        author=None,
     ) -> str:
         # ``reasoning`` (TASK-301) is forwarded through the MCP write chain so
         # server-mode deployments persist it too (display-only on the row).
@@ -1374,6 +1381,8 @@ class _MCPShortTermManager:
             attachments=attachments,
             reasoning=reasoning,
             session_id=session_id,
+            author_entity_type=(author.entity_type if author else None),
+            author_entity_id=(author.entity_id if author else None),
         )
         return msg.id
 
@@ -1392,6 +1401,8 @@ class _MCPShortTermManager:
                 timestamp=r.get("timestamp", 0.0),
                 db_id=r.get("id"),
                 session_id=r.get("session_id"),  # TASK-284: preserve thread id
+                author_entity_type=(r.get("author") or {}).get("entity_type"),
+                author_entity_id=(r.get("author") or {}).get("entity_id"),
             )
             for r in rows
         ]
@@ -1436,6 +1447,8 @@ class _MCPShortTermManager:
                 timestamp=r.get("timestamp", 0.0) or 0.0,
                 db_id=r.get("id"),
                 session_id=r.get("session_id"),
+                author_entity_type=(r.get("author") or {}).get("entity_type"),
+                author_entity_id=(r.get("author") or {}).get("entity_id"),
             )
             for r in (list(raw_rows) + list(summary_rows))
         ]
