@@ -99,6 +99,7 @@ class ToolCallRecord(SQLModel, table=True):
     preapproved: bool | None = Field(default=None, sa_column=Column(Boolean, nullable=True))
     result_total_chars: int | None = Field(default=None, sa_column=Column(Integer, nullable=True))
     result_total_bytes: int | None = Field(default=None, sa_column=Column(BigInteger, nullable=True))
+    result_total_tokens: int | None = Field(default=None, sa_column=Column(Integer, nullable=True))
     result_sha256: str | None = Field(default=None, sa_column=Column(String(64), nullable=True))
     result_content_type: str | None = Field(default=None, sa_column=Column(String(128), nullable=True))
     result_complete: bool | None = Field(default=None, sa_column=Column(Boolean, nullable=True))
@@ -173,6 +174,7 @@ class ToolCallStore:
             statements = (
                 "ALTER TABLE tool_call_records ADD COLUMN IF NOT EXISTS result_total_chars INTEGER",
                 "ALTER TABLE tool_call_records ADD COLUMN IF NOT EXISTS result_total_bytes BIGINT",
+                "ALTER TABLE tool_call_records ADD COLUMN IF NOT EXISTS result_total_tokens INTEGER",
                 "ALTER TABLE tool_call_records ADD COLUMN IF NOT EXISTS result_sha256 VARCHAR(64)",
                 "ALTER TABLE tool_call_records ADD COLUMN IF NOT EXISTS result_content_type VARCHAR(128)",
                 "ALTER TABLE tool_call_records ADD COLUMN IF NOT EXISTS result_complete BOOLEAN",
@@ -283,6 +285,7 @@ class ToolCallStore:
                 row.result_text = payload.preview
                 row.result_total_chars = payload.total_chars
                 row.result_total_bytes = payload.total_bytes
+                row.result_total_tokens = payload.total_tokens
                 row.result_sha256 = payload.sha256
                 row.result_content_type = payload.content_type
                 row.result_complete = payload.complete

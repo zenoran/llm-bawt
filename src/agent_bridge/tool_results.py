@@ -16,6 +16,49 @@ TOOL_RESULT_PREVIEW_CHARS = 2_000
 TOOL_RESULT_PAYLOAD_VERSION = 1
 STRUCTURED_TOOL_RESULT_TYPE = "application/x-tool-blocks+json"
 
+# Token accounting for tool results. tiktoken is a hard dependency; we use a
+# modern OpenAI encoding (o200k_base) as a deterministic ESTIMATE of the text
+# portion of a result — it is not the provider's exact tokenizer (Claude != o200k)
+# and does not account for image blocks or prompt-cache framing. The encoder is
+# resolved once per process (the first call may download+parse the vocab); any
+# failure degrades to the repo-wide len//4 heuristic so a tool turn never dies
+# over token counting.
+_TOKEN_ENCODING_NAME = "o200k_base"
+_TOKEN_ENCODER: Any = None
+_TOKEN_ENCODER_RESOLVED = False
+
+
+def _get_token_encoder() -> Any:
+    global _TOKEN_ENCODER, _TOKEN_ENCODER_RESOLVED
+    if _TOKEN_ENCODER_RESOLVED:
+        return _TOKEN_ENCODER
+    _TOKEN_ENCODER_RESOLVED = True
+    try:
+        import tiktoken
+
+        _TOKEN_ENCODER = tiktoken.get_encoding(_TOKEN_ENCODING_NAME)
+    except Exception:
+        _TOKEN_ENCODER = None
+    return _TOKEN_ENCODER
+
+
+def count_result_tokens(content: str) -> int:
+    """Estimate the token count of a tool-result string.
+
+    Uses tiktoken when available; falls back to the len//4 heuristic. Never
+    raises — tool results contain arbitrary text (including literal special-token
+    sequences), so encoding disables special-token handling.
+    """
+    if not content:
+        return 0
+    encoder = _get_token_encoder()
+    if encoder is not None:
+        try:
+            return len(encoder.encode(content, disallowed_special=()))
+        except Exception:
+            pass
+    return max(1, len(content) // 4)
+
 
 def _without_inline_images(value: Any) -> Any:
     """Keep structured result shape without duplicating base64 image bytes.
@@ -45,6 +88,7 @@ class ToolResultPayload:
     content_type: str
     total_chars: int
     total_bytes: int
+    total_tokens: int
     sha256: str
     complete: bool
 
@@ -73,6 +117,7 @@ class ToolResultPayload:
             content_type=content_type,
             total_chars=len(content),
             total_bytes=len(raw),
+            total_tokens=count_result_tokens(content),
             sha256=hashlib.sha256(raw).hexdigest(),
             complete=bool(complete),
         )
@@ -92,6 +137,7 @@ class ToolResultPayload:
             content_type=content_type,
             total_chars=len(content),
             total_bytes=len(content.encode("utf-8")),
+            total_tokens=count_result_tokens(content),
             sha256=hashlib.sha256(content.encode("utf-8")).hexdigest(),
             complete=bool(data.get("complete", False)),
         )
@@ -114,6 +160,7 @@ class ToolResultPayload:
             "preview_chars": len(self.preview),
             "total_chars": self.total_chars,
             "total_bytes": self.total_bytes,
+            "total_tokens": self.total_tokens,
             "sha256": self.sha256,
             "content_type": self.content_type,
             "complete": self.complete,

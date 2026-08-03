@@ -97,6 +97,7 @@ def _records_to_calls(records: list[ToolCallRecord]) -> list[dict]:
                 "preview_chars": len(row.result_text or ""),
                 "total_chars": row.result_total_chars,
                 "total_bytes": row.result_total_bytes,
+                "total_tokens": row.result_total_tokens,
                 "sha256": row.result_sha256,
                 "content_type": row.result_content_type or "text/plain",
                 "complete": row.result_complete,
