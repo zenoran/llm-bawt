@@ -138,7 +138,7 @@ class TestSendRequestThreadFields:
 class TestClaudeNewPreprocessing:
     @staticmethod
     def _harness():
-        from claude_code_bridge.send_handler import ClaudeSendMixin
+        from claude_code_bridge.session_ops import ClaudeSessionMixin
 
         class _Publisher:
             def __init__(self):
@@ -147,7 +147,7 @@ class TestClaudeNewPreprocessing:
             def publish_run_done(self, request_id):
                 self.done.append(request_id)
 
-        class _Harness(ClaudeSendMixin):
+        class _Harness(ClaudeSessionMixin):
             def __init__(self):
                 self.resets = []
                 self.seeds = []
@@ -159,7 +159,11 @@ class TestClaudeNewPreprocessing:
 
             async def _seed_new_session(self, *args, **kwargs):
                 self.seeds.append((args, kwargs))
-                return {"seeded": True, "session_id": "sdk-new"}
+                return {
+                    "seeded": True,
+                    "session_id": "sdk-new",
+                    "approx_tokens": 1_234,
+                }
 
             @staticmethod
             def _format_seed_ack(seed_stats):
@@ -186,11 +190,30 @@ class TestClaudeNewPreprocessing:
             session_key="snark:nick",
             request_id="req-1",
             model="model-1",
+            context_window=372_000,
             inject_messages=[{"role": "summary", "content": "prior"}],
             thread_session_id="thread-new",
             msg_id="redis-1",
             async_redis=redis,
         ))
+
+    def test_clean_reset_reports_zero_context_instead_of_stale_usage(self):
+        from claude_code_bridge.session_ops import ClaudeSessionMixin
+
+        assert ClaudeSessionMixin._seed_usage_estimate(
+            {"seeded": False, "clean_start": True, "approx_tokens": 0},
+            context_window=200_000,
+        ) == {
+            "input_tokens": 0,
+            "cache_read_tokens": 0,
+            "cache_creation_tokens": 0,
+            "output_tokens": 0,
+            "resident_tokens": 0,
+            "resident_source": "clean_session_reset",
+            "context_window": 200_000,
+            "total_cost_usd": 0.0,
+            "usage_status": "reset",
+        }
 
     def test_new_with_message_defers_the_only_seed_to_cold_start(self):
         harness, redis = self._harness()
@@ -214,6 +237,17 @@ class TestClaudeNewPreprocessing:
         assert len(harness.seeds) == 1
         assert harness.seeds[0][1]["thread_session_id"] == "thread-new"
         assert len(harness.events) == 1
+        assert harness.events[0][1]["token_usage"] == {
+            "input_tokens": 1_234,
+            "cache_read_tokens": 0,
+            "cache_creation_tokens": 0,
+            "output_tokens": 0,
+            "resident_tokens": 1_234,
+            "resident_source": "session_seed_char_estimate",
+            "context_window": 372_000,
+            "total_cost_usd": 0.0,
+            "usage_status": "estimated",
+        }
         assert harness._publisher.done == ["req-1"]
         assert redis.acks == [("agent:commands", "claude-code-bridge", "redis-1")]
 

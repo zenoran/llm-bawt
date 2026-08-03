@@ -75,6 +75,84 @@ class ClaudeSessionMixin:
     on the assembled instance.
     """
 
+    @staticmethod
+    def _seed_usage_estimate(
+        stats: dict | None,
+        *,
+        context_window: int | None,
+    ) -> dict:
+        """Represent reset context as a seed estimate or explicit clean zero."""
+        seeded = bool(stats and stats.get("seeded"))
+        resident_tokens = max(0, int((stats or {}).get("approx_tokens") or 0))
+        return {
+            "input_tokens": resident_tokens,
+            "cache_read_tokens": 0,
+            "cache_creation_tokens": 0,
+            "output_tokens": 0,
+            "resident_tokens": resident_tokens,
+            "resident_source": (
+                "session_seed_char_estimate" if seeded else "clean_session_reset"
+            ),
+            "context_window": context_window,
+            # Seeding writes a synthetic transcript; bare /new makes no provider
+            # request, so its exact incremental cost is zero even though the
+            # future resident-context size is estimated.
+            "total_cost_usd": 0.0,
+            "usage_status": "estimated" if seeded else "reset",
+        }
+
+    async def _preprocess_new_command(
+        self,
+        message: str,
+        *,
+        explicit_thread: bool,
+        bot_slug: str,
+        session_key: str,
+        request_id: str,
+        model: str,
+        context_window: int | None,
+        inject_messages: list | None,
+        thread_session_id: str | None,
+        msg_id: str,
+        async_redis,
+    ) -> str | None:
+        """Handle bridge-owned ``/new`` setup and return the remaining prompt.
+
+        ``None`` means a bare ``/new`` was fully acknowledged and the caller
+        must stop. ``/new <message>`` returns only the trailing message; its
+        normal cold-start path creates exactly one SDK session. Explicit-thread
+        turns pass through unchanged because opening an old thread must never
+        rotate it.
+        """
+        if explicit_thread or not message.lstrip().startswith("/new"):
+            return message
+
+        self._publish_session_reset_unified(
+            bot_slug or session_key, session_key, had_session=True,
+        )
+        remaining = message.lstrip().removeprefix("/new").strip()
+        if remaining:
+            return remaining
+
+        # Bare /new has no normal send path to create the fresh SDK session,
+        # so seed it here before acknowledging.
+        seed_stats = await self._seed_new_session(
+            bot_slug, model, injected=inject_messages,
+            thread_session_id=thread_session_id,
+        )
+        self._publish_event(
+            request_id, session_key, 1,
+            kind=AgentEventKind.ASSISTANT_DONE,
+            text=self._format_seed_ack(seed_stats),
+            model=model,
+            token_usage=self._seed_usage_estimate(
+                seed_stats, context_window=context_window,
+            ),
+        )
+        self._publisher.publish_run_done(request_id)
+        await async_redis.xack(COMMANDS_STREAM, "claude-code-bridge", msg_id)
+        return None
+
     async def _set_thread_session(
         self, thread_session_id: str, bot_id: str, sdk_session_id: str, model: str,
     ) -> None:

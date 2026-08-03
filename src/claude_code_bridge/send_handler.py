@@ -45,54 +45,6 @@ class ClaudeSendMixin(ClaudeStreamMixin, ClaudeUsageMixin, ClaudeResultMixin):
     on the assembled instance.
     """
 
-    async def _preprocess_new_command(
-        self,
-        message: str,
-        *,
-        explicit_thread: bool,
-        bot_slug: str,
-        session_key: str,
-        request_id: str,
-        model: str,
-        inject_messages: list | None,
-        thread_session_id: str | None,
-        msg_id: str,
-        async_redis,
-    ) -> str | None:
-        """Handle bridge-owned ``/new`` setup and return the remaining prompt.
-
-        ``None`` means a bare ``/new`` was fully acknowledged and the caller
-        must stop. ``/new <message>`` returns only the trailing message; its
-        normal cold-start path creates exactly one SDK session. Explicit-thread
-        turns pass through unchanged because opening an old thread must never
-        rotate it.
-        """
-        if explicit_thread or not message.lstrip().startswith("/new"):
-            return message
-
-        self._publish_session_reset_unified(
-            bot_slug or session_key, session_key, had_session=True,
-        )
-        remaining = message.lstrip().removeprefix("/new").strip()
-        if remaining:
-            return remaining
-
-        # Bare /new has no normal send path to create the fresh SDK session,
-        # so seed it here before acknowledging.
-        seed_stats = await self._seed_new_session(
-            bot_slug, model, injected=inject_messages,
-            thread_session_id=thread_session_id,
-        )
-        self._publish_event(
-            request_id, session_key, 1,
-            kind=AgentEventKind.ASSISTANT_DONE,
-            text=self._format_seed_ack(seed_stats),
-            model=model,
-        )
-        self._publisher.publish_run_done(request_id)
-        await async_redis.xack(COMMANDS_STREAM, "claude-code-bridge", msg_id)
-        return None
-
     async def _handle_send(
         self, fields: dict, msg_id: str, async_redis,
     ) -> None:
@@ -161,6 +113,7 @@ class ClaudeSendMixin(ClaudeStreamMixin, ClaudeUsageMixin, ClaudeResultMixin):
             session_key=session_key,
             request_id=request_id,
             model=model,
+            context_window=bot_context_window,
             inject_messages=inject_messages,
             thread_session_id=thread_session_id,
             msg_id=msg_id,
