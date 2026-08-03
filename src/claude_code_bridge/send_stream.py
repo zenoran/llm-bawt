@@ -500,15 +500,14 @@ class ClaudeStreamMixin:
                             "Screenshot persist failed (tool_use_id=%s)",
                             block.tool_use_id, exc_info=True,
                         )
-                # TASK-594: the harness truncates large
-                # tool output to a <persisted-output>
-                # wrapper and writes the real bytes to a
-                # tool-results/<id>.txt file. Re-hydrate
-                # the full output from that file so the
-                # payload's total_chars/preview reflect the
-                # REAL result (non-fatal: falls back to the
-                # inline wrapper if the file is missing).
-                result_content = self._resolve_persisted_output(result_content)
+                # TASK-594 (reversed): persist/report ONLY what the
+                # model actually ingested. When the harness truncates
+                # oversized tool output, ``block.content`` IS the
+                # <persisted-output> wrapper (~2KB preview + file path)
+                # the model consumed. We keep it verbatim instead of
+                # re-hydrating the full on-disk file, so DB/history and
+                # the token badge reflect real model-facing cost — not
+                # the untruncated result the model never saw.
                 result_payload = normalize_tool_result(result_content)
                 # TOOLMAP (TASK-414): log the id the bridge
                 # stamps on TOOL_END. The frontend heals a

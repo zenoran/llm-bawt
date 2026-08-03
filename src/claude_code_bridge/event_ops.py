@@ -76,65 +76,6 @@ class ClaudeEventMixin:
     """
 
     @classmethod
-    def _read_persisted_output(cls, text: str) -> str:
-        """If ``text`` is a <persisted-output> wrapper, return the full file body.
-
-        The harness truncates oversized tool output to a wrapper containing
-        ``Full output saved to: <path>`` plus a ~2KB preview, writing the real
-        bytes to that path. We read the file back so the persisted payload holds
-        the COMPLETE result. Non-fatal: any miss returns ``text`` unchanged.
-        """
-        if not isinstance(text, str) or cls._PERSISTED_OUTPUT_MARKER not in text:
-            return text
-        match = cls._PERSISTED_OUTPUT_PATH_RE.search(text)
-        if not match:
-            return text
-        path = match.group(1)
-        try:
-            with open(path, "r", encoding="utf-8", errors="replace") as handle:
-                full = handle.read()
-        except OSError:
-            logger.warning(
-                "persisted-output file unreadable (%s); using inline wrapper", path,
-                exc_info=True,
-            )
-            return text
-        logger.info(
-            "persisted-output: re-hydrated %d chars from %s", len(full), path,
-        )
-        return full
-
-    @classmethod
-    def _resolve_persisted_output(cls, content: object) -> object:
-        """Re-hydrate any <persisted-output> wrapper in a ToolResultBlock body.
-
-        Handles both a raw string body and a list of content-block dicts (the
-        text block is swapped for its re-hydrated full text). Never raises.
-        """
-        try:
-            if isinstance(content, str):
-                return cls._read_persisted_output(content)
-            if isinstance(content, list):
-                resolved: list = []
-                changed = False
-                for part in content:
-                    if (
-                        isinstance(part, dict)
-                        and part.get("type") == "text"
-                        and isinstance(part.get("text"), str)
-                        and cls._PERSISTED_OUTPUT_MARKER in part["text"]
-                    ):
-                        full = cls._read_persisted_output(part["text"])
-                        if full != part["text"]:
-                            part = {**part, "text": full}
-                            changed = True
-                    resolved.append(part)
-                return resolved if changed else content
-        except Exception:
-            logger.warning("persisted-output resolve failed; using inline content", exc_info=True)
-        return content
-
-    @classmethod
     def _is_image_result_tool(cls, tool_name: str | None) -> bool:
         """True for tools whose result carries an image we should persist
         (namespaced ``mcp__x__name`` or bare)."""

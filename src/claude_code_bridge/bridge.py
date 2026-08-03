@@ -6,7 +6,6 @@ import asyncio
 import json
 import logging
 import os
-import re
 import time
 import uuid
 from collections.abc import AsyncIterable
@@ -339,14 +338,6 @@ class ClaudeCodeBridge(
 
 
     # ----- Event publishing -----
-
-
-
-    # ----- Persisted-output re-hydration (TASK-594) -----
-
-    #: Marker the claude-code harness emits when it externalizes large tool output.
-    _PERSISTED_OUTPUT_MARKER = "<persisted-output>"
-    _PERSISTED_OUTPUT_PATH_RE = re.compile(r"Full output saved to:\s*(\S+)")
 
 
 
