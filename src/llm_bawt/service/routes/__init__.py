@@ -21,6 +21,7 @@ from .approval_policies import router as approval_policies_router
 from .tasks import router as tasks_router
 from .ha_weather import router as ha_weather_router
 from .turn_logs import router as turn_logs_router
+from .workspace_provenance import router as workspace_provenance_router
 from .inter_bot_deliveries import router as inter_bot_deliveries_router
 from .agent_context import router as agent_context_router
 from .usage import router as usage_router
@@ -41,6 +42,7 @@ all_routers = [
     chat_router,
     tasks_router,
     turn_logs_router,
+    workspace_provenance_router,
     inter_bot_deliveries_router,
     agent_context_router,
     usage_router,

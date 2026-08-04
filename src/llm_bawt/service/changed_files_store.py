@@ -19,7 +19,7 @@ import json
 import logging
 import os
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -477,6 +477,28 @@ class ChangedFilesStore:
 
     # -- read -------------------------------------------------------------
 
+    def recent_rows(
+        self, *, user_id: str, since_hours: int, limit: int = 2000
+    ) -> tuple[list[TurnChangedFile], bool]:
+        """Return bounded recent provenance rows for one user.
+
+        The extra row detects truncation without a separate count query. Callers
+        still resolve diff bytes through this store so object/Postgres backends
+        remain an implementation detail.
+        """
+        if self.engine is None:
+            raise RuntimeError("changed-file provenance DB unavailable")
+        cutoff = datetime.now(timezone.utc) - timedelta(hours=max(1, since_hours))
+        with Session(self.engine) as session:
+            rows = list(session.exec(
+                select(TurnChangedFile)
+                .where(TurnChangedFile.user_id == user_id)
+                .where(TurnChangedFile.created_at >= cutoff)
+                .order_by(TurnChangedFile.created_at.desc(), TurnChangedFile.id.desc())
+                .limit(limit + 1)
+            ).all())
+        return rows[:limit], len(rows) > limit
+
     def summaries_for_turns(self, turn_ids: list[str]) -> dict[str, dict[str, Any]]:
         """Return {turn_id: summary} for the given turns (empty if none)."""
         if self.engine is None or not turn_ids:
@@ -525,6 +547,27 @@ class ChangedFilesStore:
         return self.summaries_for_turns([turn_id]).get(
             turn_id, build_turn_summary(turn_id, [])
         )
+
+    def content_for_rows(
+        self, rows: list[TurnChangedFile]
+    ) -> dict[int, tuple[FileContent, FileContent]]:
+        """Resolve content for already-loaded rows in one database session."""
+        if self.engine is None or not rows:
+            return {}
+        output: dict[int, tuple[FileContent, FileContent]] = {}
+        with Session(self.engine) as session:
+            for row in rows:
+                if row.id is None:
+                    continue
+                output[row.id] = (
+                    self._resolve_side(
+                        session, row.before_blob_key, row.before_sha256, row.binary, row.truncated
+                    ),
+                    self._resolve_side(
+                        session, row.after_blob_key, row.after_sha256, row.binary, row.truncated
+                    ),
+                )
+        return output
 
     def get_file_content(
         self, *, turn_id: str, repo_key: str, path: str
