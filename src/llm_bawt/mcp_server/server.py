@@ -560,7 +560,7 @@ async def supersede_memory(
 ) -> bool:
     """Mark a memory as superseded by another (or DELETED)."""
     storage = _get_storage()
-    backend = storage.get_backend(bot_id)
+    backend = storage.get_backend(bot_id, provision_schema=True)
     if hasattr(backend, "supersede_memory"):
         return bool(backend.supersede_memory(old_memory_id, new_memory_id))  # type: ignore[attr-defined]
     return False

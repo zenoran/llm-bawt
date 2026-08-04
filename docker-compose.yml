@@ -297,7 +297,7 @@ services:
       redis:
         condition: service_healthy
       app:
-        condition: service_started
+        condition: service_healthy
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8682/health"]

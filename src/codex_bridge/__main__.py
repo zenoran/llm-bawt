@@ -29,6 +29,7 @@ import logging
 import os
 import signal
 import sys
+import time
 from pathlib import Path
 
 from agent_bridge.publisher import RedisPublisher
@@ -38,6 +39,8 @@ from .exec_patch import install as install_exec_patch
 from .local_plugins import install_repo_local_plugins
 from .parser_patch import install as install_parser_patch
 from .transport import auth_path, scrub_api_key_env, validate_auth_json
+
+logger = logging.getLogger("codex_bridge")
 
 
 # Fallback client version if the codex binary can't be probed. The backend
@@ -220,28 +223,42 @@ def _materialize_auth_from_broker(auth_file: Path) -> bool:
     secret = os.environ.get("BRIDGE_CLAUDE_TOKEN_SECRET")
     if secret:
         headers["X-Bridge-Token"] = secret
-    try:
-        resp = httpx.get(
-            f"{api_url}/v1/providers/openai_chatgpt/bundle",
-            headers=headers,
-            timeout=10.0,
-        )
-        if resp.is_error:
+    attempts = max(1, int(os.getenv("CODEX_AUTH_BROKER_ATTEMPTS", "8")))
+    delay = max(0.0, float(os.getenv("CODEX_AUTH_BROKER_RETRY_SECONDS", "1")))
+    for attempt in range(1, attempts + 1):
+        try:
+            resp = httpx.get(
+                f"{api_url}/v1/providers/openai_chatgpt/bundle",
+                headers=headers,
+                timeout=10.0,
+            )
+            if not resp.is_error:
+                bundle = resp.json()
+                auth_file.parent.mkdir(parents=True, exist_ok=True)
+                auth_file.write_text(json.dumps(bundle, indent=2))
+                os.chmod(auth_file, 0o600)
+                logger.info("Materialized auth.json from app broker (path=%s)", auth_file)
+                return True
             logger.warning(
-                "Auth bundle broker returned %s: %s",
+                "Auth bundle broker returned %s on attempt %d/%d: %s",
                 resp.status_code,
+                attempt,
+                attempts,
                 (resp.text or "")[:200],
             )
-            return False
-        bundle = resp.json()
-        auth_file.parent.mkdir(parents=True, exist_ok=True)
-        auth_file.write_text(json.dumps(bundle, indent=2))
-        os.chmod(auth_file, 0o600)
-        logger.info("Materialized auth.json from app broker (path=%s)", auth_file)
-        return True
-    except Exception as e:  # noqa: BLE001
-        logger.warning("Auth bundle broker unreachable: %s", e)
-        return False
+            # Authentication/configuration failures will not heal with a wait.
+            if resp.status_code < 500:
+                return False
+        except Exception as e:  # noqa: BLE001
+            logger.warning(
+                "Auth bundle broker unreachable on attempt %d/%d: %s",
+                attempt,
+                attempts,
+                e,
+            )
+        if attempt < attempts:
+            time.sleep(delay)
+    return False
 
 
 def main() -> None:
@@ -253,8 +270,6 @@ def main() -> None:
         stream=sys.stdout,
     )
     logging.getLogger("httpx").setLevel(logging.WARNING)
-    logger = logging.getLogger("codex_bridge")
-
     # Patch the SDK's strict-literal parser so a single mismatched item
     # status doesn't kill the whole turn (see parser_patch.py).
     install_parser_patch()

@@ -140,15 +140,25 @@ def test_memory_storage_caches_are_instance_owned_and_single_flight(
     backend_builds: list[str] = []
     manager_builds: list[str] = []
 
-    def backend_factory(*, config, bot_id):
+    def backend_factory(*, config, bot_id, provision_schema=False):
         time.sleep(0.01)
         backend_builds.append(bot_id)
-        return SimpleNamespace(config=config, bot_id=bot_id)
+        return SimpleNamespace(
+            config=config,
+            bot_id=bot_id,
+            ensure_schema=lambda: None,
+            provision_schema=provision_schema,
+        )
 
-    def manager_factory(*, config, bot_id):
+    def manager_factory(*, config, bot_id, provision_schema=False):
         time.sleep(0.01)
         manager_builds.append(bot_id)
-        return SimpleNamespace(config=config, bot_id=bot_id)
+        return SimpleNamespace(
+            config=config,
+            bot_id=bot_id,
+            ensure_schema=lambda: None,
+            provision_schema=provision_schema,
+        )
 
     monkeypatch.setattr(storage_module, "PostgreSQLMemoryBackend", backend_factory)
     monkeypatch.setattr(postgresql, "PostgreSQLShortTermManager", manager_factory)

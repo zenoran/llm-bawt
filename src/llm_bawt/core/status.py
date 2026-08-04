@@ -229,7 +229,11 @@ def _collect_memory_info(config: Config, default_bot_slug: str) -> MemoryInfo:
     try:
         from llm_bawt.memory.postgresql import PostgreSQLMemoryBackend
 
-        backend = PostgreSQLMemoryBackend(config, bot_id=default_bot_slug)
+        backend = PostgreSQLMemoryBackend(
+            config,
+            bot_id=default_bot_slug,
+            provision_schema=False,
+        )
         db_stats = backend.stats()
         info.postgres_connected = True
         info.postgres_host = config.POSTGRES_HOST

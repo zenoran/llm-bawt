@@ -10,6 +10,7 @@ The actual implementation delegates to the battle-tested postgresql.py backend.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import threading
 import time
@@ -22,6 +23,7 @@ from llm_bawt.memory.postgresql import PostgreSQLMemoryBackend
 from llm_bawt.memory.embeddings import generate_embedding
 from llm_bawt.message_authorship import AuthorReference, normalize_author
 from llm_bawt.utils.config import Config
+from llm_bawt.utils.db import get_shared_engine
 
 if TYPE_CHECKING:
     from llm_bawt.memory.postgresql import PostgreSQLShortTermManager
@@ -92,31 +94,52 @@ class MemoryStorage:
 
     def __init__(self, config: Config | None = None):
         self.config = config or Config()
+        self.engine = get_shared_engine(self.config)
         self._backends: dict[str, PostgreSQLMemoryBackend] = {}
         self._short_term_managers: dict[str, "PostgreSQLShortTermManager"] = {}
         self._cache_lock = threading.Lock()
 
-    def _get_backend(self, bot_id: str) -> PostgreSQLMemoryBackend:
-        """Get or create a backend for the given bot."""
+    def _require_engine(self):
+        if self.engine is None:
+            raise RuntimeError("MemoryStorage requires Postgres credentials")
+        return self.engine
+
+    def _get_backend(
+        self,
+        bot_id: str,
+        *,
+        provision_schema: bool = False,
+    ) -> PostgreSQLMemoryBackend:
+        """Get a backend, provisioning schema only for an explicit mutation."""
         cached = self._backends.get(bot_id)
         if cached is not None:
+            if provision_schema:
+                cached.ensure_schema()
             return cached
         with self._cache_lock:
             cached = self._backends.get(bot_id)
             if cached is not None:
+                if provision_schema:
+                    cached.ensure_schema()
                 return cached
             self._backends[bot_id] = PostgreSQLMemoryBackend(
                 config=self.config,
                 bot_id=bot_id,
+                provision_schema=provision_schema,
             )
             return self._backends[bot_id]
 
-    def get_backend(self, bot_id: str) -> PostgreSQLMemoryBackend:
+    def get_backend(
+        self,
+        bot_id: str,
+        *,
+        provision_schema: bool = False,
+    ) -> PostgreSQLMemoryBackend:
         """Public access to get or create a backend for the given bot.
         
         Used by MemoryClient for raw backend access.
         """
-        return self._get_backend(bot_id)
+        return self._get_backend(bot_id, provision_schema=provision_schema)
 
     def hydrate_message_authors(
         self,
@@ -127,12 +150,12 @@ class MemoryStorage:
         """Attach canonical, deterministic-legacy, or unknown author envelopes."""
         from llm_bawt.message_authorship import LegacyAuthorResolver
 
-        backend = self._get_backend(bot_id)
-        authors = LegacyAuthorResolver(backend.engine).resolve(messages, bot_id=bot_id)
+        engine = self._require_engine()
+        authors = LegacyAuthorResolver(engine).resolve(messages, bot_id=bot_id)
         references = [authors[str(message.get("id") or "")] for message in messages]
         from llm_bawt.entity_presentation import EntityPresentationResolver
 
-        presentation = EntityPresentationResolver(backend.engine).resolve_many_safe(
+        presentation = EntityPresentationResolver(engine).resolve_many_safe(
             references
         )
         return [
@@ -143,22 +166,32 @@ class MemoryStorage:
             for message, author in zip(messages, references, strict=True)
         ]
 
-    def get_short_term_manager(self, bot_id: str) -> "PostgreSQLShortTermManager":
+    def get_short_term_manager(
+        self,
+        bot_id: str,
+        *,
+        provision_schema: bool = False,
+    ) -> "PostgreSQLShortTermManager":
         """Get a short-term memory manager for conversation history.
         
         The short-term manager handles session messages for HistoryManager.
         """
         cached = self._short_term_managers.get(bot_id)
         if cached is not None:
+            if provision_schema:
+                cached.ensure_schema()
             return cached
         with self._cache_lock:
             cached = self._short_term_managers.get(bot_id)
             if cached is not None:
+                if provision_schema:
+                    cached.ensure_schema()
                 return cached
             from llm_bawt.memory.postgresql import PostgreSQLShortTermManager
             self._short_term_managers[bot_id] = PostgreSQLShortTermManager(
                 config=self.config,
                 bot_id=bot_id,
+                provision_schema=provision_schema,
             )
             return self._short_term_managers[bot_id]
 
@@ -178,7 +211,7 @@ class MemoryStorage:
         memory_id = str(uuid.uuid4())
         tags = tags or ["misc"]
         
-        backend = self._get_backend(bot_id)
+        backend = self._get_backend(bot_id, provision_schema=True)
         
         # Generate embedding
         embedding = generate_embedding(content, self.config.MEMORY_EMBEDDING_MODEL, verbose=self.config.VERBOSE)
@@ -305,7 +338,7 @@ class MemoryStorage:
         importance: float | None = None,
     ) -> Memory | None:
         """Update an existing memory."""
-        backend = self._get_backend(bot_id)
+        backend = self._get_backend(bot_id, provision_schema=True)
         
         # Get current memory
         current = await self.get_memory(memory_id, bot_id)
@@ -343,7 +376,7 @@ class MemoryStorage:
         bot_id: str = "default",
     ) -> bool:
         """Delete a memory."""
-        backend = self._get_backend(bot_id)
+        backend = self._get_backend(bot_id, provision_schema=True)
         
         try:
             if hasattr(backend, 'delete_memory'):
@@ -404,7 +437,7 @@ class MemoryStorage:
         # cached instances converge on the same active thread per (bot, user).
         if session_id is None:
             try:
-                manager = self.get_short_term_manager(bot_id)
+                manager = self.get_short_term_manager(bot_id, provision_schema=True)
                 session_id = manager.get_or_create_active_session(
                     bot_id=bot_id, user_id=user_id
                 )
@@ -414,7 +447,7 @@ class MemoryStorage:
                     bot_id, user_id, e,
                 )
 
-        backend = self._get_backend(bot_id)
+        backend = self._get_backend(bot_id, provision_schema=True)
         backend.add_message(
             message_id=message_id_final,
             role=role,
@@ -510,7 +543,7 @@ class MemoryStorage:
         bot_id: str = "default",
     ) -> None:
         """Mark messages as processed for memory extraction."""
-        backend = self._get_backend(bot_id)
+        backend = self._get_backend(bot_id, provision_schema=True)
         backend.mark_messages_processed(message_ids)
 
     # =========================================================================
@@ -550,11 +583,11 @@ class MemoryStorage:
         return backend.preview_ignored_messages()
 
     async def ignore_recent_messages(self, bot_id: str = "default", count: int = 10) -> int:
-        backend = self._get_backend(bot_id)
+        backend = self._get_backend(bot_id, provision_schema=True)
         return backend.ignore_recent_messages(count)
 
     async def ignore_messages_since_minutes(self, bot_id: str = "default", minutes: int = 60) -> int:
-        backend = self._get_backend(bot_id)
+        backend = self._get_backend(bot_id, provision_schema=True)
         return backend.ignore_messages_since_minutes(minutes)
 
     async def get_message_by_id(
@@ -577,11 +610,11 @@ class MemoryStorage:
         return self.hydrate_message_authors([result], bot_id=bot_id)[0]
 
     async def ignore_message_by_id(self, bot_id: str = "default", message_id: str = "") -> bool:
-        backend = self._get_backend(bot_id)
+        backend = self._get_backend(bot_id, provision_schema=True)
         return backend.ignore_message_by_id(message_id)
 
     async def restore_ignored_messages(self, bot_id: str = "default") -> int:
-        backend = self._get_backend(bot_id)
+        backend = self._get_backend(bot_id, provision_schema=True)
         return backend.restore_ignored_messages()
 
     async def get_messages_for_summary(self, bot_id: str = "default", summary_id: str = "") -> list[dict[str, Any]]:
@@ -600,15 +633,15 @@ class MemoryStorage:
         return results
 
     async def mark_messages_recalled(self, bot_id: str = "default", message_ids: list[str] | None = None) -> int:
-        manager = self.get_short_term_manager(bot_id)
+        manager = self.get_short_term_manager(bot_id, provision_schema=True)
         return manager.mark_messages_recalled(message_ids or [])
 
     async def delete_memories_by_source_message_ids(self, bot_id: str = "default", message_ids: list[str] | None = None) -> int:
-        backend = self._get_backend(bot_id)
+        backend = self._get_backend(bot_id, provision_schema=True)
         return backend.delete_memories_by_source_message_ids(message_ids or [])
 
     async def regenerate_embeddings(self, bot_id: str = "default", batch_size: int = 50) -> dict[str, Any]:
-        backend = self._get_backend(bot_id)
+        backend = self._get_backend(bot_id, provision_schema=True)
         return backend.regenerate_embeddings(batch_size=batch_size)
 
     async def consolidate_memories(
@@ -623,7 +656,7 @@ class MemoryStorage:
         """
         from llm_bawt.memory.consolidation import MemoryConsolidator, get_local_llm_client
 
-        backend = self._get_backend(bot_id)
+        backend = self._get_backend(bot_id, provision_schema=True)
         llm_client = None if dry_run else get_local_llm_client(self.config)
 
         threshold = similarity_threshold or getattr(self.config, "MEMORY_CONSOLIDATION_THRESHOLD", 0.92)
@@ -661,7 +694,7 @@ class MemoryStorage:
             return False
         from llm_bawt.memory.maintenance import update_memory_meaning
 
-        backend = self._get_backend(bot_id)
+        backend = self._get_backend(bot_id, provision_schema=True)
         return bool(
             update_memory_meaning(
                 backend=backend,
@@ -686,7 +719,7 @@ class MemoryStorage:
         """Run unified memory maintenance inside the memory service."""
         from llm_bawt.memory.maintenance import MemoryMaintenance
 
-        backend = self._get_backend(bot_id)
+        backend = self._get_backend(bot_id, provision_schema=True)
         maint = MemoryMaintenance(
             backend=backend,
             llm_client=None,
@@ -742,39 +775,52 @@ class MemoryStorage:
         single selected thread. Cheap: it never pulls cross-session raw rows.
         """
         if summaries_only:
-            return self._get_summary_husks(bot_id, limit=limit)
+            return await asyncio.to_thread(
+                self._get_summary_husks,
+                bot_id,
+                limit=limit,
+            )
         if session_id is not None:
-            return self._get_messages_raw(
-                bot_id, since_seconds=since_seconds, limit=limit,
-                session_id=session_id, exclude_summarized=exclude_summarized,
+            return await asyncio.to_thread(
+                self._get_messages_raw,
+                bot_id,
+                since_seconds=since_seconds,
+                limit=limit,
+                session_id=session_id,
+                exclude_summarized=exclude_summarized,
             )
         if raw:
-            return self._get_messages_raw(
-                bot_id, since_seconds=since_seconds, limit=limit
+            return await asyncio.to_thread(
+                self._get_messages_raw,
+                bot_id,
+                since_seconds=since_seconds,
+                limit=limit,
             )
 
         manager = self.get_short_term_manager(bot_id)
 
         try:
-            messages = manager.get_messages(since_minutes=since_seconds)
-            if limit is not None and limit >= 0:
-                messages = messages[-limit:]
+            def load_and_hydrate() -> list[dict[str, Any]]:
+                messages = manager.get_messages(since_minutes=since_seconds)
+                if limit is not None and limit >= 0:
+                    messages = messages[-limit:]
 
-            rows = [
-                {
-                    "id": msg.db_id,
-                    "role": msg.role,
-                    "content": msg.content,
-                    "timestamp": msg.timestamp,
-                    # TASK-284: preserve the durable thread id instead of dropping
-                    # it — getattr keeps this safe for any Message-like without it.
-                    "session_id": getattr(msg, "session_id", None),
-                    "author_entity_type": getattr(msg, "author_entity_type", None),
-                    "author_entity_id": getattr(msg, "author_entity_id", None),
-                }
-                for msg in messages
-            ]
-            return self.hydrate_message_authors(rows, bot_id=bot_id)
+                rows = [
+                    {
+                        "id": msg.db_id,
+                        "role": msg.role,
+                        "content": msg.content,
+                        "timestamp": msg.timestamp,
+                        # Preserve durable thread and canonical author columns.
+                        "session_id": getattr(msg, "session_id", None),
+                        "author_entity_type": getattr(msg, "author_entity_type", None),
+                        "author_entity_id": getattr(msg, "author_entity_id", None),
+                    }
+                    for msg in messages
+                ]
+                return self.hydrate_message_authors(rows, bot_id=bot_id)
+
+            return await asyncio.to_thread(load_and_hydrate)
         except Exception as e:
             logger.error("Failed to get messages: %s", e)
             return []
@@ -892,7 +938,7 @@ class MemoryStorage:
 
     async def clear_messages(self, bot_id: str = "default") -> int:
         """Delete all messages for a bot."""
-        backend = self._get_backend(bot_id)
+        backend = self._get_backend(bot_id, provision_schema=True)
         from sqlalchemy import text
 
         try:
@@ -906,11 +952,11 @@ class MemoryStorage:
 
     async def clear_memories(self, bot_id: str = "default") -> bool:
         """Delete all distilled memories for a bot through its cached backend."""
-        return bool(self._get_backend(bot_id).clear())
+        return bool(self._get_backend(bot_id, provision_schema=True).clear())
 
     async def remove_last_message_if_partial(self, bot_id: str = "default", role: str = "assistant") -> bool:
         """Remove the most recent message if it matches role."""
-        backend = self._get_backend(bot_id)
+        backend = self._get_backend(bot_id, provision_schema=True)
         from sqlalchemy import text
 
         try:
@@ -961,7 +1007,7 @@ class MemoryStorage:
 
         from llm_bawt.memory.summarization import resolve_source_session_ids
 
-        backend = self._get_backend(bot_id)
+        backend = self._get_backend(bot_id, provision_schema=True)
         summary_id = str(uuid.uuid4())
         metadata = {
             "summary_type": "self_recap",
@@ -1020,7 +1066,7 @@ class MemoryStorage:
         Returns True iff a row was updated. Idempotent: closing an already-
         closed session returns False without error.
         """
-        manager = self.get_short_term_manager(bot_id)
+        manager = self.get_short_term_manager(bot_id, provision_schema=True)
         return manager.close_session(session_id)
 
     async def get_session(
@@ -1088,7 +1134,7 @@ class MemoryStorage:
         the previous session row flips to ``status='archived'``. Returns the
         new active session id. Close+open run in one transaction.
         """
-        manager = self.get_short_term_manager(bot_id)
+        manager = self.get_short_term_manager(bot_id, provision_schema=True)
         return manager.rotate_session(bot_id=bot_id, user_id=user_id)
 
     async def activate_session(
@@ -1102,7 +1148,7 @@ class MemoryStorage:
         TASK-284: the thread-switch primitive. Returns ``False`` if the target
         doesn't exist or belongs to a different (bot, user).
         """
-        manager = self.get_short_term_manager(bot_id)
+        manager = self.get_short_term_manager(bot_id, provision_schema=True)
         return manager.activate_session(session_id, bot_id=bot_id, user_id=user_id)
 
     async def get_or_create_active_session(
@@ -1115,7 +1161,7 @@ class MemoryStorage:
         TASK-284 step 15: used by the provider↔thread mirror so a freshly
         minted provider session always has a durable DB thread to map onto.
         """
-        manager = self.get_short_term_manager(bot_id)
+        manager = self.get_short_term_manager(bot_id, provision_schema=True)
         return manager.get_or_create_active_session(bot_id=bot_id, user_id=user_id)
 
     async def set_session_status(
@@ -1130,7 +1176,7 @@ class MemoryStorage:
         and its deep-links return 410. Reactivation goes through
         :meth:`activate_session`, never here.
         """
-        manager = self.get_short_term_manager(bot_id)
+        manager = self.get_short_term_manager(bot_id, provision_schema=True)
         return manager.set_session_status(session_id, status)
 
     async def update_session_metadata(
@@ -1143,7 +1189,7 @@ class MemoryStorage:
 
         Records canonical per-backend SDK key/model maps on the durable thread.
         """
-        manager = self.get_short_term_manager(bot_id)
+        manager = self.get_short_term_manager(bot_id, provision_schema=True)
         return manager.update_session_metadata(session_id, patch)
 
 
@@ -1163,10 +1209,9 @@ class MemoryStorage:
         """
         from sqlalchemy import text
 
-        backend = self._get_backend("default")
         prefix = f"{parent}_p_"
         try:
-            with backend.engine.connect() as conn:
+            with self._require_engine().connect() as conn:
                 rows = conn.execute(text("""
                     SELECT c.relname
                     FROM pg_inherits i
@@ -1226,13 +1271,12 @@ class MemoryStorage:
 
         from llm_bawt.memory.postgresql import MEMORIES_PARENT
 
-        backend = self._get_backend("default")
         bots = self._global_search_bots(MEMORIES_PARENT)
         if not bots:
             return []
 
         try:
-            with backend.engine.connect() as conn:
+            with self._require_engine().connect() as conn:
                 rows = conn.execute(text(
                     f"SELECT bot_id, COUNT(*) FROM {MEMORIES_PARENT} GROUP BY bot_id"
                 )).fetchall()
@@ -1279,102 +1323,24 @@ class MemoryStorage:
         every row; callers can read it from the first row and ignore the
         rest. Empty result → no rows → caller should treat as ``total=0``.
         """
-        from sqlalchemy import text
-        from llm_bawt.memory.postgresql import MESSAGES_PARENT, build_fts_query
+        from llm_bawt.mcp_server.message_search import CrossBotMessageSearcher
 
-        or_query = build_fts_query(query)
-        if not or_query:
-            return []
-
-        # Visibility policy: opted-out bots never appear in aggregate
-        # results — even when explicitly requested by ``bot_id`` (same
-        # semantics the shard-discovery filter enforced).
-        excluded = self._global_search_excluded_bot_ids()
-        params: dict[str, Any] = {"query": or_query, "limit": n_results}
-        if bot_id:
-            if bot_id in excluded:
-                return []
-            bot_clause = "AND bot_id = :bot_filter"
-            params["bot_filter"] = bot_id
-        elif excluded:
-            bot_clause = "AND NOT (bot_id = ANY(:excluded))"
-            params["excluded"] = sorted(excluded)
-        else:
-            bot_clause = ""
-
-        # Compose conditional WHERE fragments once. They reference bind
-        # params resolved per-execution below.
-        time_lower = "AND timestamp >= :since" if since is not None else ""
-        time_upper = "AND timestamp <= :until" if until is not None else ""
-        role_clause = "AND role = :role_filter" if role_filter else ""
-
-        # ``sort_by="recent"`` ignores rank entirely so the user can search
-        # for a common word and still see the latest hit. Whitelist before
-        # interpolation — sort_by is the only SQL fragment built from a
-        # caller-supplied string, so the comparison is the safety net.
-        order_clause = "ORDER BY timestamp DESC" if sort_by == "recent" else "ORDER BY rank DESC, timestamp DESC"
-        # ``COUNT(*) OVER ()`` is the unbounded-total trick: each row in
-        # the LIMIT slice carries the count of all rows that matched the
-        # WHERE, so the caller knows "you're seeing 10 of 1497" without
-        # a second roundtrip. Postgres has to materialize all matches to
-        # count them — fine for tens of thousands, watch if we ever hit
-        # very common short tokens.
-        full_sql = text(f"""
-            SELECT id, role, content, timestamp, session_id,
-                   author_entity_type, author_entity_id,
-                   bot_id AS source,
-                   ts_rank(to_tsvector('english', content),
-                           to_tsquery('english', :query)) AS rank,
-                   COUNT(*) OVER () AS total
-            FROM {MESSAGES_PARENT}
-            WHERE to_tsvector('english', content) @@ to_tsquery('english', :query)
-              AND role != 'system'
-              {bot_clause}
-              {role_clause}
-              {time_lower}
-              {time_upper}
-            {order_clause}
-            LIMIT :limit
-        """)
-
-        if role_filter:
-            params["role_filter"] = role_filter
-        if since is not None:
-            params["since"] = since
-        if until is not None:
-            params["until"] = until
-
-        backend = self._get_backend("default")
+        searcher = CrossBotMessageSearcher(
+            self._require_engine(),
+            lambda rows, source: self.hydrate_message_authors(rows, bot_id=source),
+        )
         try:
-            with backend.engine.connect() as conn:
-                rows = conn.execute(full_sql, params).fetchall()
-                grouped: dict[str, list[dict[str, Any]]] = {}
-                order: dict[tuple[str, str], int] = {}
-                for index, row in enumerate(rows):
-                    source = str(row.source)
-                    message_id = str(row.id)
-                    order[(source, message_id)] = index
-                    grouped.setdefault(source, []).append({
-                        "id": row.id,
-                        "role": row.role,
-                        "content": row.content,
-                        "timestamp": row.timestamp,
-                        "session_id": row.session_id,
-                        "author_entity_type": row.author_entity_type,
-                        "author_entity_id": row.author_entity_id,
-                        "source": row.source,
-                        "rank": row.rank,
-                        "total": int(row.total),
-                    })
-                hydrated: list[dict[str, Any]] = []
-                for source, source_rows in grouped.items():
-                    hydrated.extend(
-                        self.hydrate_message_authors(source_rows, bot_id=source)
-                    )
-                hydrated.sort(
-                    key=lambda row: order[(str(row["source"]), str(row["id"]))]
-                )
-                return hydrated
+            return await asyncio.to_thread(
+                searcher.search_fts,
+                query,
+                n_results=n_results,
+                role_filter=role_filter,
+                sort_by=sort_by,
+                since=since,
+                until=until,
+                bot_id=bot_id,
+                excluded_bot_ids=self._global_search_excluded_bot_ids(),
+            )
         except Exception as e:
             logger.error("search_all_messages failed: %s", e)
             return []
@@ -1411,100 +1377,23 @@ class MemoryStorage:
         ``mode=fts`` (default) keeps prior behaviour; ``mode=trgm`` calls
         this method. The Spotlight modal exposes the choice as a toggle.
         """
-        from sqlalchemy import text
+        from llm_bawt.mcp_server.message_search import CrossBotMessageSearcher
 
-        from llm_bawt.memory.postgresql import MESSAGES_PARENT
-
-        q = (query or "").strip()
-        if not q:
-            return []
-
-        # `ilike` carries the wildcarded form used by the WHERE clause.
-        # `query` stays raw so similarity() compares against the user's
-        # literal input — wildcards in the score input would skew the
-        # trigram comparison.
-        params: dict[str, Any] = {
-            "query": q,
-            "ilike": f"%{q}%",
-            "limit": n_results,
-        }
-
-        # Visibility policy — same exclusion semantics as the FTS sibling.
-        excluded = self._global_search_excluded_bot_ids()
-        if excluded:
-            bot_clause = "AND NOT (bot_id = ANY(:excluded))"
-            params["excluded"] = sorted(excluded)
-        else:
-            bot_clause = ""
-
-        # Optional WHERE fragments. Same pattern as search_all_messages.
-        time_lower = "AND timestamp >= :since" if since is not None else ""
-        time_upper = "AND timestamp <= :until" if until is not None else ""
-        role_clause = "AND role = :role_filter" if role_filter else ""
-
-        # ``sort_by="recent"`` ignores similarity — useful for "find the
-        # latest mention of this token" once the user knows the token
-        # itself is common.
-        order_clause = "ORDER BY timestamp DESC" if sort_by == "recent" else "ORDER BY rank DESC, timestamp DESC"
-        # One trigram-indexed ILIKE over the partitioned parent (TASK-571):
-        # each partition uses its own templated gin_trgm_ops index, and
-        # similarity() only runs on rows that survived the ILIKE filter.
-        # Window COUNT(*) for the unbounded total — see the FTS sibling.
-        full_sql = text(f"""
-            SELECT id, role, content, timestamp, session_id,
-                   author_entity_type, author_entity_id,
-                   bot_id AS source,
-                   similarity(content, :query) AS rank,
-                   COUNT(*) OVER () AS total
-            FROM {MESSAGES_PARENT}
-            WHERE content ILIKE :ilike
-              AND role != 'system'
-              {bot_clause}
-              {role_clause}
-              {time_lower}
-              {time_upper}
-            {order_clause}
-            LIMIT :limit
-        """)
-
-        if role_filter:
-            params["role_filter"] = role_filter
-        if since is not None:
-            params["since"] = since
-        if until is not None:
-            params["until"] = until
-
-        backend = self._get_backend("default")
+        searcher = CrossBotMessageSearcher(
+            self._require_engine(),
+            lambda rows, source: self.hydrate_message_authors(rows, bot_id=source),
+        )
         try:
-            with backend.engine.connect() as conn:
-                rows = conn.execute(full_sql, params).fetchall()
-                grouped: dict[str, list[dict[str, Any]]] = {}
-                order: dict[tuple[str, str], int] = {}
-                for index, row in enumerate(rows):
-                    source = str(row.source)
-                    message_id = str(row.id)
-                    order[(source, message_id)] = index
-                    grouped.setdefault(source, []).append({
-                        "id": row.id,
-                        "role": row.role,
-                        "content": row.content,
-                        "timestamp": row.timestamp,
-                        "session_id": row.session_id,
-                        "author_entity_type": row.author_entity_type,
-                        "author_entity_id": row.author_entity_id,
-                        "source": row.source,
-                        "rank": row.rank,
-                        "total": int(row.total),
-                    })
-                hydrated: list[dict[str, Any]] = []
-                for source, source_rows in grouped.items():
-                    hydrated.extend(
-                        self.hydrate_message_authors(source_rows, bot_id=source)
-                    )
-                hydrated.sort(
-                    key=lambda row: order[(str(row["source"]), str(row["id"]))]
-                )
-                return hydrated
+            return await asyncio.to_thread(
+                searcher.search_trgm,
+                query,
+                n_results=n_results,
+                role_filter=role_filter,
+                sort_by=sort_by,
+                since=since,
+                until=until,
+                excluded_bot_ids=self._global_search_excluded_bot_ids(),
+            )
         except Exception as e:
             logger.error("search_all_messages_trgm failed: %s", e)
             return []

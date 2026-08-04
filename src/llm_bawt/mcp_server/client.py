@@ -384,7 +384,7 @@ class MemoryClient:
         if self.server_url:
             return int(self._call_server("messages_ignore_recent", {"bot_id": self.bot_id, "count": count}))
         storage = self._get_storage()
-        backend = storage.get_backend(self.bot_id)
+        backend = storage.get_backend(self.bot_id, provision_schema=True)
         return int(backend.ignore_recent_messages(count))
 
     def ignore_messages_since_minutes(self, minutes: int) -> int:
@@ -394,7 +394,7 @@ class MemoryClient:
                 self._call_server("messages_ignore_since_minutes", {"bot_id": self.bot_id, "minutes": minutes})
             )
         storage = self._get_storage()
-        backend = storage.get_backend(self.bot_id)
+        backend = storage.get_backend(self.bot_id, provision_schema=True)
         return int(backend.ignore_messages_since_minutes(minutes))
 
     def get_message_by_id(self, message_id: str) -> dict | None:
@@ -415,7 +415,7 @@ class MemoryClient:
                 self._call_server("messages_ignore_by_id", {"bot_id": self.bot_id, "message_id": message_id})
             )
         storage = self._get_storage()
-        backend = storage.get_backend(self.bot_id)
+        backend = storage.get_backend(self.bot_id, provision_schema=True)
         return bool(backend.ignore_message_by_id(message_id))
 
     def restore_ignored_messages(self) -> int:
@@ -423,7 +423,7 @@ class MemoryClient:
         if self.server_url:
             return int(self._call_server("messages_restore_ignored", {"bot_id": self.bot_id}))
         storage = self._get_storage()
-        backend = storage.get_backend(self.bot_id)
+        backend = storage.get_backend(self.bot_id, provision_schema=True)
         return int(backend.restore_ignored_messages())
 
     def delete_memories_by_source_message_ids(self, message_ids: list[str]) -> int:
@@ -436,7 +436,7 @@ class MemoryClient:
                 )
             )
         storage = self._get_storage()
-        backend = storage.get_backend(self.bot_id)
+        backend = storage.get_backend(self.bot_id, provision_schema=True)
         return int(backend.delete_memories_by_source_message_ids(message_ids))
 
     def regenerate_embeddings(self, batch_size: int = 50) -> dict[str, Any]:
@@ -447,7 +447,7 @@ class MemoryClient:
                 {"bot_id": self.bot_id, "batch_size": batch_size},
             )
         storage = self._get_storage()
-        backend = storage.get_backend(self.bot_id)
+        backend = storage.get_backend(self.bot_id, provision_schema=True)
         return backend.regenerate_embeddings(batch_size=batch_size)
 
     def consolidate_memories(self, dry_run: bool = True, similarity_threshold: float | None = None) -> dict[str, Any]:
@@ -458,7 +458,7 @@ class MemoryClient:
                 {"bot_id": self.bot_id, "dry_run": dry_run, "similarity_threshold": similarity_threshold},
             )
         storage = self._get_storage()
-        backend = storage.get_backend(self.bot_id)
+        backend = storage.get_backend(self.bot_id, provision_schema=True)
         from llm_bawt.memory.consolidation import MemoryConsolidator, get_local_llm_client
 
         llm_client = None if dry_run else get_local_llm_client(self.config)
@@ -909,7 +909,11 @@ class MemoryClient:
         # Create a backend connection directly since this isn't routed through MCP
         from ..memory.postgresql import PostgreSQLMemoryBackend
 
-        backend = PostgreSQLMemoryBackend(self.config, bot_id=self.bot_id)
+        backend = PostgreSQLMemoryBackend(
+            self.config,
+            bot_id=self.bot_id,
+            provision_schema=False,
+        )
 
         # Use the existing search_messages_by_text method
         results = backend.search_messages_by_text(
@@ -1184,7 +1188,7 @@ class MemoryClient:
         
         # Embedded mode
         storage = self._get_storage()
-        backend = storage.get_backend(self.bot_id)
+        backend = storage.get_backend(self.bot_id, provision_schema=True)
         if hasattr(backend, 'supersede_memory'):
             return backend.supersede_memory(old_memory_id, new_memory_id)  # type: ignore
         return False

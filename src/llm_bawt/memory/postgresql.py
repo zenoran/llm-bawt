@@ -202,12 +202,22 @@ def ensure_bot_partitions(conn, bot_id: str) -> None:
     sanitized = _sanitize_table_name(bot_id)
     for base in PARENT_TABLES:
         part = f"{base}_p_{sanitized}"
+        # This catalog probe is intentionally ahead of every DDL statement.
+        # ``IF NOT EXISTS`` still takes heavyweight relation locks, so issuing
+        # CREATE/ALTER on every cold process start made a read path capable of
+        # blocking behind its own open SELECT transaction (TASK-739).
+        exists = conn.execute(
+            text("SELECT to_regclass(:partition_name)"),
+            {"partition_name": part},
+        ).scalar()
+        if exists:
+            continue
         try:
             # SAVEPOINT so a create race doesn't abort the enclosing txn
             # before the existence re-check below.
             with conn.begin_nested():
                 conn.execute(text(
-                    f"CREATE TABLE IF NOT EXISTS {part} "
+                    f"CREATE TABLE {part} "
                     f"PARTITION OF {base} FOR VALUES IN ('{sanitized}')"
                 ))
                 conn.execute(text(
@@ -217,9 +227,10 @@ def ensure_bot_partitions(conn, bot_id: str) -> None:
             # Duplicate-table race from a concurrent backend init, or the
             # partition already exists with the same bound. Idempotent-ish:
             # verify existence before treating as fatal.
-            exists = conn.execute(text(
-                "SELECT 1 FROM information_schema.tables WHERE table_name = :n"
-            ), {"n": part}).fetchone()
+            exists = conn.execute(
+                text("SELECT to_regclass(:partition_name)"),
+                {"partition_name": part},
+            ).scalar()
             if not exists:
                 raise
             logger.debug(f"Partition {part} creation race (already exists): {e}")
@@ -396,7 +407,14 @@ class PostgreSQLMemoryBackend(MemoryBackend):
     EMBEDDING_DIM = 384
     _schema_guard = SchemaBootstrapGuard()
     
-    def __init__(self, config: Any, bot_id: str = "nova", embedding_dim: int | None = None):
+    def __init__(
+        self,
+        config: Any,
+        bot_id: str = "nova",
+        embedding_dim: int | None = None,
+        *,
+        provision_schema: bool = True,
+    ):
         super().__init__(config, bot_id=bot_id)
         
         # Get embedding settings from config
@@ -441,8 +459,22 @@ class PostgreSQLMemoryBackend(MemoryBackend):
             self._messages_table_name,
         )
 
-        self._ensure_tables_exist()
+        self._schema_ready = False
+        if provision_schema:
+            self.ensure_schema()
         logger.debug(f"Connected to PostgreSQL at {host}:{port}/{database} (bot: {bot_id})")
+
+    def ensure_schema(self) -> None:
+        """Provision shared schema and this bot's partitions before a write.
+
+        Read-only callers construct the backend with ``provision_schema=False``
+        so an HTTP GET can never acquire DDL locks.  A cached read backend can
+        later be promoted safely when a mutation arrives.
+        """
+        if self._schema_ready:
+            return
+        self._ensure_tables_exist()
+        self._schema_ready = True
     
     def _ensure_tables_exist(self) -> None:
         """Ensure the partitioned parents + this bot's partitions exist.
@@ -2090,13 +2122,24 @@ class PostgreSQLShortTermManager:
     but provides session-scoped access for building context windows.
     """
     
-    def __init__(self, config: Any, bot_id: str = "nova", user_id: str | None = None):
+    def __init__(
+        self,
+        config: Any,
+        bot_id: str = "nova",
+        user_id: str | None = None,
+        *,
+        provision_schema: bool = True,
+    ):
         self.config = config
         self.bot_id = bot_id
         # TASK-284: sessions are namespaced (bot_id, user_id). May be None for
         # legacy/back-compat callers that don't carry a user.
         self.user_id = user_id
-        self._backend = PostgreSQLMemoryBackend(config, bot_id)
+        self._backend = PostgreSQLMemoryBackend(
+            config,
+            bot_id,
+            provision_schema=provision_schema,
+        )
         # TASK-284: do NOT mint+insert a session row per construction. That was
         # the leak — these managers are cached/evicted per (model, bot, user),
         # so eager per-construction insertion accumulated hundreds of
@@ -2104,6 +2147,10 @@ class PostgreSQLShortTermManager:
         # the sessions table (the DB-derived single source of truth) on first
         # use, so every instance/worker for a (bot, user) converges on one row.
         self._session_id_cache: str | None = None
+
+    def ensure_schema(self) -> None:
+        """Promote a read-only manager before a mutating operation."""
+        self._backend.ensure_schema()
 
     @property
     def _current_session_id(self) -> str:

@@ -78,20 +78,39 @@ DEFAULT_MAX_OVERFLOW = 10
 # instead of held forever (Postgres restarts / NAT timeouts otherwise leave
 # zombies in the pool).
 DEFAULT_POOL_RECYCLE_SECONDS = 1800
+# Deadman controls for lock regressions.  A request must fail and release its
+# connection instead of silently wedging the shared pool/event loop forever.
+DEFAULT_LOCK_TIMEOUT = "5s"
+DEFAULT_STATEMENT_TIMEOUT = "120s"
+DEFAULT_IDLE_TRANSACTION_TIMEOUT = "30s"
+
+
+def _configure_dbapi_connection(dbapi_connection) -> None:
+    """Apply the per-session safety policy to a raw DB-API connection."""
+    cursor = dbapi_connection.cursor()
+    cursor.execute("SET timezone = 'UTC'")
+    cursor.execute(f"SET lock_timeout = '{DEFAULT_LOCK_TIMEOUT}'")
+    cursor.execute(f"SET statement_timeout = '{DEFAULT_STATEMENT_TIMEOUT}'")
+    cursor.execute(
+        "SET idle_in_transaction_session_timeout = "
+        f"'{DEFAULT_IDLE_TRANSACTION_TIMEOUT}'"
+    )
+    cursor.close()
 
 
 def set_utc_on_connect(engine: Engine) -> None:
-    """Register a connect listener that forces UTC on every new connection.
+    """Register safe session defaults on every new connection.
 
     This prevents naive-datetime misinterpretation when the container's
-    ``TZ`` env var is not UTC (e.g. ``America/New_York``).
+    ``TZ`` env var is not UTC (e.g. ``America/New_York``).  The bounded lock,
+    statement, and idle-transaction timeouts are a second line of defense: a
+    future transaction-boundary bug fails closed instead of freezing all MCP
+    tools behind an unbounded PostgreSQL wait.
     """
 
     @event.listens_for(engine, "connect")
     def _set_timezone(dbapi_connection, connection_record):
-        cursor = dbapi_connection.cursor()
-        cursor.execute("SET timezone = 'UTC'")
-        cursor.close()
+        _configure_dbapi_connection(dbapi_connection)
 
 
 def build_postgres_url(config: Any) -> str | None:
@@ -131,7 +150,8 @@ def build_engine(
     - Tags the connection with ``application_name`` so ``pg_stat_activity``
       reveals which subsystem opened each connection. This is the
       diagnostic hook we wished we'd had during TASK-202.
-    - Forces UTC timezone on each new connection.
+    - Forces UTC and bounded lock/statement/idle-transaction timeouts on each
+      new connection.
 
     Args:
         url: SQLAlchemy URL.
