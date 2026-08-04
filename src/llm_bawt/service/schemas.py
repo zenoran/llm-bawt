@@ -5,7 +5,7 @@ import uuid
 from datetime import datetime
 from typing import Any, Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, PrivateAttr
 
 SERVICE_VERSION = "0.1.0"
 BotKind = Literal["chat", "agent"]
@@ -90,6 +90,7 @@ class ChatCompletionRequest(BaseModel):
     # optional for every ordinary chat caller, and deliberately ride the normal
     # chat path rather than creating a second execution mechanism.
     inter_bot_delivery_id: str | None = Field(default=None, description="Durable inter-bot delivery id (server-generated and claim-validated).")
+    _internal_inter_bot_sender_id: str | None = PrivateAttr(default=None)
     inter_bot_turn_id: str | None = Field(default=None, description="Deterministic reserved turn id for a durable delivery.")
     inter_bot_bridge_request_id: str | None = Field(default=None, description="Deterministic bridge run id used to deduplicate transport retries.")
     inter_bot_claim_token: str | None = Field(default=None, description="Private dispatcher claim token; rejected unless it matches the durable delivery row.")

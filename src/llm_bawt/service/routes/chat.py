@@ -5,7 +5,7 @@ import json
 import time
 import uuid
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel, Field
 
 from ..dependencies import get_service
@@ -14,6 +14,19 @@ from ..schemas import ChatCompletionRequest
 
 router = APIRouter()
 log = get_service_logger(__name__)
+
+
+def _internal_inter_bot_sender(http_request: Request) -> str | None:
+    sender = (http_request.headers.get("X-LLM-Bawt-Inter-Bot-Sender") or "").strip()
+    if not sender:
+        return None
+    client_host = http_request.client.host if http_request.client else ""
+    if client_host not in {"127.0.0.1", "::1"}:
+        raise HTTPException(
+            status_code=403,
+            detail="internal inter-bot sender requires loopback",
+        )
+    return sender
 
 
 class ChatAbortRequest(BaseModel):
@@ -663,7 +676,7 @@ async def session_reset(request: SessionResetRequest) -> SessionResetResponse:
 
 
 @router.post("/v1/chat/completions", tags=["OpenAI Compatible"])
-async def chat_completions(request: ChatCompletionRequest):
+async def chat_completions(request: ChatCompletionRequest, http_request: Request):
     """
     Create a chat completion (OpenAI-compatible).
     
@@ -677,6 +690,10 @@ async def chat_completions(request: ChatCompletionRequest):
     from fastapi.responses import StreamingResponse
     
     service = get_service()
+
+    internal_sender = _internal_inter_bot_sender(http_request)
+    if internal_sender:
+        request._internal_inter_bot_sender_id = internal_sender
 
     # Log request BEFORE validation so we can debug failures
     log.debug(f"Request payload: {request.model_dump(exclude_none=True)}")

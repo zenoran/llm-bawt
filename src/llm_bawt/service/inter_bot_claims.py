@@ -42,4 +42,8 @@ def validate_inter_bot_claim(service: Any, request: Any):
         raise ValueError(
             "inter-bot correlation fields require a valid delivery claim"
         )
+
+    internal_sender = getattr(request, "_internal_inter_bot_sender_id", None)
+    if isinstance(internal_sender, str) and internal_sender.strip():
+        return AuthorReference.bot(internal_sender)
     return None

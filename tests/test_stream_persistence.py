@@ -7,6 +7,8 @@ import threading
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
 
+import pytest
+
 from llm_bawt.service.background_service import BackgroundService
 from llm_bawt.service.chat_stream_worker import consume_stream_chunks
 from llm_bawt.service.schemas import ChatCompletionRequest, ChatMessage
@@ -33,7 +35,10 @@ def _build_service_for_finalize() -> BackgroundService:
     return service
 
 
-def test_inter_bot_nonstream_turn_publishes_visible_lifecycle(monkeypatch) -> None:
+@pytest.mark.parametrize("sender_mode", ["durable", "synchronous"])
+def test_inter_bot_nonstream_turn_publishes_visible_lifecycle(
+    monkeypatch, sender_mode: str,
+) -> None:
     service = BackgroundService.__new__(BackgroundService)
     service.config = SimpleNamespace(DEFAULT_BOT="nova", DEFAULT_USER="nick")
     service._inter_bot_dispatcher = SimpleNamespace(
@@ -112,18 +117,24 @@ def test_inter_bot_nonstream_turn_publishes_visible_lifecycle(monkeypatch) -> No
         lambda *_args, **_kwargs: None,
     )
 
-    request = ChatCompletionRequest(
-        model="test-model",
-        messages=[ChatMessage(role="user", content="background prompt")],
-        bot_id="loopy",
-        user="nick",
-        stream=False,
-        user_message_id="user-visible",
-        inter_bot_delivery_id="delivery-visible",
-        inter_bot_turn_id="turn-visible",
-        inter_bot_bridge_request_id="req-visible",
-        inter_bot_claim_token="claim-visible",
-    )
+    request_kwargs = {
+        "model": "test-model",
+        "messages": [ChatMessage(role="user", content="background prompt")],
+        "bot_id": "loopy",
+        "user": "nick",
+        "stream": False,
+        "user_message_id": "user-visible",
+    }
+    if sender_mode == "durable":
+        request_kwargs.update({
+            "inter_bot_delivery_id": "delivery-visible",
+            "inter_bot_turn_id": "turn-visible",
+            "inter_bot_bridge_request_id": "req-visible",
+            "inter_bot_claim_token": "claim-visible",
+        })
+    request = ChatCompletionRequest(**request_kwargs)
+    if sender_mode == "synchronous":
+        request._internal_inter_bot_sender_id = "snark"
 
     response = asyncio.run(service.chat_completion(request))
 

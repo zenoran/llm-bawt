@@ -342,9 +342,7 @@ class BackgroundService(
         # Background/durable callers have no originating HTTP stream. Publish the
         # same canonical turn lifecycle the chat UI already consumes so the target
         # transcript is visible live instead of appearing only after a reload.
-        publish_nonstream_lifecycle = bool(
-            getattr(request, "inter_bot_delivery_id", None)
-        )
+        publish_nonstream_lifecycle = inter_bot_author is not None
         # Persist turn log immediately so the user's prompt is recorded
         # even if the backend times out or errors before responding.
         self._persist_turn_log(

@@ -53,6 +53,11 @@ async def _dispatch_bot_message(
             response = await client.post(
                 f"{_APP_BASE_URL}/v1/chat/completions",
                 json=payload,
+                headers=(
+                    {"X-LLM-Bawt-Inter-Bot-Sender": sender_bot_id}
+                    if sender_bot_id != "unknown"
+                    else None
+                ),
                 timeout=timeout_seconds,
             )
             response.raise_for_status()

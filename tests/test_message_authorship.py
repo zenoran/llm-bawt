@@ -127,3 +127,19 @@ def test_untrusted_request_without_claim_cannot_supply_correlation_authority() -
     )
     with pytest.raises(ValueError, match="valid delivery claim"):
         validate_inter_bot_claim(service, request)
+
+
+def test_route_validated_synchronous_sender_becomes_bot_author() -> None:
+    service = SimpleNamespace(_default_bot="loopy", _inter_bot_dispatcher=None)
+    request = SimpleNamespace(
+        inter_bot_delivery_id=None,
+        inter_bot_turn_id=None,
+        inter_bot_bridge_request_id=None,
+        inter_bot_claim_token=None,
+        inter_bot_timeout_seconds=None,
+        inter_bot_session_policy=None,
+        inter_bot_seed_session_id=None,
+        _internal_inter_bot_sender_id="Vex",
+    )
+
+    assert validate_inter_bot_claim(service, request) == AuthorReference.bot("vex")
