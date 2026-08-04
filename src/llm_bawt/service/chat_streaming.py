@@ -147,6 +147,12 @@ class ChatStreamingMixin(ChatStreamingBridgeMixin):
                 if isinstance(_mid, str) and _mid.strip():
                     trigger_message_id = _mid.strip()
                     break
+        # Every streaming turn needs one exact, durable trigger UUID before the
+        # turn log and agent command are created. BawtHub already supplies one;
+        # direct/server callers may not. Minting here keeps the history row,
+        # turn_log, bridge events, and task association on the same join key.
+        if not trigger_message_id:
+            trigger_message_id = str(uuid.uuid4())
 
         # Frontend-minted UUID for the ASSISTANT reply row. Persisting the
         # assistant message under this id makes the live streaming bubble and the
@@ -338,6 +344,34 @@ class ChatStreamingMixin(ChatStreamingBridgeMixin):
             ):
                 thread_binding = self._resolve_active_thread_binding(llm_bawt)
 
+        task_turn_capability: str | None = None
+        if is_agent_backend:
+            session_id = (
+                str(thread_binding.get("thread_session_id") or "").strip()
+                if thread_binding else ""
+            )
+            backend_name = str(getattr(llm_bawt.bot, "agent_backend", "") or "")
+            if backend_name == "claude-code" and session_id:
+                try:
+                    from ..task_turn_context import mint_task_turn_context
+
+                    task_turn_capability = mint_task_turn_context(
+                        session_id=session_id,
+                        turn_id=turn_log_id,
+                        trigger_message_id=trigger_message_id,
+                        bot_id=bot_id,
+                        user_id=user_id,
+                    )
+                except Exception as capability_error:
+                    # Association is optional metadata; a signing/config failure
+                    # must never block the actual chat turn. The MCP tool fails
+                    # closed later with a clear no-context error.
+                    log.warning(
+                        "Could not mint trusted task-turn context for %s: %s",
+                        turn_log_id,
+                        capability_error,
+                    )
+
         # Persist turn log immediately so the user's prompt is recorded
         # even if the backend times out or errors before responding.
         # TASK-269: a continuation turn answering a deferred question carries
@@ -430,6 +464,7 @@ class ChatStreamingMixin(ChatStreamingBridgeMixin):
             is_agent_backend=is_agent_backend,
             inject_seed_messages=inject_seed_messages,
             thread_binding=thread_binding,
+            task_turn_capability=task_turn_capability,
             cancel_event=cancel_event,
             done_event=done_event,
             chunk_queue=chunk_queue,

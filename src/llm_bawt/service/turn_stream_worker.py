@@ -68,6 +68,7 @@ class TurnStreamWorker(TurnStreamPublishMixin):
         tool_call_details_holder = ctx.tool_call_details_holder
         tool_context_holder = ctx.tool_context_holder
         trigger_message_id = ctx.trigger_message_id
+        task_turn_capability = ctx.task_turn_capability
         tts_scrub = ctx.tts_scrub
         tts_scrubber = ctx.tts_scrubber
         turn_log_id = ctx.turn_log_id
@@ -535,6 +536,10 @@ class TurnStreamWorker(TurnStreamPublishMixin):
                     # TASK-252: request-local explicit-thread binding — rides
                     # the kwarg channel so it can never leak between turns.
                     extra_kwargs["thread_binding"] = ctx.thread_binding
+                if is_agent_backend and task_turn_capability:
+                    # TASK-701: opaque current-turn authority. The client/backend
+                    # forwards this request-locally; it is never model-visible.
+                    extra_kwargs["task_turn_capability"] = task_turn_capability
                 stream_iter = llm_bawt.client.stream_raw(
                     messages, stop=adapter_stops or None, **gen_kwargs, **extra_kwargs
                 )

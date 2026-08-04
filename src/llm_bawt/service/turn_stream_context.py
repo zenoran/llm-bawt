@@ -64,3 +64,6 @@ class TurnStreamContext:
     # TASK-252: request-local explicit-thread SDK binding
     # ({thread_session_id, thread_resume_id?}) or None for continuous turns.
     thread_binding: Any = None
+    # TASK-701: opaque, signed current-turn capability forwarded only to
+    # harnesses that support request-local MCP headers (Claude SDK today).
+    task_turn_capability: str | None = None

@@ -159,6 +159,7 @@ class RedisSubscriber:
         thread_session_id: str | None = None,
         thread_resume_id: str | None = None,
         explicit_thread: bool = False,
+        task_turn_capability: str | None = None,
     ) -> None:
         """Publish a chat.send command to the bridge's command stream.
 
@@ -227,6 +228,10 @@ class RedisSubscriber:
                 fields["thread_resume_id"] = thread_resume_id
             if explicit_thread:
                 fields["explicit_thread"] = "1"
+        if task_turn_capability:
+            # Opaque server-minted authority; only a bridge capable of setting
+            # request-local MCP headers consumes this field.
+            fields["task_turn_capability"] = task_turn_capability
         # Stable request ids make bridge transport retries idempotent. The Lua
         # script atomically records the request id and appends the command; a
         # duplicate caller simply subscribes to the existing agent:run stream.

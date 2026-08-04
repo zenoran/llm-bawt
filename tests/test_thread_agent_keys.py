@@ -108,6 +108,7 @@ class TestSendRequestThreadFields:
         req = SendRequest.from_fields(self._base_fields())
         assert req.thread_session_id is None
         assert req.thread_resume_id is None
+        assert req.task_turn_capability is None
 
     def test_thread_fields_parsed(self):
         from claude_code_bridge.send_request import SendRequest
@@ -119,6 +120,14 @@ class TestSendRequestThreadFields:
         )
         assert req.thread_session_id == "thread-1"
         assert req.thread_resume_id == "sid-9"
+
+    def test_task_turn_capability_parsed_as_opaque_value(self):
+        from claude_code_bridge.send_request import SendRequest
+
+        req = SendRequest.from_fields(
+            self._base_fields(task_turn_capability="opaque-capability")
+        )
+        assert req.task_turn_capability == "opaque-capability"
 
     def test_routing_key_resume_dropped(self):
         from claude_code_bridge.send_request import SendRequest

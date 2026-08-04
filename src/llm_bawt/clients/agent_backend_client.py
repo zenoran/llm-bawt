@@ -213,6 +213,9 @@ class AgentBackendClient(LLMClient):
         # turn). Merged into the per-call config COPY below — never written to
         # the shared _bot_config, so concurrent turns cannot cross-bind.
         thread_binding = kwargs.pop("thread_binding", None)
+        # TASK-701: opaque trusted current-turn capability. Request-local only;
+        # never persist it on shared bot config or expose its identifiers.
+        task_turn_capability = kwargs.pop("task_turn_capability", None)
 
         # Extract system prompt from messages for backends that support it
         # (e.g. claude-code bridge). Merge into config so the backend can
@@ -228,6 +231,8 @@ class AgentBackendClient(LLMClient):
             config["inject_messages"] = inject_messages
         if thread_binding:
             config.update(thread_binding)
+        if task_turn_capability:
+            config["task_turn_capability"] = task_turn_capability
 
         if hasattr(self._backend, "stream_raw"):
             backend_kwargs: dict[str, Any] = {"attachments": attachments}

@@ -48,6 +48,9 @@ class SendRequest:
     # True when the user explicitly selected this thread in the UI.
     # Controls /new gating: explicit threads never process /new.
     explicit_thread: bool = False
+    # TASK-701: opaque app-signed current-turn authority, forwarded as an MCP
+    # HTTP header. The bridge never opens or logs the payload.
+    task_turn_capability: str | None = None
 
     @classmethod
     def from_fields(cls, fields: dict) -> "SendRequest":
@@ -155,6 +158,9 @@ class SendRequest:
             )
             thread_resume_id = None
         explicit_thread = (fields.get("explicit_thread") or "").strip() in ("1", "true")
+        task_turn_capability = (
+            fields.get("task_turn_capability") or ""
+        ).strip() or None
 
         attachments_raw = fields.get("attachments", "")
         attachments: list[dict] = []
@@ -183,4 +189,5 @@ class SendRequest:
             thread_session_id=thread_session_id,
             thread_resume_id=thread_resume_id,
             explicit_thread=explicit_thread,
+            task_turn_capability=task_turn_capability,
         )

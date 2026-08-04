@@ -104,6 +104,26 @@ class TestTransport:
 
         assert captured["disallowed_tools"] == "[]"
 
+    def test_subscriber_forwards_opaque_task_turn_capability(self):
+        from agent_bridge.subscriber import RedisSubscriber
+
+        subscriber = RedisSubscriber("redis://localhost:6379/0")
+        captured: dict = {}
+
+        async def fake_xadd(_stream, fields, **_kwargs):
+            captured.update(fields)
+            return b"1"
+
+        subscriber._pub_redis = SimpleNamespace(xadd=fake_xadd)
+        asyncio.run(subscriber.send_command(
+            session_key="test-session",
+            message="hello",
+            request_id="req-test",
+            task_turn_capability="opaque-capability",
+        ))
+
+        assert captured["task_turn_capability"] == "opaque-capability"
+
     def test_agent_bridge_forwards_configured_list(self, monkeypatch):
         from llm_bawt.agent_backends import agent_bridge as module
 

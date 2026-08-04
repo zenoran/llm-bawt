@@ -241,6 +241,10 @@ class AgentBridgeBackend(AgentBackend):
                                 or None
                             ),
                             explicit_thread=bool(config.get("explicit_thread")),
+                            task_turn_capability=(
+                                str(config.get("task_turn_capability") or "").strip()
+                                or None
+                            ),
                         )
                         logger.info(
                             "%s request via bridge: session=%s request_id=%s",

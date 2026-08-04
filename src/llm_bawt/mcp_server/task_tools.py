@@ -1,245 +1,39 @@
-"""MCP tools for the agent task system.
+"""MCP tools for BawtHub task CRUD and dependency operations.
 
-Registers task/project/step/activity tools on the shared FastMCP server.
-Tools call the BawtHub REST API internally via httpx — agents see clean
-MCP tool interfaces without needing to think about HTTP.
-
-Imported by server.py to trigger tool registration on startup.
+Imported by server.py to register the task tool group.
 """
 
 from __future__ import annotations
 
-import os
 import logging
 from typing import Any
 
 import httpx
 
 from .server import mcp
+from .task_association import associate_current_task
+from .task_api import (
+    API_PREFIX as _API_PREFIX,
+    api_delete as _api_delete,
+    api_get as _api_get,
+    api_patch as _api_patch,
+    api_post as _api_post,
+    compact_project_list_payload as _compact_project_list_payload,
+    compact_task as _compact_task,
+    compact_task_list_payload as _compact_task_list_payload,
+    get_client as _get_client,
+    headers as _headers,
+    http_error as _http_error,
+)
 
 logger = logging.getLogger(__name__)
 
-# ---------------------------------------------------------------------------
-# Configuration
-# ---------------------------------------------------------------------------
-
-_BASE_URL = os.getenv(
-    "LLM_BAWT_TASK_API_URL",
-    "http://echo.lan.zenoran.com",
-)
-_API_PREFIX = "/api/tasks"
-_TIMEOUT = 30.0
-
-
-def _count_by_status(items: list[dict]) -> dict[str, int]:
-    counts: dict[str, int] = {}
-    for item in items:
-        status = str(item.get("status") or "UNKNOWN")
-        counts[status] = counts.get(status, 0) + 1
-    return counts
-
-
-def _compact_project(project: dict | None) -> dict | None:
-    if not isinstance(project, dict):
-        return None
-    count = project.get("_count")
-    task_count = None
-    if isinstance(count, dict):
-        task_count = count.get("tasks")
-    return {
-        "id": project.get("id"),
-        "name": project.get("name"),
-        "agentBotId": project.get("agentBotId"),
-        "taskCount": task_count,
-    }
-
-
-def _compact_task(task: dict) -> dict:
-    steps = task.get("steps") if isinstance(task.get("steps"), list) else []
-    dependencies = (
-        task.get("dependencies") if isinstance(task.get("dependencies"), list) else []
-    )
-    dependents = task.get("dependents") if isinstance(task.get("dependents"), list) else []
-    description = task.get("description") or ""
-    response = task.get("response") or ""
-    return {
-        "id": task.get("id"),
-        "shortId": task.get("shortId"),
-        "title": task.get("title"),
-        "status": task.get("status"),
-        "priority": task.get("priority"),
-        "planned": task.get("planned"),
-        "project": _compact_project(task.get("project")),
-        "agentBotId": task.get("agentBotId"),
-        "createdAt": task.get("createdAt"),
-        "updatedAt": task.get("updatedAt"),
-        "url": task.get("url"),
-        "descriptionChars": len(str(description)),
-        "responseChars": len(str(response)),
-        "stepCount": len(steps),
-        "stepStatusCounts": _count_by_status(steps),
-        "dependencyCount": len(dependencies),
-        "dependentCount": len(dependents),
-    }
-
-
-def _compact_task_list_payload(payload: Any) -> Any:
-    if not isinstance(payload, dict) or not isinstance(payload.get("tasks"), list):
-        return payload
-    compact = dict(payload)
-    compact["tasks"] = [
-        _compact_task(task) if isinstance(task, dict) else task
-        for task in payload["tasks"]
-    ]
-    return compact
-
-
-def _compact_project_list_payload(payload: Any) -> Any:
-    if not isinstance(payload, list):
-        return payload
-    compact_projects = []
-    for project in payload:
-        if not isinstance(project, dict):
-            compact_projects.append(project)
-            continue
-        task_count = None
-        count = project.get("_count")
-        if isinstance(count, dict):
-            task_count = count.get("tasks")
-        compact_projects.append({
-            "id": project.get("id"),
-            "name": project.get("name"),
-            "descriptionChars": len(str(project.get("description") or "")),
-            "color": project.get("color"),
-            "icon": project.get("icon"),
-            "agentBotId": project.get("agentBotId"),
-            "taskCount": task_count,
-            "createdAt": project.get("createdAt"),
-            "updatedAt": project.get("updatedAt"),
-        })
-    return compact_projects
-
-# ---------------------------------------------------------------------------
-# HTTP client accessor (lazy singleton, mirrors _get_storage pattern)
-# ---------------------------------------------------------------------------
-
-_client: httpx.AsyncClient | None = None
-
-
-def _get_client() -> httpx.AsyncClient:
-    """Get or create the singleton httpx client for the task API."""
-    global _client
-    if _client is None:
-        _client = httpx.AsyncClient(
-            base_url=_BASE_URL,
-            timeout=_TIMEOUT,
-            headers={"Content-Type": "application/json"},
-        )
-    return _client
-
-
-def _headers(bot_id: str | None = None) -> dict[str, str]:
-    """Build request headers, optionally including bot actor identification."""
-    h: dict[str, str] = {}
-    if bot_id:
-        h["X-Agent-Bot-Id"] = bot_id
-    return h
-
-
-async def _api_get(path: str, params: dict | None = None) -> Any:
-    """GET helper with standard error handling."""
-    client = _get_client()
-    url = f"{_API_PREFIX}{path}"
-    logger.debug("Task API GET %s params=%s", url, params)
-    resp = await client.get(url, params=params)
-    resp.raise_for_status()
-    return resp.json()
-
-
-async def _api_post(
-    path: str, json: dict | list, headers: dict | None = None,
-) -> Any:
-    """POST helper with standard error handling."""
-    client = _get_client()
-    url = f"{_API_PREFIX}{path}"
-    logger.debug("Task API POST %s", url)
-    resp = await client.post(url, json=json, headers=headers or {})
-    resp.raise_for_status()
-    return resp.json()
-
-
-async def _api_patch(
-    path: str, json: dict, headers: dict | None = None,
-) -> Any:
-    """PATCH helper with standard error handling."""
-    client = _get_client()
-    url = f"{_API_PREFIX}{path}"
-    logger.debug("Task API PATCH %s", url)
-    resp = await client.patch(url, json=json, headers=headers or {})
-    resp.raise_for_status()
-    return resp.json()
-
-
-async def _api_put(
-    path: str, json: dict | list, headers: dict | None = None,
-) -> Any:
-    """PUT helper with standard error handling."""
-    client = _get_client()
-    url = f"{_API_PREFIX}{path}"
-    logger.debug("Task API PUT %s", url)
-    resp = await client.put(url, json=json, headers=headers or {})
-    resp.raise_for_status()
-    return resp.json()
-
-
-async def _api_delete(
-    path: str, headers: dict | None = None, json: dict | list | None = None,
-) -> Any:
-    """DELETE helper with standard error handling.
-
-    Supports an optional JSON body (via ``client.request`` — httpx's
-    ``.delete()`` convenience method takes no ``json=``) for collection-level
-    bulk deletes like ``DELETE /tasks/:id/steps`` with ``{"stepIds": [...]}``.
-    """
-    client = _get_client()
-    url = f"{_API_PREFIX}{path}"
-    logger.debug("Task API DELETE %s", url)
-    if json is None:
-        resp = await client.delete(url, headers=headers or {})
-    else:
-        resp = await client.request("DELETE", url, json=json, headers=headers or {})
-    resp.raise_for_status()
-    return resp.json()
-
-
-def _http_error(e: httpx.HTTPStatusError) -> dict:
-    """Compact error dict that surfaces the API's own message.
-
-    The BawtHub task API returns a JSON body like ``{"error": "..."}`` (or
-    ``{"detail": "..."}``) explaining *why* a request was rejected — e.g. a
-    REVIEW transition missing an owner. ``str(e)`` throws that away and yields
-    only the opaque ``"Client error '400 Bad Request' ... check MDN"`` line, so
-    callers see a status code with no actionable reason. Extract the server
-    message when present; fall back to ``str(e)`` when the body isn't JSON.
-
-    This is the single source of truth for HTTP-error -> tool-result mapping;
-    every tool's ``except httpx.HTTPStatusError`` returns this.
-    """
-    message = str(e)
+async def list_projects() -> list[dict]:
+    """Compatibility wrapper; the registered tool lives in project_tools."""
     try:
-        body = e.response.json()
-    except Exception:
-        body = None
-    if isinstance(body, dict):
-        server_message = body.get("error") or body.get("detail")
-        if server_message:
-            message = server_message if isinstance(server_message, str) else str(server_message)
-    return {"error": message, "status": e.response.status_code}
-
-
-# ---------------------------------------------------------------------------
-# Task Tools
-# ---------------------------------------------------------------------------
+        return _compact_project_list_payload(await _api_get("/projects"))
+    except httpx.HTTPStatusError as error:
+        return _http_error(error)
 
 
 @mcp.tool(name="tasks_list")
@@ -343,6 +137,28 @@ async def get_task(
         return _http_error(e)
 
 
+@mcp.tool(name="tasks_associate_current")
+async def associate_task_to_current_turn(task_id: str) -> dict:
+    """Associate the trusted current chat session and exact turn to a task.
+
+    Call this when you actually begin or resume work on an existing task during
+    ordinary chat. Supply only the task UUID or shortId; the server obtains the
+    session, turn, trigger-message, bot, and user identifiers from a signed
+    current-turn capability. Never infer association merely because TASK-N text
+    appears in a prompt, quote, or negative reference.
+
+    This capability is currently available on Claude SDK/proxy turns. Calls from
+    a harness without trusted request-local MCP headers fail closed.
+    """
+    logger.debug("MCP tool invoked: tasks_associate_current id=%s", task_id)
+    try:
+        return await associate_current_task(task_id)
+    except httpx.HTTPStatusError as error:
+        return _http_error(error)
+    except ValueError as error:
+        return {"error": str(error)}
+
+
 @mcp.tool(name="tasks_update")
 async def update_task(
     task_id: str,
@@ -356,6 +172,7 @@ async def update_task(
     project_id: str | None = None,
     agent_bot_id: str | None = None,
     bot_id: str | None = None,
+    associate_current_turn: bool = False,
 ) -> dict:
     """Update a task's fields. Only provided fields are changed.
 
@@ -391,6 +208,9 @@ async def update_task(
                       hand the task to a different bot.
         bot_id: Your bot ID for activity attribution. Also becomes the task
                 owner when moving to REVIEW without an explicit agent_bot_id.
+        associate_current_turn: Also link this trusted current chat turn to the
+                task. Use when claiming/starting ordinary-chat work. The server
+                supplies all correlation IDs; unsupported harnesses fail closed.
 
     Returns:
         Compact updated task summary, or error dict. Use tasks_get for full detail.
@@ -427,6 +247,8 @@ async def update_task(
         body["agentBotId"] = bot_id
 
     if not body:
+        if associate_current_turn:
+            return await associate_task_to_current_turn(task_id)
         return {"error": "No fields to update"}
 
     try:
@@ -436,12 +258,23 @@ async def update_task(
             headers=_headers(bot_id),
         )
         if isinstance(updated, dict):
-            return {
+            result = {
                 "ok": True,
                 "updated": sorted(body.keys()),
                 "task": _compact_task(updated),
                 "detail": "Use tasks_get for full task description, response, steps, and dependencies.",
             }
+            if associate_current_turn:
+                try:
+                    task_ref = str(updated.get("shortId") or task_id)
+                    result["currentTurnAssociation"] = await associate_current_task(task_ref)
+                except (httpx.HTTPStatusError, ValueError) as error:
+                    result["currentTurnAssociation"] = (
+                        _http_error(error)
+                        if isinstance(error, httpx.HTTPStatusError)
+                        else {"error": str(error)}
+                    )
+            return result
         return updated
     except httpx.HTTPStatusError as e:
         return _http_error(e)
@@ -619,6 +452,7 @@ async def create_task(
     status: str = "QUEUED",
     steps: list[dict] | None = None,
     bot_id: str | None = None,
+    associate_current_turn: bool = False,
 ) -> dict:
     """Create a new agent task.
 
@@ -633,9 +467,12 @@ async def create_task(
         steps: Optional initial steps. Each dict needs "title" (str)
                and optional "type" (PLAN, READ_FILE, EDIT_FILE, etc.).
         bot_id: Your bot ID for activity attribution.
+        associate_current_turn: Link the newly created task to this trusted
+                current chat session and exact turn immediately after creation.
+                The server supplies all correlation IDs.
 
     Returns:
-        Created task with generated shortId.
+        Created task with generated shortId and, when requested, an association result.
     """
     logger.debug("MCP tool invoked: tools/create_task title=%s", title)
     body: dict[str, Any] = {
@@ -651,582 +488,25 @@ async def create_task(
         body["steps"] = steps
 
     try:
-        return await _api_post("/tasks", json=body, headers=_headers(bot_id))
-    except httpx.HTTPStatusError as e:
-        return _http_error(e)
-
-
-# ---------------------------------------------------------------------------
-# Step Tools
-# ---------------------------------------------------------------------------
-
-
-@mcp.tool(name="steps_update")
-async def update_step(
-    task_id: str,
-    step_id: str | None = None,
-    status: str | None = None,
-    output: str | None = None,
-    updates: list[dict] | None = None,
-    bot_id: str | None = None,
-) -> Any:
-    """Update one step, or many steps in a single call.
-
-    Call this as you work through each step:
-    1. Set status="RUNNING" when you start the step.
-    2. Set status="COMPLETED", output="what you did" when done.
-    3. Set status="FAILED", output="error details" if it fails.
-    4. Set status="SKIPPED", output="reason" to skip.
-
-    BATCH: to update several steps at once (e.g. mark five steps COMPLETED),
-    pass ``updates`` instead of the scalar args — one MCP call, one DB
-    transaction, instead of N separate steps_update calls. Each entry needs
-    ``step_id`` plus any of ``status``/``output``/``title``/``type``/
-    ``file_path``. Steps not belonging to ``task_id`` are ignored.
-
-    Args:
-        task_id: Parent task UUID or shortId (e.g. "TASK-42").
-        step_id: Step UUID (single-update mode).
-        status: PENDING, RUNNING, COMPLETED, FAILED, or SKIPPED (single mode).
-        output: Summary of what was done or error details (single mode).
-        updates: List of dicts for batch mode, each {"step_id": ..., "status"?:
-                 ..., "output"?: ..., ...}. Overrides the scalar args.
-        bot_id: Your bot ID for activity attribution.
-
-    Returns:
-        Single mode: the updated step object. Batch mode: the task's steps in
-        order. Error dict on failure.
-    """
-    if updates:
-        logger.debug("MCP tool invoked: tools/update_step task=%s batch=%d", task_id, len(updates))
-        norm: list[dict[str, Any]] = []
-        for u in updates:
-            sid = u.get("step_id") or u.get("stepId")
-            if not sid:
-                return {"error": "each update needs a step_id"}
-            entry: dict[str, Any] = {"stepId": sid}
-            for key in ("status", "output", "title", "type"):
-                if u.get(key) is not None:
-                    entry[key] = u[key]
-            fp = u.get("file_path", u.get("filePath"))
-            if fp is not None:
-                entry["filePath"] = fp
-            norm.append(entry)
-        try:
-            return await _api_patch(
-                f"/tasks/{task_id}/steps",
-                json={"updates": norm},
-                headers=_headers(bot_id),
-            )
-        except httpx.HTTPStatusError as e:
-            return _http_error(e)
-
-    if not step_id:
-        return {"error": "Provide step_id (single) or updates (batch)"}
-
-    logger.debug("MCP tool invoked: tools/update_step task=%s step=%s status=%s", task_id, step_id, status)
-    body: dict[str, Any] = {}
-    if status is not None:
-        body["status"] = status
-    if output is not None:
-        body["output"] = output
-
-    if not body:
-        return {"error": "No fields to update"}
-
-    try:
-        return await _api_patch(
-            f"/tasks/{task_id}/steps/{step_id}",
-            json=body,
-            headers=_headers(bot_id),
-        )
-    except httpx.HTTPStatusError as e:
-        return _http_error(e)
-
-
-@mcp.tool(name="steps_delete")
-async def delete_step(
-    task_id: str,
-    step_id: str | None = None,
-    step_ids: list[str] | None = None,
-    bot_id: str | None = None,
-) -> dict:
-    """Delete one step, or many steps in a single call.
-
-    WARNING: This permanently removes the step(s). Prefer setting status to
-    SKIPPED via steps_update unless the step is genuinely a mistake — the
-    audit trail is more useful than a silently-deleted row.
-
-    BATCH: to remove several steps at once, pass ``step_ids`` instead of
-    ``step_id`` — one MCP call and one DB transaction instead of N separate
-    steps_delete calls. Ids not belonging to ``task_id`` are ignored. (To
-    replace a task's entire checklist, prefer ``steps_set``.)
-
-    Args:
-        task_id: Parent task UUID or shortId.
-        step_id: Step UUID to delete (single mode).
-        step_ids: List of step UUIDs to delete (batch mode). Overrides step_id.
-        bot_id: Your bot ID for activity attribution.
-
-    Returns:
-        Confirmation dict, or error dict.
-    """
-    if step_ids:
-        logger.debug("MCP tool invoked: tools/delete_step task=%s batch=%d", task_id, len(step_ids))
-        try:
-            return await _api_delete(
-                f"/tasks/{task_id}/steps",
-                json={"stepIds": step_ids},
-                headers=_headers(bot_id),
-            )
-        except httpx.HTTPStatusError as e:
-            return _http_error(e)
-
-    if not step_id:
-        return {"error": "Provide step_id (single) or step_ids (batch)"}
-
-    logger.debug(
-        "MCP tool invoked: tools/delete_step task=%s step=%s",
-        task_id,
-        step_id,
-    )
-    try:
-        return await _api_delete(
-            f"/tasks/{task_id}/steps/{step_id}",
-            headers=_headers(bot_id),
-        )
-    except httpx.HTTPStatusError as e:
-        return _http_error(e)
-
-
-@mcp.tool(name="steps_add")
-async def add_steps(
-    task_id: str,
-    steps: list[dict],
-    bot_id: str | None = None,
-) -> list[dict]:
-    """Add new steps to a task.
-
-    Steps are appended after existing steps. Use when planning work
-    or when you discover additional steps mid-execution.
-
-    Args:
-        task_id: Task UUID or shortId (e.g. "TASK-42").
-        steps: List of step dicts. Each needs "title" (str).
-               Optional: "type" (default "PLAN") and "status"
-               (default "PENDING").
-               Types: PLAN, READ_FILE, EDIT_FILE, CREATE_FILE,
-               DELETE_FILE, RUN_COMMAND, SEARCH, ASK_USER, REVIEW.
-        bot_id: Your bot ID for activity attribution.
-
-    Returns:
-        List of created step objects.
-    """
-    logger.debug("MCP tool invoked: tools/add_steps task=%s count=%d", task_id, len(steps))
-    try:
-        return await _api_post(
-            f"/tasks/{task_id}/steps",
-            json=steps,
-            headers=_headers(bot_id),
-        )
-    except httpx.HTTPStatusError as e:
-        return _http_error(e)
-
-
-@mcp.tool(name="steps_set")
-async def set_steps(
-    task_id: str,
-    steps: list[dict],
-    bot_id: str | None = None,
-) -> list[dict]:
-    """Replace a task's ENTIRE step list in one atomic call.
-
-    Deletes all existing steps and recreates them from ``steps``, reindexed
-    from 0. This is the right tool for rewriting a checklist: instead of N
-    steps_delete + M steps_add calls (a wall of tool invocations), set the whole
-    plan in a single transaction. The task title/description are untouched.
-
-    Args:
-        task_id: Task UUID or shortId (e.g. "TASK-42").
-        steps: The full ordered list of step dicts. Each needs "title" (str);
-               optional "type" (default "PLAN"), "status" (default "PENDING"),
-               "output", "filePath". Pass [] to clear all steps.
-               Types: PLAN, READ_FILE, EDIT_FILE, CREATE_FILE, DELETE_FILE,
-               RUN_COMMAND, SEARCH, ASK_USER, REVIEW.
-        bot_id: Your bot ID for activity attribution.
-
-    Returns:
-        The task's steps in order after the replace.
-    """
-    logger.debug("MCP tool invoked: tools/set_steps task=%s count=%d", task_id, len(steps))
-    try:
-        return await _api_put(
-            f"/tasks/{task_id}/steps",
-            json=steps,
-            headers=_headers(bot_id),
-        )
-    except httpx.HTTPStatusError as e:
-        return _http_error(e)
-
-
-# ---------------------------------------------------------------------------
-# Project Tools
-# ---------------------------------------------------------------------------
-
-
-@mcp.tool(name="projects_list")
-async def list_projects() -> list[dict]:
-    """List all agent projects with task counts.
-
-    Returns projects sorted by most recently updated.
-    Use get_project() for full details including tasks and context.
-
-    Returns:
-        Compact project rows with id, name, agentBotId, taskCount, and metadata.
-        Use projects_get for full context prompt and tasks.
-    """
-    logger.debug("MCP tool invoked: tools/list_projects")
-    try:
-        return _compact_project_list_payload(await _api_get("/projects"))
-    except httpx.HTTPStatusError as e:
-        return _http_error(e)
-
-
-@mcp.tool(name="projects_get")
-async def get_project(
-    project_id: str,
-) -> dict:
-    """Get a project's details including context prompt and all tasks.
-
-    The contextPrompt contains project-specific instructions and
-    conventions. Read this before working on tasks in the project.
-
-    Args:
-        project_id: Project UUID.
-
-    Returns:
-        Project with name, description, contextPrompt, tasks
-        (with steps and dependencies), and configuration.
-    """
-    logger.debug("MCP tool invoked: tools/get_project id=%s", project_id)
-    try:
-        return await _api_get(f"/projects/{project_id}")
-    except httpx.HTTPStatusError as e:
-        return _http_error(e)
-
-
-@mcp.tool(name="projects_create")
-async def create_project(
-    name: str,
-    description: str | None = None,
-    color: str = "#3b82f6",
-    icon: str = "layers",
-    context_prompt: str | None = None,
-    agent_bot_id: str | None = None,
-    bot_id: str | None = None,
-) -> dict:
-    """Create a new agent project.
-
-    Projects group related tasks and carry a context prompt that agents
-    read before working on tasks in the project.
-
-    Args:
-        name: Project name (required).
-        description: Short description of the project's purpose.
-        color: Hex color for the project badge (default "#3b82f6").
-        icon: Lucide icon name for the project (default "layers").
-        context_prompt: Instructions and conventions for agents working
-                        on tasks in this project. Agents load this
-                        automatically via get_task_context.
-        agent_bot_id: Default bot assigned to new tasks in this project.
-        bot_id: Your bot ID for activity attribution.
-
-    Returns:
-        Created project object with id, name, description, color,
-        icon, contextPrompt, and agentBotId.
-    """
-    logger.debug("MCP tool invoked: tools/create_project name=%s", name)
-    body: dict[str, Any] = {
-        "name": name,
-        "color": color,
-        "icon": icon,
-    }
-    if description is not None:
-        body["description"] = description
-    if context_prompt is not None:
-        body["contextPrompt"] = context_prompt
-    if agent_bot_id is not None:
-        body["agentBotId"] = agent_bot_id
-
-    try:
-        return await _api_post("/projects", json=body, headers=_headers(bot_id))
-    except httpx.HTTPStatusError as e:
-        return _http_error(e)
-
-
-@mcp.tool(name="projects_update")
-async def update_project(
-    project_id: str,
-    name: str | None = None,
-    description: str | None = None,
-    color: str | None = None,
-    icon: str | None = None,
-    context_prompt: str | None = None,
-    agent_bot_id: str | None = None,
-    bot_id: str | None = None,
-) -> dict:
-    """Update an existing project. Only provided fields are changed.
-
-    Args:
-        project_id: Project UUID (required).
-        name: Updated project name.
-        description: Updated description.
-        color: Updated hex color (e.g. "#ef4444").
-        icon: Updated Lucide icon name (e.g. "folder", "code").
-        context_prompt: Updated instructions for agents working on
-                        tasks in this project.
-        agent_bot_id: Updated default bot for new tasks.
-        bot_id: Your bot ID for activity attribution.
-
-    Returns:
-        Updated project object, or error dict.
-    """
-    logger.debug("MCP tool invoked: tools/update_project id=%s", project_id)
-    body: dict[str, Any] = {}
-    if name is not None:
-        body["name"] = name
-    if description is not None:
-        body["description"] = description
-    if color is not None:
-        body["color"] = color
-    if icon is not None:
-        body["icon"] = icon
-    if context_prompt is not None:
-        body["contextPrompt"] = context_prompt
-    if agent_bot_id is not None:
-        body["agentBotId"] = agent_bot_id
-
-    if not body:
-        return {"error": "No fields to update"}
-
-    try:
-        return await _api_patch(
-            f"/projects/{project_id}",
-            json=body,
-            headers=_headers(bot_id),
-        )
-    except httpx.HTTPStatusError as e:
-        return _http_error(e)
-
-
-@mcp.tool(name="projects_get_context")
-async def get_project_context(
-    project_id: str,
-) -> str:
-    """Get a project's context as a plain-text markdown briefing.
-
-    Returns the project name and contextPrompt formatted as readable
-    markdown. Use this for a lightweight read of project conventions
-    when you don't need the full task list (which projects_get returns).
-
-    Args:
-        project_id: Project UUID.
-
-    Returns:
-        Markdown text with the project name as an H1 heading and the
-        contextPrompt under a "## Context" section. Returns an error
-        string if the project is not found.
-    """
-    logger.debug("MCP tool invoked: tools/get_project_context id=%s", project_id)
-    client = _get_client()
-    url = f"{_API_PREFIX}/projects/{project_id}/context"
-    try:
-        resp = await client.get(url)
-        resp.raise_for_status()
-        return resp.text
-    except httpx.HTTPStatusError as e:
-        return f"Error fetching project context: HTTP {e.response.status_code}"
-
-
-@mcp.tool(name="projects_delete")
-async def delete_project(
-    project_id: str,
-    bot_id: str | None = None,
-) -> dict:
-    """Delete an agent project.
-
-    WARNING: This permanently deletes the project. Tasks in the project
-    are NOT deleted — they become unassigned.
-
-    Args:
-        project_id: Project UUID (required).
-        bot_id: Your bot ID for activity attribution.
-
-    Returns:
-        Confirmation dict {"ok": true}, or error dict.
-    """
-    logger.debug("MCP tool invoked: tools/delete_project id=%s", project_id)
-    try:
-        return await _api_delete(
-            f"/projects/{project_id}",
-            headers=_headers(bot_id),
-        )
-    except httpx.HTTPStatusError as e:
-        return _http_error(e)
-
-
-# ---------------------------------------------------------------------------
-# Activity Tool
-# ---------------------------------------------------------------------------
-
-
-@mcp.tool(name="activity_get")
-async def get_activity(
-    task_id: str | None = None,
-    project_id: str | None = None,
-    limit: int = 20,
-) -> dict:
-    """Get recent activity log entries.
-
-    Shows what has happened on tasks/projects — status changes,
-    dispatches, assignments, step updates, etc.
-
-    Args:
-        task_id: Filter to a specific task (UUID).
-        project_id: Filter to a specific project (UUID).
-        limit: Maximum entries to return (default 20, max 100).
-
-    Returns:
-        Dict with "activities" list and "total" count.
-        Each entry has type, actorType, actorId, meta, createdAt,
-        and related task/project summaries.
-    """
-    logger.debug("MCP tool invoked: tools/get_activity task=%s project=%s", task_id, project_id)
-    params: dict[str, str] = {"limit": str(min(limit, 100))}
-    if task_id:
-        params["taskId"] = task_id
-    if project_id:
-        params["projectId"] = project_id
-    try:
-        return await _api_get("/activity", params=params)
-    except httpx.HTTPStatusError as e:
-        return _http_error(e)
-
-
-# ---------------------------------------------------------------------------
-# Context Tool
-# ---------------------------------------------------------------------------
-
-
-@mcp.tool(name="tasks_get_context")
-async def get_task_context(
-    task_id: str,
-) -> str:
-    """Get a formatted briefing document for a task.
-
-    Combines task details, step checklist, dependencies, and the
-    parent project's context prompt into a single readable document.
-    Load this before starting work on a task.
-
-    Args:
-        task_id: Task UUID or shortId (e.g. "TASK-42").
-
-    Returns:
-        Formatted markdown text with everything you need to work
-        on the task. Returns error string if not found.
-    """
-    logger.debug("MCP tool invoked: tools/get_task_context id=%s", task_id)
-    try:
-        task = await _api_get(f"/tasks/{task_id}")
-    except httpx.HTTPStatusError as e:
-        return f"Error fetching task: {e}"
-
-    if "error" in task:
-        return f"Task not found: {task_id}"
-
-    # Build formatted context document
-    lines: list[str] = []
-
-    # Task header
-    lines.append(f"# {task.get('shortId', '')} — {task.get('title', 'Untitled')}")
-    lines.append("")
-    lines.append(f"**Status:** {task.get('status', '?')}  ")
-    lines.append(f"**Priority:** {task.get('priority', '?')}  ")
-    if task.get("agentBotId"):
-        lines.append(f"**Assigned to:** {task['agentBotId']}  ")
-    if task.get("modelId"):
-        lines.append(f"**Model:** {task['modelId']}  ")
-    lines.append(f"**Created:** {task.get('createdAt', '?')}  ")
-    lines.append(f"**Updated:** {task.get('updatedAt', '?')}  ")
-    lines.append("")
-
-    # Description
-    if task.get("description"):
-        lines.append("## Description")
-        lines.append("")
-        lines.append(task["description"])
-        lines.append("")
-
-    # Dependencies
-    deps = task.get("dependsOn", [])
-    if deps:
-        lines.append("## Dependencies")
-        lines.append("")
-        for dep in deps:
-            status_icon = "✅" if dep.get("status") == "COMPLETED" else "⏳"
-            lines.append(f"- {status_icon} {dep.get('shortId', '?')} — {dep.get('title', '?')} ({dep.get('status', '?')})")
-        lines.append("")
-
-    # Steps
-    steps = task.get("steps", [])
-    if steps:
-        lines.append("## Steps")
-        lines.append("")
-        for step in steps:
-            status_map = {
-                "PENDING": "[ ]",
-                "RUNNING": "[~]",
-                "COMPLETED": "[x]",
-                "FAILED": "[!]",
-                "SKIPPED": "[-]",
+        created = await _api_post("/tasks", json=body, headers=_headers(bot_id))
+        if not associate_current_turn or not isinstance(created, dict):
+            return created
+        task_ref = str(created.get("shortId") or created.get("id") or "").strip()
+        if not task_ref:
+            return {
+                "task": created,
+                "currentTurnAssociation": {
+                    "error": "Task was created but its response had no task identifier",
+                },
             }
-            checkbox = status_map.get(step.get("status", ""), "[ ]")
-            step_type = step.get("type", "")
-            type_label = f" ({step_type})" if step_type else ""
-            lines.append(f"- {checkbox} {step.get('title', '?')}{type_label}")
-            if step.get("output"):
-                # Indent output under step
-                for out_line in step["output"].split("\n"):
-                    lines.append(f"      {out_line}")
-        lines.append("")
-
-    # Existing response
-    if task.get("response"):
-        lines.append("## Previous Response")
-        lines.append("")
-        lines.append(task["response"])
-        lines.append("")
-
-    # Project context
-    project = task.get("project")
-    if project:
-        lines.append(f"## Project: {project.get('name', '?')}")
-        lines.append("")
-        # Fetch full project for context prompt
         try:
-            full_project = await _api_get(f"/projects/{project['id']}")
-            if full_project.get("contextPrompt"):
-                lines.append("### Project Context")
-                lines.append("")
-                lines.append(full_project["contextPrompt"])
-                lines.append("")
-            if full_project.get("description"):
-                lines.append("### Project Description")
-                lines.append("")
-                lines.append(full_project["description"])
-                lines.append("")
-        except httpx.HTTPStatusError:
-            lines.append("_(Could not load project context)_")
-            lines.append("")
-
-    return "\n".join(lines)
+            association = await associate_current_task(task_ref)
+        except (httpx.HTTPStatusError, ValueError) as error:
+            association = (
+                _http_error(error)
+                if isinstance(error, httpx.HTTPStatusError)
+                else {"error": str(error)}
+            )
+        return {"task": created, "currentTurnAssociation": association}
+    except httpx.HTTPStatusError as e:
+        return _http_error(e)

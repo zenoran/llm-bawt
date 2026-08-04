@@ -27,7 +27,11 @@ _MCP_TOOL_CONTEXT_FALLBACK = (
     "Your bot_id is \"{bot_slug}\". When using bawthub MCP tools:\n"
     "- Memory/message tools: always pass bot_id=\"{bot_slug}\"\n"
     "- Profile tool with entity_type=\"user\": use entity_id=\"nick\" (the user)\n"
-    "- Profile tool with entity_type=\"bot\": use entity_id=\"{bot_slug}\" (yourself)"
+    "- Profile tool with entity_type=\"bot\": use entity_id=\"{bot_slug}\" (yourself)\n"
+    "- When you actually begin/resume an existing task in ordinary chat, call "
+    "tasks_associate_current(task_id=...). Do not link from TASK-N text alone.\n"
+    "- tasks_create(..., associate_current_turn=true) creates and links new work; "
+    "tasks_update(..., associate_current_turn=true) claims/links existing work."
 )
 
 

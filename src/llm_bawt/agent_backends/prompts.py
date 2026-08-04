@@ -406,9 +406,16 @@ These wrap the HTTP API. They handle auth, base URL, and JSON shape.
 - `tasks_get(task_id=)` — full task object
 - `tasks_get_context(task_id=)` — formatted briefing with steps,
   dependencies, and project context prompt
-- `tasks_create(title=, description=, project_id=, priority=, status=, steps=)`
+- `tasks_associate_current(task_id=)` — link the trusted current chat session
+  and exact turn to an existing task. Supply only the task reference; the server
+  owns all correlation IDs. Never persist a link from TASK-N text detection alone.
+- `tasks_create(title=, description=, project_id=, priority=, status=, steps=,
+  associate_current_turn=)` — set the flag when newly queued work belongs to the
+  current ordinary-chat turn.
 - `tasks_update(task_id=, status=, response=, model_id=, title=,
-  description=, priority=, planned=, project_id=, agent_bot_id=)`
+  description=, priority=, planned=, project_id=, agent_bot_id=,
+  associate_current_turn=)` — set the flag when claiming/resuming existing work.
+  An association-only call may omit all update fields.
 - `tasks_delete(task_id=)` — hard delete; prefer status="CANCELLED"
 - `tasks_add_dependency(task_id=, depends_on_id=)` — declare task waits
   for another
@@ -472,7 +479,13 @@ refuses updates that would retarget an existing model to another access path.
 
 ## Working a Task (Execution Mode)
 
-1. `tasks_update(task_id=<id>, status="IN_PROGRESS", model_id="<your-model>")`.
+1. In ordinary chat, explicitly associate the turn while claiming the task:
+   `tasks_update(task_id=<id>, status="IN_PROGRESS", model_id="<your-model>",
+   associate_current_turn=true)`. If the task is already in the right state,
+   `tasks_associate_current(task_id=<id>)` is sufficient. A quoted, negated, or
+   incidental TASK-N reference is never authority to link.
+   Current-turn authority is available on Claude SDK/proxy turns; harnesses that
+   cannot provide request-local MCP headers fail closed rather than accepting raw IDs.
 2. For each step:
    a. `steps_update(task_id=<id>, step_id=<sid>, status="RUNNING")`.
    b. Do the work.

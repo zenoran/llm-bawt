@@ -70,6 +70,7 @@ class ClaudeSendMixin(ClaudeStreamMixin, ClaudeUsageMixin, ClaudeResultMixin):
         attachments = req.attachments
         thread_session_id = req.thread_session_id
         explicit_thread = req.explicit_thread
+        task_turn_capability = req.task_turn_capability
 
         if not request_id or not message:
             logger.warning("Invalid send command: missing request_id or message")
@@ -353,6 +354,7 @@ class ClaudeSendMixin(ClaudeStreamMixin, ClaudeUsageMixin, ClaudeResultMixin):
                         pre_tool_use_cb=pre_tool_use_cb,
                         post_tool_use_cb=post_tool_use_cb,
                         stderr=_log_stderr,
+                        task_turn_capability=task_turn_capability,
                     )
 
                     session_persisted = False

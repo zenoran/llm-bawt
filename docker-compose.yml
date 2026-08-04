@@ -43,6 +43,11 @@ services:
       # in the "Attached Images" prompt manifest. Same in-network address the
       # bridges already use for LLM_BAWT_API_URL.
       - LLM_BAWT_AGENT_ORIGIN=http://app:8642
+      # TASK-701: trusted current-turn MCP tools write through BawtHub's
+      # container-only association API. The same bearer must be configured in
+      # bawthub; unset fails closed without blocking ordinary chat.
+      - BAWTHUB_TASK_ASSOCIATION_INTERNAL_URL=${BAWTHUB_TASK_ASSOCIATION_INTERNAL_URL:-http://frontend-prod:3002}
+      - TASK_ASSOCIATION_INTERNAL_TOKEN=${TASK_ASSOCIATION_INTERNAL_TOKEN:-}
       # TASK-636: CODEX_AUTH_PATH removed — the app reads the codex bundle
       # from the encrypted DB store (provider_connection:openai_chatgpt).
     ports:
@@ -135,6 +140,8 @@ services:
       # talk to the API without a flag override.
       - LLM_BAWT_SERVICE_HOST=app
       - REDIS_URL=redis://redis:6379/0
+      # App-only TASK-701 bearer must not reach agent tool subprocesses.
+      - TASK_ASSOCIATION_INTERNAL_TOKEN=
     extra_hosts:
       - "host.docker.internal:host-gateway"
       - "echo.lan.zenoran.com:${ECHO_LAN_HOST_IP:-10.0.0.101}"
@@ -181,6 +188,8 @@ services:
       # talk to the API without a flag override.
       - LLM_BAWT_SERVICE_HOST=app
       - REDIS_URL=redis://redis:6379/0
+      # App-only TASK-701 bearer must not reach agent tool subprocesses.
+      - TASK_ASSOCIATION_INTERNAL_TOKEN=
       # TASK-636: CODEX_AUTH_PATH removed — the proxy adapter fetches tokens
       # from the app's broker endpoint (GET /v1/providers/openai_chatgpt/token).
       # Z.AI (Zhipu GLM) — native Anthropic Messages API passthrough.
@@ -268,6 +277,8 @@ services:
       # talk to the API without a flag override.
       - LLM_BAWT_SERVICE_HOST=app
       - REDIS_URL=redis://redis:6379/0
+      # App-only TASK-701 bearer must not reach agent tool subprocesses.
+      - TASK_ASSOCIATION_INTERNAL_TOKEN=
     extra_hosts:
       - "host.docker.internal:host-gateway"
       - "echo.lan.zenoran.com:${ECHO_LAN_HOST_IP:-10.0.0.101}"
@@ -366,6 +377,8 @@ services:
       # at the compose service name `app`.
       - LLM_BAWT_SERVICE_HOST=app
       - REDIS_URL=redis://redis:6379/0
+      # App-only TASK-701 bearer must not reach agent tool subprocesses.
+      - TASK_ASSOCIATION_INTERNAL_TOKEN=
     extra_hosts:
       - "host.docker.internal:host-gateway"
       - "echo.lan.zenoran.com:${ECHO_LAN_HOST_IP:-10.0.0.101}"

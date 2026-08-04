@@ -826,6 +826,8 @@ from .profile_tools import _get_profile_manager, profile  # noqa: E402,F401
 # Task system tools (registered via import side-effect)
 # ---------------------------------------------------------------------------
 
+from . import project_tools as _project_tools  # noqa: F401, E402
+from . import step_tools as _step_tools  # noqa: F401, E402
 from . import task_tools as _task_tools  # noqa: F401, E402
 
 # ---------------------------------------------------------------------------
@@ -930,10 +932,23 @@ def run_server(
     if final_transport == "stdio":
         mcp.run(transport="stdio")
     else:
-        # Use streamable-http which exposes /mcp endpoint for JSON-RPC calls
+        # Use streamable-http which exposes /mcp endpoint for JSON-RPC calls.
+        # TASK-701 wraps only this generated ASGI app so an opaque, per-request
+        # task-turn capability can reach task tools without becoming a model
+        # argument or leaking through process-global state.
+        import uvicorn
+        from .task_association import TaskTurnCapabilityMiddleware
+
         mcp.settings.host = final_host
         mcp.settings.port = final_port
-        mcp.run(transport="streamable-http")
+        app = TaskTurnCapabilityMiddleware(mcp.streamable_http_app())
+        config = uvicorn.Config(
+            app,
+            host=final_host,
+            port=final_port,
+            log_level=mcp.settings.log_level.lower(),
+        )
+        uvicorn.Server(config).run()
 
 
 if __name__ == "__main__":

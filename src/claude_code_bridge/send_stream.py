@@ -18,6 +18,8 @@ instance.
 
 from __future__ import annotations
 
+import copy
+
 import asyncio
 import logging
 from collections.abc import AsyncIterable
@@ -200,8 +202,16 @@ class ClaudeStreamMixin:
         pre_tool_use_cb,
         post_tool_use_cb,
         stderr,
+        task_turn_capability: str | None = None,
     ) -> ClaudeAgentOptions:
-        """Construct the per-attempt ``ClaudeAgentOptions`` (verbatim move)."""
+        """Construct per-attempt options with isolated MCP request headers."""
+        mcp_servers = copy.deepcopy(self._mcp_servers) if self._mcp_servers else {}
+        if task_turn_capability:
+            bawthub = mcp_servers.get("bawthub")
+            if isinstance(bawthub, dict) and bawthub.get("type") == "http":
+                headers = dict(bawthub.get("headers") or {})
+                headers["X-LLM-Bawt-Task-Turn-Context"] = task_turn_capability
+                bawthub["headers"] = headers
         return ClaudeAgentOptions(
             model=model,
             # TASK-288: send the system prompt on EVERY turn, resume
@@ -233,7 +243,7 @@ class ClaudeStreamMixin:
             # thinking and are unaffected by this flag.
             thinking={"type": "adaptive", "display": "summarized"},
             max_turns=bot_max_turns,
-            mcp_servers=self._mcp_servers if self._mcp_servers else {},
+            mcp_servers=mcp_servers,
             can_use_tool=can_use_tool_cb,
             # TASK-292: matcher=None → fires for every tool. The hook
             # (not can_use_tool) is the sole approval gate.

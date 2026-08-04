@@ -293,6 +293,37 @@ def test_tool_end_retries_after_post_tool_upload_failure() -> None:
     assert turn_refs == [{"asset_id": "ma_test", "kind": "image"}]
 
 
+def test_agent_options_injects_task_capability_without_mutating_shared_mcp_config() -> None:
+    bridge = _bridge()
+    bridge._mcp_servers = {
+        "bawthub": {"type": "http", "url": "http://app:8001/mcp"},
+    }
+
+    async def noop(*args, **kwargs):
+        return {}
+
+    options = bridge._build_agent_options(
+        model="claude-opus-4-8",
+        system_prompt="system",
+        disallowed_tools=[],
+        resume_id=None,
+        sdk_env={},
+        settings_path=None,
+        bot_effort=None,
+        bot_max_turns=None,
+        can_use_tool_cb=noop,
+        pre_tool_use_cb=noop,
+        post_tool_use_cb=noop,
+        stderr=lambda line: None,
+        task_turn_capability="opaque-capability",
+    )
+
+    assert options.mcp_servers["bawthub"]["headers"] == {
+        "X-LLM-Bawt-Task-Turn-Context": "opaque-capability",
+    }
+    assert "headers" not in bridge._mcp_servers["bawthub"]
+
+
 def test_agent_options_registers_playwright_post_tool_hook() -> None:
     bridge = _bridge()
 
