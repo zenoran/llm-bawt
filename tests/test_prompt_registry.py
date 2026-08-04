@@ -49,6 +49,21 @@ def test_prompt_resolver_renders_memory_maintenance_prompt() -> None:
     assert "intent phrase" in rendered
 
 
+def test_scoped_commit_prompt_is_catalog_owned_and_renders_runtime_scope() -> None:
+    resolver = PromptResolver()
+    definition = resolver.definition_for("chat.scoped_commit")
+
+    assert definition is not None
+    assert definition.required_vars == ("scope",)
+    rendered = resolver.render(
+        key="chat.scoped_commit",
+        variables={"scope": "Repository: bawthub\n- frontend/src/app/chat/ChangedFilesRow.tsx"},
+    )
+    assert "Repository: bawthub" in rendered
+    assert "stage only your hunks" in rendered
+    assert "Do not amend or push" in rendered
+
+
 def test_agent_global_prompt_explains_playwright_artifact_workflow() -> None:
     assert "browser_take_screenshot` without `filename`" in AGENT_GLOBAL_PROMPT
     assert "returned `original`, `preview`, or `thumb` URL" in AGENT_GLOBAL_PROMPT

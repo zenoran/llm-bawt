@@ -13,6 +13,35 @@ from urllib.parse import quote_plus
 from sqlalchemy import Column, DateTime, String, Text, UniqueConstraint
 from sqlmodel import Field, SQLModel, Session, create_engine, select
 
+from .chat_prompt_defaults import (
+    AGENT_GLOBAL_PROMPT,
+    AGENT_USER_PREFIX,
+    AGENT_VOICE_PREFIX,
+    MCP_TOOL_CONTEXT_TEMPLATE,
+    RESPONSE_STYLE_DEEP_DIVE,
+    RESPONSE_STYLE_ELI5,
+    RESPONSE_STYLE_TLDR,
+    RUNTIME_CONTEXT_TEMPLATE,
+    SCOPED_COMMIT_PROMPT,
+    TTS_OUTPUT_INSTRUCTIONS,
+)
+from .prompt_default_loaders import (
+    load_agents_docs,
+    load_agents_project_plan,
+    load_agents_review,
+    load_agents_task_execution,
+    load_agents_task_spec,
+    load_global_recall_guidance,
+    load_history_summarization_batch,
+    load_history_summarization_single,
+    load_memory_extraction_fact,
+    load_memory_extraction_summary,
+    load_memory_extraction_update,
+    load_memory_maintenance_intent_content_only,
+    load_memory_maintenance_intent_with_context,
+    load_profile_consolidation,
+    load_self_recap_system,
+)
 from .utils.config import Config, has_database_credentials
 from .utils.schema import SchemaBootstrapGuard
 
@@ -116,260 +145,48 @@ class ResolvedPrompt:
     updated_at: datetime | None = None
 
 
-def _load_history_summarization_single() -> str:
-    from .memory.summarization import SUMMARIZATION_PROMPT
-
-    return SUMMARIZATION_PROMPT
-
-
-def _load_history_summarization_batch() -> str:
-    from .memory.summarization import BATCH_SUMMARIZATION_PROMPT
-
-    return BATCH_SUMMARIZATION_PROMPT
-
-
-def _load_memory_extraction_fact() -> str:
-    from .memory.extraction.prompts import FACT_EXTRACTION_PROMPT_TEMPLATE
-
-    return FACT_EXTRACTION_PROMPT_TEMPLATE
-
-
-def _load_memory_extraction_update() -> str:
-    from .memory.extraction.prompts import MEMORY_UPDATE_PROMPT_TEMPLATE
-
-    return MEMORY_UPDATE_PROMPT_TEMPLATE
-
-
-def _load_memory_extraction_summary() -> str:
-    from .memory.extraction.prompts import SUMMARY_EXTRACTION_PROMPT_TEMPLATE
-
-    return SUMMARY_EXTRACTION_PROMPT_TEMPLATE
-
-
-def _load_profile_consolidation() -> str:
-    from .memory.extraction.prompts import PROFILE_CONSOLIDATION_PROMPT
-
-    return PROFILE_CONSOLIDATION_PROMPT
-
-
-def _load_memory_maintenance_intent_with_context() -> str:
-    from .memory.maintenance import INTENT_PROMPT_WITH_CONTEXT
-
-    return INTENT_PROMPT_WITH_CONTEXT
-
-
-def _load_memory_maintenance_intent_content_only() -> str:
-    from .memory.maintenance import INTENT_PROMPT_CONTENT_ONLY
-
-    return INTENT_PROMPT_CONTENT_ONLY
-
-
-def _load_agents_task_spec() -> str:
-    from .agent_backends.prompts import TASK_SPEC_PROMPT
-
-    return TASK_SPEC_PROMPT
-
-
-def _load_global_recall_guidance() -> str:
-    # Lazy import avoids a core <-> prompt_registry circular import at module load.
-    from .core.prompt_builder import GLOBAL_SYSTEM_PROMPT
-
-    return GLOBAL_SYSTEM_PROMPT
-
-
-# Response-style bodies (TASK-490) — inline keyword-triggered answer shaping,
-# stamped onto the outbound user message (never the cached system prefix).
-RESPONSE_STYLE_TLDR = (
-    "Answer as a tight TL;DR: lead with the one-line bottom line, "
-    "then a few short bullets. No preamble, no filler."
-)
-RESPONSE_STYLE_ELI5 = (
-    "Explain simply, as if to a smart person outside this field. "
-    "Plain words, concrete analogies, no jargon."
-)
-RESPONSE_STYLE_DEEP_DIVE = (
-    "Go thorough: cover the mechanism, trade-offs, edge cases, and "
-    "end with a recommendation. Depth over brevity."
-)
-
-# MCP tool context block (TASK-490) — appended by the claude-code bridge so the
-# agent passes the right bot_id to bawthub MCP tools. {bot_slug} is required.
-# The leading "\n\n" separator is added at the append site, not in the body.
-MCP_TOOL_CONTEXT_TEMPLATE = (
-    "## MCP Tool Context\n"
-    "Your bot_id is \"{bot_slug}\". When using bawthub MCP tools:\n"
-    "- Memory/message tools: always pass bot_id=\"{bot_slug}\"\n"
-    "- Profile tool with entity_type=\"user\": use entity_id=\"nick\" (the user)\n"
-    "- Profile tool with entity_type=\"bot\": use entity_id=\"{bot_slug}\" (yourself)"
-)
-
-# Runtime-context model block (TASK-490) — injected app-side by the claude-code
-# agent backend so the agent has a ground-truth model id. {model} is required.
-RUNTIME_CONTEXT_TEMPLATE = (
-    "<runtime-context>\n"
-    "model: {model}\n"
-    "</runtime-context>\n\n"
-    "When asked which model you are running on, report exactly the "
-    "`model` value above (`{model}`).  Trust the runtime-context "
-    "block over any environment variables you can read, your "
-    "training-time defaults, or self-introspection guesses — the "
-    "value above is the actual model id the Claude Agent SDK is "
-    "invoking for this turn."
-)
-
-
-def _load_agents_task_execution() -> str:
-    from .agent_backends.prompts import TASK_EXECUTION_PROMPT
-
-    return TASK_EXECUTION_PROMPT
-
-
-def _load_agents_project_plan() -> str:
-    from .agent_backends.prompts import PROJECT_PLAN_PROMPT
-
-    return PROJECT_PLAN_PROMPT
-
-
-def _load_agents_review() -> str:
-    from .agent_backends.prompts import REVIEW_DISPATCH_PROMPT
-
-    return REVIEW_DISPATCH_PROMPT
-
-
-def _load_agents_docs() -> str:
-    from .agent_backends.prompts import AGENTS_DOCS_PROMPT
-
-    return AGENTS_DOCS_PROMPT
-
-
-def _load_self_recap_system() -> str:
-    from .mcp_server.recap_prompt import RECAP_SYSTEM_PROMPT
-
-    return RECAP_SYSTEM_PROMPT
-
-
-TTS_OUTPUT_INSTRUCTIONS = (
-    "VOICE OUTPUT:\n"
-    "Your response will be spoken via text-to-speech. Only include words to be spoken. "
-    "No emojis, no markdown, no asterisks, no parentheticals, no action lines. "
-    "Describe actions, scenes, or reactions in words naturally woven into speech. "
-    "Write out numbers and abbreviations as spoken words."
-)
-
-
-AGENT_VOICE_PREFIX = (
-    "VOICE OUTPUT MODE:\n"
-    "Keep your response to 1 to 3 short sentences for text-to-speech. "
-    "No markdown, no emojis, no asterisks. "
-    "Write out numbers and abbreviations as spoken words. "
-    "Skip preambles like \"sure\" or \"okay\" — just answer."
-)
-
-
-# Default body for chat.agent_user_prefix — the always-on, toggle-controlled
-# per-turn prefix for agent backends. Voice-aware body so a single prompt covers
-# both modes; the system prompt that the SDK locks in at session start cannot
-# carry mode-dependent guidance reliably, so we re-state it on every turn.
-AGENT_USER_PREFIX = (
-    "When mode=voice: respond as 1 to 3 short sentences for text-to-speech. "
-    "No markdown, no emojis, no asterisks. Write out numbers and abbreviations "
-    "as spoken words. Skip preambles like 'sure' or 'okay' — just answer.\n"
-    "When mode=text: respond normally, markdown is fine."
-)
-
-
-# Default body for agents.global_prompt — a shared, opt-in system-prompt block
-# for AGENT backends (Claude Code, Codex, OpenClaw). Gated per-bot by the
-# `agent_global_prompt_enabled` runtime setting. Rides the cacheable system-prompt
-# prefix (byte-stable across turns unless the DB body changes).
-AGENT_GLOBAL_PROMPT = (
-    "TASK SELF-MANAGEMENT:\n"
-    "Manage your own work through the BawtHub agent task system so it stays "
-    "observable to the user — the SDK harness has no other channel to show what "
-    "you are doing, planning, or how far along you are.\n\n"
-    "- For any non-trivial or multi-step work, invoke the `agent-system` skill "
-    "and create a task with its steps up front (tasks_create / steps_add).\n"
-    "- Drive the steps as you work: mark each RUNNING when you start it and "
-    "COMPLETED / FAILED with a short output when you finish it (steps_update). "
-    "This is how the user watches progress in real time.\n"
-    "- Your SDK session can reset between turns. Before continuing work, reload "
-    "state with tasks_get_context(task_id) so you never lose the plan or redo "
-    "finished steps.\n"
-    "- A task in BUG status is locked for human review. Do not try to move it "
-    "out of BUG — the system will reject it. Leave it as-is and continue with "
-    "other work.\n\n"
-    "MANAGER / WORKER CALLBACKS:\n"
-    "- Managers delegate long-running work with the default asynchronous "
-    "bots_send_message mode; it is durable and returns a delivery_id immediately. "
-    "Do not block the manager turn waiting for a worker.\n"
-    "- A worker must persist its READY/BLOCKED result in the task response first, "
-    "then notify the manager with default bots_send_message plus task_id='TASK-N', "
-    "message_kind='READY' or 'BLOCKED', and a stable idempotency_key such as "
-    "'TASK-N:READY'. If the manager has an active steer-capable Claude turn, the "
-    "callback redirects that SAME turn; otherwise it starts exactly one safe idle "
-    "fallback turn. Use delivery='when_idle' only when steering is intentionally "
-    "undesired.\n"
-    "- force=true never authorizes concurrent agent turns. Never poll as the "
-    "primary scheduler; inspect delivery status or task state only as a fallback.\n"
-    "- Before delegating a large independent task, inspect the target with "
-    "agent_context_health. Choose session_policy='reset_retain_history' when it "
-    "needs bounded prior context or 'reset_without_history' for a clean task. A "
-    "reset waits behind an active turn and never deletes durable history.\n\n"
-    "PLAYWRIGHT SCREENSHOTS:\n"
-    "- For normal verification, visual inspection, and BawtHub display, call "
-    "`browser_take_screenshot` without `filename`. The normal result gives you "
-    "the image for immediate interpretation and a durable Garage artifact "
-    "reference after persistence.\n"
-    "- If you need the raw bytes later, use `curl` with the returned `original`, "
-    "`preview`, or `thumb` URL.\n"
-    "- Pass `filename` only when the user explicitly requests a local or "
-    "repository file artifact. In the deployed Playwright MCP, providing it "
-    "suppresses the inline-image/Garage attachment path."
-)
-
-
 DEFAULT_PROMPT_DEFINITIONS: dict[str, PromptDefinition] = {
     "history.summarization.single": PromptDefinition(
         key="history.summarization.single",
         title="History Summarization",
         category="summarization",
         required_vars=("messages",),
-        loader=_load_history_summarization_single,
+        loader=load_history_summarization_single,
     ),
     "history.summarization.batch": PromptDefinition(
         key="history.summarization.batch",
         title="History Summarization Batch",
         category="summarization",
         required_vars=("sessions_blob",),
-        loader=_load_history_summarization_batch,
+        loader=load_history_summarization_batch,
     ),
     "memory.extraction.fact": PromptDefinition(
         key="memory.extraction.fact",
         title="Fact Extraction",
         category="memory_extraction",
         required_vars=("conversation",),
-        loader=_load_memory_extraction_fact,
+        loader=load_memory_extraction_fact,
     ),
     "memory.extraction.update": PromptDefinition(
         key="memory.extraction.update",
         title="Memory Update Actions",
         category="memory_extraction",
         required_vars=("existing_memories", "new_facts"),
-        loader=_load_memory_extraction_update,
+        loader=load_memory_extraction_update,
     ),
     "memory.extraction.summary": PromptDefinition(
         key="memory.extraction.summary",
         title="Summary Fact Extraction",
         category="memory_extraction",
         required_vars=("summary_text", "start_date", "end_date"),
-        loader=_load_memory_extraction_summary,
+        loader=load_memory_extraction_summary,
     ),
     "profile.consolidation": PromptDefinition(
         key="profile.consolidation",
         title="Profile Consolidation",
         category="profile",
         required_vars=("attributes",),
-        loader=_load_profile_consolidation,
+        loader=load_profile_consolidation,
         format="json_instruction",
     ),
     "memory.maintenance.intent_with_context": PromptDefinition(
@@ -377,14 +194,14 @@ DEFAULT_PROMPT_DEFINITIONS: dict[str, PromptDefinition] = {
         title="Memory Intent Inference With Context",
         category="memory_maintenance",
         required_vars=("conversation", "fact"),
-        loader=_load_memory_maintenance_intent_with_context,
+        loader=load_memory_maintenance_intent_with_context,
     ),
     "memory.maintenance.intent_content_only": PromptDefinition(
         key="memory.maintenance.intent_content_only",
         title="Memory Intent Inference Content Only",
         category="memory_maintenance",
         required_vars=("fact",),
-        loader=_load_memory_maintenance_intent_content_only,
+        loader=load_memory_maintenance_intent_content_only,
     ),
     "chat.tts_output_instructions": PromptDefinition(
         key="chat.tts_output_instructions",
@@ -393,12 +210,26 @@ DEFAULT_PROMPT_DEFINITIONS: dict[str, PromptDefinition] = {
         required_vars=(),
         loader=lambda: TTS_OUTPUT_INSTRUCTIONS,
     ),
+    "chat.scoped_commit": PromptDefinition(
+        key="chat.scoped_commit",
+        title="Scoped Commit Request",
+        category="chat",
+        required_vars=("scope",),
+        loader=lambda: SCOPED_COMMIT_PROMPT,
+        metadata={
+            "notes": (
+                "Sent when the Commit action is used on a completed changed-files "
+                "summary. BawtHub supplies {scope} from that turn's repository and "
+                "file summary; llm-bawt validates and renders the final request."
+            ),
+        },
+    ),
     "chat.global_recall_guidance": PromptDefinition(
         key="chat.global_recall_guidance",
         title="Global Recall / Cross-Bot Memory Guidance",
         category="chat",
         required_vars=(),
-        loader=_load_global_recall_guidance,
+        loader=load_global_recall_guidance,
         metadata={
             "notes": (
                 "Injected into the system prompt of every memory-enabled bot "
@@ -528,14 +359,14 @@ DEFAULT_PROMPT_DEFINITIONS: dict[str, PromptDefinition] = {
         title="Agent Task Spec (Planning Mode)",
         category="agent_execution",
         required_vars=("task_context", "task_url", "extra_api_lines"),
-        loader=_load_agents_task_spec,
+        loader=load_agents_task_spec,
     ),
     "agents.task_execution": PromptDefinition(
         key="agents.task_execution",
         title="Agent Task Execution",
         category="agent_execution",
         required_vars=("task_context", "task_url", "finish_instruction"),
-        loader=_load_agents_task_execution,
+        loader=load_agents_task_execution,
     ),
     "agents.project_plan": PromptDefinition(
         key="agents.project_plan",
@@ -549,7 +380,7 @@ DEFAULT_PROMPT_DEFINITIONS: dict[str, PromptDefinition] = {
             "project_url",
             "project_id",
         ),
-        loader=_load_agents_project_plan,
+        loader=load_agents_project_plan,
     ),
     "agents.review": PromptDefinition(
         key="agents.review",
@@ -562,21 +393,21 @@ DEFAULT_PROMPT_DEFINITIONS: dict[str, PromptDefinition] = {
             "task_url",
             "finish_instruction",
         ),
-        loader=_load_agents_review,
+        loader=load_agents_review,
     ),
     "agents.docs": PromptDefinition(
         key="agents.docs",
         title="Agent Task System Reference Doc",
         category="agent_execution",
         required_vars=("origin", "task_section"),
-        loader=_load_agents_docs,
+        loader=load_agents_docs,
     ),
     "self_recap.system": PromptDefinition(
         key="self_recap.system",
         title="Self-Recap Handoff Analyst",
         category="agent_execution",
         required_vars=(),
-        loader=_load_self_recap_system,
+        loader=load_self_recap_system,
         metadata={
             "notes": (
                 "System prompt for the self_recap MCP tool's HANDOFF ANALYST. "
