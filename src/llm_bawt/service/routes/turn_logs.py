@@ -766,6 +766,7 @@ def get_uncommitted_changed_files(
     bot_id: str = Query(...),
     user_id: str = Query(...),
     session_id: str | None = Query(None),
+    anchor_turn_id: str | None = Query(None),
 ):
     """Aggregate unacknowledged changed files inside one canonical session."""
     store = get_turn_log_store()
@@ -773,6 +774,7 @@ def get_uncommitted_changed_files(
         raise HTTPException(status_code=503, detail="Turn logs DB unavailable")
     resolved, summary = store.uncommitted_changed_files_summary(
         session_id=session_id,
+        anchor_turn_id=anchor_turn_id,
         bot_id=bot_id.strip().lower(),
         user_id=user_id.strip().lower(),
     )

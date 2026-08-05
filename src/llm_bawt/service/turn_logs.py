@@ -1014,12 +1014,14 @@ class TurnLogStore:
         session_id: str | None,
         bot_id: str,
         user_id: str,
+        anchor_turn_id: str | None = None,
     ) -> tuple[str | None, dict]:
         if self.engine is None:
             from .changed_files_store import build_uncommitted_summary
             return None, build_uncommitted_summary([])
         return self._changed_files_store().uncommitted_summary_for_session(
             session_id=session_id,
+            anchor_turn_id=anchor_turn_id,
             bot_id=bot_id,
             user_id=user_id,
         )

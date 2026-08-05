@@ -296,6 +296,24 @@ def test_uncommitted_summary_is_session_scoped_and_deduplicates_paths(store):
     assert same["deletions"] == 3
 
 
+def test_uncommitted_summary_anchor_survives_active_session_rotation(store):
+    _conversation(store, session_id="session-old", status="completed", started_at="2026-08-04 10:00:00")
+    _conversation(store, session_id="session-new", status="active", started_at="2026-08-05 10:00:00")
+    _trigger(store, message_id="msg-old", session_id="session-old")
+    store.save_turn_files(
+        turn_id="turn-old", bot_id="b", user_id="u", trigger_message_id="msg-old",
+        files=[_mod("old.py", "a", "b")],
+    )
+
+    resolved, summary = store.uncommitted_summary_for_session(
+        session_id=None, anchor_turn_id="turn-old", bot_id="b", user_id="u"
+    )
+
+    assert resolved == "session-old"
+    assert summary["turn_ids"] == ["turn-old"]
+    assert [file["path"] for file in summary["files"]] == ["old.py"]
+
+
 def test_commit_requested_advances_only_selected_turns_in_active_session(store):
     _conversation(store, session_id="session-active")
     _trigger(store, message_id="msg-1", session_id="session-active")
@@ -322,6 +340,24 @@ def test_commit_requested_advances_only_selected_turns_in_active_session(store):
     assert remaining["turn_ids"] == ["turn-2"]
     assert [file["path"] for file in remaining["files"]] == ["two.py"]
     assert committed["commit_requested"] is True
+
+
+def test_commit_requested_uses_selected_turn_after_active_session_rotation(store):
+    _conversation(store, session_id="session-old", status="completed", started_at="2026-08-04 10:00:00")
+    _conversation(store, session_id="session-new", status="active", started_at="2026-08-05 10:00:00")
+    _trigger(store, message_id="msg-old", session_id="session-old")
+    store.save_turn_files(
+        turn_id="turn-old", bot_id="b", user_id="u", trigger_message_id="msg-old",
+        files=[_mod("old.py", "a", "b")],
+    )
+
+    resolved, marked = store.mark_commit_requested(
+        session_id=None, bot_id="b", user_id="u", turn_ids=["turn-old"]
+    )
+
+    assert resolved == "session-old"
+    assert marked == 1
+    assert store.summary_for_turn("turn-old")["commit_requested"] is True
 
 
 def test_commit_requested_rejects_turn_from_other_session(store):

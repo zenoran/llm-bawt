@@ -602,13 +602,19 @@ class ChangedFilesStore:
         self,
         *,
         session_id: str | None,
+        anchor_turn_id: str | None,
         bot_id: str,
         user_id: str,
     ) -> str | None:
-        """Resolve an explicit conversation or the owner's active conversation."""
+        """Resolve an explicit, turn-anchored, or active conversation.
+
+        A turn anchor keeps historical changed-file cards attached to their
+        canonical session after ``/new`` rotates which session is active.
+        """
         if self.engine is None:
             return None
         requested = (session_id or "").strip()
+        anchor = (anchor_turn_id or "").strip()
         with self.engine.connect() as conn:
             if requested:
                 return conn.execute(
@@ -617,6 +623,20 @@ class ChangedFilesStore:
                         "WHERE id = :session_id AND bot_id = :bot_id AND user_id = :user_id"
                     ),
                     {"session_id": requested, "bot_id": bot_id, "user_id": user_id},
+                ).scalar_one_or_none()
+            if anchor:
+                return conn.execute(
+                    sa_text(
+                        "SELECT message.session_id FROM turn_changed_files AS changed "
+                        "JOIN messages AS message "
+                        "  ON message.bot_id = changed.bot_id "
+                        " AND message.id = changed.trigger_message_id "
+                        "WHERE changed.turn_id = :turn_id "
+                        "  AND changed.bot_id = :bot_id AND changed.user_id = :user_id "
+                        "  AND message.session_id IS NOT NULL "
+                        "ORDER BY changed.created_at DESC, changed.id DESC LIMIT 1"
+                    ),
+                    {"turn_id": anchor, "bot_id": bot_id, "user_id": user_id},
                 ).scalar_one_or_none()
             return conn.execute(
                 sa_text(
@@ -633,10 +653,12 @@ class ChangedFilesStore:
         session_id: str | None,
         bot_id: str,
         user_id: str,
+        anchor_turn_id: str | None = None,
     ) -> tuple[str | None, dict[str, Any]]:
         """Aggregate unacknowledged changed files inside one conversation."""
         resolved = self._resolve_session_id(
             session_id=session_id,
+            anchor_turn_id=anchor_turn_id,
             bot_id=bot_id,
             user_id=user_id,
         )
@@ -670,12 +692,13 @@ class ChangedFilesStore:
         turn_ids: list[str],
     ) -> tuple[str | None, int]:
         """Acknowledge selected turns, rejecting rows outside the conversation."""
+        clean_turn_ids = list(dict.fromkeys(value.strip() for value in turn_ids if value.strip()))
         resolved = self._resolve_session_id(
             session_id=session_id,
+            anchor_turn_id=clean_turn_ids[0] if clean_turn_ids else None,
             bot_id=bot_id,
             user_id=user_id,
         )
-        clean_turn_ids = list(dict.fromkeys(value.strip() for value in turn_ids if value.strip()))
         if self.engine is None or not resolved or not clean_turn_ids:
             return resolved, 0
         statement = sa_text(
