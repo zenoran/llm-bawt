@@ -38,6 +38,13 @@ class SessionInfo(BaseModel):
     started_at: str | None = None
     ended_at: str | None = None
     archived_at: str | None = None
+    last_activity_at: str | None = None
+    first_message_at: str | None = None
+    message_count: int = 0
+    turn_count: int = 0
+    first_user_message: str | None = None
+    last_user_message: str | None = None
+    summary: str | None = None
     status: str
     session_metadata: dict | None = None
 
@@ -219,6 +226,13 @@ def _to_info(row: dict) -> SessionInfo:
         started_at=str(row["started_at"]) if row.get("started_at") is not None else None,
         ended_at=str(row["ended_at"]) if row.get("ended_at") is not None else None,
         archived_at=str(row["archived_at"]) if row.get("archived_at") is not None else None,
+        last_activity_at=row.get("last_activity_at"),
+        first_message_at=row.get("first_message_at"),
+        message_count=int(row.get("message_count") or 0),
+        turn_count=int(row.get("turn_count") or 0),
+        first_user_message=row.get("first_user_message"),
+        last_user_message=row.get("last_user_message"),
+        summary=row.get("summary"),
         status=row.get("status", ""),
         session_metadata=_normalize_metadata(row),
     )
