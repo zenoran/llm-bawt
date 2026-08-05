@@ -463,7 +463,7 @@ class TestScopedSeedDecision:
         )
 
     def test_thread_without_key_builds_scoped_seed(self, monkeypatch):
-        from llm_bawt.service.routes import history as history_routes
+        from llm_bawt.service.routes import history_seed
 
         captured = {}
 
@@ -471,16 +471,23 @@ class TestScopedSeedDecision:
             captured["session_id"] = session_id
             return {"messages": [{"role": "user", "content": "x"}]}
 
-        monkeypatch.setattr(history_routes, "build_context_seed", _fake_seed)
-        out = history_routes.maybe_build_session_seed(
+        monkeypatch.setattr(history_seed, "build_context_seed", _fake_seed)
+        out = history_seed.maybe_build_session_seed(
             self._llm_bawt(), "byte", "m", "hello", None,
             thread_binding={"thread_session_id": "t-1", "explicit_thread": True},
         )
         assert out == [{"role": "user", "content": "x"}]
         assert captured["session_id"] == "t-1"
 
-    def test_cold_active_thread_builds_seed(self, monkeypatch):
-        from llm_bawt.service.routes import history as history_routes
+    @pytest.mark.parametrize("prompt", ["hello", "/new"])
+    def test_cold_active_thread_uses_preview_history_pool(self, monkeypatch, prompt):
+        """Normal cold starts and /new must match the unscoped seed preview.
+
+        The active thread id is still the destination for SDK-key writeback, but
+        it must not narrow context assembly to that one durable thread. Doing so
+        makes back-to-back /new carry only the previous reset exchange.
+        """
+        from llm_bawt.service.routes import history_seed
 
         captured = {}
 
@@ -488,13 +495,13 @@ class TestScopedSeedDecision:
             captured["session_id"] = session_id
             return {"messages": [{"role": "summary", "content": "prior"}]}
 
-        monkeypatch.setattr(history_routes, "build_context_seed", _fake_seed)
-        out = history_routes.maybe_build_session_seed(
-            self._llm_bawt(), "byte", "m", "hello", None,
+        monkeypatch.setattr(history_seed, "build_context_seed", _fake_seed)
+        out = history_seed.maybe_build_session_seed(
+            self._llm_bawt(), "byte", "m", prompt, None,
             thread_binding={"thread_session_id": "active-1"},
         )
         assert out == [{"role": "summary", "content": "prior"}]
-        assert captured["session_id"] == "active-1"
+        assert captured["session_id"] is None
 
     def test_warm_active_thread_does_not_double_seed(self):
         from llm_bawt.service.routes.history import maybe_build_session_seed

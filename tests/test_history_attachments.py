@@ -31,6 +31,7 @@ from fastapi.testclient import TestClient
 
 from llm_bawt.service import dependencies as service_deps
 from llm_bawt.service.routes import history as history_routes
+from llm_bawt.service.routes import history_pages
 
 
 # ---------------------------------------------------------------------------
@@ -148,7 +149,7 @@ def app_factory(monkeypatch):
         fake_store = FakeMediaAssetStore(asset_rows or {})
 
         monkeypatch.setattr(
-            history_routes,
+            history_pages,
             "get_media_asset_store",
             lambda *a, **kw: fake_store,
         )
