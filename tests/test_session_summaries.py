@@ -18,7 +18,6 @@ protected tail kept raw.
 
 from __future__ import annotations
 
-import re
 import uuid
 from pathlib import Path
 from types import SimpleNamespace
@@ -144,6 +143,62 @@ class TestChunkPropagation:
 
 
 # ──────────────────────────────────────────────────────────────────────────
+# Common per-thread summarizer policy
+# ──────────────────────────────────────────────────────────────────────────
+
+class TestSummarizeThreadPolicy:
+    def test_per_call_minimum_allows_short_summary_only_thread(self):
+        from llm_bawt.memory.summarization import HistorySummarizer
+
+        rows = [
+            SimpleNamespace(
+                id="u1", role="user", content="what is next",
+                timestamp=1.0, session_id="thread-short",
+            ),
+            SimpleNamespace(
+                id="a1", role="assistant", content="TASK-702 is next",
+                timestamp=2.0, session_id="thread-short",
+            ),
+        ]
+
+        class _Result:
+            def fetchall(self):
+                return rows
+
+        class _Connection:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+            def execute(self, *_args, **_kwargs):
+                return _Result()
+
+        summarizer = HistorySummarizer.__new__(HistorySummarizer)
+        summarizer._backend = SimpleNamespace(
+            engine=SimpleNamespace(connect=lambda: _Connection()),
+            _messages_table_name="messages_p_test",
+        )
+        summarizer.min_messages_per_session = 4
+        summarizer.protected_recent_turns = 3
+        summarizer.summarize_session = lambda session, _fallback: {
+            "success": True,
+            "created": True,
+            "message_count": session.message_count,
+        }
+
+        baseline = summarizer.summarize_thread("thread-short")
+        assert baseline["summaries_created"] == 0
+
+        forced = summarizer.summarize_thread(
+            "thread-short", min_messages=1, protect_recent_turns=False,
+        )
+        assert forced["summaries_created"] == 1
+        assert forced["messages_summarized"] == 2
+
+
+# ──────────────────────────────────────────────────────────────────────────
 # /new pre-seed summarize gate
 # ──────────────────────────────────────────────────────────────────────────
 
@@ -223,9 +278,16 @@ class TestMaybeSummarizeOnNew:
             def __init__(self, config, bot_id, summarize_fn=None, **kw):
                 calls["bot_id"] = bot_id
 
-            def summarize_thread(self, session_id, protect_recent_turns=False, **kw):
+            def summarize_thread(
+                self,
+                session_id,
+                protect_recent_turns=False,
+                min_messages=None,
+                **kw,
+            ):
                 calls["session_id"] = session_id
                 calls["protect"] = protect_recent_turns
+                calls["min_messages"] = min_messages
                 return {"summaries_created": 1, "messages_summarized": 4,
                         "errors": []}
 
@@ -234,7 +296,51 @@ class TestMaybeSummarizeOnNew:
 
         assert _Bridge()._maybe_summarize_on_new(_llm(), "byte", "/new") is True
         assert calls == {
-            "bot_id": "byte", "session_id": "thread-1", "protect": True,
+            "bot_id": "byte",
+            "session_id": "thread-1",
+            "protect": True,
+            "min_messages": None,
+        }
+
+    def test_summary_only_scope_summarizes_short_thread_without_raw_fallback(
+        self, monkeypatch
+    ):
+        """A summary-only /new must not lose a short outgoing thread.
+
+        Raw messages are intentionally excluded from the seed in this scope, so
+        protecting the recent tail or applying the background-job minimum would
+        leave the conversation represented by neither raw nor summary context.
+        """
+        calls = {}
+
+        class _FakeSummarizer:
+            def __init__(self, config, bot_id, summarize_fn=None, **kw):
+                calls["bot_id"] = bot_id
+
+            def summarize_thread(
+                self,
+                session_id,
+                protect_recent_turns=False,
+                min_messages=None,
+                **kw,
+            ):
+                calls["session_id"] = session_id
+                calls["protect"] = protect_recent_turns
+                calls["min_messages"] = min_messages
+                return {"summaries_created": 1, "messages_summarized": 2,
+                        "errors": []}
+
+        import llm_bawt.memory.summarization as summod
+        monkeypatch.setattr(summod, "HistorySummarizer", _FakeSummarizer)
+
+        assert _Bridge()._maybe_summarize_on_new(
+            _llm(scope="summaries"), "loopy", "/new"
+        ) is True
+        assert calls == {
+            "bot_id": "loopy",
+            "session_id": "thread-1",
+            "protect": False,
+            "min_messages": 1,
         }
 
     def test_mcp_proxy_backend_resolves_active_session(self, monkeypatch):

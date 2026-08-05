@@ -1229,6 +1229,7 @@ class HistorySummarizer:
         message_ids: list[str] | None = None,
         use_heuristic_fallback: bool = True,
         protect_recent_turns: bool = False,
+        min_messages: int | None = None,
         max_tokens_per_chunk: int = 4000,
     ) -> dict:
         """THE common per-thread summarization unit (TASK-641).
@@ -1240,6 +1241,8 @@ class HistorySummarizer:
           unsummarized rows are summarized, minus the protected recent tail
           when ``protect_recent_turns`` is set (keeps the seed's
           high-fidelity raw tail instead of degrading it to summaries-only).
+          ``min_messages`` may lower the job threshold for a caller that has no
+          raw-history fallback, such as a summary-only continuity seed.
 
         Chunks large threads exactly like the job path and stores each chunk
         via ``summarize_session`` — so every summary row created here carries
@@ -1282,7 +1285,12 @@ class HistorySummarizer:
             if n_protected > 0:
                 msgs = msgs[:-n_protected] if len(msgs) > n_protected else []
 
-        if len(msgs) < self.min_messages_per_session:
+        minimum = (
+            self.min_messages_per_session
+            if min_messages is None
+            else max(1, int(min_messages))
+        )
+        if len(msgs) < minimum:
             return {"success": True, "summaries_created": 0,
                     "messages_summarized": 0, "results": [], "errors": []}
 

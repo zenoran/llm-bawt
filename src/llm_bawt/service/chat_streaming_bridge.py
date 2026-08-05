@@ -362,7 +362,7 @@ class ChatStreamingBridgeMixin:
                 ).value
             except Exception:
                 scope = None
-            _, include_summaries = scope_flags(scope)
+            include_history, include_summaries = scope_flags(scope)
             if not include_summaries:
                 log.info(
                     "/new summarize skipped: scope=%r has no summaries (bot=%s)",
@@ -418,8 +418,15 @@ class ChatStreamingBridgeMixin:
                     summarizer = HistorySummarizer(
                         self.config, bot_id=bot_id, summarize_fn=_bounded_llm,
                     )
+                    # Mixed raw+summary seeds preserve the configured recent
+                    # tail verbatim. Summary-only seeds have no raw fallback:
+                    # summarize the complete outgoing thread and lower the job
+                    # threshold so even a one-turn conversation survives /new.
+                    summary_only = not include_history
                     result = summarizer.summarize_thread(
-                        session_id, protect_recent_turns=True,
+                        session_id,
+                        protect_recent_turns=not summary_only,
+                        min_messages=1 if summary_only else None,
                     )
                     log.info(
                         "/new pre-seed summarization: bot=%s thread=%s "
