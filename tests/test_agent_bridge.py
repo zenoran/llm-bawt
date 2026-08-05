@@ -81,6 +81,89 @@ class TestClaudeActiveRun:
         interrupted = MagicMock(subtype="error_during_execution")
         assert run.consume_replaced_result(interrupted) is False
 
+    @pytest.mark.anyio
+    async def test_steer_returns_no_active_run_when_turn_finishes_during_interrupt(self):
+        interrupt_started = asyncio.Event()
+        release_interrupt = asyncio.Event()
+
+        async def hanging_interrupt():
+            interrupt_started.set()
+            await release_interrupt.wait()
+
+        client = AsyncMock()
+        client.interrupt.side_effect = hanging_interrupt
+        run = ClaudeActiveRun(client=client, request_id="req-1")
+
+        steer_task = asyncio.create_task(run.steer("change direction"))
+        await interrupt_started.wait()
+        run.mark_completed()
+
+        with pytest.raises(RuntimeError, match="no_active_run"):
+            await steer_task
+
+        client.query.assert_not_awaited()
+        assert run.consume_replaced_result(MagicMock(subtype="success")) is False
+
+    @pytest.mark.anyio
+    async def test_steer_rejects_already_completed_run_without_interrupting(self):
+        client = AsyncMock()
+        run = ClaudeActiveRun(client=client, request_id="req-1")
+        run.mark_completed()
+
+        with pytest.raises(RuntimeError, match="no_active_run"):
+            await run.steer("change direction")
+
+        client.interrupt.assert_not_awaited()
+        client.query.assert_not_awaited()
+
+    @pytest.mark.anyio
+    async def test_steer_bounds_unacknowledged_interrupt_before_rpc_deadline(self):
+        interrupt_started = asyncio.Event()
+        release_interrupt = asyncio.Event()
+
+        async def hanging_interrupt():
+            interrupt_started.set()
+            await release_interrupt.wait()
+
+        client = AsyncMock()
+        client.interrupt.side_effect = hanging_interrupt
+        run = ClaudeActiveRun(
+            client=client,
+            request_id="req-1",
+            _steer_timeout_s=0.01,
+        )
+
+        with pytest.raises(RuntimeError, match="steer_interrupt_timeout"):
+            await run.steer("change direction")
+
+        assert interrupt_started.is_set()
+        client.query.assert_not_awaited()
+        assert run.consume_replaced_result(MagicMock(subtype="success")) is False
+
+    @pytest.mark.anyio
+    async def test_steer_bounds_replacement_query_before_rpc_deadline(self):
+        query_started = asyncio.Event()
+        release_query = asyncio.Event()
+
+        async def hanging_query(_message):
+            query_started.set()
+            await release_query.wait()
+
+        client = AsyncMock()
+        client.query.side_effect = hanging_query
+        run = ClaudeActiveRun(
+            client=client,
+            request_id="req-1",
+            _steer_timeout_s=0.01,
+        )
+
+        with pytest.raises(RuntimeError, match="steer_query_timeout"):
+            await run.steer("change direction")
+
+        assert query_started.is_set()
+        client.disconnect.assert_awaited_once_with()
+        assert run.consume_replaced_result(MagicMock(subtype="success")) is False
+
     def test_success_result_in_interrupt_race_is_still_replaced(self):
         run = ClaudeActiveRun(client=AsyncMock(), request_id="req-1")
         run._expected_interrupt_results = 1

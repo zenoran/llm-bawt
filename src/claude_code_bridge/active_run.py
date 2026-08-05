@@ -22,6 +22,8 @@ class ClaudeActiveRun:
     request_id: str
     _steer_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     _expected_interrupt_results: int = 0
+    _completed: asyncio.Event = field(default_factory=asyncio.Event)
+    _steer_timeout_s: float = field(default=8.0, repr=False)
 
     async def steer(self, message: str) -> None:
         """Interrupt current work and inject ``message`` into the same SDK run."""
@@ -46,12 +48,39 @@ class ClaudeActiveRun:
         )
 
         async with self._steer_lock:
+            if self._completed.is_set():
+                raise RuntimeError("no_active_run")
+
             self._expected_interrupt_results += 1
             interrupted = False
+            loop = asyncio.get_running_loop()
+            deadline = loop.time() + self._steer_timeout_s
+            interrupt_task = asyncio.create_task(self.client.interrupt())
+            completed_task = asyncio.create_task(self._completed.wait())
             try:
-                await self.client.interrupt()
+                done, _pending = await asyncio.wait(
+                    {interrupt_task, completed_task},
+                    timeout=max(0.0, deadline - loop.time()),
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+                if completed_task in done:
+                    raise RuntimeError("no_active_run")
+                if interrupt_task not in done:
+                    raise RuntimeError("steer_interrupt_timeout")
+                await interrupt_task
                 interrupted = True
-                await self.client.query(replacement_prompt)
+                if self._completed.is_set():
+                    raise RuntimeError("no_active_run")
+                remaining_s = deadline - loop.time()
+                if remaining_s <= 0:
+                    raise RuntimeError("steer_interrupt_timeout")
+                try:
+                    await asyncio.wait_for(
+                        self.client.query(replacement_prompt),
+                        timeout=remaining_s,
+                    )
+                except asyncio.TimeoutError as exc:
+                    raise RuntimeError("steer_query_timeout") from exc
             except BaseException:
                 # If the replacement query was not accepted, do not hide the
                 # interrupted result as though a continuation were coming. Once
@@ -66,6 +95,19 @@ class ClaudeActiveRun:
                     except BaseException:
                         pass
                 raise
+            finally:
+                for task in (interrupt_task, completed_task):
+                    if not task.done():
+                        task.cancel()
+                await asyncio.gather(
+                    interrupt_task,
+                    completed_task,
+                    return_exceptions=True,
+                )
+
+    def mark_completed(self) -> None:
+        """Signal that the response consumer reached the run's terminal edge."""
+        self._completed.set()
 
     def consume_replaced_result(self, result_message: Any) -> bool:
         """Consume one terminal boundary superseded by a steering message.

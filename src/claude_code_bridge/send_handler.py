@@ -898,6 +898,12 @@ class ClaudeSendMixin(ClaudeStreamMixin, ClaudeUsageMixin, ClaudeResultMixin):
                         # and this session's lock can never be reacquired — the
                         # TASK-269 deadlock. Event.set() is idempotent.
                         turn_done.set()
+                        # Wake any concurrent steer that is waiting for the SDK
+                        # CLI to acknowledge interrupt. A turn can finish in the
+                        # narrow window after the bridge accepted the steer
+                        # command but before the CLI handles its control request.
+                        if active_run is not None:
+                            active_run.mark_completed()
                         # Always deregister this iteration's client so a
                         # subsequent chat.abort doesn't try to disconnect()
                         # something that's already finished. We pop only if
