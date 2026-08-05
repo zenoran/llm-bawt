@@ -772,7 +772,7 @@ def get_uncommitted_changed_files(
     store = get_turn_log_store()
     if store.engine is None:
         raise HTTPException(status_code=503, detail="Turn logs DB unavailable")
-    resolved, summary = store.uncommitted_changed_files_summary(
+    resolved, summary, other_summary = store.uncommitted_changed_files_summaries(
         session_id=session_id,
         anchor_turn_id=anchor_turn_id,
         bot_id=bot_id.strip().lower(),
@@ -780,7 +780,11 @@ def get_uncommitted_changed_files(
     )
     if session_id and not resolved:
         raise HTTPException(status_code=404, detail="Conversation not found")
-    return {"session_id": resolved, "summary": summary}
+    return {
+        "session_id": resolved,
+        "summary": summary,
+        "other_summary": other_summary,
+    }
 
 
 @router.post("/v1/turn-changed-files/commit-requested", tags=["History"])

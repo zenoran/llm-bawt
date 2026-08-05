@@ -647,15 +647,15 @@ class ChangedFilesStore:
                 {"bot_id": bot_id, "user_id": user_id},
             ).scalar_one_or_none()
 
-    def uncommitted_summary_for_session(
+    def uncommitted_summaries_for_session(
         self,
         *,
         session_id: str | None,
         bot_id: str,
         user_id: str,
         anchor_turn_id: str | None = None,
-    ) -> tuple[str | None, dict[str, Any]]:
-        """Aggregate unacknowledged changed files inside one conversation."""
+    ) -> tuple[str | None, dict[str, Any], dict[str, Any]]:
+        """Build full and other-turn aggregates for one conversation."""
         resolved = self._resolve_session_id(
             session_id=session_id,
             anchor_turn_id=anchor_turn_id,
@@ -663,7 +663,8 @@ class ChangedFilesStore:
             user_id=user_id,
         )
         if self.engine is None or not resolved:
-            return resolved, build_uncommitted_summary([])
+            empty = build_uncommitted_summary([])
+            return resolved, empty, empty
         statement = sa_text(
             "SELECT changed.* FROM turn_changed_files AS changed "
             "JOIN messages AS message "
@@ -681,7 +682,30 @@ class ChangedFilesStore:
                 "session_id": resolved,
             })
             rows = [TurnChangedFile(**dict(row)) for row in result.mappings()]
-        return resolved, build_uncommitted_summary(rows)
+        current_turn_id = anchor_turn_id or (rows[-1].turn_id if rows else None)
+        other_rows = [row for row in rows if row.turn_id != current_turn_id]
+        return (
+            resolved,
+            build_uncommitted_summary(rows),
+            build_uncommitted_summary(other_rows),
+        )
+
+    def uncommitted_summary_for_session(
+        self,
+        *,
+        session_id: str | None,
+        bot_id: str,
+        user_id: str,
+        anchor_turn_id: str | None = None,
+    ) -> tuple[str | None, dict[str, Any]]:
+        """Aggregate unacknowledged changed files inside one conversation."""
+        resolved, summary, _ = self.uncommitted_summaries_for_session(
+            session_id=session_id,
+            anchor_turn_id=anchor_turn_id,
+            bot_id=bot_id,
+            user_id=user_id,
+        )
+        return resolved, summary
 
     def mark_commit_requested(
         self,
