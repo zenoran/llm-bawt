@@ -116,7 +116,7 @@ AGENT_GLOBAL_PROMPT = (
 )
 
 SCOPED_COMMIT_PROMPT = (
-    "Commit only the changes from your completed turn summarized below.\n\n"
+    "Commit only the changes from the selected conversation scope summarized below.\n\n"
     "Scoped files:\n"
     "{scope}\n\n"
     "Inspect the current git status and diff, then create an appropriate commit "

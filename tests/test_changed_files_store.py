@@ -39,6 +39,24 @@ def store(tmp_path, monkeypatch):
             TurnDiffPayloadRecord.__table__,
         ],
     )
+    with engine.begin() as conn:
+        conn.execute(text("""
+            CREATE TABLE sessions (
+                id VARCHAR PRIMARY KEY,
+                bot_id VARCHAR NOT NULL,
+                user_id VARCHAR,
+                status VARCHAR NOT NULL,
+                started_at DATETIME NOT NULL
+            )
+        """))
+        conn.execute(text("""
+            CREATE TABLE messages (
+                bot_id VARCHAR NOT NULL,
+                id VARCHAR NOT NULL,
+                session_id VARCHAR,
+                PRIMARY KEY (bot_id, id)
+            )
+        """))
     s = ChangedFilesStore(engine)
     yield s
     reset_diff_blob_backend()
@@ -222,6 +240,105 @@ def test_summaries_for_triggers_keys_by_message(store):
     out = store.summaries_for_triggers(["msg-8", "nope"])
     assert set(out.keys()) == {"msg-8"}
     assert out["msg-8"]["turn_id"] == "turn-8"
+
+
+def _conversation(store, *, session_id, bot_id="b", user_id="u", status="active", started_at="2026-08-04 10:00:00"):
+    with store.engine.begin() as conn:
+        conn.execute(text(
+            "INSERT INTO sessions (id, bot_id, user_id, status, started_at) "
+            "VALUES (:id, :bot_id, :user_id, :status, :started_at)"
+        ), {
+            "id": session_id,
+            "bot_id": bot_id,
+            "user_id": user_id,
+            "status": status,
+            "started_at": started_at,
+        })
+
+
+def _trigger(store, *, message_id, session_id, bot_id="b"):
+    with store.engine.begin() as conn:
+        conn.execute(text(
+            "INSERT INTO messages (bot_id, id, session_id) "
+            "VALUES (:bot_id, :id, :session_id)"
+        ), {"bot_id": bot_id, "id": message_id, "session_id": session_id})
+
+
+def test_uncommitted_summary_is_session_scoped_and_deduplicates_paths(store):
+    _conversation(store, session_id="session-a")
+    _conversation(store, session_id="session-b", status="completed", started_at="2026-08-03 10:00:00")
+    _trigger(store, message_id="msg-a1", session_id="session-a")
+    _trigger(store, message_id="msg-a2", session_id="session-a")
+    _trigger(store, message_id="msg-b1", session_id="session-b")
+    store.save_turn_files(
+        turn_id="turn-a1", bot_id="b", user_id="u", trigger_message_id="msg-a1",
+        files=[_mod("same.py", "v1", "v2", additions=2, deletions=1)],
+    )
+    store.save_turn_files(
+        turn_id="turn-a2", bot_id="b", user_id="u", trigger_message_id="msg-a2",
+        files=[_mod("same.py", "v2", "v3", additions=3, deletions=2), _mod("new.py", "", "x", additions=1, deletions=0)],
+    )
+    store.save_turn_files(
+        turn_id="turn-b1", bot_id="b", user_id="u", trigger_message_id="msg-b1",
+        files=[_mod("other.py", "x", "y", additions=9, deletions=9)],
+    )
+
+    resolved, summary = store.uncommitted_summary_for_session(
+        session_id="session-a", bot_id="b", user_id="u"
+    )
+
+    assert resolved == "session-a"
+    assert summary["turn_ids"] == ["turn-a1", "turn-a2"]
+    assert summary["total_files"] == 2
+    same = next(file for file in summary["files"] if file["path"] == "same.py")
+    assert same["turn_id"] == "turn-a2"
+    assert same["additions"] == 5
+    assert same["deletions"] == 3
+
+
+def test_commit_requested_advances_only_selected_turns_in_active_session(store):
+    _conversation(store, session_id="session-active")
+    _trigger(store, message_id="msg-1", session_id="session-active")
+    _trigger(store, message_id="msg-2", session_id="session-active")
+    store.save_turn_files(
+        turn_id="turn-1", bot_id="b", user_id="u", trigger_message_id="msg-1",
+        files=[_mod("one.py", "a", "b")],
+    )
+    store.save_turn_files(
+        turn_id="turn-2", bot_id="b", user_id="u", trigger_message_id="msg-2",
+        files=[_mod("two.py", "a", "b")],
+    )
+
+    resolved, marked = store.mark_commit_requested(
+        session_id=None, bot_id="b", user_id="u", turn_ids=["turn-1"]
+    )
+    _, remaining = store.uncommitted_summary_for_session(
+        session_id=None, bot_id="b", user_id="u"
+    )
+    committed = store.summary_for_turn("turn-1")
+
+    assert resolved == "session-active"
+    assert marked == 1
+    assert remaining["turn_ids"] == ["turn-2"]
+    assert [file["path"] for file in remaining["files"]] == ["two.py"]
+    assert committed["commit_requested"] is True
+
+
+def test_commit_requested_rejects_turn_from_other_session(store):
+    _conversation(store, session_id="session-a")
+    _conversation(store, session_id="session-b", status="completed")
+    _trigger(store, message_id="msg-b", session_id="session-b")
+    store.save_turn_files(
+        turn_id="turn-b", bot_id="b", user_id="u", trigger_message_id="msg-b",
+        files=[_mod("other.py", "a", "b")],
+    )
+
+    _, marked = store.mark_commit_requested(
+        session_id="session-a", bot_id="b", user_id="u", turn_ids=["turn-b"]
+    )
+
+    assert marked == 0
+    assert "commit_requested" not in store.summary_for_turn("turn-b")
 
 
 def test_postgres_fallback_when_no_object_store(store, monkeypatch):

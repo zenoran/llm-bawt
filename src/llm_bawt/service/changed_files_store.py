@@ -31,6 +31,7 @@ from sqlalchemy import (
     Integer,
     String,
     Text,
+    bindparam,
     inspect,
     text as sa_text,
 )
@@ -140,6 +141,12 @@ class TurnChangedFile(SQLModel, table=True):
 
     # Optional provenance: tool_use ids that produced this change.
     source_tool_call_ids: str | None = Field(default=None, sa_column=Column(Text, nullable=True))
+    # Durable boundary for conversation-level commit aggregation. A click marks
+    # every row in the selected scope, so reloads do not resurrect old work.
+    commit_requested_at: datetime | None = Field(
+        default=None,
+        sa_column=Column(DateTime(timezone=True), nullable=True, index=True),
+    )
 
 
 class TurnDiffPayloadRecord(SQLModel, table=True):
@@ -269,12 +276,41 @@ def build_turn_summary(turn_id: str, rows: list[TurnChangedFile]) -> dict[str, A
     files = [serialize_changed_file(r) for r in rows]
     total_add = sum(f["additions"] or 0 for f in files)
     total_del = sum(f["deletions"] or 0 for f in files)
-    return {
+    summary = {
         "turn_id": turn_id,
         "files": files,
         "total_files": len(files),
         "total_additions": total_add,
         "total_deletions": total_del,
+    }
+    if rows and all(row.commit_requested_at is not None for row in rows):
+        summary["commit_requested"] = True
+    return summary
+
+
+def build_uncommitted_summary(rows: list[TurnChangedFile]) -> dict[str, Any]:
+    """Collapse conversation rows to one file per repo/path, newest diff wins."""
+    turn_ids = list(dict.fromkeys(row.turn_id for row in rows))
+    merged: dict[tuple[str, str], dict[str, Any]] = {}
+    for row in rows:
+        key = (row.repo_key, row.path)
+        current = serialize_changed_file(row)
+        previous = merged.get(key)
+        if previous is not None:
+            current["additions"] = (previous.get("additions") or 0) + (current.get("additions") or 0)
+            current["deletions"] = (previous.get("deletions") or 0) + (current.get("deletions") or 0)
+            current["old_path"] = previous.get("old_path") or current.get("old_path")
+            if previous.get("change_kind") == "added" and current.get("change_kind") != "deleted":
+                current["change_kind"] = "added"
+        merged[key] = current
+    files = list(merged.values())
+    return {
+        "turn_id": turn_ids[-1] if turn_ids else "",
+        "turn_ids": turn_ids,
+        "files": files,
+        "total_files": len(files),
+        "total_additions": sum(file.get("additions") or 0 for file in files),
+        "total_deletions": sum(file.get("deletions") or 0 for file in files),
     }
 
 
@@ -327,6 +363,20 @@ class ChangedFilesStore:
             conn.execute(sa_text(
                 "CREATE INDEX IF NOT EXISTS ix_turn_changed_files_owner_created"
                 " ON turn_changed_files (bot_id, user_id, created_at)"
+            ))
+            if "commit_requested_at" not in legacy_columns:
+                column_type = (
+                    "TIMESTAMP WITH TIME ZONE"
+                    if conn.dialect.name == "postgresql"
+                    else "DATETIME"
+                )
+                conn.execute(sa_text(
+                    "ALTER TABLE turn_changed_files ADD COLUMN commit_requested_at "
+                    f"{column_type}"
+                ))
+            conn.execute(sa_text(
+                "CREATE INDEX IF NOT EXISTS ix_turn_changed_files_commit_requested_at"
+                " ON turn_changed_files (commit_requested_at)"
             ))
 
         self._schema_guard.run(self.engine, "changed-files-store", bootstrap)
@@ -547,6 +597,109 @@ class ChangedFilesStore:
         return self.summaries_for_turns([turn_id]).get(
             turn_id, build_turn_summary(turn_id, [])
         )
+
+    def _resolve_session_id(
+        self,
+        *,
+        session_id: str | None,
+        bot_id: str,
+        user_id: str,
+    ) -> str | None:
+        """Resolve an explicit conversation or the owner's active conversation."""
+        if self.engine is None:
+            return None
+        requested = (session_id or "").strip()
+        with self.engine.connect() as conn:
+            if requested:
+                return conn.execute(
+                    sa_text(
+                        "SELECT id FROM sessions "
+                        "WHERE id = :session_id AND bot_id = :bot_id AND user_id = :user_id"
+                    ),
+                    {"session_id": requested, "bot_id": bot_id, "user_id": user_id},
+                ).scalar_one_or_none()
+            return conn.execute(
+                sa_text(
+                    "SELECT id FROM sessions "
+                    "WHERE bot_id = :bot_id AND user_id = :user_id AND status = 'active' "
+                    "ORDER BY started_at DESC LIMIT 1"
+                ),
+                {"bot_id": bot_id, "user_id": user_id},
+            ).scalar_one_or_none()
+
+    def uncommitted_summary_for_session(
+        self,
+        *,
+        session_id: str | None,
+        bot_id: str,
+        user_id: str,
+    ) -> tuple[str | None, dict[str, Any]]:
+        """Aggregate unacknowledged changed files inside one conversation."""
+        resolved = self._resolve_session_id(
+            session_id=session_id,
+            bot_id=bot_id,
+            user_id=user_id,
+        )
+        if self.engine is None or not resolved:
+            return resolved, build_uncommitted_summary([])
+        statement = sa_text(
+            "SELECT changed.* FROM turn_changed_files AS changed "
+            "JOIN messages AS message "
+            "  ON message.bot_id = changed.bot_id "
+            " AND message.id = changed.trigger_message_id "
+            "WHERE changed.bot_id = :bot_id AND changed.user_id = :user_id "
+            "  AND changed.commit_requested_at IS NULL "
+            "  AND message.session_id = :session_id "
+            "ORDER BY changed.created_at, changed.id"
+        )
+        with self.engine.connect() as conn:
+            result = conn.execute(statement, {
+                "bot_id": bot_id,
+                "user_id": user_id,
+                "session_id": resolved,
+            })
+            rows = [TurnChangedFile(**dict(row)) for row in result.mappings()]
+        return resolved, build_uncommitted_summary(rows)
+
+    def mark_commit_requested(
+        self,
+        *,
+        session_id: str | None,
+        bot_id: str,
+        user_id: str,
+        turn_ids: list[str],
+    ) -> tuple[str | None, int]:
+        """Acknowledge selected turns, rejecting rows outside the conversation."""
+        resolved = self._resolve_session_id(
+            session_id=session_id,
+            bot_id=bot_id,
+            user_id=user_id,
+        )
+        clean_turn_ids = list(dict.fromkeys(value.strip() for value in turn_ids if value.strip()))
+        if self.engine is None or not resolved or not clean_turn_ids:
+            return resolved, 0
+        statement = sa_text(
+            "UPDATE turn_changed_files AS changed "
+            "SET commit_requested_at = :requested_at "
+            "WHERE changed.bot_id = :bot_id AND changed.user_id = :user_id "
+            "AND changed.commit_requested_at IS NULL "
+            "AND changed.turn_id IN :turn_ids "
+            "AND EXISTS ("
+            "  SELECT 1 FROM messages AS message "
+            "  WHERE message.bot_id = :bot_id "
+            "    AND message.id = changed.trigger_message_id "
+            "    AND message.session_id = :session_id"
+            ")"
+        ).bindparams(bindparam("turn_ids", expanding=True))
+        with self.engine.begin() as conn:
+            result = conn.execute(statement, {
+                "requested_at": datetime.now(timezone.utc),
+                "bot_id": bot_id,
+                "user_id": user_id,
+                "session_id": resolved,
+                "turn_ids": clean_turn_ids,
+            })
+        return resolved, int(result.rowcount or 0)
 
     def content_for_rows(
         self, rows: list[TurnChangedFile]

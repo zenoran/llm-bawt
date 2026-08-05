@@ -3,6 +3,7 @@
 import json
 
 from fastapi import APIRouter, HTTPException, Query, Request
+from pydantic import BaseModel, Field
 from fastapi.responses import Response
 from sqlalchemy import func
 from sqlmodel import Session, select
@@ -730,6 +731,13 @@ def download_tool_call_result(
 # ---------------------------------------------------------------------------
 
 
+class CommitChangedFilesRequest(BaseModel):
+    session_id: str | None = None
+    bot_id: str = Field(min_length=1)
+    user_id: str = Field(min_length=1)
+    turn_ids: list[str] = Field(min_length=1)
+
+
 @router.get("/v1/turn-changed-files", tags=["Debug"])
 def get_turn_changed_files(
     message_id: str | None = Query(None, description="Single trigger message ID"),
@@ -751,6 +759,43 @@ def get_turn_changed_files(
     target_ids = parse_message_filters(message_id, message_ids)
     by_message = store.changed_files_summaries_for_triggers(list(target_ids)) if target_ids else {}
     return {"by_message": by_message}
+
+
+@router.get("/v1/turn-changed-files/uncommitted", tags=["History"])
+def get_uncommitted_changed_files(
+    bot_id: str = Query(...),
+    user_id: str = Query(...),
+    session_id: str | None = Query(None),
+):
+    """Aggregate unacknowledged changed files inside one canonical session."""
+    store = get_turn_log_store()
+    if store.engine is None:
+        raise HTTPException(status_code=503, detail="Turn logs DB unavailable")
+    resolved, summary = store.uncommitted_changed_files_summary(
+        session_id=session_id,
+        bot_id=bot_id.strip().lower(),
+        user_id=user_id.strip().lower(),
+    )
+    if session_id and not resolved:
+        raise HTTPException(status_code=404, detail="Conversation not found")
+    return {"session_id": resolved, "summary": summary}
+
+
+@router.post("/v1/turn-changed-files/commit-requested", tags=["History"])
+def mark_changed_files_commit_requested(payload: CommitChangedFilesRequest):
+    """Advance the durable uncommitted boundary for selected conversation turns."""
+    store = get_turn_log_store()
+    if store.engine is None:
+        raise HTTPException(status_code=503, detail="Turn logs DB unavailable")
+    resolved, marked = store.mark_changed_files_commit_requested(
+        session_id=payload.session_id,
+        bot_id=payload.bot_id.strip().lower(),
+        user_id=payload.user_id.strip().lower(),
+        turn_ids=payload.turn_ids,
+    )
+    if payload.session_id and not resolved:
+        raise HTTPException(status_code=404, detail="Conversation not found")
+    return {"session_id": resolved, "marked_files": marked}
 
 
 @router.get("/v1/turn-changed-files/{turn_id}/content", tags=["Debug"])

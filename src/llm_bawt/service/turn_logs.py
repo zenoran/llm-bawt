@@ -1008,6 +1008,39 @@ class TurnLogStore:
             return {}
         return self._changed_files_store().summaries_for_turns(turn_ids)
 
+    def uncommitted_changed_files_summary(
+        self,
+        *,
+        session_id: str | None,
+        bot_id: str,
+        user_id: str,
+    ) -> tuple[str | None, dict]:
+        if self.engine is None:
+            from .changed_files_store import build_uncommitted_summary
+            return None, build_uncommitted_summary([])
+        return self._changed_files_store().uncommitted_summary_for_session(
+            session_id=session_id,
+            bot_id=bot_id,
+            user_id=user_id,
+        )
+
+    def mark_changed_files_commit_requested(
+        self,
+        *,
+        session_id: str | None,
+        bot_id: str,
+        user_id: str,
+        turn_ids: list[str],
+    ) -> tuple[str | None, int]:
+        if self.engine is None:
+            return None, 0
+        return self._changed_files_store().mark_commit_requested(
+            session_id=session_id,
+            bot_id=bot_id,
+            user_id=user_id,
+            turn_ids=turn_ids,
+        )
+
     def changed_file_content(self, *, turn_id: str, repo_key: str, path: str):
         if self.engine is None:
             return None
