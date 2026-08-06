@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-from datetime import datetime
 from typing import Optional
 
 from pydantic import BaseModel, Field
@@ -12,6 +11,10 @@ class MediaGenerationRequest(BaseModel):
     """Request body for POST /v1/media/generations."""
 
     prompt: str = Field(..., description="Text prompt describing the desired media")
+    provider: str = Field(
+        default="grok",
+        description="Stable provider ID. Defaults to grok for compatibility.",
+    )
     media_type: str = Field(
         default="video",
         description="Type of media to generate: 'video' or 'image'",
@@ -22,11 +25,15 @@ class MediaGenerationRequest(BaseModel):
     )
     source_image: Optional[str] = Field(
         default=None,
-        description="Base64 data URI or URL for image-to-video generation",
+        description="Base64 data URI or URL used as a generation reference",
     )
-    aspect_ratio: str = Field(
-        default="16:9",
-        description="Aspect ratio (e.g. '16:9', '9:16', '1:1')",
+    reference_generation_id: Optional[str] = Field(
+        default=None,
+        description="Existing generation whose stored output becomes the reference image",
+    )
+    aspect_ratio: Optional[str] = Field(
+        default=None,
+        description="Aspect ratio. Provider default is used when omitted.",
     )
     duration: Optional[float] = Field(
         default=5,
@@ -34,9 +41,9 @@ class MediaGenerationRequest(BaseModel):
         le=15,
         description="Video duration in seconds (1-15, default 5). Video only.",
     )
-    resolution: str = Field(
-        default="720p",
-        description="Output resolution (e.g. '720p', '1080p')",
+    resolution: Optional[str] = Field(
+        default=None,
+        description="Output resolution. Provider default is used when omitted.",
     )
     num_outputs: int = Field(
         default=1,
@@ -85,3 +92,23 @@ class MediaGenerationListResponse(BaseModel):
 
     items: list[MediaGenerationResponse] = Field(default_factory=list)
     total: int = Field(default=0)
+
+
+class MediaProviderCapabilitiesResponse(BaseModel):
+    """Provider options consumed by MCP and Studio clients."""
+
+    provider: str
+    label: str
+    media_types: list[str]
+    default_models: dict[str, str]
+    models: dict[str, list[str]]
+    image_input: bool = False
+    aspect_ratios: dict[str, list[str]] = Field(default_factory=dict)
+    resolutions: dict[str, list[str]] = Field(default_factory=dict)
+    default_aspect_ratios: dict[str, str] = Field(default_factory=dict)
+    default_resolutions: dict[str, str] = Field(default_factory=dict)
+
+
+class MediaProviderListResponse(BaseModel):
+    providers: list[MediaProviderCapabilitiesResponse] = Field(default_factory=list)
+    default_provider: str = "grok"

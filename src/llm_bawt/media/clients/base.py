@@ -74,12 +74,10 @@ class MediaClient(abc.ABC):
 
     @abc.abstractmethod
     async def download(self, media_url: str) -> bytes:
-        """Download completed media from the provider's temporary URL.
+        """Download completed media from a URL or provider data URI."""
+        ...
 
-        Args:
-            media_url: URL to download the media from.
-
-        Returns:
-            Raw bytes of the media file.
-        """
+    @abc.abstractmethod
+    async def close(self) -> None:
+        """Close provider-owned network resources."""
         ...

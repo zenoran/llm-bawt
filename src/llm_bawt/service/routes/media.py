@@ -12,22 +12,25 @@ Endpoints:
 from __future__ import annotations
 
 import asyncio
+import base64
 import logging
-import os
 import uuid
 from datetime import datetime, timezone
 
 from fastapi import APIRouter, HTTPException, Query, Request
 from fastapi.responses import Response
 
-from ...media.clients.grok_media import GrokMediaClient
+from ...media.clients import MediaClient, media_provider_registry
 from ...media.db import MediaGenerationStore
+from ...media.generation_service import MediaGenerationService
 from ...media.object_store import BlobBackendUnavailable
 from ...media.schemas import (
     MediaGenerationListResponse,
     MediaGenerationRequest,
     MediaGenerationResponse,
     MediaOutput,
+    MediaProviderCapabilitiesResponse,
+    MediaProviderListResponse,
 )
 from ...media.storage import MediaStorage
 from ..dependencies import get_media_generation_store, get_service
@@ -38,7 +41,8 @@ router = APIRouter(tags=["Media"])
 
 # Module-level non-DB helpers initialised lazily
 _storage: MediaStorage | None = None
-_grok_client: GrokMediaClient | None = None
+_generation_service = MediaGenerationService()
+_video_clients: dict[str, MediaClient] = {}
 # Track active polling tasks so they can be cancelled on shutdown
 _poll_tasks: dict[str, asyncio.Task] = {}
 
@@ -55,11 +59,34 @@ def _get_storage() -> MediaStorage:
     return _storage
 
 
-def _get_grok_client() -> GrokMediaClient:
-    global _grok_client
-    if _grok_client is None:
-        _grok_client = GrokMediaClient()
-    return _grok_client
+def _get_video_client(provider: str) -> MediaClient:
+    canonical = media_provider_registry.canonical_provider(provider)
+    client = _video_clients.get(canonical)
+    if client is None:
+        client = media_provider_registry.create_client(canonical, "video")
+        _video_clients[canonical] = client
+    return client
+
+
+def _sniff_image_storage(raw: bytes) -> tuple[str, str]:
+    if raw.startswith(b"\x89PNG\r\n\x1a\n"):
+        return ".png", "image/png"
+    if raw.startswith(b"RIFF") and raw[8:12] == b"WEBP":
+        return ".webp", "image/webp"
+    if raw[:6] in (b"GIF87a", b"GIF89a"):
+        return ".gif", "image/gif"
+    return ".jpg", "image/jpeg"
+
+
+async def _stored_image_as_data_url(row: dict, storage: MediaStorage) -> str:
+    file_path = row.get("file_path")
+    if not file_path or row.get("status") != "completed":
+        raise ValueError(f"Generation {row.get('id')} has no completed image output")
+    if row.get("media_type") != "image":
+        raise ValueError(f"Generation {row.get('id')} is not an image")
+    raw = await asyncio.to_thread(storage.read, file_path)
+    mime = row.get("mime_type") or _sniff_image_storage(raw)[1]
+    return f"data:{mime};base64,{base64.b64encode(raw).decode('ascii')}"
 
 
 def _gen_id() -> str:
@@ -97,7 +124,7 @@ def _row_to_response(row: dict) -> MediaGenerationResponse:
         revised_prompt=row.get("revised_prompt"),
         progress=row.get("progress", 0),
         outputs=outputs,
-        provider=row.get("provider"),
+        provider=media_provider_registry.canonical_provider(row.get("provider")),
         model=row.get("model"),
         aspect_ratio=row.get("aspect_ratio"),
         duration=row.get("duration"),
@@ -120,13 +147,13 @@ async def _poll_video_job(gen_id: str) -> None:
     """
     store = _get_store()
     storage = _get_storage()
-    client = _get_grok_client()
 
     row = store.get_by_id(gen_id)
     if not row:
         logger.error("Poll task: generation %s not found", gen_id)
         return
 
+    client = _get_video_client(row.get("provider") or "grok")
     provider_job_id = row["provider_job_id"]
     if not provider_job_id:
         logger.error("Poll task: no provider_job_id for %s", gen_id)
@@ -224,33 +251,25 @@ async def _poll_video_job(gen_id: str) -> None:
         _poll_tasks.pop(gen_id, None)
 
 
-async def _download_image_job(gen_id: str, image_url: str) -> None:
-    """Download a synchronously-generated image and store it.
-
-    xAI image generation returns a finished (temporary) URL inline, so there
-    is nothing to poll — we just fetch the bytes and persist them, then mark
-    the generation completed.
-    """
+async def _store_image_job(gen_id: str, img_data: bytes) -> None:
+    """Persist normalized image bytes returned by any synchronous provider."""
     store = _get_store()
     storage = _get_storage()
-    client = _get_grok_client()
     try:
-        logger.info("Downloading image for %s from %s", gen_id, image_url[:80])
-        img_data = await client.download(image_url)
-
-        rel_path, _sha256 = await storage.write_async(img_data, "images", ".jpg")
+        extension, mime_type = _sniff_image_storage(img_data)
+        rel_path, _sha256 = await storage.write_async(img_data, "images", extension)
         store.update(gen_id, {
             "status": "completed",
             "progress": 100,
             "file_path": rel_path,
-            "thumbnail_path": rel_path,  # images are their own thumbnail for now
+            "thumbnail_path": rel_path,
             "file_size_bytes": len(img_data),
-            "mime_type": "image/jpeg",
+            "mime_type": mime_type,
             "completed_at": datetime.now(timezone.utc),
         })
         logger.info("Image generation %s completed: %s (%d bytes)", gen_id, rel_path, len(img_data))
     except Exception as e:
-        logger.exception("Failed to download/store image for %s", gen_id)
+        logger.exception("Failed to store image for %s", gen_id)
         store.update(gen_id, {"status": "failed", "error": str(e)})
     finally:
         _poll_tasks.pop(gen_id, None)
@@ -260,78 +279,111 @@ async def _download_image_job(gen_id: str, image_url: str) -> None:
 # Endpoints
 # ------------------------------------------------------------------
 
+@router.get("/v1/media/providers", response_model=MediaProviderListResponse)
+async def list_media_providers(media_type: str | None = Query(default=None)):
+    """Return provider/model/capability metadata for clients."""
+    providers = [
+        MediaProviderCapabilitiesResponse.model_validate(capability.to_dict())
+        for capability in media_provider_registry.list_capabilities(media_type)
+    ]
+    return MediaProviderListResponse(providers=providers, default_provider="grok")
+
+
 @router.post("/v1/media/generations", response_model=MediaGenerationResponse)
 async def create_generation(request: MediaGenerationRequest):
-    """Submit a new media generation job."""
+    """Submit a provider-routed media generation job."""
     store = _get_store()
-    client = _get_grok_client()
+    storage = _get_storage()
+
+    source_image = request.source_image
+    if request.reference_generation_id:
+        if source_image:
+            raise HTTPException(
+                status_code=400,
+                detail="Provide source_image or reference_generation_id, not both",
+            )
+        reference = store.get_by_id(request.reference_generation_id)
+        if not reference:
+            raise HTTPException(
+                status_code=404,
+                detail=f"Reference generation {request.reference_generation_id} not found",
+            )
+        try:
+            source_image = await _stored_image_as_data_url(reference, storage)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    try:
+        provider, model, aspect_ratio, resolution = _generation_service.resolve_request(
+            provider=request.provider,
+            media_type=request.media_type,
+            model=request.model,
+            aspect_ratio=request.aspect_ratio,
+            resolution=request.resolution,
+            has_source_image=bool(source_image),
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     gen_id = _gen_id()
-
-    # Auto-select model based on media type
-    model = request.model
-    if not model:
-        if request.media_type == "video":
-            model = "grok-imagine-video"
-        else:
-            model = "grok-imagine-image"
-
-    # Determine provider from model name
-    provider = "xai"
-
-    # Insert the initial DB record
-    row = {
+    store.insert({
         "id": gen_id,
         "status": "pending",
         "media_type": request.media_type,
         "prompt": request.prompt,
         "provider": provider,
         "model": model,
-        "aspect_ratio": request.aspect_ratio,
+        "aspect_ratio": aspect_ratio,
         "duration": request.duration if request.media_type == "video" else None,
-        "resolution": request.resolution,
+        "resolution": resolution,
         "progress": 0,
         "created_at": datetime.now(timezone.utc),
-    }
-    store.insert(row)
+    })
 
-    # Submit to the provider
     try:
-        result = await client.generate(
-            prompt=request.prompt,
-            media_type=request.media_type,
-            model=model,
-            source_image=request.source_image,
-            aspect_ratio=request.aspect_ratio,
-            duration=request.duration or 5,
-            resolution=request.resolution,
-            num_outputs=request.num_outputs,
-        )
-
-        store.update(gen_id, {
-            "status": result.status,
-            "provider_job_id": result.provider_job_id,
-            "progress": result.progress,
-            "revised_prompt": result.revised_prompt,
-        })
-
-        # Image generation is synchronous: xAI returns the finished URL inline.
-        # Download + store in the background so the create call stays fast; the
-        # client polls get_generation until the stored output appears.
-        if request.media_type == "image" and result.status == "completed" and result.media_url:
-            store.update(gen_id, {"status": "processing", "progress": 50})
-            task = asyncio.create_task(_download_image_job(gen_id, result.media_url))
+        if request.media_type == "image":
+            generated = await _generation_service.generate_image(
+                prompt=request.prompt,
+                provider=provider,
+                model=model,
+                source_image=source_image,
+                aspect_ratio=aspect_ratio,
+                resolution=resolution,
+                num_outputs=request.num_outputs,
+            )
+            store.update(gen_id, {
+                "status": "processing",
+                "provider_job_id": generated.result.provider_job_id,
+                "progress": 75,
+                "revised_prompt": generated.result.revised_prompt,
+            })
+            task = asyncio.create_task(_store_image_job(gen_id, generated.data))
             _poll_tasks[gen_id] = task
-        # Start background polling for async jobs (video)
-        elif result.status in ("pending", "processing"):
-            task = asyncio.create_task(_poll_video_job(gen_id))
-            _poll_tasks[gen_id] = task
-
-    except Exception as e:
+        else:
+            client = _get_video_client(provider)
+            result = await client.generate(
+                prompt=request.prompt,
+                media_type="video",
+                model=model,
+                source_image=source_image,
+                aspect_ratio=aspect_ratio,
+                duration=request.duration or 5,
+                resolution=resolution,
+                num_outputs=request.num_outputs,
+            )
+            store.update(gen_id, {
+                "status": result.status,
+                "provider_job_id": result.provider_job_id,
+                "progress": result.progress,
+                "revised_prompt": result.revised_prompt,
+            })
+            if result.status in ("pending", "processing"):
+                task = asyncio.create_task(_poll_video_job(gen_id))
+                _poll_tasks[gen_id] = task
+    except Exception as exc:
         logger.exception("Failed to submit generation %s", gen_id)
-        store.update(gen_id, {"status": "failed", "error": str(e)})
+        store.update(gen_id, {"status": "failed", "error": str(exc)})
 
-    # Return current state
     db_row = store.get_by_id(gen_id)
     if not db_row:
         raise HTTPException(status_code=500, detail="Failed to retrieve generation after creation")
@@ -490,5 +542,5 @@ async def serve_thumbnail(gen_id: str):
     return Response(
         content=data,
         status_code=200,
-        media_type="image/jpeg",
+        media_type=row.get("mime_type") or "image/jpeg",
     )
