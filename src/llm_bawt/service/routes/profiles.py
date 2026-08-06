@@ -286,7 +286,7 @@ def update_typed_profile(entity_type: str, entity_id: str, request: ProfileUpdat
         if request.avatar is not None:
             from ...media.avatar import resolve_avatar_render
 
-            avatar_render = resolve_avatar_render(request.avatar)
+            avatar_render = resolve_avatar_render(request.avatar) or ""
 
         profile = manager.update_profile(
             target_type,
