@@ -441,7 +441,10 @@ class CodexCommandMixin:
                             self._publish_event(
                                 request_id, session_key, seq,
                                 kind=AgentEventKind.ERROR,
-                                text="Codex OAuth failed — re-run codex login on echo",
+                                text=(
+                                    "[credential_expired:codex] "
+                                    "Codex OAuth failed — re-run codex login on echo"
+                                ),
                                 model=model,
                             )
                             self._publisher.publish_run_done(request_id)

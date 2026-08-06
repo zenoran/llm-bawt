@@ -227,11 +227,12 @@ def _save(raw: dict, bundle: dict) -> None:
     )
 
     tokens = bundle.get("tokens") or {}
+    auth_method = raw.get("auth_method") or AUTH_CLI_OAUTH
     store.save(
         ConnectionRecord(
             provider=_PROVIDER_ID,
             status=STATUS_CONNECTED,
-            auth_method=AUTH_CLI_OAUTH,
+            auth_method=auth_method,
             account="chatgpt-subscription",
             meta={
                 "auth_mode": bundle.get("auth_mode", "chatgpt"),

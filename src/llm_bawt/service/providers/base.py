@@ -266,7 +266,7 @@ class ProviderAdapter:
     def start_device_flow(self) -> DeviceFlowStart:
         raise NotImplementedError(f"{self.id} does not support device oauth")
 
-    def poll_device_flow(self, device_code: str) -> DevicePollResult:
+    def poll_device_flow(self, device_code: str, user_code: str = "") -> DevicePollResult:
         raise NotImplementedError(f"{self.id} does not support device oauth")
 
     # --- cli oauth -----------------------------------------------------------

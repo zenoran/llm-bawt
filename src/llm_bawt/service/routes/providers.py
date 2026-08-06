@@ -29,6 +29,7 @@ router = APIRouter()
 
 class PollRequest(BaseModel):
     device_code: str
+    user_code: str = ""
 
 
 class CliLoginCompleteRequest(BaseModel):
@@ -110,7 +111,7 @@ async def connect_poll(provider_id: str, body: PollRequest):
     if not adapter.supports(AUTH_DEVICE_OAUTH):
         raise HTTPException(status_code=400, detail=f"{provider_id} has no device flow")
     try:
-        result = await run_in_threadpool(adapter.poll_device_flow, body.device_code)
+        result = await run_in_threadpool(adapter.poll_device_flow, body.device_code, body.user_code)
     except GitHubConfigError as e:
         raise HTTPException(status_code=503, detail=str(e))
     except Exception as e:  # noqa: BLE001

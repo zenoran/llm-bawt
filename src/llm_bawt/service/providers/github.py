@@ -128,7 +128,7 @@ class GitHubAdapter(ProviderAdapter):
             expires_in=int(d.get("expires_in", 900)),
         )
 
-    def poll_device_flow(self, device_code: str) -> DevicePollResult:
+    def poll_device_flow(self, device_code: str, user_code: str = "") -> DevicePollResult:
         resp = httpx.post(
             _ACCESS_TOKEN_URL,
             data={
