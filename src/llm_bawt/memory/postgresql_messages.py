@@ -165,6 +165,56 @@ class PostgreSQLMessageMixin:
                 result[row["id"]] = row.get("reasoning")
         return result
 
+    def set_interrupt_anchor(
+        self,
+        message_id: str,
+        source_message_id: str,
+        content_offset: int,
+    ) -> bool:
+        """Persist the assistant-turn anchor for one accepted steer message."""
+        if not message_id or not source_message_id or content_offset < 0:
+            return False
+
+        with self.engine.begin() as conn:
+            result = conn.execute(
+                text(
+                    f"UPDATE {self._messages_table_name} "
+                    "SET interrupt_source_message_id=:source_message_id, "
+                    "interrupt_content_offset=:content_offset "
+                    "WHERE id=:message_id"
+                ),
+                {
+                    "message_id": message_id,
+                    "source_message_id": source_message_id,
+                    "content_offset": content_offset,
+                },
+            )
+        return bool(result.rowcount)
+
+    def get_interrupt_anchors_for_message_ids(
+        self,
+        message_ids: list[str],
+    ) -> dict[str, tuple[str, int] | None]:
+        """Return durable interrupt anchors for a history page."""
+        if not message_ids:
+            return {}
+
+        result: dict[str, tuple[str, int] | None] = {mid: None for mid in message_ids}
+        with self.engine.connect() as conn:
+            rows = conn.execute(
+                text(
+                    f"SELECT id, interrupt_source_message_id, interrupt_content_offset "
+                    f"FROM {self._messages_table_name} WHERE id = ANY(:ids)"
+                ),
+                {"ids": list(message_ids)},
+            ).mappings().all()
+        for row in rows:
+            source_id = row.get("interrupt_source_message_id")
+            offset = row.get("interrupt_content_offset")
+            if source_id and isinstance(offset, int) and offset >= 0:
+                result[str(row["id"])] = (str(source_id), offset)
+        return result
+
     def add(self, message_id: str, role: str, content: str, timestamp: float) -> None:
         """Add a message to storage (implements MemoryBackend interface).
         
@@ -489,6 +539,7 @@ class PostgreSQLMessageMixin:
                 if len(message_id) < 36:
                     select_sql = text(f"""
                         SELECT id, role, content, timestamp, session_id, processed, created_at,
+                           interrupt_source_message_id, interrupt_content_offset,
                            author_entity_type, author_entity_id
                         FROM {self._messages_table_name}
                         WHERE id LIKE :id_pattern
@@ -498,6 +549,7 @@ class PostgreSQLMessageMixin:
                 else:
                     select_sql = text(f"""
                         SELECT id, role, content, timestamp, session_id, processed, created_at,
+                           interrupt_source_message_id, interrupt_content_offset,
                            author_entity_type, author_entity_id
                         FROM {self._messages_table_name}
                         WHERE id = :id
@@ -512,8 +564,10 @@ class PostgreSQLMessageMixin:
                 insert_sql = text(f"""
                     INSERT INTO {self._forgotten_table_name}
                     (id, role, content, timestamp, session_id, processed, created_at,
+                     interrupt_source_message_id, interrupt_content_offset,
                      author_entity_type, author_entity_id, forgotten_at)
                     VALUES (:id, :role, :content, :timestamp, :session_id, :processed, :created_at,
+                            :interrupt_source_message_id, :interrupt_content_offset,
                             :author_entity_type, :author_entity_id, CURRENT_TIMESTAMP)
                     ON CONFLICT (bot_id, id) DO NOTHING
                 """)
@@ -525,6 +579,8 @@ class PostgreSQLMessageMixin:
                     "session_id": row.session_id,
                     "processed": row.processed,
                     "created_at": row.created_at,
+                    "interrupt_source_message_id": row.interrupt_source_message_id,
+                    "interrupt_content_offset": row.interrupt_content_offset,
                     "author_entity_type": row.author_entity_type,
                     "author_entity_id": row.author_entity_id,
                 })
@@ -554,6 +610,7 @@ class PostgreSQLMessageMixin:
                 # Get all forgotten messages
                 select_sql = text(f"""
                     SELECT id, role, content, timestamp, session_id, processed, created_at,
+                           interrupt_source_message_id, interrupt_content_offset,
                            author_entity_type, author_entity_id
                     FROM {self._forgotten_table_name}
                     ORDER BY timestamp ASC
@@ -570,8 +627,10 @@ class PostgreSQLMessageMixin:
                     insert_sql = text(f"""
                         INSERT INTO {self._messages_table_name}
                         (id, role, content, timestamp, session_id, processed, created_at,
+                         interrupt_source_message_id, interrupt_content_offset,
                          author_entity_type, author_entity_id)
                         VALUES (:id, :role, :content, :timestamp, :session_id, :processed, :created_at,
+                                :interrupt_source_message_id, :interrupt_content_offset,
                                 :author_entity_type, :author_entity_id)
                         ON CONFLICT (bot_id, id) DO NOTHING
                     """)

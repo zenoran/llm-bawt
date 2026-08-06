@@ -140,6 +140,7 @@ class ChatSteerRequest(BaseModel):
     turn_id: str = Field(..., description="Active llm-bawt turn log ID")
     message: str = Field(..., min_length=1, description="User correction/instruction")
     message_id: str = Field(..., description="Frontend-generated user message UUID")
+    content_offset: int | None = Field(None, ge=0, description="Assistant characters visible when steering")
     bot_id: str = Field(..., description="Bot slug owning the active turn")
     user_id: str = Field("nick", description="User namespace owning the turn")
 
@@ -150,6 +151,51 @@ class ChatSteerResponse(BaseModel):
     turn_id: str
     message_id: str
     persisted: bool = False
+
+
+def _persist_interrupt_anchor(
+    service,
+    *,
+    bot_id: str,
+    message_id: str,
+    source_message_id: str,
+    content_offset: int,
+) -> bool:
+    """Persist a steer anchor through embedded or MCP-backed memory modes."""
+    memory_client = service.get_memory_client(bot_id)
+    if memory_client is not None:
+        manager = memory_client.get_short_term_manager()
+        backend = getattr(manager, "_backend", None)
+        if backend is not None:
+            return backend.set_interrupt_anchor(
+                message_id,
+                source_message_id,
+                content_offset,
+            )
+
+    store = getattr(service, "_turn_log_store", None)
+    engine = getattr(store, "engine", None)
+    if engine is None:
+        return False
+
+    from sqlalchemy import text
+
+    with engine.begin() as conn:
+        result = conn.execute(
+            text(
+                "UPDATE messages "
+                "SET interrupt_source_message_id=:source_message_id, "
+                "interrupt_content_offset=:content_offset "
+                "WHERE bot_id=:bot_id AND id=:message_id"
+            ),
+            {
+                "bot_id": bot_id,
+                "message_id": message_id,
+                "source_message_id": source_message_id,
+                "content_offset": content_offset,
+            },
+        )
+    return bool(result.rowcount)
 
 
 async def steer_active_turn(
@@ -247,6 +293,17 @@ async def steer_active_turn(
             (author.entity_type if author else None),
             (author.entity_id if author else None),
         )
+        if turn.trigger_message_id is not None and request.content_offset is not None:
+            anchored = await asyncio.to_thread(
+                _persist_interrupt_anchor,
+                service,
+                bot_id=bot_id,
+                message_id=request.message_id,
+                source_message_id=turn.trigger_message_id,
+                content_offset=request.content_offset,
+            )
+            if not anchored:
+                raise RuntimeError("Persisted steer message was not found for anchor update")
         persisted = True
     except Exception:
         log.exception(

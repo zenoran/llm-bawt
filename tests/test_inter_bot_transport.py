@@ -565,6 +565,38 @@ def test_ended_never_ready_turn_is_definitively_not_active():
     assert caught.value.detail == "no_active_run"
 
 
+def test_interrupt_anchor_uses_canonical_turn_trigger():
+    from llm_bawt.service.routes.chat import _persist_interrupt_anchor
+
+    captured: dict[str, object] = {}
+
+    class FakeBackend:
+        def set_interrupt_anchor(self, message_id, source_message_id, content_offset):
+            captured.update(
+                message_id=message_id,
+                source_message_id=source_message_id,
+                content_offset=content_offset,
+            )
+            return True
+
+    manager = SimpleNamespace(_backend=FakeBackend())
+    memory_client = SimpleNamespace(get_short_term_manager=lambda: manager)
+    service = SimpleNamespace(get_memory_client=lambda _bot_id: memory_client)
+
+    assert _persist_interrupt_anchor(
+        service,
+        bot_id="snark",
+        message_id="interrupt-1",
+        source_message_id="canonical-trigger-1",
+        content_offset=42,
+    ) is True
+    assert captured == {
+        "message_id": "interrupt-1",
+        "source_message_id": "canonical-trigger-1",
+        "content_offset": 42,
+    }
+
+
 def test_steer_failure_policy_never_falls_back_after_acceptance():
     classify = InterBotDeliveryDispatcher._steer_failure_action
 

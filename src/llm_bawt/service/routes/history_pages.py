@@ -179,6 +179,57 @@ def _hydrate_reply_links_for_page(
         return {}
 
 
+def _hydrate_interrupt_anchors_for_page(
+    service,
+    bot_id: str,
+    page_messages: list[dict],
+) -> dict[str, tuple[str, int] | None]:
+    """Resolve durable mid-turn interrupt anchors for the given history page."""
+    message_ids = [
+        str(message.get("id"))
+        for message in page_messages
+        if message.get("role") == "user" and message.get("id")
+    ]
+    if not message_ids:
+        return {}
+
+    try:
+        client = service.get_memory_client(bot_id)
+        if not client:
+            return {mid: None for mid in message_ids}
+        manager = client.get_short_term_manager()
+        backend = getattr(manager, "_backend", None)
+        if backend is not None:
+            return backend.get_interrupt_anchors_for_message_ids(message_ids)
+
+        from sqlalchemy import text
+        from ...media.assets import _build_engine
+        from ...memory.postgresql import MESSAGES_PARENT, partition_name
+
+        engine = _build_engine(service.config)
+        if engine is None:
+            return {mid: None for mid in message_ids}
+        table = partition_name(MESSAGES_PARENT, bot_id)
+        result: dict[str, tuple[str, int] | None] = {mid: None for mid in message_ids}
+        with engine.connect() as conn:
+            rows = conn.execute(
+                text(
+                    f"SELECT id, interrupt_source_message_id, interrupt_content_offset "
+                    f"FROM {table} WHERE id = ANY(:ids)"
+                ),
+                {"ids": message_ids},
+            ).mappings().all()
+        for row in rows:
+            source_id = row.get("interrupt_source_message_id")
+            offset = row.get("interrupt_content_offset")
+            if source_id and isinstance(offset, int) and offset >= 0:
+                result[str(row["id"])] = (str(source_id), offset)
+        return result
+    except Exception as exc:
+        log.warning("Failed to load interrupt anchors for history page: %s", exc)
+        return {mid: None for mid in message_ids}
+
+
 def _hydrate_reasoning_for_page(
     service,
     bot_id: str,
@@ -385,19 +436,25 @@ def _build_history_response(
     reply_links_by_id = _hydrate_reply_links_for_page(
         service, effective_bot_id, page_messages
     )
-    history_messages = [
-        HistoryMessage(
+    interrupt_anchors_by_id = _hydrate_interrupt_anchors_for_page(
+        service, effective_bot_id, page_messages
+    )
+    history_messages = []
+    for msg in page_messages:
+        message_id = str(msg.get("id") or "")
+        interrupt_anchor = interrupt_anchors_by_id.get(message_id)
+        history_messages.append(HistoryMessage(
             id=msg.get("id"),
             role=msg.get("role", ""),
             content=msg.get("content", ""),
             timestamp=msg.get("timestamp", 0.0),
-            attachments=attachments_by_id.get(str(msg.get("id") or ""), []),
-            reasoning=reasoning_by_id.get(str(msg.get("id") or "")),
-            reply_to_message_id=reply_links_by_id.get(str(msg.get("id") or "")),
+            attachments=attachments_by_id.get(message_id, []),
+            reasoning=reasoning_by_id.get(message_id),
+            reply_to_message_id=reply_links_by_id.get(message_id),
+            interrupt_source_message_id=(interrupt_anchor[0] if interrupt_anchor else None),
+            interrupt_content_offset=(interrupt_anchor[1] if interrupt_anchor else None),
             author=_message_author_payload(msg),
-        )
-        for msg in page_messages
-    ]
+        ))
 
     oldest_timestamp = history_messages[0].timestamp if history_messages else None
     newest_timestamp = history_messages[-1].timestamp if history_messages else None

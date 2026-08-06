@@ -40,11 +40,11 @@ from llm_bawt.service.routes import history_pages
 
 
 class FakeBackend:
-    """Stands in for :class:`PostgreSQLMemoryBackend` — only the bit the
-    route reaches into (``get_attachments_for_message_ids``)."""
+    """Stands in for the focused history-hydration backend reads."""
 
     def __init__(self, attachments_by_msg: dict[str, list[dict]]):
         self._attachments_by_msg = attachments_by_msg
+        self._interrupt_anchors_by_msg: dict[str, tuple[str, int]] = {}
         self.call_count = 0
         self.last_ids: list[str] = []
 
@@ -54,6 +54,16 @@ class FakeBackend:
         self.call_count += 1
         self.last_ids = list(message_ids)
         return {mid: list(self._attachments_by_msg.get(mid, [])) for mid in message_ids}
+
+    def get_reasoning_for_message_ids(
+        self, message_ids: list[str]
+    ) -> dict[str, str | None]:
+        return {mid: None for mid in message_ids}
+
+    def get_interrupt_anchors_for_message_ids(
+        self, message_ids: list[str]
+    ) -> dict[str, tuple[str, int] | None]:
+        return {mid: self._interrupt_anchors_by_msg.get(mid) for mid in message_ids}
 
 
 class FakeShortTermManager:
@@ -184,6 +194,22 @@ def test_message_without_attachments_still_carries_empty_list(app_factory):
     data = resp.json()
     assert len(data["messages"]) == 1
     assert data["messages"][0]["attachments"] == []
+
+
+def test_history_returns_persisted_interrupt_anchor(app_factory):
+    msgs = [
+        _msg("source-1", content="start", ts=1.0),
+        _msg("interrupt-1", content="change direction", ts=2.0),
+    ]
+    client, _, backend = app_factory(msgs)
+    backend._interrupt_anchors_by_msg["interrupt-1"] = ("source-1", 42)
+
+    resp = client.get("/v1/history")
+
+    assert resp.status_code == 200, resp.text
+    interrupt = next(message for message in resp.json()["messages"] if message["id"] == "interrupt-1")
+    assert interrupt["interrupt_source_message_id"] == "source-1"
+    assert interrupt["interrupt_content_offset"] == 42
 
 
 def test_message_with_attachment_returns_full_url_block(app_factory):

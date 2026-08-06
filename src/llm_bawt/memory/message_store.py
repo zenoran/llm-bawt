@@ -16,6 +16,7 @@ from sqlalchemy import (
     Column,
     DateTime,
     Float,
+    Integer,
     JSON,
     MetaData,
     String,
@@ -56,6 +57,8 @@ def ensure_message_parent_tables(conn) -> None:
             recalled_history BOOLEAN DEFAULT FALSE,
             attachments JSONB NOT NULL DEFAULT '[]'::jsonb,
             reasoning TEXT,
+            interrupt_source_message_id VARCHAR(36),
+            interrupt_content_offset INTEGER,
             author_entity_type VARCHAR(16),
             author_entity_id VARCHAR(100),
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
@@ -71,6 +74,8 @@ def ensure_message_parent_tables(conn) -> None:
             timestamp DOUBLE PRECISION NOT NULL,
             session_id VARCHAR(36),
             processed BOOLEAN DEFAULT FALSE,
+            interrupt_source_message_id VARCHAR(36),
+            interrupt_content_offset INTEGER,
             author_entity_type VARCHAR(16),
             author_entity_id VARCHAR(100),
             created_at TIMESTAMP,
@@ -86,6 +91,14 @@ def ensure_message_parent_tables(conn) -> None:
         conn.execute(text(
             f"ALTER TABLE {table_name} "
             "ADD COLUMN IF NOT EXISTS author_entity_id VARCHAR(100)"
+        ))
+        conn.execute(text(
+            f"ALTER TABLE {table_name} "
+            "ADD COLUMN IF NOT EXISTS interrupt_source_message_id VARCHAR(36)"
+        ))
+        conn.execute(text(
+            f"ALTER TABLE {table_name} "
+            "ADD COLUMN IF NOT EXISTS interrupt_content_offset INTEGER"
         ))
 
 
@@ -128,6 +141,8 @@ def get_message_table(
             default=list,
         ),
         Column("reasoning", Text, nullable=True),
+        Column("interrupt_source_message_id", String(36), nullable=True),
+        Column("interrupt_content_offset", Integer, nullable=True),
         Column("author_entity_type", String(16), nullable=True),
         Column("author_entity_id", String(100), nullable=True),
         Column("created_at", DateTime, default=utcnow),
@@ -155,6 +170,8 @@ def get_forgotten_message_table(
         Column("timestamp", Float, nullable=False),
         Column("session_id", String(36), nullable=True),
         Column("processed", Boolean, default=False),
+        Column("interrupt_source_message_id", String(36), nullable=True),
+        Column("interrupt_content_offset", Integer, nullable=True),
         Column("author_entity_type", String(16), nullable=True),
         Column("author_entity_id", String(100), nullable=True),
         Column("created_at", DateTime, default=utcnow),
