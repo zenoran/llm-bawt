@@ -22,7 +22,11 @@ from ._bridge_helpers import (
     _is_auth_failure,
 )
 from .active_run import ClaudeActiveRun
-from .send_boundaries import separator_before_new_block
+from .send_boundaries import (
+    publish_run_done_once,
+    separator_before_new_block,
+    should_read_native_context_usage,
+)
 from .send_errors import (
     AuthRetryPolicy,
     TerminalSDKResultError,
@@ -163,6 +167,7 @@ class ClaudeSendMixin(ClaudeStreamMixin, ClaudeUsageMixin, ClaudeResultMixin):
                 and self._model_provider_prefix(model) is not None
             )
             interrupted_usage: dict | None = None
+            run_done_published = False
             try:
                 # Inject MCP tool context so Claude passes the right identifiers.
                 # Body comes from the registry (TASK-490) with a byte-identical
@@ -726,9 +731,11 @@ class ClaudeSendMixin(ClaudeStreamMixin, ClaudeUsageMixin, ClaudeResultMixin):
                                 if terminal_error is not None:
                                     raise terminal_error
 
-                                native_context_usage = await self._read_native_context_usage(
-                                    sdk_client
-                                )
+                                native_context_usage = None
+                                if should_read_native_context_usage(use_proxy=use_proxy):
+                                    native_context_usage = await self._read_native_context_usage(
+                                        sdk_client
+                                    )
                                 seq = await self._finalize_result_message(
                                     msg,
                                     request_id=request_id,
@@ -751,6 +758,17 @@ class ClaudeSendMixin(ClaudeStreamMixin, ClaudeUsageMixin, ClaudeResultMixin):
                                     turn_screenshot_assets=turn_screenshot_assets,
                                 )
                                 assistant_done_emitted = True
+                                # ASSISTANT_DONE is now terminal for the app-side
+                                # subscription. Publish the run sentinel immediately
+                                # so persistence/UI finalization does not wait for the
+                                # SDK subprocess's graceful-shutdown window. The
+                                # session lock remains held through disconnect below,
+                                # so a successor turn still cannot overlap cleanup.
+                                run_done_published = publish_run_done_once(
+                                    self._publisher,
+                                    request_id,
+                                    already_published=run_done_published,
+                                )
                                 # Turn complete — release the prompt generator so
                                 # the SDK closes its input stream.  Kept open until
                                 # now so the can_use_tool control channel survived
@@ -808,6 +826,12 @@ class ClaudeSendMixin(ClaudeStreamMixin, ClaudeUsageMixin, ClaudeResultMixin):
                                 "EOF fallback ASSISTANT_DONE: chars=%d request_id=%s session=%s",
                                 len(full_text), request_id, session_key,
                             )
+                        if assistant_done_emitted:
+                            run_done_published = publish_run_done_once(
+                                self._publisher,
+                                request_id,
+                                already_published=run_done_published,
+                            )
                         break
                     except asyncio.CancelledError:
                         # task.cancel() arrived from elsewhere (legacy path /
@@ -824,7 +848,11 @@ class ClaudeSendMixin(ClaudeStreamMixin, ClaudeUsageMixin, ClaudeResultMixin):
                         except Exception:
                             logger.debug("Failed to publish ASSISTANT_DONE on cancel", exc_info=True)
                         try:
-                            self._publisher.publish_run_done(request_id)
+                            run_done_published = publish_run_done_once(
+                                self._publisher,
+                                request_id,
+                                already_published=run_done_published,
+                            )
                         except Exception:
                             logger.debug("Failed to publish run_done on cancel", exc_info=True)
                         raise
@@ -837,6 +865,11 @@ class ClaudeSendMixin(ClaudeStreamMixin, ClaudeUsageMixin, ClaudeResultMixin):
                             aborted = True
                             _publish_partial("".join(text_parts))
                             assistant_done_emitted = True
+                            run_done_published = publish_run_done_once(
+                                self._publisher,
+                                request_id,
+                                already_published=run_done_published,
+                            )
                             break
 
                         interrupted_usage = self._compute_interrupted_usage(
@@ -922,7 +955,11 @@ class ClaudeSendMixin(ClaudeStreamMixin, ClaudeUsageMixin, ClaudeResultMixin):
                                     "sdk_client.disconnect() raised", exc_info=True,
                                 )
 
-                self._publisher.publish_run_done(request_id)
+                run_done_published = publish_run_done_once(
+                    self._publisher,
+                    request_id,
+                    already_published=run_done_published,
+                )
                 if aborted:
                     logger.info(
                         "Send aborted via chat.abort: request_id=%s session=%s",
