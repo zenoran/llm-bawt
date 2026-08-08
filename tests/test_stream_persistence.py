@@ -54,7 +54,9 @@ def test_inter_bot_nonstream_turn_publishes_visible_lifecycle(
     service._update_turn_log = Mock()
     service._end_generation = Mock()
     service._bind_agent_thread = Mock(return_value=None)
-    service._resolve_active_thread_binding = Mock(return_value=None)
+    service._resolve_active_thread_binding = Mock(
+        return_value={"thread_session_id": "sess-visible-abc"}
+    )
     service._maybe_summarize_on_new = Mock()
     service._maybe_rotate_agent_session = Mock()
     service._finalize_turn = Mock()
@@ -159,6 +161,124 @@ def test_inter_bot_nonstream_turn_publishes_visible_lifecycle(
     assert events[4]["status"] == "completed"
     assert events[4]["assistant_message_id"] == events[0]["assistant_message_id"]
     assert service._finalize_turn.call_args.kwargs["assistant_message_id"] == events[0]["assistant_message_id"]
+
+    # TASK-709: turn_start and turn_complete carry the durable session_id so
+    # a receiving BawtHub window can route lifecycle events to the correct
+    # thread without a follow-up DB fetch. Value comes from the pre-emit
+    # session resolve (see background_service ~line 405) — either
+    # ``request.session_id`` (dispatcher-written target for reset deliveries;
+    # explicit thread selection for chat clients) or the target bot's
+    # active-thread fallback.
+    assert "session_id" in events[0], "turn_start must carry session_id"
+    assert "session_id" in events[4], "turn_complete must carry session_id"
+    assert events[0]["session_id"] == "sess-visible-abc"
+    assert events[4]["session_id"] == "sess-visible-abc"
+
+
+def test_inter_bot_nonstream_turn_start_prefers_request_session_over_archived_seed(
+    monkeypatch,
+) -> None:
+    """TASK-709 F1: for durable inter-bot deliveries with a reset session
+    policy, the dispatcher writes the NEW (target) session id to
+    ``request.session_id`` and the OLD/ARCHIVED session id to
+    ``inter_bot_seed_session_id`` (the history SOURCE for
+    ``build_context_seed``). The lifecycle payload's ``session_id`` must
+    route to the TARGET, not the archived source — otherwise turn_start
+    events go to the dead thread and the pane on the fresh session gates
+    them out as "wrong thread"."""
+    service = BackgroundService.__new__(BackgroundService)
+    service.config = SimpleNamespace(DEFAULT_BOT="nova", DEFAULT_USER="nick")
+    service._inter_bot_dispatcher = SimpleNamespace(
+        store=SimpleNamespace(
+            validate_claim=Mock(return_value=True),
+            get=Mock(return_value=SimpleNamespace(sender_bot_id="snark")),
+        )
+    )
+    subscriber = SimpleNamespace(publish_tool_event=AsyncMock())
+    service._redis_subscriber = subscriber
+    service._resolve_request_model = Mock(return_value=("test-model", []))
+    service._persist_turn_log = Mock()
+    service._update_turn_log = Mock()
+    service._end_generation = Mock()
+    service._bind_agent_thread = Mock(return_value=None)
+    # Active-thread resolver would return a fallback if request.session_id were
+    # missing, but with request.session_id present it MUST NOT be consulted
+    # for the pre-emit lifecycle session id.
+    active_resolver = Mock(return_value={"thread_session_id": "sess-fresh-target"})
+    service._resolve_active_thread_binding = active_resolver
+    service._maybe_summarize_on_new = Mock()
+    service._maybe_rotate_agent_session = Mock()
+    service._finalize_turn = Mock()
+    service._turn_log_store = SimpleNamespace(engine=object())
+
+    class FakeCoordinator:
+        def __init__(self, _engine):
+            pass
+
+        def start(self, event):
+            return {**event, "_tool_persisted": True}
+
+        def end(self, event):
+            return {**event, "_tool_persisted": True}
+
+    monkeypatch.setattr(
+        "llm_bawt.service.tool_event_coordinator.ToolEventCoordinator",
+        FakeCoordinator,
+    )
+
+    client = SimpleNamespace(
+        model_definition={"type": "claude-code"},
+        get_token_usage=Mock(return_value=None),
+    )
+    llm_bawt = SimpleNamespace(
+        client=client,
+        bot=SimpleNamespace(tts_mode=False),
+        prepare_messages_for_query=Mock(return_value=[]),
+        execute_llm_query=Mock(return_value=("reply", "", [])),
+    )
+    service._get_llm_bawt = Mock(return_value=llm_bawt)
+    monkeypatch.setattr(
+        "llm_bawt.service.background_service.get_bot", lambda _bot_id: None
+    )
+    monkeypatch.setattr(
+        "llm_bawt.service.routes.history.maybe_build_session_seed",
+        lambda *_args, **_kwargs: None,
+    )
+
+    request = ChatCompletionRequest(
+        model="test-model",
+        messages=[ChatMessage(role="user", content="reset delivery")],
+        bot_id="loopy",
+        user="nick",
+        stream=False,
+        user_message_id="user-reset",
+        # request.session_id = the NEW (target) session id the dispatcher
+        # rotated into. This is where the turn_start/turn_complete lifecycle
+        # events must be routed so the fresh pane picks them up.
+        session_id="sess-fresh-target",
+        inter_bot_delivery_id="delivery-reset",
+        inter_bot_turn_id="turn-reset",
+        inter_bot_bridge_request_id="req-reset",
+        inter_bot_claim_token="claim-reset",
+        # inter_bot_seed_session_id = the OLD/ARCHIVED session id from which
+        # ``build_context_seed`` reads history. MUST NOT be emitted as the
+        # lifecycle session id — that would route events to the dead thread.
+        inter_bot_seed_session_id="sess-archived-source",
+    )
+
+    asyncio.run(service.chat_completion(request))
+
+    events = [call.args[2] for call in subscriber.publish_tool_event.await_args_list]
+    turn_start = next(e for e in events if e["_type"] == "turn_start")
+    turn_complete = next(e for e in events if e["_type"] == "turn_complete")
+    # F1: request.session_id (dispatcher-written target) wins.
+    assert turn_start["session_id"] == "sess-fresh-target"
+    assert turn_complete["session_id"] == "sess-fresh-target"
+    # F1: the archived seed id must NEVER surface in a lifecycle payload.
+    for evt in events:
+        assert evt.get("session_id") != "sess-archived-source", (
+            f"archived seed session id must not be emitted; got in {evt.get('_type')}"
+        )
 
 
 def test_finalize_turn_saves_history() -> None:

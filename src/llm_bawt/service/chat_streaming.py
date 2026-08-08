@@ -544,6 +544,12 @@ class ChatStreamingMixin(ChatStreamingBridgeMixin):
             "assistant_message_id": assistant_message_id,
             "bot_id": bot_id,
             "user_id": user_id,
+            # TASK-709: durable session id, so a receiving window can route this
+            # event to the correct thread WITHOUT a follow-up DB fetch. Present
+            # for agent-backend turns bound to an active/explicit thread; null
+            # for continuous non-agent turns or on resolution failure — the
+            # client's backward-compat path (adopt as before) still applies.
+            "session_id": session_id or None,
             "parent_turn_id": parent_turn_id,
             "role": "user",
             "content": user_prompt,

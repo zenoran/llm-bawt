@@ -651,6 +651,16 @@ class TurnStreamWorker(TurnStreamPublishMixin):
                                     "turn_id": _rt["id"],
                                     "bot_id": bot_id,
                                     "user_id": _ruid,
+                                    # TASK-709: reap path finalizes a STALE
+                                    # OPEN turn recovered from turn_logs. The
+                                    # project reference (data-model.md)
+                                    # forbids adding session_id to turn_logs;
+                                    # deriving it via messages here would cost
+                                    # a DB round-trip per reap. Client's
+                                    # backward-compat fallback (remove from
+                                    # per-bot activeTurns by turn_id) still
+                                    # clears the indicator on null session_id.
+                                    "session_id": None,
                                     "status": "timeout",
                                     "end_reason": "timeout",
                                     "ts": time.time(),

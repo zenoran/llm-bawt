@@ -30,3 +30,32 @@ def test_finalizer_uses_injected_attachment_enricher() -> None:
 
     assert finalizer._enrich_attachment_refs(refs) == refs
     assert calls == [refs]
+
+
+def test_finalizer_carries_response_text_on_completed_turn_complete() -> None:
+    """TASK-779: the streaming turn_complete emit MUST carry response_text
+    on successful completion so the frontend can fall back to
+    server-authoritative bytes when the client-side text_delta partial is
+    empty (subscriber gap, packed flush, dropped delta). Symmetric with
+    the nonstream inter-bot emit in background_service.py.
+
+    Guarded by status == "completed" — cancelled/timeout paths own their
+    own terminal state via _finalize_turn and must NOT leak partial text.
+    """
+    import inspect
+
+    source = inspect.getsource(TurnStreamFinalizer.finalize)
+    # Field is present in the emit dict:
+    assert '"response_text": _response_text' in source, (
+        "streaming turn_complete emit must carry response_text (TASK-779 safety net)"
+    )
+    # Value is guarded by completed status — cancelled/timeout must not leak partial text:
+    assert 'if status == "completed"' in source, (
+        "response_text must be gated on status == 'completed' to avoid leaking "
+        "partial text on cancelled/timeout paths"
+    )
+    # The value pulls from the accumulated streaming text holder, not empty:
+    assert "ctx.full_response_holder[0]" in source, (
+        "response_text must pull from full_response_holder[0] (the accumulated "
+        "streaming text)"
+    )

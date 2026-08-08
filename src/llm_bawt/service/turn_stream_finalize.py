@@ -206,11 +206,41 @@ class TurnStreamFinalizer:
             completed_attachments = None
             log.warning("turn_complete attachment enrichment failed: %s", attachment_err)
 
+        # TASK-709: session id for external-turn adoption. Read from the
+        # request-local thread binding — the same source that populated
+        # turn_start's session_id in chat_streaming.py. Falls back to null on
+        # non-agent turns or when the turn was never thread-bound.
+        _sid: str | None = None
+        try:
+            _binding = getattr(ctx, "thread_binding", None)
+            if isinstance(_binding, dict):
+                _rsid = str(_binding.get("thread_session_id") or "").strip()
+                _sid = _rsid or None
+        except Exception:
+            _sid = None
+
+        # TASK-779: server-authoritative final text on the STREAMING turn
+        # finalize path (symmetric with background_service.py's nonstream
+        # emit). Streaming turns normally commit from the client-side
+        # partial (accumulated text_delta), but if enough deltas drop
+        # (subscriber gap, packed flush, network hiccup) the partial can
+        # be empty at finalize and the reply vanishes. Carrying the full
+        # server-side text lets commitServerOriginatedTurn fall back to
+        # the same bytes the DB persisted. Additive optional field —
+        # `partial || event.response_text` ordering means healthy
+        # streaming still commits from the live partial. Only emitted on
+        # successful completion; cancelled/timeout paths already own
+        # their terminal state via _finalize_turn above.
+        _response_text = (
+            ctx.full_response_holder[0] if status == "completed" else None
+        )
         self._publish_event_direct({
             "_type": "turn_complete",
             "turn_id": ctx.turn_log_id,
             "bot_id": ctx.bot_id,
             "user_id": ctx.user_id,
+            # TASK-709: match turn_start's session id (see block above).
+            "session_id": _sid,
             "status": status,
             "end_reason": end_reason,
             "question_id": question_id,
@@ -220,6 +250,7 @@ class TurnStreamFinalizer:
             "token_usage": self._usage_so_far(),
             "changed_files": changed_files,
             "attachments": completed_attachments,
+            "response_text": _response_text,
             "model": ctx.model_alias,
             "ts": time.time(),
         })

@@ -374,6 +374,46 @@ class BackgroundService(
             },
         )
 
+        # TASK-709: resolve the durable session id BEFORE publishing turn_start
+        # so external clients can route the lifecycle stream to the correct
+        # thread without a follow-up DB fetch.
+        #
+        # Priority:
+        #   1. ``request.session_id`` — for reset-policy inter-bot deliveries
+        #      the dispatcher wrote the NEW (target) session id there via
+        #      ``agent_context.rotate_delivery_session``. For explicit thread
+        #      selection from a chat client, that's also where the target
+        #      lives. This is always the correct routing target.
+        #   2. ``_resolve_active_thread_binding`` fallback for cases without
+        #      an explicit selection.
+        #
+        # Do NOT use ``inter_bot_seed_session_id`` for routing — it names the
+        # ARCHIVED (old) session that ``build_context_seed`` reads history
+        # FROM. Routing turn_start there would send events to the dead thread
+        # and the pane on the fresh target session would gate them out as
+        # "wrong thread" (the exact cross-thread failure TASK-709 forbids).
+        #
+        # Best-effort: a resolution failure emits ``session_id: null`` for
+        # backward-compat.
+        # NB: nonlocal-mutable so post-rotation refresh inside ``_do_query``
+        # can update it for the ``turn_complete`` emits (see F4 note there).
+        resolved_session_id: str | None = None
+        if is_agent_backend:
+            _sid_req = getattr(request, "session_id", None)
+            if isinstance(_sid_req, str) and _sid_req.strip():
+                resolved_session_id = _sid_req.strip()
+            else:
+                try:
+                    _binding = self._resolve_active_thread_binding(llm_bawt)
+                    if _binding:
+                        _rsid = str(_binding.get("thread_session_id") or "").strip()
+                        resolved_session_id = _rsid or None
+                except Exception as _sid_err:
+                    log.warning(
+                        "TASK-709: pre-emit session resolve failed for %s/%s: %s",
+                        bot_id, user_id, _sid_err,
+                    )
+
         if publish_nonstream_lifecycle:
             from ..entity_presentation import EntityPresentationResolver
 
@@ -391,6 +431,8 @@ class BackgroundService(
                     "assistant_message_id": assistant_message_id,
                     "bot_id": bot_id,
                     "user_id": user_id,
+                    # TASK-709: see resolve block above.
+                    "session_id": resolved_session_id,
                     "role": "user",
                     "content": user_prompt,
                     "author": author_presentations[
@@ -565,6 +607,23 @@ class BackgroundService(
                 ):
                     thread_binding = self._resolve_active_thread_binding(llm_bawt)
 
+                # TASK-709 F4: refresh the outer ``resolved_session_id`` from
+                # the post-rotation binding so ``turn_complete`` emits point at
+                # the CURRENT (post-``/new``-rotate, post-``_bind_agent_thread``)
+                # session id, not the stale pre-emit value from turn_start.
+                # ``turn_start`` staleness on ``/new`` is unavoidable (emit
+                # happens before rotation); ``turn_complete`` accuracy is
+                # cheap here and matches how ``turn_stream_finalize`` already
+                # threads its session id.
+                nonlocal resolved_session_id
+                _final_binding = thread_binding
+                if _is_agent and _final_binding:
+                    _final_sid = str(
+                        _final_binding.get("thread_session_id") or ""
+                    ).strip()
+                    if _final_sid:
+                        resolved_session_id = _final_sid
+
                 # Execute the query with prepared messages
                 response, tool_context, tool_call_details = llm_bawt.execute_llm_query(
                     prepared_messages,
@@ -633,6 +692,9 @@ class BackgroundService(
                             "assistant_message_id": assistant_message_id,
                             "bot_id": bot_id,
                             "user_id": user_id,
+                            # TASK-709: match turn_start's session id so a
+                            # receiving window can finalize the correct thread.
+                            "session_id": resolved_session_id,
                             "status": "cancelled",
                             "end_reason": "error",
                             "model": model_alias,
@@ -661,6 +723,8 @@ class BackgroundService(
                             "assistant_message_id": assistant_message_id,
                             "bot_id": bot_id,
                             "user_id": user_id,
+                            # TASK-709: match turn_start's session id.
+                            "session_id": resolved_session_id,
                             "status": "cancelled",
                             "end_reason": "aborted",
                             "model": model_alias,
@@ -708,8 +772,21 @@ class BackgroundService(
                         "assistant_message_id": assistant_message_id,
                         "bot_id": bot_id,
                         "user_id": user_id,
+                        # TASK-709: match turn_start's session id.
+                        "session_id": resolved_session_id,
                         "status": "completed",
                         "end_reason": "stop",
+                        # TASK-779: server-authoritative final text. The
+                        # nonstream inter-bot path emits a single aggregate
+                        # text_delta immediately before turn_complete; if
+                        # that delta never lands (packed flush, filter
+                        # race, subscriber gap), the frontend has no live
+                        # partial to commit and the reply vanishes at
+                        # finalize. Carrying response_text here lets the
+                        # commit fall back to the same bytes the DB
+                        # persisted. Additive optional field — legacy
+                        # consumers ignore it.
+                        "response_text": response_text,
                         "token_usage": token_usage,
                         "model": model_alias,
                         "ts": time.time(),
