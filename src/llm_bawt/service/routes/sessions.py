@@ -90,6 +90,18 @@ class CreateSessionRequest(BaseModel):
     user: str | None = None
     title: str | None = None
     fork_from: ForkFrom | None = None
+    activate: bool = Field(
+        default=True,
+        description=(
+            "TASK-702: when true (default), opening a thread rotates "
+            "(closes) the prior active thread for (bot,user) — the historic "
+            "behavior. When false, mint a session that is BORN archived: "
+            "no rotation, no activation, no impact on the one-active-per-"
+            "(bot,user) invariant. Reachable via explicit session_id for "
+            "background task threads that must not disturb the user's live "
+            "conversation."
+        ),
+    )
 
 
 class UpdateSessionRequest(BaseModel):
@@ -125,7 +137,12 @@ class CreateSessionResponse(BaseModel):
     status: str = "active"
     rotated: bool = Field(
         default=True,
-        description="True — creating a thread rotates (closes) the prior active one.",
+        description=(
+            "True when the default activating path ran (prior active thread "
+            "closed, new one opened active). False for TASK-702 non-activating "
+            "creation (activate=false): a thread was minted archived without "
+            "touching the active-thread invariant."
+        ),
     )
 
 
@@ -374,6 +391,11 @@ async def create_session(
     is stored as a user-sourced title; ``fork_from`` records fork provenance
     (``at_message_id`` required — enforced by the schema) after verifying the
     source thread is owned by the same (bot, user).
+
+    TASK-702: ``activate=false`` mints a session that is BORN archived — it
+    does not rotate the active thread and does not become active. Background
+    task dispatch uses this to open a dedicated task thread without disturbing
+    the user's currently active conversation.
     """
     body = body or CreateSessionRequest()
     effective_bot = get_effective_bot_id(body.bot_id or bot_id)
@@ -386,8 +408,6 @@ async def create_session(
             body.fork_from.session_id, effective_bot, user_id
         )
 
-    new_id = await storage.rotate_session(bot_id=effective_bot, user_id=user_id)
-
     meta: dict = {}
     if body.title and body.title.strip():
         meta["title"] = body.title.strip()
@@ -397,11 +417,39 @@ async def create_session(
             "session_id": body.fork_from.session_id,
             "at_message_id": body.fork_from.at_message_id,
         }
-    if meta:
-        await storage.update_session_metadata(new_id, meta, bot_id=effective_bot)
 
+    if body.activate:
+        new_id = await storage.rotate_session(
+            bot_id=effective_bot, user_id=user_id,
+        )
+        if meta:
+            await storage.update_session_metadata(
+                new_id, meta, bot_id=effective_bot,
+            )
+        return CreateSessionResponse(
+            session_id=new_id,
+            bot_id=effective_bot,
+            user_id=user_id,
+            status="active",
+            rotated=True,
+        )
+
+    # Non-activating: seed metadata at creation time so a follow-up write
+    # is not required, and mark the row so operators can distinguish
+    # background/task threads from a UI-archived one on read.
+    seed_meta = dict(meta)
+    seed_meta.setdefault("created_inactive", True)
+    new_id = await storage.create_inactive_session(
+        bot_id=effective_bot,
+        user_id=user_id,
+        session_metadata=seed_meta,
+    )
     return CreateSessionResponse(
-        session_id=new_id, bot_id=effective_bot, user_id=user_id
+        session_id=new_id,
+        bot_id=effective_bot,
+        user_id=user_id,
+        status="archived",
+        rotated=False,
     )
 
 

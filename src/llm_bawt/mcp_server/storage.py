@@ -1137,6 +1137,27 @@ class MemoryStorage:
         manager = self.get_short_term_manager(bot_id, provision_schema=True)
         return manager.rotate_session(bot_id=bot_id, user_id=user_id)
 
+    async def create_inactive_session(
+        self,
+        bot_id: str = "default",
+        user_id: str | None = None,
+        session_metadata: dict | None = None,
+    ) -> str:
+        """Mint a session row that is born archived (TASK-702).
+
+        Background dispatch uses this to open a dedicated task thread
+        without rotating (closing) the user's currently active
+        conversation. The one-active-per-(bot,user) invariant is untouched.
+        The returned session is fully owned and reachable via explicit
+        ``session_id`` continuation.
+        """
+        manager = self.get_short_term_manager(bot_id, provision_schema=True)
+        return manager.create_inactive_session(
+            bot_id=bot_id,
+            user_id=user_id,
+            session_metadata=session_metadata,
+        )
+
     async def activate_session(
         self,
         session_id: str,

@@ -447,6 +447,48 @@ class PostgreSQLShortTermManager:
         self._session_id_cache = new_id
         return new_id
 
+    def create_inactive_session(
+        self,
+        bot_id: str | None = None,
+        user_id: str | None = None,
+        session_metadata: dict | None = None,
+    ) -> str:
+        """Insert a new session row that is born archived (TASK-702).
+
+        Background dispatch uses this to mint a dedicated task thread
+        WITHOUT rotating (closing) the user's currently active conversation.
+        The one-active-per-(bot,user) invariant is untouched — the fresh
+        row is created with ``status='archived'`` and ``ended_at``/
+        ``archived_at`` set, so it never competes for the active slot but
+        is fully owned by (bot,user), reachable via explicit ``session_id``
+        continuation, and eligible for per-thread SDK resume metadata.
+
+        Returns the new session id.
+        """
+        target_bot = self.bot_id if bot_id is None else bot_id
+        target_user = self.user_id if user_id is None else user_id
+        new_id = str(uuid.uuid4())
+        meta_json = json.dumps(session_metadata) if session_metadata else None
+        with self._backend.engine.begin() as conn:
+            conn.execute(
+                text("""
+                    INSERT INTO sessions
+                        (id, bot_id, user_id, started_at, ended_at,
+                         archived_at, status, session_metadata)
+                    VALUES
+                        (:id, :bot_id, :user_id, CURRENT_TIMESTAMP,
+                         CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, 'archived',
+                         CAST(:meta AS JSONB))
+                """),
+                {
+                    "id": new_id,
+                    "bot_id": target_bot,
+                    "user_id": target_user,
+                    "meta": meta_json,
+                },
+            )
+        return new_id
+
     def activate_session(
         self,
         session_id: str,

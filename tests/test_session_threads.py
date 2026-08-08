@@ -318,3 +318,65 @@ class TestRegistryInvariantsLiveDB:
             for r in m.list_sessions(bot_id=bot, user_id="lc5", status="archived")
         ]
         assert sid in ids
+
+    # ── TASK-702: non-activating (background dispatch) session creation ────
+
+    def test_create_inactive_session_does_not_disturb_active_thread(self, live_managers):
+        """Non-activating creation must not rotate/close the live thread.
+
+        Background task dispatch relies on this to open a dedicated task
+        conversation without unseating the user's currently active one.
+        """
+        bot, make = live_managers["bot"], live_managers["make"]
+        m = make("t702-a")
+        live = m.get_or_create_active_session(bot_id=bot, user_id="t702-a")
+        inactive = m.create_inactive_session(bot_id=bot, user_id="t702-a")
+
+        assert inactive != live
+        row = m.get_session(inactive)
+        assert row["status"] == "archived"
+        assert row["archived_at"] is not None
+        assert row["ended_at"] is not None
+        assert row["user_id"] == "t702-a"
+
+        # The live thread is untouched — still active and still the winner
+        # of the one-active-per-(bot,user) invariant.
+        live_row = m.get_session(live)
+        assert live_row["status"] == "active"
+        active_rows = _active_rows(m, bot, "t702-a")
+        assert [r[0] for r in active_rows] == [live], (
+            "create_inactive_session must not touch the active thread"
+        )
+
+    def test_create_inactive_session_persists_metadata(self, live_managers):
+        bot, make = live_managers["bot"], live_managers["make"]
+        m = make("t702-b")
+        sid = m.create_inactive_session(
+            bot_id=bot,
+            user_id="t702-b",
+            session_metadata={"created_inactive": True, "source": "dispatch"},
+        )
+        row = m.get_session(sid)
+        assert row["session_metadata"]["created_inactive"] is True
+        assert row["session_metadata"]["source"] == "dispatch"
+        assert row["status"] == "archived"
+
+    def test_create_inactive_session_multiple_calls_never_collide(self, live_managers):
+        """Multiple non-activating creations for the same (bot,user) all coexist.
+
+        No unique-index conflict, no rotation racing, and the one-active
+        invariant continues to hold because none of them are active.
+        """
+        bot, make = live_managers["bot"], live_managers["make"]
+        m = make("t702-c")
+        live = m.get_or_create_active_session(bot_id=bot, user_id="t702-c")
+        ids = {
+            m.create_inactive_session(bot_id=bot, user_id="t702-c")
+            for _ in range(4)
+        }
+        assert len(ids) == 4, "each call must return a fresh session id"
+        assert live not in ids
+        active_rows = _active_rows(m, bot, "t702-c")
+        assert [r[0] for r in active_rows] == [live], (
+            "one-active-per-(bot,user) invariant must survive many inactive creations"
+        )
