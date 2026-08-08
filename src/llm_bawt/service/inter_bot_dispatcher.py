@@ -43,6 +43,7 @@ class InterBotDeliveryDispatcher:
         self._target_tasks: dict[str, asyncio.Task] = {}
         self.claim_owner = f"dispatcher-{uuid.uuid4().hex}"
         self._dispatcher_lock = None
+        self._subscriber_gap_logged = False
 
     def start(self) -> None:
         self._loop = asyncio.get_running_loop()
@@ -73,7 +74,15 @@ class InterBotDeliveryDispatcher:
                 self._task = asyncio.create_task(
                     self.run(), name="inter-bot-delivery-dispatcher"
                 )
-            await self._task
+            try:
+                await self._task
+            except Exception:
+                # An unhandled crash in run() must not kill leadership forever:
+                # before this guard, one transient DB error here left QUEUED
+                # deliveries with no consumer until the next app restart.
+                logger.exception(
+                    "inter-bot dispatcher loop crashed; restarting under leadership"
+                )
             if not self._stop_event.is_set():
                 logger.warning("inter-bot dispatcher loop exited; restarting under leadership")
                 await asyncio.sleep(1)
@@ -87,9 +96,9 @@ class InterBotDeliveryDispatcher:
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
         if self._task:
-            await self._task
+            await asyncio.gather(self._task, return_exceptions=True)
         if self._leader_task:
-            await self._leader_task
+            await asyncio.gather(self._leader_task, return_exceptions=True)
         self.store.release_dispatcher_lock(self._dispatcher_lock)
         self._dispatcher_lock = None
 
@@ -103,8 +112,18 @@ class InterBotDeliveryDispatcher:
             self._wake_event.set()
 
     async def run(self) -> None:
-        self.store.recover_expired()
+        # Belt-and-suspenders around the outer leadership guard: transient
+        # SQLAlchemy pool blips (e.g. InvalidatePoolError from a DB restart)
+        # showed up in prod as 5 crashes in 25s because the outer guard tore
+        # down and rebuilt the whole run() task each time. Guarding the sweep
+        # in-place lets one task instance ride through pool recovery with
+        # exponential backoff instead of hot-looping.
+        try:
+            self.store.recover_expired()
+        except Exception:
+            logger.exception("initial recover_expired failed; continuing")
         self._wake_event.set()
+        consecutive_failures = 0
         while not self._stop_event.is_set():
             try:
                 await asyncio.wait_for(
@@ -113,14 +132,53 @@ class InterBotDeliveryDispatcher:
             except asyncio.TimeoutError:
                 pass
             self._wake_event.clear()
-            self.store.recover_expired()
-            self._schedule_eligible_targets()
+            try:
+                self.store.recover_expired()
+                self._schedule_eligible_targets()
+            except Exception:
+                consecutive_failures += 1
+                backoff = min(30.0, float(2 ** min(consecutive_failures - 1, 5)))
+                logger.exception(
+                    "dispatcher sweep iteration failed (%d consecutive); "
+                    "backing off %.1fs",
+                    consecutive_failures,
+                    backoff,
+                )
+                try:
+                    await asyncio.wait_for(self._stop_event.wait(), timeout=backoff)
+                except asyncio.TimeoutError:
+                    pass
+            else:
+                consecutive_failures = 0
         await asyncio.gather(*self._target_tasks.values(), return_exceptions=True)
 
     def _schedule_eligible_targets(self) -> None:
         subscriber = getattr(self.service, "_redis_subscriber", None)
         if subscriber is None or not getattr(subscriber, "connected", False):
+            # Silent-dead-consumer guard: if the Redis subscriber isn't
+            # connected we cannot dispatch, but that must not be an invisible
+            # no-op when ripe deliveries are sitting in the queue. Log once
+            # per gap (throttled) so ops can see it in the same shape as the
+            # 2026-08-07 stuck-delivery incident.
+            try:
+                eligible = list(self.store.eligible_targets())
+            except Exception:
+                logger.exception(
+                    "eligible_targets probe failed while Redis subscriber offline"
+                )
+                return
+            if eligible and not self._subscriber_gap_logged:
+                logger.warning(
+                    "Redis subscriber offline; %d target(s) with QUEUED deliveries "
+                    "cannot be dispatched: %s",
+                    len(eligible),
+                    ", ".join(sorted(eligible)[:5]),
+                )
+                self._subscriber_gap_logged = True
             return
+        if self._subscriber_gap_logged:
+            logger.info("Redis subscriber back online; resuming dispatch sweeps")
+            self._subscriber_gap_logged = False
         for target in self.store.eligible_targets():
             existing = self._target_tasks.get(target)
             if existing and not existing.done():
