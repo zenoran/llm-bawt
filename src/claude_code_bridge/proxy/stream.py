@@ -58,11 +58,67 @@ from __future__ import annotations
 import json
 import logging
 import uuid
+from dataclasses import dataclass, field
 from typing import Any, AsyncIterator, Callable
 
 from .tool_sanitizers import recover_trailing_json, sanitize_tool_arguments
 
 logger = logging.getLogger(__name__)
+
+
+# ── TASK-714: TranslatorState — live view of what's been yielded ────────────
+#
+# The retry loop in adapters/base.py consults this on failure to pick a policy:
+#   - TOOL_COMMITTED (state.tool_committed=True) → hard no-retry
+#   - TEXT (state.text_delta_yielded=True) → default fail-upward with api_error
+#   - THINKING (state.thinking_yielded=True) → retry OK; block-index hygiene
+#     across the splice is the loop's responsibility (Al #1)
+#   - PRE_OUTPUT (state.message_start_yielded=True, no content) → retry OK
+#   - CONNECTING (state.message_start_yielded=False) → retry OK
+#
+# When ``state`` is passed to :func:`responses_to_anthropic_sse` the translator
+# ALSO changes error behavior: exceptions from the upstream iterator PROPAGATE
+# to the caller (retry loop catches), and in-band ``response.failed`` /
+# ``response.error`` / ``error`` payloads populate ``state.inband_error`` and
+# short-circuit WITHOUT emitting an SSE error frame — the retry loop consults
+# the payload and either retries (bucket B) or emits its own final error frame
+# with a bucket-appropriate Anthropic error type.
+#
+# Backward compat: ``state=None`` preserves the pre-TASK-714 behavior
+# (translator emits its own error frame and swallows the exception). Nothing
+# outside this proxy calls this generator, so backcompat is only for tests /
+# the non-streaming route buffer in routes.py that treats the generator as
+# opaque.
+
+@dataclass
+class TranslatorState:
+    """Observation of what the translator has yielded so far, for retry decisions."""
+
+    # ── Yield markers (drive RetryPhase classification in retry.py) ─────────
+    message_start_yielded: bool = False
+    thinking_yielded: bool = False       # any thinking_delta emitted
+    text_delta_yielded: bool = False     # ANY text_delta emitted (partial visible output)
+    tool_committed: bool = False         # content_block_start(tool_use) emitted — hard no-retry
+
+    # ── Block index bookkeeping (Al #1: monotone indexes across a retry splice) ─
+    # ``next_block_index`` is the index that WILL be assigned to the next block
+    # opened by the translator. When the retry loop closes the current open
+    # block and re-invokes the translator with ``resumed_from_index=state.next_block_index``,
+    # new blocks pick up from there — no restart at 0, no duplicate indexes.
+    next_block_index: int = 0
+    open_block: dict | None = None       # {"index", "kind", "item_id", "call_id"?, "name"?}
+
+    # ── In-band terminal events (Al #2) ─────────────────────────────────────
+    # Populated by response.failed / response.error / error SSE events from the
+    # upstream. When present after a "clean" return from the translator, the
+    # retry loop treats the run as failed and consults classify_inband_error.
+    inband_error: dict | None = field(default=None)
+
+    # ── Usage snapshot (Al #4) ──────────────────────────────────────────────
+    # Only the final SUCCESSFUL attempt's usage should count toward turn
+    # accounting. The retry loop resets this per attempt; on_usage on the
+    # translator populates it. See adapters/base.py::call for the reset dance.
+    usage_snapshot: tuple[int, int, int, int] | None = None    # (input, output, cache_read, cache_create)
 
 
 def _sse(event: str, data: dict) -> bytes:
@@ -161,9 +217,25 @@ async def responses_to_anthropic_sse(
     anthropic_model: str,
     tool_schemas: list[dict] | None = None,
     on_usage: Callable[[int, int, int, int], None] | None = None,
+    *,
+    state: TranslatorState | None = None,
+    resumed_from_index: int | None = None,
 ) -> AsyncIterator[bytes]:
-    """Translate a Responses API event stream into Anthropic SSE bytes."""
+    """Translate a Responses API event stream into Anthropic SSE bytes.
 
+    TASK-714 additions (kwargs-only, backward compat when both omitted):
+
+    - ``state`` — a :class:`TranslatorState` the translator updates as it yields.
+      When provided, ALSO changes error behavior: exceptions from the upstream
+      iterator PROPAGATE (retry loop catches), and in-band ``response.failed``/
+      ``response.error``/``error`` payloads populate ``state.inband_error`` and
+      short-circuit WITHOUT emitting an SSE error frame.
+    - ``resumed_from_index`` — if not None, skip ``message_start`` (previous
+      attempt already emitted it), start block indexes at this integer, and
+      assume the caller has already emitted a ``content_block_stop`` for any
+      block open at retry time. Al #1: keeps indexes monotone across the
+      splice; the SDK's Anthropic-SSE parser is strict about this.
+    """
     message_id = _anthropic_message_id()
     required_args_by_tool: dict[str, frozenset[str]] = {}
     for tool in tool_schemas or []:
@@ -178,37 +250,48 @@ async def responses_to_anthropic_sse(
             value for value in required or [] if isinstance(value, str)
         )
 
-    # Emit message_start up front so the SDK has the envelope before any
-    # content arrives. Our Responses-backed providers only know real usage at
-    # response.completed, so we start with zeroes and refine at message_delta.
-    yield _sse(
-        "message_start",
-        {
-            "type": "message_start",
-            "message": {
-                "id": message_id,
-                "type": "message",
-                "role": "assistant",
-                "content": [],
-                "model": anthropic_model,
-                "stop_reason": None,
-                "stop_sequence": None,
-                "usage": {
-                    "input_tokens": 0,
-                    "output_tokens": 0,
-                    "cache_creation_input_tokens": 0,
-                    "cache_read_input_tokens": 0,
+    # TASK-714: skip message_start on resumed attempts — the previous attempt
+    # already emitted it and the SDK's parser rejects a second one. When state
+    # is provided we also mark message_start_yielded=True for the initial
+    # emission so the retry loop's phase classifier sees PRE_OUTPUT immediately.
+    if resumed_from_index is None:
+        # Emit message_start up front so the SDK has the envelope before any
+        # content arrives. Our Responses-backed providers only know real usage at
+        # response.completed, so we start with zeroes and refine at message_delta.
+        yield _sse(
+            "message_start",
+            {
+                "type": "message_start",
+                "message": {
+                    "id": message_id,
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [],
+                    "model": anthropic_model,
+                    "stop_reason": None,
+                    "stop_sequence": None,
+                    "usage": {
+                        "input_tokens": 0,
+                        "output_tokens": 0,
+                        "cache_creation_input_tokens": 0,
+                        "cache_read_input_tokens": 0,
+                    },
                 },
             },
-        },
-    )
+        )
+        if state is not None:
+            state.message_start_yielded = True
 
     # Anthropic permits at most one *open* content block at a time and requires
     # strict open→delta→stop ordering. Responses emits output items
     # sequentially (reasoning, then message text, then function calls), so we
     # model a single ``open_block`` and a per-item index map for routing arg
     # deltas to the right tool block.
-    next_index = 0
+    # TASK-714 (Al #1): on a resumed attempt, block indexes start from where
+    # the previous attempt left off — NOT at 0 — so the spliced stream stays
+    # monotone. The caller is responsible for emitting content_block_stop on
+    # any block that was open at the failure point BEFORE calling us again.
+    next_index = resumed_from_index if resumed_from_index is not None else 0
     open_block: dict | None = None          # {"index", "kind", "item_id", "call_id"?}
     blocks_by_item: dict[str, dict] = {}    # item_id → block dict (tools)
     # Buffer tool argument deltas so we can sanitize before the SDK sees them.
@@ -242,6 +325,23 @@ async def responses_to_anthropic_sse(
     def _stop_frame(idx: int) -> bytes:
         return _sse("content_block_stop", {"type": "content_block_stop", "index": idx})
 
+    def _alloc_index() -> int:
+        """Allocate the next monotone block index, syncing to state (TASK-714)."""
+        nonlocal next_index
+        idx = next_index
+        next_index += 1
+        if state is not None:
+            state.next_block_index = next_index
+        return idx
+
+    def _set_open(block: dict | None) -> None:
+        """Set the open block, mirroring to state (TASK-714) so the retry loop
+        knows what content_block_stop to emit before a splice."""
+        nonlocal open_block
+        open_block = block
+        if state is not None:
+            state.open_block = block
+
     try:
         async for event in upstream_stream:
             etype = getattr(event, "type", "") or ""
@@ -258,16 +358,15 @@ async def responses_to_anthropic_sse(
                 if itype == "reasoning":
                     if open_block is not None:
                         yield _stop_frame(open_block["index"])
-                        open_block = None
-                    idx = next_index
-                    next_index += 1
-                    open_block = {"index": idx, "kind": "thinking",
-                                  "item_id": getattr(item, "id", "") or ""}
+                        _set_open(None)
+                    idx = _alloc_index()
+                    _set_open({"index": idx, "kind": "thinking",
+                               "item_id": getattr(item, "id", "") or ""})
                     yield _open_start_frame("thinking", idx)
                 elif itype in ("function_call", "custom_tool_call"):
                     if open_block is not None:
                         yield _stop_frame(open_block["index"])
-                        open_block = None
+                        _set_open(None)
                     item_id = getattr(item, "id", "") or ""
                     call_id = (
                         getattr(item, "call_id", "")
@@ -275,8 +374,7 @@ async def responses_to_anthropic_sse(
                         or f"call_{uuid.uuid4().hex[:16]}"
                     )
                     name = getattr(item, "name", "") or ""
-                    idx = next_index
-                    next_index += 1
+                    idx = _alloc_index()
                     block = {
                         "index": idx,
                         "kind": "tool",
@@ -284,9 +382,15 @@ async def responses_to_anthropic_sse(
                         "call_id": call_id,
                         "name": name,
                     }
-                    open_block = block
+                    _set_open(block)
                     blocks_by_item[item_id] = block
                     saw_tool_use = True
+                    # TASK-714 HARD BARRIER: a tool call has been forwarded to
+                    # the SDK. Retry policy will refuse to replay from this
+                    # point regardless of failure bucket — replaying could
+                    # duplicate tool execution.
+                    if state is not None:
+                        state.tool_committed = True
                     yield _open_start_frame("tool", idx, call_id=call_id, name=name)
                 elif itype == "message":
                     # Text container — the actual text block opens lazily on the
@@ -311,10 +415,13 @@ async def responses_to_anthropic_sse(
                 if open_block is None or open_block["kind"] != "thinking":
                     if open_block is not None:
                         yield _stop_frame(open_block["index"])
-                    idx = next_index
-                    next_index += 1
-                    open_block = {"index": idx, "kind": "thinking", "item_id": ""}
+                    idx = _alloc_index()
+                    _set_open({"index": idx, "kind": "thinking", "item_id": ""})
                     yield _open_start_frame("thinking", idx)
+                # TASK-714: mark THINKING phase — retry loop may still replay
+                # this whole call (thinking is display-only per Al's decision).
+                if state is not None:
+                    state.thinking_yielded = True
                 yield _sse(
                     "content_block_delta",
                     {
@@ -349,12 +456,17 @@ async def responses_to_anthropic_sse(
                 if open_block is None or open_block["kind"] != "text":
                     if open_block is not None:
                         yield _stop_frame(open_block["index"])
-                    idx = next_index
-                    next_index += 1
-                    open_block = {"index": idx, "kind": "text", "item_id": ""}
+                    idx = _alloc_index()
+                    _set_open({"index": idx, "kind": "text", "item_id": ""})
                     yield _open_start_frame("text", idx)
                 if etype == "response.refusal.delta":
                     saw_refusal = True
+                # TASK-714 HARD BARRIER for retry: any visible text_delta means
+                # partial visible content has been forwarded to the SDK. Retry
+                # policy defaults to honest fail-upward from this state to
+                # prevent duplicated visible text on a CLI-side retry.
+                if state is not None:
+                    state.text_delta_yielded = True
                 yield _sse(
                     "content_block_delta",
                     {
@@ -374,9 +486,8 @@ async def responses_to_anthropic_sse(
                     if open_block is None or open_block["kind"] != "text":
                         if open_block is not None:
                             yield _stop_frame(open_block["index"])
-                        idx = next_index
-                        next_index += 1
-                        open_block = {"index": idx, "kind": "text", "item_id": ""}
+                        idx = _alloc_index()
+                        _set_open({"index": idx, "kind": "text", "item_id": ""})
                         yield _open_start_frame("text", idx)
                 continue
 
@@ -417,19 +528,19 @@ async def responses_to_anthropic_sse(
                             },
                         )
                         yield _stop_frame(open_block["index"])
-                        open_block = None
+                        _set_open(None)
                 elif itype in ("function_call", "custom_tool_call"):
                     item_id = getattr(item, "id", "") or ""
                     block = blocks_by_item.get(item_id) or open_block
                     if block is not None:
                         yield _stop_frame(block["index"])
                         if open_block is block:
-                            open_block = None
+                            _set_open(None)
                     saw_tool_use = True
                 elif itype == "message":
                     if open_block is not None and open_block["kind"] == "text":
                         yield _stop_frame(open_block["index"])
-                        open_block = None
+                        _set_open(None)
                 continue
 
             # ── terminal: success ───────────────────────────────────────────
@@ -437,6 +548,13 @@ async def responses_to_anthropic_sse(
                 resp = getattr(event, "response", None)
                 if resp is not None:
                     input_tokens, output_tokens, cache_read, cache_create = _extract_usage(resp)
+                    # TASK-714 (Al #4): stash usage on state so the retry loop
+                    # can pick the FINAL successful attempt's numbers, not the
+                    # sum across aborted attempts. Callback still fires for
+                    # side effects; the loop is responsible for gating which
+                    # attempt's callback actually credits the turn.
+                    if state is not None:
+                        state.usage_snapshot = (input_tokens, output_tokens, cache_read, cache_create)
                     if on_usage is not None:
                         on_usage(input_tokens, output_tokens, cache_read, cache_create)
                     logger.info(
@@ -458,6 +576,8 @@ async def responses_to_anthropic_sse(
                 resp = getattr(event, "response", None)
                 if resp is not None:
                     input_tokens, output_tokens, cache_read, cache_create = _extract_usage(resp)
+                    if state is not None:
+                        state.usage_snapshot = (input_tokens, output_tokens, cache_read, cache_create)
                     if on_usage is not None:
                         on_usage(input_tokens, output_tokens, cache_read, cache_create)
                     details = getattr(resp, "incomplete_details", None)
@@ -466,6 +586,14 @@ async def responses_to_anthropic_sse(
                 continue
 
             # ── terminal: failure / error ───────────────────────────────────
+            # TASK-714 Al #2: in-band terminal errors historically short-circuited
+            # with a wire error frame and cleanly returned — the exception-only
+            # retry loop never saw them. When a state is provided, we instead
+            # populate state.inband_error and return cleanly WITHOUT emitting an
+            # error frame; the retry loop consults classify_inband_error() and
+            # either retries (bucket B, 5xx-shaped) or emits its own final error
+            # frame (bucket C, auth/4xx-shaped). Backcompat: state=None keeps
+            # the pre-TASK-714 behavior.
             if etype in ("response.failed", "response.error", "error"):
                 err = getattr(event, "error", None)
                 if err is None:
@@ -473,6 +601,12 @@ async def responses_to_anthropic_sse(
                     err = getattr(resp, "error", None) if resp is not None else None
                 msg = getattr(err, "message", "") or "upstream error"
                 code = getattr(err, "code", "") or "upstream_error"
+                if state is not None:
+                    # Retry loop owns the wire response — pass through cleanly
+                    # WITHOUT yielding an error frame here. Close-open-block
+                    # hygiene (Al #1) is also the loop's responsibility.
+                    state.inband_error = {"code": code, "message": msg}
+                    return
                 # Close any open block before the error so the SDK's parser
                 # doesn't choke on a dangling block.
                 if open_block is not None:
@@ -565,7 +699,7 @@ async def responses_to_anthropic_sse(
 
         if open_block is not None:
             yield _stop_frame(open_block["index"])
-            open_block = None
+            _set_open(None)
 
         # Precedence: a tool call ends the turn for the agent loop; an explicit
         # non-default terminal (max_tokens, content-filter refusal) outranks a
@@ -599,6 +733,13 @@ async def responses_to_anthropic_sse(
         yield _sse("message_stop", {"type": "message_stop"})
 
     except Exception as exc:  # noqa: BLE001
+        # TASK-714: when a state is provided the retry loop owns the wire
+        # response — we PROPAGATE the exception so the loop can decide bucket +
+        # phase policy. Block-close hygiene (Al #1) becomes the loop's job.
+        # Backcompat: state=None keeps the pre-TASK-714 behavior (emit an SSE
+        # error frame with a canonical Anthropic error type and swallow).
+        if state is not None:
+            raise
         logger.exception("Stream translation failed")
         if open_block is not None:
             try:

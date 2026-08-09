@@ -34,6 +34,30 @@ class TurnStreamFinalizer:
         except Exception:
             return False
 
+    def _turn_has_upstream_error(self) -> tuple[bool, str | None]:
+        """TASK-714: was the turn already marked ``status="error"`` by an
+        upstream-error signal from the bridge (agent path) or the finalize
+        exception handler below (chat path)?
+
+        The claude-code bridge ERROR event handler at
+        ``chat_streaming_bridge.py:877`` already writes ``status="error"`` on
+        the turn log BEFORE this finalize runs. Without this check, the
+        subsequent ``_finalize_turn`` + ``turn_complete`` emit at line 253
+        would clobber that honest error back to ``status="completed"`` /
+        ``end_reason="stop"`` if any partial visible text was accumulated —
+        the exact spec bug.
+
+        Returns ``(had_error, error_text or None)`` so the classifier can also
+        surface a stable ``end_reason`` and forward the error text on the wire.
+        """
+        try:
+            current_turn = self.ctx.svc._turn_log_store.get_turn(self.ctx.turn_log_id)
+            if current_turn is not None and current_turn.status == "error":
+                return True, getattr(current_turn, "error_text", None)
+        except Exception:
+            pass
+        return False, None
+
     def _usage_so_far(self) -> dict | None:
         ctx = self.ctx
         return ctx.svc._resolve_turn_token_usage(
@@ -51,6 +75,13 @@ class TurnStreamFinalizer:
         externally_aborted = self._turn_was_aborted()
         if externally_aborted:
             ctx.cancelled_holder[0] = True
+
+        # TASK-714: honor a prior upstream-error status BEFORE persistence so
+        # we don't clobber it back to "completed" via _finalize_turn. Ordering:
+        # aborted > upstream_error > (success/timeout branches below).
+        upstream_error, upstream_error_text = (False, None)
+        if not externally_aborted:
+            upstream_error, upstream_error_text = self._turn_has_upstream_error()
 
         # Wrap finalization so the sentinel, turn_complete event, and generation
         # cleanup still fire when persistence raises (for example, DB failure).
@@ -87,6 +118,24 @@ class TurnStreamFinalizer:
                         tool_calls=ctx.tool_call_details_holder or None,
                         end_reason="aborted",
                     )
+            elif upstream_error:
+                # TASK-714: an upstream error was already recorded on this turn
+                # (bridge ERROR handler in chat_streaming_bridge.py, or the
+                # finalize-exception handler below on a prior partial). Persist
+                # any accumulated response text + tool details WITHOUT flipping
+                # status back to "completed" — the honest terminal is "error".
+                # Route through _update_turn_log which preserves the existing
+                # status field instead of _finalize_turn which forces "completed".
+                svc._update_turn_log(
+                    turn_id=ctx.turn_log_id,
+                    latency_ms=elapsed_ms,
+                    response_text=ctx.full_response_holder[0] or None,
+                    tool_calls=ctx.tool_call_details_holder or None,
+                    token_usage=ctx.token_usage_holder[0] or self._usage_so_far(),
+                    # NOTE: intentionally not passing status= — the row is
+                    # already status="error" and we want to keep it that way.
+                    # error_text already set upstream; don't overwrite here.
+                )
             elif ctx.full_response_holder[0]:
                 svc._finalize_turn(
                     llm_bawt=ctx.llm_bawt,
@@ -130,9 +179,21 @@ class TurnStreamFinalizer:
             except Exception:
                 pass
 
-        status = "completed" if ctx.full_response_holder[0] else "timeout"
+        # TASK-714 accounting fix: the classifier now considers upstream_error
+        # ALONGSIDE aborted + full_response presence. Precedence (spec-locked):
+        # cancelled/aborted > upstream_error > completed(has text) > timeout(empty).
+        # Without this, an upstream-error turn with partial visible output would
+        # persist status="completed"/end_reason="stop" — a lie that breaks
+        # /v1/turn-logs review, task-context aggregation, and downstream
+        # observability. See _turn_has_upstream_error() docstring.
         if ctx.cancelled_holder[0]:
             status = "cancelled"
+        elif upstream_error:
+            status = "error"
+        elif ctx.full_response_holder[0]:
+            status = "completed"
+        else:
+            status = "timeout"
 
         question_id = ctx.question_id_holder[0]
         approval_id = ctx.approval_id_holder[0]
@@ -145,6 +206,11 @@ class TurnStreamFinalizer:
             end_reason = "approval_persist_failed"
         elif ctx.cancelled_holder[0]:
             end_reason = "aborted"
+        elif upstream_error:
+            # TASK-714: new terminal value for the turn_complete wire — additive
+            # only; consumers that don't switch on it fall through to their
+            # default handling (typically "error state" bucket).
+            end_reason = "upstream_error"
         elif status == "timeout":
             end_reason = "error"
         else:
@@ -219,20 +285,25 @@ class TurnStreamFinalizer:
         except Exception:
             _sid = None
 
-        # TASK-779: server-authoritative final text on the STREAMING turn
-        # finalize path (symmetric with background_service.py's nonstream
-        # emit). Streaming turns normally commit from the client-side
-        # partial (accumulated text_delta), but if enough deltas drop
-        # (subscriber gap, packed flush, network hiccup) the partial can
+        # TASK-779 + TASK-714: server-authoritative final text on the STREAMING
+        # turn finalize path (symmetric with background_service.py's nonstream
+        # emit). Streaming turns normally commit from the client-side partial
+        # (accumulated text_delta), but if enough deltas drop the partial can
         # be empty at finalize and the reply vanishes. Carrying the full
-        # server-side text lets commitServerOriginatedTurn fall back to
-        # the same bytes the DB persisted. Additive optional field —
-        # `partial || event.response_text` ordering means healthy
-        # streaming still commits from the live partial. Only emitted on
-        # successful completion; cancelled/timeout paths already own
-        # their terminal state via _finalize_turn above.
+        # server-side text lets commitServerOriginatedTurn fall back to the
+        # same bytes the DB persisted. Additive optional field.
+        #
+        # TASK-714 extension: also carry the text on upstream-error terminals.
+        # The claude-code bridge appends its visible error marker
+        # ("⚠️ openclaw bridge error\n\n```\n...\n```") to full_response_holder
+        # before ERROR is raised — preserving it here lets the client-side
+        # assistant bubble still render the honest failure if the partial
+        # buffer is empty. cancelled/timeout paths remain None because their
+        # terminal is owned elsewhere.
         _response_text = (
-            ctx.full_response_holder[0] if status == "completed" else None
+            ctx.full_response_holder[0]
+            if status in ("completed", "error")
+            else None
         )
         self._publish_event_direct({
             "_type": "turn_complete",

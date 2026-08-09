@@ -4,11 +4,24 @@ Adapters are stateful (cached credentials, refresh timers) so the registry
 stores live instances, not classes. The default ``call`` implementation
 targets the OpenAI Responses API and is shared by every Responses-API
 provider — adapters only override when their upstream shape differs.
+
+TASK-714: ``call()`` now wraps the initial-request + stream iteration in a
+bounded retry loop consulting :mod:`proxy.retry`. The state machine + backoff
++ failure-bucket classification live there; this module only ORCHESTRATES the
+retry (close open block on splice, invoke translator in resumed mode with a
+monotone starting index, honor rate-limit cap, gate final-attempt usage
+accounting).
+
+Request identity across retries is load-bearing for prompt-cache routing —
+the ``responses_body`` (including ``prompt_cache_key``), the ``session_id``
+header, and the ``chatgpt-account-id`` header are built ONCE outside the loop
+and reused verbatim on every attempt.
 """
 
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import time
 from abc import ABC, abstractmethod
@@ -17,8 +30,27 @@ from typing import AsyncIterator, ClassVar
 import httpx
 
 from ..request_context import ProxyRequestContext
+from .. import retry as retry_mod
+from ..stream import TranslatorState
 
 logger = logging.getLogger(__name__)
+
+
+def _stop_block_frame(index: int) -> bytes:
+    """Emit a well-formed content_block_stop frame for the splice (Al #1).
+
+    Kept in adapters/base.py rather than exported from stream.py to avoid
+    coupling the retry loop to the translator's internals — the shape is
+    trivial and stable per the Anthropic Messages API spec.
+    """
+    payload = {"type": "content_block_stop", "index": index}
+    return f"event: content_block_stop\ndata: {json.dumps(payload, separators=(',', ':'))}\n\n".encode()
+
+
+def _final_error_frame(error_type: str, message: str) -> bytes:
+    """Emit a well-formed Anthropic-shaped SSE error frame."""
+    payload = {"type": "error", "error": {"type": error_type, "message": message}}
+    return f"event: error\ndata: {json.dumps(payload, separators=(',', ':'))}\n\n".encode()
 
 
 class ProviderAdapter(ABC):
@@ -119,13 +151,23 @@ class ProviderAdapter(ABC):
         upstream_model: str,
         context: ProxyRequestContext | None = None,
     ) -> AsyncIterator[bytes]:
-        """Default Responses API call. Yields Anthropic-shaped SSE bytes."""
+        """Default Responses API call. Yields Anthropic-shaped SSE bytes.
+
+        TASK-714: wraps the initial request + stream iteration in a bounded
+        retry loop. State machine + budget in :mod:`proxy.retry`; loop-level
+        responsibilities documented in the module docstring.
+        """
         # Local imports keep the module import-graph trivial (the proxy
         # subpackage imports adapters, which imports openai, which is heavy).
         from .. import stream as stream_mod
         from .. import translate
 
         call_started = time.perf_counter()
+        # authorize() runs once outside the loop — subsequent attempts reuse the
+        # bearer unless bucket F (auth-broker) fires, in which case we invalidate
+        # the adapter's cached token and re-authorize. Response body is also
+        # built ONCE so prompt_cache_key / session_id / account-id stay stable
+        # across retries (load-bearing for cache routing).
         bearer, base_url = await self.authorize()
         await self.start()
         assert self._responses_client is not None
@@ -134,9 +176,6 @@ class ProviderAdapter(ABC):
         )
         responses_body = self.prepare_request(responses_body, context)
         headers = self.extra_headers(responses_body, context) or None
-        # ``with_options`` creates a cheap request wrapper around the SAME
-        # lifecycle-owned httpx pool. Credentials and default headers are
-        # immutable on that wrapper, so concurrent requests cannot cross-talk.
         client = self._responses_client.with_options(
             api_key=bearer,
             base_url=base_url,
@@ -146,10 +185,7 @@ class ProviderAdapter(ABC):
             context.local_setup_ms = (
                 time.perf_counter() - call_started
             ) * 1000
-        # Prompt-cache divergence diagnostic (no-op unless PROXY_CACHE_DIAG is
-        # set). Runs on the exact post-prepare body.
         from .. import cache_diag
-
         cache_diag.record(responses_body)
         logger.debug(
             "Proxy → Responses API model=%s tools=%d input_items=%d",
@@ -157,24 +193,180 @@ class ProviderAdapter(ABC):
             len(responses_body.get("tools", []) or []),
             len(responses_body.get("input", []) or []),
         )
-        upstream_started = time.perf_counter()
-        # ``stream=True`` returns after response headers arrive. This is the
-        # upstream TTFB boundary; it intentionally excludes local setup/auth.
-        upstream_stream = await client.responses.create(**responses_body)
-        if context is not None:
-            context.upstream_ttfb_ms = (
-                time.perf_counter() - upstream_started
-            ) * 1000
-        # Best-effort: stash codex plan-usage from the response headers for
-        # /v1/usage. Synchronous header peek + fire-and-forget Redis write;
-        # never blocks or breaks inference.
-        from .. import usage_capture
 
-        usage_capture.schedule_capture(upstream_stream)
-        async for chunk in stream_mod.responses_to_anthropic_sse(
-            upstream_stream,
-            anthropic_model=anthropic_body.get("model", upstream_model),
-            tool_schemas=anthropic_body.get("tools"),
-            on_usage=context.record_usage if context is not None else None,
-        ):
-            yield chunk
+        state = TranslatorState()
+        policy = retry_mod.RetryPolicy()
+        # Per Al #4: the on_usage callback wired into context.record_usage
+        # fires INSIDE the translator whenever the upstream emits usage. On
+        # retry we want the FINAL SUCCESSFUL attempt's usage to win. The
+        # translator populates ``state.usage_snapshot`` on every attempt; we
+        # gate the callback to fire only for the terminal successful attempt
+        # by using a local wrapper that we swap out on retry.
+        record_usage_fn = context.record_usage if context is not None else None
+        anthropic_model_for_translator = anthropic_body.get("model", upstream_model)
+        tool_schemas = anthropic_body.get("tools")
+
+        while True:
+            attempt = policy.start_attempt()
+            # Only treat this as a resumed attempt if the PRIOR attempt actually
+            # emitted the ``message_start`` envelope downstream. A retry after a
+            # CONNECTING failure (initial request never returned; translator
+            # never ran) is functionally a fresh start — the translator must
+            # emit ``message_start`` normally on attempt 2, not skip it.
+            resumed_from_index = (
+                state.next_block_index
+                if attempt > 1 and state.message_start_yielded
+                else None
+            )
+            upstream_stream = None
+            initial_exc: BaseException | None = None
+            try:
+                # ── initial request boundary ────────────────────────────────
+                upstream_started = time.perf_counter()
+                upstream_stream = await client.responses.create(**responses_body)
+                if context is not None and attempt == 1:
+                    # Only the FIRST attempt's TTFB is meaningful; later attempts
+                    # measure retry latency, not upstream health.
+                    context.upstream_ttfb_ms = (
+                        time.perf_counter() - upstream_started
+                    ) * 1000
+                # Usage capture on final attempt only — retries would double-
+                # count headers. Fire only when we know this attempt is the last
+                # one; instead of predicting, we schedule on every attempt and
+                # rely on state.usage_snapshot for the authoritative final value.
+                # (The header-capture path writes to Redis and is idempotent.)
+                from .. import usage_capture as _usage_capture
+                _usage_capture.schedule_capture(upstream_stream)
+            except (asyncio.CancelledError, GeneratorExit):
+                # Client is gone (aclose from FastAPI's StreamingResponse, or a
+                # task cancellation). Do not retry, do not emit an error frame
+                # — the receiver isn't there to see it. Both propagate as
+                # BaseException subclasses; re-raise BEFORE the generic catch.
+                raise
+            except BaseException as exc:  # noqa: BLE001
+                initial_exc = exc
+
+            if initial_exc is not None:
+                bucket = retry_mod.classify_initial_exception(initial_exc)
+                retry_after = retry_mod.extract_retry_after_seconds(initial_exc)
+                phase = retry_mod.phase_from_state(state)
+                decision = retry_mod.decide(
+                    bucket=bucket, phase=phase, policy=policy,
+                    retry_after_s=retry_after,
+                    permanent_error_type=retry_mod.permanent_error_type_for_exception(
+                        initial_exc
+                    ),
+                )
+                logger.warning(
+                    "proxy_retry attempt=%d/%d bucket=%s phase=%s decision=%s "
+                    "reason=%r backoff_ms=%.0f exc=%s",
+                    attempt, policy.max_attempts, bucket.value, phase.value,
+                    "retry" if decision.retry else "final",
+                    decision.reason, decision.backoff_s * 1000,
+                    type(initial_exc).__name__,
+                )
+                if decision.retry:
+                    # Bucket F (auth-broker) → invalidate cached token so the
+                    # next authorize() re-fetches. Adapter-agnostic: guard with
+                    # getattr for adapters that don't have the attribute.
+                    if bucket is retry_mod.FailureBucket.F_AUTH_BROKER:
+                        if hasattr(self, "_cached_expires_at"):
+                            self._cached_expires_at = 0  # type: ignore[attr-defined]
+                        bearer, base_url = await self.authorize()
+                        client = self._responses_client.with_options(
+                            api_key=bearer, base_url=base_url,
+                            set_default_headers=headers,
+                        )
+                    await asyncio.sleep(decision.backoff_s)
+                    continue
+                # Terminal — surface the final error type. On CONNECTING
+                # failure state.message_start_yielded is still False, so the
+                # client sees ONLY an error frame (no orphan message_start).
+                yield _final_error_frame(
+                    decision.final_error_type or "api_error",
+                    f"Proxy exhausted retries: {initial_exc}",
+                )
+                return
+
+            # ── stream iteration boundary ───────────────────────────────────
+            stream_exc: BaseException | None = None
+            try:
+                async for chunk in stream_mod.responses_to_anthropic_sse(
+                    upstream_stream,
+                    anthropic_model=anthropic_model_for_translator,
+                    tool_schemas=tool_schemas,
+                    on_usage=record_usage_fn,
+                    state=state,
+                    resumed_from_index=resumed_from_index,
+                ):
+                    yield chunk
+            except (asyncio.CancelledError, GeneratorExit):
+                raise
+            except BaseException as exc:  # noqa: BLE001
+                stream_exc = exc
+
+            # Clean return path — either translator finished successfully OR
+            # populated state.inband_error (Al #2). Same decision path.
+            if stream_exc is None and state.inband_error is None:
+                return  # success
+
+            if stream_exc is None:
+                # In-band terminal — classify by payload code.
+                bucket = retry_mod.classify_inband_error(state.inband_error or {})
+                exc_repr = f"in-band {state.inband_error.get('code')}: {state.inband_error.get('message', '')[:120]}"
+                exc_hint = None
+                permanent_type = retry_mod.permanent_error_type_for_inband(
+                    state.inband_error or {}
+                )
+            else:
+                bucket = retry_mod.classify_stream_exception(stream_exc)
+                exc_repr = f"{type(stream_exc).__name__}: {str(stream_exc)[:120]}"
+                exc_hint = stream_exc
+                permanent_type = retry_mod.permanent_error_type_for_exception(
+                    stream_exc
+                )
+
+            retry_after = retry_mod.extract_retry_after_seconds(exc_hint)
+            phase = retry_mod.phase_from_state(state)
+            decision = retry_mod.decide(
+                bucket=bucket, phase=phase, policy=policy,
+                retry_after_s=retry_after,
+                permanent_error_type=permanent_type,
+            )
+            logger.warning(
+                "proxy_retry attempt=%d/%d bucket=%s phase=%s decision=%s "
+                "reason=%r backoff_ms=%.0f detail=%r",
+                attempt, policy.max_attempts, bucket.value, phase.value,
+                "retry" if decision.retry else "final",
+                decision.reason, decision.backoff_s * 1000, exc_repr,
+            )
+
+            if decision.retry:
+                # Al #1 block-index hygiene: close any block that was open at
+                # failure time. The translator has already set state.open_block
+                # to None if it emitted the close naturally; if we exited via
+                # exception mid-block, state.open_block is still the last-opened
+                # block and needs one content_block_stop before the resumed
+                # translator emits new blocks starting at state.next_block_index.
+                if state.open_block is not None:
+                    yield _stop_block_frame(state.open_block["index"])
+                    state.open_block = None
+                # Clear the in-band error so the next attempt starts clean.
+                state.inband_error = None
+                await asyncio.sleep(decision.backoff_s)
+                continue
+
+            # Terminal — emit the state-appropriate final error type. On
+            # TEXT/TOOL_COMMITTED phases, the decision returns api_error (not
+            # overloaded_error) so the CLI does NOT retry from scratch — this
+            # is the invariant against duplicate visible text / duplicate tool
+            # execution. On PRE_OUTPUT/THINKING, overloaded_error lets the CLI
+            # take one more swing.
+            if state.open_block is not None:
+                yield _stop_block_frame(state.open_block["index"])
+                state.open_block = None
+            yield _final_error_frame(
+                decision.final_error_type or "api_error",
+                f"Proxy stream failed: {exc_repr}",
+            )
+            return
