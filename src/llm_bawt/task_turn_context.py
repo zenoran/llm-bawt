@@ -20,8 +20,33 @@ from .service.providers.crypto import _get_fernet
 
 TASK_TURN_CONTEXT_HEADER = "X-LLM-Bawt-Task-Turn-Context"
 TASK_TURN_CONTEXT_TTL_SECONDS = 6 * 60 * 60
+# Two canonical shapes are minted server-side and both must round-trip through
+# the capability: ordinary chat turns (``turn-<32 hex>``) and synthetic
+# inter-bot delivery turns (``turn-delivery-<32 hex>``, produced by
+# ``inter_bot_delivery.stable_ids`` for durable dispatch/callbacks). Rejecting
+# the delivery shape silently killed ``tasks_update(associate_current_turn=true)``
+# on every delivery-dispatched claude-code turn (TASK-783) because the mint
+# raised, the exception was swallowed to a warning, no capability header was
+# sent, and the MCP tool then failed closed with "No trusted current-turn
+# context is available for this MCP request". The delivery shape is stored in
+# the signed capability but NEVER written as an ``AgentTaskTurn.turnId`` on the
+# BawtHub side — attribution for delivery turns rides on ``triggerMessageId``
+# alone per the TASK-706 design (see ``task_association.associate_current_task``
+# for the PUT-body filter and ``scripts/commit-recon`` for the resolve-batch
+# filter).
 _TURN_ID_RE = re.compile(r"^turn-[0-9a-f]{32}$")
+_DELIVERY_TURN_ID_RE = re.compile(r"^turn-delivery-[0-9a-f]{32}$")
 _ACTOR_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9@._:-]{0,63}$")
+
+
+def is_delivery_turn_id(turn_id: str | None) -> bool:
+    """True if ``turn_id`` is a synthetic inter-bot-delivery id.
+
+    Delivery ids are canonical enough to pass the capability validator, but
+    they are NOT chat turn ids and must not be persisted as ``AgentTaskTurn.turnId``
+    on the BawtHub side (see the module docstring on the two shapes).
+    """
+    return bool(_DELIVERY_TURN_ID_RE.fullmatch(str(turn_id or "")))
 
 
 class TaskTurnContextError(ValueError):
@@ -58,8 +83,12 @@ def _actor_id(value: str, field: str) -> str:
 
 def _validate_context(context: TaskTurnContext) -> TaskTurnContext:
     turn_id = str(context.turn_id or "").strip()
-    if not _TURN_ID_RE.fullmatch(turn_id):
-        raise TaskTurnContextError("turn_id must match turn- plus 32 lowercase hex characters")
+    if not (_TURN_ID_RE.fullmatch(turn_id) or _DELIVERY_TURN_ID_RE.fullmatch(turn_id)):
+        raise TaskTurnContextError(
+            "turn_id must match turn- plus 32 lowercase hex characters "
+            "(or turn-delivery- plus 32 lowercase hex characters "
+            "for synthetic inter-bot delivery turns)"
+        )
     return TaskTurnContext(
         session_id=_canonical_uuid(context.session_id, "session_id"),
         turn_id=turn_id,

@@ -13,6 +13,7 @@ from ..task_turn_context import (
     TASK_TURN_CONTEXT_HEADER,
     TaskTurnContext,
     TaskTurnContextError,
+    is_delivery_turn_id,
     open_task_turn_context,
 )
 
@@ -85,6 +86,14 @@ async def associate_current_task(task_ref: str) -> dict[str, Any]:
             "Task association is unavailable because the internal service credential is not configured"
         )
 
+    # Synthetic inter-bot-delivery turn ids (``turn-delivery-<hex>``) are
+    # signed into the capability for audit but are NOT valid ``AgentTaskTurn.turnId``
+    # values on the BawtHub side. Per the TASK-706 design, delivery-turn
+    # attribution rides on ``triggerMessageId`` alone; the resolve batch and
+    # PUT bodies both filter delivery ids so BawtHub's strict validator can
+    # stay strict (``turn-<32 hex>`` only). Null the turnId here instead of
+    # letting the PUT 400 the whole association.
+    turn_id_for_put = None if is_delivery_turn_id(context.turn_id) else context.turn_id
     body = {
         "sessionId": context.session_id,
         "botId": context.bot_id,
@@ -92,7 +101,7 @@ async def associate_current_task(task_ref: str) -> dict[str, Any]:
         "source": "AGENT",
         "turn": {
             "triggerMessageId": context.trigger_message_id,
-            "turnId": context.turn_id,
+            "turnId": turn_id_for_put,
             "source": "AGENT",
         },
     }
