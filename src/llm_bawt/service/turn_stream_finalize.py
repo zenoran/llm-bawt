@@ -237,6 +237,13 @@ class TurnStreamFinalizer:
         self._publish_event_direct({
             "_type": "turn_complete",
             "turn_id": ctx.turn_log_id,
+            # TASK-784: symmetric with turn_start / background_service.py nonstream
+            # emits — carry the assistant_message_id on the streaming success path
+            # too, so commitServerOriginatedTurn on the client can adopt the reply
+            # even if it never saw turn_start (mid-turn page join, HMR reconnect
+            # after the run began). Additive optional field; consumers that ignore
+            # it keep working.
+            "assistant_message_id": ctx.assistant_message_id,
             "bot_id": ctx.bot_id,
             "user_id": ctx.user_id,
             # TASK-709: match turn_start's session id (see block above).
