@@ -301,7 +301,7 @@ endif  # not Windows
 # DEV TOOLS
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-.PHONY: lint format typecheck test test-cov
+.PHONY: lint format typecheck test test-cov test-integration test-all
 
 lint: ## Lint with ruff
 	uv run ruff check src/
@@ -312,11 +312,17 @@ format: ## Format with ruff
 typecheck: ## Type-check with mypy
 	uv run mypy src/
 
-test: ## Run tests
+test: ## Run hermetic tests only (fast, no DB/Redis/live service needed)
 	uv run pytest
 
-test-cov: ## Run tests with coverage
+test-cov: ## Run hermetic tests with coverage
 	uv run pytest --cov=src --cov-report=term-missing
+
+test-integration: ## Run tests marked `integration` (need live Postgres/Redis) — pair with plain `test`
+	uv run pytest -m integration
+
+test-all: ## Run EVERY test (hermetic + integration + service + llm_call). Use before merging inter-bot / dispatcher / capability / bridge changes — a bare `pytest` silently skips those (TASK-780).
+	uv run pytest -m ""
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # CLEAN

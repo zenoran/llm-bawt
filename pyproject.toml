@@ -137,8 +137,20 @@ where = ["src"]
 # Collection is scoped to tests/ and live-system tests are excluded by default.
 # A bare `pytest` / `pytest tests/` runs ONLY hermetic unit tests — nothing that
 # touches the live service or real bots. Opt in explicitly to run the gated ones:
+#
+#   make test              # hermetic only (this default)
+#   make test-integration  # -m integration     (needs live Postgres/Redis)
+#   make test-all          # -m ""              (everything — inter-bot + service + llm_call)
 #   uv run pytest -m service        # CLI/integration tests vs a running :8642
 #   uv run pytest -m llm_call       # tests that spend real LLM credits
+#
+# The default filter silently drops whole files (test_inter_bot_delivery.py is
+# module-scoped `pytestmark = pytest.mark.integration` — ~25 tests) which used
+# to be a false-green trap for anyone verifying inter-bot changes with plain
+# `pytest`. `tests/conftest.py` now prints a session-end WARNING that names
+# every file fully deselected by the default filter (see TASK-780). If you touch
+# inter-bot / dispatcher / delivery / capability code, run `make test-all`.
+#
 # Intentional live smoke tools live OUTSIDE tests/ (e.g. scripts/smoke/) so they
 # are never auto-collected — run them by explicit path only.
 testpaths = ["tests"]
