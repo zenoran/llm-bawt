@@ -109,9 +109,42 @@ The main compose stack mounts:
 
 That is the layout the bridge code expects in production.
 
+## Trusted task-turn capability header (TASK-701)
+
+For claude-code bridge turns, the app mints a short-lived Fernet capability
+containing the resolved `session_id`, `turn_id`, `trigger_message_id`,
+`bot_id`, `user_id`, and `issued_at` (6 h TTL). The bridge forwards it as an
+MCP HTTP header on the `bawthub` MCP tool calls only:
+
+    X-LLM-Bawt-Task-Turn-Context: <opaque-fernet-token>
+
+Propagation trail (all in this repo — the bridge is a dumb executor here too):
+
+1. `src/llm_bawt/service/chat_streaming.py:347-373` — mint site. Only fires
+   when `is_agent_backend AND backend_name == "claude-code" AND
+   thread_binding.session_id` is present. Mint failure logs a warning; the
+   chat turn is never blocked over association plumbing.
+2. `src/llm_bawt/agent_bridge/subscriber.py` — capability rides as one of the
+   Redis command fields (`task_turn_capability`).
+3. `src/claude_code_bridge/send_request.py` → `send_handler.py` →
+   `send_stream.py` — pops the field, sets the MCP HTTP header on the
+   outbound MCP client env for this run.
+4. `src/llm_bawt/mcp_server/task_association.py` —
+   `TaskTurnCapabilityMiddleware` binds the ASGI header to a `ContextVar`;
+   `open_task_turn_context()` verifies the Fernet token in the app process.
+
+Native Codex and OpenClaw bridges do not mint or forward the capability; MCP
+task tools that require it (`tasks_associate_current`, the
+`associate_current_turn=true` flag on `tasks_update` / `tasks_create`) fail
+closed on those bridges. See
+[`agent-skills/agent-system/task-conversation-architecture.md`](../../agent-skills/agent-system/task-conversation-architecture.md)
+for the cross-system diagrams and the internal-listener write contract.
+
 ## Related files
 
 - [src/llm_bawt/agent_backends/claude_code.py](../src/llm_bawt/agent_backends/claude_code.py)
 - [src/claude_code_bridge/proxy/app.py](../src/claude_code_bridge/proxy/app.py)
+- [src/llm_bawt/mcp_server/task_association.py](../src/llm_bawt/mcp_server/task_association.py)
+- [src/llm_bawt/task_turn_context.py](../src/llm_bawt/task_turn_context.py)
 - [docs/approval-policies.md](../docs/approval-policies.md)
 - [docs/usage-endpoint.md](../docs/usage-endpoint.md)

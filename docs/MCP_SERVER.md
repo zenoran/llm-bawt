@@ -77,7 +77,44 @@ internally.
 | `LLM_BAWT_TASK_API_URL` | `http://echo.lan.zenoran.com` | Task API base URL for task-related tools |
 | `LLM_BAWT_APP_BASE_URL` | `http://localhost:8642` | Used by some self tools |
 
+## Task association middleware (TASK-701)
+
+`src/llm_bawt/mcp_server/task_association.py` provides the trusted
+current-turn context path for the BawtHub task tools:
+
+- **`TaskTurnCapabilityMiddleware`** — an ASGI middleware that reads the
+  MCP HTTP header `X-LLM-Bawt-Task-Turn-Context` from the request scope
+  and binds it to a `ContextVar` for the lifetime of one request. No
+  process-local state assumptions across Redis/SDK/MCP hops.
+- **`open_task_turn_context()`** — Fernet-verifies the capability token
+  (6 h TTL), returns a `TaskTurnContext` dataclass with the app-known
+  `session_id`, `turn_id`, `trigger_message_id`, `bot_id`, `user_id`,
+  `issued_at`. Raises `TaskTurnContextError` on absent/expired/invalid
+  tokens — MCP tools fail closed with a clear error message.
+- **`associate_current_task(task_ref)`** — reads the capability from the
+  ContextVar, PUTs `source: AGENT` to BawtHub's internal listener at
+  `${BAWTHUB_TASK_ASSOCIATION_INTERNAL_URL}/internal/tasks/{task_ref}/associations`
+  with `Authorization: Bearer ${TASK_ASSOCIATION_INTERNAL_TOKEN}`. Raw
+  identifiers are never accepted as MCP tool arguments.
+
+Task tools that use this path (`src/llm_bawt/mcp_server/task_tools.py`):
+
+| Tool | Trusted-context behavior |
+|---|---|
+| `tasks_associate_current(task_id)` | Requires capability; fails closed. |
+| `tasks_update(..., associate_current_turn=true)` | Applies update; attempts association after. Association-only branch when no update fields set. |
+| `tasks_create(..., associate_current_turn=true)` | Creates task; attempts association on returned `shortId`. |
+
+Text detection (`TASK-N` in prompts) is never authority — quoted, negative,
+and incidental references must not persist a link.
+
+See
+[`agent-skills/agent-system/task-conversation-architecture.md`](../../agent-skills/agent-system/task-conversation-architecture.md)
+for the cross-system diagrams, all 16 verified invariants, and the
+internal-listener contract on the BawtHub side.
+
 ## Related docs
 
 - [docs/INTER_BOT_COMMUNICATION.md](../docs/INTER_BOT_COMMUNICATION.md)
 - [docs/BACKGROUND_SCHEDULER.md](../docs/BACKGROUND_SCHEDULER.md)
+- [docs/CLAUDE_CODE_BRIDGE.md](../docs/CLAUDE_CODE_BRIDGE.md)
