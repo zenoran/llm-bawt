@@ -53,7 +53,7 @@ class FakeExecutor(Executor):
         self.next_reconcile: ReconcileResult | None = None
 
     def kind(self) -> str:
-        return "nohup_ssh"
+        return "docker"
 
     def available(self) -> bool:
         return self._available

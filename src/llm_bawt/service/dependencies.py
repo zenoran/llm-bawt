@@ -175,7 +175,7 @@ def get_ops_store(config: Any):
 def get_ops_service(config: Any):
     """Process-wide ``OpsService`` singleton (TASK-639).
 
-    Wraps the shared OpsStore + the default NohupSshExecutor. Callers that
+    Wraps the shared OpsStore + the default DockerExecutor. Callers that
     need to swap the executor (tests) should construct their own OpsService
     directly rather than going through this cache.
     """

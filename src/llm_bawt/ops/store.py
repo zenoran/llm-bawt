@@ -31,7 +31,7 @@ from sqlmodel import Session, SQLModel, select
 from ..utils.config import Config, has_database_credentials
 from ..utils.schema import SchemaBootstrapGuard
 from .models import (
-    EXECUTOR_NOHUP_SSH,
+    EXECUTOR_DOCKER,
     JOB_CANCELLED,
     JOB_DISPATCHING,
     JOB_FAILED,
@@ -214,7 +214,7 @@ class OpsStore:
             title=str(clean.get("title", "") or ""),
             description=str(clean.get("description", "") or ""),
             enabled=bool(clean.get("enabled", False)),
-            executor_kind=str(clean.get("executor_kind", EXECUTOR_NOHUP_SSH)),
+            executor_kind=str(clean.get("executor_kind", EXECUTOR_DOCKER)),
             target_host=str(clean.get("target_host", "") or ""),
             run_as_user=clean.get("run_as_user"),
             working_directory=clean.get("working_directory"),

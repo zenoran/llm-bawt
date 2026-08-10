@@ -14,6 +14,15 @@ scripts should require a human enable.
 
 Argument schemas use ``additionalProperties: false`` so unknown args are
 rejected before any script runs.
+
+Every op targets the local Docker daemon via the mounted socket. The
+``command_script`` column holds a JSON spec that
+:class:`~llm_bawt.ops.executor.DockerExecutor` parses:
+
+    {"action": "restart", "container_name": "..."}
+    {"action": "restart", "compose_project": "...", "compose_service": "..."}
+    {"action": "restart", "compose_project": "...",
+     "compose_service_from_arg": "<arg-key>"}
 """
 
 from __future__ import annotations
@@ -22,7 +31,7 @@ import json
 from typing import Any
 
 from .models import (
-    EXECUTOR_NOHUP_SSH,
+    EXECUTOR_DOCKER,
     RISK_CRITICAL,
     RISK_HIGH,
     RISK_LOW,
@@ -34,9 +43,9 @@ from .models import (
 # Helpers
 # ---------------------------------------------------------------------------
 
-_ECHO_HOST = "nick@172.18.0.1"
-_LLM_BAWT_DIR = "/home/nick/dev/llm-bawt"
-_BAWTHUB_DIR = "/home/nick/dev/bawthub"
+# Compose project as seen in the docker labels (com.docker.compose.project).
+_LLM_BAWT_PROJECT = "llm-bawt"
+_BAWTHUB_PROJECT = "bawthub"
 
 
 def _schema(props: dict[str, Any] | None = None, required: list[str] | None = None) -> str:
@@ -58,6 +67,10 @@ def _defaults(d: dict[str, Any] | None = None) -> str:
     return json.dumps(d or {}, ensure_ascii=False)
 
 
+def _spec(**fields: Any) -> str:
+    return json.dumps(fields, ensure_ascii=False)
+
+
 # ---------------------------------------------------------------------------
 # llm-bawt service restarts
 # ---------------------------------------------------------------------------
@@ -68,18 +81,17 @@ _LLM_BAWT_SEEDS: list[dict[str, Any]] = [
         "title": "Restart llm-bawt app",
         "description": (
             "Reload Python source in the `app` container. Safe for `.py` edits — "
-            "does not rebuild image. Cuts SSE mid-turn, so use ``start_delay_seconds`` "
-            "when calling from an active chat."
+            "does not rebuild image. Executor forces a start_delay so the "
+            "response has time to drain before Docker kills us."
         ),
         "enabled": False,
-        "executor_kind": EXECUTOR_NOHUP_SSH,
-        "target_host": _ECHO_HOST,
-        "working_directory": _LLM_BAWT_DIR,
-        "command_script": (
-            "#!/usr/bin/env bash\n"
-            "set -euo pipefail\n"
-            "cd \"$OPS_WORKING_DIR\"\n"
-            "docker compose restart app\n"
+        "executor_kind": EXECUTOR_DOCKER,
+        "target_host": "",
+        "working_directory": None,
+        "command_script": _spec(
+            action="restart",
+            compose_project=_LLM_BAWT_PROJECT,
+            compose_service="app",
         ),
         "args_schema_json": _no_args_schema(),
         "args_defaults_json": _defaults(),
@@ -98,18 +110,13 @@ _LLM_BAWT_SEEDS: list[dict[str, Any]] = [
             "explicit dedicated ops."
         ),
         "enabled": False,
-        "executor_kind": EXECUTOR_NOHUP_SSH,
-        "target_host": _ECHO_HOST,
-        "working_directory": _LLM_BAWT_DIR,
-        "command_script": (
-            "#!/usr/bin/env bash\n"
-            "set -euo pipefail\n"
-            "cd \"$OPS_WORKING_DIR\"\n"
-            "case \"$OPS_ARG_SERVICE\" in\n"
-            "  crawl4ai|playwright-mcp|local-model-bridge) ;;\n"
-            "  *) echo \"forbidden service: $OPS_ARG_SERVICE\" >&2; exit 2 ;;\n"
-            "esac\n"
-            "docker compose restart \"$OPS_ARG_SERVICE\"\n"
+        "executor_kind": EXECUTOR_DOCKER,
+        "target_host": "",
+        "working_directory": None,
+        "command_script": _spec(
+            action="restart",
+            compose_project=_LLM_BAWT_PROJECT,
+            compose_service_from_arg="service",
         ),
         "args_schema_json": _schema(
             {
@@ -122,7 +129,7 @@ _LLM_BAWT_SEEDS: list[dict[str, Any]] = [
         ),
         "args_defaults_json": _defaults(),
         "timeout_seconds": 180,
-        "start_delay_seconds": 5,
+        "start_delay_seconds": 0,
         "risk_level": RISK_LOW,
         "category": "restart",
         "approval_prompt_prefix": "Restart llm-bawt aux service",
@@ -136,18 +143,13 @@ _LLM_BAWT_SEEDS: list[dict[str, Any]] = [
             "explicit operator approval each time."
         ),
         "enabled": False,
-        "executor_kind": EXECUTOR_NOHUP_SSH,
-        "target_host": _ECHO_HOST,
-        "working_directory": _LLM_BAWT_DIR,
-        "command_script": (
-            "#!/usr/bin/env bash\n"
-            "set -euo pipefail\n"
-            "cd \"$OPS_WORKING_DIR\"\n"
-            "case \"$OPS_ARG_BRIDGE\" in\n"
-            "  claude-code-bridge|openclaw-bridge|codex-bridge) ;;\n"
-            "  *) echo \"forbidden bridge: $OPS_ARG_BRIDGE\" >&2; exit 2 ;;\n"
-            "esac\n"
-            "docker compose restart \"$OPS_ARG_BRIDGE\"\n"
+        "executor_kind": EXECUTOR_DOCKER,
+        "target_host": "",
+        "working_directory": None,
+        "command_script": _spec(
+            action="restart",
+            compose_project=_LLM_BAWT_PROJECT,
+            compose_service_from_arg="bridge",
         ),
         "args_schema_json": _schema(
             {
@@ -174,14 +176,13 @@ _LLM_BAWT_SEEDS: list[dict[str, Any]] = [
             "explicit operator approval each time."
         ),
         "enabled": False,
-        "executor_kind": EXECUTOR_NOHUP_SSH,
-        "target_host": _ECHO_HOST,
-        "working_directory": _LLM_BAWT_DIR,
-        "command_script": (
-            "#!/usr/bin/env bash\n"
-            "set -euo pipefail\n"
-            "cd \"$OPS_WORKING_DIR\"\n"
-            "docker compose restart redis\n"
+        "executor_kind": EXECUTOR_DOCKER,
+        "target_host": "",
+        "working_directory": None,
+        "command_script": _spec(
+            action="restart",
+            compose_project=_LLM_BAWT_PROJECT,
+            compose_service="redis",
         ),
         "args_schema_json": _no_args_schema(),
         "args_defaults_json": _defaults(),
@@ -195,7 +196,8 @@ _LLM_BAWT_SEEDS: list[dict[str, Any]] = [
 
 
 # ---------------------------------------------------------------------------
-# BawtHub restarts + prod rebuild
+# BawtHub restarts (rebuild-prod dropped — that's a `make` shell command, not
+# a docker action; add back with a future SSH executor if needed).
 # ---------------------------------------------------------------------------
 
 _BAWTHUB_SEEDS: list[dict[str, Any]] = [
@@ -204,19 +206,18 @@ _BAWTHUB_SEEDS: list[dict[str, Any]] = [
         "title": "Restart bawthub backend",
         "description": "Restart the bawthub Python voice/agent backend container.",
         "enabled": False,
-        "executor_kind": EXECUTOR_NOHUP_SSH,
-        "target_host": _ECHO_HOST,
-        "working_directory": _BAWTHUB_DIR,
-        "command_script": (
-            "#!/usr/bin/env bash\n"
-            "set -euo pipefail\n"
-            "cd \"$OPS_WORKING_DIR\"\n"
-            "docker compose restart backend\n"
+        "executor_kind": EXECUTOR_DOCKER,
+        "target_host": "",
+        "working_directory": None,
+        "command_script": _spec(
+            action="restart",
+            compose_project=_BAWTHUB_PROJECT,
+            compose_service="backend",
         ),
         "args_schema_json": _no_args_schema(),
         "args_defaults_json": _defaults(),
         "timeout_seconds": 120,
-        "start_delay_seconds": 5,
+        "start_delay_seconds": 0,
         "risk_level": RISK_MEDIUM,
         "category": "restart",
         "approval_prompt_prefix": "Restart bawthub backend",
@@ -226,14 +227,13 @@ _BAWTHUB_SEEDS: list[dict[str, Any]] = [
         "title": "Restart bawthub frontend (HMR)",
         "description": "Restart the bawthub Vite/Hono HMR container.",
         "enabled": False,
-        "executor_kind": EXECUTOR_NOHUP_SSH,
-        "target_host": _ECHO_HOST,
-        "working_directory": _BAWTHUB_DIR,
-        "command_script": (
-            "#!/usr/bin/env bash\n"
-            "set -euo pipefail\n"
-            "cd \"$OPS_WORKING_DIR\"\n"
-            "docker compose restart frontend\n"
+        "executor_kind": EXECUTOR_DOCKER,
+        "target_host": "",
+        "working_directory": None,
+        "command_script": _spec(
+            action="restart",
+            compose_project=_BAWTHUB_PROJECT,
+            compose_service="frontend",
         ),
         "args_schema_json": _no_args_schema(),
         "args_defaults_json": _defaults(),
@@ -243,61 +243,28 @@ _BAWTHUB_SEEDS: list[dict[str, Any]] = [
         "category": "restart",
         "approval_prompt_prefix": "Restart bawthub frontend HMR",
     },
-    {
-        "slug": "bawthub.rebuild-prod",
-        "title": "Rebuild bawthub prod image",
-        "description": (
-            "Run `make rebuild-prod` in the bawthub repo — builds fresh prod "
-            "images, tags a release, and rolls the prod container. HIGH risk: "
-            "a broken build kills the public site."
-        ),
-        "enabled": False,
-        "executor_kind": EXECUTOR_NOHUP_SSH,
-        "target_host": _ECHO_HOST,
-        "working_directory": _BAWTHUB_DIR,
-        "command_script": (
-            "#!/usr/bin/env bash\n"
-            "set -euo pipefail\n"
-            "cd \"$OPS_WORKING_DIR\"\n"
-            "make rebuild-prod\n"
-        ),
-        "args_schema_json": _no_args_schema(),
-        "args_defaults_json": _defaults(),
-        "timeout_seconds": 900,
-        "start_delay_seconds": 0,
-        "risk_level": RISK_HIGH,
-        "category": "deploy",
-        "approval_prompt_prefix": "Rebuild + roll bawthub prod",
-    },
 ]
 
 
 # ---------------------------------------------------------------------------
-# Standalone container restarts (things not managed by a compose file the
-# app happens to own — the ones on Unraid via docker socket over SSH)
+# Standalone container restarts (not managed by a compose file the app owns).
 # ---------------------------------------------------------------------------
 
-_UNRAID_CONTAINER_SEEDS: list[dict[str, Any]] = [
+_STANDALONE_CONTAINER_SEEDS: list[dict[str, Any]] = [
     {
         "slug": "container.restart",
         "title": "Restart an allowlisted container",
         "description": (
             "Restart a specific container by name. Only the allowlist below is "
-            "runnable — every other name is rejected inside the script."
+            "runnable — every other name is rejected by the args schema."
         ),
         "enabled": False,
-        "executor_kind": EXECUTOR_NOHUP_SSH,
-        "target_host": _ECHO_HOST,
-        "working_directory": "/home/nick",
-        "command_script": (
-            "#!/usr/bin/env bash\n"
-            "set -euo pipefail\n"
-            "case \"$OPS_ARG_CONTAINER\" in\n"
-            "  bawthub-frontend-1|NginxProxyManager|bawthub-nocodb-1|"
-            "llm-bawt-local-model-bridge|bawthub-public-site) ;;\n"
-            "  *) echo \"forbidden container: $OPS_ARG_CONTAINER\" >&2; exit 2 ;;\n"
-            "esac\n"
-            "docker restart \"$OPS_ARG_CONTAINER\"\n"
+        "executor_kind": EXECUTOR_DOCKER,
+        "target_host": "",
+        "working_directory": None,
+        "command_script": _spec(
+            action="restart",
+            container_name_from_arg="container",
         ),
         "args_schema_json": _schema(
             {
@@ -331,7 +298,7 @@ _UNRAID_CONTAINER_SEEDS: list[dict[str, Any]] = [
 SEEDS: list[dict[str, Any]] = [
     *_LLM_BAWT_SEEDS,
     *_BAWTHUB_SEEDS,
-    *_UNRAID_CONTAINER_SEEDS,
+    *_STANDALONE_CONTAINER_SEEDS,
 ]
 
 

@@ -1,55 +1,50 @@
-"""Executor contract + NohupSshExecutor (TASK-639).
+"""Executor contract + DockerExecutor (TASK-639).
 
-An executor turns a validated :class:`OpsJob` into a detached host-side
-child process and later reconciles its exit state back into the DB. The
-executor never touches the DB directly — it hands intermediate state back
-to :class:`OpsService`, which owns the row transitions.
+An executor turns a validated :class:`OpsJob` into an actual side effect.
+For llm-bawt today that means "restart / stop / start / pull a container
+in this Docker daemon" — the daemon is reached through the mounted socket
+at ``/var/run/docker.sock``, no SSH and no host-side runner.
 
-The transport is just SSH + ``nohup``: no host-side runner script, no
-transient systemd unit, no ``systemd --user`` linger setup. Every job's
-working dir on the host is::
+Operations describe themselves via a JSON spec stored in
+:attr:`OpsOperation.command_script`. The DockerExecutor parses that spec
+and drives the Docker SDK. Example specs::
 
-    ~/.local/share/llm-bawt/ops-jobs/<job_id>/
-        pid          # writer's PID (echo $! right after backgrounding)
-        exit         # exit code of the wrapped command (present iff done)
-        output.log   # combined stdout+stderr, size-capped by tail on read
+    {"action": "restart", "container_name": "llm-bawt-app"}
 
-Dispatch = one SSH call that mkdirs the job dir, ``nohup``s a bash wrapper
-that (a) optionally sleeps ``start_delay_seconds``, (b) runs the operator's
-script under ``timeout``, (c) writes ``$?`` to ``exit`` — then prints the
-child PID so we can record it. The wrapper is fully self-contained; the
-container can exit or restart and the child keeps going.
+    {"action": "restart", "compose_project": "llm-bawt", "compose_service": "app"}
 
-Reconcile = one SSH call that either cats ``exit`` (job done) or ``kill -0``s
-the PID (still alive vs disappeared with no exit code). Terminal → a second
-SSH call tails ``output.log``.
+    # Service selected from a validated arg:
+    {"action": "restart", "compose_project": "llm-bawt",
+     "compose_service_from_arg": "service"}
 
-Deployment prerequisite: the ``app`` container needs ``openssh-client`` and a
-mounted SSH identity that authenticates to ``target_host``. Until that lands,
-:meth:`NohupSshExecutor.available` returns False and :meth:`OpsService.dispatch`
-fails cleanly instead of pretending the job started.
+Every dispatch is synchronous unless ``start_delay_seconds`` is non-zero
+OR the target container is us. Delayed dispatch spawns a background
+thread that fires after the delay, so the caller's response can drain
+before we (or any container we're restarting) get killed. The
+:class:`DispatchResult` returned in the delayed case carries
+``terminal_state="succeeded"`` immediately — we can't observe the
+outcome from the corpse of the app process, so the "success" refers to
+"the schedule was placed", not "the restart completed."
+
+Deployment prerequisite: ``/var/run/docker.sock`` must be bind-mounted
+into the container (see docker-compose.yml). Until that lands,
+:meth:`DockerExecutor.available` returns False and
+:meth:`OpsService.dispatch` fails cleanly with a clear reason instead of
+pretending the job started.
 """
 
 from __future__ import annotations
 
+import json
 import logging
-import shlex
-import shutil
-import subprocess
+import os
+import threading
+import time
 from abc import ABC, abstractmethod
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 logger = logging.getLogger(__name__)
-
-
-# Host-side working root for all ops jobs. Each job gets a subdir named by
-# its job_id. The reconciler reads exit/output.log from these paths.
-DEFAULT_HOST_JOBS_ROOT = "/home/nick/.local/share/llm-bawt/ops-jobs"
-
-# ``timeout`` exits 124 when it kills the child for exceeding its limit.
-# We map that back to :data:`OpsJob.state` = timed_out.
-TIMEOUT_EXIT_CODE = 124
 
 
 class ExecutorError(RuntimeError):
@@ -58,40 +53,51 @@ class ExecutorError(RuntimeError):
 
 @dataclass
 class DispatchResult:
-    """What the executor tells the store after a successful dispatch.
+    """What the executor tells the store after dispatching.
 
-    ``host_unit_name`` reuses the existing DB column for observability —
-    format is ``pid:<pid>`` so operators can spot orphans in ``ps`` and the
-    reconciler has a durable liveness handle without a second read.
+    Docker-side ops complete synchronously in most cases — dispatch
+    returns the final outcome directly via ``terminal_state`` /
+    ``exit_code`` / ``output``. The service marks the job terminal in
+    one shot instead of waiting on a reconciler.
+
+    ``host_unit_name`` is a short human-readable identifier for logs and
+    the BawtHub UI (e.g. ``"docker:restart:llm-bawt-app"``). It uses the
+    existing DB column of that name; the label there has no semantic role
+    beyond display.
+
+    When ``terminal_state`` is ``None`` the store still marks the job
+    ``DISPATCHING`` and relies on ``reconcile()`` — that path is unused
+    by :class:`DockerExecutor` today but preserved for future executors.
     """
 
     host_unit_name: str
-    status_file_path: str  # path to the ``exit`` file on the host
-    log_file_path: str
+    status_file_path: str = ""
+    log_file_path: str = ""
+    terminal_state: str | None = None  # "succeeded" | "failed" | "timed_out"
+    exit_code: int | None = None
+    output: str | None = None
 
 
 @dataclass
 class ReconcileResult:
     """What the executor tells the store after polling one job.
 
-    ``state`` uses the executor-facing vocabulary
-    (``running`` | ``succeeded`` | ``failed`` | ``timed_out``) which the
-    service maps to :data:`OpsJob.state`. ``None`` = no signal yet (the
-    child hasn't materialized any files), so keep the current DB state.
+    Docker jobs terminal-mark at dispatch time, so this only matters if
+    a future executor needs async polling. Kept for contract stability.
     """
 
-    state: str | None
-    exit_code: int | None
-    output_tail: str | None
-    error: str | None
-    started_at: str | None
-    finished_at: str | None
+    state: str | None  # None = no signal, keep current DB state
+    exit_code: int | None = None
+    output_tail: str | None = None
+    error: str | None = None
+    started_at: str | None = None
+    finished_at: str | None = None
 
 
 class Executor(ABC):
     """Abstract executor contract. All methods are synchronous — call from
-    a threadpool if you need concurrency; the operations are I/O-bound but
-    short-lived so a simple executor pool is fine.
+    a threadpool if you need concurrency; ops are I/O-bound but short-lived
+    so a simple executor pool is fine.
     """
 
     @abstractmethod
@@ -101,9 +107,8 @@ class Executor(ABC):
     def available(self) -> bool:
         """Return True if this executor can dispatch right now.
 
-        Called before every dispatch so the service can fail cleanly with a
-        clear message ("openssh-client not installed") instead of the SSH
-        binary going missing mid-dispatch.
+        Called before every dispatch so the service can fail cleanly with
+        a clear message instead of surprising the caller mid-dispatch.
         """
 
     @abstractmethod
@@ -135,61 +140,63 @@ class Executor(ABC):
 
 
 # ---------------------------------------------------------------------------
-# NohupSshExecutor
+# DockerExecutor
 # ---------------------------------------------------------------------------
 
-class SshTransport:
-    """Thin subprocess-based SSH transport. Isolated so tests can swap it."""
-
-    def __init__(self, *, ssh_bin: str = "ssh") -> None:
-        self.ssh_bin = ssh_bin
-
-    def available(self) -> bool:
-        return shutil.which(self.ssh_bin) is not None
-
-    def run(
-        self,
-        target: str,
-        command: str,
-        *,
-        timeout: int = 30,
-    ) -> tuple[int, str, str]:
-        """Run ``command`` remotely. Returns (exit_code, stdout, stderr)."""
-        args = [
-            self.ssh_bin,
-            "-o", "BatchMode=yes",
-            "-o", "StrictHostKeyChecking=accept-new",
-            "-o", "ConnectTimeout=10",
-            target,
-            command,
-        ]
-        proc = subprocess.run(
-            args, capture_output=True, text=True, timeout=timeout, check=False,
-        )
-        return proc.returncode, proc.stdout, proc.stderr
+# Supported actions. Extending this = one new elif branch in
+# :meth:`DockerExecutor._fire_action`, and mirrored allowlisting here so the
+# validation error surfaces before we start reaching for containers.
+SUPPORTED_ACTIONS = frozenset({"restart", "start", "stop", "pull"})
 
 
-class NohupSshExecutor(Executor):
-    """Dispatch jobs as detached ``nohup`` children on an SSH-reachable host.
+class DockerExecutor(Executor):
+    """Drive Docker via the mounted socket + Python SDK.
 
-    No host-side runner script, no systemd unit. The child owns its own
-    working dir; ``exit`` file presence is the source of truth for "done."
+    Injectable ``client_factory`` so tests can pass a fake without needing
+    the real docker package or a real socket.
     """
 
     def __init__(
         self,
         *,
-        transport: SshTransport | None = None,
-        host_jobs_root: str = DEFAULT_HOST_JOBS_ROOT,
+        client_factory=None,
+        self_container_names: tuple[str, ...] = ("llm-bawt-app", "app"),
     ) -> None:
-        self.transport = transport or SshTransport()
-        self.host_jobs_root = host_jobs_root
+        self._client_factory = client_factory
+        self._client = None
+        # Container names/service labels that identify "this process's
+        # container" — used to force delayed dispatch on self-restart so
+        # the response drains before Docker kills us.
+        self.self_container_names = tuple(self_container_names)
 
     def kind(self) -> str:
-        return "nohup_ssh"
+        return "docker"
+
+    # ---- lazy client ------------------------------------------------------
+
+    def _default_factory(self):
+        try:
+            import docker  # type: ignore[import-not-found]
+        except ImportError as exc:  # pragma: no cover - install-time guard
+            raise ExecutorError(
+                "docker executor unavailable: python `docker` package not installed"
+            ) from exc
+        return docker.from_env()
+
+    @property
+    def client(self):
+        if self._client is None:
+            factory = self._client_factory or self._default_factory
+            self._client = factory()
+        return self._client
 
     def available(self) -> bool:
-        return self.transport.available()
+        try:
+            self.client.ping()
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("docker executor unavailable: %s", exc)
+            return False
+        return True
 
     # ---- dispatch --------------------------------------------------------
 
@@ -207,75 +214,60 @@ class NohupSshExecutor(Executor):
         start_delay_seconds: int,
         max_output_bytes: int,
     ) -> DispatchResult:
-        if not self.transport.available():
+        if not self.available():
             raise ExecutorError(
-                "NohupSshExecutor unavailable: ssh not found in the container "
-                "(openssh-client required, TASK-639 Slice C)"
+                "docker executor unavailable: cannot reach /var/run/docker.sock "
+                "(is the socket bind-mounted into this container?)"
             )
-        if not target_host:
-            raise ExecutorError("operation missing target_host")
 
-        job_dir = f"{self.host_jobs_root.rstrip('/')}/{job_id}"
-        exit_path = f"{job_dir}/exit"
-        log_path = f"{job_dir}/output.log"
-        pid_path = f"{job_dir}/pid"
-
-        # Args → OPS_ARG_<NAME> env exports. Values are shlex-quoted so no
-        # agent-supplied value can break out of its var into shell syntax.
-        env_exports = ""
-        for k, v in (env_args or {}).items():
-            key = f"OPS_ARG_{str(k).upper()}"
-            val = "" if v is None else str(v)
-            env_exports += f"export {key}={shlex.quote(val)}; "
-
-        # Working directory prefix. Empty string when not configured so the
-        # child inherits the SSH login shell's cwd.
-        cd_prefix = ""
-        if working_directory:
-            cd_prefix = f"cd {shlex.quote(working_directory)} && "
-
-        # Optional pre-start sleep. Non-zero for self-affecting ops so the
-        # caller's response has time to stream before the restart lands.
-        delay_prefix = ""
-        if start_delay_seconds and start_delay_seconds > 0:
-            delay_prefix = f"sleep {int(start_delay_seconds)}; "
-
-        # The bash body that will run inside `nohup`. `timeout` bounds the
-        # runtime; its exit code (124 on kill) surfaces as the child exit.
-        # The exit file is written AFTER the command completes so its
-        # presence is the "done" signal for the reconciler.
-        inner = (
-            f"{delay_prefix}"
-            f"{env_exports}"
-            f"{cd_prefix}"
-            f"timeout {int(timeout_seconds or 300)}s bash -c {shlex.quote(command_script)}; "
-            f"echo $? > {shlex.quote(exit_path)}"
-        )
-
-        # Outer: create the job dir, background the inner with nohup, capture
-        # PID, then print it so we can record host_unit_name.
-        outer = (
-            f"install -d -m 700 {shlex.quote(job_dir)} && "
-            f"( nohup bash -c {shlex.quote(inner)} > {shlex.quote(log_path)} 2>&1 & "
-            f"echo $! > {shlex.quote(pid_path)} ) && "
-            f"cat {shlex.quote(pid_path)}"
-        )
-
-        rc, stdout, err = self.transport.run(target_host, outer, timeout=30)
-        if rc != 0:
+        spec = self._parse_spec(command_script)
+        action = str(spec.get("action") or "").strip().lower()
+        if action not in SUPPORTED_ACTIONS:
             raise ExecutorError(
-                f"ssh dispatch to {target_host} failed: {err.strip() or f'rc={rc}'}"
+                f"unsupported docker action {action!r} "
+                f"(supported: {sorted(SUPPORTED_ACTIONS)})"
             )
-        pid = (stdout or "").strip().splitlines()[-1].strip() if stdout else ""
-        if not pid or not pid.isdigit():
-            raise ExecutorError(
-                f"ssh dispatch to {target_host} returned no PID (stdout={stdout!r})"
+
+        selector = self._resolve_selector(spec, env_args)
+        target_label = self._selector_label(selector)
+
+        # Force delayed dispatch when we'd be killing ourselves — the caller
+        # response has to drain before Docker cuts us off.
+        is_self = self._is_self_target(selector)
+        delay = int(start_delay_seconds or 0)
+        if is_self and delay <= 0:
+            delay = 5  # sensible default — enough for SSE to flush
+
+        unit_name = f"docker:{action}:{target_label}"
+        if delay > 0:
+            unit_name += f":delay={delay}s"
+
+        if delay > 0:
+            self._fire_delayed(action, selector, delay, timeout_seconds)
+            return DispatchResult(
+                host_unit_name=unit_name,
+                terminal_state="succeeded",
+                exit_code=0,
+                output=(
+                    f"scheduled: {action} {target_label} in {delay}s "
+                    f"(self-restart)" if is_self else
+                    f"scheduled: {action} {target_label} in {delay}s"
+                ),
             )
+
+        # Immediate synchronous dispatch.
+        try:
+            output = self._fire_action(action, selector, timeout_seconds)
+        except ExecutorError:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            raise ExecutorError(f"docker {action} failed: {exc}") from exc
 
         return DispatchResult(
-            host_unit_name=f"pid:{pid}",
-            status_file_path=exit_path,
-            log_file_path=log_path,
+            host_unit_name=unit_name,
+            terminal_state="succeeded",
+            exit_code=0,
+            output=output,
         )
 
     # ---- reconcile -------------------------------------------------------
@@ -289,77 +281,184 @@ class NohupSshExecutor(Executor):
         log_file_path: str,
         output_tail_bytes: int = 4096,
     ) -> ReconcileResult:
-        # Sibling paths — the dispatcher always writes pid + exit + output.log
-        # into the same job dir, so we can derive the pid path from the exit
-        # path without threading it through the store.
-        job_dir = status_file_path.rsplit("/", 1)[0]
-        pid_path = f"{job_dir}/pid"
+        # DockerExecutor terminal-marks at dispatch time, so reconcile
+        # is a no-op — service.get_job_status won't call it for terminal
+        # jobs, and there are no non-terminal docker jobs to poll.
+        return ReconcileResult(state=None)
 
-        # Single round-trip: exit file wins, else PID liveness. Sentinels
-        # are wrapped in double-underscores so they don't collide with any
-        # exit code integer.
-        probe = (
-            f"if [ -f {shlex.quote(status_file_path)} ]; then "
-            f"cat {shlex.quote(status_file_path)}; "
-            f"else "
-            f"pid=$(cat {shlex.quote(pid_path)} 2>/dev/null); "
-            f'if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then echo __running__; '
-            f"else echo __missing__; fi; "
-            f"fi"
-        )
-        rc, stdout, err = self.transport.run(target_host, probe, timeout=20)
-        if rc != 0:
-            raise ExecutorError(
-                f"reconcile ssh to {target_host} failed: {err.strip() or f'rc={rc}'}"
-            )
-        line = (stdout or "").strip()
+    # ---- internals -------------------------------------------------------
 
-        if line == "__running__":
-            return ReconcileResult(
-                state="running", exit_code=None, output_tail=None, error=None,
-                started_at=None, finished_at=None,
-            )
-        if line == "__missing__" or not line:
-            # Either the child hasn't backgrounded yet (dispatch just fired)
-            # OR the pid file was cleaned up externally. Keep polling.
-            return ReconcileResult(
-                state=None, exit_code=None, output_tail=None, error=None,
-                started_at=None, finished_at=None,
-            )
-
-        # Exit file present — its content is a single integer.
+    def _parse_spec(self, command_script: str) -> dict[str, Any]:
+        raw = (command_script or "").strip()
+        if not raw:
+            raise ExecutorError("operation command_script is empty (need JSON spec)")
         try:
-            exit_code = int(line)
-        except ValueError:
-            return ReconcileResult(
-                state="failed", exit_code=None, output_tail=None,
-                error=f"malformed exit file: {line!r}",
-                started_at=None, finished_at=None,
+            spec = json.loads(raw)
+        except json.JSONDecodeError as exc:
+            raise ExecutorError(
+                f"operation command_script is not valid JSON: {exc}"
+            ) from exc
+        if not isinstance(spec, dict):
+            raise ExecutorError(
+                f"operation command_script must be a JSON object, got {type(spec).__name__}"
             )
+        return spec
 
-        if exit_code == 0:
-            state = "succeeded"
-        elif exit_code == TIMEOUT_EXIT_CODE:
-            state = "timed_out"
-        else:
-            state = "failed"
-
-        # Terminal → fetch a bounded tail of the log for the DB row.
-        tail: str | None = None
-        if log_file_path:
-            tail_cmd = (
-                f"if [ -f {shlex.quote(log_file_path)} ]; then "
-                f"tail -c {int(output_tail_bytes)} {shlex.quote(log_file_path)}; "
-                f"fi"
+    def _resolve_selector(
+        self, spec: dict[str, Any], env_args: dict[str, Any]
+    ) -> dict[str, str]:
+        """Return a container-locator dict with keys in
+        {``name``, ``project``, ``service``}. Merges spec-literal fields
+        with ``*_from_arg`` fields that pull from the validated args.
+        """
+        sel: dict[str, str] = {}
+        if "container_name" in spec:
+            sel["name"] = str(spec["container_name"])
+        if "container_name_from_arg" in spec:
+            key = str(spec["container_name_from_arg"])
+            val = env_args.get(key)
+            if val is None:
+                raise ExecutorError(
+                    f"selector references arg {key!r} but it wasn't supplied"
+                )
+            sel["name"] = str(val)
+        if "compose_project" in spec:
+            sel["project"] = str(spec["compose_project"])
+        if "compose_service" in spec:
+            sel["service"] = str(spec["compose_service"])
+        if "compose_service_from_arg" in spec:
+            key = str(spec["compose_service_from_arg"])
+            val = env_args.get(key)
+            if val is None:
+                raise ExecutorError(
+                    f"selector references arg {key!r} but it wasn't supplied"
+                )
+            sel["service"] = str(val)
+        if not sel:
+            raise ExecutorError(
+                "operation spec has no container selector "
+                "(need container_name, compose_project+compose_service, or *_from_arg)"
             )
-            trc, tstdout, _terr = self.transport.run(target_host, tail_cmd, timeout=20)
-            if trc == 0 and tstdout:
-                tail = tstdout
+        if "project" in sel and "service" not in sel:
+            raise ExecutorError(
+                "compose_project without compose_service (or compose_service_from_arg)"
+            )
+        return sel
 
-        return ReconcileResult(
-            state=state, exit_code=exit_code, output_tail=tail, error=None,
-            started_at=None, finished_at=None,
+    def _selector_label(self, sel: dict[str, str]) -> str:
+        if "name" in sel:
+            return sel["name"]
+        return f"{sel.get('project','?')}/{sel.get('service','?')}"
+
+    def _find_container(self, sel: dict[str, str]):
+        """Resolve selector → docker container object. Raises ExecutorError
+        on any lookup miss so the caller gets a specific reason."""
+        try:
+            import docker.errors as derrs  # type: ignore[import-not-found]
+        except ImportError:  # pragma: no cover
+            derrs = None  # type: ignore[assignment]
+
+        if "name" in sel:
+            try:
+                return self.client.containers.get(sel["name"])
+            except Exception as exc:  # docker.errors.NotFound + friends
+                if derrs and isinstance(exc, derrs.NotFound):
+                    raise ExecutorError(f"container not found: {sel['name']!r}")
+                raise ExecutorError(f"container lookup failed: {exc}") from exc
+
+        # Compose project + service — filter by the standard compose labels.
+        filters = {
+            "label": [
+                f"com.docker.compose.project={sel['project']}",
+                f"com.docker.compose.service={sel['service']}",
+            ]
+        }
+        try:
+            matches = self.client.containers.list(all=True, filters=filters)
+        except Exception as exc:  # noqa: BLE001
+            raise ExecutorError(f"container list failed: {exc}") from exc
+        if not matches:
+            raise ExecutorError(
+                f"no container for compose project={sel['project']!r} "
+                f"service={sel['service']!r}"
+            )
+        if len(matches) > 1:
+            names = ", ".join(c.name for c in matches)
+            raise ExecutorError(
+                f"selector matched multiple containers ({names}); "
+                "narrow it with container_name"
+            )
+        return matches[0]
+
+    def _is_self_target(self, sel: dict[str, str]) -> bool:
+        # If the selector names the app container by name OR by compose service.
+        if sel.get("name") in self.self_container_names:
+            return True
+        if sel.get("service") in self.self_container_names:
+            return True
+        return False
+
+    def _fire_action(
+        self, action: str, sel: dict[str, str], timeout_seconds: int,
+    ) -> str:
+        """Execute one docker action synchronously. Returns a short summary
+        line for the job's ``output_tail``."""
+        container = self._find_container(sel)
+        name = container.name
+        if action == "restart":
+            container.restart(timeout=max(int(timeout_seconds or 30), 10))
+            return f"restarted {name}"
+        if action == "start":
+            container.start()
+            return f"started {name}"
+        if action == "stop":
+            container.stop(timeout=max(int(timeout_seconds or 30), 10))
+            return f"stopped {name}"
+        if action == "pull":
+            image = None
+            try:
+                image = container.image.tags[0] if container.image.tags else None
+            except Exception:  # noqa: BLE001
+                image = None
+            if not image:
+                raise ExecutorError(
+                    f"container {name!r} has no tagged image to pull"
+                )
+            self.client.images.pull(image)
+            return f"pulled {image} (container: {name})"
+        raise ExecutorError(f"unsupported docker action: {action!r}")
+
+    def _fire_delayed(
+        self,
+        action: str,
+        sel: dict[str, str],
+        delay_seconds: int,
+        timeout_seconds: int,
+    ) -> None:
+        """Fire ``action`` after ``delay_seconds`` in a background daemon
+        thread. Errors are logged (never re-raised) since the caller has
+        already returned by the time this runs — the job row is stamped
+        succeeded at dispatch time on the "schedule placed" contract.
+        """
+
+        label = self._selector_label(sel)
+
+        def _worker() -> None:
+            try:
+                time.sleep(max(int(delay_seconds), 0))
+                self._fire_action(action, sel, timeout_seconds)
+                logger.info("ops delayed dispatch: %s %s done", action, label)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "ops delayed dispatch failed: %s %s: %s", action, label, exc
+                )
+
+        t = threading.Thread(
+            target=_worker,
+            name=f"ops-delayed-{action}-{label}",
+            daemon=True,
         )
+        t.start()
 
 
 __all__ = [
@@ -367,8 +466,6 @@ __all__ = [
     "ExecutorError",
     "DispatchResult",
     "ReconcileResult",
-    "SshTransport",
-    "NohupSshExecutor",
-    "DEFAULT_HOST_JOBS_ROOT",
-    "TIMEOUT_EXIT_CODE",
+    "DockerExecutor",
+    "SUPPORTED_ACTIONS",
 ]

@@ -16,13 +16,13 @@ from typing import Any
 
 from .executor import (
     DispatchResult,
+    DockerExecutor,
     Executor,
     ExecutorError,
-    NohupSshExecutor,
     ReconcileResult,
 )
 from .models import (
-    EXECUTOR_NOHUP_SSH,
+    EXECUTOR_DOCKER,
     JOB_DISPATCHING,
     JOB_FAILED,
     JOB_LOST,
@@ -99,14 +99,14 @@ class OpsService:
     ) -> None:
         self.store = store
         self._executors: dict[str, Executor] = {}
-        default = executor or NohupSshExecutor()
+        default = executor or DockerExecutor()
         self._executors[default.kind()] = default
 
     def register_executor(self, executor: Executor) -> None:
         self._executors[executor.kind()] = executor
 
     def _resolve_executor(self, op: OpsOperation) -> Executor:
-        kind = (op.executor_kind or EXECUTOR_NOHUP_SSH).strip()
+        kind = (op.executor_kind or EXECUTOR_DOCKER).strip()
         ex = self._executors.get(kind)
         if ex is None:
             raise OpsDispatchError(
@@ -232,13 +232,33 @@ class OpsService:
             )
             raise OpsDispatchError("dispatch_failed", str(exc)) from exc
 
+        # Record dispatch metadata (unit name, log paths if any) so the row
+        # reflects "we tried" before we possibly flip it terminal below.
         self.store.mark_dispatching(
             job.id,
             host_unit_name=result.host_unit_name,
             status_file_path=result.status_file_path,
             log_file_path=result.log_file_path,
         )
-        # Return the fresh row so the caller sees state=DISPATCHING.
+
+        # Fast path — executor completed the work synchronously (docker
+        # actions terminal-mark at dispatch time). Skip the polling loop.
+        terminal = getattr(result, "terminal_state", None)
+        if terminal:
+            final_state = {
+                "succeeded": JOB_SUCCEEDED,
+                "failed": JOB_FAILED,
+                "timed_out": JOB_TIMED_OUT,
+            }.get(terminal, JOB_SUCCEEDED)
+            self.store.mark_terminal(
+                job.id,
+                state=final_state,
+                exit_code=result.exit_code,
+                output_tail=result.output,
+            )
+
+        # Return the fresh row so the caller sees final state (or DISPATCHING
+        # if the executor kicked off an async job for a future reconciler).
         row = self.store.get_job(job.id)
         return (row or job).to_api(include_output=False)
 

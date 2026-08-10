@@ -96,6 +96,10 @@ services:
       # that removed x-systemd.idle-timeout from /mnt/user/home, so the NFS
       # mount never idle-unmounts in the first place (2026-06-12).
       - ${LLM_BAWT_MEDIA_HOST_PATH:-/mnt/user/home/echo/llmbawt-media}:/var/lib/llm-bawt/media:rslave
+      # TASK-639: ops catalog controls this compose stack via the Docker socket.
+      # No SSH, no keys, no host runner — the container talks to the same daemon
+      # that spawned it. Host and container both trusted (LAN-only deployment).
+      - /var/run/docker.sock:/var/run/docker.sock
     extra_hosts:
       - "host.docker.internal:host-gateway"
       - "echo.lan.zenoran.com:${ECHO_LAN_HOST_IP:-10.0.0.101}"
