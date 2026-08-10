@@ -19,10 +19,10 @@ from __future__ import annotations
 import json
 import logging
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
-from sqlalchemy import Boolean, Column, DateTime, Integer, String, Text
+from sqlalchemy import Boolean, Column, DateTime, Integer, String, Text, text
 from sqlmodel import Field, Session, SQLModel, select
 
 from agent_bridge.approval import (
@@ -60,6 +60,21 @@ def _utcnow() -> datetime:
     return datetime.now(timezone.utc)
 
 
+def _as_aware_utc(dt: datetime | None) -> datetime | None:
+    """Coerce a possibly-naive datetime to tz-aware UTC.
+
+    Postgres round-trips ``TIMESTAMP WITH TIME ZONE`` as aware, but SQLite
+    (test env) strips tzinfo on read. Comparisons of ``_utcnow()`` (aware)
+    against a stored value would then raise ``TypeError``. Coerce here so
+    the lease/backoff math works uniformly.
+    """
+    if dt is None:
+        return None
+    if dt.tzinfo is None:
+        return dt.replace(tzinfo=timezone.utc)
+    return dt
+
+
 # Request lifecycle states.
 REQ_PENDING = "pending"
 REQ_APPROVED = "approved"
@@ -74,6 +89,36 @@ REQ_CANCELLED = "cancelled"
 REQ_RESPONDED = "responded"
 REQ_EXPIRED = "expired"
 REQ_SUPERSEDED = "superseded"
+
+# TASK-639: request kind. "harness" = classic bridge-hook approvals (Bash and
+# other bridge-layer gated tools; the client dispatches a one-shot grant +
+# continuation). "mcp" = server-side approval interception at the BawtHub
+# MCP server; the approved tool is executed exactly-once server-side and the
+# result is delivered back through a durable continuation outbox — the agent
+# never re-issues the call. Default stays "harness" so existing rows are
+# unambiguous.
+KIND_HARNESS = "harness"
+KIND_MCP = "mcp"
+
+# TASK-639: execution state machine for MCP-kind approvals. Harness-kind rows
+# leave this at EXEC_NOT_APPLICABLE — execution happens on the CLIENT after
+# the one-shot grant lands.
+EXEC_NOT_APPLICABLE = "not_applicable"
+EXEC_PENDING = "pending"
+EXEC_RUNNING = "running"
+EXEC_SUCCEEDED = "succeeded"
+EXEC_FAILED = "failed"
+EXEC_SKIPPED = "skipped"
+
+# TASK-639: continuation outbox state. Harness-kind = CONT_NOT_NEEDED (client
+# dispatches its own continuation). MCP-kind = CONT_PENDING once the tool has
+# executed; a lifespan worker moves it through DISPATCHING → DELIVERED (or
+# FAILED with backoff).
+CONT_NOT_NEEDED = "not_needed"
+CONT_PENDING = "pending"
+CONT_DISPATCHING = "dispatching"
+CONT_DELIVERED = "delivered"
+CONT_FAILED = "failed"
 
 
 class ToolApprovalPolicy(SQLModel, table=True):
@@ -197,6 +242,90 @@ class ToolApprovalRequest(SQLModel, table=True):
     resolved_by: str | None = Field(default=None, sa_column=Column(String(128), nullable=True))
     resolved_turn_id: str | None = Field(default=None, sa_column=Column(String(128), nullable=True))
 
+    # TASK-639 --- MCP-kind extensions --------------------------------------
+    # Two lifecycles share this table: the classic "harness" flow (Bash and
+    # other bridge-hook gated tools; client re-issues on approve) and the new
+    # "mcp" flow (BawtHub MCP server intercepts; server executes exactly-once
+    # on approve; result delivered via the durable continuation outbox).
+    request_kind: str = Field(
+        default=KIND_HARNESS,
+        sa_column=Column(String(16), nullable=False, index=True, server_default=KIND_HARNESS),
+    )
+    # For MCP-kind the row `id` is an app-generated approval-request id; the
+    # SDK's tool_use_id (used by the client harness to correlate a resumed
+    # ToolResultBlock) is captured separately when the caller-context header
+    # provided it. For harness-kind this stays None (their `id` IS the SDK
+    # tool_use_id, per pre-TASK-639 invariant).
+    tool_use_id: str | None = Field(
+        default=None, sa_column=Column(String(128), nullable=True, index=True)
+    )
+    # The BawtHub MCP server that received the intercepted call (e.g. "bawthub").
+    # None for harness-kind.
+    mcp_server: str | None = Field(default=None, sa_column=Column(String(128), nullable=True))
+    # sha256(tool_name + canonical(args_json)) — used to bind the internal
+    # signed approval-bypass to the exact stored invocation so a model-forged
+    # bypass header can't swap args at execute time.
+    invocation_hash: str | None = Field(
+        default=None, sa_column=Column(String(64), nullable=True)
+    )
+    # The signed per-turn caller context stamped by the Claude PreToolUse
+    # hook (bot_id, user_id, turn_id, trigger_message_id, session_key,
+    # backend, tool_use_id). Verified at MCP dispatch and again at resolve.
+    caller_context_json: str | None = Field(
+        default=None, sa_column=Column(Text, nullable=True)
+    )
+    # Some callers (raw MCP clients that don't ride an active agent turn) can
+    # be approved but cannot receive a continuation. When False the outbox
+    # marks itself CONT_NOT_NEEDED and the result is only retrievable via the
+    # approval API / job status endpoints.
+    continuation_capable: bool = Field(
+        default=False,
+        sa_column=Column(Boolean, nullable=False, server_default="false"),
+    )
+
+    # ---- MCP execution state machine (only meaningful for KIND_MCP rows) ---
+    execution_state: str = Field(
+        default=EXEC_NOT_APPLICABLE,
+        sa_column=Column(String(16), nullable=False, server_default=EXEC_NOT_APPLICABLE, index=True),
+    )
+    execution_attempts: int = Field(
+        default=0, sa_column=Column(Integer, nullable=False, server_default="0"),
+    )
+    execution_started_at: datetime | None = Field(
+        default=None, sa_column=Column(DateTime(timezone=True), nullable=True)
+    )
+    execution_finished_at: datetime | None = Field(
+        default=None, sa_column=Column(DateTime(timezone=True), nullable=True)
+    )
+    execution_error: str | None = Field(
+        default=None, sa_column=Column(Text, nullable=True)
+    )
+    # Normalized MCP result payload (JSON-serialized). For an ordinary success
+    # this is the tool's return value; for a refusal/deny/respond it is a
+    # structured refusal envelope. Never contains an inflight/pending marker.
+    result_json: str | None = Field(default=None, sa_column=Column(Text, nullable=True))
+    result_is_error: bool | None = Field(
+        default=None, sa_column=Column(Boolean, nullable=True),
+    )
+
+    # ---- continuation outbox state (only meaningful for KIND_MCP rows) -----
+    continuation_state: str = Field(
+        default=CONT_NOT_NEEDED,
+        sa_column=Column(String(16), nullable=False, server_default=CONT_NOT_NEEDED, index=True),
+    )
+    continuation_attempts: int = Field(
+        default=0, sa_column=Column(Integer, nullable=False, server_default="0"),
+    )
+    continuation_last_error: str | None = Field(
+        default=None, sa_column=Column(Text, nullable=True)
+    )
+    continuation_next_attempt_at: datetime | None = Field(
+        default=None, sa_column=Column(DateTime(timezone=True), nullable=True, index=True)
+    )
+    continuation_delivered_at: datetime | None = Field(
+        default=None, sa_column=Column(DateTime(timezone=True), nullable=True)
+    )
+
     def to_api(self) -> dict[str, Any]:
         try:
             args = json.loads(self.tool_arguments_json) if self.tool_arguments_json else {}
@@ -223,6 +352,33 @@ class ToolApprovalRequest(SQLModel, table=True):
             "resolved_at": self.resolved_at.isoformat() if self.resolved_at else None,
             "resolved_by": self.resolved_by,
             "resolved_turn_id": self.resolved_turn_id,
+            # TASK-639 — MCP-kind fields. Present on every row (server_default
+            # backfills), so ApprovalCard hydration stays field-compatible with
+            # pre-TASK-639 harness rows.
+            "request_kind": self.request_kind,
+            "tool_use_id": self.tool_use_id,
+            "mcp_server": self.mcp_server,
+            "invocation_hash": self.invocation_hash,
+            "continuation_capable": bool(self.continuation_capable),
+            "execution_state": self.execution_state,
+            "execution_attempts": int(self.execution_attempts or 0),
+            "execution_started_at": (
+                self.execution_started_at.isoformat() if self.execution_started_at else None
+            ),
+            "execution_finished_at": (
+                self.execution_finished_at.isoformat() if self.execution_finished_at else None
+            ),
+            "execution_error": self.execution_error,
+            "result_is_error": self.result_is_error,
+            # result_json is intentionally excluded from the default API dict —
+            # it can be large; callers that need it fetch via the dedicated
+            # /v1/tool-approval-requests/{id}/result endpoint.
+            "continuation_state": self.continuation_state,
+            "continuation_attempts": int(self.continuation_attempts or 0),
+            "continuation_delivered_at": (
+                self.continuation_delivered_at.isoformat()
+                if self.continuation_delivered_at else None
+            ),
         }
 
 
@@ -265,8 +421,79 @@ class ToolApprovalPolicyStore:
                     ToolApprovalRequest.__table__,
                 ],
             )
+            self._migrate_add_columns(conn)
 
         self._schema_guard.run(self.engine, "tool-approval-policy-store", bootstrap)
+
+    def _migrate_add_columns(self, conn) -> None:
+        """Add columns introduced after initial schema creation.
+
+        TASK-639 extends ``tool_approval_requests`` with the MCP-kind execution
+        + continuation state so the same table serves both the classic bridge-
+        hook (harness) flow and the new server-side MCP flow. Idempotent via
+        ``ADD COLUMN IF NOT EXISTS``; safe to run every bootstrap.
+
+        Postgres-only: SQLite (test env) got the full column list from the
+        preceding ``create_all`` and doesn't accept ``ADD COLUMN IF NOT EXISTS``
+        syntax. Skip cleanly there.
+        """
+        if conn.dialect.name != "postgresql":
+            return
+        migrations = [
+            # request kind + SDK/MCP correlation
+            f"ALTER TABLE tool_approval_requests ADD COLUMN IF NOT EXISTS "
+            f"request_kind VARCHAR(16) NOT NULL DEFAULT '{KIND_HARNESS}'",
+            "ALTER TABLE tool_approval_requests ADD COLUMN IF NOT EXISTS "
+            "tool_use_id VARCHAR(128)",
+            "ALTER TABLE tool_approval_requests ADD COLUMN IF NOT EXISTS "
+            "mcp_server VARCHAR(128)",
+            "ALTER TABLE tool_approval_requests ADD COLUMN IF NOT EXISTS "
+            "invocation_hash VARCHAR(64)",
+            "ALTER TABLE tool_approval_requests ADD COLUMN IF NOT EXISTS "
+            "caller_context_json TEXT",
+            "ALTER TABLE tool_approval_requests ADD COLUMN IF NOT EXISTS "
+            "continuation_capable BOOLEAN NOT NULL DEFAULT FALSE",
+            # execution state machine
+            f"ALTER TABLE tool_approval_requests ADD COLUMN IF NOT EXISTS "
+            f"execution_state VARCHAR(16) NOT NULL DEFAULT '{EXEC_NOT_APPLICABLE}'",
+            "ALTER TABLE tool_approval_requests ADD COLUMN IF NOT EXISTS "
+            "execution_attempts INTEGER NOT NULL DEFAULT 0",
+            "ALTER TABLE tool_approval_requests ADD COLUMN IF NOT EXISTS "
+            "execution_started_at TIMESTAMP WITH TIME ZONE",
+            "ALTER TABLE tool_approval_requests ADD COLUMN IF NOT EXISTS "
+            "execution_finished_at TIMESTAMP WITH TIME ZONE",
+            "ALTER TABLE tool_approval_requests ADD COLUMN IF NOT EXISTS "
+            "execution_error TEXT",
+            "ALTER TABLE tool_approval_requests ADD COLUMN IF NOT EXISTS "
+            "result_json TEXT",
+            "ALTER TABLE tool_approval_requests ADD COLUMN IF NOT EXISTS "
+            "result_is_error BOOLEAN",
+            # continuation outbox
+            f"ALTER TABLE tool_approval_requests ADD COLUMN IF NOT EXISTS "
+            f"continuation_state VARCHAR(16) NOT NULL DEFAULT '{CONT_NOT_NEEDED}'",
+            "ALTER TABLE tool_approval_requests ADD COLUMN IF NOT EXISTS "
+            "continuation_attempts INTEGER NOT NULL DEFAULT 0",
+            "ALTER TABLE tool_approval_requests ADD COLUMN IF NOT EXISTS "
+            "continuation_last_error TEXT",
+            "ALTER TABLE tool_approval_requests ADD COLUMN IF NOT EXISTS "
+            "continuation_next_attempt_at TIMESTAMP WITH TIME ZONE",
+            "ALTER TABLE tool_approval_requests ADD COLUMN IF NOT EXISTS "
+            "continuation_delivered_at TIMESTAMP WITH TIME ZONE",
+            # indexes matching the SQLModel Field(index=True) declarations
+            "CREATE INDEX IF NOT EXISTS ix_tool_approval_requests_request_kind "
+            "ON tool_approval_requests (request_kind)",
+            "CREATE INDEX IF NOT EXISTS ix_tool_approval_requests_tool_use_id "
+            "ON tool_approval_requests (tool_use_id)",
+            "CREATE INDEX IF NOT EXISTS ix_tool_approval_requests_execution_state "
+            "ON tool_approval_requests (execution_state)",
+            "CREATE INDEX IF NOT EXISTS ix_tool_approval_requests_continuation_state "
+            "ON tool_approval_requests (continuation_state)",
+            "CREATE INDEX IF NOT EXISTS "
+            "ix_tool_approval_requests_continuation_next_attempt_at "
+            "ON tool_approval_requests (continuation_next_attempt_at)",
+        ]
+        for stmt in migrations:
+            conn.execute(text(stmt))
 
     # ---- policy CRUD -------------------------------------------------------
 
@@ -487,6 +714,334 @@ class ToolApprovalPolicyStore:
                 session.commit()
                 session.refresh(row)
             return row
+
+    # ---- MCP-kind execution + continuation state machine (TASK-639) --------
+
+    def record_mcp_request(
+        self,
+        *,
+        request_id: str,
+        tool_use_id: str | None,
+        mcp_server: str,
+        bot_id: str,
+        user_id: str,
+        turn_id: str,
+        backend: str,
+        tool_name: str,
+        tool_arguments: dict[str, Any],
+        subject: str,
+        grant_key: str,
+        policy_id: str | None,
+        severity: str,
+        prompt: str,
+        invocation_hash: str,
+        caller_context_json: str | None = None,
+        continuation_capable: bool = False,
+        trigger_message_id: str | None = None,
+        session_key: str | None = None,
+    ) -> ToolApprovalRequest:
+        """Persist a new MCP-kind gated request. Idempotent on request_id.
+
+        Same durability contract as :meth:`record_request` — raises
+        ``ApprovalPersistError`` on missing engine / insert failure so the MCP
+        interceptor never returns ``approval_required`` to the caller unless
+        the row is committed. Starts in status=REQ_PENDING (approval flow) +
+        execution_state=EXEC_PENDING (MCP execution has not run yet).
+        """
+        if self.engine is None:
+            raise ApprovalPersistError(
+                f"approval store has no DB engine; cannot persist MCP request {request_id}"
+            )
+        try:
+            with Session(self.engine) as session:
+                existing = session.get(ToolApprovalRequest, request_id)
+                if existing is not None:
+                    return existing
+                row = ToolApprovalRequest(
+                    id=request_id,
+                    bot_id=(bot_id or "unknown").strip() or "unknown",
+                    user_id=(user_id or "unknown").strip() or "unknown",
+                    turn_id=(turn_id or "unknown").strip() or "unknown",
+                    trigger_message_id=trigger_message_id or None,
+                    session_key=session_key or None,
+                    backend=backend or "claude-code",
+                    tool_name=tool_name or "",
+                    tool_arguments_json=json.dumps(
+                        tool_arguments if isinstance(tool_arguments, dict) else {"value": tool_arguments},
+                        ensure_ascii=False, default=str,
+                    ),
+                    subject=subject or "",
+                    grant_key=grant_key or "",
+                    policy_id=policy_id,
+                    severity=severity or "medium",
+                    prompt=prompt or "",
+                    status=REQ_PENDING,
+                    request_kind=KIND_MCP,
+                    tool_use_id=tool_use_id,
+                    mcp_server=mcp_server or "",
+                    invocation_hash=invocation_hash,
+                    caller_context_json=caller_context_json,
+                    continuation_capable=bool(continuation_capable),
+                    execution_state=EXEC_PENDING,
+                    continuation_state=CONT_NOT_NEEDED,
+                )
+                session.add(row)
+                session.commit()
+                session.refresh(row)
+                return row
+        except ApprovalPersistError:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("Failed to record MCP approval request id=%s", request_id)
+            raise ApprovalPersistError(
+                f"insert failed for MCP approval request {request_id}: {exc}"
+            ) from exc
+
+    def claim_mcp_execution(
+        self,
+        request_id: str,
+        *,
+        lease_seconds: int = 60,
+    ) -> ToolApprovalRequest | None:
+        """Atomically claim an approved MCP request for execution.
+
+        Returns the claimed row (execution_state=EXEC_RUNNING) or None if:
+          * request does not exist
+          * status is not REQ_APPROVED
+          * execution has already completed (EXEC_SUCCEEDED / EXEC_FAILED / EXEC_SKIPPED)
+          * another worker holds a fresh RUNNING lease (started_at within lease_seconds)
+
+        A stale RUNNING lease may be reclaimed only after ``lease_seconds`` has
+        elapsed and no result_json is present. Attempts counter increments.
+        """
+        if self.engine is None:
+            return None
+        now = _utcnow()
+        with Session(self.engine) as session:
+            row = session.get(ToolApprovalRequest, request_id)
+            if row is None:
+                return None
+            if row.status != REQ_APPROVED:
+                return None
+            # Already terminal — never re-execute.
+            if row.execution_state in (EXEC_SUCCEEDED, EXEC_FAILED, EXEC_SKIPPED):
+                return None
+            # Live lease held by another worker?
+            if row.execution_state == EXEC_RUNNING:
+                started = _as_aware_utc(row.execution_started_at)
+                if started is not None and row.result_json is None:
+                    elapsed = (now - started).total_seconds()
+                    if elapsed < lease_seconds:
+                        return None
+            row.execution_state = EXEC_RUNNING
+            row.execution_started_at = now
+            row.execution_attempts = int(row.execution_attempts or 0) + 1
+            session.add(row)
+            session.commit()
+            session.refresh(row)
+            return row
+
+    def complete_mcp_execution(
+        self,
+        request_id: str,
+        *,
+        result_json: str,
+        is_error: bool,
+        error: str | None = None,
+        skipped: bool = False,
+    ) -> ToolApprovalRequest | None:
+        """Persist the terminal result of an MCP execution. Idempotent.
+
+        Once a request has a stored result, subsequent complete calls are
+        no-ops that return the stored row — this is the exactly-once guarantee
+        against duplicate resolve calls and outbox retries.
+        """
+        if self.engine is None:
+            return None
+        with Session(self.engine) as session:
+            row = session.get(ToolApprovalRequest, request_id)
+            if row is None:
+                return None
+            # Idempotent on already-terminal.
+            if row.execution_state in (EXEC_SUCCEEDED, EXEC_FAILED, EXEC_SKIPPED):
+                return row
+            now = _utcnow()
+            row.execution_state = (
+                EXEC_SKIPPED if skipped
+                else (EXEC_FAILED if is_error else EXEC_SUCCEEDED)
+            )
+            row.execution_finished_at = now
+            row.result_json = result_json
+            row.result_is_error = bool(is_error)
+            if error:
+                row.execution_error = error
+            session.add(row)
+            session.commit()
+            session.refresh(row)
+            return row
+
+    def enqueue_continuation(
+        self,
+        request_id: str,
+    ) -> ToolApprovalRequest | None:
+        """Mark a completed MCP execution as CONT_PENDING for the outbox worker.
+
+        No-op if the row is not continuation_capable, has no terminal execution
+        result, or is already in a continuation lifecycle. Idempotent.
+        """
+        if self.engine is None:
+            return None
+        with Session(self.engine) as session:
+            row = session.get(ToolApprovalRequest, request_id)
+            if row is None:
+                return None
+            if not row.continuation_capable:
+                return row
+            if row.execution_state not in (EXEC_SUCCEEDED, EXEC_FAILED, EXEC_SKIPPED):
+                return row
+            # Already enqueued / in-flight / delivered — no-op.
+            if row.continuation_state != CONT_NOT_NEEDED:
+                return row
+            row.continuation_state = CONT_PENDING
+            row.continuation_next_attempt_at = _utcnow()
+            session.add(row)
+            session.commit()
+            session.refresh(row)
+            return row
+
+    def claim_continuation(
+        self,
+        request_id: str,
+        *,
+        lease_seconds: int = 60,
+    ) -> ToolApprovalRequest | None:
+        """Atomically transition CONT_PENDING → CONT_DISPATCHING for the worker.
+
+        Same lease semantics as ``claim_mcp_execution``: a DISPATCHING row with
+        an expired lease and no continuation_delivered_at may be reclaimed.
+        """
+        if self.engine is None:
+            return None
+        now = _utcnow()
+        with Session(self.engine) as session:
+            row = session.get(ToolApprovalRequest, request_id)
+            if row is None:
+                return None
+            if row.continuation_state == CONT_DELIVERED:
+                return None
+            if row.continuation_state == CONT_DISPATCHING:
+                # Reclaim only after the lease expires and delivery didn't complete.
+                if row.continuation_delivered_at is not None:
+                    return None
+                next_at = _as_aware_utc(row.continuation_next_attempt_at)
+                if next_at is not None:
+                    elapsed = (now - next_at).total_seconds()
+                    if elapsed < lease_seconds:
+                        return None
+            if row.continuation_state not in (CONT_PENDING, CONT_DISPATCHING):
+                return None
+            row.continuation_state = CONT_DISPATCHING
+            row.continuation_next_attempt_at = now
+            row.continuation_attempts = int(row.continuation_attempts or 0) + 1
+            session.add(row)
+            session.commit()
+            session.refresh(row)
+            return row
+
+    def mark_continuation_delivered(
+        self,
+        request_id: str,
+    ) -> ToolApprovalRequest | None:
+        """CONT_DISPATCHING → CONT_DELIVERED. Idempotent."""
+        if self.engine is None:
+            return None
+        with Session(self.engine) as session:
+            row = session.get(ToolApprovalRequest, request_id)
+            if row is None:
+                return None
+            if row.continuation_state == CONT_DELIVERED:
+                return row
+            row.continuation_state = CONT_DELIVERED
+            row.continuation_delivered_at = _utcnow()
+            row.continuation_last_error = None
+            row.continuation_next_attempt_at = None
+            session.add(row)
+            session.commit()
+            session.refresh(row)
+            return row
+
+    def mark_continuation_failed(
+        self,
+        request_id: str,
+        *,
+        error: str,
+        max_attempts: int = 5,
+        backoff_seconds: int = 30,
+    ) -> ToolApprovalRequest | None:
+        """Record a failed continuation dispatch. Reschedules with backoff or
+        marks CONT_FAILED after ``max_attempts``. Never regresses a delivered
+        row.
+        """
+        if self.engine is None:
+            return None
+        with Session(self.engine) as session:
+            row = session.get(ToolApprovalRequest, request_id)
+            if row is None:
+                return None
+            if row.continuation_state == CONT_DELIVERED:
+                return row
+            attempts = int(row.continuation_attempts or 0)
+            row.continuation_last_error = (error or "")[:2000]
+            if attempts >= max_attempts:
+                row.continuation_state = CONT_FAILED
+                row.continuation_next_attempt_at = None
+            else:
+                # Exponential backoff capped at 10 minutes.
+                delay = min(backoff_seconds * (2 ** max(0, attempts - 1)), 600)
+                row.continuation_state = CONT_PENDING
+                row.continuation_next_attempt_at = _utcnow() + timedelta(seconds=delay)
+            session.add(row)
+            session.commit()
+            session.refresh(row)
+            return row
+
+    def find_pending_continuations(
+        self,
+        *,
+        limit: int = 50,
+        include_dispatching_older_than_s: int = 120,
+    ) -> list[ToolApprovalRequest]:
+        """Outbox worker query: continuations ready for dispatch.
+
+        Includes CONT_PENDING rows whose next_attempt_at is due, plus any
+        CONT_DISPATCHING rows whose lease expired without delivery (crash /
+        app restart mid-dispatch).
+        """
+        if self.engine is None:
+            return []
+        now = _utcnow()
+        stale_before = now - timedelta(seconds=include_dispatching_older_than_s)
+        with Session(self.engine) as session:
+            stmt = (
+                select(ToolApprovalRequest)
+                .where(
+                    (
+                        (ToolApprovalRequest.continuation_state == CONT_PENDING)
+                        & (
+                            (ToolApprovalRequest.continuation_next_attempt_at.is_(None))
+                            | (ToolApprovalRequest.continuation_next_attempt_at <= now)
+                        )
+                    )
+                    | (
+                        (ToolApprovalRequest.continuation_state == CONT_DISPATCHING)
+                        & (ToolApprovalRequest.continuation_delivered_at.is_(None))
+                        & (ToolApprovalRequest.continuation_next_attempt_at <= stale_before)
+                    )
+                )
+                .order_by(ToolApprovalRequest.continuation_next_attempt_at)
+                .limit(limit)
+            )
+            return list(session.exec(stmt).all())
 
     def list_requests(
         self,
