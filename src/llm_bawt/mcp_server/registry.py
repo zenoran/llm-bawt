@@ -1,0 +1,56 @@
+"""FastMCP server instance + host/origin allowlist (TASK-639 slice A).
+
+Extracted from ``mcp_server/server.py`` so the FastMCP instance can be wrapped
+by the approval-aware interceptor (TASK-639 Slice E) without dragging in the
+full 900+ line tool-registration module. ``server.py`` re-exports ``mcp`` from
+here, so existing ``from .server import mcp`` imports across the tool_modules
+continue to work byte-compatibly.
+
+DO NOT move tool registrations here. This module owns exactly the FastMCP
+transport/security config; tool modules keep registering against the same
+``mcp`` singleton via ``from .server import mcp`` (or, going forward,
+``from .registry import mcp``).
+"""
+
+from __future__ import annotations
+
+import logging
+import os
+
+# Suppress noisy MCP library session lifecycle logging BEFORE the FastMCP
+# import so its own logger inherits the WARNING level.
+logging.getLogger("mcp.server").setLevel(logging.WARNING)
+logging.getLogger("mcp.server.streamable_http").setLevel(logging.WARNING)
+
+from mcp.server.fastmcp import FastMCP
+from mcp.server.transport_security import TransportSecuritySettings
+
+
+# Allow localhost by default; add LAN hosts via LLM_BAWT_MCP_ALLOWED_HOSTS env var.
+# The MCP library matches host:port patterns — use ":*" suffix to allow any port.
+_allowed_hosts = [
+    h.strip() for h in os.getenv(
+        "LLM_BAWT_MCP_ALLOWED_HOSTS",
+        "127.0.0.1:*,localhost:*",
+    ).split(",")
+]
+_allowed_origins = [f"http://{h}" for h in _allowed_hosts]
+
+
+mcp = FastMCP(
+    "bawthub",
+    json_response=True,
+    stateless_http=True,
+    transport_security=TransportSecuritySettings(
+        enable_dns_rebinding_protection=True,
+        allowed_hosts=_allowed_hosts,
+        allowed_origins=_allowed_origins,
+    ),
+)
+
+# Suppress uvicorn access logs by setting log_level to WARNING
+# We log our own human-friendly MCP operation summaries via ServiceLogger
+mcp.settings.log_level = "WARNING"
+
+
+__all__ = ["mcp"]

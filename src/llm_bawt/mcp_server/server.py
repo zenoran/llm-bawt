@@ -26,48 +26,19 @@ import os
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING
 
-# Suppress noisy MCP library session lifecycle logging
-logging.getLogger("mcp.server").setLevel(logging.WARNING)
-logging.getLogger("mcp.server.streamable_http").setLevel(logging.WARNING)
-
-from mcp.server.fastmcp import FastMCP
-from mcp.server.transport_security import TransportSecuritySettings
-
 from llm_bawt.shared.logging import LogConfig
+
+# TASK-639 slice A: the FastMCP instance + host allowlist moved to
+# ``mcp_server/registry.py`` so the approval-aware interceptor (Slice E) can
+# wrap it without importing this 900+ line tool-registration module. We
+# re-export ``mcp`` here so existing ``from .server import mcp`` imports
+# across the tool_modules keep working byte-compatibly.
+from .registry import mcp  # noqa: F401 — re-exported for downstream tool modules
 
 if TYPE_CHECKING:
     pass
 
 logger = logging.getLogger(__name__)
-
-# ---------------------------------------------------------------------------
-# MCP Server instance
-# ---------------------------------------------------------------------------
-
-# Allow localhost by default; add LAN hosts via LLM_BAWT_MCP_ALLOWED_HOSTS env var.
-# The MCP library matches host:port patterns — use ":*" suffix to allow any port.
-_allowed_hosts = [
-    h.strip() for h in os.getenv(
-        "LLM_BAWT_MCP_ALLOWED_HOSTS",
-        "127.0.0.1:*,localhost:*",
-    ).split(",")
-]
-_allowed_origins = [f"http://{h}" for h in _allowed_hosts]
-
-mcp = FastMCP(
-    "bawthub",
-    json_response=True,
-    stateless_http=True,
-    transport_security=TransportSecuritySettings(
-        enable_dns_rebinding_protection=True,
-        allowed_hosts=_allowed_hosts,
-        allowed_origins=_allowed_origins,
-    ),
-)
-
-# Suppress uvicorn access logs by setting log_level to WARNING
-# We log our own human-friendly MCP operation summaries via ServiceLogger
-mcp.settings.log_level = "WARNING"
 
 
 # ---------------------------------------------------------------------------
