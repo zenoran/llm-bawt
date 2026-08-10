@@ -18,6 +18,7 @@ from .providers import router as providers_router
 from .settings import router as settings_router
 from .sessions import router as sessions_router
 from .approval_policies import router as approval_policies_router
+from .ops import router as ops_router
 from .tasks import router as tasks_router
 from .ha_weather import router as ha_weather_router
 from .turn_logs import router as turn_logs_router
@@ -55,6 +56,7 @@ all_routers = [
     sessions_router,
     config_router,
     approval_policies_router,
+    ops_router,
     profiles_router,
     llm_router,
     media_router,

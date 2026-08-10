@@ -820,6 +820,12 @@ from . import media_generation_tools as _media_generation_tools  # noqa: F401, E
 from . import self_tools as _self_tools  # noqa: F401, E402
 
 # ---------------------------------------------------------------------------
+# Ops tools (TASK-639 — DB-configured operations catalog)
+# ---------------------------------------------------------------------------
+
+from . import ops_tools as _ops_tools  # noqa: F401, E402
+
+# ---------------------------------------------------------------------------
 # Web search tool (local Brave/Reddit/Tavily fan-out — replaces the Anthropic
 # server-side WebSearch that hangs on the proxy path)
 # ---------------------------------------------------------------------------

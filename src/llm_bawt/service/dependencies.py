@@ -165,6 +165,27 @@ def get_tool_approval_policy_store(config: Any):
     )
 
 
+def get_ops_store(config: Any):
+    """Process-wide ``OpsStore`` singleton (TASK-639)."""
+    from ..ops import OpsStore
+
+    return _get_or_build_store("ops_store", config, lambda: OpsStore(config))
+
+
+def get_ops_service(config: Any):
+    """Process-wide ``OpsService`` singleton (TASK-639).
+
+    Wraps the shared OpsStore + the default SystemdSshExecutor. Callers that
+    need to swap the executor (tests) should construct their own OpsService
+    directly rather than going through this cache.
+    """
+    from ..ops import OpsService
+
+    return _get_or_build_store(
+        "ops_service", config, lambda: OpsService(get_ops_store(config))
+    )
+
+
 def set_service(service: "BackgroundService | None") -> None:
     """Set the global background service instance."""
     global _service

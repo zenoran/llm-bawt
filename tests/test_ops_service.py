@@ -1,0 +1,287 @@
+"""Tests for :class:`llm_bawt.ops.service.OpsService` (TASK-639).
+
+Exercises the dispatch orchestration end-to-end with a fake executor so no
+real SSH is required. Covers:
+
+* unknown operation
+* disabled operation
+* invalid args (schema violation)
+* idempotency on repeated dispatch with same key
+* successful dispatch flips job to DISPATCHING and records unit + paths
+* executor-unavailable path marks job FAILED and surfaces the reason
+* reconcile: RUNNING → SUCCEEDED transitions land in the store
+* reconcile: no status.json yet → keep polling (state unchanged)
+"""
+
+from __future__ import annotations
+
+import json
+
+from sqlmodel import create_engine
+from sqlalchemy.pool import StaticPool
+
+from llm_bawt.ops import (
+    JOB_DISPATCHING,
+    JOB_FAILED,
+    JOB_QUEUED,
+    JOB_RUNNING,
+    JOB_SUCCEEDED,
+    OpsDispatchError,
+    OpsService,
+    OpsStore,
+)
+from llm_bawt.ops.executor import DispatchResult, Executor, ExecutorError, ReconcileResult
+
+
+def _store():
+    store = object.__new__(OpsStore)
+    store.engine = create_engine(
+        "sqlite://",
+        connect_args={"check_same_thread": False},
+        poolclass=StaticPool,
+    )
+    store._ensure_tables_exist()
+    return store
+
+
+class FakeExecutor(Executor):
+    def __init__(self, *, available: bool = True, dispatch_error: str | None = None):
+        self._available = available
+        self._dispatch_error = dispatch_error
+        self.dispatch_calls: list[dict] = []
+        self.reconcile_calls: list[dict] = []
+        self.next_reconcile: ReconcileResult | None = None
+
+    def kind(self) -> str:
+        return "systemd_ssh"
+
+    def available(self) -> bool:
+        return self._available
+
+    def dispatch(self, **kwargs) -> DispatchResult:
+        self.dispatch_calls.append(kwargs)
+        if self._dispatch_error:
+            raise ExecutorError(self._dispatch_error)
+        return DispatchResult(
+            host_unit_name=f"llm-bawt-ops-{kwargs['job_id'][:8]}",
+            status_file_path=f"/host/jobs/{kwargs['job_id']}/status.json",
+            log_file_path=f"/host/jobs/{kwargs['job_id']}/output.log",
+        )
+
+    def reconcile(self, **kwargs) -> ReconcileResult:
+        self.reconcile_calls.append(kwargs)
+        assert self.next_reconcile is not None, "test forgot to set next_reconcile"
+        return self.next_reconcile
+
+
+def _op_data(**over):
+    base = dict(
+        slug="test.restart-thing",
+        title="Restart Thing",
+        description="Test op",
+        enabled=True,
+        target_host="nick@host",
+        working_directory="/tmp",
+        command_script="echo hello",
+        args_schema_json=json.dumps({
+            "type": "object", "additionalProperties": False,
+            "properties": {"target": {"type": "string", "enum": ["a", "b"]}},
+            "required": ["target"],
+        }),
+        args_defaults_json="{}",
+        timeout_seconds=60,
+        risk_level="low",
+        category="restart",
+    )
+    base.update(over)
+    return base
+
+
+def _make(store):
+    executor = FakeExecutor()
+    service = OpsService(store, executor=executor)
+    return service, executor
+
+
+def test_dispatch_unknown_operation_raises():
+    store = _store()
+    service, _ = _make(store)
+    try:
+        service.dispatch_job(
+            operation_slug="nope", args={}, idempotency_key="k1",
+        )
+    except OpsDispatchError as exc:
+        assert exc.code == "operation_not_found"
+        return
+    raise AssertionError("expected OpsDispatchError")
+
+
+def test_dispatch_disabled_operation_raises():
+    store = _store()
+    store.create_operation(_op_data(enabled=False))
+    service, _ = _make(store)
+    try:
+        service.dispatch_job(
+            operation_slug="test.restart-thing", args={"target": "a"},
+            idempotency_key="k1",
+        )
+    except OpsDispatchError as exc:
+        assert exc.code == "operation_disabled"
+        return
+    raise AssertionError("expected OpsDispatchError")
+
+
+def test_dispatch_invalid_args_raises_with_reason():
+    store = _store()
+    store.create_operation(_op_data())
+    service, _ = _make(store)
+    try:
+        service.dispatch_job(
+            operation_slug="test.restart-thing", args={"target": "z"},
+            idempotency_key="k1",
+        )
+    except OpsDispatchError as exc:
+        assert exc.code == "args_invalid"
+        assert "not in enum" in str(exc)
+        return
+    raise AssertionError("expected OpsDispatchError")
+
+
+def test_dispatch_success_records_dispatching_and_unit_name():
+    store = _store()
+    store.create_operation(_op_data())
+    service, executor = _make(store)
+    result = service.dispatch_job(
+        operation_slug="test.restart-thing", args={"target": "a"},
+        idempotency_key="k1", caller_bot_id="snark",
+    )
+    assert result["state"] == JOB_DISPATCHING
+    assert result["host_unit_name"].startswith("llm-bawt-ops-")
+    assert result["operation"] == "test.restart-thing"
+    assert result["caller"]["bot_id"] == "snark"
+    assert len(executor.dispatch_calls) == 1
+    # Args land as OPS_ARG_ env keys inside the executor call.
+    assert executor.dispatch_calls[0]["env_args"] == {"target": "a"}
+
+
+def test_dispatch_idempotent_on_key():
+    store = _store()
+    store.create_operation(_op_data())
+    service, executor = _make(store)
+    first = service.dispatch_job(
+        operation_slug="test.restart-thing", args={"target": "a"},
+        idempotency_key="k1",
+    )
+    second = service.dispatch_job(
+        operation_slug="test.restart-thing", args={"target": "b"},
+        idempotency_key="k1",
+    )
+    assert first["id"] == second["id"]
+    # Second call must NOT re-dispatch.
+    assert len(executor.dispatch_calls) == 1
+
+
+def test_dispatch_marks_job_failed_when_executor_unavailable():
+    store = _store()
+    store.create_operation(_op_data())
+    service, executor = _make(store)
+    executor._available = False
+    try:
+        service.dispatch_job(
+            operation_slug="test.restart-thing", args={"target": "a"},
+            idempotency_key="k1",
+        )
+    except OpsDispatchError as exc:
+        assert exc.code == "executor_unavailable"
+    # Job row should be FAILED with a useful reason.
+    jobs = store.list_jobs(operation_slug="test.restart-thing")
+    assert len(jobs) == 1
+    assert jobs[0].state == JOB_FAILED
+    assert "not available" in (jobs[0].error_text or "")
+
+
+def test_dispatch_marks_job_failed_when_executor_raises():
+    store = _store()
+    store.create_operation(_op_data())
+    service, executor = _make(store)
+    executor._dispatch_error = "ssh: connection refused"
+    try:
+        service.dispatch_job(
+            operation_slug="test.restart-thing", args={"target": "a"},
+            idempotency_key="k1",
+        )
+    except OpsDispatchError as exc:
+        assert exc.code == "dispatch_failed"
+        assert "connection refused" in str(exc)
+    jobs = store.list_jobs(operation_slug="test.restart-thing")
+    assert jobs[0].state == JOB_FAILED
+
+
+def test_get_job_status_reconciles_running_to_succeeded():
+    store = _store()
+    store.create_operation(_op_data())
+    service, executor = _make(store)
+    dispatched = service.dispatch_job(
+        operation_slug="test.restart-thing", args={"target": "a"},
+        idempotency_key="k1",
+    )
+    executor.next_reconcile = ReconcileResult(
+        state="succeeded", exit_code=0, output_tail="ok\n",
+        error=None, started_at="2026-01-01T00:00:00Z",
+        finished_at="2026-01-01T00:00:05Z",
+    )
+    status = service.get_job_status(dispatched["id"], output_tail_bytes=1024)
+    assert status["state"] == JOB_SUCCEEDED
+    assert status["exit_code"] == 0
+    assert status["output_tail"] == "ok\n"
+
+
+def test_get_job_status_no_status_file_keeps_state():
+    store = _store()
+    store.create_operation(_op_data())
+    service, executor = _make(store)
+    dispatched = service.dispatch_job(
+        operation_slug="test.restart-thing", args={"target": "a"},
+        idempotency_key="k1",
+    )
+    executor.next_reconcile = ReconcileResult(
+        state=None, exit_code=None, output_tail=None, error=None,
+        started_at=None, finished_at=None,
+    )
+    status = service.get_job_status(dispatched["id"])
+    # Still DISPATCHING (no state change; touch_reconcile ran).
+    assert status["state"] == JOB_DISPATCHING
+
+
+def test_get_job_status_terminal_is_no_op():
+    store = _store()
+    store.create_operation(_op_data())
+    service, executor = _make(store)
+    dispatched = service.dispatch_job(
+        operation_slug="test.restart-thing", args={"target": "a"},
+        idempotency_key="k1",
+    )
+    # Mark terminal directly.
+    store.mark_terminal(dispatched["id"], state=JOB_SUCCEEDED, exit_code=0)
+    executor.next_reconcile = None  # would raise if called
+    status = service.get_job_status(dispatched["id"])
+    assert status["state"] == JOB_SUCCEEDED
+    # And reconcile was NOT invoked.
+    assert executor.reconcile_calls == []
+
+
+def test_get_job_status_unknown_returns_none():
+    store = _store()
+    service, _ = _make(store)
+    assert service.get_job_status("nope") is None
+
+
+def test_list_operations_for_agent_hides_disabled():
+    store = _store()
+    store.create_operation(_op_data(slug="live", enabled=True))
+    store.create_operation(_op_data(slug="dark", enabled=False))
+    service, _ = _make(store)
+    slugs = [row["slug"] for row in service.list_operations_for_agent()]
+    assert slugs == ["live"]
+    slugs = [row["slug"] for row in service.list_operations_for_agent(include_disabled=True)]
+    assert set(slugs) == {"live", "dark"}
