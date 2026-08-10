@@ -5,7 +5,7 @@ Public surface:
 - :mod:`.models` — ``OpsOperation`` (catalog) + ``OpsJob`` (ledger) SQLModel tables
 - :mod:`.store` — ``OpsStore``: CRUD, atomic state transitions, per-slug seeding
 - :mod:`.service` — ``OpsService``: catalog validation + job dispatch orchestration
-- :mod:`.executor` — ``Executor`` ABC + ``SystemdSshExecutor`` (host-owned jobs)
+- :mod:`.executor` — ``Executor`` ABC + ``NohupSshExecutor`` (SSH + nohup, no host runner)
 - :mod:`.seeds` — canonical operation rows (per-slug insert-if-missing)
 
 Why this exists (TASK-639 invariants):
@@ -15,13 +15,13 @@ Why this exists (TASK-639 invariants):
 2. The agent never supplies arbitrary shell. ``ops_run`` accepts only a slug
    + JSON-Schema-validated args. Args become ``OPS_ARG_<NAME>`` env vars for
    the operator-authored script.
-3. Jobs execute as host-owned systemd units (``systemd-run --user``) so an
-   ``app`` / ``claude-code-bridge`` / ``redis`` restart cannot kill the child.
+3. Jobs execute detached on the host via ``nohup`` over SSH, so an ``app`` /
+   ``claude-code-bridge`` / ``redis`` restart cannot kill the child.
 4. Job records snapshot the operation version + script hash at dispatch —
    later edits to the catalog never mutate an in-flight job.
 """
 
-from .executor import Executor, ExecutorError, SystemdSshExecutor
+from .executor import Executor, ExecutorError, NohupSshExecutor
 from .models import (
     JOB_CANCELLED,
     JOB_DISPATCHING,
@@ -47,7 +47,7 @@ __all__ = [
     "OpsDispatchError",
     "Executor",
     "ExecutorError",
-    "SystemdSshExecutor",
+    "NohupSshExecutor",
     "validate_args",
     "ArgValidationError",
     "JOB_QUEUED",

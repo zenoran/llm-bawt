@@ -22,7 +22,7 @@ import json
 from typing import Any
 
 from .models import (
-    EXECUTOR_SYSTEMD_SSH,
+    EXECUTOR_NOHUP_SSH,
     RISK_CRITICAL,
     RISK_HIGH,
     RISK_LOW,
@@ -72,7 +72,7 @@ _LLM_BAWT_SEEDS: list[dict[str, Any]] = [
             "when calling from an active chat."
         ),
         "enabled": False,
-        "executor_kind": EXECUTOR_SYSTEMD_SSH,
+        "executor_kind": EXECUTOR_NOHUP_SSH,
         "target_host": _ECHO_HOST,
         "working_directory": _LLM_BAWT_DIR,
         "command_script": (
@@ -98,7 +98,7 @@ _LLM_BAWT_SEEDS: list[dict[str, Any]] = [
             "explicit dedicated ops."
         ),
         "enabled": False,
-        "executor_kind": EXECUTOR_SYSTEMD_SSH,
+        "executor_kind": EXECUTOR_NOHUP_SSH,
         "target_host": _ECHO_HOST,
         "working_directory": _LLM_BAWT_DIR,
         "command_script": (
@@ -136,7 +136,7 @@ _LLM_BAWT_SEEDS: list[dict[str, Any]] = [
             "explicit operator approval each time."
         ),
         "enabled": False,
-        "executor_kind": EXECUTOR_SYSTEMD_SSH,
+        "executor_kind": EXECUTOR_NOHUP_SSH,
         "target_host": _ECHO_HOST,
         "working_directory": _LLM_BAWT_DIR,
         "command_script": (
@@ -174,7 +174,7 @@ _LLM_BAWT_SEEDS: list[dict[str, Any]] = [
             "explicit operator approval each time."
         ),
         "enabled": False,
-        "executor_kind": EXECUTOR_SYSTEMD_SSH,
+        "executor_kind": EXECUTOR_NOHUP_SSH,
         "target_host": _ECHO_HOST,
         "working_directory": _LLM_BAWT_DIR,
         "command_script": (
@@ -204,7 +204,7 @@ _BAWTHUB_SEEDS: list[dict[str, Any]] = [
         "title": "Restart bawthub backend",
         "description": "Restart the bawthub Python voice/agent backend container.",
         "enabled": False,
-        "executor_kind": EXECUTOR_SYSTEMD_SSH,
+        "executor_kind": EXECUTOR_NOHUP_SSH,
         "target_host": _ECHO_HOST,
         "working_directory": _BAWTHUB_DIR,
         "command_script": (
@@ -226,7 +226,7 @@ _BAWTHUB_SEEDS: list[dict[str, Any]] = [
         "title": "Restart bawthub frontend (HMR)",
         "description": "Restart the bawthub Vite/Hono HMR container.",
         "enabled": False,
-        "executor_kind": EXECUTOR_SYSTEMD_SSH,
+        "executor_kind": EXECUTOR_NOHUP_SSH,
         "target_host": _ECHO_HOST,
         "working_directory": _BAWTHUB_DIR,
         "command_script": (
@@ -252,7 +252,7 @@ _BAWTHUB_SEEDS: list[dict[str, Any]] = [
             "a broken build kills the public site."
         ),
         "enabled": False,
-        "executor_kind": EXECUTOR_SYSTEMD_SSH,
+        "executor_kind": EXECUTOR_NOHUP_SSH,
         "target_host": _ECHO_HOST,
         "working_directory": _BAWTHUB_DIR,
         "command_script": (
@@ -286,7 +286,7 @@ _UNRAID_CONTAINER_SEEDS: list[dict[str, Any]] = [
             "runnable — every other name is rejected inside the script."
         ),
         "enabled": False,
-        "executor_kind": EXECUTOR_SYSTEMD_SSH,
+        "executor_kind": EXECUTOR_NOHUP_SSH,
         "target_host": _ECHO_HOST,
         "working_directory": "/home/nick",
         "command_script": (

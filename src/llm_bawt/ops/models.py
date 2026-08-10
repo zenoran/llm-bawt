@@ -47,10 +47,10 @@ RISK_HIGH = "high"
 RISK_CRITICAL = "critical"
 
 # ---------------------------------------------------------------------------
-# Executor kinds (only systemd_ssh is implemented in Slice C)
+# Executor kinds (only nohup_ssh is implemented — see :mod:`.executor`)
 # ---------------------------------------------------------------------------
 
-EXECUTOR_SYSTEMD_SSH = "systemd_ssh"
+EXECUTOR_NOHUP_SSH = "nohup_ssh"
 
 # ---------------------------------------------------------------------------
 # Job state machine
@@ -113,10 +113,10 @@ class OpsOperation(SQLModel, table=True):
         default=False,
         sa_column=Column(Boolean, nullable=False, server_default="false", index=True),
     )
-    # Only systemd_ssh in Slice C. Extra executor kinds land alongside their
-    # implementation modules.
+    # Only nohup_ssh is implemented. Extra executor kinds land alongside
+    # their implementation modules.
     executor_kind: str = Field(
-        default=EXECUTOR_SYSTEMD_SSH,
+        default=EXECUTOR_NOHUP_SSH,
         sa_column=Column(String(32), nullable=False),
     )
     # Where the systemd unit runs. For LAN work this is "nick@172.18.0.1"
@@ -416,7 +416,7 @@ __all__ = [
     "RISK_MEDIUM",
     "RISK_HIGH",
     "RISK_CRITICAL",
-    "EXECUTOR_SYSTEMD_SSH",
+    "EXECUTOR_NOHUP_SSH",
     "JOB_QUEUED",
     "JOB_DISPATCHING",
     "JOB_RUNNING",

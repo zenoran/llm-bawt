@@ -18,11 +18,11 @@ from .executor import (
     DispatchResult,
     Executor,
     ExecutorError,
+    NohupSshExecutor,
     ReconcileResult,
-    SystemdSshExecutor,
 )
 from .models import (
-    EXECUTOR_SYSTEMD_SSH,
+    EXECUTOR_NOHUP_SSH,
     JOB_DISPATCHING,
     JOB_FAILED,
     JOB_LOST,
@@ -99,14 +99,14 @@ class OpsService:
     ) -> None:
         self.store = store
         self._executors: dict[str, Executor] = {}
-        default = executor or SystemdSshExecutor()
+        default = executor or NohupSshExecutor()
         self._executors[default.kind()] = default
 
     def register_executor(self, executor: Executor) -> None:
         self._executors[executor.kind()] = executor
 
     def _resolve_executor(self, op: OpsOperation) -> Executor:
-        kind = (op.executor_kind or EXECUTOR_SYSTEMD_SSH).strip()
+        kind = (op.executor_kind or EXECUTOR_NOHUP_SSH).strip()
         ex = self._executors.get(kind)
         if ex is None:
             raise OpsDispatchError(
