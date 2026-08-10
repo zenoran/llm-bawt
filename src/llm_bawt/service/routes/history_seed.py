@@ -8,6 +8,32 @@ from ..logging import get_service_logger
 router = APIRouter()
 log = get_service_logger(__name__)
 
+def cap_seed_contents(
+    role_content_pairs: list[tuple[str, str]], cap: int
+) -> tuple[list[str], int]:
+    """Apply the per-message seed char cap (TASK-785). Pure, unit-tested.
+
+    Truncates oversized ``user``/``assistant`` contents at ``cap`` chars with a
+    marker pointing at durable chat history. Other roles (``summary`` — already
+    the dense representation, bounded by summary_count) pass through untouched.
+    ``cap <= 0`` disables (pre-785 behavior). Returns (contents, trimmed_count).
+    """
+    contents: list[str] = []
+    trimmed = 0
+    for role, content in role_content_pairs:
+        if cap <= 0 or len(content) <= cap or role not in ("user", "assistant"):
+            contents.append(content)
+            continue
+        dropped = len(content) - cap
+        contents.append(
+            content[:cap].rstrip()
+            + f"\n[... trimmed {dropped} chars for session seed — "
+            "full text is in durable chat history (messages_get)]"
+        )
+        trimmed += 1
+    return contents, trimmed
+
+
 def build_context_seed(
     bot_id: str, model: str | None, service, session_id: str | None = None
 ) -> dict:
@@ -27,8 +53,6 @@ def build_context_seed(
     Returns ``{bot_id, model, budget_tokens, messages:[{role,content,timestamp}],
     stats:{...}}``. Raises on failure (callers decide whether to swallow).
     """
-    from ...utils.history import estimate_messages_tokens
-
     effective_bot_id = bot_id or service._default_bot
     # Pass the caller's model through AS-IS (usually None for a preview). Do NOT
     # coalesce to the service default here: _resolve_request_model already
@@ -81,9 +105,33 @@ def build_context_seed(
     )
     seed_msgs = payload.seed_messages
 
+    # TASK-785: cap per-message size in the seed. Inter-bot task-report
+    # deliveries run 12-16k chars each and were seeded verbatim, tripling the
+    # fresh-session base cost. Oversized user/assistant rows are truncated with
+    # a marker pointing at durable chat history; summaries are exempt (they are
+    # already the dense representation and capped by summary_count). Applied
+    # here — the single choke point for BOTH live delivery
+    # (maybe_build_session_seed) and the /v1/history/context-seed preview — so
+    # preview and delivery can never disagree. 0 = no cap.
+    try:
+        seed_cap = int(
+            llm_bawt.config_resolver.resolve_config_setting(
+                "seed_message_max_chars"
+            ).value
+        )
+    except Exception:
+        from ...setting_definitions import setting_default
+
+        seed_cap = int(setting_default("seed_message_max_chars", 3000) or 0)
+
+    seed_contents, trimmed_count = cap_seed_contents(
+        [(m.role, m.content or "") for m in seed_msgs], seed_cap
+    )
+
     summary_count = sum(1 for m in seed_msgs if m.role == "summary")
     convo_count = sum(1 for m in seed_msgs if m.role in ("user", "assistant"))
-    approx_tokens = estimate_messages_tokens(seed_msgs)
+    # Same per-message estimate as estimate_messages_tokens, on trimmed content.
+    approx_tokens = sum(len(c) // 4 + 4 for c in seed_contents)
     ts_values = [
         float(getattr(m, "timestamp", 0.0) or 0.0)
         for m in seed_msgs
@@ -119,19 +167,21 @@ def build_context_seed(
             "history_tokens": _eff("history_tokens", 12000),
             "history_max_age_hours": _eff("history_max_age_hours", 0),
             "summary_count": _eff("summary_count", 5),
+            "seed_message_max_chars": _eff("seed_message_max_chars", 3000),
         },
         "messages": [
             {
                 "role": m.role,
-                "content": m.content or "",
+                "content": content,
                 "timestamp": float(getattr(m, "timestamp", 0.0) or 0.0),
             }
-            for m in seed_msgs
+            for m, content in zip(seed_msgs, seed_contents)
         ],
         "stats": {
             "summary_count": summary_count,
             "message_count": convo_count,
             "total_count": len(seed_msgs),
+            "trimmed_count": trimmed_count,
             "approx_tokens": approx_tokens,
             "oldest_timestamp": oldest,
             "newest_timestamp": newest,

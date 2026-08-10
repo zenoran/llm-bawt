@@ -155,6 +155,22 @@ SETTING_DEFINITIONS: dict[str, SettingDefinition] = {
         ),
         legacy_keys=("summarization_max_in_context",),
     ),
+    "seed_message_max_chars": SettingDefinition(
+        key="seed_message_max_chars",
+        type="int",
+        default=3000,
+        applies_to=BOT_TYPES_ALL,
+        storage=STORAGE_RUNTIME_SETTING,
+        label="Seed per-message char cap",
+        help=(
+            "Max characters any single message may occupy in a fresh-session "
+            "continuity seed (TASK-785). Oversized messages (typically inter-bot "
+            "task-report deliveries, 12-16k chars each) are truncated with a "
+            "marker pointing at full chat history instead of being seeded "
+            "verbatim. Applies to the SEED delivery only — inline chat context "
+            "and rolling summaries are untouched. 0 = no cap (pre-785 behavior)."
+        ),
+    ),
     "compact_context": SettingDefinition(
         key="compact_context",
         type="bool",
