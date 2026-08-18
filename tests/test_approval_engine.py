@@ -56,6 +56,33 @@ def test_derive_subject_missing_field_is_empty():
     assert derive_subject("Write", {"x": 1}, "file_path") == ""
 
 
+def test_derive_subject_ops_run_is_canonical_and_ignores_idempotency_key():
+    subject = derive_subject(
+        "mcp__bawthub__ops_run",
+        {
+            "idempotency_key": "tool-use-123",
+            "args": {"z": 2, "a": "x"},
+            "operation": "llm-bawt.restart-bridge",
+        },
+        None,
+    )
+    assert subject == 'operation=llm-bawt.restart-bridge args={"a":"x","z":2}'
+
+
+def test_derive_subject_ops_run_missing_args_is_empty_object():
+    assert derive_subject("ops_run", {"operation": "llm-bawt.restart-redis"}, None) == (
+        "operation=llm-bawt.restart-redis args={}"
+    )
+
+
+def test_derive_subject_ops_run_explicit_field_still_wins():
+    assert derive_subject(
+        "ops_run",
+        {"operation": "llm-bawt.restart-app", "args": {}},
+        "operation",
+    ) == "llm-bawt.restart-app"
+
+
 # ---- matcher semantics -----------------------------------------------------
 
 def test_always_matches():

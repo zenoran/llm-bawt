@@ -55,6 +55,17 @@ class ChatRequestAnimation(BaseModel):
     description: str | None = None
 
 
+class McpToolResultContinuation(BaseModel):
+    """Server-owned actual result of an already-executed approved MCP call."""
+
+    kind: Literal["mcp_tool_result"] = "mcp_tool_result"
+    approval_request_id: str
+    original_tool_use_id: str | None = None
+    tool_name: str
+    result: Any
+    is_error: bool = False
+
+
 class ChatCompletionRequest(BaseModel):
     """OpenAI-compatible chat completion request."""
     model: str | None = None  # Optional, will use service default if not specified
@@ -110,6 +121,11 @@ class ChatCompletionRequest(BaseModel):
     # carried the answer back to the agent.
     parent_turn_id: str | None = Field(default=None, description="TASK-269: the awaiting turn this continuation answers")
     answered_question_id: str | None = Field(default=None, description="TASK-269: tool_use_id of the question this continuation answers")
+    continuation_payload: McpToolResultContinuation | None = Field(
+        default=None,
+        exclude=True,
+        description="Server-owned persisted MCP result delivered on a continuation turn.",
+    )
     # TASK-214: animations + avatar visibility now flow on each request.
     # The avatar catalog is owned by the bawthub frontend; llm-bawt is stateless
     # w.r.t. animations. `avatar_visible` is currently informational (consumed

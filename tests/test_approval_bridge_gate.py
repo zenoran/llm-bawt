@@ -13,6 +13,8 @@ from __future__ import annotations
 import asyncio
 import time
 
+from agent_bridge.mcp_call_context import MCP_CALL_CONTEXT_KEY, verify_mcp_call_context
+
 try:
     from claude_code_bridge.bridge import ClaudeCodeBridge
     from claude_agent_sdk.types import PermissionResultAllow, PermissionResultDeny
@@ -234,6 +236,46 @@ def test_pre_tool_use_hook_gates_dangerous_bash():
     assert asyncio.run(run("ls")) == {}                                  # allow
     assert _hook_decision(asyncio.run(run("dd of=/dev/sda"))) == "deny"  # deny
     assert _hook_decision(asyncio.run(run("rm -rf /home/x"))) == "deny"  # require→deny
+
+
+def test_pre_tool_use_hook_stamps_bawthub_mcp_without_bridge_gating():
+    _skip_if_no_sdk()
+    b = _bridge()
+    capability = "opaque-turn-capability"
+    hook = b._make_pre_tool_use_hook(
+        request_id="req-1",
+        session_key="snark:nick",
+        seq_holder=[0],
+        task_turn_capability=capability,
+    )
+    clean = {"operation": "llm-bawt.restart-app", "args": {}}
+
+    async def run():
+        return await hook(
+            {
+                "tool_name": "mcp__bawthub__ops_run",
+                "tool_input": clean,
+                "tool_use_id": "toolu-1",
+            },
+            "toolu-1",
+            {},
+        )
+
+    output = asyncio.run(run())
+    specific = output["hookSpecificOutput"]
+    assert "permissionDecision" not in specific
+    updated = specific["updatedInput"]
+    assert updated["operation"] == "llm-bawt.restart-app"
+    stamp = updated[MCP_CALL_CONTEXT_KEY]
+    verified = verify_mcp_call_context(
+        capability=capability,
+        tool_name="ops_run",
+        tool_input=clean,
+        raw_context=stamp,
+    )
+    assert verified.tool_use_id == "toolu-1"
+    assert verified.agent_request_id == "req-1"
+    assert verified.session_key == "snark:nick"
 
 
 def test_pre_tool_use_hook_fails_open_on_unexpected_error():

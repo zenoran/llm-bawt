@@ -41,8 +41,13 @@ def reset_current_task_turn_capability(token: Token) -> None:
     _current_capability.reset(token)
 
 
+def current_task_turn_capability() -> str | None:
+    """Return the opaque capability bound to this HTTP request, if any."""
+    return _current_capability.get()
+
+
 def current_task_turn_context() -> TaskTurnContext:
-    return open_task_turn_context(_current_capability.get())
+    return open_task_turn_context(current_task_turn_capability())
 
 
 def task_turn_context_header_name() -> str:

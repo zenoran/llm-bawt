@@ -144,6 +144,7 @@ class BackgroundService(
         from .turn_logs import TurnLogStore
         self._turn_log_store = TurnLogStore(config)
         self._inter_bot_dispatcher: Any | None = None
+        self._mcp_continuation_task: asyncio.Task | None = None
         # Persistent registry of in-flight AskUserQuestion pauses.  Lets the
         # chat UI hydrate open pickers on page load / second tab / after a
         # bridge restart instead of relying solely on the live SSE event.

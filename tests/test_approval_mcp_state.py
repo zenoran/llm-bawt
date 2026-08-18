@@ -94,6 +94,50 @@ def _approve(store, request_id):
         session.commit()
 
 
+# ---- default policy seeding ------------------------------------------------
+
+
+def test_seed_defaults_adds_ops_rules_and_is_idempotent():
+    store = _store()
+    assert store.seed_defaults() == 9  # six legacy Bash rules + three ops rules
+    assert store.seed_defaults() == 0
+    rows = store.list_all()
+    ops_rows = [row for row in rows if row.tool_name == "ops_run"]
+    assert [row.id for row in ops_rows] == [
+        "seed-ops-run-bridge-restart",
+        "seed-ops-run-redis-restart",
+        "seed-ops-run-require-approval",
+    ]
+    assert ops_rows[-1].matcher_type == "always"
+    assert ops_rows[-1].action == "require_approval"
+
+
+def test_seed_defaults_preserves_operator_edited_ops_rule():
+    store = _store()
+    store.seed_defaults()
+    edited = store.update(
+        "seed-ops-run-require-approval",
+        {"enabled": False, "approval_prompt": "Nick changed this"},
+        actor="nick",
+    )
+    assert edited is not None
+    assert store.seed_defaults() == 0
+    preserved = store.get("seed-ops-run-require-approval")
+    assert preserved is not None
+    assert preserved.enabled is False
+    assert preserved.approval_prompt == "Nick changed this"
+    assert preserved.version == 2
+    assert preserved.updated_by == "nick"
+
+
+def test_seed_defaults_adds_missing_ops_rule_to_existing_policy_table():
+    store = _store()
+    store.create({"tool_name": "Bash", "matcher_type": "always"}, actor="nick")
+    assert store.seed_defaults() == 3
+    assert store.get("seed-ops-run-require-approval") is not None
+    assert len(store.list_all()) == 4
+
+
 # ---- record_mcp_request ----------------------------------------------------
 
 def test_record_mcp_writes_kind_mcp_row_with_pending_execution():

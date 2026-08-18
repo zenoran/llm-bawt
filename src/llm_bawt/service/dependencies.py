@@ -48,7 +48,14 @@ _service: "BackgroundService | None" = None
 # --------------------------------------------------------------------------
 # Process-wide store singletons (TASK-202: prevent connection-pool leaks).
 # --------------------------------------------------------------------------
-_store_lock = threading.Lock()
+# Re-entrant by requirement, not convenience: ``factory()`` runs while the
+# lock is held, and a factory may resolve a sibling singleton through this
+# same helper (``get_ops_service`` builds on ``get_ops_store``). With a plain
+# Lock that nesting self-deadlocks the calling thread forever — and because
+# the MCP tools await these accessors on the event loop, one such call wedges
+# the whole MCP server. A cache hit on the inner store hides it, so the
+# deadlock only fires on the paths where the inner store isn't warm yet.
+_store_lock = threading.RLock()
 _store_cache: dict[tuple[str, int], Any] = {}
 
 

@@ -37,6 +37,10 @@ from agent_bridge.approval import (
     PolicyBundle,
     evaluate as evaluate_policies,
 )
+from agent_bridge.mcp_call_context import (
+    MCP_CALL_CONTEXT_KEY,
+    mint_mcp_call_context,
+)
 from agent_bridge.events import AgentEvent, AgentEventKind, synthesize_event_id
 from agent_bridge.publisher import COMMANDS_STREAM, RedisPublisher
 from agent_bridge.session_queue import SessionQueue
@@ -592,6 +596,7 @@ class ClaudeApprovalMixin:
         request_id: str,
         session_key: str,
         seq_holder: list[int],
+        task_turn_capability: str | None = None,
     ):
         """Build the per-run PreToolUse hook bound to this turn (TASK-292).
 
@@ -613,6 +618,32 @@ class ClaudeApprovalMixin:
                 if not isinstance(tool_input, dict):
                     tool_input = {}
                 tuid = (tool_use_id or input_data.get("tool_use_id") or "")
+                # TASK-639: this first-party MCP server is the authoritative
+                # approval interception point. The bridge stamps exact call
+                # identity into updatedInput but must not also policy-gate it,
+                # otherwise one policy creates two approval cards.
+                if tool_name.startswith("mcp__bawthub__"):
+                    if not task_turn_capability:
+                        # Generic/manual calls can still reach the server without
+                        # continuation context; ordinary app turns should always
+                        # have the capability. Do not fabricate authority here.
+                        return {}
+                    updated_input = dict(tool_input)
+                    updated_input[MCP_CALL_CONTEXT_KEY] = mint_mcp_call_context(
+                        capability=task_turn_capability,
+                        tool_name=tool_name.rsplit("__", 1)[-1],
+                        tool_input=tool_input,
+                        tool_use_id=tuid,
+                        agent_request_id=request_id,
+                        session_key=session_key,
+                        backend=self._backend_name,
+                    )
+                    return {
+                        "hookSpecificOutput": {
+                            "hookEventName": "PreToolUse",
+                            "updatedInput": updated_input,
+                        }
+                    }
                 return await self._evaluate_tool_gate_hook(
                     tool_name, tool_input, tuid,
                     request_id, session_key, seq_holder,

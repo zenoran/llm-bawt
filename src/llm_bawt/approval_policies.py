@@ -22,7 +22,7 @@ import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
-from sqlalchemy import Boolean, Column, DateTime, Integer, String, Text, text
+from sqlalchemy import Boolean, Column, DateTime, Integer, String, Text, and_, or_, text, update
 from sqlmodel import Field, Session, SQLModel, select
 
 from agent_bridge.approval import (
@@ -527,12 +527,27 @@ class ToolApprovalPolicyStore:
         return out
 
     def create(self, data: dict[str, Any], actor: str | None = None) -> ToolApprovalPolicy:
+        return self._create_with_id(_new_id(), data, actor=actor)
+
+    def _create_with_id(
+        self,
+        policy_id: str,
+        data: dict[str, Any],
+        *,
+        actor: str | None = None,
+    ) -> ToolApprovalPolicy:
+        """Create one policy with a caller-selected stable id.
+
+        Public CRUD still generates opaque ids. Catalog defaults use this seam
+        so each seed is independently insert-if-missing and never overwrites an
+        operator-edited row on later startups.
+        """
         if self.engine is None:
             raise RuntimeError("Tool approval policies DB unavailable")
         clean = self._clean(data)
         now = _utcnow()
         row = ToolApprovalPolicy(
-            id=_new_id(),
+            id=policy_id,
             enabled=bool(clean.get("enabled", True)),
             backend_scope=str(clean.get("backend_scope", "*") or "*"),
             tool_name=str(clean.get("tool_name", "*") or "*"),
@@ -817,29 +832,37 @@ class ToolApprovalPolicyStore:
         if self.engine is None:
             return None
         now = _utcnow()
+        stale_before = now - timedelta(seconds=max(0, lease_seconds))
         with Session(self.engine) as session:
-            row = session.get(ToolApprovalRequest, request_id)
-            if row is None:
-                return None
-            if row.status != REQ_APPROVED:
-                return None
-            # Already terminal — never re-execute.
-            if row.execution_state in (EXEC_SUCCEEDED, EXEC_FAILED, EXEC_SKIPPED):
-                return None
-            # Live lease held by another worker?
-            if row.execution_state == EXEC_RUNNING:
-                started = _as_aware_utc(row.execution_started_at)
-                if started is not None and row.result_json is None:
-                    elapsed = (now - started).total_seconds()
-                    if elapsed < lease_seconds:
-                        return None
-            row.execution_state = EXEC_RUNNING
-            row.execution_started_at = now
-            row.execution_attempts = int(row.execution_attempts or 0) + 1
-            session.add(row)
+            claimable = and_(
+                ToolApprovalRequest.id == request_id,
+                ToolApprovalRequest.status == REQ_APPROVED,
+                ToolApprovalRequest.result_json.is_(None),
+                or_(
+                    ToolApprovalRequest.execution_state == EXEC_PENDING,
+                    and_(
+                        ToolApprovalRequest.execution_state == EXEC_RUNNING,
+                        or_(
+                            ToolApprovalRequest.execution_started_at.is_(None),
+                            ToolApprovalRequest.execution_started_at <= stale_before,
+                        ),
+                    ),
+                ),
+            )
+            stmt = (
+                update(ToolApprovalRequest)
+                .where(claimable)
+                .values(
+                    execution_state=EXEC_RUNNING,
+                    execution_started_at=now,
+                    execution_attempts=ToolApprovalRequest.execution_attempts + 1,
+                )
+            )
+            result = session.exec(stmt)
             session.commit()
-            session.refresh(row)
-            return row
+            if int(result.rowcount or 0) != 1:
+                return None
+            return session.get(ToolApprovalRequest, request_id)
 
     def complete_mcp_execution(
         self,
@@ -923,30 +946,36 @@ class ToolApprovalPolicyStore:
         if self.engine is None:
             return None
         now = _utcnow()
+        stale_before = now - timedelta(seconds=max(0, lease_seconds))
         with Session(self.engine) as session:
-            row = session.get(ToolApprovalRequest, request_id)
-            if row is None:
-                return None
-            if row.continuation_state == CONT_DELIVERED:
-                return None
-            if row.continuation_state == CONT_DISPATCHING:
-                # Reclaim only after the lease expires and delivery didn't complete.
-                if row.continuation_delivered_at is not None:
-                    return None
-                next_at = _as_aware_utc(row.continuation_next_attempt_at)
-                if next_at is not None:
-                    elapsed = (now - next_at).total_seconds()
-                    if elapsed < lease_seconds:
-                        return None
-            if row.continuation_state not in (CONT_PENDING, CONT_DISPATCHING):
-                return None
-            row.continuation_state = CONT_DISPATCHING
-            row.continuation_next_attempt_at = now
-            row.continuation_attempts = int(row.continuation_attempts or 0) + 1
-            session.add(row)
+            claimable = and_(
+                ToolApprovalRequest.id == request_id,
+                ToolApprovalRequest.continuation_delivered_at.is_(None),
+                or_(
+                    ToolApprovalRequest.continuation_state == CONT_PENDING,
+                    and_(
+                        ToolApprovalRequest.continuation_state == CONT_DISPATCHING,
+                        or_(
+                            ToolApprovalRequest.continuation_next_attempt_at.is_(None),
+                            ToolApprovalRequest.continuation_next_attempt_at <= stale_before,
+                        ),
+                    ),
+                ),
+            )
+            stmt = (
+                update(ToolApprovalRequest)
+                .where(claimable)
+                .values(
+                    continuation_state=CONT_DISPATCHING,
+                    continuation_next_attempt_at=now,
+                    continuation_attempts=ToolApprovalRequest.continuation_attempts + 1,
+                )
+            )
+            result = session.exec(stmt)
             session.commit()
-            session.refresh(row)
-            return row
+            if int(result.rowcount or 0) != 1:
+                return None
+            return session.get(ToolApprovalRequest, request_id)
 
     def mark_continuation_delivered(
         self,
@@ -1064,23 +1093,72 @@ class ToolApprovalPolicyStore:
     # ---- seeding -----------------------------------------------------------
 
     def seed_defaults(self) -> int:
-        """Insert a conservative starter rule set if the table is empty.
+        """Insert missing starter policies without overwriting operator edits.
 
-        Only unambiguously destructive shell patterns, enabled by default —
-        a safety feature that ships disabled protects nothing. Operators can
-        disable or delete any rule from the admin UI. See docs/approval-policies.md.
+        The legacy Bash rules retain their original whole-table-empty bootstrap
+        behavior to avoid duplicating random-id seeds in existing databases.
+        TASK-639 ops rules use stable ids and are inserted independently, so a
+        newly introduced default appears on upgrade while an existing (possibly
+        operator-edited or disabled) row is preserved byte-for-byte.
         """
         if self.engine is None:
             raise RuntimeError("Tool approval policies DB unavailable")
-        if self.list_all():
-            return 0
-        defaults = _DEFAULT_POLICIES
-        for d in defaults:
-            self.create(d, actor="seed")
-        return len(defaults)
+        seeded = 0
+        if not self.list_all():
+            for default in _DEFAULT_POLICIES:
+                self.create(default, actor="seed")
+                seeded += 1
+        for default in _OPS_DEFAULT_POLICIES:
+            policy_id = str(default["id"])
+            if self.get(policy_id) is not None:
+                continue
+            payload = {key: value for key, value in default.items() if key != "id"}
+            self._create_with_id(policy_id, payload, actor="seed")
+            seeded += 1
+        return seeded
 
 
 # Conservative default rule set (TASK-296). High/critical, shell-destructive only.
+_OPS_DEFAULT_POLICIES: list[dict[str, Any]] = [
+    {
+        "id": "seed-ops-run-bridge-restart",
+        "backend_scope": "*",
+        "tool_name": "ops_run",
+        "matcher_type": "prefix",
+        "pattern": "operation=llm-bawt.restart-bridge ",
+        "action": "require_approval",
+        "severity": "high",
+        "category": "restart",
+        "approval_prompt": "Restarting an agent bridge kills its active sessions. Approve?",
+        "order": 5,
+    },
+    {
+        "id": "seed-ops-run-redis-restart",
+        "backend_scope": "*",
+        "tool_name": "ops_run",
+        "matcher_type": "prefix",
+        "pattern": "operation=llm-bawt.restart-redis ",
+        "action": "require_approval",
+        "severity": "critical",
+        "category": "restart",
+        "approval_prompt": "Restarting Redis interrupts the shared agent event bus. Approve?",
+        "order": 6,
+    },
+    {
+        "id": "seed-ops-run-require-approval",
+        "backend_scope": "*",
+        "tool_name": "ops_run",
+        "matcher_type": "always",
+        "pattern": "",
+        "action": "require_approval",
+        "severity": "medium",
+        "category": "operations",
+        "approval_prompt": "Run this operator-configured operation?",
+        "order": 100,
+    },
+]
+
+
 _DEFAULT_POLICIES: list[dict[str, Any]] = [
     {
         "backend_scope": "*", "tool_name": "Bash", "matcher_type": "regex",

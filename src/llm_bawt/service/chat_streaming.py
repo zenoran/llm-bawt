@@ -415,6 +415,10 @@ class ChatStreamingMixin(ChatStreamingBridgeMixin):
                     "inter_bot_seed_session_id": getattr(
                         request, "inter_bot_seed_session_id", None
                     ),
+                    "continuation_payload": (
+                        request.continuation_payload.model_dump()
+                        if getattr(request, "continuation_payload", None) else None
+                    ),
                 }.items()
                 if value
             },

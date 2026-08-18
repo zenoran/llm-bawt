@@ -112,12 +112,41 @@ def _tool_tail(tool_name: str) -> str:
 
 # Per-tool default field to derive the subject from, when a policy leaves
 # ``field`` blank. Bash/shell calls match against the command string; anything
-# else falls back to the whole compact-JSON input (``*``).
+# else falls back to the whole compact-JSON input (``*``). ``ops_run`` is
+# special-cased below because its policy subject deliberately excludes the
+# caller-provided idempotency key.
 _DEFAULT_FIELD_BY_TOOL = {
     "Bash": "command",
     "BashOutput": "command",
     "Shell": "command",
 }
+
+
+def _derive_ops_run_subject(tool_input: Any) -> str:
+    """Canonical policy/audit subject for a catalogued operation call.
+
+    The operation slug leads so exact/prefix policies stay readable and stable.
+    Args use compact sorted JSON; the idempotency key is transport metadata and
+    must not change the approval subject or grant key.
+    """
+    if not isinstance(tool_input, dict):
+        return "operation= args={}"
+    operation = tool_input.get("operation", "")
+    if operation is None:
+        operation = ""
+    elif not isinstance(operation, str):
+        operation = json.dumps(operation, sort_keys=True, ensure_ascii=False, default=str)
+    args = tool_input.get("args")
+    if not isinstance(args, dict):
+        args = {}
+    args_json = json.dumps(
+        args,
+        sort_keys=True,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        default=str,
+    )
+    return f"operation={operation.strip()} args={args_json}"
 
 
 def derive_subject(tool_name: str, tool_input: Any, field_name: str | None) -> str:
@@ -131,8 +160,11 @@ def derive_subject(tool_name: str, tool_input: Any, field_name: str | None) -> s
       JSON so a policy can match against any part of it.
     """
     fld = (field_name or "").strip()
+    tool_tail = _tool_tail(tool_name)
+    if not fld and tool_tail == "ops_run":
+        return _derive_ops_run_subject(tool_input)
     if not fld:
-        fld = _DEFAULT_FIELD_BY_TOOL.get(_tool_tail(tool_name), "*")
+        fld = _DEFAULT_FIELD_BY_TOOL.get(tool_tail, "*")
 
     if fld != "*" and isinstance(tool_input, dict):
         val = tool_input.get(fld, "")

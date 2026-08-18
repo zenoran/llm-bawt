@@ -325,6 +325,7 @@ class ClaudeSendMixin(ClaudeStreamMixin, ClaudeUsageMixin, ClaudeResultMixin):
                         request_id=request_id,
                         session_key=session_key,
                         seq_holder=seq_holder,
+                        task_turn_capability=task_turn_capability,
                     )
                     post_tool_use_cb = self._make_post_tool_use_hook(
                         session_key=session_key,

@@ -92,6 +92,38 @@ def test_concurrent_media_store_access_constructs_once(monkeypatch) -> None:
     assert all(store is stores[0] for store in stores)
 
 
+def test_nested_store_factory_does_not_deadlock(monkeypatch) -> None:
+    """A factory may resolve a sibling singleton through the same helper.
+
+    ``get_ops_service``'s factory calls ``get_ops_store``, so the build runs
+    while the store lock is already held. A non-reentrant lock deadlocked the
+    calling thread here — and because the MCP ops tools await these accessors
+    on the event loop, that wedged the whole MCP server until restart. A warm
+    inner cache hides it, so the cold path is the one worth pinning.
+    """
+    from llm_bawt import ops
+
+    monkeypatch.setattr(ops, "OpsStore", lambda config: ("store", config))
+    monkeypatch.setattr(ops, "OpsService", lambda store: ("service", store))
+    config = object()
+
+    done = threading.Event()
+    result: list[object] = []
+
+    def build() -> None:
+        # Cold cache: the inner get_ops_store cannot take the lock-free path.
+        result.append(dependencies.get_ops_service(config))
+        done.set()
+
+    worker = threading.Thread(target=build, daemon=True)
+    worker.start()
+    assert done.wait(timeout=10), "get_ops_service deadlocked on the store lock"
+    assert result[0] == ("service", ("store", config))
+    # Both singletons must be cached, and the sibling reused rather than rebuilt.
+    assert dependencies.get_ops_service(config) is result[0]
+    assert dependencies.get_ops_store(config) is result[0][1]
+
+
 def test_memory_client_cache_is_single_flight_and_keeps_user_dimension(
     monkeypatch,
 ) -> None:

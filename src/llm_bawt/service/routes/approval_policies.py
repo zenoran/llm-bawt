@@ -11,6 +11,7 @@ from __future__ import annotations
 import json
 import logging
 import time
+from typing import Any
 
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field
@@ -26,6 +27,10 @@ from ..dependencies import (
     get_turn_log_store,
 )
 from ...approval_policies import (
+    EXEC_FAILED,
+    EXEC_SKIPPED,
+    EXEC_SUCCEEDED,
+    KIND_MCP,
     REQ_APPROVED,
     REQ_CANCELLED,
     REQ_DENIED,
@@ -167,6 +172,139 @@ async def reload_policies():
 # Request audit + resolve
 # ---------------------------------------------------------------------------
 
+
+def _decode_stored_args(row) -> dict[str, Any]:
+    try:
+        value = json.loads(row.tool_arguments_json or "{}")
+    except (json.JSONDecodeError, TypeError) as error:
+        raise RuntimeError("stored MCP tool arguments are malformed") from error
+    if not isinstance(value, dict):
+        raise RuntimeError("stored MCP tool arguments are not an object")
+    return value
+
+
+def _normalize_mcp_result(result: Any) -> Any:
+    """Convert FastMCP content blocks/results into a durable JSON value."""
+    if isinstance(result, dict):
+        return result
+    if isinstance(result, (str, int, float, bool)) or result is None:
+        return result
+    if isinstance(result, (list, tuple)):
+        normalized: list[Any] = []
+        for block in result:
+            text_value = getattr(block, "text", None)
+            if isinstance(text_value, str):
+                try:
+                    normalized.append(json.loads(text_value))
+                except json.JSONDecodeError:
+                    normalized.append(text_value)
+                continue
+            model_dump = getattr(block, "model_dump", None)
+            normalized.append(model_dump() if callable(model_dump) else str(block))
+        return normalized[0] if len(normalized) == 1 else normalized
+    model_dump = getattr(result, "model_dump", None)
+    return model_dump() if callable(model_dump) else str(result)
+
+
+def _stored_mcp_resolution(row) -> dict[str, Any]:
+    result: Any = None
+    if row.result_json:
+        try:
+            result = json.loads(row.result_json)
+        except json.JSONDecodeError:
+            result = row.result_json
+    return {
+        "ok": row.execution_state in (EXEC_SUCCEEDED, EXEC_SKIPPED),
+        "detail": "already_resolved",
+        "status": row.status,
+        "request_id": row.id,
+        "bot_id": row.bot_id,
+        "parent_turn_id": row.turn_id,
+        "already_resolved": True,
+        "request_kind": KIND_MCP,
+        "execution_state": row.execution_state,
+        "result": result,
+        "result_is_error": bool(row.result_is_error),
+        "continuation_prompt": None,
+        "server_dispatched": bool(row.continuation_capable),
+        "continuation_status": row.continuation_state,
+    }
+
+
+async def _resolve_mcp_request(store, row, *, outcome: str, message: str, resolved_by: str | None):
+    """Resolve + exactly-once execute one MCP-kind approval request."""
+    new_status = {
+        "approve": REQ_APPROVED,
+        "deny": REQ_DENIED,
+        "cancel": REQ_CANCELLED,
+        "respond": REQ_RESPONDED,
+    }[outcome]
+    updated = store.resolve_request(row.id, status=new_status, resolved_by=resolved_by)
+    if updated is None:
+        raise HTTPException(status_code=404, detail="Request disappeared during resolve")
+
+    if outcome != "approve":
+        if outcome == "cancel":
+            payload = {"status": "cancelled", "message": "The MCP call was cancelled."}
+        elif outcome == "respond":
+            payload = {
+                "status": "responded",
+                "message": message or "The user chose not to run the MCP call.",
+            }
+        else:
+            payload = {"status": "denied", "message": "The MCP call was denied."}
+        completed = store.complete_mcp_execution(
+            row.id,
+            result_json=json.dumps(payload, ensure_ascii=False),
+            is_error=outcome != "cancel",
+            skipped=True,
+        )
+    else:
+        claimed = store.claim_mcp_execution(row.id)
+        if claimed is None:
+            current = store.get_request(row.id)
+            return _stored_mcp_resolution(current or updated)
+        try:
+            from ...mcp_server.registry import mcp
+
+            stored_args = _decode_stored_args(claimed)
+            # Approved ops calls derive job idempotency from the durable approval
+            # request. A stale execution lease may be reclaimed after a crash,
+            # but the operation service then returns the already-created job.
+            trusted_overrides = (
+                {"idempotency_key": claimed.id}
+                if claimed.tool_name == "ops_run" else None
+            )
+            result = await mcp.call_approved_tool(
+                claimed.tool_name,
+                stored_args,
+                expected_invocation_hash=claimed.invocation_hash or "",
+                trusted_argument_overrides=trusted_overrides,
+            )
+            payload = _normalize_mcp_result(result)
+            completed = store.complete_mcp_execution(
+                row.id,
+                result_json=json.dumps(payload, ensure_ascii=False, default=str),
+                is_error=False,
+            )
+        except Exception as error:  # noqa: BLE001
+            log.exception("Approved MCP execution failed id=%s", row.id)
+            payload = {"status": "failed", "error": str(error)}
+            completed = store.complete_mcp_execution(
+                row.id,
+                result_json=json.dumps(payload, ensure_ascii=False),
+                is_error=True,
+                error=str(error),
+            )
+    if completed is None:
+        raise HTTPException(status_code=500, detail="Could not persist MCP execution result")
+    completed = store.enqueue_continuation(row.id) or completed
+    response = _stored_mcp_resolution(completed)
+    response["detail"] = completed.status
+    response["already_resolved"] = False
+    return response
+
+
 @router.get("/v1/tool-approval-requests", tags=["Approval Policies"])
 def list_requests(status: str | None = None, bot_id: str | None = None, limit: int = 50):
     store = _store()
@@ -213,6 +351,23 @@ async def resolve_approval(request_id: str, body: ResolveRequest):
     bot_id = body.bot_id or row.bot_id
     user_id = body.user_id or row.user_id
     message = (body.message or "").strip()
+
+    if row.request_kind == KIND_MCP:
+        # MCP approvals are server-owned: execute the exact stored invocation
+        # once, persist its actual result, and never ask the model to re-issue.
+        if row.status != "pending":
+            return _stored_mcp_resolution(row)
+        result = await _resolve_mcp_request(
+            store,
+            row,
+            outcome=outcome,
+            message=message,
+            resolved_by=body.resolved_by,
+        )
+        await _fanout_resolved(
+            _subscriber(), bot_id, user_id, request_id, row.turn_id, result["status"]
+        )
+        return result
 
     if row.status != "pending":
         # Idempotent replay — return the same continuation the first resolve did.

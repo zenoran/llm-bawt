@@ -22,8 +22,9 @@ import os
 logging.getLogger("mcp.server").setLevel(logging.WARNING)
 logging.getLogger("mcp.server.streamable_http").setLevel(logging.WARNING)
 
-from mcp.server.fastmcp import FastMCP
 from mcp.server.transport_security import TransportSecuritySettings
+
+from .approval_interceptor import ApprovalAwareFastMCP
 
 
 # Allow localhost by default; add LAN hosts via LLM_BAWT_MCP_ALLOWED_HOSTS env var.
@@ -37,7 +38,7 @@ _allowed_hosts = [
 _allowed_origins = [f"http://{h}" for h in _allowed_hosts]
 
 
-mcp = FastMCP(
+mcp = ApprovalAwareFastMCP(
     "bawthub",
     json_response=True,
     stateless_http=True,

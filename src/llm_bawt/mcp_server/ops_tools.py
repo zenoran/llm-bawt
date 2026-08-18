@@ -25,14 +25,32 @@ from .registry import mcp
 logger = logging.getLogger(__name__)
 
 
-def _get_ops_service():
-    """Lazy accessor — the app service is constructed after the MCP module
-    is imported, so we resolve on each call.
-    """
-    from ..service.dependencies import get_ops_service, get_service
+_CONFIG_SINGLETON = None
 
-    svc = get_service()
-    return get_ops_service(svc.config)
+
+def _get_ops_service():
+    """Lazy accessor — resolve via a module-cached ``Config`` (the same
+    singleton pattern as :mod:`profile_tools` and :mod:`storage`).
+
+    ``get_service()`` is not usable here: the MCP server runs as its own
+    process, so the FastAPI service singleton is never set in it and the
+    accessor raises ``Service not initialized``.
+
+    The ``Config`` must be cached, not constructed per call. The store cache
+    in ``service.dependencies`` is keyed on ``id(config)``, so a fresh
+    ``Config()`` each call misses the cache and rebuilds every ops store —
+    re-running schema bootstrap DDL on every invocation, and (before the
+    lock was made re-entrant) deadlocking the MCP event loop outright.
+    Caching also avoids ``id()`` reuse aliasing a store to a dead config.
+    """
+    global _CONFIG_SINGLETON
+    if _CONFIG_SINGLETON is None:
+        from ..utils.config import Config
+
+        _CONFIG_SINGLETON = Config()
+    from ..service.dependencies import get_ops_service
+
+    return get_ops_service(_CONFIG_SINGLETON)
 
 
 # ---------------------------------------------------------------------------

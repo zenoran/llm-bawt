@@ -288,6 +288,14 @@ async def lifespan(app):
     service._inter_bot_dispatcher = InterBotDeliveryDispatcher(service)
     service._inter_bot_dispatcher.start()
 
+    # TASK-639: durable approved-MCP result delivery. The DB outbox survives
+    # app/bridge/Redis restarts; this lifespan worker reclaims due rows and drives
+    # the normal chat pipeline until each actual result is delivered.
+    from .approval_continuations import run_mcp_continuation_outbox
+    service._mcp_continuation_task = asyncio.create_task(
+        run_mcp_continuation_outbox(service, service._tool_approval_policy_store)
+    )
+
     # Log startup with rich formatting
     log.startup(
         version=SERVICE_VERSION,
@@ -333,7 +341,13 @@ async def lifespan(app):
             await service._inter_bot_dispatcher.stop()
 
         # Cancel background tasks
-        for task_attr in ("_group_cleanup_task", "_tool_persist_task", "_claude_refresh_task", "_codex_refresh_task"):
+        for task_attr in (
+            "_group_cleanup_task",
+            "_tool_persist_task",
+            "_mcp_continuation_task",
+            "_claude_refresh_task",
+            "_codex_refresh_task",
+        ):
             task = getattr(service, task_attr, None)
             if task:
                 task.cancel()
