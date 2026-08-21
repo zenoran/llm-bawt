@@ -93,9 +93,10 @@ current-turn context path for the BawtHub task tools:
   tokens — MCP tools fail closed with a clear error message.
 - **`associate_current_task(task_ref)`** — reads the capability from the
   ContextVar, PUTs `source: AGENT` to BawtHub's internal listener at
-  `${BAWTHUB_TASK_ASSOCIATION_INTERNAL_URL}/internal/tasks/{task_ref}/associations`
-  with `Authorization: Bearer ${TASK_ASSOCIATION_INTERNAL_TOKEN}`. Raw
-  identifiers are never accepted as MCP tool arguments.
+  `${BAWTHUB_TASK_ASSOCIATION_INTERNAL_URL}/internal/tasks/{task_ref}/associations`.
+  No bearer (TASK-793) — the listener is container-only and the docker network
+  boundary is the auth layer. Raw identifiers are never accepted as MCP tool
+  arguments.
 
 Task tools that use this path (`src/llm_bawt/mcp_server/task_tools.py`):
 

@@ -24,7 +24,6 @@ _INTERNAL_URL = os.getenv(
     "BAWTHUB_TASK_ASSOCIATION_INTERNAL_URL",
     "http://frontend-prod:3002",
 ).rstrip("/")
-_INTERNAL_TOKEN_ENV = "TASK_ASSOCIATION_INTERNAL_TOKEN"
 _TIMEOUT = 10.0
 _current_capability: ContextVar[str | None] = ContextVar(
     "task_turn_context_capability",
@@ -85,11 +84,6 @@ class TaskTurnCapabilityMiddleware:
 async def associate_current_task(task_ref: str) -> dict[str, Any]:
     """Associate the trusted current session+turn to ``task_ref`` as AGENT."""
     context = current_task_turn_context()
-    token = os.getenv(_INTERNAL_TOKEN_ENV, "").strip()
-    if not token:
-        raise TaskTurnContextError(
-            "Task association is unavailable because the internal service credential is not configured"
-        )
 
     # Synthetic inter-bot-delivery turn ids (``turn-delivery-<hex>``) are
     # signed into the capability for audit but are NOT valid ``AgentTaskTurn.turnId``
@@ -110,10 +104,13 @@ async def associate_current_task(task_ref: str) -> dict[str, Any]:
             "source": "AGENT",
         },
     }
+    # TASK-793: no bearer — the internal listener is reachable only inside the
+    # docker network; the network boundary is the auth layer (see the llm-bawt
+    # security model). Trust in WHICH turn is associated still comes from the
+    # signed Fernet capability above, which is a correctness mechanism, not auth.
     async with httpx.AsyncClient(
         base_url=_INTERNAL_URL,
         timeout=_TIMEOUT,
-        headers={"Authorization": f"Bearer {token}"},
     ) as client:
         response = await client.put(
             f"/internal/tasks/{task_ref}/associations",

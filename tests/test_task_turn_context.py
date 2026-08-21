@@ -138,7 +138,6 @@ def test_association_posts_only_verified_server_context(
     values = _values()
     token = codec.mint_task_turn_context(**values)
     binding = task_association.set_current_task_turn_capability(token)
-    monkeypatch.setenv("TASK_ASSOCIATION_INTERNAL_TOKEN", "internal-secret")
     captured: dict = {}
 
     class FakeResponse:
@@ -171,9 +170,8 @@ def test_association_posts_only_verified_server_context(
 
     assert result["ok"] is True
     assert captured["path"] == "/internal/tasks/TASK-701/associations"
-    assert captured["client"]["headers"] == {
-        "Authorization": "Bearer internal-secret",
-    }
+    # TASK-793: no bearer — the docker network boundary is the auth layer.
+    assert "headers" not in captured["client"]
     assert captured["json"] == {
         "sessionId": values["session_id"],
         "botId": "loopy",
@@ -200,7 +198,6 @@ def test_association_nulls_turn_id_for_delivery_shape(
     values["turn_id"] = "turn-delivery-" + "c" * 32
     token = codec.mint_task_turn_context(**values)
     binding = task_association.set_current_task_turn_capability(token)
-    monkeypatch.setenv("TASK_ASSOCIATION_INTERNAL_TOKEN", "internal-secret")
     captured: dict = {}
 
     class FakeResponse:
@@ -242,17 +239,3 @@ def test_association_nulls_turn_id_for_delivery_shape(
     finally:
         task_association.reset_current_task_turn_capability(binding)
     assert captured["json"]["turn"]["turnId"] == values["turn_id"]
-
-
-def test_association_requires_internal_service_credential(
-    fernet: Fernet,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    token = codec.mint_task_turn_context(**_values())
-    binding = task_association.set_current_task_turn_capability(token)
-    monkeypatch.delenv("TASK_ASSOCIATION_INTERNAL_TOKEN", raising=False)
-    try:
-        with pytest.raises(codec.TaskTurnContextError, match="service credential"):
-            asyncio.run(task_association.associate_current_task("TASK-701"))
-    finally:
-        task_association.reset_current_task_turn_capability(binding)
