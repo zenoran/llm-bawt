@@ -84,8 +84,8 @@ def test_legacy_resolution_never_parses_content_or_defaults_unknown_to_viewer() 
     assert result["unknown"] == AuthorReference.unknown()
 
 
-def test_validated_inter_bot_claim_returns_durable_sender() -> None:
-    record = SimpleNamespace(sender_bot_id="Snark")
+def test_validated_inter_bot_claim_returns_durable_author() -> None:
+    record = SimpleNamespace(author=AuthorReference.user("Nick"))
 
     class Store:
         def validate_claim(self, **kwargs):
@@ -111,7 +111,7 @@ def test_validated_inter_bot_claim_returns_durable_sender() -> None:
         inter_bot_seed_session_id=None,
     )
 
-    assert validate_inter_bot_claim(service, request) == AuthorReference.bot("snark")
+    assert validate_inter_bot_claim(service, request) == AuthorReference.user("nick")
 
 
 def test_untrusted_request_without_claim_cannot_supply_correlation_authority() -> None:

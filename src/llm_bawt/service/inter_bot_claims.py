@@ -36,7 +36,7 @@ def validate_inter_bot_claim(service: Any, request: Any):
         record = dispatcher.store.get(delivery_id)
         if record is None:
             raise ValueError("inter-bot delivery claim disappeared")
-        return AuthorReference.bot(record.sender_bot_id)
+        return record.author
 
     if any(getattr(request, field, None) for field in _CORRELATION_FIELDS):
         raise ValueError(

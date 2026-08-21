@@ -218,13 +218,12 @@ class InterBotDeliveryDispatcher:
         claim_token = record.claim_token or ""
         payload = self.store.payload(record.id) or {}
         message = str((payload.get("messages") or [{}])[-1].get("content") or record.message)
+        user_id = str(payload.get("user") or getattr(self.service.config, "DEFAULT_USER", "nick"))
         heartbeat = asyncio.create_task(
             self._heartbeat(record.id, claim_token),
             name=f"inter-bot-steer-heartbeat:{record.id}",
         )
         try:
-            from ..message_authorship import AuthorReference
-
             response = await steer_active_turn(
                 self.service,
                 ChatSteerRequest(
@@ -232,12 +231,12 @@ class InterBotDeliveryDispatcher:
                     message=message,
                     message_id=record.user_message_id,
                     bot_id=record.target_bot_id,
-                    user_id=getattr(self.service.config, "DEFAULT_USER", "nick"),
+                    user_id=user_id,
                 ),
                 steer_request_id=(
                     f"steer_delivery_{record.id.removeprefix('delivery-')}"
                 ),
-                author=AuthorReference.bot(record.sender_bot_id),
+                author=record.author,
             )
             if response.ok:
                 self.store.mark_transport_accepted(record.id, claim_token)

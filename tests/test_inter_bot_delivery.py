@@ -19,6 +19,7 @@ from llm_bawt.inter_bot_delivery import (
     STEERING,
     InterBotDeliveryStore,
 )
+from llm_bawt.message_authorship import AuthorReference
 from llm_bawt.service.turn_logs import DeliveryTargetBusy, TurnLogStore
 from llm_bawt.utils.config import Config
 
@@ -60,7 +61,9 @@ def delivery_store():
         ), {"target": target})
 
 
-def _enqueue(store, sender, target, message, *, key=None, max_attempts=5):
+def _enqueue(
+    store, sender, target, message, *, key=None, max_attempts=5, author=None
+):
     return store.enqueue(
         sender_bot_id=sender,
         target_bot_id=target,
@@ -70,6 +73,7 @@ def _enqueue(store, sender, target, message, *, key=None, max_attempts=5):
             "bot_id": target,
             "stream": False,
         },
+        author=author,
         idempotency_key=key,
         task_id="TASK-700",
         project_id="project-1",
@@ -77,6 +81,32 @@ def _enqueue(store, sender, target, message, *, key=None, max_attempts=5):
         metadata={"source": "test"},
         max_attempts=max_attempts,
     )
+
+
+def test_delivery_persists_explicit_user_author(delivery_store):
+    store, sender, target = delivery_store
+    record, duplicate = _enqueue(
+        store,
+        sender,
+        target,
+        "UI commit request",
+        author=AuthorReference.user("Nick"),
+    )
+
+    assert duplicate is False
+    assert record.author == AuthorReference.user("nick")
+    assert record.to_api()["author"] == {
+        "entity_type": "user",
+        "entity_id": "nick",
+        "status": "canonical",
+    }
+
+
+def test_delivery_defaults_to_bot_sender_author(delivery_store):
+    store, sender, target = delivery_store
+    record, _ = _enqueue(store, sender, target, "bot callback")
+
+    assert record.author == AuthorReference.bot(sender)
 
 
 def _finish_reserved_turn(store, turn_id, *, status="ok"):
@@ -201,6 +231,40 @@ def test_active_claude_turn_claims_steering_without_new_turn(delivery_store):
         assert conn.execute(sa_text(
             "SELECT count(*) FROM turn_logs WHERE id=:id"
         ), {"id": original.turn_id}).scalar_one() == 0
+
+
+def test_user_delivery_does_not_steer_another_users_active_turn(delivery_store):
+    store, sender, target = delivery_store
+    original, _ = store.enqueue(
+        sender_bot_id=sender,
+        target_bot_id=target,
+        message="UI request",
+        payload={
+            "messages": [{"role": "user", "content": "UI request"}],
+            "bot_id": target,
+            "user": "nick",
+            "prefer_steer": True,
+            "stream": False,
+        },
+        author=AuthorReference.user("nick"),
+    )
+    active_id = f"turn-other-user-{uuid.uuid4().hex}"
+    with store.engine.begin() as conn:
+        conn.execute(sa_text("""
+            INSERT INTO turn_logs (
+                id, created_at, path, stream, bot_id, user_id, status,
+                user_prompt, response_text, agent_session_key,
+                agent_request_id, ended_at
+            ) VALUES (
+                :id, now(), '/test', true, :target, 'alex', 'streaming',
+                'working', '', 'snark:alex', 'req-active', NULL
+            )
+        """), {"id": active_id, "target": target})
+
+    assert store.claim_next(
+        target, claim_owner="test-owner", steer_capable=True
+    ) is None
+    assert store.get(original.id).status == QUEUED
 
 
 def test_active_claude_not_ready_still_claims_steering_for_retry(delivery_store):

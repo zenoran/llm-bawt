@@ -21,6 +21,7 @@ from sqlalchemy import text as sa_text
 from sqlalchemy.engine import Connection
 
 from .agent_context import SessionPolicy
+from .message_authorship import AuthorReference, normalize_author
 from .utils.config import Config
 from .utils.db import get_shared_engine
 from .utils.schema import SchemaBootstrapGuard
@@ -70,6 +71,8 @@ def submission_result(
 class DeliveryRecord:
     id: str
     sender_bot_id: str
+    author_entity_type: str
+    author_entity_id: str
     target_bot_id: str
     message: str
     user_message_id: str
@@ -114,6 +117,8 @@ class DeliveryRecord:
         return cls(
             id=row["id"],
             sender_bot_id=row["sender_bot_id"],
+            author_entity_type=row.get("author_entity_type") or "bot",
+            author_entity_id=row.get("author_entity_id") or row["sender_bot_id"],
             target_bot_id=row["target_bot_id"],
             message=row["message"],
             user_message_id=row["user_message_id"],
@@ -148,6 +153,13 @@ class DeliveryRecord:
             overflow_recovery_count=int(row.get("overflow_recovery_count") or 0),
         )
 
+    @property
+    def author(self) -> AuthorReference:
+        author = normalize_author(self.author_entity_type, self.author_entity_id)
+        if author is None:  # Database constraints keep this unreachable.
+            raise ValueError("delivery author is required")
+        return author
+
     def to_api(self, *, duplicate: bool = False) -> dict[str, Any]:
         def iso(value: datetime | None) -> str | None:
             return value.isoformat() if value else None
@@ -156,6 +168,7 @@ class DeliveryRecord:
             "delivery_id": self.id,
             "status": self.status,
             "sender_bot_id": self.sender_bot_id,
+            "author": self.author.to_dict(),
             "target_bot_id": self.target_bot_id,
             "user_message_id": self.user_message_id,
             "turn_id": self.turn_id,
@@ -216,6 +229,8 @@ class InterBotDeliveryStore:
                     ordinal BIGSERIAL UNIQUE NOT NULL,
                     id VARCHAR(96) PRIMARY KEY,
                     sender_bot_id VARCHAR(128) NOT NULL,
+                    author_entity_type VARCHAR(16) NOT NULL DEFAULT 'bot',
+                    author_entity_id VARCHAR(128) NOT NULL,
                     target_bot_id VARCHAR(128) NOT NULL,
                     message TEXT NOT NULL,
                     payload_json JSONB NOT NULL DEFAULT '{}'::jsonb,
@@ -252,9 +267,30 @@ class InterBotDeliveryStore:
                     reset_at TIMESTAMPTZ,
                     overflow_recovery_count INTEGER NOT NULL DEFAULT 0,
                     CHECK (status IN ('QUEUED','STEERING','DISPATCHING','DELIVERED','FAILED','CANCELLED')),
+                    CHECK (author_entity_type IN ('user','bot')),
                     CHECK (session_policy IN ('continue','reset_retain_history','reset_without_history'))
                 )
             """))
+            conn.execute(sa_text(
+                "ALTER TABLE inter_bot_deliveries ADD COLUMN IF NOT EXISTS author_entity_type VARCHAR(16)"
+            ))
+            conn.execute(sa_text(
+                "ALTER TABLE inter_bot_deliveries ADD COLUMN IF NOT EXISTS author_entity_id VARCHAR(128)"
+            ))
+            conn.execute(sa_text("""
+                UPDATE inter_bot_deliveries
+                SET author_entity_type='bot', author_entity_id=sender_bot_id
+                WHERE author_entity_type IS NULL OR author_entity_id IS NULL
+            """))
+            conn.execute(sa_text(
+                "ALTER TABLE inter_bot_deliveries ALTER COLUMN author_entity_type SET NOT NULL"
+            ))
+            conn.execute(sa_text(
+                "ALTER TABLE inter_bot_deliveries ALTER COLUMN author_entity_type SET DEFAULT 'bot'"
+            ))
+            conn.execute(sa_text(
+                "ALTER TABLE inter_bot_deliveries ALTER COLUMN author_entity_id SET NOT NULL"
+            ))
             conn.execute(sa_text(
                 "ALTER TABLE inter_bot_deliveries ADD COLUMN IF NOT EXISTS claim_token VARCHAR(96)"
             ))
@@ -295,6 +331,9 @@ class InterBotDeliveryStore:
                 "ALTER TABLE inter_bot_deliveries DROP CONSTRAINT IF EXISTS inter_bot_deliveries_status_check"
             ))
             conn.execute(sa_text(
+                "ALTER TABLE inter_bot_deliveries DROP CONSTRAINT IF EXISTS inter_bot_deliveries_author_entity_type_check"
+            ))
+            conn.execute(sa_text(
                 "ALTER TABLE inter_bot_deliveries DROP CONSTRAINT IF EXISTS inter_bot_deliveries_session_policy_check"
             ))
             conn.execute(sa_text("""
@@ -302,12 +341,22 @@ class InterBotDeliveryStore:
                 CHECK (status IN ('QUEUED','STEERING','DISPATCHING','DELIVERED','FAILED','CANCELLED'))
             """))
             conn.execute(sa_text("""
+                ALTER TABLE inter_bot_deliveries ADD CONSTRAINT inter_bot_deliveries_author_entity_type_check
+                CHECK (author_entity_type IN ('user','bot'))
+            """))
+            conn.execute(sa_text("""
                 ALTER TABLE inter_bot_deliveries ADD CONSTRAINT inter_bot_deliveries_session_policy_check
                 CHECK (session_policy IN ('continue','reset_retain_history','reset_without_history'))
             """))
             conn.execute(sa_text("""
-                CREATE UNIQUE INDEX IF NOT EXISTS uq_inter_bot_delivery_idempotency
-                ON inter_bot_deliveries (sender_bot_id, target_bot_id, idempotency_key)
+                DROP INDEX IF EXISTS uq_inter_bot_delivery_idempotency
+            """))
+            conn.execute(sa_text("""
+                CREATE UNIQUE INDEX uq_inter_bot_delivery_idempotency
+                ON inter_bot_deliveries (
+                    author_entity_type, author_entity_id,
+                    sender_bot_id, target_bot_id, idempotency_key
+                )
                 WHERE idempotency_key IS NOT NULL
             """))
             conn.execute(sa_text("""
@@ -384,6 +433,7 @@ class InterBotDeliveryStore:
         target_bot_id: str,
         message: str,
         payload: dict[str, Any],
+        author: AuthorReference | None = None,
         idempotency_key: str | None = None,
         project_id: str | None = None,
         task_id: str | None = None,
@@ -396,6 +446,9 @@ class InterBotDeliveryStore:
         if self.engine is None:
             raise RuntimeError("Inter-bot delivery database unavailable")
         sender = sender_bot_id.strip().lower() or "unknown"
+        resolved_author = author or AuthorReference.bot(sender)
+        if resolved_author.entity_type not in {"user", "bot"} or not resolved_author.entity_id:
+            raise ValueError("delivery author must identify a user or bot")
         target = target_bot_id.strip().lower()
         body = message.strip()
         if not target:
@@ -418,6 +471,8 @@ class InterBotDeliveryStore:
         values = {
             "id": delivery_id,
             "sender": sender,
+            "author_type": resolved_author.entity_type,
+            "author_id": resolved_author.entity_id,
             "target": target,
             "message": body,
             "payload": json.dumps(payload, ensure_ascii=False, default=str),
@@ -435,11 +490,16 @@ class InterBotDeliveryStore:
         with self.engine.begin() as conn:
             if idem:
                 # Serialize same-key submissions so callers always receive one stable row.
-                digest = hashlib.sha256(f"{sender}\0{target}\0{idem}".encode()).hexdigest()[:16]
+                digest = hashlib.sha256(
+                    f"{resolved_author.entity_type}\0{resolved_author.entity_id}\0"
+                    f"{sender}\0{target}\0{idem}".encode()
+                ).hexdigest()[:16]
                 conn.execute(sa_text("SELECT pg_advisory_xact_lock(hashtext(:key))"), {"key": digest})
                 existing = conn.execute(sa_text("""
                     SELECT * FROM inter_bot_deliveries
-                    WHERE sender_bot_id=:sender AND target_bot_id=:target
+                    WHERE author_entity_type=:author_type
+                      AND author_entity_id=:author_id
+                      AND sender_bot_id=:sender AND target_bot_id=:target
                       AND idempotency_key=:idem
                 """), values).mappings().first()
                 if existing:
@@ -452,12 +512,14 @@ class InterBotDeliveryStore:
                     return record, True
             row = conn.execute(sa_text("""
                 INSERT INTO inter_bot_deliveries (
-                    id, sender_bot_id, target_bot_id, message, payload_json,
+                    id, sender_bot_id, author_entity_type, author_entity_id,
+                    target_bot_id, message, payload_json,
                     metadata_json, user_message_id, turn_id, idempotency_key,
                     project_id, task_id, message_kind, status, max_attempts,
                     session_policy, reset_status, reset_reason
                 ) VALUES (
-                    :id, :sender, :target, :message, CAST(:payload AS jsonb),
+                    :id, :sender, :author_type, :author_id,
+                    :target, :message, CAST(:payload AS jsonb),
                     CAST(:metadata AS jsonb), :message_id, :turn_id, :idem,
                     :project, :task, :kind, 'QUEUED', :max_attempts,
                     :session_policy,
@@ -586,12 +648,17 @@ class InterBotDeliveryStore:
             payload = head["payload_json"] if isinstance(head["payload_json"], dict) else {}
             policy = SessionPolicy(head.get("session_policy") or SessionPolicy.CONTINUE.value)
             prefer_steer = bool(payload.get("prefer_steer", True))
+            delivery_user_id = str(
+                payload.get("user") or getattr(self.config, "DEFAULT_USER", "nick")
+            )
             active = conn.execute(sa_text("""
                 SELECT id, agent_session_key, agent_request_id, user_id
                 FROM turn_logs
                 WHERE bot_id=:target AND ended_at IS NULL AND id != :turn_id
                 ORDER BY created_at DESC LIMIT 1
             """), {"target": target, "turn_id": head["turn_id"]}).mappings().first()
+            if active and str(active.get("user_id") or "") != delivery_user_id:
+                return None
             if active and policy != SessionPolicy.CONTINUE:
                 # Reset is an ordered precondition, never an interrupt. Wait until
                 # the authoritative active turn ends; do not steer or rotate under it.
@@ -631,7 +698,7 @@ class InterBotDeliveryStore:
                 status = DISPATCHING
                 target_turn_id = head["turn_id"]
                 delivery_mode = "turn"
-                user_id = str(payload.get("user") or getattr(self.config, "DEFAULT_USER", "nick"))
+                user_id = delivery_user_id
                 from .agent_context import rotate_delivery_session
                 payload, _, _ = rotate_delivery_session(
                     conn,

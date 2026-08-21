@@ -15,6 +15,7 @@ from ...agent_context import (
 )
 from ...bots import BotManager
 from ...inter_bot_delivery import submission_result
+from ...message_authorship import AuthorReference, normalize_author
 from ..dependencies import get_service
 
 router = APIRouter()
@@ -22,6 +23,8 @@ router = APIRouter()
 
 class DeliveryCreate(BaseModel):
     sender_bot_id: str = "unknown"
+    author_entity_type: Literal["user", "bot"] | None = None
+    author_entity_id: str | None = Field(default=None, max_length=128)
     target_bot_id: str
     message: str
     max_tokens: int | None = None
@@ -62,11 +65,25 @@ def _dispatcher():
     return dispatcher
 
 
+def _format_delivery_message(message: str, author: AuthorReference) -> str:
+    if author.entity_type == "bot" and author.entity_id != "unknown":
+        return f"Message from bot '{author.entity_id}': {message}"
+    return message
+
+
 @router.post("/v1/inter-bot-deliveries", tags=["Inter-Bot Deliveries"], status_code=202)
 async def create_delivery(body: DeliveryCreate):
     """Persist a callback and dispatch it through the target's next idle turn."""
     target = body.target_bot_id.strip().lower()
     sender = body.sender_bot_id.strip().lower() or "unknown"
+    try:
+        explicit_author = normalize_author(
+            body.author_entity_type,
+            body.author_entity_id,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    author = explicit_author or AuthorReference.bot(sender)
     if not target:
         raise HTTPException(status_code=422, detail="target_bot_id is required")
     if not body.message.strip():
@@ -144,13 +161,16 @@ async def create_delivery(body: DeliveryCreate):
     except RuntimeError as exc:
         raise HTTPException(status_code=503, detail=str(exc)) from exc
 
-    formatted = body.message
-    if sender != "unknown":
-        formatted = f"Message from bot '{sender}': {body.message}"
+    formatted = _format_delivery_message(body.message, author)
     payload = {
         "messages": [{"role": "user", "content": formatted}],
         "prefer_steer": body.prefer_steer,
         "bot_id": target,
+        "user": (
+            author.entity_id
+            if author.entity_type == "user"
+            else getattr(get_service().config, "DEFAULT_USER", "nick")
+        ),
         "max_tokens": body.max_tokens,
         "temperature": body.temperature,
         "extract_memory": False,
@@ -164,6 +184,7 @@ async def create_delivery(body: DeliveryCreate):
         target_bot_id=target,
         message=body.message,
         payload=payload,
+        author=author,
         idempotency_key=body.idempotency_key,
         project_id=body.project_id,
         task_id=body.task_id,
