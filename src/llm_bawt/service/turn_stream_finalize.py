@@ -120,21 +120,61 @@ class TurnStreamFinalizer:
                     )
             elif upstream_error:
                 # TASK-714: an upstream error was already recorded on this turn
-                # (bridge ERROR handler in chat_streaming_bridge.py, or the
-                # finalize-exception handler below on a prior partial). Persist
-                # any accumulated response text + tool details WITHOUT flipping
-                # status back to "completed" — the honest terminal is "error".
-                # Route through _update_turn_log which preserves the existing
-                # status field instead of _finalize_turn which forces "completed".
-                svc._update_turn_log(
+                # (bridge ERROR handler, or the finalize-exception handler below
+                # on a prior partial). The honest terminal is "error".
+                #
+                # TASK-790: a failed turn must never end SILENT. Previously this
+                # branch only updated the turn log — no assistant row was
+                # persisted, so on reload the reply vanished entirely (user
+                # message with no answer, no error, no retry hint — the exact
+                # "silent death" Loopy hit on 2026-08-19). Now: append a visible
+                # failure marker to any partial text and commit it to history as
+                # the assistant message via _finalize_turn (same mechanism the
+                # abort path uses to preserve partials), keeping status="error"
+                # / end_reason="upstream_error". The mutated
+                # full_response_holder also feeds the turn_complete wire's
+                # response_text below, so live clients render the same marker
+                # without a history refetch.
+                _partial = ctx.full_response_holder[0] or ""
+                # Guard: the legacy openclaw path (chat_streaming_bridge.py,
+                # TASK-202) already appends its own visible "⚠️ … error" block
+                # to the text before ERROR terminates — don't double-mark.
+                if "⚠️" in _partial[-600:]:
+                    _final_text = _partial
+                else:
+                    _err_note = (upstream_error_text or "upstream backend error").strip()
+                    _marker = (
+                        f"⚠️ **Turn failed** — {_err_note}\n\n"
+                        "_The turn was aborted mid-run; the session is intact. "
+                        "Resend your message or say \"continue\" to retry._"
+                    )
+                    _final_text = (
+                        f"{_partial.rstrip()}\n\n{_marker}" if _partial.strip() else _marker
+                    )
+                ctx.full_response_holder[0] = _final_text
+                svc._finalize_turn(
+                    llm_bawt=ctx.llm_bawt,
                     turn_id=ctx.turn_log_id,
-                    latency_ms=elapsed_ms,
-                    response_text=ctx.full_response_holder[0] or None,
-                    tool_calls=ctx.tool_call_details_holder or None,
+                    response_text=_final_text,
+                    tool_context=ctx.tool_context_holder[0],
+                    tool_call_details=ctx.tool_call_details_holder,
+                    prepared_messages=prepared_messages,
+                    user_prompt=ctx.user_prompt,
+                    model=ctx.model_alias,
+                    bot_id=ctx.bot_id,
+                    user_id=ctx.user_id,
+                    elapsed_ms=elapsed_ms,
+                    stream=True,
+                    animation=ctx.animation_holder[0],
                     token_usage=ctx.token_usage_holder[0] or self._usage_so_far(),
-                    # NOTE: intentionally not passing status= — the row is
-                    # already status="error" and we want to keep it that way.
-                    # error_text already set upstream; don't overwrite here.
+                    attachments=ctx.agent_attachments_holder or None,
+                    reasoning=ctx.reasoning_holder[0] or None,
+                    # Keep the honest terminal — _finalize_turn passes status
+                    # through to the turn log; error_text set upstream survives
+                    # (never passed here, so never overwritten).
+                    status="error",
+                    end_reason="upstream_error",
+                    assistant_message_id=ctx.assistant_message_id,
                 )
             elif ctx.full_response_holder[0]:
                 svc._finalize_turn(
@@ -321,6 +361,11 @@ class TurnStreamFinalizer:
             "session_id": _sid,
             "status": status,
             "end_reason": end_reason,
+            # TASK-790: raw upstream failure reason (e.g. "claude-code error:
+            # No SDK messages for 300.0s — CLI may be hung"). Additive; only
+            # populated on error terminals so clients can render WHY the turn
+            # died and offer a retry, instead of a silent mid-turn stop.
+            "error_text": upstream_error_text if upstream_error else None,
             "question_id": question_id,
             "approval_id": approval_id,
             "approval_persist_failed": approval_persist_failed,
