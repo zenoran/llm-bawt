@@ -37,6 +37,7 @@ from .send_request import SendRequest
 from .send_result import ClaudeResultMixin
 from .send_stream import ClaudeStreamMixin
 from .send_usage import ClaudeUsageMixin, LiveUsagePublisher
+from .turn_watchdog import TurnWatchdog, TurnWatchdogTimeout
 
 logger = logging.getLogger("claude_code_bridge.bridge")
 
@@ -432,6 +433,22 @@ class ClaudeSendMixin(ClaudeStreamMixin, ClaudeUsageMixin, ClaudeResultMixin):
                             request_id=request_id,
                         )
                         msg_stream = sdk_client.receive_messages()
+
+                        def _publish_turn_health(health: dict) -> None:
+                            nonlocal seq
+                            seq += 1
+                            self._publish_event(
+                                request_id,
+                                session_key,
+                                seq,
+                                kind=AgentEventKind.SYSTEM_NOTE,
+                                extra_raw={"turn_health": health},
+                            )
+
+                        watchdog = TurnWatchdog(
+                            self._request_timeout,
+                            on_health=_publish_turn_health,
+                        )
                         # Register one live run controller for both control paths:
                         # chat.abort calls disconnect(), while chat.steer performs
                         # SDK interrupt -> replacement query on this same client.
@@ -451,16 +468,13 @@ class ClaudeSendMixin(ClaudeStreamMixin, ClaudeUsageMixin, ClaudeResultMixin):
                                 aborted = True
                                 break
                             try:
-                                msg = await asyncio.wait_for(
-                                    msg_stream.__anext__(),
-                                    timeout=self._request_timeout,
+                                msg = await watchdog.receive_next(
+                                    msg_stream,
+                                    request_id=request_id,
+                                    session_key=session_key,
                                 )
                             except StopAsyncIteration:
-                                    break
-                            except TimeoutError:
-                                raise TimeoutError(
-                                    f"No SDK messages for {self._request_timeout}s — CLI may be hung"
-                                )
+                                break
 
                             # Session-mirror write failure. MirrorErrorMessage is a
                             # SystemMessage subclass the SDK emits when its
@@ -905,10 +919,17 @@ class ClaudeSendMixin(ClaudeStreamMixin, ClaudeUsageMixin, ClaudeResultMixin):
 
                         # 2) CLI crash or timeout before any text streamed →
                         #    clear stale session and retry once fresh
+                        retryable_timeout = (
+                            isinstance(e, TimeoutError)
+                            and not isinstance(e, TurnWatchdogTimeout)
+                        ) or (
+                            isinstance(e, TurnWatchdogTimeout)
+                            and e.retry_fresh_session
+                        )
                         if (
                             not fresh_session_retry
                             and not text_parts
-                            and (_is_cli_crash(e) or isinstance(e, TimeoutError))
+                            and (_is_cli_crash(e) or retryable_timeout)
                         ):
                             fresh_session_retry = True
                             reason = "timeout" if isinstance(e, TimeoutError) else "CLI crash (exit code 1)"
