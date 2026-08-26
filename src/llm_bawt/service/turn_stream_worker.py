@@ -560,14 +560,30 @@ class TurnStreamWorker(TurnStreamPublishMixin):
             def _intercept_tool_events(inner):
                 _saw_tool = False  # Track tool→content transitions
                 _saw_text = False  # Track whether any text has been yielded
-                # Cumulative count of assistant text chars yielded so far.
-                # Stamped onto each tool_call as text_offset so the frontend
-                # can split response_text at tool boundaries and render an
-                # interleaved transcript (text → tool → text) that survives
-                # reload. MUST match what consume_stream_chunks accumulates
-                # into full_response_holder, so count EVERY str yielded
-                # (including the injected "\n\n" breaks below).
+                # Cumulative count of assistant text yielded so far, in UTF-16
+                # CODE UNITS (JavaScript string-length semantics), NOT Python
+                # code points. Stamped onto each tool_call as text_offset so
+                # the frontend can split response_text at tool boundaries and
+                # render an interleaved transcript (text → tool → text) that
+                # survives reload. The ONLY consumer of these offsets is the
+                # JS client, which slices strings by UTF-16 index — a Python
+                # code-point count drifts +1 per astral-plane char (emoji
+                # like 🙂 are len()==1 here but .length==2 in JS), shifting
+                # every later tool anchor one char short and orphaning the
+                # pre-tool sentence's final "." into the next bubble
+                # (TASK-799). MUST stay in lock-step with the strs yielded to
+                # consume_stream_chunks (including the injected "\n\n"
+                # breaks below), measured with _js_len.
                 _text_chars = [0]
+
+                def _js_len(s: str) -> int:
+                    """len(s) in UTF-16 code units — JS ``String.length``."""
+                    return len(s) + sum(1 for ch in s if ord(ch) > 0xFFFF)
+
+                # Reasoning-lane offset counter, same UTF-16 units. Running
+                # tally (not _js_len(reasoning_holder[0]) per delta) so long
+                # lanes stay O(n) total.
+                _reasoning_units = [0]
 
                 # TASK-286: buffer assistant text and publish it to the
                 # unified Redis stream as coalesced ``text_delta`` events so
@@ -604,11 +620,12 @@ class TurnStreamWorker(TurnStreamPublishMixin):
                         "trigger_message_id": trigger_message_id,
                         "bot_id": bot_id,
                         "user_id": user_id,
-                        # Chars of assistant text emitted BEFORE this delta —
-                        # lets the client splice it at the right position and
-                        # dedupe an overlapping/replayed delta regardless of
-                        # arrival order vs the cold-reload partial fetch.
-                        "text_offset": _text_chars[0] - len(s),
+                        # UTF-16 units of assistant text emitted BEFORE this
+                        # delta — lets the client splice it at the right
+                        # position and dedupe an overlapping/replayed delta
+                        # regardless of arrival order vs the cold-reload
+                        # partial fetch. JS-length semantics (TASK-799).
+                        "text_offset": _text_chars[0] - _js_len(s),
                         "delta": s,
                         "ts": time.time(),
                     })
@@ -761,7 +778,10 @@ class TurnStreamWorker(TurnStreamPublishMixin):
                                 # connect-vs-snapshot ordering. Without it the
                                 # reasoning lane freezes at the seed until
                                 # turn_complete (TASK-506).
-                                _r_offset = len(reasoning_holder[0])
+                                # UTF-16 units, not code points — the client
+                                # splices at JS string indexes (TASK-799).
+                                _r_offset = _reasoning_units[0]
+                                _reasoning_units[0] += _js_len(_rtext)
                                 reasoning_holder[0] += _rtext
                                 _publish_event_direct({
                                     "_type": "reasoning_delta",
@@ -1051,7 +1071,7 @@ class TurnStreamWorker(TurnStreamPublishMixin):
                                     _td["is_error"] = item.get("is_error")
                                     break
                     if isinstance(item, str):
-                        _text_chars[0] += len(item)
+                        _text_chars[0] += _js_len(item)
                         _text_buf.append(item)
                         _flush_text(min_chars=_TEXT_DELTA_FLUSH_CHARS)
                     yield item

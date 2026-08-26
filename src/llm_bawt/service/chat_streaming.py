@@ -596,7 +596,17 @@ class ChatStreamingMixin(ChatStreamingBridgeMixin):
         try:
             # Visual-stream emote filtering shares the SAME decision as TTS
             # scrubbing (should_scrub_for_tts), computed once above as tts_scrub.
-            emote_filter = StreamingEmoteFilter() if tts_scrub else None
+            # NEVER for agent backends (TASK-799): their asterisks are markdown
+            # (**bold** / *italic*), not roleplay emotes — the filter mangled
+            # them AND removed wire chars that _text_chars/text_offset had
+            # already counted, shifting every later tool anchor forward so
+            # bubbles split mid-sentence live ("Before Taurus," / "Integration"
+            # stranding). Persisted content is unfiltered, so offsets only map
+            # onto an unfiltered wire. TTS scrubbing (tts_scrubber → tts_delta
+            # in the worker) is a separate path and stays on.
+            emote_filter = (
+                StreamingEmoteFilter() if (tts_scrub and not is_agent_backend) else None
+            )
             oc_tool_call_index = 0  # OpenClaw agent backend tool call index
 
             # TASK-367: release-at-boundary buffer for agent-backend assistant
