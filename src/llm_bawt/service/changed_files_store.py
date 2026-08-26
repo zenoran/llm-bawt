@@ -120,6 +120,10 @@ class TurnChangedFile(SQLModel, table=True):
     # Stable workspace identity + human display label.
     repo_key: str = Field(sa_column=Column(String(128), nullable=False))
     repo_label: str | None = Field(default=None, sa_column=Column(String(255), nullable=True))
+    # Whether the file lives inside a git repository at capture time.
+    # NULL = unknown (legacy rows, or the app-side TOOL_END fallback which has
+    # no filesystem access). False = scratch file (e.g. /tmp) — not committable.
+    in_repo: bool | None = Field(default=None, sa_column=Column(Boolean, nullable=True))
 
     path: str = Field(sa_column=Column(Text, nullable=False))
     old_path: str | None = Field(default=None, sa_column=Column(Text, nullable=True))
@@ -193,6 +197,9 @@ class ChangedFileInput:
     before: bytes | None = None
     after: bytes | None = None
     source_tool_call_ids: list[str] = field(default_factory=list)
+    # None = unknown; the store only overwrites a row's value when the bridge
+    # actually reported one, so the richer capture always wins.
+    in_repo: bool | None = None
 
 
 def decode_file_changes(files: list[Any]) -> list[ChangedFileInput]:
@@ -223,6 +230,7 @@ def decode_file_changes(files: list[Any]) -> list[ChangedFileInput]:
             content_type=raw.get("content_type"),
             before=_decode_b64(raw.get("before_b64")),
             after=_decode_b64(raw.get("after_b64")),
+            in_repo=raw["in_repo"] if isinstance(raw.get("in_repo"), bool) else None,
         ))
     return out
 
@@ -264,6 +272,9 @@ def serialize_changed_file(row: TurnChangedFile) -> dict[str, Any]:
         # rows render as a non-clickable entry.
         "has_content": (not row.binary) and (has_before or has_after),
         "content_type": row.content_type,
+        # None = unknown (legacy/fallback rows) — the UI treats only an explicit
+        # False as "scratch file, not committable".
+        "in_repo": row.in_repo,
     }
 
 
@@ -300,6 +311,8 @@ def build_uncommitted_summary(rows: list[TurnChangedFile]) -> dict[str, Any]:
             current["additions"] = (previous.get("additions") or 0) + (current.get("additions") or 0)
             current["deletions"] = (previous.get("deletions") or 0) + (current.get("deletions") or 0)
             current["old_path"] = previous.get("old_path") or current.get("old_path")
+            if current.get("in_repo") is None:
+                current["in_repo"] = previous.get("in_repo")
             if previous.get("change_kind") == "added" and current.get("change_kind") != "deleted":
                 current["change_kind"] = "added"
         merged[key] = current
@@ -364,6 +377,10 @@ class ChangedFilesStore:
                 "CREATE INDEX IF NOT EXISTS ix_turn_changed_files_owner_created"
                 " ON turn_changed_files (bot_id, user_id, created_at)"
             ))
+            if "in_repo" not in legacy_columns:
+                conn.execute(sa_text(
+                    "ALTER TABLE turn_changed_files ADD COLUMN in_repo BOOLEAN"
+                ))
             if "commit_requested_at" not in legacy_columns:
                 column_type = (
                     "TIMESTAMP WITH TIME ZONE"
@@ -454,6 +471,8 @@ class ChangedFilesStore:
                         row.truncated = bool(f.truncated or trunc_b or trunc_a)
                     if is_new or f.content_type is not None:
                         row.content_type = f.content_type
+                    if f.in_repo is not None:
+                        row.in_repo = f.in_repo
                     # Multiple Edit/Write calls may target the same path in one
                     # turn. Keep the FIRST before-side and the LATEST after-side
                     # so the diff represents the whole turn, not only its last

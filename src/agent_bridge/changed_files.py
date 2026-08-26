@@ -49,6 +49,7 @@ class _PendingCapture:
     repo_key: str
     repo_label: str
     repo_path: str
+    in_repo: bool
     before: _FileSnapshot
 
 
@@ -100,6 +101,7 @@ class ToolChangedFileCapture:
                 repo_key=repo_key,
                 repo_label=repo_label or repo_key,
                 repo_path=repo_path,
+                in_repo=repo_root is not None,
                 before=self._baselines.setdefault(
                     (request_id, absolute_path), self._read_snapshot(absolute_path)
                 ),
@@ -154,6 +156,7 @@ class ToolChangedFileCapture:
                 "repo_key": pending.repo_key,
                 "repo_label": pending.repo_label,
                 "path": pending.repo_path,
+                "in_repo": pending.in_repo,
                 "change_kind": change_kind,
                 "additions": additions,
                 "deletions": deletions,
@@ -170,6 +173,7 @@ class ToolChangedFileCapture:
                 "repo_key": pending.repo_key,
                 "repo_label": pending.repo_label,
                 "path": pending.repo_path,
+                "in_repo": pending.in_repo,
                 "change_kind": "modified",
                 "binary": False,
                 "truncated": False,
