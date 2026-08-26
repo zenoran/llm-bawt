@@ -5,6 +5,7 @@ from types import SimpleNamespace
 from claude_code_bridge.send_errors import (
     AuthRetryPolicy,
     CLAUDE_CREDENTIAL_ERROR_MARKER,
+    CODEX_CREDENTIAL_ERROR_MARKER,
     classify_terminal_error,
     result_message_error,
 )
@@ -48,6 +49,43 @@ def test_proxy_auth_failure_does_not_emit_claude_reconnect_marker():
     assert error is not None
     text, raw = classify_terminal_error(error, direct_anthropic=False)
     assert CLAUDE_CREDENTIAL_ERROR_MARKER not in text
+    assert raw is None
+
+
+def test_chatgpt_proxy_auth_failure_emits_codex_reconnect_marker():
+    """TASK: expired ChatGPT OAuth behind the proxy must open the ChatGPT
+    reconnect flow, not the Claude one (Nova 401 misroute)."""
+    error = result_message_error(
+        _result(
+            api_error_status=401,
+            errors=[
+                "Failed to authenticate. API Error: 401 Proxy exhausted retries: "
+                "Provided authentication token is expired."
+            ],
+        )
+    )
+
+    assert error is not None
+    text, raw = classify_terminal_error(
+        error, direct_anthropic=False, proxy_provider="openai_chatgpt"
+    )
+    assert text.startswith(CODEX_CREDENTIAL_ERROR_MARKER)
+    assert CLAUDE_CREDENTIAL_ERROR_MARKER not in text
+    assert raw == {"error_code": "credential_expired", "provider": "codex"}
+
+
+def test_api_key_proxy_auth_failure_has_no_reconnect_marker():
+    """API-key providers (xai, zai, …) have no UI reconnect flow — no marker."""
+    error = result_message_error(
+        _result(api_error_status=401, errors=["authentication_failed"])
+    )
+
+    assert error is not None
+    text, raw = classify_terminal_error(
+        error, direct_anthropic=False, proxy_provider="xai"
+    )
+    assert CLAUDE_CREDENTIAL_ERROR_MARKER not in text
+    assert CODEX_CREDENTIAL_ERROR_MARKER not in text
     assert raw is None
 
 

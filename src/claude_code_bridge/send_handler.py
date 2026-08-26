@@ -981,6 +981,10 @@ class ClaudeSendMixin(ClaudeStreamMixin, ClaudeUsageMixin, ClaudeResultMixin):
                 error_text, error_raw = classify_terminal_error(
                     e,
                     direct_anthropic=direct_anthropic,
+                    proxy_provider=(
+                        None if direct_anthropic
+                        else self._model_provider_prefix(model)
+                    ),
                 )
                 seq += 1
                 self._publish_event(

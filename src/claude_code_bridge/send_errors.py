@@ -7,6 +7,19 @@ from dataclasses import dataclass
 
 CLAUDE_CREDENTIAL_ERROR_MARKER = "[credential_expired:claude]"
 
+# ChatGPT-subscription OAuth (the ~/.codex/auth.json bundle) rides the bridge's
+# Anthropic-compat proxy under the ``openai_chatgpt`` provider prefix. BawtHub's
+# established recovery contract for that bundle is the codex marker → its
+# "Reconnect ChatGPT" flow — reuse it so proxy 401s open the RIGHT reconnect.
+CODEX_CREDENTIAL_ERROR_MARKER = "[credential_expired:codex]"
+
+# Proxy provider prefix → (marker, provider) for credential errors that have a
+# BawtHub reconnect flow. API-key providers (xai, zai, …) have nothing to
+# reconnect in the UI and intentionally stay unmapped.
+_PROXY_CREDENTIAL_CONTRACTS: dict[str, tuple[str, str]] = {
+    "openai_chatgpt": (CODEX_CREDENTIAL_ERROR_MARKER, "codex"),
+}
+
 
 _AUTH_MARKERS = (
     "oauth access token has been revoked",
@@ -100,19 +113,30 @@ def classify_terminal_error(
     exc: Exception,
     *,
     direct_anthropic: bool = True,
+    proxy_provider: str | None = None,
 ) -> tuple[str, dict | None]:
-    """Build the stable bridge ERROR contract consumed by BawtHub."""
+    """Build the stable bridge ERROR contract consumed by BawtHub.
+
+    ``proxy_provider`` is the proxy path's provider prefix (e.g.
+    ``openai_chatgpt``) when ``direct_anthropic`` is False, so credential
+    failures get tagged with the provider whose token actually died instead
+    of defaulting BawtHub's recovery UI to the Claude reconnect.
+    """
     text = str(exc)
-    credential_error = direct_anthropic and (
-        (
-            isinstance(exc, TerminalSDKResultError)
-            and exc.credential_error
-        )
-        or is_auth_failure_text(text)
-    )
-    if credential_error:
-        return (
-            f"{CLAUDE_CREDENTIAL_ERROR_MARKER} {text}",
-            {"error_code": "credential_expired", "provider": "claude"},
-        )
+    is_credential_failure = (
+        isinstance(exc, TerminalSDKResultError) and exc.credential_error
+    ) or is_auth_failure_text(text)
+    if is_credential_failure:
+        if direct_anthropic:
+            return (
+                f"{CLAUDE_CREDENTIAL_ERROR_MARKER} {text}",
+                {"error_code": "credential_expired", "provider": "claude"},
+            )
+        contract = _PROXY_CREDENTIAL_CONTRACTS.get(proxy_provider or "")
+        if contract:
+            marker, provider = contract
+            return (
+                f"{marker} {text}",
+                {"error_code": "credential_expired", "provider": provider},
+            )
     return text, None
