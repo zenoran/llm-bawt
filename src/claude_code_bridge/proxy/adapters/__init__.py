@@ -13,6 +13,7 @@ from .base import ProviderAdapter
 from .kimi_coding import KimiCodingAdapter
 from .moonshot import MoonshotAdapter
 from .openai_chatgpt import OpenAIChatGPTAdapter
+from .openrouter import OpenRouterAdapter
 from .xai import XaiAdapter
 from .zai import ZaiAdapter
 
@@ -44,6 +45,7 @@ register(XaiAdapter())
 register(ZaiAdapter())
 register(MoonshotAdapter())
 register(KimiCodingAdapter())
+register(OpenRouterAdapter())
 
 __all__ = [
     "ProviderAdapter", "REGISTRY", "register", "lookup", "start_all", "close_all",

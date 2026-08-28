@@ -204,6 +204,82 @@ def test_upstream_401_raises_labeled_runtime_error(fake_upstream, monkeypatch):
     assert "401" in str(exc.value)
 
 
+# --- openrouter (TASK-822): broker-backed key, nested-slash models ------
+
+
+def test_openrouter_registered_with_documented_endpoint(monkeypatch):
+    from claude_code_bridge.proxy.adapters.openrouter import OpenRouterAdapter
+
+    monkeypatch.delenv("OPENROUTER_BASE_URL", raising=False)
+    assert isinstance(lookup("openrouter"), OpenRouterAdapter)
+    assert OpenRouterAdapter._base_url() == "https://openrouter.ai/api"
+
+
+def test_openrouter_sends_bearer():
+    from claude_code_bridge.proxy.adapters.openrouter import OpenRouterAdapter
+
+    headers = OpenRouterAdapter()._auth_headers("K")
+    assert headers["Authorization"] == "Bearer K"
+    assert headers["x-api-key"] == "K"  # harmless compatibility mirror
+
+
+def test_openrouter_key_is_broker_only(monkeypatch):
+    """The DB-driven key is the whole point (TASK-822): no env-var fallback,
+    and a missing broker URL fails loudly rather than silently reading env."""
+    from claude_code_bridge.proxy.adapters.openrouter import OpenRouterAdapter
+
+    assert OpenRouterAdapter.API_KEY_ENVS == ()
+    monkeypatch.delenv("LLM_BAWT_API_URL", raising=False)
+    with pytest.raises(RuntimeError, match="LLM_BAWT_API_URL"):
+        OpenRouterAdapter()._api_key()
+
+
+def test_openrouter_caches_broker_key(monkeypatch):
+    from claude_code_bridge.proxy.adapters.openrouter import OpenRouterAdapter
+
+    adapter = OpenRouterAdapter()
+    calls = {"n": 0}
+
+    def fake_fetch():
+        calls["n"] += 1
+        return "sk-or-test"
+
+    monkeypatch.setattr(adapter, "_fetch_broker_key", fake_fetch)
+    assert adapter._api_key() == "sk-or-test"
+    assert adapter._api_key() == "sk-or-test"
+    assert calls["n"] == 1  # second call served from the TTL cache
+
+
+def test_openrouter_round_trip_preserves_nested_slashes(fake_upstream, monkeypatch):
+    """OpenRouter upstream ids contain slashes (``qwen/qwen3-coder``); the
+    proxy splits provider on the FIRST slash only, so the bare upstream model
+    must keep its inner slash both upstream and in the rewritten response."""
+    from claude_code_bridge.proxy.adapters.openrouter import OpenRouterAdapter
+
+    base_url, captured, holder = fake_upstream
+    upstream_model = "qwen/qwen3-coder"
+    holder["echo_model"] = upstream_model
+    monkeypatch.setenv("OPENROUTER_BASE_URL", base_url)
+
+    adapter = OpenRouterAdapter()
+    monkeypatch.setattr(adapter, "_fetch_broker_key", lambda: "sk-or-test")
+
+    body = {
+        "model": "openrouter/qwen/qwen3-coder",
+        "max_tokens": 32,
+        "messages": [{"role": "user", "content": "hi"}],
+        "stream": False,
+    }
+    out = _run(adapter, body, upstream_model)
+
+    assert captured["path"] == "/v1/messages"
+    assert captured["headers"]["authorization"] == "Bearer sk-or-test"
+    assert captured["body"]["model"] == upstream_model
+    assert captured["body"]["stream"] is True
+    assert b'"model": "openrouter/qwen/qwen3-coder"' in out
+    assert b"message_stop" in out
+
+
 # --- usage tap ----------------------------------------------------------
 
 

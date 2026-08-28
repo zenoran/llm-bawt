@@ -11,6 +11,7 @@ from .base import ProviderAdapter
 from .claude import ClaudeAdapter
 from .codex import CodexAdapter
 from .github import GitHubAdapter
+from .openrouter import OpenRouterAdapter
 
 # Adapter classes keyed by provider id. Extend here as providers are added.
 # TASK-635: the single `claude` adapter supersedes the old claude-sub +
@@ -20,6 +21,7 @@ _ADAPTER_CLASSES: dict[str, type[ProviderAdapter]] = {
     GitHubAdapter.id: GitHubAdapter,
     ClaudeAdapter.id: ClaudeAdapter,
     CodexAdapter.id: CodexAdapter,
+    OpenRouterAdapter.id: OpenRouterAdapter,
 }
 
 

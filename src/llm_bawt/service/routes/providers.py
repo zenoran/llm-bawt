@@ -18,7 +18,7 @@ from fastapi.concurrency import run_in_threadpool
 from pydantic import BaseModel
 
 from ..dependencies import get_service
-from ..providers.base import AUTH_CLI_OAUTH, AUTH_DEVICE_OAUTH
+from ..providers.base import AUTH_API_KEY, AUTH_CLI_OAUTH, AUTH_DEVICE_OAUTH
 from ..providers.github import GitHubAdapter, GitHubConfigError
 from ..providers.registry import all_adapters, get_adapter
 
@@ -40,6 +40,10 @@ class CliLoginCompleteRequest(BaseModel):
 class SelectReposRequest(BaseModel):
     installation_id: int
     repos: list[str] | None = None
+
+
+class ApiKeyRequest(BaseModel):
+    api_key: str
 
 
 def _adapter_or_404(provider_id: str):
@@ -161,6 +165,54 @@ async def cli_login_complete(provider_id: str, body: CliLoginCompleteRequest):
     if result.record is not None:
         out["connection"] = result.record.public()
     return out
+
+
+# --- API-key connect (openrouter, any future AUTH_API_KEY adapter) ----------
+@router.post("/v1/providers/{provider_id}/connect/api-key")
+async def connect_api_key(provider_id: str, body: ApiKeyRequest):
+    """Validate and persist an API key for a key-auth provider.
+
+    The adapter probes the key upstream before saving; a bad key never lands
+    in the CredentialStore. The key is encrypted at rest and never echoed back.
+    """
+    adapter = _adapter_or_404(provider_id)
+    if not adapter.supports(AUTH_API_KEY):
+        raise HTTPException(status_code=400, detail=f"{provider_id} has no api-key auth")
+    try:
+        result = await run_in_threadpool(adapter.set_api_key, body.api_key)
+    except Exception as e:  # noqa: BLE001
+        logger.warning("api-key connect failed for %s: %s", provider_id, e)
+        raise HTTPException(status_code=502, detail="provider error")
+    if not result.ok:
+        raise HTTPException(status_code=400, detail=result.detail or "invalid API key")
+    record = adapter.store.load(provider_id)
+    return {
+        "status": "connected",
+        "account": result.account,
+        "connection": record.public() if record else None,
+    }
+
+
+# --- OpenRouter key broker (TASK-822) ----------------------------------------
+@router.get("/v1/providers/openrouter/token")
+async def openrouter_api_key(request: Request):
+    """Internal: hand a reader the stored OpenRouter API key.
+
+    The claude-code bridge proxy adapter calls this instead of reading env
+    vars — the DB-backed CredentialStore is the sole source of truth. Static
+    key, so no refresh chain; ``expires_at`` is always null. Same trust model
+    as the Claude/ChatGPT brokers above: internal network only, optional
+    ``X-Bridge-Token`` defense in depth.
+    """
+    expected = os.getenv("BRIDGE_CLAUDE_TOKEN_SECRET")
+    if expected and request.headers.get("X-Bridge-Token") != expected:
+        raise HTTPException(status_code=401, detail="bad bridge token")
+
+    adapter = _adapter_or_404("openrouter")
+    key = await run_in_threadpool(adapter.api_key)
+    if not key:
+        raise HTTPException(status_code=503, detail="no OpenRouter credential installed")
+    return {"access_token": key, "expires_at": None, "state": "ok"}
 
 
 @router.delete("/v1/providers/{provider_id}")

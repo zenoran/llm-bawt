@@ -244,6 +244,10 @@ class ModelCatalog:
             return "moonshot"
         if access_path.vendor == "kimi":
             return "kimi_coding"
+        if access_path.vendor == "openrouter":
+            # Upstream ids themselves contain slashes (qwen/qwen3-coder);
+            # the bridge splits on the FIRST slash only, so nesting is safe.
+            return "openrouter"
         return None
 
     @classmethod

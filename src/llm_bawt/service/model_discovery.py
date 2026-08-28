@@ -164,6 +164,52 @@ class KimiCodingDiscoveryProvider(ModelDiscoveryProvider):
         return _normalize(data)
 
 
+class OpenRouterDiscoveryProvider(ModelDiscoveryProvider):
+    """OpenRouter public catalog (TASK-822) — no key needed to list models."""
+
+    aliases = ("openrouter",)
+    _url = "https://openrouter.ai/api/v1/models"
+
+    def fetch(self) -> list[dict[str, Any]]:
+        try:
+            response = httpx.get(
+                self._url, headers={"Accept": "application/json"}, timeout=20.0
+            )
+            response.raise_for_status()
+        except httpx.HTTPStatusError as exc:
+            raise ModelDiscoveryError(
+                f"OpenRouter model catalog returned HTTP {exc.response.status_code}"
+            ) from exc
+        except httpx.HTTPError as exc:
+            raise ModelDiscoveryError(
+                f"Network error reaching OpenRouter model catalog: {exc}"
+            ) from exc
+
+        try:
+            payload = response.json()
+        except ValueError as exc:
+            raise ModelDiscoveryError(
+                "OpenRouter model catalog returned non-JSON data"
+            ) from exc
+        data = payload.get("data") if isinstance(payload, dict) else None
+        if not isinstance(data, list):
+            raise ModelDiscoveryError(
+                "OpenRouter model catalog returned an invalid payload"
+            )
+        # Prefer the human ``name`` over OpenRouter's long-form ``description``
+        # blurbs — the dialog shows one line. _normalize keeps id/context_length.
+        rows = [
+            {
+                "id": item.get("id"),
+                "description": item.get("name") or "",
+                "context_length": item.get("context_length"),
+            }
+            for item in data
+            if isinstance(item, dict)
+        ]
+        return _normalize(rows)
+
+
 def _providers() -> tuple[ModelDiscoveryProvider, ...]:
     # Imports stay lazy so the model-manager's optional provider SDKs remain off
     # the service import path until discovery is actually requested.
@@ -204,6 +250,7 @@ def _providers() -> tuple[ModelDiscoveryProvider, ...]:
             ),
         ),
         KimiCodingDiscoveryProvider(),
+        OpenRouterDiscoveryProvider(),
     )
 
 
