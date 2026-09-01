@@ -154,3 +154,71 @@ def test_disconnect_reports_shared_bundle_removal() -> None:
 
     assert adapter.disconnect() is True
     assert store.records == {}
+
+
+# ── Health: refresh-chain awareness ────────────────────────────────────
+
+
+def _store_valid_token(store: FakeStore) -> None:
+    import time as _time
+    from types import SimpleNamespace
+
+    exp = int(_time.time()) + 3600
+    store.records["openai_chatgpt"] = SimpleNamespace(
+        secret={"codex_auth": {"tokens": {"access_token": _jwt({"exp": exp}), "id_token": ""}}},
+        meta={},
+        account=None,
+    )
+
+
+def test_health_warns_when_refresh_chain_failing(monkeypatch) -> None:
+    adapter, store = _adapter()
+    _store_valid_token(store)
+    monkeypatch.setattr(
+        codex,
+        "refresh_health",
+        lambda: {
+            "last_refresh_at": None,
+            "last_refresh_error": "ChatGPT OAuth refresh failed (400)",
+            "last_refresh_error_at": 1000,
+        },
+    )
+
+    health = adapter.health()
+
+    assert health["state"] == "warning"
+    assert health["fix"] == "reconnect"
+    assert "refresh is failing" in health["detail"]
+
+
+def test_health_ok_when_refresh_error_is_stale(monkeypatch) -> None:
+    adapter, store = _adapter()
+    _store_valid_token(store)
+    monkeypatch.setattr(
+        codex,
+        "refresh_health",
+        lambda: {
+            "last_refresh_at": 2000,
+            "last_refresh_error": "old transient failure",
+            "last_refresh_error_at": 1000,
+        },
+    )
+
+    health = adapter.health()
+
+    assert health["state"] == "ok"
+    assert health["last_refresh_at"] == 2000
+
+
+def test_health_ok_when_refresh_chain_clean(monkeypatch) -> None:
+    adapter, store = _adapter()
+    _store_valid_token(store)
+    monkeypatch.setattr(
+        codex,
+        "refresh_health",
+        lambda: {"last_refresh_at": None, "last_refresh_error": None, "last_refresh_error_at": None},
+    )
+
+    health = adapter.health()
+
+    assert health["state"] == "ok"

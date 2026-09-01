@@ -239,11 +239,6 @@ def _save(raw: dict, bundle: dict) -> None:
                 "account_id": tokens.get("account_id"),
                 "last_refresh": bundle.get("last_refresh"),
             },
-            **(
-                {"connected_at": raw["connected_at"]}
-                if raw.get("connected_at")
-                else {}
-            ),
             secret={_SECRET_KEY: bundle},
             connected_at=raw.get("connected_at"),
         )

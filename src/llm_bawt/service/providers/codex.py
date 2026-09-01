@@ -30,11 +30,13 @@ from typing import Any
 
 import httpx
 
+from ..usage.codex_oauth import refresh_health
 from .base import (
     AUTH_DEVICE_OAUTH,
     HEALTH_BROKEN,
     HEALTH_OK,
     HEALTH_UNCONFIGURED,
+    HEALTH_WARNING,
     STATUS_CONNECTED,
     ConnectionRecord,
     DeviceFlowStart,
@@ -204,7 +206,26 @@ class CodexAdapter(ProviderAdapter):
                 expires_at=expires_at,
                 fix="reconnect",
             )
-        return health_block(HEALTH_OK, expires_at=expires_at)
+
+        # The JWT exp claim only proves the token *should* be valid. If the
+        # in-app refresh chain is failing (e.g. a 401-triggered force refresh
+        # couldn't rotate the pair), the credential is effectively dead even
+        # with a future exp — surface it as an action item instead of "ok".
+        chain = refresh_health()
+        err_at = chain.get("last_refresh_error_at")
+        ok_at = chain.get("last_refresh_at")
+        if err_at is not None and (ok_at is None or err_at > ok_at):
+            return health_block(
+                HEALTH_WARNING,
+                detail=(
+                    "Token refresh is failing — codex may reject requests "
+                    f"despite an unexpired token: {chain.get('last_refresh_error')}"
+                ),
+                expires_at=expires_at,
+                last_refresh_at=ok_at,
+                fix="reconnect",
+            )
+        return health_block(HEALTH_OK, expires_at=expires_at, last_refresh_at=ok_at)
 
     # --- device-code OAuth (TASK-773) -----------------------------------------
 

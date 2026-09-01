@@ -989,3 +989,64 @@ class TestPermanentTypeMapping:
         with pytest.raises(asyncio.CancelledError):
             _ = await _drain(adapter.call({"model": "fake/foo"}, "foo"))
         assert adapter._responses_client._i == 1
+
+
+class _FakeBrokerAdapter(_FakeAdapter):
+    """Broker-cached adapter (has _cached_expires_at) — 401s must trigger one
+    cache-invalidated re-authorize instead of failing permanent."""
+
+    def __init__(self, script):
+        super().__init__(script)
+        self._cached_expires_at = 9_999_999_999.0  # "valid" cache, revoked upstream
+        self.authorize_calls = 0
+
+    async def authorize(self):
+        self.authorize_calls += 1
+        return f"bearer-{self.authorize_calls}", "http://127.0.0.1"
+
+
+def _fake_401() -> Exception:
+    class Fake401(Exception):
+        def __init__(self):
+            super().__init__("Provided authentication token is expired.")
+            self.status_code = 401
+    Fake401.__module__ = "openai"
+    return Fake401()
+
+
+class TestBrokerCached401:
+    @pytest.mark.anyio
+    async def test_upstream_401_reauthorizes_once_and_succeeds(self):
+        good_stream = _FakeUpstreamStream([
+            _mk_event("response.output_item.added",
+                      item=types.SimpleNamespace(type="message")),
+            _mk_event("response.output_text.delta", delta="ok"),
+            _mk_event("response.completed",
+                      response=types.SimpleNamespace(usage=None, status="completed")),
+        ])
+        adapter = _FakeBrokerAdapter(script=[_fake_401(), good_stream])
+        chunks = await _drain(adapter.call({"model": "fake/foo"}, "foo"))
+        joined = b"".join(chunks)
+        assert b"message_stop" in joined
+        assert b'"type":"error"' not in joined
+        # initial authorize + post-401 re-authorize
+        assert adapter.authorize_calls == 2
+        # cache was invalidated before the re-authorize
+        assert adapter._cached_expires_at == 0
+
+    @pytest.mark.anyio
+    async def test_upstream_401_twice_fails_as_authentication_error(self):
+        adapter = _FakeBrokerAdapter(script=[_fake_401(), _fake_401()])
+        chunks = await _drain(adapter.call({"model": "fake/foo"}, "foo"))
+        joined = b"".join(chunks)
+        assert b"authentication_error" in joined
+        assert adapter.authorize_calls == 2  # no infinite auth loop
+
+    @pytest.mark.anyio
+    async def test_non_broker_adapter_401_stays_permanent(self):
+        adapter = _FakeAdapter(script=[_fake_401()])
+        chunks = await _drain(adapter.call({"model": "fake/foo"}, "foo"))
+        joined = b"".join(chunks)
+        assert b"authentication_error" in joined
+        # single upstream call — no retry for non-broker adapters
+        assert adapter._responses_client._i == 1

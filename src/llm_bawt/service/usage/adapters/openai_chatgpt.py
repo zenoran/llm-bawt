@@ -258,11 +258,64 @@ class OpenAIChatGPTUsageAdapter(UsageAdapter):
         except Exception as e:  # noqa: BLE001
             logger.warning("codex usage snapshot write failed: %s", e)
 
-    async def _probe_snapshot(self) -> dict | None:
-        """Fetch current quota headers with a tiny codex backend request."""
-        try:
-            import httpx
+    async def _probe_once(self, result) -> tuple[dict | None, int | None]:
+        """One codex backend request → (snapshot, http_status)."""
+        import httpx
 
+        base_url = (
+            os.getenv("OPENAI_BASE_URL")
+            or "https://chatgpt.com/backend-api/codex"
+        )
+        headers = {
+            "Authorization": f"Bearer {result.token}",
+            "OpenAI-Beta": "responses=experimental",
+            "originator": "codex_cli_rs",
+            "session_id": uuid.uuid4().hex,
+        }
+        if result.account_id:
+            headers["chatgpt-account-id"] = result.account_id
+        model = os.getenv(_PROBE_MODEL_ENV) or "gpt-5.4"
+        body = {
+            "model": model,
+            "instructions": "Reply with OK.",
+            "input": [
+                {
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "OK"}],
+                }
+            ],
+            "stream": True,
+            "store": False,
+            "reasoning": {"effort": "none"},
+        }
+        async with httpx.AsyncClient(timeout=20.0) as client:
+            async with client.stream(
+                "POST",
+                f"{base_url.rstrip('/')}/responses",
+                headers=headers,
+                json=body,
+            ) as resp:
+                if resp.status_code != 200:
+                    logger.warning(
+                        "codex usage probe failed: HTTP %s", resp.status_code
+                    )
+                    return None, resp.status_code
+                snap = _snapshot_from_headers(resp.headers)
+                if snap is None:
+                    logger.warning("codex usage probe returned no quota headers")
+                    return None, resp.status_code
+                await self._write_snapshot(snap)
+                return snap, resp.status_code
+
+    async def _probe_snapshot(self) -> dict | None:
+        """Fetch current quota headers with a tiny codex backend request.
+
+        A 401 means the stored access token was rejected upstream even though
+        its ``exp`` claim may look fine (revoked / rotated elsewhere). Rotate
+        the token pair once (``force_refresh``) and retry — the documented
+        reader-got-a-401 recovery path.
+        """
+        try:
             from ..codex_oauth import get_access_token
 
             # TASK-636: call the in-process credential owner directly instead
@@ -272,50 +325,15 @@ class OpenAIChatGPTUsageAdapter(UsageAdapter):
             if not result.token:
                 logger.warning("codex usage probe: no ChatGPT token available")
                 return None
-            base_url = (
-                os.getenv("OPENAI_BASE_URL")
-                or "https://chatgpt.com/backend-api/codex"
-            )
-            headers = {
-                "Authorization": f"Bearer {result.token}",
-                "OpenAI-Beta": "responses=experimental",
-                "originator": "codex_cli_rs",
-                "session_id": uuid.uuid4().hex,
-            }
-            if result.account_id:
-                headers["chatgpt-account-id"] = result.account_id
-            model = os.getenv(_PROBE_MODEL_ENV) or "gpt-5.4"
-            body = {
-                "model": model,
-                "instructions": "Reply with OK.",
-                "input": [
-                    {
-                        "role": "user",
-                        "content": [{"type": "input_text", "text": "OK"}],
-                    }
-                ],
-                "stream": True,
-                "store": False,
-                "reasoning": {"effort": "none"},
-            }
-            async with httpx.AsyncClient(timeout=20.0) as client:
-                async with client.stream(
-                    "POST",
-                    f"{base_url.rstrip('/')}/responses",
-                    headers=headers,
-                    json=body,
-                ) as resp:
-                    if resp.status_code != 200:
-                        logger.warning(
-                            "codex usage probe failed: HTTP %s", resp.status_code
-                        )
-                        return None
-                    snap = _snapshot_from_headers(resp.headers)
-                    if snap is None:
-                        logger.warning("codex usage probe returned no quota headers")
-                        return None
-                    await self._write_snapshot(snap)
-                    return snap
+            snap, status = await self._probe_once(result)
+            if snap is not None or status != 401:
+                return snap
+            logger.info("codex usage probe got 401 — force-refreshing token")
+            result = await asyncio.to_thread(get_access_token, force_refresh=True)
+            if not result.token:
+                return None
+            snap, _ = await self._probe_once(result)
+            return snap
         except Exception as e:  # noqa: BLE001
             logger.warning("codex usage probe failed: %s", e)
             return None

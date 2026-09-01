@@ -248,6 +248,19 @@ class ProviderAdapter(ABC):
 
             if initial_exc is not None:
                 bucket = retry_mod.classify_initial_exception(initial_exc)
+                # An upstream 401 from a broker-cached adapter can mean OUR
+                # cached bearer went stale (the app rotates the token pair out
+                # from under long-lived proxy processes; the revoked token
+                # reports "expired" upstream while its exp claim looks fine).
+                # Route it through bucket F — one cache-invalidated re-authorize
+                # against the broker — instead of failing permanent. Bucket F's
+                # own attempt cap keeps a genuinely dead credential bounded.
+                if (
+                    bucket is retry_mod.FailureBucket.C_PERMANENT
+                    and retry_mod._extract_status_code(initial_exc) == 401
+                    and hasattr(self, "_cached_expires_at")
+                ):
+                    bucket = retry_mod.FailureBucket.F_AUTH_BROKER
                 retry_after = retry_mod.extract_retry_after_seconds(initial_exc)
                 phase = retry_mod.phase_from_state(state)
                 decision = retry_mod.decide(
