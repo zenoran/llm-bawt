@@ -102,6 +102,14 @@ class OpenRouterAdapter(AnthropicPassthroughAdapter):
         logger.info("Fetched OpenRouter API key from app broker")
         return key
 
+    def _supports_deferral(self, upstream_model: str) -> bool:
+        """OpenRouter only honors the tool-search/deferred-tools beta when the
+        routed model is Anthropic's ("Deferred custom tools are only supported
+        on Anthropic models…" — live 400, 2026-08-28). For everything else
+        (moonshot, qwen, …) the deferral markers must be stripped or the
+        request is rejected before it ever reaches the model."""
+        return upstream_model.startswith("anthropic/")
+
     def _auth_headers(self, api_key: str) -> dict[str, str]:
         """Bearer is OpenRouter's documented contract; x-api-key mirror is a
         harmless compatibility fallback (Moonshot precedent)."""

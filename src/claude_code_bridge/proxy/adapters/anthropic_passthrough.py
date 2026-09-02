@@ -59,6 +59,13 @@ class AnthropicPassthroughAdapter(ProviderAdapter):
     LABEL: ClassVar[str] = ""
     #: Path appended to the base URL for the messages endpoint.
     MESSAGES_PATH: ClassVar[str] = "/v1/messages"
+    #: Whether the upstream implements Anthropic's tool-search/deferred-tools
+    #: beta (``defer_loading`` on tool defs + ``tool_search_tool_*`` server
+    #: tools). The Claude Agent SDK sends these unconditionally; endpoints
+    #: that validate strictly (OpenRouter → non-Anthropic models) 400 on
+    #: them. When ``False`` the adapter inlines every deferred tool (drops
+    #: the flag) and removes the server-side search tool entries.
+    SUPPORTS_TOOL_DEFERRAL: ClassVar[bool] = True
 
     # -- credentials -----------------------------------------------------
 
@@ -113,6 +120,8 @@ class AnthropicPassthroughAdapter(ProviderAdapter):
         original_model = body.get("model", upstream_model)
         body["model"] = upstream_model
         body["stream"] = True  # proxy only supports streaming (routes.py)
+        if not self._supports_deferral(upstream_model):
+            self._strip_tool_deferral(body)
 
         headers = {
             **self._auth_headers(api_key),
@@ -167,6 +176,44 @@ class AnthropicPassthroughAdapter(ProviderAdapter):
                     )
                 except Exception:  # noqa: BLE001 — logging must never break the stream
                     usage_logged = True
+
+    def _supports_deferral(self, upstream_model: str) -> bool:
+        """Hook so adapters can decide per-model (OpenRouter overrides)."""
+        return self.SUPPORTS_TOOL_DEFERRAL
+
+    @classmethod
+    def _strip_tool_deferral(cls, body: dict) -> None:
+        """Remove tool-search/deferral beta constructs, in place.
+
+        The SDK marks most tools ``defer_loading: true`` and adds a
+        ``tool_search_tool_*`` server tool so Anthropic's API can lazy-load
+        schemas. Upstreams without the beta reject the request outright
+        ("Deferred custom tools are only supported on Anthropic models…").
+        Inlining is lossless — every deferred tool def arrives complete, the
+        flag only controls context loading — so the model simply sees all
+        tools. The search tool itself is server-side and meaningless without
+        the beta, so it is dropped.
+        """
+        tools = body.get("tools")
+        if not tools:
+            return
+        cleaned: list[dict] = []
+        dropped = 0
+        inlined = 0
+        for tool in tools:
+            if str(tool.get("type") or "").startswith("tool_search_tool"):
+                dropped += 1
+                continue
+            if "defer_loading" in tool:
+                tool = {k: v for k, v in tool.items() if k != "defer_loading"}
+                inlined += 1
+            cleaned.append(tool)
+        body["tools"] = cleaned
+        if dropped or inlined:
+            logger.info(
+                "%s: stripped tool deferral (inlined=%d, search_tools_dropped=%d, tools_now=%d)",
+                cls.LABEL, inlined, dropped, len(cleaned),
+            )
 
     @classmethod
     def _tap_usage(
