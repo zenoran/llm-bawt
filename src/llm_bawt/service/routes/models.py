@@ -27,7 +27,7 @@ _UPSTREAM_TTL_S = 300.0
 _upstream_cache: dict[str, tuple[float, list[dict]]] = {}
 
 
-def _upstream_lookup(provider: str) -> list[dict]:
+def _upstream_lookup(provider: str, config=None) -> list[dict]:
     """Fetch and cache one provider's normalized upstream catalog."""
     now = time.time()
     cached = _upstream_cache.get(provider)
@@ -37,7 +37,11 @@ def _upstream_lookup(provider: str) -> list[dict]:
     from ..model_discovery import ModelDiscoveryError, discover_models
 
     try:
-        models = discover_models(provider)
+        models = (
+            discover_models(provider, config)
+            if config is not None
+            else discover_models(provider)
+        )
     except ModelDiscoveryError as exc:
         raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc
 
@@ -115,7 +119,7 @@ def list_upstream_models(
         raise HTTPException(status_code=400, detail="provider is required")
     return {
         "provider": provider_key,
-        "models": _upstream_lookup(provider_key),
+        "models": _upstream_lookup(provider_key, get_service().config),
     }
 
 

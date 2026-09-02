@@ -79,7 +79,9 @@ class LLMBawt(BaseLLMBawt):
         
         # Handle Grok (xAI) models
         if model_type == "grok":
-            api_key = self.model_definition.get("api_key") or self.config.XAI_API_KEY
+            # Explicit per-model key only; GrokClient resolves the rest
+            # DB-first (CredentialStore) with env/config as legacy fallback.
+            api_key = self.model_definition.get("api_key")
             
             if self.verbose:
                 logger.info(f"Initializing Grok client for model: {model_id}")

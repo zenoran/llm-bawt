@@ -43,10 +43,14 @@ class OpenAIClient(LLMClient):
         super().__init__(model, config, model_definition=model_definition)
         self.base_url = base_url
         self.api_key = api_key or self._get_api_key()
-        
+
         # For custom endpoints, API key is optional (many local servers don't need it)
         if not self.api_key and not base_url:
-            raise ValueError("OpenAI API key not found. Set OPENAI_API_KEY environment variable.")
+            raise ValueError(
+                "OpenAI API key not found. Connect the OpenAI API provider in "
+                "the UI (Settings → Providers), or set OPENAI_API_KEY as a "
+                "legacy fallback."
+            )
         
         # Use dummy key for local servers if none provided
         effective_key = self.api_key or "not-needed"
@@ -58,7 +62,10 @@ class OpenAIClient(LLMClient):
             self.client = OpenAI(api_key=effective_key)
 
     def _get_api_key(self) -> str | None:
-        return os.getenv("OPENAI_API_KEY")
+        """DB-first (CredentialStore via the `openai-api` adapter), env as legacy fallback."""
+        from ..service.providers.api_key import resolve_api_key
+
+        return resolve_api_key(self.config, "openai-api", env_vars=("OPENAI_API_KEY",))
 
     def supports_native_tools(self) -> bool:
         return True

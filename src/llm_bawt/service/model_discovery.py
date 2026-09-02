@@ -14,6 +14,8 @@ from typing import Any
 
 import httpx
 
+from ..utils.config import Config
+
 
 class ModelDiscoveryError(RuntimeError):
     """Expected discovery failure with an HTTP status suitable for the API."""
@@ -68,6 +70,9 @@ class ExistingFetcherProvider(ModelDiscoveryProvider):
         label: str,
         fetcher: Callable[..., tuple[bool, list[dict[str, Any]]]],
         key_envs: tuple[str, ...] = (),
+        provider_id: str | None = None,
+        config: Config | None = None,
+        config_attr: str | None = None,
         missing_key_message: str | None = None,
         pass_key: bool = False,
     ):
@@ -75,11 +80,25 @@ class ExistingFetcherProvider(ModelDiscoveryProvider):
         self.label = label
         self._fetcher = fetcher
         self._key_envs = key_envs
+        self._provider_id = provider_id
+        self._config = config
+        self._config_attr = config_attr
         self._missing_key_message = missing_key_message
         self._pass_key = pass_key
 
     def fetch(self) -> list[dict[str, Any]]:
-        key = next((os.getenv(name) for name in self._key_envs if os.getenv(name)), None)
+        key = None
+        if self._provider_id and self._config is not None:
+            from .providers.api_key import resolve_api_key
+
+            key = resolve_api_key(
+                self._config,
+                self._provider_id,
+                env_vars=self._key_envs,
+                config_attr=self._config_attr,
+            )
+        if key is None:
+            key = next((os.getenv(name) for name in self._key_envs if os.getenv(name)), None)
         if self._key_envs and not key:
             raise ModelDiscoveryError(
                 self._missing_key_message or f"{self.label} discovery requires an API key",
@@ -210,7 +229,7 @@ class OpenRouterDiscoveryProvider(ModelDiscoveryProvider):
         return _normalize(rows)
 
 
-def _providers() -> tuple[ModelDiscoveryProvider, ...]:
+def _providers(config: Config | None = None) -> tuple[ModelDiscoveryProvider, ...]:
     # Imports stay lazy so the model-manager's optional provider SDKs remain off
     # the service import path until discovery is actually requested.
     from ..model_manager import (
@@ -230,13 +249,21 @@ def _providers() -> tuple[ModelDiscoveryProvider, ...]:
             aliases=("openai",),
             label="openai",
             fetcher=fetch_openai_api_models,
+            key_envs=("OPENAI_API_KEY",),
+            provider_id="openai-api",
+            config=config,
+            missing_key_message="OpenAI discovery requires a connected OpenAI API key",
+            pass_key=True,
         ),
         ExistingFetcherProvider(
             aliases=("grok", "xai"),
             label="Grok",
             fetcher=fetch_grok_api_models,
-            key_envs=("LLM_BAWT_XAI_API_KEY", "XAI_API_KEY"),
-            missing_key_message="Grok discovery requires LLM_BAWT_XAI_API_KEY in env",
+            key_envs=("XAI_API_KEY", "LLM_BAWT_XAI_API_KEY"),
+            provider_id="xai",
+            config=config,
+            config_attr="XAI_API_KEY",
+            missing_key_message="Grok discovery requires a connected xAI API key",
             pass_key=True,
         ),
         ExistingFetcherProvider(
@@ -244,21 +271,26 @@ def _providers() -> tuple[ModelDiscoveryProvider, ...]:
             label="Anthropic",
             fetcher=fetch_anthropic_api_models,
             key_envs=("LLM_BAWT_ANTHROPIC_API_KEY", "ANTHROPIC_API_KEY"),
+            provider_id="anthropic-api",
+            config=config,
             missing_key_message=(
-                "Anthropic discovery requires ANTHROPIC_API_KEY in env "
-                "(the Claude Code OAuth token does not work for /v1/models)."
+                "Anthropic discovery requires a connected Anthropic API key "
+                "(Claude subscription OAuth does not authenticate /v1/models)."
             ),
+            pass_key=True,
         ),
         KimiCodingDiscoveryProvider(),
         OpenRouterDiscoveryProvider(),
     )
 
 
-def discover_models(provider: str) -> list[dict[str, Any]]:
+def discover_models(
+    provider: str, config: Config | None = None
+) -> list[dict[str, Any]]:
     """Resolve a provider alias and return its normalized live catalog."""
 
     provider_key = provider.strip().lower()
-    for adapter in _providers():
+    for adapter in _providers(config):
         if provider_key in adapter.aliases:
             return adapter.fetch()
     supported = sorted(alias for adapter in _providers() for alias in adapter.aliases)

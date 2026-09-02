@@ -743,14 +743,14 @@ def fetch_ollama_api_models(ollama_url: str) -> Tuple[bool, List[Dict[str, Any]]
         console.print(f"[bold red]Ollama API error:[/bold red] {e}")
         return False, []
 
-def fetch_openai_api_models() -> Tuple[bool, List[Dict[str, Any]]]:
+def fetch_openai_api_models(api_key: str | None = None) -> Tuple[bool, List[Dict[str, Any]]]:
     """Fetches model list from OpenAI API."""
     from openai import OpenAI # Import lazily
     from openai import APIConnectionError, AuthenticationError, RateLimitError
     details = []
     start = time.time()
     try:
-        client = OpenAI()
+        client = OpenAI(api_key=api_key) if api_key else OpenAI()
         client.models.list()
     except Exception as e:
         console.print(f"[bold red]OpenAI init error:[/bold red] {e}")
@@ -821,7 +821,9 @@ def fetch_codex_models() -> Tuple[bool, List[Dict[str, Any]]]:
     return True, [dict(item) for item in CODEX_MODEL_CATALOG]
 
 
-def fetch_anthropic_api_models() -> Tuple[bool, List[Dict[str, Any]]]:
+def fetch_anthropic_api_models(
+    api_key: str | None = None,
+) -> Tuple[bool, List[Dict[str, Any]]]:
     """Fetch Claude model list from the Anthropic API.
 
     Used to populate the Claude Code bridge's model picker — the bridge
@@ -829,8 +831,7 @@ def fetch_anthropic_api_models() -> Tuple[bool, List[Dict[str, Any]]]:
     IDs to choose from. Requires ``ANTHROPIC_API_KEY`` (the Claude Code
     subscription OAuth token does NOT authenticate /v1/models).
     """
-    import os
-    api_key = (
+    api_key = api_key or (
         os.getenv("LLM_BAWT_ANTHROPIC_API_KEY")
         or os.getenv("ANTHROPIC_API_KEY")
         or ""

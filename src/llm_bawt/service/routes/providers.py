@@ -360,3 +360,31 @@ async def github_git_credential(request: Request):
     # git credential helper protocol: key=value lines on stdout.
     body = f"username=x-access-token\npassword={token}\n"
     return Response(content=body, media_type="text/plain")
+
+
+# --- Generic API-key broker (TASK-825) ---------------------------------------
+# Registered LAST so the specific claude / openai_chatgpt / openrouter routes
+# above always match first (FastAPI resolves in registration order).
+@router.get("/v1/providers/{provider_id}/token")
+async def api_key_token(provider_id: str, request: Request):
+    """Internal: hand a reader the stored API key for any api-key provider.
+
+    Serves xai / openai-api / anthropic-api (and any future ApiKeyAdapter)
+    from the DB-backed CredentialStore — bridges and internal consumers call
+    this instead of reading env vars. Static keys, so ``expires_at`` is null.
+    Same trust model as the brokers above: internal network only, optional
+    ``X-Bridge-Token`` defense in depth.
+    """
+    from ..providers.api_key import ApiKeyAdapter  # noqa: PLC0415
+
+    expected = os.getenv("BRIDGE_CLAUDE_TOKEN_SECRET")
+    if expected and request.headers.get("X-Bridge-Token") != expected:
+        raise HTTPException(status_code=401, detail="bad bridge token")
+
+    adapter = _adapter_or_404(provider_id)
+    if not isinstance(adapter, ApiKeyAdapter):
+        raise HTTPException(status_code=404, detail=f"{provider_id} has no api-key broker")
+    key = await run_in_threadpool(adapter.api_key)
+    if not key:
+        raise HTTPException(status_code=503, detail=f"no {provider_id} credential installed")
+    return {"access_token": key, "expires_at": None, "state": "ok"}

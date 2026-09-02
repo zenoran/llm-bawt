@@ -442,9 +442,11 @@ class Config(RuntimeTunables, BaseSettings):
             if model_type == PROVIDER_OPENAI:
                 available_options.append(alias)
             elif model_type == PROVIDER_GROK:
-                # Grok requires XAI_API_KEY
-                if self.XAI_API_KEY:
-                    available_options.append(alias)
+                # Credential availability is resolved when GrokClient is built
+                # (explicit model key → CredentialStore → legacy env/config).
+                # Catalog presence determines availability here so DB-only keys
+                # are not hidden by an obsolete env check.
+                available_options.append(alias)
             elif model_type == PROVIDER_OLLAMA:
                 # Do not probe the Ollama server during normal execution.
                 # If the alias is defined, treat it as selectable and let actual

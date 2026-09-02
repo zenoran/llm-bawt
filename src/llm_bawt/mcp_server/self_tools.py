@@ -214,7 +214,7 @@ async def self_recap(
 
         config = Config()
         system_prompt = _resolve_recap_system_prompt(bot_id, config)
-        client = GrokClient(model=resolved_model, config=config, api_key=config.XAI_API_KEY)
+        client = GrokClient(model=resolved_model, config=config)
 
         # query() is synchronous and does network IO — keep it off the event loop.
         recap_text = await asyncio.to_thread(

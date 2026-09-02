@@ -316,7 +316,9 @@ class ServiceLLMBawt(BaseLLMBawt):
                 raise ValueError(
                     f"Missing 'model_id' in definition for '{self.resolved_model_alias}'"
                 )
-            api_key = self.model_definition.get("api_key") or self.config.XAI_API_KEY
+            # Explicit per-model key only; GrokClient resolves CredentialStore
+            # first, then legacy env/config fallbacks.
+            api_key = self.model_definition.get("api_key")
             client = GrokClient(
                 model_id,
                 config=self.config,

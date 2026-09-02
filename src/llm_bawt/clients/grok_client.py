@@ -6,7 +6,6 @@ API documentation: https://docs.x.ai/api
 
 from __future__ import annotations
 
-import os
 import logging
 
 from .responses_client import ResponsesClient
@@ -33,12 +32,13 @@ class GrokClient(ResponsesClient):
         model_definition: dict | None = None,
     ):
         self._provided_api_key = api_key
-        effective_key = api_key or self._get_api_key()
+        effective_key = self._resolve_api_key(config, api_key)
 
         if not effective_key:
             raise ValueError(
-                "xAI API key not found. Set XAI_API_KEY environment variable "
-                "or LLM_BAWT_XAI_API_KEY in your config."
+                "xAI API key not found. Connect the xAI provider in the UI "
+                "(Settings → Providers), or set XAI_API_KEY / "
+                "LLM_BAWT_XAI_API_KEY as a legacy fallback."
             )
 
         super().__init__(
@@ -49,8 +49,18 @@ class GrokClient(ResponsesClient):
             model_definition=model_definition,
         )
 
-    def _get_api_key(self) -> str | None:
-        return os.getenv("XAI_API_KEY") or os.getenv("LLM_BAWT_XAI_API_KEY")
+    @staticmethod
+    def _resolve_api_key(config: Config, explicit: str | None) -> str | None:
+        """DB-first (CredentialStore via the `xai` adapter), env as legacy fallback."""
+        from ..service.providers.api_key import resolve_api_key
+
+        return resolve_api_key(
+            config,
+            "xai",
+            env_vars=("XAI_API_KEY", "LLM_BAWT_XAI_API_KEY"),
+            explicit=explicit,
+            config_attr="XAI_API_KEY",
+        )
 
     def get_styling(self) -> tuple[str | None, str]:
         return None, "bright_magenta"
