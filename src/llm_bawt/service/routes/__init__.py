@@ -16,6 +16,7 @@ from .prompts import router as prompts_router
 from .profiles import router as profiles_router
 from .providers import router as providers_router
 from .settings import router as settings_router
+from .setup import router as setup_router
 from .sessions import router as sessions_router
 from .approval_policies import router as approval_policies_router
 from .ops import router as ops_router
@@ -53,6 +54,7 @@ all_routers = [
     prompts_router,
     providers_router,
     settings_router,
+    setup_router,
     sessions_router,
     config_router,
     approval_policies_router,
