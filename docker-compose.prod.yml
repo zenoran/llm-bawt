@@ -31,6 +31,29 @@ services:
       retries: 5
     restart: unless-stopped
 
+  # One-shot: give the frontend (Prisma) its OWN database inside the in-stack
+  # Postgres. It must NOT share `llm_bawt` with the app — `prisma db push`
+  # treats unknown tables as drift and would drop the app's schema (TASK-376).
+  db-init:
+    image: pgvector/pgvector:pg16
+    container_name: bawthub-db-init
+    environment:
+      - PGHOST=postgres
+      - PGUSER=${LLM_BAWT_POSTGRES_USER:-llm_bawt}
+      - PGPASSWORD=${LLM_BAWT_POSTGRES_PASSWORD:?set LLM_BAWT_POSTGRES_PASSWORD in .env}
+      - PGDATABASE=${LLM_BAWT_POSTGRES_DATABASE:-llm_bawt}
+      - BAWTHUB_DB=${BAWTHUB_POSTGRES_DATABASE:-bawthub}
+    entrypoint: ["sh", "-c"]
+    command:
+      - >-
+        psql -v ON_ERROR_STOP=1 -tAc
+        "SELECT 1 FROM pg_database WHERE datname = '$$BAWTHUB_DB'" | grep -q 1
+        || psql -v ON_ERROR_STOP=1 -c "CREATE DATABASE \"$$BAWTHUB_DB\""
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: "no"
+
   redis:
     image: redis:7-alpine
     container_name: bawthub-redis
@@ -60,6 +83,11 @@ services:
       - LLM_BAWT_POSTGRES_USER=${LLM_BAWT_POSTGRES_USER:-llm_bawt}
       - LLM_BAWT_POSTGRES_PASSWORD=${LLM_BAWT_POSTGRES_PASSWORD:?set LLM_BAWT_POSTGRES_PASSWORD in .env}
       - LLM_BAWT_POSTGRES_DATABASE=${LLM_BAWT_POSTGRES_DATABASE:-llm_bawt}
+      # The app's Config reads env with the LLM_BAWT_ prefix; without this the
+      # shared agent Redis transport never starts and /v1/ws (unified SSE for
+      # tool activity / turn events) answers 503. Bare REDIS_URL is what the
+      # agent bridges read — keep both.
+      - LLM_BAWT_REDIS_URL=redis://redis:6379/0
       - REDIS_URL=redis://redis:6379/0
       # Memory embeddings (TASK-277) POST to this CPU endpoint. Optional for
       # boot: if unset/unreachable the stack still comes up; only memory/vector
@@ -93,8 +121,11 @@ services:
     environment:
       # Server-side calls to the LLM backend go to the in-stack app service.
       - BAWTHUB_LLM_URL=http://app:8642
-      # Frontend's own Prisma DB — points at the in-stack Postgres for now.
-      - DATABASE_URL=postgresql://${LLM_BAWT_POSTGRES_USER:-llm_bawt}:${LLM_BAWT_POSTGRES_PASSWORD:?set LLM_BAWT_POSTGRES_PASSWORD in .env}@postgres:5432/${LLM_BAWT_POSTGRES_DATABASE:-llm_bawt}
+      # Frontend's own Prisma DB — a SEPARATE database (created by db-init) in
+      # the in-stack Postgres. Never the app's `llm_bawt` DB: see db-init.
+      - DATABASE_URL=postgresql://${LLM_BAWT_POSTGRES_USER:-llm_bawt}:${LLM_BAWT_POSTGRES_PASSWORD:?set LLM_BAWT_POSTGRES_PASSWORD in .env}@postgres:5432/${BAWTHUB_POSTGRES_DATABASE:-bawthub}
+      # Self-serve schema sync on start (prisma db push + prisma/sql deltas).
+      - PRISMA_DB_PUSH=1
       - STORAGE_BACKEND=fs
     ports:
       - "3000:3000"
@@ -103,6 +134,8 @@ services:
         condition: service_started
       postgres:
         condition: service_healthy
+      db-init:
+        condition: service_completed_successfully
     restart: unless-stopped
 
 volumes:
