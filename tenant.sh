@@ -9,6 +9,9 @@
 #   ./tenant.sh status  [name]          VM state, containers, forward, URL
 #   ./tenant.sh url     [name]          print the click-in URL
 #   ./tenant.sh logs    [name] [svc]    tail stack logs
+#   ./tenant.sh seed    [name]          apply the idempotent infrastructure seed
+#                                       (schema, access paths, prompt defaults — no bots;
+#                                       the wizard creates the first bot after a provider connects)
 #   ./tenant.sh bridge-git-setup [name] [container]  wire agent-bridge git auth
 #                                       to the provider-connect credential helper
 #                                       (run after GitHub is connected in wizard)
@@ -134,6 +137,12 @@ cmd_stop() { local IP; IP="$(vm_ip)"; $SSH "bawthub@$IP" 'docker compose -f dock
 cmd_restart() { cmd_stop; cmd_up; }
 cmd_url()  { echo "http://${LAN_IP}:${FWD_PORT}"; }
 cmd_logs() { local IP; IP="$(vm_ip)"; $SSH "bawthub@$IP" "docker compose -f docker-compose.prod.yml logs -f --tail=100 ${4:-}"; }
+cmd_seed() {
+  local IP; IP="$(vm_ip)"
+  [ -n "$IP" ] || { echo "VM not reachable"; exit 1; }
+  echo "==> applying idempotent tenant infrastructure seed (no bots)"
+  $SSH "bawthub@$IP" 'docker compose -f docker-compose.prod.yml exec -T app python -m llm_bawt.seeding'
+}
 cmd_status() {
   echo "VM $NAME: $(sudo virsh domstate "$NAME" 2>/dev/null || echo 'does not exist')"
   local IP; IP="$(vm_ip)"; echo "IP: ${IP:-none}"
@@ -151,7 +160,7 @@ cmd_destroy() {
 
 case "${1:-status}" in
   new) cmd_new ;; up) cmd_up ;; stop) cmd_stop ;; restart) cmd_restart ;;
-  status) cmd_status ;; url) cmd_url ;; logs) cmd_logs ;; destroy) cmd_destroy ;;
+  status) cmd_status ;; url) cmd_url ;; logs) cmd_logs ;; seed) cmd_seed ;; destroy) cmd_destroy ;;
   bridge-git-setup) cmd_bridge_git_setup ;;
   *) grep '^#' "$0" | sed 's/^# \{0,1\}//' | head -20 ;;
 esac
