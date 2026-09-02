@@ -77,9 +77,6 @@ async def lifespan(app):
     # voice response after a restart doesn't pay a ~6s lazy-load. Fire it
     # off-thread — the model load is CPU-bound and ~6s, and we don't want
     # to block the event loop or delay the rest of startup.
-    # NB: a later `import asyncio` inside this lifespan function shadows
-    # the module-level import, so use threading directly to avoid the
-    # UnboundLocalError trap.
     def _warm_embedding_model() -> None:
         try:
             from ..memory.embeddings import generate_embedding
@@ -153,9 +150,8 @@ async def lifespan(app):
             # Start background task to clean up stale consumer groups
             async def _cleanup_stale_groups():
                 """Periodically destroy idle ui:* consumer groups."""
-                import asyncio as _asyncio
                 while True:
-                    await _asyncio.sleep(300)
+                    await asyncio.sleep(300)
                     try:
                         streams = await redis_subscriber.list_unified_streams()
                         total = 0
@@ -166,7 +162,6 @@ async def lifespan(app):
                     except Exception:
                         log.debug("Stale group cleanup error", exc_info=True)
 
-            import asyncio
             service._group_cleanup_task = asyncio.create_task(_cleanup_stale_groups())
 
             # Start persistence consumer for tool events → Postgres.
@@ -314,15 +309,12 @@ async def lifespan(app):
     # TASK-635: the app is the SOLE refresher of the app-owned Claude
     # credential (bridge + usage are read-only consumers). Keep it fresh
     # proactively so readers never see a lapsed token, even when idle.
-    # NB: local asyncio alias — the conditional `import asyncio` above
-    # shadows the module-level import inside this function scope.
-    import asyncio as _aio
     from .usage.claude_oauth import proactive_refresh_loop
-    service._claude_refresh_task = _aio.create_task(proactive_refresh_loop())
+    service._claude_refresh_task = asyncio.create_task(proactive_refresh_loop())
 
     # TASK-636 Phase 2: same pattern for the ChatGPT/codex OAuth bundle.
     from .usage.codex_oauth import proactive_refresh_loop as _codex_loop
-    service._codex_refresh_task = _aio.create_task(_codex_loop())
+    service._codex_refresh_task = asyncio.create_task(_codex_loop())
 
     try:
         yield
