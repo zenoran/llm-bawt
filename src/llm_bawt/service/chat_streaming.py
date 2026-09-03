@@ -345,6 +345,9 @@ class ChatStreamingMixin(ChatStreamingBridgeMixin):
                 thread_binding = self._resolve_active_thread_binding(llm_bawt)
 
         task_turn_capability: str | None = None
+        # Always bound: turn_start below publishes it for every backend, and
+        # non-agent turns must send null rather than blow up on an unbound name.
+        session_id: str = ""
         if is_agent_backend:
             session_id = (
                 str(thread_binding.get("thread_session_id") or "").strip()
