@@ -17,6 +17,10 @@
 services:
   postgres:
     image: pgvector/pgvector:pg16
+    # TASK-834: never append the host DNS search domain to bare service names.
+    # Before the in-stack container registers in Docker DNS (daemon restart ignores
+    # depends_on), "postgres" would otherwise resolve via the LAN to a foreign host.
+    dns_search: ["."]
     container_name: bawthub-postgres
     environment:
       - POSTGRES_USER=${LLM_BAWT_POSTGRES_USER:-llm_bawt}
@@ -36,6 +40,7 @@ services:
   # treats unknown tables as drift and would drop the app's schema (TASK-376).
   db-init:
     image: pgvector/pgvector:pg16
+    dns_search: ["."]
     container_name: bawthub-db-init
     environment:
       - PGHOST=postgres
@@ -56,6 +61,7 @@ services:
 
   redis:
     image: redis:7-alpine
+    dns_search: ["."]
     container_name: bawthub-redis
     command: ["redis-server", "--maxmemory", "128mb", "--maxmemory-policy", "allkeys-lru"]
     volumes:
@@ -69,6 +75,7 @@ services:
 
   app:
     image: ghcr.io/bawthub/app:${IMAGE_TAG:-latest}
+    dns_search: ["."]
     container_name: bawthub-app
     env_file:
       - ./.env
@@ -117,6 +124,7 @@ services:
 
   frontend:
     image: ghcr.io/bawthub/frontend:${FRONTEND_TAG:-latest}
+    dns_search: ["."]
     container_name: bawthub-frontend
     environment:
       # Server-side calls to the LLM backend go to the in-stack app service.
