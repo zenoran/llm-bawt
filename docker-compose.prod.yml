@@ -122,6 +122,60 @@ services:
         condition: service_healthy
     restart: unless-stopped
 
+  # TASK-835: the coding surface. Without this the tenant is a chat product —
+  # nothing can read or write a repo. Runs the SAME shared agent-bridge image as
+  # dev, minus every echo-ism: no credential bind mounts (tokens come from the
+  # app's broker endpoint, TASK-635/636), no ~/.ssh mount, no extra_hosts.
+  claude-code-bridge:
+    image: ghcr.io/bawthub/agent-bridge:${BRIDGE_TAG:-latest}
+    dns_search: ["."]
+    container_name: bawthub-claude-code-bridge
+    command: ["python", "-m", "claude_code_bridge"]
+    env_file:
+      - ./.env
+    environment:
+      # CLAUDE_CODE_MODEL is deliberately unset — every request carries its own
+      # model, resolved from the bot's default_model catalog row.
+      - CLAUDE_CODE_BRIDGE_LOG_LEVEL=${CLAUDE_CODE_BRIDGE_LOG_LEVEL:-INFO}
+      - LLM_BAWT_API_URL=http://app:8642
+      # Override the 0.0.0.0 the app needs as a BIND address: from inside a
+      # bridge the service is a compose service name, and the `llm` CLI dials it.
+      - LLM_BAWT_SERVICE_HOST=app
+      - REDIS_URL=redis://redis:6379/0
+      - ENABLE_TOOL_SEARCH=true
+      - CLAUDE_CODE_SKILLS_PATH=/home/bridge/dev/agent-skills
+      - CLAUDE_CODE_BAWTHUB_MCP_URL=http://app:8001/mcp
+      # Turn on the baked git credential helper (see Dockerfile.agent-bridge).
+      # Done through GIT_CONFIG_* rather than a baked ~/.gitconfig so the same
+      # image stays inert on the dev host, where bridges push over SSH.
+      # The insteadOf rewrite makes `git@github.com:` clones work with no key.
+      - GIT_CONFIG_COUNT=2
+      - GIT_CONFIG_KEY_0=credential.helper
+      - GIT_CONFIG_VALUE_0=bawthub
+      - "GIT_CONFIG_KEY_1=url.https://github.com/.insteadOf"
+      # Quoted: the trailing colon would otherwise make YAML read this entry as
+      # a map instead of a string.
+      - "GIT_CONFIG_VALUE_1=git@github.com:"
+    volumes:
+      # Agent workspace. Named volume, seeded from the image path (which the
+      # Dockerfile pre-creates as bridge:bridge). Shared READ-ONLY into the
+      # frontend below so the /repos viewer sees the trees the agent edits.
+      - bridge-dev:/home/bridge/dev
+      # Claude Code state: sessions, settings.json, the skills symlink.
+      - bridge-claude:/home/bridge/.claude
+    depends_on:
+      redis:
+        condition: service_healthy
+      app:
+        condition: service_started
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8681/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+
   frontend:
     image: ghcr.io/bawthub/frontend:${FRONTEND_TAG:-latest}
     dns_search: ["."]
@@ -135,6 +189,11 @@ services:
       # Self-serve schema sync on start (prisma db push + prisma/sql deltas).
       - PRISMA_DB_PUSH=1
       - STORAGE_BACKEND=fs
+    volumes:
+      # TASK-835: the /repos dashboard reads REPOS_ROOT (default /repos). Same
+      # volume the bridge writes, mounted READ-ONLY here — the viewer's git
+      # status/diff physically cannot mutate a tree (TASK-634 invariant).
+      - bridge-dev:/repos:ro
     ports:
       - "3000:3000"
     depends_on:
@@ -152,3 +211,6 @@ volumes:
   app-config:
   app-storage:
   app-logs:
+  # Agent workspace — written by claude-code-bridge, read-only in frontend.
+  bridge-dev:
+  bridge-claude:
