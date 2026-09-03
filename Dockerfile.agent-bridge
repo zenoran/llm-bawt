@@ -114,10 +114,18 @@ RUN uv pip install --prerelease=allow "openai-codex>=0.1.0b3"
 RUN uv pip install -e . --no-deps
 
 RUN useradd -m -s /bin/bash bridge && chown -R bridge:bridge /app
-# Pre-create ~/.codex so Docker bind mounts inherit bridge ownership for
-# the parent directory; otherwise codex CLI can't write cache/log/history
-# alongside the bind-mounted auth.json and config.toml.
-RUN mkdir -p /home/bridge/.codex && chown bridge:bridge /home/bridge/.codex
+# Pre-create the bridge-owned dirs the compose files mount over, so both
+# mount kinds inherit correct ownership:
+#   ~/.codex  - bind mounts inherit the parent dir's ownership; without this the
+#               codex CLI can't write cache/log/history alongside the
+#               bind-mounted auth.json and config.toml.
+#   ~/dev     - agent workspace (shared read-only with the frontend /repos viewer).
+#   ~/.claude - Claude Code bridge state (sessions, settings, skills symlink).
+# A NAMED volume seeds itself from the image path on first mount, so these must
+# exist with bridge:bridge ownership at build time or the tenant stack comes up
+# with root-owned, unwritable dirs.
+RUN mkdir -p /home/bridge/.codex /home/bridge/dev /home/bridge/.claude \
+    && chown bridge:bridge /home/bridge/.codex /home/bridge/dev /home/bridge/.claude
 USER bridge
 
 # uv tool-installed `llm` CLI (editable, full deps).
