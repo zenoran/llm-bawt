@@ -74,14 +74,25 @@ def main() -> None:
     # to send (the proxy ignores its value).
     from .bridge import _get_fresh_oauth_token
     if not _get_fresh_oauth_token():
-        logger.error(
-            "No OAuth token available. Ensure the app (llm-bawt) is running "
-            "and the Claude provider is connected (the bridge fetches tokens "
-            "via the /v1/providers/claude/token broker endpoint, TASK-636), "
-            "or set CLAUDE_CODE_OAUTH_TOKEN, or mount a legacy "
+        # TASK-835: warn, don't exit. A fresh tenant boots this stack BEFORE
+        # anyone has run the setup wizard, so there is legitimately no Claude
+        # credential yet. Exiting here turned that into a crash-loop with no
+        # health endpoint to curl and no obvious cause — strictly worse to
+        # diagnose than a running bridge that reports the problem.
+        #
+        # Nothing is lost by continuing: the token is re-fetched from the
+        # broker on every send (it is deliberately uncached, see
+        # _get_fresh_oauth_token), so the bridge starts working the moment the
+        # provider is connected, with no restart. A turn attempted before then
+        # fails with the broker's own error.
+        logger.warning(
+            "No OAuth token available yet — starting anyway; turns will fail "
+            "until the Claude provider is connected. Ensure the app (llm-bawt) "
+            "is running and Claude is connected (the bridge fetches tokens via "
+            "the /v1/providers/claude/token broker endpoint, TASK-636), or set "
+            "CLAUDE_CODE_OAUTH_TOKEN, or mount a legacy "
             "~/.claude/.credentials.json into the container."
         )
-        sys.exit(1)
 
     add_dirs_raw = os.getenv("CLAUDE_CODE_ADD_DIRS", "")
     add_dirs = [d.strip() for d in add_dirs_raw.split(",") if d.strip()]
