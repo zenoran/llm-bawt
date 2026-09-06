@@ -200,3 +200,34 @@ def test_local_serving_config_is_flattened_for_existing_consumers():
     assert resolved["filename"] == "model.gguf"
     assert resolved["n_gpu_layers"] == 33
     assert resolved["engine_kind"] == "llama-cpp"
+
+
+def test_local_anthropic_access_path_gets_local_namespace():
+    """Ollama / llama-server native Anthropic surface → LocalAdapter ("local/")."""
+    endpoint = _endpoint(
+        5,
+        "qwen3.8-27b-local",
+        "local-anthropic",
+        "local",
+        "anthropic-messages",
+        "qwen3.8:27b",
+    )
+    resolved = ModelCatalog([endpoint]).resolve(
+        "qwen3.8-27b-local", harness="claude-proxy"
+    )
+    assert resolved["type"] == "claude-code"
+    assert resolved["model_id"] == "local/qwen3.8:27b"
+
+
+def test_local_chat_completions_path_keeps_no_namespace():
+    """The app-served ollama chat path must NOT be routed to the proxy."""
+    endpoint = _endpoint(
+        6,
+        "qwen3.8-27b-chat",
+        "ollama",
+        "local",
+        "chat-completions",
+        "qwen3.8:27b",
+    )
+    resolved = ModelCatalog([endpoint]).resolve("qwen3.8-27b-chat")
+    assert resolved["model_id"] == "qwen3.8:27b"

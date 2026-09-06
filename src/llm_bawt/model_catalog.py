@@ -248,6 +248,11 @@ class ModelCatalog:
             # Upstream ids themselves contain slashes (qwen/qwen3-coder);
             # the bridge splits on the FIRST slash only, so nesting is safe.
             return "openrouter"
+        if access_path.vendor == "local" and access_path.protocol == "anthropic-messages":
+            # Ollama / llama-server native Anthropic surface (LocalAdapter).
+            # The chat-completions local paths (ollama/llama-cpp/vllm engine
+            # kinds) are served by the app's own clients, not the proxy.
+            return "local"
         return None
 
     @classmethod

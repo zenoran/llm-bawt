@@ -11,6 +11,7 @@ import asyncio
 
 from .base import ProviderAdapter
 from .kimi_coding import KimiCodingAdapter
+from .local import LocalAdapter
 from .moonshot import MoonshotAdapter
 from .openai_chatgpt import OpenAIChatGPTAdapter
 from .openrouter import OpenRouterAdapter
@@ -46,6 +47,7 @@ register(ZaiAdapter())
 register(MoonshotAdapter())
 register(KimiCodingAdapter())
 register(OpenRouterAdapter())
+register(LocalAdapter())
 
 __all__ = [
     "ProviderAdapter", "REGISTRY", "register", "lookup", "start_all", "close_all",

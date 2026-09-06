@@ -300,3 +300,44 @@ def test_usage_tap_is_idempotent_and_bounded():
     junk = "x" * 70000
     remaining, logged = ZaiAdapter._tap_usage(junk, "m", False)
     assert len(remaining) <= 4096 and logged is True
+
+
+# --- local (Ollama / llama-server): keyless passthrough ------------------
+
+
+def test_local_registered_with_keyless_default(monkeypatch):
+    from claude_code_bridge.proxy.adapters.local import LocalAdapter, PLACEHOLDER_KEY
+
+    monkeypatch.delenv("LOCAL_ANTHROPIC_BASE_URL", raising=False)
+    monkeypatch.delenv("LOCAL_ANTHROPIC_API_KEY", raising=False)
+    adapter = lookup("local")
+    assert isinstance(adapter, LocalAdapter)
+    assert LocalAdapter._base_url() == "http://10.0.0.246:11434"
+    # A missing key must NOT raise — local servers don't validate it.
+    assert adapter._api_key() == PLACEHOLDER_KEY
+    monkeypatch.setenv("LOCAL_ANTHROPIC_API_KEY", "real")
+    assert adapter._api_key() == "real"
+
+
+def test_local_round_trip_strips_tool_deferral(fake_upstream, monkeypatch):
+    """Ollama/llama.cpp lack the tool-search beta: inline deferred tools."""
+    base_url, captured, holder = fake_upstream
+    holder["echo_model"] = "qwen3.8:27b"
+    monkeypatch.setenv("LOCAL_ANTHROPIC_BASE_URL", base_url)
+    monkeypatch.delenv("LOCAL_ANTHROPIC_API_KEY", raising=False)
+    body = {
+        "model": "local/qwen3.8:27b",
+        "max_tokens": 32,
+        "messages": [{"role": "user", "content": "hi"}],
+        "tools": [
+            {"name": "a", "input_schema": {"type": "object"}, "defer_loading": True},
+            {"type": "tool_search_tool_regex_20251119", "name": "tool_search"},
+        ],
+    }
+    out = _run(lookup("local"), body, "qwen3.8:27b")
+    assert captured["path"] == "/v1/messages"
+    assert captured["headers"]["x-api-key"] == "local"
+    assert captured["body"]["model"] == "qwen3.8:27b"
+    assert captured["body"]["tools"] == [{"name": "a", "input_schema": {"type": "object"}}]
+    assert b'"model": "local/qwen3.8:27b"' in out
+    assert b"message_stop" in out
