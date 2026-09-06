@@ -34,6 +34,22 @@ Successful snapshots are cached for `LLM_BAWT_USAGE_CACHE_TTL` seconds
 (default `120`). On refresh errors or upstream `429`s, the endpoint returns the
 last good cached snapshot when it has one.
 
+## ChatGPT / Codex usage
+
+`openai_chatgpt` fetches current subscription limits from the same dedicated
+endpoint used by the official Codex client:
+
+`GET https://chatgpt.com/backend-api/wham/usage`
+
+This is a non-inference request; it does not select a model or create a hidden
+chat turn. A `401` triggers one bounded force-refresh through the app-owned
+OAuth bundle, then one retry. Real Codex `/responses` calls also expose quota
+headers; the claude-code bridge saves those passively in Redis as a fallback.
+If the dedicated endpoint fails and only an old passive snapshot is available,
+the adapter returns `status=usage_stale` with `cached=true`. This means the
+quota values are old, not that the credential is broken. Credential expiry and
+refresh-chain health remain authoritative under `GET /v1/providers/health`.
+
 ## Claude credential model
 
 Claude usage is separate from Claude inference.
@@ -94,6 +110,7 @@ curl -s 'http://localhost:8642/v1/usage' | jq '.providers[] | {provider,status,a
 | Status | Meaning |
 |---|---|
 | `stale` | Shared credential exists but its access token expired |
+| `usage_stale` | Cached quota values are shown because a live usage refresh failed; credential health is separate |
 | `unauthorized` | Missing bundle or wrong scope |
 | `rate_limited` | Upstream usage endpoint returned `429` |
 | `error` | Network or unexpected upstream failure |

@@ -23,6 +23,7 @@ STATUS_NOT_IMPLEMENTED = "not_implemented"
 STATUS_UNAUTHORIZED = "unauthorized"
 STATUS_RATE_LIMITED = "rate_limited"
 STATUS_STALE = "stale"  # credential present but access token expired (shared mode)
+STATUS_USAGE_STALE = "usage_stale"  # cached limits shown; live usage refresh failed
 STATUS_ERROR = "error"
 
 

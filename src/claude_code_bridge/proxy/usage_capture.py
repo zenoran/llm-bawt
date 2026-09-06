@@ -1,11 +1,11 @@
-"""Capture codex subscription plan-usage from /responses response headers.
+"""Capture passive Codex plan-usage fallback from response headers.
 
-The ChatGPT codex backend has **no standalone usage endpoint** — the OAuth
-bearer only authorizes ``/responses``. But every ``/responses`` call returns
-the caller's live plan-usage as ``x-codex-*`` response headers (the same data
-``codex /status`` shows). We peek those headers off the SDK stream object
-(already buffered — no extra request, no body consumed) and stash a canonical
-snapshot in Redis so the app's ``/v1/usage`` endpoint can serve it.
+The app normally refreshes limits through the official ``/wham/usage``
+endpoint. Real ``/responses`` calls also carry equivalent ``x-codex-*``
+headers, so the bridge passively saves them as a fallback when that dedicated
+endpoint is temporarily unavailable. We peek those headers off the SDK stream
+object (already buffered — no extra request, no body consumed) and stash a
+canonical snapshot in Redis for the app's ``/v1/usage`` endpoint.
 
 This must NEVER affect inference: ``schedule_capture`` is synchronous, reads
 the (already-present) headers inline, and fire-and-forgets only the Redis

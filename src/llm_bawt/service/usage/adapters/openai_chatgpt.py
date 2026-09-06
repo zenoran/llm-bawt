@@ -1,12 +1,11 @@
 """OpenAI ChatGPT (codex subscription) usage adapter.
 
-The ChatGPT codex backend has **no standalone usage endpoint** — the OAuth
-bearer only authorizes ``/responses``. Plan-usage instead rides on every
-``/responses`` call as ``x-codex-*`` response headers. The claude-code bridge's
-proxy harvests those headers on each codex turn and publishes a canonical
-snapshot to Redis (see
-``src/claude_code_bridge/proxy/usage_capture.py``). This adapter normally reads
-that snapshot, and runs a tiny codex backend probe when the snapshot is stale.
+The official Codex client reads subscription limits from
+``GET https://chatgpt.com/backend-api/wham/usage``. This adapter uses that
+non-inference endpoint as the authoritative refresh path. The claude-code
+bridge also passively harvests equivalent ``x-codex-*`` headers from real
+``/responses`` turns and publishes a canonical Redis snapshot; that snapshot
+is a fallback only when the dedicated endpoint is temporarily unavailable.
 
 Mapping:
 - ``primary``   window → ``session_5h``  (the rolling 5-hour limit)
@@ -21,7 +20,6 @@ import json
 import logging
 import os
 import time
-import uuid
 
 from ..base import UsageAdapter
 from ..canonical import (
@@ -29,7 +27,7 @@ from ..canonical import (
     UsageLimit,
     STATUS_ERROR,
     STATUS_OK,
-    STATUS_STALE,
+    STATUS_USAGE_STALE,
 )
 
 logger = logging.getLogger(__name__)
@@ -37,8 +35,9 @@ logger = logging.getLogger(__name__)
 # Shared contract with the bridge-side writer. Keep both in lockstep.
 REDIS_KEY = "llm_bawt:usage:openai_chatgpt:snapshot"
 _TTL_SECONDS = 7 * 24 * 3600
-_PROBE_MAX_AGE_SECONDS = 60
-_PROBE_MODEL_ENV = "OPENAI_CHATGPT_USAGE_PROBE_MODEL"
+_SNAPSHOT_MAX_AGE_SECONDS = 60
+_USAGE_URL = "https://chatgpt.com/backend-api/wham/usage"
+_USAGE_URL_ENV = "OPENAI_CHATGPT_USAGE_URL"
 
 _PLAN_LABEL = {
     "free": "Free",
@@ -75,52 +74,6 @@ def _window_label(minutes) -> str | None:
     return f"{m}m"
 
 
-def _i(headers, key):
-    v = headers.get(key)
-    if v in (None, ""):
-        return None
-    try:
-        return int(float(v))
-    except (TypeError, ValueError):
-        return None
-
-
-def _b(headers, key):
-    v = headers.get(key)
-    if v is None:
-        return None
-    return str(v).strip().lower() in ("true", "1", "yes")
-
-
-def _snapshot_from_headers(headers) -> dict | None:
-    if (
-        headers.get("x-codex-primary-used-percent") is None
-        and headers.get("x-codex-plan-type") is None
-    ):
-        return None
-    return {
-        "captured_at": int(time.time()),
-        "plan_type": headers.get("x-codex-plan-type"),
-        "active_limit": headers.get("x-codex-active-limit"),
-        "primary": {
-            "used_percent": _i(headers, "x-codex-primary-used-percent"),
-            "window_minutes": _i(headers, "x-codex-primary-window-minutes"),
-            "reset_at": _i(headers, "x-codex-primary-reset-at"),
-            "reset_after_seconds": _i(headers, "x-codex-primary-reset-after-seconds"),
-        },
-        "secondary": {
-            "used_percent": _i(headers, "x-codex-secondary-used-percent"),
-            "window_minutes": _i(headers, "x-codex-secondary-window-minutes"),
-            "reset_at": _i(headers, "x-codex-secondary-reset-at"),
-            "reset_after_seconds": _i(headers, "x-codex-secondary-reset-after-seconds"),
-        },
-        "credits": {
-            "has_credits": _b(headers, "x-codex-credits-has-credits"),
-            "balance": headers.get("x-codex-credits-balance") or None,
-            "unlimited": _b(headers, "x-codex-credits-unlimited"),
-        },
-    }
-
 
 def _snapshot_age(snap: dict | None) -> float | None:
     if not isinstance(snap, dict):
@@ -133,7 +86,7 @@ def _snapshot_age(snap: dict | None) -> float | None:
 
 def _snapshot_is_stale(snap: dict | None) -> bool:
     age = _snapshot_age(snap)
-    if age is None or age > _PROBE_MAX_AGE_SECONDS:
+    if age is None or age > _SNAPSHOT_MAX_AGE_SECONDS:
         return True
     now = time.time()
     for key in ("primary", "secondary"):
@@ -258,101 +211,107 @@ class OpenAIChatGPTUsageAdapter(UsageAdapter):
         except Exception as e:  # noqa: BLE001
             logger.warning("codex usage snapshot write failed: %s", e)
 
-    async def _probe_once(self, result) -> tuple[dict | None, int | None]:
-        """One codex backend request → (snapshot, http_status)."""
+    @staticmethod
+    def _window_from_payload(window: dict | None) -> dict:
+        if not isinstance(window, dict):
+            return {}
+        duration = window.get("limit_window_seconds")
+        try:
+            minutes = int(duration) // 60 if duration is not None else None
+        except (TypeError, ValueError):
+            minutes = None
+        return {
+            "used_percent": window.get("used_percent"),
+            "window_minutes": minutes,
+            "reset_at": window.get("reset_at"),
+            "reset_after_seconds": window.get("reset_after_seconds"),
+        }
+
+    @classmethod
+    def _snapshot_from_payload(cls, payload: dict) -> dict | None:
+        rate_limit = payload.get("rate_limit")
+        if not isinstance(rate_limit, dict):
+            return None
+        primary = cls._window_from_payload(rate_limit.get("primary_window"))
+        secondary = cls._window_from_payload(rate_limit.get("secondary_window"))
+        if primary.get("used_percent") is None and secondary.get("used_percent") is None:
+            return None
+        return {
+            "captured_at": int(time.time()),
+            "plan_type": payload.get("plan_type"),
+            "active_limit": payload.get("rate_limit_reached_type"),
+            "primary": primary,
+            "secondary": secondary,
+            "credits": payload.get("credits") if isinstance(payload.get("credits"), dict) else {},
+        }
+
+    async def _fetch_usage_once(self, result) -> tuple[dict | None, int | None]:
+        """Fetch the official non-inference Codex usage endpoint once."""
         import httpx
 
-        base_url = (
-            os.getenv("OPENAI_BASE_URL")
-            or "https://chatgpt.com/backend-api/codex"
-        )
         headers = {
             "Authorization": f"Bearer {result.token}",
-            "OpenAI-Beta": "responses=experimental",
-            "originator": "codex_cli_rs",
-            "session_id": uuid.uuid4().hex,
+            "Accept": "application/json",
+            "User-Agent": "llm-bawt-usage/1",
         }
         if result.account_id:
-            headers["chatgpt-account-id"] = result.account_id
-        model = os.getenv(_PROBE_MODEL_ENV) or "gpt-5.4"
-        body = {
-            "model": model,
-            "instructions": "Reply with OK.",
-            "input": [
-                {
-                    "role": "user",
-                    "content": [{"type": "input_text", "text": "OK"}],
-                }
-            ],
-            "stream": True,
-            "store": False,
-            "reasoning": {"effort": "none"},
-        }
+            headers["ChatGPT-Account-Id"] = result.account_id
+        url = os.getenv(_USAGE_URL_ENV) or _USAGE_URL
         async with httpx.AsyncClient(timeout=20.0) as client:
-            async with client.stream(
-                "POST",
-                f"{base_url.rstrip('/')}/responses",
-                headers=headers,
-                json=body,
-            ) as resp:
-                if resp.status_code != 200:
-                    logger.warning(
-                        "codex usage probe failed: HTTP %s", resp.status_code
-                    )
-                    return None, resp.status_code
-                snap = _snapshot_from_headers(resp.headers)
-                if snap is None:
-                    logger.warning("codex usage probe returned no quota headers")
-                    return None, resp.status_code
-                await self._write_snapshot(snap)
-                return snap, resp.status_code
+            resp = await client.get(url, headers=headers)
+        if resp.status_code != 200:
+            logger.warning("codex usage endpoint failed: HTTP %s", resp.status_code)
+            return None, resp.status_code
+        try:
+            payload = resp.json()
+        except ValueError:
+            logger.warning("codex usage endpoint returned non-JSON data")
+            return None, resp.status_code
+        snap = self._snapshot_from_payload(payload) if isinstance(payload, dict) else None
+        if snap is None:
+            logger.warning("codex usage endpoint returned no usable limit windows")
+            return None, resp.status_code
+        await self._write_snapshot(snap)
+        return snap, resp.status_code
 
-    async def _probe_snapshot(self) -> dict | None:
-        """Fetch current quota headers with a tiny codex backend request.
-
-        A 401 means the stored access token was rejected upstream even though
-        its ``exp`` claim may look fine (revoked / rotated elsewhere). Rotate
-        the token pair once (``force_refresh``) and retry — the documented
-        reader-got-a-401 recovery path.
-        """
+    async def _fetch_live_snapshot(self) -> dict | None:
+        """Fetch usage directly, force-rotating the app-owned token once on 401."""
         try:
             from ..codex_oauth import get_access_token
 
-            # TASK-636: call the in-process credential owner directly instead
-            # of going through the proxy adapter (which uses the HTTP broker
-            # endpoint — not reachable from inside the app container).
             result = await asyncio.to_thread(get_access_token)
             if not result.token:
-                logger.warning("codex usage probe: no ChatGPT token available")
+                logger.warning("codex usage endpoint: no ChatGPT token available")
                 return None
-            snap, status = await self._probe_once(result)
+            snap, status = await self._fetch_usage_once(result)
             if snap is not None or status != 401:
                 return snap
-            logger.info("codex usage probe got 401 — force-refreshing token")
+            logger.info("codex usage endpoint got 401 — force-refreshing token")
             result = await asyncio.to_thread(get_access_token, force_refresh=True)
             if not result.token:
                 return None
-            snap, _ = await self._probe_once(result)
+            snap, _ = await self._fetch_usage_once(result)
             return snap
         except Exception as e:  # noqa: BLE001
-            logger.warning("codex usage probe failed: %s", e)
+            logger.warning("codex usage endpoint failed: %s", e)
             return None
 
     async def fetch(self) -> ProviderUsage:
-        snap = await self._read_snapshot()
-        stale = _snapshot_is_stale(snap)
-        if stale:
-            snap = await self._probe_snapshot() or snap
+        passive_snap = await self._read_snapshot()
+        snap = await self._fetch_live_snapshot()
+        live = snap is not None
+        if snap is None:
+            snap = passive_snap
         if snap is None:
             return self._base(
                 available=False,
                 status=STATUS_ERROR,
                 error=(
-                    "No codex usage observed yet — plan-usage is harvested from "
-                    "/responses headers and populates after the next codex turn."
+                    "Could not fetch Codex usage, and no passive snapshot from a "
+                    "recent model response is available."
                 ),
             )
-        stale = _snapshot_is_stale(snap)
+        stale = not live and _snapshot_is_stale(snap)
 
         now = int(time.time())
         limits: list[UsageLimit] = []
@@ -379,10 +338,16 @@ class OpenAIChatGPTUsageAdapter(UsageAdapter):
 
         return self._base(
             available=True,
-            status=STATUS_STALE if stale else STATUS_OK,
+            status=STATUS_USAGE_STALE if stale else STATUS_OK,
             display_name=display,
-            error="Codex usage snapshot is stale; probe refresh failed." if stale else None,
+            error=(
+                "Showing cached Codex usage; the dedicated usage endpoint is "
+                "temporarily unavailable. Credential health is checked separately."
+                if stale
+                else None
+            ),
             fetched_at=snap.get("captured_at"),
+            cached=not live,
             limits=limits,
             raw=snap,
         )
