@@ -54,4 +54,22 @@ mcp = ApprovalAwareFastMCP(
 mcp.settings.log_level = "WARNING"
 
 
-__all__ = ["mcp"]
+def ensure_tools_registered() -> None:
+    """Import the tool modules so ``mcp`` can actually dispatch by name.
+
+    The app and the MCP server are separate processes in one container. In the
+    MCP process ``server.py`` is the entry point and its module-level imports
+    register every tool. The FastAPI process never imports it — it only reaches
+    for the ``mcp`` singleton when executing an *approved* MCP call server-side.
+    Without this the singleton is bare and trusted execution fails with
+    "Unknown tool: ops_run" after the user already approved it (TASK-639).
+
+    Importing ``server`` is registration-only: ``run_server()`` runs solely
+    under ``__main__``. The import is lazy (``registry`` is imported *by*
+    ``server``, so a module-level import here would cycle) and idempotent via
+    ``sys.modules``.
+    """
+    from . import server  # noqa: F401
+
+
+__all__ = ["mcp", "ensure_tools_registered"]

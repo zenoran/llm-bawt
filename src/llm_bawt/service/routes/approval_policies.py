@@ -265,6 +265,7 @@ async def _resolve_mcp_request(store, row, *, outcome: str, message: str, resolv
             current = store.get_request(row.id)
             return _stored_mcp_resolution(current or updated)
         try:
+            from ...mcp_server.approval_interceptor import ApprovedCallerContext
             from ...mcp_server.registry import mcp
 
             stored_args = _decode_stored_args(claimed)
@@ -280,6 +281,16 @@ async def _resolve_mcp_request(store, row, *, outcome: str, message: str, resolv
                 stored_args,
                 expected_invocation_hash=claimed.invocation_hash or "",
                 trusted_argument_overrides=trusted_overrides,
+                # Provenance the tool records in its own ledger. Read from the
+                # persisted row, never from agent-supplied input.
+                caller_context=ApprovedCallerContext(
+                    bot_id=claimed.bot_id or "",
+                    user_id=claimed.user_id or "",
+                    turn_id=claimed.turn_id or "",
+                    session_key=claimed.session_key or "",
+                    backend=claimed.backend or "",
+                    approval_request_id=claimed.id,
+                ),
             )
             payload = _normalize_mcp_result(result)
             completed = store.complete_mcp_execution(

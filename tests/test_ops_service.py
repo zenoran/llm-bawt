@@ -285,3 +285,47 @@ def test_list_operations_for_agent_hides_disabled():
     assert slugs == ["live"]
     slugs = [row["slug"] for row in service.list_operations_for_agent(include_disabled=True)]
     assert set(slugs) == {"live", "dark"}
+
+
+# ---- caller provenance (TASK-639) ------------------------------------------
+
+def test_ops_run_records_approved_caller_provenance(monkeypatch):
+    """An approved job must be traceable back to who asked for it.
+
+    Regression: ``ops_run`` never passed caller identity to ``dispatch_job``,
+    so ``ops_jobs.caller_bot_id`` / ``approval_request_id`` stayed empty and a
+    completed restart had no audit linkage back to its approval.
+    """
+    from llm_bawt.mcp_server import ops_tools
+    from llm_bawt.mcp_server.approval_interceptor import (
+        ApprovedCallerContext,
+        _approved_caller_context,
+    )
+
+    token = _approved_caller_context.set(
+        ApprovedCallerContext(
+            bot_id="snark", user_id="nick", turn_id="turn-1",
+            session_key="sk-1", backend="claude-code",
+            approval_request_id="mcp-appr-abc",
+        )
+    )
+    try:
+        provenance = ops_tools._caller_provenance()
+    finally:
+        _approved_caller_context.reset(token)
+
+    assert provenance == {
+        "caller_bot_id": "snark",
+        "caller_user_id": "nick",
+        "caller_turn_id": "turn-1",
+        "caller_session_key": "sk-1",
+        "caller_backend": "claude-code",
+        "approval_request_id": "mcp-appr-abc",
+    }
+
+
+def test_ops_run_provenance_is_empty_without_any_trusted_context():
+    """A manual/generic MCP client leaves the columns null, never guessed."""
+    from llm_bawt.mcp_server import ops_tools
+
+    assert ops_tools._caller_provenance() == {}

@@ -8,10 +8,12 @@ field is stripped before FastMCP schema validation/function binding.
 
 from __future__ import annotations
 
+import contextvars
 import inspect
 import json
 import logging
 import uuid
+from dataclasses import dataclass
 from typing import Any, Awaitable, Callable
 
 from agent_bridge.approval import PolicyAction, evaluate
@@ -35,6 +37,35 @@ ApprovalPublisher = Callable[[dict[str, Any]], Awaitable[None] | None]
 
 def _new_request_id() -> str:
     return "mcp-appr-" + uuid.uuid4().hex
+
+
+@dataclass(frozen=True)
+class ApprovedCallerContext:
+    """Who originally asked for an approved call, replayed at execution time.
+
+    Server-side execution happens in the FastAPI process, long after the
+    agent's turn-scoped contextvars are gone, so a tool that wants to record
+    provenance (``ops_run`` writing ``ops_jobs.caller_*``) has nothing to read.
+    This carries it without adding anything to the tool's public MCP schema —
+    an agent must never be able to supply its own caller identity.
+    """
+
+    bot_id: str = ""
+    user_id: str = ""
+    turn_id: str = ""
+    session_key: str = ""
+    backend: str = ""
+    approval_request_id: str = ""
+
+
+_approved_caller_context: contextvars.ContextVar[ApprovedCallerContext | None] = (
+    contextvars.ContextVar("llm_bawt_approved_caller_context", default=None)
+)
+
+
+def current_approved_caller_context() -> ApprovedCallerContext | None:
+    """Caller provenance for the approved call being executed, if any."""
+    return _approved_caller_context.get()
 
 
 class ApprovalAwareFastMCP(FastMCP):
@@ -104,6 +135,7 @@ class ApprovalAwareFastMCP(FastMCP):
         *,
         expected_invocation_hash: str,
         trusted_argument_overrides: dict[str, Any] | None = None,
+        caller_context: ApprovedCallerContext | None = None,
     ):
         """Invoke an already-approved exact stored call without policy recursion.
 
@@ -111,13 +143,22 @@ class ApprovalAwareFastMCP(FastMCP):
         server-owned transport overrides (currently the ops idempotency key) are
         added. A caller cannot use the override seam through public MCP input.
         """
+        # The FastAPI process reaches this without ever importing the tool
+        # modules, so the singleton would otherwise be bare (TASK-639).
+        from .registry import ensure_tools_registered
+
+        ensure_tools_registered()
         received = dict(arguments or {})
         actual_hash = canonical_invocation_hash(name, received)
         if actual_hash != str(expected_invocation_hash or ""):
             raise ValueError("approved MCP invocation hash mismatch")
         if trusted_argument_overrides:
             received.update(trusted_argument_overrides)
-        return await super().call_tool(name, received)
+        token = _approved_caller_context.set(caller_context)
+        try:
+            return await super().call_tool(name, received)
+        finally:
+            _approved_caller_context.reset(token)
 
     async def call_tool(self, name: str, arguments: dict[str, Any]):
         received = dict(arguments or {})
@@ -240,4 +281,8 @@ class ApprovalAwareFastMCP(FastMCP):
         }
 
 
-__all__ = ["ApprovalAwareFastMCP"]
+__all__ = [
+    "ApprovalAwareFastMCP",
+    "ApprovedCallerContext",
+    "current_approved_caller_context",
+]

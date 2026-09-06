@@ -56,6 +56,7 @@ def _mcp_req(**over):
 class FakeMcp:
     def __init__(self):
         self.calls = []
+        self.caller_contexts = []
         self.fail = None
 
     async def call_approved_tool(
@@ -65,18 +66,24 @@ class FakeMcp:
         *,
         expected_invocation_hash,
         trusted_argument_overrides=None,
+        caller_context=None,
     ):
         if self.fail:
             raise self.fail
         assert expected_invocation_hash == canonical_invocation_hash(name, arguments)
         effective = {**arguments, **(trusted_argument_overrides or {})}
         self.calls.append((name, arguments, trusted_argument_overrides))
+        self.caller_contexts.append(caller_context)
         return [SimpleNamespace(text=json.dumps({
             "job_id": "job-1",
             "operation": effective["operation"],
             "idempotency_key": effective.get("idempotency_key"),
             "state": "queued",
         }))]
+
+
+def persisted_bot(store, request_id):
+    return store.get_request(request_id).bot_id
 
 
 def _record(store, *, continuation_capable=True, invocation_hash=None):
@@ -113,6 +120,12 @@ def test_approve_executes_stored_call_once_and_persists_actual_result(monkeypatc
     assert name == "ops_run"
     assert public_args == {"operation": "llm-bawt.restart-app", "args": {}}
     assert overrides == {"idempotency_key": row.id}
+    # Provenance comes from the persisted row, so the executed job is
+    # traceable back to the approval that authorized it (TASK-639).
+    caller = fake.caller_contexts[0]
+    assert caller is not None
+    assert caller.approval_request_id == row.id
+    assert caller.bot_id == persisted_bot(store, row.id)
     assert first["execution_state"] == EXEC_SUCCEEDED
     assert first["result"]["job_id"] == "job-1"
     assert first["result"]["idempotency_key"] == row.id
@@ -168,3 +181,44 @@ def test_live_execution_claim_cannot_be_taken_twice():
     assert first is not None
     assert second is None
     assert first.execution_attempts == 1
+
+
+# ---- cross-process tool registration (TASK-639) ----------------------------
+
+def test_ensure_tools_registered_populates_bare_app_process_singleton():
+    """The FastAPI process must be able to dispatch an approved MCP call.
+
+    Regression: the resolve route imports the ``mcp`` singleton from
+    ``registry`` alone. In the app process nothing else imports the tool
+    modules, so the singleton was bare and every approved call died with
+    "Unknown tool: ops_run" *after* the user had already approved it.
+
+    Run in a subprocess so an unrelated test importing ``server`` first can't
+    mask the bug through ``sys.modules``.
+    """
+    import subprocess
+    import sys
+
+    script = """
+import asyncio
+from llm_bawt.mcp_server.registry import mcp, ensure_tools_registered
+
+async def names():
+    return {t.name for t in await mcp.list_tools()}
+
+before = asyncio.run(names())
+assert "ops_run" not in before, "expected a bare singleton before registration"
+ensure_tools_registered()
+after = asyncio.run(names())
+assert "ops_run" in after, "ops_run still missing after ensure_tools_registered()"
+assert "ops_job_status" in after
+print("OK")
+"""
+    proc = subprocess.run(
+        [sys.executable, "-c", script],
+        capture_output=True,
+        text=True,
+        timeout=180,
+    )
+    assert proc.returncode == 0, f"stdout={proc.stdout}\nstderr={proc.stderr[-3000:]}"
+    assert "OK" in proc.stdout

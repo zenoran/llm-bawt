@@ -80,6 +80,48 @@ async def ops_list_operations(include_disabled: bool = False) -> dict:
 # ops_run
 # ---------------------------------------------------------------------------
 
+def _caller_provenance() -> dict[str, str]:
+    """Who is running this job, for the ``ops_jobs.caller_*`` audit columns.
+
+    Two arrival paths:
+
+    * approved server-side execution — the resolve route replays the persisted
+      approval row's identity through a contextvar;
+    * a directly allowed call — the agent's signed per-turn capability is still
+      on the contextvar stack.
+
+    Never sourced from tool arguments: caller identity must not be forgeable
+    through the public MCP schema. Returns ``{}`` when neither is available
+    (manual/generic MCP clients), leaving the columns null rather than guessing.
+    """
+    from .approval_interceptor import current_approved_caller_context
+
+    approved = current_approved_caller_context()
+    if approved is not None:
+        return {
+            "caller_bot_id": approved.bot_id or None,
+            "caller_user_id": approved.user_id or None,
+            "caller_turn_id": approved.turn_id or None,
+            "caller_session_key": approved.session_key or None,
+            "caller_backend": approved.backend or None,
+            "approval_request_id": approved.approval_request_id or None,
+        }
+
+    from ..task_turn_context import open_task_turn_context
+    from .task_association import current_task_turn_capability
+
+    try:
+        # Raises (never returns None) when no capability is present.
+        turn = open_task_turn_context(current_task_turn_capability())
+    except Exception:  # noqa: BLE001 — provenance is best-effort, never fatal
+        return {}
+    return {
+        "caller_bot_id": turn.bot_id or None,
+        "caller_user_id": turn.user_id or None,
+        "caller_turn_id": turn.turn_id or None,
+    }
+
+
 @mcp.tool(name="ops_run")
 async def ops_run(
     operation: str,
@@ -130,6 +172,7 @@ async def ops_run(
             operation_slug=operation,
             args=args or {},
             idempotency_key=idem,
+            **_caller_provenance(),
         )
     except OpsDispatchError as exc:
         # Surface a structured error the agent can parse. MCP tools
