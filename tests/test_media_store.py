@@ -515,3 +515,142 @@ def test_upload_dedup_check_treats_estale_as_not_intact(
             / f"{first.sha256}.webp"
         )
         assert shard.exists(), f"variant {subdir} missing after heal-on-ESTALE"
+
+
+# ---------------------------------------------------------------------------
+# TASK-847: non-image ``file`` kind
+# ---------------------------------------------------------------------------
+
+from llm_bawt.media.asset_kinds import (  # noqa: E402
+    FILES_DIR,
+    FILE_KIND,
+    IMAGE_KIND,
+    UnsupportedVariant,
+    kind_for_mime,
+)
+
+
+def _file_key(store: MediaStore, sha: str) -> Path:
+    return store.root / FILES_DIR / sha[:2] / sha[2:4] / sha
+
+
+def test_kind_for_mime_routes_images_vs_files() -> None:
+    assert kind_for_mime("image/png") is IMAGE_KIND
+    assert kind_for_mime("Image/JPEG; charset=x") is IMAGE_KIND
+    assert kind_for_mime("application/pdf") is FILE_KIND
+    assert kind_for_mime("image/svg+xml") is FILE_KIND  # not Pillow-safe → verbatim
+    assert kind_for_mime("") is FILE_KIND
+    assert kind_for_mime(None) is FILE_KIND
+
+
+def test_upload_file_stores_bytes_verbatim(store: MediaStore) -> None:
+    """A PDF goes under files/<aa>/<bb>/<sha> untouched, mime + name kept."""
+    raw = b"%PDF-1.4\n1 0 obj\n<<>>\nendobj\n%%EOF\n" * 20
+    asset = store.upload(
+        raw, "application/pdf", "agent_attachment", owner_user_id="nick", filename="report.pdf"
+    )
+    assert asset.kind == "file"
+    assert asset.mime_type == "application/pdf"
+    assert asset.original_mime_type == "application/pdf"
+    assert asset.filename == "report.pdf"
+    assert asset.size_bytes == len(raw)
+    assert asset.width is None and asset.height is None
+    import hashlib
+
+    assert asset.sha256 == hashlib.sha256(raw).hexdigest()
+
+    blob = _file_key(store, asset.sha256)
+    assert blob.exists()
+    assert blob.read_bytes() == raw
+    # No image variants were produced.
+    for subdir in VARIANT_DIRS.values():
+        assert not list((store.root / subdir).rglob("*")) if (store.root / subdir).exists() else True
+
+    data, mime = store.read_variant(asset.id, "original")
+    assert data == raw
+    assert mime == "application/pdf"
+
+
+def test_upload_file_octet_stream_default_and_mime_normalised(store: MediaStore) -> None:
+    a = store.upload(b"\x00\x01\x02", "", "agent_attachment", owner_user_id=None, filename="blob.bin")
+    assert a.mime_type == "application/octet-stream"
+    b = store.upload(b"a,b\n1,2\n", "TEXT/CSV; charset=utf-8", "chat_upload", owner_user_id="u")
+    assert b.mime_type == "text/csv"
+    assert b.filename is None
+
+
+def test_upload_file_dedups_by_raw_sha(store: MediaStore) -> None:
+    raw = b"same bytes, different names"
+    first = store.upload(raw, "text/plain", "agent_attachment", owner_user_id="nick", filename="a.txt")
+    second = store.upload(raw, "text/plain", "agent_attachment", owner_user_id="nick", filename="b.txt")
+    assert first.id == second.id
+    # First name wins — the row is content-addressed.
+    assert second.filename == "a.txt"
+    assert len(store.db.rows) == 1  # type: ignore[union-attr]
+
+
+def test_upload_file_self_heals_missing_blob(store: MediaStore) -> None:
+    raw = b"heal me" * 100
+    first = store.upload(raw, "text/plain", "agent_attachment", owner_user_id="nick", filename="h.txt")
+    blob = _file_key(store, first.sha256)
+    blob.unlink()
+    second = store.upload(raw, "text/plain", "agent_attachment", owner_user_id="nick", filename="h.txt")
+    assert second.id == first.id
+    assert blob.exists() and blob.read_bytes() == raw
+
+
+def test_file_thumb_and_preview_unsupported(store: MediaStore) -> None:
+    asset = store.upload(b"log line\n" * 10, "text/plain", "agent_attachment", owner_user_id="nick", filename="x.log")
+    with pytest.raises(UnsupportedVariant):
+        store.read_variant(asset.id, "thumb")
+    with pytest.raises(UnsupportedVariant):
+        store.read_variant(asset.id, "preview")
+    # Still a ValueError for pre-TASK-847 callers.
+    with pytest.raises(ValueError):
+        store.read_preview_as_data_url(asset.id)
+    # Unknown variant names are rejected for images too.
+    img = store.upload(_png_bytes(64, 64), "image/png", "chat_upload", owner_user_id="u")
+    with pytest.raises(ValueError):
+        store.read_variant(img.id, "bogus")  # type: ignore[arg-type]
+
+
+def test_delete_file_removes_blob_and_row(store: MediaStore) -> None:
+    asset = store.upload(b"bye" * 50, "application/zip", "agent_attachment", owner_user_id="nick", filename="z.zip")
+    blob = _file_key(store, asset.sha256)
+    assert blob.exists()
+    store.delete(asset.id)
+    assert not blob.exists()
+    assert store.stat(asset.id) is None
+    store.delete(asset.id)  # idempotent
+
+
+def test_forced_file_kind_keeps_png_verbatim(store: MediaStore) -> None:
+    """kind='file' bypasses the WebP pipeline even for a PNG."""
+    raw = _png_bytes(100, 80)
+    asset = store.upload_file(raw, "image/png", "agent_attachment", owner_user_id="nick", filename="raw.png")
+    assert asset.kind == "file"
+    assert asset.mime_type == "image/png"
+    data, mime = store.read_variant(asset.id, "original")
+    assert data == raw and mime == "image/png"
+
+
+def test_image_upload_rows_carry_kind_image(store: MediaStore) -> None:
+    """The image path is unchanged and now labels itself."""
+    asset = store.upload(_png_bytes(300, 200), "image/png", "chat_upload", owner_user_id="u", filename="shot.png")
+    assert asset.kind == "image"
+    assert asset.mime_type == VARIANT_MIME
+    assert asset.filename == "shot.png"
+    for subdir in VARIANT_DIRS.values():
+        assert (store.root / subdir / asset.sha256[:2] / asset.sha256[2:4] / f"{asset.sha256}.webp").exists()
+
+
+def test_legacy_row_without_kind_reads_as_image(store: MediaStore) -> None:
+    """Pre-TASK-847 rows have no ``kind`` key — they must resolve to image keys."""
+    asset = store.upload(_png_bytes(50, 50), "image/png", "chat_upload", owner_user_id="u")
+    row = store.db.rows[asset.id]  # type: ignore[union-attr]
+    row.pop("kind", None)
+    row.pop("filename", None)
+    data, mime = store.read_variant(asset.id, "thumb")
+    assert mime == VARIANT_MIME and data[:4] == b"RIFF"
+    store.delete(asset.id)
+    assert store.stat(asset.id) is None

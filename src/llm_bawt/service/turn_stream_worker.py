@@ -172,6 +172,7 @@ class TurnStreamWorker(TurnStreamPublishMixin):
                         attachments_to_persist,
                         media_store.db,
                         origin=getattr(self.config, "AGENT_ORIGIN", "") or "",
+                        public_origin_override=getattr(self.config, "PUBLIC_ORIGIN", None),
                     )
                 except Exception as _manifest_err:
                     manifest = ""

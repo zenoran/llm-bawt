@@ -88,6 +88,19 @@ async def prepare_stream_request_attachments(
                     asset_id,
                 )
                 continue
+            # TASK-847: non-image assets (PDF, log, zip, …) are persisted as
+            # refs but never inlined — there is no preview rendition and
+            # vision input only takes images. Agent backends still learn
+            # about them through the attachment manifest built in
+            # turn_stream_worker (curlable + public URLs).
+            try:
+                meta = await asyncio.to_thread(media_store.stat, asset_id)
+            except Exception as exc:
+                log.warning("TASK-847: stat failed for attachment_id=%s: %s", asset_id, exc)
+                meta = None
+            if meta is not None and getattr(meta, "kind", "image") != "image":
+                attachments_to_persist.append({"asset_id": asset_id, "kind": meta.kind})
+                continue
             try:
                 data_url = await asyncio.to_thread(
                     media_store.read_preview_as_data_url, asset_id

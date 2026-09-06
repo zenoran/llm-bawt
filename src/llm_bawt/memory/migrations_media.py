@@ -32,7 +32,7 @@ def add_media_assets_table(backend: Any, dry_run: bool = False) -> dict:
         Dict with action summary.
     """
     from sqlalchemy import text
-    from ..media.assets import CREATE_TABLE_SQL, CREATE_INDEXES_SQL, TABLE_NAME
+    from ..media.assets import ALTER_TABLE_SQL, CREATE_TABLE_SQL, CREATE_INDEXES_SQL, TABLE_NAME
 
     with backend.engine.connect() as conn:
         exists = conn.execute(text(
@@ -48,6 +48,9 @@ def add_media_assets_table(backend: Any, dry_run: bool = False) -> dict:
             }
 
         conn.execute(text(CREATE_TABLE_SQL))
+        # TASK-847: bring pre-existing tables up to the current column set.
+        for alter_sql in ALTER_TABLE_SQL:
+            conn.execute(text(alter_sql))
         for idx_sql in CREATE_INDEXES_SQL:
             try:
                 conn.execute(text(idx_sql))

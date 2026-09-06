@@ -21,6 +21,8 @@ here's how."
 
 from __future__ import annotations
 
+import pytest
+
 from collections import defaultdict
 
 
@@ -83,3 +85,17 @@ def pytest_terminal_summary(terminalreporter, exitstatus, config):
         "  make test-all           # everything (hermetic + integration + service + llm_call)",
         yellow=True,
     )
+
+
+@pytest.fixture(autouse=True)
+def force_fs_media_backend(monkeypatch):
+    """Never let the unit suite talk to Garage (TASK-847).
+
+    Bridge containers and echo export ``LLM_BAWT_STORAGE_BACKEND=s3`` plus real
+    credentials, and ``MediaStore(root=tmp_path)`` honours them — so a plain
+    ``pytest`` run would spray synthetic blobs into the production bucket.
+    Pin the unit tests to the filesystem backend; S3 behaviour is covered by
+    ``tests/test_object_store.py`` with explicit ``S3Config`` objects.
+    """
+    monkeypatch.setenv("LLM_BAWT_STORAGE_BACKEND", "fs")
+    monkeypatch.setenv("LLM_BAWT_S3_FALLBACK_FS", "false")

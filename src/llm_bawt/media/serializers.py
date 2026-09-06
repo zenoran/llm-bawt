@@ -29,11 +29,88 @@ helper to pick a variant URL.
 from __future__ import annotations
 
 import logging
+import os
 from typing import Any, Iterable
 
+from .asset_kinds import IMAGE_KIND, kind_by_name
 from .assets import MediaAsset
 
 logger = logging.getLogger(__name__)
+
+
+#: Default user-facing origin for clickable asset links (TASK-847). Mirrors
+#: ``Config.PUBLIC_ORIGIN``; read straight from the environment here so the
+#: serializers stay import-light and usable without a Config instance.
+DEFAULT_PUBLIC_ORIGIN = "https://app.bawthub.com"
+
+#: BawtHub's same-origin proxy prefix for llm-bawt ``/v1/uploads/...``.
+PUBLIC_UPLOADS_PREFIX = "/api/chat/uploads"
+
+
+def public_origin() -> str:
+    """User-facing BawtHub origin, or ``""`` when public links are disabled."""
+    return (os.environ.get("LLM_BAWT_PUBLIC_ORIGIN", DEFAULT_PUBLIC_ORIGIN) or "").rstrip("/")
+
+
+def variant_urls(asset_id: str, kind: str = "image") -> dict[str, str]:
+    """Relative ``/v1/uploads`` URLs for an asset.
+
+    Images keep the pre-TASK-847 ``thumb`` / ``preview`` / ``original`` trio.
+    Files expose ``original`` (inline) plus ``download`` (forces
+    ``Content-Disposition: attachment``) — there is no thumb/preview to
+    point at, and emitting broken URLs would only confuse renderers.
+    """
+    base = f"/v1/uploads/{asset_id}"
+    if kind_by_name(kind) is IMAGE_KIND:
+        return {
+            "thumb": f"{base}/thumb",
+            "preview": f"{base}/preview",
+            "original": base,
+        }
+    return {
+        "original": base,
+        "download": f"{base}?download=1",
+    }
+
+
+def public_urls(asset_id: str, kind: str = "image", origin: str | None = None) -> dict[str, str]:
+    """Clickable BawtHub URLs for an asset: ``{"url": ..., "download": ...}``.
+
+    Routed through BawtHub's ``/api/chat/uploads`` proxy so the browser hits
+    the same origin (and auth) it already uses for chat thumbnails. Empty
+    when no public origin is configured.
+    """
+    o = public_origin() if origin is None else origin.rstrip("/")
+    if not o:
+        return {}
+    base = f"{o}{PUBLIC_UPLOADS_PREFIX}/{asset_id}"
+    out = {"url": base}
+    if kind_by_name(kind) is not IMAGE_KIND:
+        out["download"] = f"{base}?download=1"
+    return out
+
+
+def _attachment_dict(
+    *,
+    asset_id: str,
+    kind: str | None,
+    mime_type: str | None,
+    width: int | None,
+    height: int | None,
+    filename: str | None,
+    size_bytes: int | None,
+) -> dict:
+    kind_name = kind_by_name(kind).name
+    return {
+        "asset_id": asset_id,
+        "kind": kind_name,
+        "mime_type": mime_type,
+        "width": width,
+        "height": height,
+        "filename": filename,
+        "size_bytes": size_bytes,
+        "urls": variant_urls(asset_id, kind_name),
+    }
 
 
 def asset_to_attachment_dict(asset: MediaAsset) -> dict:
@@ -42,19 +119,20 @@ def asset_to_attachment_dict(asset: MediaAsset) -> dict:
     This is the shape persisted in ``{bot}_messages.attachments`` and the
     shape returned inside ``/v1/history`` messages. Keep field names and
     URL structure stable — bawthub renderers read this directly.
+
+    TASK-847 additions are purely additive for images: ``kind`` now reflects
+    the row (``image`` | ``file``), and ``filename`` / ``size_bytes`` ride
+    along so file chips can render without a second round-trip.
     """
-    return {
-        "asset_id": asset.id,
-        "kind": "image",
-        "mime_type": asset.mime_type,
-        "width": asset.width,
-        "height": asset.height,
-        "urls": {
-            "thumb": f"/v1/uploads/{asset.id}/thumb",
-            "preview": f"/v1/uploads/{asset.id}/preview",
-            "original": f"/v1/uploads/{asset.id}",
-        },
-    }
+    return _attachment_dict(
+        asset_id=asset.id,
+        kind=getattr(asset, "kind", None),
+        mime_type=asset.mime_type,
+        width=asset.width,
+        height=asset.height,
+        filename=getattr(asset, "filename", None),
+        size_bytes=asset.size_bytes,
+    )
 
 
 def asset_to_upload_response_dict(asset: MediaAsset) -> dict:
@@ -69,6 +147,12 @@ def asset_to_upload_response_dict(asset: MediaAsset) -> dict:
     base["sha256"] = asset.sha256
     base["size_bytes"] = asset.size_bytes
     base["original_mime_type"] = asset.original_mime_type
+    # TASK-847: clickable BawtHub links so an agent (or the composer) can
+    # hand the user a URL that opens in a browser, not just an internal
+    # http://app:8642 path.
+    pub = public_urls(asset.id, base["kind"])
+    base["public_url"] = pub.get("url")
+    base["public_download_url"] = pub.get("download")
     return base
 
 
@@ -80,19 +164,15 @@ def asset_row_to_attachment_dict(row: dict[str, Any]) -> dict:
     overload that takes a mapping. Keep this in sync with
     :func:`asset_to_attachment_dict` — both shapes are wire-identical.
     """
-    asset_id = row.get("id")
-    return {
-        "asset_id": asset_id,
-        "kind": "image",
-        "mime_type": row.get("mime_type"),
-        "width": row.get("width"),
-        "height": row.get("height"),
-        "urls": {
-            "thumb": f"/v1/uploads/{asset_id}/thumb",
-            "preview": f"/v1/uploads/{asset_id}/preview",
-            "original": f"/v1/uploads/{asset_id}",
-        },
-    }
+    return _attachment_dict(
+        asset_id=row.get("id"),
+        kind=row.get("kind"),
+        mime_type=row.get("mime_type"),
+        width=row.get("width"),
+        height=row.get("height"),
+        filename=row.get("filename"),
+        size_bytes=row.get("size_bytes"),
+    )
 
 
 def _abs_url(path: str, origin: str) -> str:
@@ -123,8 +203,9 @@ def build_agent_image_manifest(
     refs: Iterable[dict[str, Any]],
     asset_store,
     origin: str = "",
+    public_origin_override: str | None = None,
 ) -> str:
-    """Render a plain-text 'Attached Images' manifest for agent backends.
+    """Render a plain-text 'Attached Files' manifest for agent backends.
 
     TASK-391 — when a chat turn carrying image attachments is dispatched
     to an agent backend (Claude Code / Codex / OpenClaw), the model can
@@ -150,6 +231,9 @@ def build_agent_image_manifest(
             and optionally ``get_many(ids) -> list[dict]`` (preferred —
             single round-trip).
         origin: Absolute base URL for curlable links, or "" for relative.
+        public_origin_override: User-facing origin for the ``public:`` line
+            (TASK-847). ``None`` reads ``LLM_BAWT_PUBLIC_ORIGIN``; ``""``
+            suppresses the line.
     """
     ids: list[str] = []
     seen: set[str] = set()
@@ -186,6 +270,7 @@ def build_agent_image_manifest(
 
     lines: list[str] = []
     n = 0
+    n_images = 0
     for aid in ids:
         row = rows.get(aid)
         if not row:
@@ -193,10 +278,15 @@ def build_agent_image_manifest(
         n += 1
         att = asset_row_to_attachment_dict(row)
         urls = att["urls"]
+        is_image = att["kind"] == "image"
+        if is_image:
+            n_images += 1
         meta_bits = [
             f"asset_id={att['asset_id']}",
-            f"type={att.get('mime_type') or 'image'}",
+            f"type={att.get('mime_type') or ('image' if is_image else 'file')}",
         ]
+        if att.get("filename"):
+            meta_bits.append(f"name={att['filename']}")
         if att.get("width") and att.get("height"):
             meta_bits.append(f"{att['width']}x{att['height']}")
         size = _fmt_size(row.get("size_bytes"))
@@ -204,17 +294,30 @@ def build_agent_image_manifest(
             meta_bits.append(size)
         lines.append(f"{n}. " + "  ".join(meta_bits))
         lines.append(f"   original: {_abs_url(urls['original'], origin)}")
-        lines.append(f"   preview:  {_abs_url(urls['preview'], origin)}")
-        lines.append(f"   thumb:    {_abs_url(urls['thumb'], origin)}")
+        if is_image:
+            lines.append(f"   preview:  {_abs_url(urls['preview'], origin)}")
+            lines.append(f"   thumb:    {_abs_url(urls['thumb'], origin)}")
+        pub = public_urls(att["asset_id"], att["kind"], public_origin_override)
+        if pub.get("url"):
+            lines.append(f"   public:   {pub['url']}")
 
     if not lines:
         return ""
 
-    header = (
-        f"[Attached Images] The user attached {n} image(s) to this message. "
-        "You can see them inline; your tools can fetch the same assets by "
-        "curling these URLs (HTTP GET, no auth on the internal network):"
-    )
+    if n_images == n:
+        header = (
+            f"[Attached Images] The user attached {n} image(s) to this message. "
+            "You can see them inline; your tools can fetch the same assets by "
+            "curling these URLs (HTTP GET, no auth on the internal network). "
+            "The `public:` link is the one to paste back to the user:"
+        )
+    else:
+        header = (
+            f"[Attached Files] The user attached {n} file(s) to this message "
+            f"({n_images} image(s) visible inline). Your tools can fetch them by "
+            "curling the `original` URLs (HTTP GET, no auth on the internal "
+            "network). The `public:` link is the one to paste back to the user:"
+        )
     return header + "\n" + "\n".join(lines)
 
 

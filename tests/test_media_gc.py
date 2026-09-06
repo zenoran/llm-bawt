@@ -450,3 +450,43 @@ class TestSqlBuilder:
         the source)."""
         sql = _build_referenced_query(["nova_messages"])
         assert "IS NOT NULL" in sql
+
+
+# ---------------------------------------------------------------------------
+# TASK-847: mixed image / file orphans
+# ---------------------------------------------------------------------------
+
+
+def test_gc_removes_file_kind_blob_and_image_variants(
+    fake_store: tuple[MediaStore, FakeMediaAssetStore],
+    tmp_path: Path,
+    patched_orphan_finder: dict,
+) -> None:
+    """A ``kind=file`` orphan loses its single ``files/`` blob; an image orphan
+    loses its three variants; both rows go."""
+    from llm_bawt.media.asset_kinds import FILES_DIR
+
+    store, asset_store = fake_store
+    img_sha = "a" * 64
+    file_sha = "b" * 64
+    img_paths = _write_blob_set(tmp_path, img_sha)
+    file_path = tmp_path / FILES_DIR / file_sha[:2] / file_sha[2:4] / file_sha
+    file_path.parent.mkdir(parents=True)
+    file_path.write_bytes(b"pdf-ish")
+
+    asset_store.add(asset_id="ma_img", sha256=img_sha, size_bytes=300)
+    asset_store.add(asset_id="ma_file", sha256=file_sha, size_bytes=7)
+    asset_store.rows["ma_file"]["kind"] = "file"
+    asset_store.rows["ma_file"]["filename"] = "x.pdf"
+
+    patched_orphan_finder["orphans"] = [
+        {"id": "ma_img", "sha256": img_sha, "size_bytes": 300},
+        {"id": "ma_file", "sha256": file_sha, "size_bytes": 7},
+    ]
+    result = run_media_gc(config=object(), media_store=store)
+    assert result["deleted_count"] == 2
+    assert result["freed_bytes"] == 307
+    assert result["errors"] == []
+    assert all(not p.exists() for p in img_paths)
+    assert not file_path.exists()
+    assert asset_store.rows == {}

@@ -1,65 +1,51 @@
-"""MediaStore — normalized, content-addressed image storage (TASK-223).
+"""MediaStore — normalized, content-addressed asset storage (TASK-223 / TASK-847).
 
-This is the single entry point for image bytes flowing into llm-bawt: chat
-uploads, tool-generated images, agent attachments. Every image goes through
-the same normalization pipeline before it touches disk, so we can rely on a
-predictable WebP-everywhere world downstream.
+This is the single entry point for bytes flowing into llm-bawt's chat asset
+store: chat uploads, tool-generated images, agent attachments, and (since
+TASK-847) arbitrary files agents want to hand the user a link to.
 
-Pipeline on upload
-------------------
-1. ``Pillow.Image.open(BytesIO(raw_bytes))``
-2. Strip EXIF / GPS / ICC profile / XMP — we rebuild the image from its
-   RGB(A) pixel buffer, which leaves no metadata behind by construction.
-3. Convert ``CMYK`` / ``P`` palette modes to ``RGB``; keep ``RGBA`` as-is so
-   transparent screenshots round-trip without flattening.
-4. If ``max(w, h) > 1568``: ``image.thumbnail((1568, 1568), Image.LANCZOS)``.
-5. Encode WebP, ``quality=85``, ``method=6``. The resulting bytes are the
-   stored "original" — see the rationale below for why we discard the
-   user's source format.
-6. ``sha256(stored_original_bytes)`` — computed **after** normalization, so
-   two upload paths that produce the same normalized buffer dedup
-   correctly. Pasting the same screenshot twice -> one row. Pasting the
-   same image at different source resolutions -> different rows, as the
-   normalized bytes differ.
+Two asset *kinds*, one store
+----------------------------
+Per-kind policy lives in :mod:`llm_bawt.media.asset_kinds`; MediaStore is
+kind-agnostic and only orchestrates dedup → blob writes → DB row.
 
-From the same normalized buffer we derive two more variants:
+``image`` (jpeg / png / gif / webp uploads)
+    Pipeline on upload:
 
-- ``thumb_256``: fit ``(256, 256)``, WebP Q80 — chat bubble + image strip.
-- ``preview_1024``: fit ``(1024, 1024)``, WebP Q82 — lightbox view and the
-  primary feed to standard-detail vision models.
+    1. ``Pillow.Image.open(BytesIO(raw_bytes))``
+    2. Strip EXIF / GPS / ICC profile / XMP — we rebuild the image from its
+       RGB(A) pixel buffer, which leaves no metadata behind by construction.
+    3. Convert ``CMYK`` / ``P`` palette modes to ``RGB``; keep ``RGBA``.
+    4. If ``max(w, h) > 1568``: ``image.thumbnail((1568, 1568), LANCZOS)``.
+    5. Encode WebP, ``quality=85``, ``method=6`` → the stored "original".
+    6. ``sha256(stored_original_bytes)`` — computed **after** normalization,
+       so two upload paths that produce the same normalized buffer dedup.
 
-Why a 1568px cap?
------------------
-Anthropic's vision API recommends an image stay ≤ ~1.15 MP; anything bigger
-is downscaled server-side before the model sees it, so the extra pixels
-just inflate the upload and the token bill. 1568 longest-edge is comfortably
-under 1.15 MP for any aspect ratio you'll see in practice.
+    From the same normalized buffer: ``thumb_256`` (fit 256, Q80) and
+    ``preview_1024`` (fit 1024, Q82 — the vision-model feed size).
 
-Concrete numbers we've measured on real screenshots:
+    Why a 1568px cap? Anthropic's vision API downsizes anything over ~1.15 MP
+    server-side, so extra pixels only inflate the upload and the token bill.
+    Measured on real 4K screenshots: ~8 MB PNG → ~200–400 KB WebP, ~2,500–
+    3,000 → ~1,200 vision tokens, no visible quality loss.
 
-============================  ============  ============
-                              raw 4K PNG    1568-cap WebP
-                              ------------  ------------
-size on disk                  ~ 8 MB        ~ 200–400 KB
-Anthropic vision tokens       ~ 2,500–3,000 ~ 1,200
-============================  ============  ============
-
-That's a 30–60% token reduction and 95%+ storage reduction, with no visible
-quality loss for screenshots or photos. WebP Q85 is the inflection point
-where double-blind comparisons stop reliably distinguishing it from PNG.
+``file`` (everything else)
+    Stored verbatim — bytes, MIME, and the caller's filename are preserved.
+    ``sha256(raw_bytes)`` keys dedup. One ``original`` variant; ``thumb`` /
+    ``preview`` raise :class:`~llm_bawt.media.asset_kinds.UnsupportedVariant`.
 
 Storage layout
 --------------
 ``<MEDIA_ROOT>`` (env: ``LLM_BAWT_MEDIA_ROOT``, default
-``/var/lib/llm-bawt/media/blobs``)::
+``/var/lib/llm-bawt/media/blobs``; S3 backend prefixes ``blobs/``)::
 
     originals/<aa>/<bb>/<sha256>.webp
     thumb_256/<aa>/<bb>/<sha256>.webp
     preview_1024/<aa>/<bb>/<sha256>.webp
+    files/<aa>/<bb>/<sha256>
 
-The ``<aa>/<bb>`` shard prefix (first / next two hex chars of the sha)
-keeps any single directory from growing past a few thousand entries. Same
-convention used by :class:`llm_bawt.media.storage.MediaStorage`.
+The ``<aa>/<bb>`` shard prefix keeps any single directory from growing past
+a few thousand entries. Same convention as :class:`llm_bawt.media.storage.MediaStorage`.
 
 Database
 --------
@@ -68,22 +54,44 @@ Metadata lives in the ``media_assets`` table managed by
 that Store for inserts / lookups / deletes — it doesn't talk to Postgres
 directly. The ``sha256`` UNIQUE constraint there is the source of truth
 for dedup; we do an explicit ``get_by_sha256`` first to avoid the bytes
-write entirely when we already have the asset.
+write entirely when we already have the asset. The row's ``kind`` column
+selects the strategy on read / delete.
 """
 
 from __future__ import annotations
 
 import base64
-import hashlib
-import io
 import logging
 import os
 from datetime import datetime
 from pathlib import Path
 from typing import Literal, Optional
 
-from PIL import Image
-
+from .asset_kinds import (  # noqa: F401  (constants re-exported for back-compat)
+    ALLOWED_KINDS,
+    FILE_KIND,
+    FILES_DIR,
+    IMAGE_KIND,
+    IMAGE_MIME_TYPES,
+    MAX_LONG_EDGE,
+    ORIGINAL_WEBP_QUALITY,
+    PREVIEW_MAX,
+    PREVIEW_WEBP_QUALITY,
+    THUMB_MAX,
+    THUMB_WEBP_QUALITY,
+    VARIANT_DIRS,
+    VARIANT_MIME,
+    WEBP_METHOD,
+    AssetKind,
+    UnsupportedVariant,
+    _encode_variant,
+    _normalize_to_original,
+    kind_by_name,
+    kind_for_mime,
+    kind_for_row,
+    normalize_mime,
+    shard_key,
+)
 from .assets import MediaAsset, MediaAssetStore, new_asset_id
 
 # NFS ESTALE helpers + the blob-backend abstraction are canonical in
@@ -115,40 +123,11 @@ from .object_store import (  # noqa: F401  (re-exported for back-compat)
 logger = logging.getLogger(__name__)
 
 
-# ---------------------------------------------------------------------------
-# Constants — tuned for Anthropic vision; see module docstring.
-# ---------------------------------------------------------------------------
-
 DEFAULT_MEDIA_ROOT = Path("/var/lib/llm-bawt/media/blobs")
 
-#: Longest-edge cap. Stays under Anthropic's ~1.15 MP recommendation for
-#: any aspect ratio you'll see in practice.
-MAX_LONG_EDGE = 1568
-
-#: Quality settings for the WebP encoder. Q85 is the screenshot/photo sweet
-#: spot; Q80/Q82 for derived variants where we want a smaller payload.
-ORIGINAL_WEBP_QUALITY = 85
-THUMB_WEBP_QUALITY = 80
-PREVIEW_WEBP_QUALITY = 82
-
-#: WebP encode effort. ``method=6`` is the maximum — slow on encode (we
-#: only do this once per asset thanks to dedup) but produces materially
-#: smaller files vs the default ``method=4``.
-WEBP_METHOD = 6
-
-THUMB_MAX = (256, 256)
-PREVIEW_MAX = (1024, 1024)
-
-#: Three on-disk subdirectories, one per variant.
-VARIANT_DIRS: dict[str, str] = {
-    "original": "originals",
-    "thumb": "thumb_256",
-    "preview": "preview_1024",
-}
-
-VARIANT_MIME = "image/webp"
-
 ALLOWED_SOURCES = ("chat_upload", "tool_generated", "agent_attachment")
+
+Variant = Literal["original", "thumb", "preview"]
 
 
 # ---------------------------------------------------------------------------
@@ -165,102 +144,13 @@ class MediaAssetNotFound(LookupError):
 # ---------------------------------------------------------------------------
 
 
-def _normalize_to_original(raw_bytes: bytes) -> tuple[bytes, Image.Image, int, int]:
-    """Run the full normalization pipeline on raw image bytes.
-
-    Returns ``(stored_original_webp_bytes, normalized_image, width, height)``
-    where ``normalized_image`` is a Pillow Image kept in memory so the
-    caller can derive the thumb / preview variants without decoding the
-    WebP we just produced.
-    """
-    src = Image.open(io.BytesIO(raw_bytes))
-
-    # Step 1: strip ALL metadata — EXIF, ICC profile, XMP, comments. The
-    # canonical way to do this in Pillow is to reconstruct the image from
-    # just its pixel buffer; ``Image.new`` + ``putdata`` would also work
-    # but is slower. ``frombytes`` keeps it to a single allocation.
-    src.load()  # force-decode before we touch .mode / .size
-
-    # Step 2: collapse exotic color modes. CMYK and palette (P) modes have
-    # no natural WebP encoding and would confuse vision models even if
-    # they did — convert to sRGB. Preserve RGBA so transparent screenshots
-    # don't lose their alpha channel.
-    if src.mode == "RGBA":
-        target_mode = "RGBA"
-    elif src.mode == "LA":
-        # Grayscale + alpha — promote to RGBA so the rest of the pipeline
-        # has one fewer case to handle.
-        src = src.convert("RGBA")
-        target_mode = "RGBA"
-    else:
-        # Everything else: RGB, L, P, CMYK, 1, I, F — all roll up to RGB.
-        src = src.convert("RGB")
-        target_mode = "RGB"
-
-    # Rebuild a clean image from just the pixel buffer. Anything Pillow
-    # was carrying on the original (``.info``, ``.applist``, ``.icc_profile``)
-    # is dropped on the floor — that's the EXIF / ICC strip.
-    stripped = Image.frombytes(target_mode, src.size, src.tobytes())
-
-    # Step 3: downscale if needed. ``thumbnail`` mutates in place and
-    # preserves aspect ratio.
-    if max(stripped.size) > MAX_LONG_EDGE:
-        stripped.thumbnail((MAX_LONG_EDGE, MAX_LONG_EDGE), Image.LANCZOS)
-
-    # Step 4: encode WebP. ``save_all=False`` so we don't accidentally
-    # emit an animated WebP for multi-frame inputs (animated GIFs collapse
-    # to their first frame — intentional for now; revisit if anyone uploads
-    # an animated screenshot).
-    buf = io.BytesIO()
-    stripped.save(
-        buf,
-        format="WEBP",
-        quality=ORIGINAL_WEBP_QUALITY,
-        method=WEBP_METHOD,
-        # ``exif=b""`` + ``icc_profile=None`` are belt-and-suspenders;
-        # frombytes() already discarded both, but if a future Pillow
-        # version starts back-filling them from defaults this still wins.
-        exif=b"",
-        icc_profile=None,
-    )
-    original_bytes = buf.getvalue()
-    return original_bytes, stripped, stripped.size[0], stripped.size[1]
-
-
-def _encode_variant(normalized: Image.Image, max_size: tuple[int, int], quality: int) -> bytes:
-    """Derive a fit-inside WebP variant from the already-normalized image.
-
-    We ``.copy()`` so the caller's ``normalized`` instance is left at its
-    original (cap-bounded) dimensions and can be reused for multiple
-    variants.
-    """
-    img = normalized.copy()
-    img.thumbnail(max_size, Image.LANCZOS)
-    buf = io.BytesIO()
-    img.save(
-        buf,
-        format="WEBP",
-        quality=quality,
-        method=WEBP_METHOD,
-        exif=b"",
-        icc_profile=None,
-    )
-    return buf.getvalue()
-
-
 def _shard_key(variant_subdir: str, sha256_hex: str) -> str:
-    """Return the blob-backend key for a given variant + sha.
+    """Back-compat alias for the image-variant key layout.
 
-    Backend-agnostic relative path: ``<variant_subdir>/<aa>/<bb>/<sha>.webp``.
-    For the FS backend this joins under ``MediaStore.root``; for S3 the
-    factory prepends a ``blobs/`` prefix so MediaStore + MediaStorage can
-    share one bucket without colliding.
-
-    The two-level shard mirrors :class:`llm_bawt.media.storage.MediaStorage`
-    so anyone walking the tree (or rclone-copying it into Garage) sees the
-    same fan-out everywhere.
+    Pre-TASK-847 callers built ``<subdir>/<aa>/<bb>/<sha>.webp`` through this
+    helper; the canonical implementation is :func:`asset_kinds.shard_key`.
     """
-    return f"{variant_subdir}/{sha256_hex[:2]}/{sha256_hex[2:4]}/{sha256_hex}.webp"
+    return shard_key(variant_subdir, sha256_hex, ".webp")
 
 
 def _row_to_asset(row: dict) -> MediaAsset:
@@ -325,49 +215,54 @@ class MediaStore:
         source: str,
         owner_user_id: Optional[str],
         expires_at: Optional[datetime] = None,
+        *,
+        filename: Optional[str] = None,
+        kind: AssetKind | str | None = None,
     ) -> MediaAsset:
-        """Normalize, deduplicate, and persist an image.
+        """Prepare, deduplicate, and persist an upload of any kind.
 
-        Dedup is keyed on the **post-normalization** sha256. If a row
-        already exists with that sha, we short-circuit: no re-encode, no
-        rewrite, just return the existing asset. Blob writes are idempotent
-        too — if the DB row is gone but the file is still there we'll
-        skip the disk write and let the new row point at the same path.
+        ``kind`` defaults to :func:`kind_for_mime` — the four Pillow-safe
+        image MIMEs take the normalising image pipeline, everything else is
+        stored verbatim as a ``file``. Pass ``kind="file"`` to force verbatim
+        storage of an image (e.g. an SVG or a PNG whose metadata must
+        survive).
+
+        Dedup is keyed on the kind's sha256 (post-normalization for images,
+        raw bytes for files). If a row already exists with that sha, we
+        short-circuit: no re-encode, no rewrite, just return the existing
+        asset. Blob writes are idempotent too — if the DB row is gone but
+        the blobs are still there we skip nothing but corrupt nothing.
         """
         if source not in ALLOWED_SOURCES:
             raise ValueError(
                 f"source must be one of {ALLOWED_SOURCES!r}, got {source!r}"
             )
+        strategy = self._resolve_kind(kind, original_mime)
 
-        # Step 1: normalize. This is the only place we hold the full
-        # decoded image; everything else just shuffles bytes around.
-        original_bytes, normalized, width, height = _normalize_to_original(raw_bytes)
-        sha256_hex = hashlib.sha256(original_bytes).hexdigest()
+        # Step 1: prepare. For images this is the only place we hold the
+        # full decoded image; everything else just shuffles bytes around.
+        prepared = strategy.prepare(raw_bytes, original_mime)
+        sha256_hex = prepared.sha256
 
-        # Step 2: dedup hit? Return early before touching disk or
-        # generating variants. ``MediaAssetStore.insert`` would do this
-        # internally, but we check first to skip the variant-encode work.
+        # Step 2: dedup hit? Return early before touching the backend.
+        # ``MediaAssetStore.insert`` would dedup internally, but checking
+        # first skips the blob writes.
         #
-        # Self-heal: if the row exists but any of its on-disk blobs are
-        # gone (manual cleanup, partial restore, container reset that
-        # wiped the bind-mount), we cannot just return the row — chat
-        # reads would 404.  Re-write the blobs from the bytes we have
-        # in hand right now and then return the existing row, so the
-        # caller's asset_id stays stable across the heal.
+        # Self-heal: if the row exists but any of its blobs are gone
+        # (manual cleanup, partial restore, container reset that wiped the
+        # bind-mount), we cannot just return the row — reads would 404.
+        # Re-write the blobs from the bytes in hand and return the existing
+        # row, so the caller's asset_id stays stable across the heal.
+        _heal_existing_row: dict | None = None
         if self.db is not None:
             existing = self.db.get_by_sha256(sha256_hex)
             if existing is not None:
-                # Treat "backend can't confirm" as "not intact" so we
-                # take the heal path and rewrite — safer than returning
-                # a row whose blobs we can't verify. For the FS backend
-                # this covers NFS ESTALE ambiguity; for S3 it covers
-                # transient connection blips (we treat the latter as
-                # "unknown" rather than propagating a 503 here, since
-                # the subsequent put() will surface a real backend error
-                # if Garage is truly down).
+                # Treat "backend can't confirm" as "not intact" so we take
+                # the heal path and rewrite — safer than returning a row
+                # whose blobs we can't verify (NFS ESTALE ambiguity on FS,
+                # transient blips on S3; a real outage surfaces on put()).
                 blobs_intact = all(
-                    self._backend_exists_safe(_shard_key(subdir, sha256_hex))
-                    for subdir in VARIANT_DIRS.values()
+                    self._backend_exists_safe(blob.key) for blob in prepared.blobs
                 )
                 if blobs_intact:
                     logger.debug(
@@ -381,50 +276,35 @@ class MediaStore:
                     sha256_hex[:12],
                     existing["id"],
                 )
-                # Fall through to variant encode + idempotent write below.
-                # The DB row stays; insert() would race the existing
-                # sha unique constraint, so we skip it on the heal path.
+                # Fall through to the idempotent writes below. The DB row
+                # stays; insert() would race the sha unique constraint, so
+                # we skip it on the heal path.
                 _heal_existing_row = existing
-            else:
-                _heal_existing_row = None
-        else:
-            _heal_existing_row = None
 
-        # Step 3: derive variants from the same normalized buffer (NOT
-        # re-decoding the WebP we just wrote — that would re-apply lossy
-        # compression on top of itself).
-        thumb_bytes = _encode_variant(normalized, THUMB_MAX, THUMB_WEBP_QUALITY)
-        preview_bytes = _encode_variant(normalized, PREVIEW_MAX, PREVIEW_WEBP_QUALITY)
+        # Step 3: write every blob through the backend. Content-addressed
+        # keys make the writes idempotent, so racing writers can never
+        # corrupt anything.
+        for blob in prepared.blobs:
+            self.backend.put(blob.key, blob.data, blob.mime)
 
-        # Step 4: write all three blobs through the backend. Same sha256
-        # path for all three variants — the variant subdir disambiguates.
-        # Backend writes are idempotent for content-addressed keys, so
-        # racing writers can never corrupt anything.
-        self.backend.put(_shard_key(VARIANT_DIRS["original"], sha256_hex), original_bytes, VARIANT_MIME)
-        self.backend.put(_shard_key(VARIANT_DIRS["thumb"], sha256_hex), thumb_bytes, VARIANT_MIME)
-        self.backend.put(_shard_key(VARIANT_DIRS["preview"], sha256_hex), preview_bytes, VARIANT_MIME)
-
-        # Step 5: register in Postgres. ``insert`` is itself dedup-safe —
+        # Step 4: register in Postgres. ``insert`` is itself dedup-safe —
         # if two callers race on the same bytes, the second one gets the
         # first one's row back instead of an IntegrityError.
-        #
-        # Heal path: we already had a row for this sha but its blobs
-        # were missing; we just rewrote them above.  Skip the insert
-        # (would unique-key race) and return the existing row so the
-        # caller's previously-known asset_id stays stable.
         if _heal_existing_row is not None:
             return _row_to_asset(_heal_existing_row)
         if self.db is not None:
             row = self.db.insert(
                 sha256=sha256_hex,
-                mime_type=VARIANT_MIME,
-                original_mime_type=original_mime,
-                size_bytes=len(original_bytes),
-                width=width,
-                height=height,
+                mime_type=prepared.mime_type,
+                original_mime_type=normalize_mime(original_mime) or None,
+                size_bytes=prepared.size_bytes,
+                width=prepared.width,
+                height=prepared.height,
                 source=source,
                 owner_user_id=owner_user_id,
                 expires_at=expires_at,
+                kind=strategy.name,
+                filename=filename,
             )
             return _row_to_asset(row)
 
@@ -433,14 +313,37 @@ class MediaStore:
         return MediaAsset(
             id=new_asset_id(),
             sha256=sha256_hex,
-            mime_type=VARIANT_MIME,
-            original_mime_type=original_mime,
-            size_bytes=len(original_bytes),
-            width=width,
-            height=height,
+            mime_type=prepared.mime_type,
+            original_mime_type=normalize_mime(original_mime) or None,
+            size_bytes=prepared.size_bytes,
+            width=prepared.width,
+            height=prepared.height,
+            kind=strategy.name,
+            filename=filename,
             source=source,
             owner_user_id=owner_user_id,
             expires_at=expires_at,
+        )
+
+    def upload_file(
+        self,
+        raw_bytes: bytes,
+        mime_type: str,
+        source: str,
+        owner_user_id: Optional[str],
+        *,
+        filename: Optional[str] = None,
+        expires_at: Optional[datetime] = None,
+    ) -> MediaAsset:
+        """Store bytes verbatim as a ``file`` asset regardless of MIME (TASK-847)."""
+        return self.upload(
+            raw_bytes,
+            mime_type,
+            source,
+            owner_user_id,
+            expires_at,
+            filename=filename,
+            kind=FILE_KIND,
         )
 
     # ------------------------------------------------------------------
@@ -450,7 +353,7 @@ class MediaStore:
     def read_variant(
         self,
         asset_id: str,
-        variant: Literal["original", "thumb", "preview"],
+        variant: Variant,
     ) -> tuple[bytes, str]:
         """Return ``(bytes, mime_type)`` for the requested variant.
 
@@ -460,14 +363,13 @@ class MediaStore:
             S3 key deleted out-of-band).
         :raises BlobBackendUnavailable: if the backend can't be reached
             at all (network / 5xx). Route handlers should map this to 503.
-        :raises ValueError: if ``variant`` is not one of the three known names.
+        :raises UnsupportedVariant: if this asset's kind has no such variant
+            (``thumb`` / ``preview`` on a ``file``; any unknown name). It is a
+            ``ValueError`` subclass for pre-TASK-847 callers.
         """
-        if variant not in VARIANT_DIRS:
-            raise ValueError(
-                f"variant must be one of {list(VARIANT_DIRS)!r}, got {variant!r}"
-            )
         row = self._require_row(asset_id)
-        key = _shard_key(VARIANT_DIRS[variant], row["sha256"])
+        strategy = kind_for_row(row)
+        key = strategy.blob_key(variant, row["sha256"])
         try:
             data = self.backend.get(key)
         except BlobNotFound as e:
@@ -477,10 +379,13 @@ class MediaStore:
             raise FileNotFoundError(
                 f"MediaStore blob missing for asset={asset_id} variant={variant} key={key}"
             ) from e
-        return data, VARIANT_MIME
+        # Image rows store VARIANT_MIME; file rows store the declared MIME.
+        # Legacy rows always have mime_type set, so the fallback is only
+        # for hand-built test fakes.
+        return data, row.get("mime_type") or VARIANT_MIME
 
     def read_original_as_data_url(self, asset_id: str) -> str:
-        """Return the original variant as a ``data:image/webp;base64,...`` URL.
+        """Return the original variant as a ``data:<mime>;base64,...`` URL.
 
         Convenience for the LLM inlining path (TASK-225). Always returns
         the cap-bounded original — callers that want the smaller preview
@@ -497,6 +402,7 @@ class MediaStore:
         original (1024² vs 1568²) at Q82, cutting the per-image token bill with
         only a modest quality loss. Callers that need maximum fidelity (e.g.
         reading dense fine print) should use :meth:`read_original_as_data_url`.
+        Images only — raises :class:`UnsupportedVariant` for ``file`` assets.
         """
         data, mime = self.read_variant(asset_id, "preview")
         b64 = base64.b64encode(data).decode("ascii")
@@ -514,7 +420,7 @@ class MediaStore:
     # ------------------------------------------------------------------
 
     def delete(self, asset_id: str) -> None:
-        """Remove all three blob variants + the DB row. Idempotent.
+        """Remove every blob for the asset's kind + the DB row. Idempotent.
 
         Order: blobs first, then DB row. If the process dies between the
         two, the next ``upload`` of the same content will overwrite
@@ -529,22 +435,29 @@ class MediaStore:
         :raises BlobBackendUnavailable: if the backend can't be reached
             at all. The DB row is left in place so the GC pass can retry.
         """
-        if self.db is not None:
-            row = self.db.get_by_id(asset_id)
-            if row is None:
-                return  # nothing to do
-            sha256_hex = row["sha256"]
-        else:  # tests
+        if self.db is None:  # tests
             return
+        row = self.db.get_by_id(asset_id)
+        if row is None:
+            return  # nothing to do
 
-        for subdir in VARIANT_DIRS.values():
-            self.backend.delete(_shard_key(subdir, sha256_hex))
+        strategy = kind_for_row(row)
+        for key in strategy.all_keys(row["sha256"]):
+            self.backend.delete(key)
 
         self.db.delete(asset_id)
 
     # ------------------------------------------------------------------
     # Internal
     # ------------------------------------------------------------------
+
+    @staticmethod
+    def _resolve_kind(kind: AssetKind | str | None, mime: str) -> AssetKind:
+        if isinstance(kind, AssetKind):
+            return kind
+        if kind:
+            return kind_by_name(kind)
+        return kind_for_mime(mime)
 
     def _backend_exists_safe(self, key: str) -> bool:
         """Like ``backend.exists(key)`` but swallows backend-unavailable.

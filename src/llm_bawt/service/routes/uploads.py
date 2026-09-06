@@ -1,4 +1,4 @@
-"""HTTP routes for the content-addressed media store (TASK-224).
+"""HTTP routes for the content-addressed media store (TASK-224 / TASK-847).
 
 Endpoints
 ---------
@@ -10,13 +10,16 @@ Endpoints
               application/json {"data_url": "...", "filename": "..."}
         query: ?source=chat_upload | tool_generated | agent_attachment
         auth:  X-Entity-Id header (owner scoping)
-        returns: asset metadata + variant URLs (see
+        returns: asset metadata + variant URLs + public_url (see
                  ``asset_to_upload_response_dict``).
 
-    GET    /v1/uploads/{asset_id}            -> original WebP bytes
-    GET    /v1/uploads/{asset_id}/thumb      -> 256px variant
-    GET    /v1/uploads/{asset_id}/preview    -> 1024px variant
-    DELETE /v1/uploads/{asset_id}            -> owner-only delete
+    GET    /v1/uploads/{asset_id}[?download=1] -> original bytes
+                                                 (WebP for images, verbatim
+                                                 for files; ?download=1 forces
+                                                 Content-Disposition: attachment)
+    GET    /v1/uploads/{asset_id}/thumb        -> 256px variant (images only)
+    GET    /v1/uploads/{asset_id}/preview      -> 1024px variant (images only)
+    DELETE /v1/uploads/{asset_id}              -> owner-only delete
 
 These routes wrap :class:`MediaStore` (TASK-223). The store handles
 normalization, dedup, variant generation, and disk layout; this module
@@ -38,18 +41,27 @@ Auth model
 Limits
 ------
 
-- 15 MB max raw upload — the store normalises down to a 1568px-cap WebP,
-  but we reject obvious abuse before reading the full body.
-- Accept ``image/jpeg``, ``image/png``, ``image/gif``, ``image/webp``;
-  anything else returns ``415 Unsupported Media Type``.
+- Images (``image/jpeg`` / ``png`` / ``gif`` / ``webp``): 15 MB max raw —
+  the store normalises down to a 1568px-cap WebP, so anything bigger is
+  misuse.
+- Every other MIME (TASK-847) is stored verbatim as a ``file`` asset, capped
+  by ``LLM_BAWT_MAX_FILE_UPLOAD_BYTES`` (default 100 MB). There is no MIME
+  allowlist any more; the LAN boundary is the trust boundary (see
+  ``reference/security-model.md``). A handful of browser-active types
+  (``text/html``, ``image/svg+xml``, …) are always served as
+  ``Content-Disposition: attachment`` so they never execute in the
+  BawtHub origin.
 """
 
 from __future__ import annotations
 
 import base64
 import logging
+import mimetypes
+import os
 import re
 from typing import Optional
+from urllib.parse import quote
 
 from fastapi import APIRouter, File, Header, HTTPException, Query, Request, Response, UploadFile
 from fastapi.responses import JSONResponse
@@ -59,6 +71,15 @@ from ...media import (
     MediaStore,
     asset_to_upload_response_dict,
     get_media_store,
+)
+from ...media.asset_kinds import (
+    IMAGE_KIND,
+    IMAGE_MIME_TYPES,
+    OCTET_STREAM,
+    AssetKind,
+    UnsupportedVariant,
+    kind_for_mime,
+    normalize_mime,
 )
 from ...media.object_store import BlobBackendUnavailable
 
@@ -71,22 +92,37 @@ router = APIRouter(tags=["Uploads"])
 # Constants
 # ---------------------------------------------------------------------------
 
-#: Hard cap on raw upload size. We normalise down to ~200-400 KB WebP, so
-#: anything above this is either a misuse of the API or an attack.
+#: Hard cap on raw *image* upload size. We normalise down to ~200-400 KB
+#: WebP, so anything above this is either a misuse of the API or an attack.
 MAX_RAW_UPLOAD_BYTES = 15 * 1024 * 1024  # 15 MB
 
-#: MIME types we'll accept on POST. Everything else returns 415.
-ACCEPTED_MIME_TYPES = frozenset(
+#: Default cap for non-image files (TASK-847). Override with
+#: ``LLM_BAWT_MAX_FILE_UPLOAD_BYTES``. The body is buffered in memory, so
+#: keep this in the "large log / small video" range, not "disk image".
+DEFAULT_MAX_FILE_UPLOAD_BYTES = 100 * 1024 * 1024  # 100 MB
+
+#: MIME types routed through the image pipeline. Kept under the historic
+#: name for callers that imported it; everything else is now a ``file``.
+ACCEPTED_MIME_TYPES = IMAGE_MIME_TYPES
+
+#: Fallback MIME when nothing better is known (images always report WebP).
+RESPONSE_MIME = "image/webp"
+
+#: MIME types that browsers will *execute* if served inline from our origin.
+#: Always forced to ``Content-Disposition: attachment``.
+FORCE_ATTACHMENT_MIMES = frozenset(
     {
-        "image/jpeg",
-        "image/png",
-        "image/gif",
-        "image/webp",
+        OCTET_STREAM,
+        "text/html",
+        "application/xhtml+xml",
+        "image/svg+xml",
+        "application/javascript",
+        "text/javascript",
     }
 )
 
-#: Stored variants always WebP; we serve them out unchanged.
-RESPONSE_MIME = "image/webp"
+#: Longest filename we will store / echo in Content-Disposition.
+MAX_FILENAME_CHARS = 200
 
 #: One year, immutable — the URL is content-addressed so the bytes can
 #: never change. Browsers can cache aggressively.
@@ -155,30 +191,96 @@ def _decode_data_url(data_url: str) -> tuple[bytes, str]:
     return raw, declared_mime
 
 
-def _check_mime(declared_mime: str) -> str:
-    """Normalise and validate the declared MIME, or raise 415."""
-    mime = declared_mime.split(";")[0].strip().lower()
-    if mime not in ACCEPTED_MIME_TYPES:
-        raise HTTPException(
-            status_code=415,
-            detail=(
-                f"Unsupported media type {mime!r}. "
-                f"Accepted: {sorted(ACCEPTED_MIME_TYPES)}"
-            ),
-        )
-    return mime
+def max_file_upload_bytes() -> int:
+    """Cap for ``file``-kind uploads; env-tunable, read per request."""
+    raw = os.environ.get("LLM_BAWT_MAX_FILE_UPLOAD_BYTES", "").strip()
+    if raw:
+        try:
+            value = int(raw)
+            if value > 0:
+                return value
+        except ValueError:
+            logger.warning("LLM_BAWT_MAX_FILE_UPLOAD_BYTES=%r is not an int; using default", raw)
+    return DEFAULT_MAX_FILE_UPLOAD_BYTES
 
 
-def _check_size(raw: bytes) -> None:
-    """Reject raw uploads over :data:`MAX_RAW_UPLOAD_BYTES`."""
-    if len(raw) > MAX_RAW_UPLOAD_BYTES:
+def _sanitize_filename(name: object) -> Optional[str]:
+    """Reduce a caller-supplied filename to a safe display name, or ``None``.
+
+    Basename only (both separators), control characters stripped, whitespace
+    collapsed, capped at :data:`MAX_FILENAME_CHARS` while keeping the
+    extension. Never used to build a storage path — keys are sha-derived —
+    so this is about ``Content-Disposition`` hygiene and UI display.
+    """
+    if not isinstance(name, str):
+        return None
+    base = name.replace("\\", "/").rsplit("/", 1)[-1]
+    base = "".join(ch for ch in base if ch.isprintable() and ch not in '"\x7f')
+    base = re.sub(r"\s+", " ", base).strip().strip(".")
+    if not base:
+        return None
+    if len(base) > MAX_FILENAME_CHARS:
+        stem, dot, ext = base.rpartition(".")
+        if dot and 0 < len(ext) <= 16 and stem:
+            keep = MAX_FILENAME_CHARS - len(ext) - 1
+            base = f"{stem[:keep]}.{ext}"
+        else:
+            base = base[:MAX_FILENAME_CHARS]
+    return base
+
+
+def _resolve_mime(declared_mime: Optional[str], filename: Optional[str]) -> str:
+    """Pick the MIME we trust for kind routing + storage.
+
+    The declared type wins when it is specific. ``curl -F file=@x.pdf`` and
+    hand-rolled clients frequently send ``application/octet-stream`` (or
+    nothing), so in that case fall back to the filename extension. Unknown
+    → ``application/octet-stream``.
+    """
+    mime = normalize_mime(declared_mime)
+    if (not mime or mime == OCTET_STREAM) and filename:
+        guessed, _ = mimetypes.guess_type(filename, strict=False)
+        if guessed:
+            mime = guessed.lower()
+    return mime or OCTET_STREAM
+
+
+def _check_size(raw: bytes, kind: AssetKind) -> None:
+    """Reject uploads over the per-kind cap (413)."""
+    limit = MAX_RAW_UPLOAD_BYTES if kind is IMAGE_KIND else max_file_upload_bytes()
+    if len(raw) > limit:
         raise HTTPException(
             status_code=413,
             detail=(
-                f"Upload too large: {len(raw)} bytes > "
-                f"{MAX_RAW_UPLOAD_BYTES} byte limit"
+                f"Upload too large: {len(raw)} bytes > {limit} byte limit "
+                f"for kind={kind.name}"
             ),
         )
+
+
+def _content_disposition(disposition: str, filename: str) -> str:
+    """RFC 6266 header value with an ASCII fallback + UTF-8 ``filename*``."""
+    ascii_name = filename.encode("ascii", "ignore").decode("ascii").replace('"', "") or "download"
+    value = f'{disposition}; filename="{ascii_name}"'
+    if ascii_name != filename:
+        value += f"; filename*=UTF-8''{quote(filename)}"
+    return value
+
+
+def _display_filename(asset, mime: str, variant: str) -> str:
+    """Filename for Content-Disposition: stored name, else ``<id><ext>``."""
+    stored = getattr(asset, "filename", None) if asset is not None else None
+    asset_id = getattr(asset, "id", None) or "asset"
+    if getattr(asset, "kind", "image") == "image":
+        # Images are always re-encoded to WebP; the stored filename (if any)
+        # describes the *source*, so swap the extension and tag the variant.
+        stem = stored.rsplit(".", 1)[0] if stored else asset_id
+        suffix = "" if variant == "original" else f"-{variant}"
+        return f"{stem}{suffix}.webp"
+    if stored:
+        return stored
+    ext = mimetypes.guess_extension(mime, strict=False) or ""
+    return f"{asset_id}{ext}"
 
 
 # ---------------------------------------------------------------------------
@@ -231,13 +333,14 @@ async def upload_asset(
                 detail="JSON body must include 'data_url' (string)",
             )
         raw, declared_mime = _decode_data_url(data_url)
+        filename = _sanitize_filename(body.get("filename"))
     elif file is not None:
         # FastAPI parses multipart for us; ``file.content_type`` may be
-        # missing on hand-crafted requests, in which case fall back to a
-        # bytes sniff so we still 415 cleanly instead of crashing in
-        # Pillow.
+        # missing on hand-crafted requests — ``_resolve_mime`` then falls
+        # back to the filename extension.
         raw = await file.read()
-        declared_mime = (file.content_type or "application/octet-stream").lower()
+        declared_mime = (file.content_type or OCTET_STREAM).lower()
+        filename = _sanitize_filename(file.filename)
     else:
         raise HTTPException(
             status_code=400,
@@ -246,8 +349,9 @@ async def upload_asset(
             ),
         )
 
-    _check_mime(declared_mime)
-    _check_size(raw)
+    mime = _resolve_mime(declared_mime, filename)
+    kind = kind_for_mime(mime)
+    _check_size(raw, kind)
 
     if not raw:
         raise HTTPException(status_code=400, detail="Empty upload body")
@@ -255,9 +359,11 @@ async def upload_asset(
     try:
         asset = _store().upload(
             raw_bytes=raw,
-            original_mime=declared_mime,
+            original_mime=mime,
             source=source,
             owner_user_id=entity_id,
+            filename=filename,
+            kind=kind,
         )
     except ValueError as e:
         # ``source`` not in ALLOWED_SOURCES surfaces here.
@@ -301,6 +407,8 @@ def _serve_variant(
     asset_id: str,
     variant: str,
     if_none_match: Optional[str] = None,
+    *,
+    download: bool = False,
 ) -> Response:
     """Read a variant from the store and wrap it in a cacheable response.
 
@@ -308,6 +416,11 @@ def _serve_variant(
     the original / thumb / preview routes can't drift on caching policy.
     Honours ``If-None-Match`` by returning 304 *before* reading the blob —
     the DB-only ``stat`` call is enough to compute the ETag.
+
+    TASK-847: every response carries ``Content-Disposition`` built from the
+    stored filename. ``download=True`` (``?download=1``) or a MIME in
+    :data:`FORCE_ATTACHMENT_MIMES` switches it from ``inline`` to
+    ``attachment``.
     """
     store = _store()
 
@@ -338,25 +451,37 @@ def _serve_variant(
             status_code=503,
             detail="Media storage backend unavailable; try again shortly",
         )
+    except UnsupportedVariant as e:
+        # The asset exists but this rendition doesn't (thumb of a PDF).
+        raise HTTPException(status_code=404, detail=str(e))
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
 
+    mime = mime or RESPONSE_MIME
+    disposition = "attachment" if (download or mime in FORCE_ATTACHMENT_MIMES) else "inline"
     headers = {
         "Cache-Control": CACHE_CONTROL,
+        "Content-Disposition": _content_disposition(
+            disposition, _display_filename(asset, mime, variant)
+        ),
     }
     if etag:
         headers["ETag"] = etag
 
-    return Response(content=data, media_type=mime or RESPONSE_MIME, headers=headers)
+    return Response(content=data, media_type=mime, headers=headers)
 
 
 @router.get("/v1/uploads/{asset_id}")
 async def get_original(
     asset_id: str,
     if_none_match: Optional[str] = Header(default=None, alias="If-None-Match"),
+    download: bool = Query(
+        default=False,
+        description="Force Content-Disposition: attachment (save-as instead of inline view)",
+    ),
 ) -> Response:
-    """Return the original WebP variant (1568px-cap, Q85)."""
-    return _serve_variant(asset_id, "original", if_none_match)
+    """Return the original: 1568px-cap WebP for images, verbatim bytes for files."""
+    return _serve_variant(asset_id, "original", if_none_match, download=download)
 
 
 @router.get("/v1/uploads/{asset_id}/thumb")
@@ -364,7 +489,7 @@ async def get_thumb(
     asset_id: str,
     if_none_match: Optional[str] = Header(default=None, alias="If-None-Match"),
 ) -> Response:
-    """Return the 256px thumb variant (Q80)."""
+    """Return the 256px thumb variant (Q80). Images only — 404 for files."""
     return _serve_variant(asset_id, "thumb", if_none_match)
 
 
@@ -373,7 +498,7 @@ async def get_preview(
     asset_id: str,
     if_none_match: Optional[str] = Header(default=None, alias="If-None-Match"),
 ) -> Response:
-    """Return the 1024px preview variant (Q82) — vision-model feed size."""
+    """Return the 1024px preview variant (Q82). Images only — 404 for files."""
     return _serve_variant(asset_id, "preview", if_none_match)
 
 
@@ -387,7 +512,7 @@ async def delete_asset(
     asset_id: str,
     x_entity_id: Optional[str] = Header(default=None, alias="X-Entity-Id"),
 ) -> Response:
-    """Owner-only delete. Removes all three blob variants + the DB row.
+    """Owner-only delete. Removes every blob for the asset + the DB row.
 
     Returns ``204 No Content`` on success. Mismatched owner is ``403``;
     unknown asset is ``404``.

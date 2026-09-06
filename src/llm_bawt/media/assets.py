@@ -40,6 +40,11 @@ TABLE_NAME = "media_assets"
 # garbage that the GC job can't reason about.
 ALLOWED_SOURCES = ("chat_upload", "tool_generated", "agent_attachment")
 
+# Allowed values for media_assets.kind (TASK-847). Canonical list lives with
+# the strategy registry; mirrored here so the DB layer validates without
+# importing Pillow-backed code.
+ALLOWED_KINDS = ("image", "file")
+
 # ---------------------------------------------------------------------------
 # Schema
 # ---------------------------------------------------------------------------
@@ -53,6 +58,8 @@ CREATE TABLE IF NOT EXISTS {TABLE_NAME} (
     size_bytes          INTEGER NOT NULL,
     width               INTEGER,
     height              INTEGER,
+    kind                TEXT NOT NULL DEFAULT 'image',
+    filename            TEXT,
     source              TEXT NOT NULL,
     owner_user_id       TEXT,
     created_at          TIMESTAMPTZ NOT NULL DEFAULT NOW(),
@@ -61,6 +68,15 @@ CREATE TABLE IF NOT EXISTS {TABLE_NAME} (
         CHECK (source IN ('chat_upload', 'tool_generated', 'agent_attachment'))
 )
 """
+
+# TASK-847: columns added after the table first shipped. ``CREATE TABLE IF
+# NOT EXISTS`` is a no-op on existing installs, so each new column also gets
+# an idempotent ``ADD COLUMN IF NOT EXISTS`` that runs on every bootstrap.
+# ``kind`` defaults to 'image' so every pre-existing row keeps its meaning.
+ALTER_TABLE_SQL = [
+    f"ALTER TABLE {TABLE_NAME} ADD COLUMN IF NOT EXISTS kind TEXT NOT NULL DEFAULT 'image'",
+    f"ALTER TABLE {TABLE_NAME} ADD COLUMN IF NOT EXISTS filename TEXT",
+]
 
 # Listing assets for a given user, newest-first, is the dominant access
 # pattern (history rendering + the nightly GC job both scan by owner).
@@ -141,6 +157,8 @@ class MediaAssetStore:
         """Create the ``media_assets`` table + indexes if missing."""
         def bootstrap(conn) -> None:
             conn.execute(text(CREATE_TABLE_SQL))
+            for alter_sql in ALTER_TABLE_SQL:
+                conn.execute(text(alter_sql))
             for idx_sql in CREATE_INDEXES_SQL:
                 conn.execute(text(idx_sql))
 
@@ -163,8 +181,14 @@ class MediaAssetStore:
         owner_user_id: str | None = None,
         expires_at: datetime | None = None,
         asset_id: str | None = None,
+        kind: str = "image",
+        filename: str | None = None,
     ) -> dict[str, Any]:
         """Insert a new media asset row.
+
+        ``kind`` is ``image`` (normalised WebP + variants) or ``file``
+        (opaque bytes, TASK-847); ``filename`` is the caller-supplied
+        display name, kept for ``Content-Disposition`` and UI chips.
 
         Returns the inserted row as a dict. If a row with the same
         ``sha256`` already exists, returns that existing row instead
@@ -175,6 +199,8 @@ class MediaAssetStore:
             raise ValueError(
                 f"source must be one of {ALLOWED_SOURCES!r}, got {source!r}"
             )
+        if kind not in ALLOWED_KINDS:
+            raise ValueError(f"kind must be one of {ALLOWED_KINDS!r}, got {kind!r}")
 
         existing = self.get_by_sha256(sha256)
         if existing is not None:
@@ -189,10 +215,10 @@ class MediaAssetStore:
         insert_sql = text(f"""
             INSERT INTO {TABLE_NAME}
                 (id, sha256, mime_type, original_mime_type, size_bytes,
-                 width, height, source, owner_user_id, expires_at)
+                 width, height, kind, filename, source, owner_user_id, expires_at)
             VALUES
                 (:id, :sha256, :mime_type, :original_mime_type, :size_bytes,
-                 :width, :height, :source, :owner_user_id, :expires_at)
+                 :width, :height, :kind, :filename, :source, :owner_user_id, :expires_at)
             RETURNING *
         """)
         params = {
@@ -203,6 +229,8 @@ class MediaAssetStore:
             "size_bytes": size_bytes,
             "width": width,
             "height": height,
+            "kind": kind,
+            "filename": filename,
             "source": source,
             "owner_user_id": owner_user_id,
             "expires_at": expires_at,
@@ -310,6 +338,8 @@ class MediaAsset(SQLModel, table=True):
     size_bytes: int = Field(sa_column=Column(Integer, nullable=False))
     width: Optional[int] = Field(default=None)
     height: Optional[int] = Field(default=None)
+    kind: str = Field(default="image", description="image | file (TASK-847)")
+    filename: Optional[str] = Field(default=None)
     source: str = Field(description="chat_upload | tool_generated | agent_attachment")
     owner_user_id: Optional[str] = Field(default=None, index=True)
     created_at: datetime = Field(

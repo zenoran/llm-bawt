@@ -183,15 +183,21 @@ def test_post_data_url_happy_path_and_dedups_against_multipart(client: TestClien
     assert body["sha256"] == r1.json()["sha256"]
 
 
-def test_post_rejects_unsupported_mime_type(client: TestClient) -> None:
-    """A ``image/svg+xml`` upload returns 415."""
+def test_post_non_pillow_image_mime_stored_as_file(client: TestClient) -> None:
+    """TASK-847: ``image/svg+xml`` no longer 415s — it bypasses the WebP
+    pipeline and is stored verbatim as a ``file`` (served as attachment)."""
     resp = client.post(
         "/v1/uploads",
         headers={"X-Entity-Id": "user-1"},
         files={"file": ("evil.svg", b"<svg></svg>", "image/svg+xml")},
     )
-    assert resp.status_code == 415, resp.text
-    assert "svg" in resp.json()["detail"].lower()
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["kind"] == "file"
+    assert body["mime_type"] == "image/svg+xml"
+    get = client.get(body["urls"]["original"])
+    assert get.content == b"<svg></svg>"
+    assert get.headers["content-disposition"].startswith("attachment;")
 
 
 def test_post_rejects_oversized_raw_bytes(client: TestClient) -> None:
@@ -438,3 +444,178 @@ def test_delete_owner_null_asset_allowed_for_any_entity(
 
     follow = client.get(f"/v1/uploads/{asset.id}")
     assert follow.status_code == 404
+
+
+# ---------------------------------------------------------------------------
+# TASK-847: arbitrary file types + public links
+# ---------------------------------------------------------------------------
+
+
+def test_post_pdf_multipart_stored_as_file(client: TestClient, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("LLM_BAWT_PUBLIC_ORIGIN", "https://app.example.test")
+    raw = b"%PDF-1.4 fake pdf body " * 50
+    resp = client.post(
+        "/v1/uploads?source=agent_attachment",
+        headers={"X-Entity-Id": "nick"},
+        files={"file": ("Quarterly Report.pdf", raw, "application/pdf")},
+    )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["kind"] == "file"
+    assert body["mime_type"] == "application/pdf"
+    assert body["filename"] == "Quarterly Report.pdf"
+    assert body["size_bytes"] == len(raw)
+    assert body["width"] is None and body["height"] is None
+    assert body["urls"] == {
+        "original": f"/v1/uploads/{body['asset_id']}",
+        "download": f"/v1/uploads/{body['asset_id']}?download=1",
+    }
+    assert body["public_url"] == f"https://app.example.test/api/chat/uploads/{body['asset_id']}"
+    assert body["public_download_url"] == body["public_url"] + "?download=1"
+
+    get = client.get(f"/v1/uploads/{body['asset_id']}")
+    assert get.status_code == 200
+    assert get.content == raw
+    assert get.headers["content-type"].startswith("application/pdf")
+    assert get.headers["content-disposition"] == 'inline; filename="Quarterly Report.pdf"'
+    assert get.headers["etag"] == f'"{body["sha256"]}"'
+
+    dl = client.get(f"/v1/uploads/{body['asset_id']}?download=1")
+    assert dl.status_code == 200
+    assert dl.headers["content-disposition"].startswith('attachment; filename="Quarterly Report.pdf"')
+
+    # No image renditions for a file.
+    assert client.get(f"/v1/uploads/{body['asset_id']}/thumb").status_code == 404
+    assert client.get(f"/v1/uploads/{body['asset_id']}/preview").status_code == 404
+
+
+def test_post_text_file_json_data_url_with_filename(client: TestClient) -> None:
+    raw = "hello, world\nline two\n".encode()
+    data_url = "data:text/plain;base64," + base64.b64encode(raw).decode("ascii")
+    resp = client.post(
+        "/v1/uploads",
+        headers={"X-Entity-Id": "nick"},
+        json={"data_url": data_url, "filename": "../../etc/notes\x00.txt"},
+    )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["kind"] == "file"
+    assert body["filename"] == "notes.txt"  # basename + control chars stripped
+    get = client.get(body["urls"]["original"])
+    assert get.content == raw
+    assert get.headers["content-type"].startswith("text/plain")
+
+
+def test_post_octet_stream_guesses_mime_from_extension(client: TestClient) -> None:
+    """``curl -F file=@x.csv`` sends octet-stream — the extension should win."""
+    resp = client.post(
+        "/v1/uploads",
+        headers={"X-Entity-Id": "nick"},
+        files={"file": ("data.csv", b"a,b\n1,2\n", "application/octet-stream")},
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["mime_type"] == "text/csv"
+
+
+def test_post_octet_stream_png_extension_takes_image_pipeline(client: TestClient) -> None:
+    resp = client.post(
+        "/v1/uploads",
+        headers={"X-Entity-Id": "nick"},
+        files={"file": ("shot.png", _png_bytes(320, 200), "application/octet-stream")},
+    )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["kind"] == "image"
+    assert body["mime_type"] == "image/webp"
+    assert set(body["urls"]) == {"thumb", "preview", "original"}
+
+
+def test_unknown_binary_forced_to_attachment(client: TestClient) -> None:
+    resp = client.post(
+        "/v1/uploads",
+        headers={"X-Entity-Id": "nick"},
+        files={"file": ("mystery", b"\x00\x01\x02\x03" * 10, "application/octet-stream")},
+    )
+    assert resp.status_code == 200, resp.text
+    aid = resp.json()["asset_id"]
+    get = client.get(f"/v1/uploads/{aid}")
+    assert get.headers["content-disposition"].startswith("attachment;")
+
+
+def test_html_and_svg_never_served_inline(client: TestClient) -> None:
+    for name, mime, payload in (
+        ("page.html", "text/html", b"<script>alert(1)</script>"),
+        ("logo.svg", "image/svg+xml", b"<svg xmlns='http://www.w3.org/2000/svg'/>"),
+    ):
+        resp = client.post(
+            "/v1/uploads", headers={"X-Entity-Id": "nick"}, files={"file": (name, payload, mime)}
+        )
+        assert resp.status_code == 200, resp.text
+        get = client.get(resp.json()["urls"]["original"])
+        assert get.headers["content-disposition"].startswith("attachment;"), name
+
+
+def test_file_size_cap_is_separate_from_image_cap(client: TestClient, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("LLM_BAWT_MAX_FILE_UPLOAD_BYTES", "1024")
+    ok = client.post(
+        "/v1/uploads", headers={"X-Entity-Id": "nick"}, files={"file": ("s.txt", b"x" * 1024, "text/plain")}
+    )
+    assert ok.status_code == 200
+    too_big = client.post(
+        "/v1/uploads", headers={"X-Entity-Id": "nick"}, files={"file": ("b.txt", b"x" * 1025, "text/plain")}
+    )
+    assert too_big.status_code == 413
+    assert "kind=file" in too_big.json()["detail"]
+    # Images are still governed by the 15 MB cap, not the file cap.
+    img = client.post(
+        "/v1/uploads", headers={"X-Entity-Id": "nick"}, files={"file": ("p.png", _png_bytes(200, 200), "image/png")}
+    )
+    assert img.status_code == 200
+
+
+def test_image_response_has_content_disposition_and_public_url(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("LLM_BAWT_PUBLIC_ORIGIN", "https://app.example.test/")
+    resp = client.post(
+        "/v1/uploads", headers={"X-Entity-Id": "nick"}, files={"file": ("cat photo.jpg", _png_bytes(100, 100), "image/png")}
+    )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["kind"] == "image"
+    assert body["filename"] == "cat photo.jpg"
+    assert body["public_url"] == f"https://app.example.test/api/chat/uploads/{body['asset_id']}"
+    assert body["public_download_url"] is None
+    get = client.get(body["urls"]["thumb"])
+    assert get.headers["content-disposition"] == 'inline; filename="cat photo-thumb.webp"'
+    orig = client.get(body["urls"]["original"])
+    assert orig.headers["content-disposition"] == 'inline; filename="cat photo.webp"'
+
+
+def test_public_url_omitted_when_origin_blank(client: TestClient, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("LLM_BAWT_PUBLIC_ORIGIN", "")
+    resp = client.post(
+        "/v1/uploads", headers={"X-Entity-Id": "nick"}, files={"file": ("n.txt", b"n", "text/plain")}
+    )
+    assert resp.status_code == 200
+    assert resp.json()["public_url"] is None
+
+
+def test_unicode_filename_gets_rfc5987_fallback(client: TestClient) -> None:
+    resp = client.post(
+        "/v1/uploads", headers={"X-Entity-Id": "nick"}, files={"file": ("résumé.txt", b"cv", "text/plain")}
+    )
+    assert resp.status_code == 200, resp.text
+    get = client.get(resp.json()["urls"]["original"])
+    cd = get.headers["content-disposition"]
+    assert cd.startswith('inline; filename="rsum.txt"')
+    assert "filename*=UTF-8''r%C3%A9sum%C3%A9.txt" in cd
+
+
+def test_delete_file_asset(client: TestClient) -> None:
+    resp = client.post(
+        "/v1/uploads", headers={"X-Entity-Id": "nick"}, files={"file": ("d.zip", b"PK\x03\x04junk", "application/zip")}
+    )
+    aid = resp.json()["asset_id"]
+    assert client.delete(f"/v1/uploads/{aid}", headers={"X-Entity-Id": "nick"}).status_code == 204
+    assert client.get(f"/v1/uploads/{aid}").status_code == 404

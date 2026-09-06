@@ -139,7 +139,8 @@ class ClaudeEventMixin:
         """Render canonical upload envelopes as model-visible curlable URLs."""
         lines = [
             "[Playwright Screenshot Artifact] The screenshot is stored durably. "
-            "Use these URLs with curl if you need the raw artifact:",
+            "Use these URLs with curl if you need the raw artifact; paste the "
+            "`public` link if the user should be able to open it:",
         ]
         rendered = 0
         for artifact in artifacts:
@@ -158,6 +159,11 @@ class ClaudeEventMixin:
                 absolute = self._absolute_artifact_url(urls.get(label))
                 if absolute:
                     lines.append(f"   {label}: {absolute}")
+            # TASK-847: the user-facing BawtHub link. Only this one is
+            # clickable by the user — the URLs above are internal.
+            public_url = artifact.get("public_url")
+            if isinstance(public_url, str) and public_url:
+                lines.append(f"   public (share with user): {public_url}")
         return "\n".join(lines) if rendered else ""
 
     async def _persist_screenshot_artifacts(

@@ -238,6 +238,16 @@ class Config(RuntimeTunables, BaseSettings):
             "Empty = emit relative /v1/uploads paths. Set via LLM_BAWT_AGENT_ORIGIN."
         ),
     )
+    PUBLIC_ORIGIN: str = Field(
+        default="https://app.bawthub.com",
+        description=(
+            "User-facing BawtHub origin used to build clickable links to "
+            "uploaded assets (TASK-847): <origin>/api/chat/uploads/<asset_id>. "
+            "Returned as public_url from POST /v1/uploads and echoed in the "
+            "agent-visible attachment manifest. Empty = omit public links. "
+            "Set via LLM_BAWT_PUBLIC_ORIGIN."
+        ),
+    )
 
     # --- xAI (Grok) Settings --- #
     XAI_API_KEY: str = Field(default="", description="xAI API key for Grok models (get from x.ai)")

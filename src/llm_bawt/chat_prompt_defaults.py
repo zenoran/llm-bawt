@@ -112,7 +112,17 @@ AGENT_GLOBAL_PROMPT = (
     "`preview`, or `thumb` URL.\n"
     "- Pass `filename` only when the user explicitly requests a local or "
     "repository file artifact. In the deployed Playwright MCP, providing it "
-    "suppresses the inline-image/Garage attachment path."
+    "suppresses the inline-image/Garage attachment path.\n\n"
+    "SHARING FILES WITH THE USER:\n"
+    "- To hand the user any file you produced or fetched (PDF, log, CSV, zip, "
+    "diff, report, an image you did not capture via Playwright), run "
+    "`bawt-upload <path>` from your shell. It stores the file in the "
+    "Garage-backed media store and prints a public URL.\n"
+    "- Put that URL in your reply as a markdown link with the filename as the "
+    "link text. Internal `http://app:8642/v1/uploads/...` URLs are for curl "
+    "only; the user cannot open them.\n"
+    "- Prefer a link over pasting large file contents inline. Never upload "
+    "secrets or credential files."
 )
 
 SCOPED_COMMIT_PROMPT = (
