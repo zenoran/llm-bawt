@@ -39,6 +39,7 @@ from claude_agent_sdk.types import (
 from claude_code_bridge.tool_events import normalize_tool_result
 
 from ._bridge_helpers import _get_fresh_oauth_token
+from .context_env import proxy_context_window_env
 from .proxy.request_context import (
     ProxyRequestContext,
     custom_header_env,
@@ -120,6 +121,7 @@ class ClaudeStreamMixin:
         session_key: str,
         thread_session_id: str | None,
         request_id: str,
+        context_window: int | None = None,
     ) -> dict:
         """Build the environment dict handed to ``ClaudeAgentOptions(env=...)``."""
         sdk_env = {}
@@ -175,6 +177,10 @@ class ClaudeStreamMixin:
             effective_subagent_model = subagent_model or model
             sdk_env["ANTHROPIC_SMALL_FAST_MODEL"] = effective_subagent_model
             sdk_env["CLAUDE_CODE_SUBAGENT_MODEL"] = effective_subagent_model
+            # Tell the CLI the real window for proxy-routed models it doesn't
+            # recognise, so auto-compaction fires BEFORE the upstream silently
+            # truncates (see context_env for the verified failure mode).
+            sdk_env.update(proxy_context_window_env(context_window))
             logger.debug(
                 "Routing turn through proxy: model=%s base=%s "
                 "subagent_model=%s",

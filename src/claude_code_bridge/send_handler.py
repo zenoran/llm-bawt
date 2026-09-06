@@ -291,6 +291,7 @@ class ClaudeSendMixin(ClaudeStreamMixin, ClaudeUsageMixin, ClaudeResultMixin):
                         use_proxy=use_proxy,
                         model=model,
                         subagent_model=subagent_model,
+                        context_window=bot_context_window,
                         force_refresh=auth_retry.attempted,
                         bot_id=bot_slug,
                         session_key=session_key,
