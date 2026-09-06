@@ -240,16 +240,10 @@ class CodexBridge(
                         except OSError:
                             pass
 
-                # Rollout JSONLs under sessions/YYYY/MM/DD/*.jsonl
-                if sessions_dir.is_dir():
-                    for jsonl in sessions_dir.rglob("*.jsonl"):
-                        try:
-                            age = now - jsonl.stat().st_mtime
-                            if age > self._CACHE_MAX_AGE:
-                                jsonl.unlink()
-                                total_removed += 1
-                        except OSError:
-                            pass
+                # NEVER prune rollout JSONLs under sessions/YYYY/MM/DD/*.jsonl.
+                # They are the transcripts `resume=` replays — each thread's
+                # memory. A 24h sweep here lobotomizes any thread idle for a
+                # day (same bug as the claude-code bridge, fixed together).
                     # Best-effort empty-dir cleanup
                     self._prune_empty_dirs(sessions_dir)
 

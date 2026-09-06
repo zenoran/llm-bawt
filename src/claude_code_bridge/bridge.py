@@ -234,17 +234,13 @@ class ClaudeCodeBridge(
                         except OSError:
                             pass
 
-                # Prune old session JSONL files (can grow very large)
-                sessions_dir = claude_dir / "projects"
-                if sessions_dir.is_dir():
-                    for jsonl in sessions_dir.rglob("*.jsonl"):
-                        try:
-                            age = now - jsonl.stat().st_mtime
-                            if age > self._CACHE_MAX_AGE:
-                                jsonl.unlink()
-                                total_removed += 1
-                        except OSError:
-                            pass
+                # NEVER prune ~/.claude/projects/**/*.jsonl here. Those are the
+                # SDK transcripts that `resume=` replays — they ARE each
+                # thread's memory (see reference/agent-system-prompt.md). A
+                # 24h sweep here silently lobotomized every thread idle for a
+                # day ("No conversation found with session ID" → cold-start
+                # with no seed). The CLI's own `cleanupPeriodDays` (30d
+                # default) is the only sanctioned transcript retention.
 
                 if total_removed:
                     logger.info("Cache cleanup: removed %d stale entries", total_removed)
