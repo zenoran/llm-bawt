@@ -780,6 +780,80 @@ def summarize_session_with_llm(
         return None
 
 
+SUMMARY_SYSTEM_PROMPT = "You are a helpful assistant that summarizes conversations concisely."
+
+# Substrings that mean the "summary" is really an error message that leaked
+# into the completion body — never persist those as a summary.
+_SUMMARY_ERROR_INDICATORS = (
+    "error:",
+    "exception occurred",
+    "exceed context window",
+    "tokens exceed",
+    "cuda error",
+    "out of memory",
+)
+
+
+def summarize_session_with_client(
+    session: Session,
+    client: Any,
+    config: Any | None = None,
+    *,
+    max_tokens: int = 320,
+    temperature: float = 0.3,
+    max_prompt_tokens: int = 6000,
+) -> str | None:
+    """Summarize a session with an in-process LLM client (TASK-857).
+
+    The ONE summarize-with-an-LLM unit shared by the background
+    HISTORY_SUMMARIZATION job and the ``/new`` pre-seed summarize. ``client``
+    is whatever ``_get_background_client`` handed out — the global job model,
+    never a chat model or a bot identity.
+
+    Returns the summary text, or ``None`` when the caller should fall back to
+    :func:`summarize_session_heuristic` (no client, prompt too large, error).
+    """
+    if client is None:
+        return None
+    from ..models.message import Message
+    from ..prompt_registry import PromptResolver
+
+    conversation_text = format_session_for_summarization(session)
+    prompt = PromptResolver(config).render(
+        key="history.summarization.single",
+        variables={"messages": conversation_text},
+    )
+    # Conservative budget to reduce context overflows on smaller models.
+    if len(prompt) // 4 > max_prompt_tokens:
+        logger.warning(
+            "Summarization prompt too large (%d chars) for session %s; skipping LLM",
+            len(prompt), session.session_id,
+        )
+        return None
+    try:
+        response = client.query(
+            messages=[
+                Message(role="system", content=SUMMARY_SYSTEM_PROMPT),
+                Message(role="user", content=prompt),
+            ],
+            max_tokens=max_tokens,
+            temperature=temperature,
+            plaintext_output=True,
+            stream=False,
+        )
+    except Exception as e:  # noqa: BLE001
+        logger.error(f"History summarization LLM call failed: {e}")
+        return None
+    content = (response or "").strip()
+    if not content:
+        return None
+    lower = content.lower()
+    if any(ind in lower for ind in _SUMMARY_ERROR_INDICATORS):
+        logger.error(f"LLM returned error in content: {content[:100]}...")
+        return None
+    return content
+
+
 def summarize_session_heuristic(session: Session) -> str:
     """Generate a heuristic summary without LLM.
 
@@ -1657,6 +1731,126 @@ class HistorySummarizer:
             "messages_summarized": total_messages,
             "sessions_skipped_existing": skipped_existing_count,
             "results": results,
+            "errors": errors,
+        }
+
+    def resummarize_heuristic_summaries(
+        self,
+        limit: int = 25,
+        *,
+        thread_id: str | None = None,
+        dry_run: bool = False,
+    ) -> dict:
+        """Regenerate summaries that were written by the heuristic fallback.
+
+        TASK-857: for months every summary path silently fell back to
+        :func:`summarize_session_heuristic` because the job-model resolver
+        borrowed an agent bot's identity. Those rows are still on disk and are
+        what ``/new`` seeds from, so fixing the resolver alone leaves the bad
+        text in place. This walks the stored heuristic summaries newest-first,
+        rebuilds each one's source :class:`Session` from the message ids in its
+        own metadata, and re-runs the normal
+        :meth:`summarize_session` path with ``replace_existing=True`` — same
+        normalization, same provenance, no LLM fallback to heuristic (a failed
+        row is left untouched rather than rewritten with the same slop).
+        """
+        from sqlalchemy import text
+
+        table = self._backend._messages_table_name
+        with self._backend.engine.connect() as conn:
+            rows = conn.execute(
+                text(
+                    f"""
+                    SELECT id, summary_metadata
+                    FROM {table}
+                    WHERE role = 'summary'
+                      AND summary_metadata->>'summarization_method' = 'heuristic'
+                      AND (:thread_id IS NULL OR session_id = :thread_id)
+                    ORDER BY timestamp DESC
+                    LIMIT :limit
+                    """
+                ),
+                {"limit": max(int(limit), 0), "thread_id": thread_id},
+            ).fetchall()
+
+            targets: list[Session] = []
+            skipped: list[str] = []
+            for row in rows:
+                meta = row.summary_metadata or {}
+                if isinstance(meta, str):
+                    try:
+                        meta = json.loads(meta)
+                    except Exception:
+                        meta = {}
+                message_ids = meta.get("message_ids") or []
+                if not isinstance(message_ids, list) or not message_ids:
+                    skipped.append(f"{row.id[:8]}: no source message_ids")
+                    continue
+                src = conn.execute(
+                    text(
+                        f"""
+                        SELECT id, role, content, timestamp, session_id
+                        FROM {table}
+                        WHERE id = ANY(:ids) AND role <> 'summary'
+                        ORDER BY timestamp ASC
+                        """
+                    ),
+                    {"ids": [str(m) for m in message_ids]},
+                ).fetchall()
+                if len(src) != len(message_ids):
+                    skipped.append(
+                        f"{row.id[:8]}: {len(src)}/{len(message_ids)} source rows still present"
+                    )
+                    continue
+                thread_ids = {r.session_id for r in src if r.session_id}
+                targets.append(
+                    Session(
+                        start_timestamp=float(src[0].timestamp),
+                        end_timestamp=float(src[-1].timestamp),
+                        messages=[
+                            {"role": r.role, "content": r.content, "timestamp": r.timestamp}
+                            for r in src
+                        ],
+                        message_ids=[r.id for r in src],
+                        session_id=(thread_ids.pop() if len(thread_ids) == 1 else None),
+                    )
+                )
+
+        if dry_run:
+            return {
+                "targeted": len(targets),
+                "regenerated": 0,
+                "skipped": skipped,
+                "errors": [],
+            }
+
+        regenerated = 0
+        errors: list[str] = []
+        for session in targets:
+            try:
+                result = self.summarize_session(
+                    session,
+                    use_heuristic_fallback=False,
+                    replace_existing=True,
+                )
+                if result.get("success") and result.get("created", True):
+                    regenerated += 1
+                else:
+                    errors.append(
+                        f"{(session.session_id or '?')[:8]}: "
+                        f"{result.get('error') or result.get('method')}"
+                    )
+            except Exception as e:  # noqa: BLE001
+                errors.append(f"{(session.session_id or '?')[:8]}: {e}")
+
+        logger.info(
+            "Re-summarized %s/%s heuristic summaries for %s",
+            regenerated, len(targets), self.bot_id,
+        )
+        return {
+            "targeted": len(targets),
+            "regenerated": regenerated,
+            "skipped": skipped,
             "errors": errors,
         }
 

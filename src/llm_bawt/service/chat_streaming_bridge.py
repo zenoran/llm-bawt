@@ -403,14 +403,34 @@ class ChatStreamingBridgeMixin:
 
             from ..memory.summarization import (
                 HistorySummarizer,
-                summarize_session_with_llm,
+                summarize_session_with_client,
             )
 
-            llm_timeout = max(1.0, timeout_s - 2.0)
+            # TASK-857: summarize with the GLOBAL background job model — the
+            # same client the HISTORY_SUMMARIZATION job uses. This used to
+            # POST /v1/llm/complete, which answers with "whatever client is
+            # first in _client_cache" under a 6s timeout — on an all-agent
+            # deployment that timed out every /new and the seed only ever got
+            # the heuristic template. Time-bounding stays with the worker
+            # thread join below.
+            bg_client, bg_alias = self._get_background_client()
+            if bg_client is None:
+                log.warning(
+                    "/new pre-seed summarize: no background job model client — "
+                    "summary will be heuristic (bot=%s)", bot_id,
+                )
+
+            # TASK-858: same budget the route and the background job use —
+            # derived from the job model's context window, not a 6000 floor.
+            from ..memory.summarization_limits import resolve_summarization_limits
+            seed_max_prompt_tokens, _seed_chunk = resolve_summarization_limits(
+                self.config, bg_alias,
+            )
 
             def _bounded_llm(session):
-                return summarize_session_with_llm(
-                    session, config=self.config, timeout=llm_timeout,
+                return summarize_session_with_client(
+                    session, bg_client, self.config,
+                    max_prompt_tokens=seed_max_prompt_tokens,
                 )
 
             def _work():

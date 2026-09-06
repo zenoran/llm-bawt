@@ -483,33 +483,40 @@ class InstanceManagerMixin:
             or resolve_job_model(self.config, "extraction_model")
             or resolve_job_model(self.config, "maintenance_model")
         )
+        if not preferred:
+            log.warning("No background job model configured; falling back to heuristics.")
+            return None, None
 
-        # Resolve the alias first so the keyed pool is keyed by the actual
-        # model (TASK-281), not the raw preferred string.
+        # TASK-857: background jobs are GLOBAL (TASK-522) — resolve the job
+        # model with no bot identity at all. This used to borrow nova's
+        # identity (``_resolve_request_model(bot_id="nova")`` + nova's
+        # harness); once every bot became an agent, nova's ``claude-proxy``
+        # harness stamped EVERY job model ``type="claude-code"`` and the
+        # openai/grok gate below rejected it, so summaries/extraction silently
+        # ran on heuristics for months. ``harness="chat"`` asks the catalog for
+        # the plain API/local client type of the endpoint itself.
         try:
-            model_alias, _ = self._resolve_request_model(
-                preferred, bot_id="nova", local_mode=False,
+            model_def = resolve_model_config(
+                self.config, preferred, harness="chat", default=None,
             )
         except Exception as e:
             log.error(f"Failed to resolve background model '{preferred}': {e}")
             return None, None
+        if not model_def:
+            log.error(f"Background model '{preferred}' not found in catalog")
+            return None, None
 
         # Keyed pool: reuse this model's client if already built. Each resolved
-        # alias gets its own stable, reused client — created once, then only
+        # model gets its own stable, reused client — created once, then only
         # read — so concurrent background jobs resolving different models no
-        # longer thrash a single slot (TASK-281). Lock-free read; dict.get is
-        # atomic under the GIL.
+        # longer thrash a single slot (TASK-281). Keyed by the catalog's
+        # canonical model key, not the raw preferred string. Lock-free read;
+        # dict.get is atomic under the GIL.
+        model_alias = str(model_def.get("model_key") or preferred)
         cached = self._bg_client_cache.get(model_alias)
         if cached is not None:
             return cached, model_alias
 
-        background_bot = BotManager(self.config).get_bot("nova")
-        model_def = resolve_model_config(
-            self.config,
-            model_alias,
-            harness=getattr(background_bot, "harness", None),
-            default={},
-        )
         model_type = model_def.get("type")
 
         # TASK-276 follow-up: local GPU models (gguf/vllm) run in the standalone

@@ -403,11 +403,8 @@ class BackgroundTasksMixin:
         """Process proactive history summarization and extraction for a bot."""
         from ..memory.summarization import (
             HistorySummarizer,
-            format_session_for_summarization,
+            summarize_session_with_client,
         )
-        from ..models.message import Message
-        from ..prompt_registry import PromptResolver
-
         from ..runtime_settings import resolve_job_model
 
         bot_id = task.bot_id or self._default_bot
@@ -425,48 +422,21 @@ class BackgroundTasksMixin:
         # Use isolated background client — never interferes with main chat model
         client, model_alias = self._get_background_client(model_override=requested_model)
 
-        prompt_resolver = PromptResolver(self.config)
+        # TASK-858: size the prompt off the job model's REAL context window.
+        # This used to inherit summarize_session_with_client's conservative
+        # 6000-token default, so a 1M-context job model still refused any
+        # session over ~6.3k tokens and left it heuristic forever.
+        from ..memory.summarization_limits import resolve_summarization_limits
+        job_max_prompt_tokens, _job_max_chunk_tokens = resolve_summarization_limits(
+            self.config, model_alias,
+        )
 
         def summarize_with_loaded_client(session) -> str | None:
-            if not client:
-                return None
-
-            conversation_text = format_session_for_summarization(session)
-            prompt = prompt_resolver.render(
-                key="history.summarization.single",
-                variables={"messages": conversation_text},
+            # TASK-857: the shared unit — same function the /new pre-seed uses.
+            return summarize_session_with_client(
+                session, client, self.config,
+                max_prompt_tokens=job_max_prompt_tokens,
             )
-
-            # Conservative budget to reduce context overflows on smaller models.
-            if len(prompt) // 4 > 6000:
-                return None
-
-            try:
-                messages = [
-                    Message(
-                        role="system",
-                        content="You are a helpful assistant that summarizes conversations concisely.",
-                    ),
-                    Message(role="user", content=prompt),
-                ]
-                response = client.query(
-                    messages=messages,
-                    max_tokens=320,
-                    temperature=0.3,
-                    plaintext_output=True,
-                    stream=False,
-                )
-                if not response:
-                    return None
-
-                lower = response.lower()
-                error_indicators = ("error:", "exception occurred", "exceed context window", "tokens exceed")
-                if any(ind in lower for ind in error_indicators):
-                    return None
-                return response.strip()
-            except Exception as e:
-                log.error(f"History summarization LLM call failed: {e}")
-                return None
 
         # Create a settings resolver for per-bot summarization tunables
         from ..runtime_settings import RuntimeSettingsResolver

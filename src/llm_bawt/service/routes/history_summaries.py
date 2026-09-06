@@ -2,6 +2,7 @@
 
 from fastapi import APIRouter, HTTPException, Query
 
+from ...memory.summarization_limits import resolve_summarization_limits
 from ..dependencies import get_service
 from ..logging import get_service_logger
 from ..schemas import (
@@ -17,33 +18,15 @@ management_router = APIRouter()
 delete_router = APIRouter()
 log = get_service_logger(__name__)
 
-# Hard ceiling for summarization prompts regardless of what the model advertises.
-# Large advertised windows (e.g. 2M) are rarely practical for dense output tasks.
-_MAX_SUMMARIZATION_PROMPT_TOKENS = 512_000
-
 
 def _resolve_summarization_limits(service, model_alias: str | None) -> tuple[int, int]:
-    """Return (max_prompt_tokens, max_chunk_tokens) tuned for the active model."""
-    context_window = int(service.config.get_model_context_window(model_alias) or 0)
+    """Return (max_prompt_tokens, max_chunk_tokens) tuned for the active model.
 
-    if context_window <= 0:
-        # Conservative fallback for unknown models.
-        return (6000, 4000)
-
-    response_budget = 512
-    safety_margin = max(2048, int(context_window * 0.05))
-    max_prompt_tokens = max(6000, context_window - response_budget - safety_margin)
-
-    # Clamp to practical ceiling.
-    max_prompt_tokens = min(max_prompt_tokens, _MAX_SUMMARIZATION_PROMPT_TOKENS)
-
-    # Disable chunking for very large context models.
-    if context_window >= 200_000:
-        max_chunk_tokens = 0
-    else:
-        max_chunk_tokens = max(4000, min(64_000, int(max_prompt_tokens * 0.7)))
-
-    return (max_prompt_tokens, max_chunk_tokens)
+    TASK-858: the budget rules moved to ``memory.summarization_limits`` so the
+    background job and the ``/new`` pre-seed size their prompts the same way
+    this route always has. This stays as the service-shaped adapter.
+    """
+    return resolve_summarization_limits(service.config, model_alias)
 
 
 def _invalidate_bot_history_cache(service, bot_id: str) -> None:
@@ -83,18 +66,20 @@ def _build_summary_callable(service, bot_id: str, user_id: str = "system", model
     quality_retry_enabled = bool(getattr(service.config, "SUMMARIZATION_QUALITY_RETRY", False))
 
     try:
-        model_alias, _ = service._resolve_request_model(
-            requested_model,
-            bot_id,
-            local_mode=False,
+        # TASK-857: summarization is a GLOBAL job (TASK-522) — resolve its
+        # model with no bot identity. This used to route through
+        # ``_resolve_request_model(bot_id)`` + ``_get_llm_bawt(bot_id=...)``,
+        # which on an all-agent deployment handed back the *bot's* agent
+        # backend client (harness-typed ``claude-code``) instead of a plain
+        # API client, so every route-driven rebuild fell through to the
+        # heuristic. ``_get_background_client`` is the one job-model resolver.
+        client, model_alias = service._get_background_client(
+            model_override=requested_model,
         )
-        llm_bawt = service._get_llm_bawt(
-            model_alias=model_alias,
-            bot_id=bot_id,
-            user_id=user_id,
-            local_mode=False,
-        )
-        client = llm_bawt.client
+        if client is None:
+            raise RuntimeError(
+                f"no background job client for model '{requested_model}'"
+            )
         max_prompt_tokens, max_chunk_tokens = _resolve_summarization_limits(service, model_alias)
         log.info("History summarization route using model: %s", model_alias)
         log.info(
