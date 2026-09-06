@@ -94,9 +94,18 @@ class OpsStore:
 
     _schema_guard = SchemaBootstrapGuard()
 
-    def __init__(self, config: Config):
+    def __init__(self, config: Config, engine: Any = None):
+        """``engine`` overrides credential-derived connection resolution.
+
+        Used by the tenant seeder (and tests), which already owns a connected
+        engine and must not re-resolve one from a partial config.
+        """
         self.config = config
         self.engine = None
+        if engine is not None:
+            self.engine = engine
+            self._ensure_tables_exist()
+            return
         if not has_database_credentials(config):
             return
         try:

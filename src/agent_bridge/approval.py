@@ -23,7 +23,11 @@ Design (TASK-289):
   hard-blocks it. ``allow`` rules placed at a lower ``order`` let an operator
   carve safe exceptions out of a broad ``require_approval`` rule below them.
 * Evaluation is **first match wins** over policies sorted by ``(order, id)``. No
-  match → ``allow`` (default-allow, matching today's bypass behaviour).
+  match → ``allow`` (default-allow, matching today's bypass behaviour), EXCEPT
+  for the fail-closed tools in :data:`_FAIL_CLOSED_TOOLS` (``ops_run``), where no
+  match → ``require_approval``. Those tools execute operator-authored privileged
+  scripts, so the gate must be structural: deleting the catch-all seed row must
+  not silently ungate them. An explicit ``allow`` policy still carves exceptions.
 * The **grant key** is a stable hash of (backend, tool, normalized subject). The
   bridge stores a grant under this key when the app tells it an approval was
   granted, and consumes it when the model re-issues the identical call on the
@@ -120,6 +124,15 @@ _DEFAULT_FIELD_BY_TOOL = {
     "BashOutput": "command",
     "Shell": "command",
 }
+
+
+# Tools whose no-match fallback is ``require_approval`` instead of the global
+# default-allow (TASK-639). ``ops_run`` executes an operator-authored privileged
+# script from the ops catalog; a missing or operator-deleted catch-all policy row
+# must not silently turn that into an ungated tool. Keyed on the MCP tool tail so
+# ``mcp__bawthub__ops_run`` matches. Read-only ``ops_list_operations`` /
+# ``ops_job_status`` are deliberately NOT here — status reads stay ungated.
+_FAIL_CLOSED_TOOLS = frozenset({"ops_run"})
 
 
 def _derive_ops_run_subject(tool_input: Any) -> str:
@@ -463,9 +476,24 @@ def evaluate(
             label=humanize_subject(subject),
         )
 
-    # No policy matched → default allow. Derive the subject once for the key so
-    # callers logging the (allowed) call still get a stable identifier.
+    # No policy matched. Derive the subject once for the key so callers logging
+    # the call still get a stable identifier.
     subject = derive_subject(tool_name, tool_input, None)
+    if _tool_tail(tool_name) in _FAIL_CLOSED_TOOLS:
+        # Fail closed: a privileged catalogued operation is never ungated just
+        # because nobody wrote (or somebody deleted) a policy row for it.
+        return ApprovalDecision(
+            action=PolicyAction.REQUIRE_APPROVAL,
+            subject=subject,
+            policy=None,
+            severity=Severity.HIGH,
+            prompt=(
+                "No approval policy matched this operation, and catalogued "
+                f"operations are gated by default.\n\n{subject}"
+            ),
+            grant_key=grant_key(backend, tool_name, subject),
+            label=humanize_subject(subject),
+        )
     return ApprovalDecision(
         action=PolicyAction.ALLOW,
         subject=subject,

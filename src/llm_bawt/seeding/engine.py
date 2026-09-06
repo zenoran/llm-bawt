@@ -77,6 +77,8 @@ class TenantSeeder:
         self._bot_profile_store()
         report["catalog_migration"] = self._ensure_catalog_schema()
         report["prompts"] = self._seed_prompt_defaults()
+        report["ops_operations"] = self._seed_ops_catalog()
+        report["approval_policies"] = self._seed_approval_policies()
         logger.info("Tenant seed complete: %s", report)
         return report
 
@@ -201,6 +203,35 @@ class TenantSeeder:
             raise RuntimeError("Prompt template DB unavailable")
         result = store.seed_defaults()
         return {"created": result["created"], "existing": result["skipped"]}
+
+    def _seed_ops_catalog(self) -> dict[str, Any]:
+        """Canonical ops catalog rows (TASK-639), insert-if-missing per slug.
+
+        Seeds ship ``enabled=False``: an operator has to turn each privileged
+        operation on deliberately in the UI. Existing rows are never overwritten.
+        """
+        from ..ops.seeds import seed_all
+        from ..ops.store import OpsStore
+
+        store = OpsStore(self.config, engine=self.engine)
+        inserted, skipped = seed_all(store)
+        return {"created": inserted, "existing": skipped}
+
+    def _seed_approval_policies(self) -> dict[str, Any]:
+        """Starter approval rules, including the TASK-639 ``ops_run`` gates.
+
+        Without these an operator sees no ops rules to edit in the admin UI.
+        The gate itself does not depend on them — ``ops_run`` fails closed in
+        :func:`agent_bridge.approval.evaluate` when nothing matches — but the
+        seeded rows are what make the gating visible and carve-out-able.
+        """
+        from ..approval_policies import ToolApprovalPolicyStore
+
+        store = ToolApprovalPolicyStore(self.config, engine=self.engine)
+        if store.engine is None:
+            raise RuntimeError("Tool approval policy DB unavailable")
+        seeded = store.seed_defaults()
+        return {"created": seeded, "total": len(store.list_all())}
 
     def _resolve_endpoint_id(self, conn, model_key: str, access_path_key: str) -> int:
         endpoint_id = conn.execute(

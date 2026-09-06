@@ -129,17 +129,29 @@ def test_apply_seeds_infra_only_and_bootstraps_bot_profiles_first():
         calls.append("prompts")
         return {"created": [], "existing": ["x"]}
 
+    def _ops():
+        calls.append("ops")
+        return {"created": ["llm-bawt.restart-app"], "existing": []}
+
+    def _policies():
+        calls.append("policies")
+        return {"created": 3, "total": 9}
+
     with (
         patch.object(seeder, "_bot_profile_store", side_effect=_bot_store),
         patch.object(seeder, "_ensure_catalog_schema", side_effect=_schema),
         patch.object(seeder, "_seed_prompt_defaults", side_effect=_prompts),
+        patch.object(seeder, "_seed_ops_catalog", side_effect=_ops),
+        patch.object(seeder, "_seed_approval_policies", side_effect=_policies),
         patch.object(seeder, "_seed_models") as seed_models,
         patch.object(seeder, "_seed_endpoints") as seed_endpoints,
     ):
         report = seeder.apply()
 
-    assert calls == ["bot_store", "schema", "prompts"]
-    assert set(report) == {"catalog_migration", "prompts"}
+    assert calls == ["bot_store", "schema", "prompts", "ops", "policies"]
+    assert set(report) == {
+        "catalog_migration", "prompts", "ops_operations", "approval_policies",
+    }
     seed_models.assert_not_called()
     seed_endpoints.assert_not_called()
 

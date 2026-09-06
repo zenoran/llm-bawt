@@ -151,6 +151,41 @@ def test_default_allow_when_no_policy():
     assert d.policy is None
 
 
+# ---- evaluate: fail-closed tools (TASK-639) --------------------------------
+
+def test_ops_run_fails_closed_when_no_policy_matches():
+    """A catalogued operation is never ungated by a missing policy row."""
+    d = evaluate([], "mcp", "ops_run", {"operation": "llm-bawt.restart-redis"})
+    assert d.action is PolicyAction.REQUIRE_APPROVAL
+    assert d.policy is None
+    assert d.severity is Severity.HIGH
+    assert d.subject == 'operation=llm-bawt.restart-redis args={}'
+    assert d.grant_key
+
+
+def test_ops_run_fail_closed_matches_namespaced_mcp_tool_name():
+    d = evaluate([], "mcp", "mcp__bawthub__ops_run", {"operation": "x"})
+    assert d.action is PolicyAction.REQUIRE_APPROVAL
+
+
+def test_ops_run_explicit_allow_policy_still_wins_over_fail_closed():
+    """Operators can still carve out a safe operation with an allow rule."""
+    pols = [_pol(
+        id="allow-safe", tool_name="ops_run", matcher_type=MatcherType.PREFIX,
+        pattern="operation=llm-bawt.restart-aux ", action="allow", order=5,
+    )]
+    d = evaluate(pols, "mcp", "ops_run",
+                 {"operation": "llm-bawt.restart-aux", "args": {"service": "crawl4ai"}})
+    assert d.action is PolicyAction.ALLOW
+    assert d.policy is not None
+
+
+def test_ops_read_only_tools_are_not_fail_closed():
+    for name in ("ops_list_operations", "ops_job_status"):
+        d = evaluate([], "mcp", name, {"job_id": "j1"})
+        assert d.action is PolicyAction.ALLOW, name
+
+
 def test_require_approval_match():
     pols = [_pol(matcher_type=MatcherType.PREFIX, pattern="rm -rf", action="require_approval")]
     d = evaluate(pols, "claude-code", "Bash", {"command": "rm -rf /x"})
