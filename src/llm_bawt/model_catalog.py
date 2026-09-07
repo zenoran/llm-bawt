@@ -132,10 +132,16 @@ class ProtocolCompatibility:
                 and access_path.protocol == "anthropic-messages"
             )
         if normalized == "claude-proxy":
-            return (
-                access_path.vendor != "anthropic"
-                and access_path.protocol in cls.PROXY_TARGETS
-            )
+            if access_path.vendor == "anthropic":
+                return False
+            if access_path.vendor == "openai":
+                return access_path.key in {"openai-oauth", "openai-responses"}
+            return access_path.protocol in cls.PROXY_TARGETS
+        if normalized == "codex":
+            # The Codex bridge owns ChatGPT subscription OAuth. Standard
+            # Responses providers (including OpenAI platform API keys) run
+            # through the Claude bridge's provider proxy instead.
+            return access_path.key == "openai-oauth"
         return cls.HARNESS_PROTOCOLS[normalized] == access_path.protocol
 
 
@@ -236,6 +242,8 @@ class ModelCatalog:
     def _provider_prefix(access_path: AccessPath) -> str | None:
         if access_path.key == "openai-oauth":
             return "openai_chatgpt"
+        if access_path.key == "openai-responses":
+            return "openai"
         if access_path.vendor == "xai":
             return "xai"
         if access_path.vendor == "zai":

@@ -13,6 +13,7 @@ from .base import ProviderAdapter
 from .kimi_coding import KimiCodingAdapter
 from .local import LocalAdapter
 from .moonshot import MoonshotAdapter
+from .openai import OpenAIAdapter
 from .openai_chatgpt import OpenAIChatGPTAdapter
 from .openrouter import OpenRouterAdapter
 from .xai import XaiAdapter
@@ -42,6 +43,7 @@ async def close_all() -> None:
 # Default registrations. Adding a new provider = create the adapter file,
 # import it here, and register an instance.
 register(OpenAIChatGPTAdapter())
+register(OpenAIAdapter())
 register(XaiAdapter())
 register(ZaiAdapter())
 register(MoonshotAdapter())

@@ -104,7 +104,7 @@ async def _fetch_codex_models() -> list[dict]:
 
     adapter = OpenAIChatGPTAdapter()
     bearer, base_url = await adapter.authorize()
-    headers = {"Authorization": f"Bearer {bearer}", **adapter.extra_headers()}
+    headers = {"Authorization": f"Bearer {bearer}", **adapter.extra_headers({})}
     client_version = await _codex_client_version()
 
     async with httpx.AsyncClient(timeout=20.0) as client:

@@ -14,7 +14,6 @@ import pytest
 from claude_code_bridge.context_env import (
     MAX_CONTEXT_TOKENS_ENV,
     MAX_OUTPUT_TOKENS_ENV,
-    SDK_DEFAULT_UNKNOWN_MODEL_WINDOW,
     output_reserve_for_window,
     proxy_context_window_env,
 )
@@ -54,12 +53,13 @@ def test_unresolved_window_defers_to_cli(window) -> None:
     assert proxy_context_window_env(window) == {}
 
 
-@pytest.mark.parametrize(
-    "window", [SDK_DEFAULT_UNKNOWN_MODEL_WINDOW, 400_000, 1_000_000]
-)
-def test_default_or_larger_window_is_left_alone(window) -> None:
-    """The CLI's 200k default under-estimates these; early compaction is safe."""
-    assert proxy_context_window_env(window) == {}
+@pytest.mark.parametrize("window", [200_000, 372_000, 1_000_000])
+def test_default_or_larger_window_is_propagated(window) -> None:
+    """Unknown proxy models must not inherit Claude Code's 200k fallback."""
+    assert proxy_context_window_env(window) == {
+        MAX_CONTEXT_TOKENS_ENV: str(window),
+        MAX_OUTPUT_TOKENS_ENV: "16384",
+    }
 
 
 @pytest.mark.parametrize(
@@ -100,6 +100,51 @@ def test_proxy_turn_injects_hints_for_small_window() -> None:
     assert env["CLAUDE_CODE_SUBAGENT_MODEL"] == "local/qwen3.8:27b-64k"
 
 
+def test_proxy_turn_injects_hints_for_gpt_5_6_window() -> None:
+    env = _env(use_proxy=True, context_window=372_000)
+    assert env[MAX_CONTEXT_TOKENS_ENV] == "372000"
+    assert env[MAX_OUTPUT_TOKENS_ENV] == "16384"
+
+
+def test_proxy_turn_routes_every_explicit_subagent_tier_to_proxy_model() -> None:
+    env = _Harness()._build_sdk_env(
+        use_proxy=True,
+        model="openai_chatgpt/gpt-6-astra",
+        subagent_model=None,
+        force_refresh=False,
+        bot_id="snark",
+        session_key="snark:nick",
+        thread_session_id="thread-1",
+        request_id="request-1",
+        context_window=272_000,
+    )
+
+    expected = "openai_chatgpt/gpt-6-astra"
+    assert env["CLAUDE_CODE_SUBAGENT_MODEL"] == expected
+    assert env["ANTHROPIC_SMALL_FAST_MODEL"] == expected
+    for tier in ("HAIKU", "FABLE", "SONNET", "OPUS"):
+        assert env[f"ANTHROPIC_DEFAULT_{tier}_MODEL"] == expected
+
+
+def test_proxy_turn_routes_tiers_to_configured_subagent_override() -> None:
+    env = _Harness()._build_sdk_env(
+        use_proxy=True,
+        model="openai_chatgpt/gpt-6-astra",
+        subagent_model="openai_chatgpt/gpt-5.6-luna",
+        force_refresh=False,
+        bot_id="snark",
+        session_key="snark:nick",
+        thread_session_id="thread-1",
+        request_id="request-1",
+        context_window=272_000,
+    )
+
+    expected = "openai_chatgpt/gpt-5.6-luna"
+    assert env["CLAUDE_CODE_SUBAGENT_MODEL"] == expected
+    for tier in ("HAIKU", "FABLE", "SONNET", "OPUS"):
+        assert env[f"ANTHROPIC_DEFAULT_{tier}_MODEL"] == expected
+
+
 def test_proxy_turn_without_window_sets_no_hints() -> None:
     env = _env(use_proxy=True, context_window=None)
     assert MAX_CONTEXT_TOKENS_ENV not in env
@@ -114,3 +159,6 @@ def test_direct_turn_never_sets_hints(monkeypatch) -> None:
     env = _env(use_proxy=False, context_window=65_536)
     assert MAX_CONTEXT_TOKENS_ENV not in env
     assert MAX_OUTPUT_TOKENS_ENV not in env
+    assert "CLAUDE_CODE_SUBAGENT_MODEL" not in env
+    for tier in ("HAIKU", "FABLE", "SONNET", "OPUS"):
+        assert f"ANTHROPIC_DEFAULT_{tier}_MODEL" not in env

@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import httpx
 import pytest
 
 from llm_bawt.service.model_discovery import (
+    CodexBridgeDiscoveryProvider,
     KimiCodingDiscoveryProvider,
     ModelDiscoveryError,
     discover_models,
@@ -130,20 +132,112 @@ def test_kimi_provider_aliases_resolve(monkeypatch):
     assert discover_models("kimi-code") == expected
 
 
-def test_upstream_lookup_caches_normalized_kimi_catalog(monkeypatch):
-    model_routes._upstream_cache.clear()
+def test_openai_discovery_enriches_live_astra_with_documented_metadata(monkeypatch):
+    monkeypatch.setattr(
+        "llm_bawt.service.providers.api_key.resolve_api_key",
+        lambda *_args, **_kwargs: "stored-key",
+    )
+    monkeypatch.setattr(
+        "llm_bawt.model_manager.fetch_openai_api_models",
+        lambda key: (
+            True,
+            [
+                {"id": "gpt-6-astra"},
+                {"id": "gpt-future"},
+            ],
+        ),
+    )
+
+    models = discover_models("openai", object())
+
+    assert models == [
+        {
+            "id": "gpt-6-astra",
+            "description": "Astra — OpenAI's flagship model for complex reasoning and coding.",
+            "context_length": 1_050_000,
+        },
+        {"id": "gpt-future", "description": ""},
+    ]
+
+
+def test_codex_discovery_preserves_live_models_and_context(monkeypatch):
+    class Response:
+        @staticmethod
+        def raise_for_status():
+            return None
+
+        @staticmethod
+        def json():
+            return {
+                "models": [
+                    {
+                        "id": "gpt-6-astra",
+                        "description": "Astra",
+                        "context_window": 1_100_000,
+                    }
+                ]
+            }
+
+    monkeypatch.setattr("llm_bawt.service.model_discovery.httpx.get", lambda *_args, **_kwargs: Response())
+
+    assert CodexBridgeDiscoveryProvider().fetch() == [
+        {
+            "id": "gpt-6-astra",
+            "description": "Astra",
+            "context_length": 1_100_000,
+        }
+    ]
+
+
+def test_codex_discovery_surfaces_bridge_error(monkeypatch):
+    request = httpx.Request("GET", "http://codex-bridge:8682/models")
+    response = httpx.Response(
+        503,
+        request=request,
+        json={"error": "OpenAIChatGPTAdapter.extra_headers() missing responses_body"},
+    )
+
+    def fail(*_args, **_kwargs):
+        raise httpx.HTTPStatusError("failure", request=request, response=response)
+
+    monkeypatch.setattr("llm_bawt.service.model_discovery.httpx.get", fail)
+
+    with pytest.raises(ModelDiscoveryError) as exc_info:
+        CodexBridgeDiscoveryProvider().fetch()
+
+    assert str(exc_info.value) == (
+        "ChatGPT subscription model discovery failed: "
+        "OpenAIChatGPTAdapter.extra_headers() missing responses_body"
+    )
+
+
+def test_codex_discovery_rejects_empty_live_catalog(monkeypatch):
+    class Response:
+        @staticmethod
+        def raise_for_status():
+            return None
+
+        @staticmethod
+        def json():
+            return {"models": []}
+
+    monkeypatch.setattr("llm_bawt.service.model_discovery.httpx.get", lambda *_args, **_kwargs: Response())
+
+    with pytest.raises(ModelDiscoveryError, match="returned no available models"):
+        CodexBridgeDiscoveryProvider().fetch()
+
+
+def test_upstream_lookup_always_fetches_current_catalog(monkeypatch):
     calls = 0
 
     def fake_discover(provider):
         nonlocal calls
         calls += 1
         assert provider == "kimi"
-        return [{"id": "k3", "description": "K3", "context_length": 262_144}]
+        return [{"id": f"k{calls}", "description": "Kimi"}]
 
     monkeypatch.setattr("llm_bawt.service.model_discovery.discover_models", fake_discover)
 
-    first = model_routes._upstream_lookup("kimi")
-    second = model_routes._upstream_lookup("kimi")
-
-    assert first == second
-    assert calls == 1
+    assert model_routes._upstream_lookup("kimi")[0]["id"] == "k1"
+    assert model_routes._upstream_lookup("kimi")[0]["id"] == "k2"
+    assert calls == 2

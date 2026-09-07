@@ -29,6 +29,10 @@ services:
     env_file:
       - ./.env
     environment:
+      # Source is bind-mounted in dev. The container runs as root, so writing
+      # bytecode here creates root-owned __pycache__ directories that block host
+      # tooling. Keep generated caches out of the repository.
+      - PYTHONDONTWRITEBYTECODE=1
       # /v1/usage Claude adapter: a DEDICATED login bundle the app owns and
       # refreshes itself (mode=owned) so it never goes stale and never touches
       # your interactive Claude Code (TUI) login. Lives under the already-RW
@@ -350,6 +354,9 @@ services:
     env_file:
       - ./.env
     environment:
+      # This root-running service also bind-mounts ./src in development. Never
+      # leave root-owned Python bytecode in the shared working tree.
+      - PYTHONDONTWRITEBYTECODE=1
       - LOCAL_MODEL_BACKEND_NAME=${LOCAL_MODEL_BACKEND_NAME:-local}
       - LOCAL_MODEL_BRIDGE_LOG_LEVEL=${LOCAL_MODEL_BRIDGE_LOG_LEVEL:-INFO}
       - LOCAL_MODEL_BRIDGE_HEALTH_PORT=8683

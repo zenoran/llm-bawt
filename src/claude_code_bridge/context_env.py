@@ -23,15 +23,12 @@ bundled CLI source):
 100k.
 
 The app resolves the true window from the model catalog and sends it down with
-every command (TASK-609); this module turns that scalar into env hints. Windows
-at or above the CLI's default are left alone: the default under-estimates them,
-which only ever compacts early — safe.
+every command (TASK-609); this module turns that scalar into env hints. The hint
+must be sent for every resolved proxy model, including windows above 200k:
+otherwise the CLI's unknown-model fallback compacts large-context models early.
 """
 
 from __future__ import annotations
-
-#: What the Claude CLI assumes for a model name it doesn't recognise.
-SDK_DEFAULT_UNKNOWN_MODEL_WINDOW = 200_000
 
 #: Output reserve = window / OUTPUT_RESERVE_DIVISOR, clamped to the bounds.
 OUTPUT_RESERVE_DIVISOR = 8
@@ -48,15 +45,14 @@ def output_reserve_for_window(context_window: int) -> int:
 
 
 def proxy_context_window_env(context_window: int | None) -> dict[str, str]:
-    """Env hints for a proxy-routed turn, or ``{}`` when the CLI default is safe.
+    """Env hints for a resolved proxy model, or ``{}`` when unresolved.
 
-    Only windows strictly smaller than the CLI's unknown-model default need
-    hints; ``None``/non-positive means the app couldn't resolve one and we
-    defer to the CLI.
+    Claude Code does not recognize provider-qualified proxy model names, so its
+    200k fallback is wrong in both directions. Propagate every positive catalog
+    window: smaller models must compact before truncation, while larger models
+    must not compact prematurely at the fallback threshold.
     """
     if context_window is None or context_window <= 0:
-        return {}
-    if context_window >= SDK_DEFAULT_UNKNOWN_MODEL_WINDOW:
         return {}
     return {
         MAX_CONTEXT_TOKENS_ENV: str(context_window),

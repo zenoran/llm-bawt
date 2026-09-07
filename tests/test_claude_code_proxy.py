@@ -485,6 +485,69 @@ def test_prepare_request_rejects_unsupported_minimal_effort(monkeypatch) -> None
     assert prepared["reasoning"] == {"effort": "high", "summary": "auto"}
 
 
+# ── OpenAI platform adapter ───────────────────────────────────────────────────
+def test_openai_platform_registered_under_openai_prefix() -> None:
+    from claude_code_bridge.proxy.adapters import lookup
+    from claude_code_bridge.proxy.adapters.openai import OpenAIAdapter
+
+    adapter = lookup("openai")
+    assert isinstance(adapter, OpenAIAdapter)
+    assert adapter.name == "openai"
+
+
+def test_openai_platform_authorize_fetches_current_broker_key(monkeypatch) -> None:
+    import asyncio
+
+    from claude_code_bridge.proxy.adapters.openai import OpenAIAdapter
+
+    keys = iter(("first-key", "rotated-key"))
+    monkeypatch.setattr(
+        OpenAIAdapter, "_fetch_broker_key", staticmethod(lambda: next(keys))
+    )
+    monkeypatch.delenv("OPENAI_API_BASE_URL", raising=False)
+    adapter = OpenAIAdapter()
+
+    assert asyncio.run(adapter.authorize()) == (
+        "first-key",
+        "https://api.openai.com/v1",
+    )
+    assert asyncio.run(adapter.authorize()) == (
+        "rotated-key",
+        "https://api.openai.com/v1",
+    )
+
+
+def test_openai_platform_broker_errors_are_explicit(monkeypatch) -> None:
+    import pytest
+
+    from claude_code_bridge.proxy.adapters.openai import OpenAIAdapter
+
+    monkeypatch.delenv("LLM_BAWT_API_URL", raising=False)
+    with pytest.raises(RuntimeError, match="cannot reach the OpenAI API-key broker"):
+        OpenAIAdapter._fetch_broker_key()
+
+
+def test_openai_platform_uses_env_key_only_when_db_connection_is_unconfigured(
+    monkeypatch,
+) -> None:
+    from types import SimpleNamespace
+
+    from claude_code_bridge.proxy.adapters.openai import OpenAIAdapter
+
+    monkeypatch.setenv("LLM_BAWT_API_URL", "http://app:8642")
+    monkeypatch.setenv("OPENAI_API_KEY", "legacy-env-key")
+    monkeypatch.setattr(
+        "claude_code_bridge.proxy.adapters.openai.httpx.get",
+        lambda *_args, **_kwargs: SimpleNamespace(
+            is_error=True,
+            status_code=503,
+            text='{"detail":"no openai-api credential installed"}',
+        ),
+    )
+
+    assert OpenAIAdapter._fetch_broker_key() == "legacy-env-key"
+
+
 # ── xAI (Grok) adapter ────────────────────────────────────────────────────────
 def test_xai_registered_under_xai_prefix() -> None:
     from claude_code_bridge.proxy.adapters import lookup

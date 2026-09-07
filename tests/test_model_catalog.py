@@ -64,6 +64,40 @@ def test_shared_openai_oauth_endpoint_resolves_differently_by_harness():
     assert codex["endpoint_id"] == proxy["endpoint_id"] == 20
 
 
+def test_openai_platform_responses_routes_through_proxy_not_native_codex():
+    endpoint = _endpoint(
+        21,
+        "gpt-6-astra",
+        "openai-responses",
+        "openai",
+        "responses",
+        "gpt-6-astra",
+    )
+    catalog = ModelCatalog([endpoint])
+
+    proxy = catalog.resolve("gpt-6-astra", harness="claude-proxy")
+
+    assert proxy["type"] == "claude-code"
+    assert proxy["backend"] == "claude-code"
+    assert proxy["model_id"] == "openai/gpt-6-astra"
+    assert not ProtocolCompatibility.is_compatible("codex", endpoint.access_path)
+
+
+def test_openai_chat_completions_path_is_not_advertised_to_agent_proxy():
+    endpoint = _endpoint(
+        22,
+        "gpt-chat",
+        "openai-api",
+        "openai",
+        "chat-completions",
+        "gpt-chat",
+    )
+
+    assert not ProtocolCompatibility.is_compatible(
+        "claude-proxy", endpoint.access_path
+    )
+
+
 def test_provider_system_prompt_resolves_only_for_active_harness():
     instruction = "Use OpenAI-compatible tool semantics."
     endpoint = _endpoint(
@@ -148,6 +182,7 @@ def test_protocol_compatibility_is_single_filter_rule():
     assert ProtocolCompatibility.is_compatible("claude-code", anthropic.access_path)
     assert not ProtocolCompatibility.is_compatible("claude-code", zai.access_path)
     assert not ProtocolCompatibility.is_compatible("codex", anthropic.access_path)
+    assert not ProtocolCompatibility.is_compatible("codex", xai.access_path)
     assert ProtocolCompatibility.is_compatible("claude-proxy", xai.access_path)
     assert ProtocolCompatibility.is_compatible("claude-proxy", zai.access_path)
     assert not ProtocolCompatibility.is_compatible(

@@ -25,6 +25,17 @@ class ModelDiscoveryError(RuntimeError):
         self.status_code = status_code
 
 
+# The OpenAI /v1/models catalog is authoritative for availability but does not
+# include context windows or display metadata. Enrich only models confirmed by
+# that live response, using facts from OpenAI's official model documentation.
+_OPENAI_DOCUMENTED_METADATA: dict[str, dict[str, Any]] = {
+    "gpt-6-astra": {
+        "description": "Astra — OpenAI's flagship model for complex reasoning and coding.",
+        "context_length": 1_050_000,
+    },
+}
+
+
 class ModelDiscoveryProvider(ABC):
     """Provider-specific source for normalized upstream model metadata."""
 
@@ -109,7 +120,68 @@ class ExistingFetcherProvider(ModelDiscoveryProvider):
             raise ModelDiscoveryError(
                 f"Failed to fetch {self.label} model catalog from upstream"
             )
-        return _normalize(models)
+        normalized = _normalize(models)
+        if self._provider_id == "openai-api":
+            return [
+                {**row, **_OPENAI_DOCUMENTED_METADATA.get(row["id"], {})}
+                for row in normalized
+            ]
+        return normalized
+
+
+class CodexBridgeDiscoveryProvider(ModelDiscoveryProvider):
+    """Authenticated ChatGPT subscription catalog from the Codex bridge."""
+
+    aliases = ("codex",)
+
+    def fetch(self) -> list[dict[str, Any]]:
+        url = os.getenv(
+            "CODEX_BRIDGE_MODELS_URL", "http://codex-bridge:8682/models"
+        )
+        try:
+            response = httpx.get(url, timeout=10.0)
+            response.raise_for_status()
+        except httpx.HTTPStatusError as exc:
+            detail = None
+            try:
+                payload = exc.response.json()
+                if isinstance(payload, dict):
+                    detail = payload.get("detail") or payload.get("error")
+            except ValueError:
+                pass
+            message = str(detail).strip() if detail else f"HTTP {exc.response.status_code}"
+            raise ModelDiscoveryError(
+                f"ChatGPT subscription model discovery failed: {message}"
+            ) from exc
+        except httpx.HTTPError as exc:
+            raise ModelDiscoveryError(
+                f"ChatGPT subscription model discovery failed: {exc}"
+            ) from exc
+
+        try:
+            payload = response.json()
+        except ValueError as exc:
+            raise ModelDiscoveryError(
+                "ChatGPT subscription model discovery returned non-JSON data"
+            ) from exc
+        data = payload.get("models") if isinstance(payload, dict) else None
+        if not isinstance(data, list):
+            raise ModelDiscoveryError(
+                "ChatGPT subscription model discovery returned an invalid payload"
+            )
+        models = _normalize(
+            {
+                **item,
+                "context_length": item.get("context_window"),
+            }
+            for item in data
+            if isinstance(item, dict)
+        )
+        if not models:
+            raise ModelDiscoveryError(
+                "ChatGPT subscription model discovery returned no available models"
+            )
+        return models
 
 
 class KimiCodingDiscoveryProvider(ModelDiscoveryProvider):
@@ -234,17 +306,12 @@ def _providers(config: Config | None = None) -> tuple[ModelDiscoveryProvider, ..
     # the service import path until discovery is actually requested.
     from ..model_manager import (
         fetch_anthropic_api_models,
-        fetch_codex_models,
         fetch_grok_api_models,
         fetch_openai_api_models,
     )
 
     return (
-        ExistingFetcherProvider(
-            aliases=("codex",),
-            label="codex",
-            fetcher=fetch_codex_models,
-        ),
+        CodexBridgeDiscoveryProvider(),
         ExistingFetcherProvider(
             aliases=("openai",),
             label="openai",

@@ -38,6 +38,7 @@ class AccessPathSeed:
 
 STANDARD_ACCESS_PATHS = (
     AccessPathSeed("openai-api", "openai", "chat-completions", "https://api.openai.com/v1", "api-key"),
+    AccessPathSeed("openai-responses", "openai", "responses", "https://api.openai.com/v1", "api-key"),
     AccessPathSeed("openai-oauth", "openai", "responses", "https://chatgpt.com/backend-api/codex", "oauth"),
     AccessPathSeed("anthropic-api", "anthropic", "anthropic-messages", "https://api.anthropic.com", "api-key"),
     AccessPathSeed("anthropic-oauth", "anthropic", "anthropic-messages", "https://api.anthropic.com", "oauth"),

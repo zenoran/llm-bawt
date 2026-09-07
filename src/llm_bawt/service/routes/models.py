@@ -1,7 +1,5 @@
 """Model and bot listing routes."""
 
-import time
-
 from fastapi import APIRouter, HTTPException, Query
 
 from ...bots import BotManager
@@ -20,33 +18,18 @@ from ..schemas import (
 router = APIRouter()
 
 
-# Lightweight in-memory cache for upstream model lists. Each provider's
-# discovery result is cached for 5 minutes so the bots admin page doesn't
-# hammer OpenAI / Grok every time the Add Model dialog opens.
-_UPSTREAM_TTL_S = 300.0
-_upstream_cache: dict[str, tuple[float, list[dict]]] = {}
-
-
 def _upstream_lookup(provider: str, config=None) -> list[dict]:
-    """Fetch and cache one provider's normalized upstream catalog."""
-    now = time.time()
-    cached = _upstream_cache.get(provider)
-    if cached and (now - cached[0]) < _UPSTREAM_TTL_S:
-        return cached[1]
-
+    """Fetch one provider's current normalized catalog without stale fallback."""
     from ..model_discovery import ModelDiscoveryError, discover_models
 
     try:
-        models = (
+        return (
             discover_models(provider, config)
             if config is not None
             else discover_models(provider)
         )
     except ModelDiscoveryError as exc:
         raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc
-
-    _upstream_cache[provider] = (now, models)
-    return models
 
 
 def _coerce_pricing(raw: object) -> ModelPricing | None:
@@ -110,9 +93,9 @@ def list_upstream_models(
 
     Used by the Add Model dialog so users can pick from real model IDs instead
     of typing blind. Codex is bridge-backed; OpenAI, Grok, Anthropic, and Kimi
-    use their provider catalogs. Results are cached for 5 minutes.
+    use their current provider catalogs. Discovery failures surface directly.
 
-    Returns ``{provider, models: [{id, description}]}``.
+    Returns ``{provider, models: [{id, description, context_length?}]}``.
     """
     provider_key = (provider or "").strip().lower()
     if not provider_key:

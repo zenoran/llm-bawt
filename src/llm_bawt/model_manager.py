@@ -57,29 +57,6 @@ def is_service_mode_enabled(config: Config) -> bool:
 
 console = Console()
 
-CODEX_MODEL_CATALOG: tuple[dict[str, str], ...] = (
-    {
-        "id": "gpt-5.5",
-        "summary": "Frontier Codex model for complex coding and real-world work",
-    },
-    {
-        "id": "gpt-5.4",
-        "summary": "Strong general-purpose Codex model for everyday coding",
-    },
-    {
-        "id": "gpt-5.4-mini",
-        "summary": "Smaller, faster Codex model for simpler coding tasks",
-    },
-    {
-        "id": "gpt-5.3-codex",
-        "summary": "Coding-optimized Codex model",
-    },
-    {
-        "id": "gpt-5.2",
-        "summary": "Professional-work Codex model for long-running agents",
-    },
-)
-
 # Reference pricing + context windows for ChatGPT/Codex models, keyed by the
 # backend slug (the bit after any ``openai_chatgpt/`` proxy prefix). The codex
 # /models endpoint carries context_window but NO pricing (it's a subscription
@@ -257,7 +234,7 @@ class ModelManager:
         if messages:
             console.print(f"[bold green]Successfully processed via service: {', '.join(messages)}.[/bold green]")
         else:
-            console.print(f"[green]Models synced to service.[/green]")
+            console.print("[green]Models synced to service.[/green]")
         return True
 
     def list_available_models(self):
@@ -745,13 +722,11 @@ def fetch_ollama_api_models(ollama_url: str) -> Tuple[bool, List[Dict[str, Any]]
 
 def fetch_openai_api_models(api_key: str | None = None) -> Tuple[bool, List[Dict[str, Any]]]:
     """Fetches model list from OpenAI API."""
-    from openai import OpenAI # Import lazily
-    from openai import APIConnectionError, AuthenticationError, RateLimitError
+    from openai import OpenAI  # Import lazily
     details = []
     start = time.time()
     try:
         client = OpenAI(api_key=api_key) if api_key else OpenAI()
-        client.models.list()
     except Exception as e:
         console.print(f"[bold red]OpenAI init error:[/bold red] {e}")
         return False, []
@@ -792,17 +767,12 @@ def fetch_grok_api_models(api_key: str) -> Tuple[bool, List[Dict[str, Any]]]:
 
 
 def fetch_codex_models() -> Tuple[bool, List[Dict[str, Any]]]:
-    """Return the live Codex model catalog for the authenticated ChatGPT plan.
+    """Return the live Codex catalog for the authenticated ChatGPT plan.
 
-    Source of truth is the codex-bridge ``/models`` endpoint, which calls the
-    Codex SDK ``codex.models()`` inside the container that owns the OAuth bundle.
-    The app never imports the Codex SDK — it just does an HTTP GET. The old
-    static ``CODEX_MODEL_CATALOG`` is demoted to two roles only:
-
-    * a human-readable ``summary`` lookup by id (the API returns none), and
-    * a last-resort fallback if the bridge is unreachable / auth fails.
+    Discovery is authoritative: bridge, authentication, upstream, and empty-list
+    failures return ``False`` so callers surface an error instead of presenting a
+    stale or misleading model list.
     """
-    summaries = {m["id"]: m.get("summary", "") for m in CODEX_MODEL_CATALOG}
     url = os.getenv(
         "CODEX_BRIDGE_MODELS_URL", "http://codex-bridge:8682/models"
     )
@@ -811,14 +781,26 @@ def fetch_codex_models() -> Tuple[bool, List[Dict[str, Any]]]:
 
         resp = httpx.get(url, timeout=10.0)
         resp.raise_for_status()
-        ids = [m["id"] for m in resp.json().get("models", [])]
-        models = [{"id": i, "summary": summaries.get(i, "")} for i in ids]
-        if models:
-            return True, models
-        console.print("[yellow]codex-bridge /models returned empty; using fallback catalog[/yellow]")
-    except Exception as e:  # bridge down, auth expiry, network
-        console.print(f"[yellow]codex-bridge /models fetch failed ({e}); using fallback catalog[/yellow]")
-    return True, [dict(item) for item in CODEX_MODEL_CATALOG]
+        models = [
+            {
+                "id": item["id"],
+                "summary": item.get("description", ""),
+                **(
+                    {"context_length": item["context_window"]}
+                    if isinstance(item.get("context_window"), int)
+                    else {}
+                ),
+            }
+            for item in resp.json().get("models", [])
+            if isinstance(item, dict) and item.get("id")
+        ]
+        if not models:
+            console.print("[bold red]Codex model discovery returned no models[/bold red]")
+            return False, []
+        return True, models
+    except Exception as e:  # bridge down, auth expiry, network, invalid payload
+        console.print(f"[bold red]Codex model discovery failed:[/bold red] {e}")
+        return False, []
 
 
 def fetch_anthropic_api_models(

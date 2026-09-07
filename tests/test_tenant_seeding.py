@@ -38,6 +38,16 @@ def test_first_bot_providers_use_standard_chat_completions_access_paths():
         assert path.auth_mechanism == "api-key"
 
 
+def test_standard_paths_include_openai_platform_responses_route():
+    by_key = {p.key: p for p in STANDARD_ACCESS_PATHS}
+    path = by_key["openai-responses"]
+
+    assert path.vendor == "openai"
+    assert path.protocol == "responses"
+    assert path.base_url == "https://api.openai.com/v1"
+    assert path.auth_mechanism == "api-key"
+
+
 def test_first_bot_provider_lookup_is_case_insensitive_and_strict():
     assert first_bot_provider("XAI") is FIRST_BOT_PROVIDERS[0]
     assert first_bot_provider("  openai-api ") is not None

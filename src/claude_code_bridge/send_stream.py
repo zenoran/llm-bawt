@@ -165,18 +165,22 @@ class ClaudeStreamMixin:
                     conversation_id=conversation_id,
                 )
             )
-            # TASK-546: Override the small/fast (Haiku) and subagent
-            # models so Claude Code's internal background calls
-            # (title gen, tool-use summaries, API verification) and
-            # Agent tool subagents route through the proxy with a
-            # provider-qualified model instead of sending bare
-            # Anthropic IDs that the proxy rejects (HTTP 400).
-            # If subagent_model is not configured, fall back to the
-            # main model — the proxy accepts it and the cost is
-            # acceptable for the low volume of background calls.
+            # TASK-546: Override every internal/subagent model selector with a
+            # provider-qualified model the proxy accepts.  The generic
+            # CLAUDE_CODE_SUBAGENT_MODEL covers inherited/default workers, but
+            # an Agent call with ``model="opus"`` (or sonnet/haiku/fable) is
+            # resolved through the corresponding ANTHROPIC_DEFAULT_* variable
+            # and otherwise becomes a bare ``claude-*`` ID.  Bare IDs cannot be
+            # routed by the multi-provider proxy and fail with HTTP 400.
+            #
+            # If subagent_model is not configured, use the main model.  Tier
+            # names are Claude-specific and have no portable meaning for a
+            # proxy provider, so all tiers deliberately map to that one model.
             effective_subagent_model = subagent_model or model
             sdk_env["ANTHROPIC_SMALL_FAST_MODEL"] = effective_subagent_model
             sdk_env["CLAUDE_CODE_SUBAGENT_MODEL"] = effective_subagent_model
+            for tier in ("HAIKU", "FABLE", "SONNET", "OPUS"):
+                sdk_env[f"ANTHROPIC_DEFAULT_{tier}_MODEL"] = effective_subagent_model
             # Tell the CLI the real window for proxy-routed models it doesn't
             # recognise, so auto-compaction fires BEFORE the upstream silently
             # truncates (see context_env for the verified failure mode).
