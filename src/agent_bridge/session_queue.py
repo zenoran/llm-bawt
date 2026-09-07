@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from collections.abc import Callable
 from contextlib import asynccontextmanager
 from typing import Any
 
@@ -46,6 +47,7 @@ class SessionQueue:
     def __init__(self) -> None:
         self._locks: dict[str, asyncio.Lock] = {}
         self._active_tasks: dict[str, asyncio.Task] = {}
+        self._request_tasks: dict[tuple[str, str], asyncio.Task] = {}
         # Cooperative cancel signals — handlers check this between SDK
         # messages so an abort takes effect without waiting for the next
         # `await` point to fire CancelledError.
@@ -105,22 +107,80 @@ class SessionQueue:
         return True
 
     @asynccontextmanager
-    async def active(self, session_key: str):
+    async def active(
+        self,
+        session_key: str,
+        *,
+        on_wait: Callable[[], None] | None = None,
+        wait_interval: float = 30.0,
+        request_id: str | None = None,
+    ):
         """Serialize a send and expose only the lock holder to abort.
 
         Tasks waiting for the session lock are queued, not active. Registering
         them when they were created allowed a queued send to replace the
         running send in ``_active_tasks``, so abort cancelled the wrong task.
+        ``on_wait`` provides a non-terminal heartbeat for callers subscribed to
+        the queued request's run stream; without it, a legitimate long queue wait
+        is indistinguishable from a bridge that accepted and then lost the send.
         """
-        async with self.lock(session_key):
+        lock = self.lock(session_key)
+        if wait_interval <= 0:
+            raise ValueError("wait_interval must be positive")
+
+        was_queued = lock.locked()
+        if was_queued and on_wait is not None:
+            on_wait()
+        acquire_task = asyncio.create_task(lock.acquire())
+        acquired = False
+        task: asyncio.Task | None = None
+        owner = asyncio.current_task()
+        request_key = (session_key, request_id) if request_id else None
+        if request_key is not None and owner is not None:
+            self._request_tasks[request_key] = owner
+        try:
+            while True:
+                done, _ = await asyncio.wait(
+                    {acquire_task}, timeout=wait_interval
+                )
+                if acquire_task in done:
+                    acquire_task.result()
+                    acquired = True
+                    break
+                if on_wait is not None:
+                    on_wait()
+
             task = asyncio.current_task()
             if task is not None:
                 self.set_active_task(session_key, task)
-            try:
-                yield
-            finally:
-                if task is not None:
-                    self.clear_active_task(session_key, task)
+            yield
+        finally:
+            if not acquire_task.done():
+                acquire_task.cancel()
+                await asyncio.gather(acquire_task, return_exceptions=True)
+            elif not acquired:
+                # Cancellation can race lock acquisition. If this waiter won the
+                # lock before cancellation landed, release it for the next waiter.
+                try:
+                    acquire_task.result()
+                except BaseException:
+                    pass
+                else:
+                    acquired = True
+            if task is not None:
+                self.clear_active_task(session_key, task)
+            if acquired:
+                lock.release()
+            if request_key is not None and self._request_tasks.get(request_key) is owner:
+                self._request_tasks.pop(request_key, None)
+
+    def cancel_request(self, session_key: str, request_id: str) -> bool:
+        """Cancel exactly one queued/running send, never its session siblings."""
+        task = self._request_tasks.get((session_key, request_id))
+        if task is None or task.done():
+            return False
+        task.cancel()
+        return True
 
     def cancel_active(self, session_key: str) -> bool:
         """Cancel the active task for *session_key*.

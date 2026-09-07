@@ -145,8 +145,9 @@ class TurnStreamFinalizer:
                     _err_note = (upstream_error_text or "upstream backend error").strip()
                     _marker = (
                         f"⚠️ **Turn failed** — {_err_note}\n\n"
-                        "_The turn was aborted mid-run; the session is intact. "
-                        "Resend your message or say \"continue\" to retry._"
+                        "_This response ended with an error. Work already performed "
+                        "is not rolled back; a transport failure does not confirm "
+                        "the worker stopped. Check active work before retrying._"
                     )
                     _final_text = (
                         f"{_partial.rstrip()}\n\n{_marker}" if _partial.strip() else _marker

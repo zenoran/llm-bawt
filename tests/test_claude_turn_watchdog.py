@@ -3,6 +3,7 @@ import asyncio
 import pytest
 from claude_agent_sdk.types import (
     AssistantMessage,
+    TaskProgressMessage,
     ToolResultBlock,
     ToolUseBlock,
     UserMessage,
@@ -201,3 +202,119 @@ def test_bash_timeout_is_capped_and_other_tools_keep_idle_limit() -> None:
     by_id = {tool.tool_use_id: tool for tool in watchdog.active_tools}
     assert by_id["toolu_bash"].timeout_seconds == 600
     assert by_id["toolu_read"].timeout_seconds == 300
+
+
+def test_agent_child_activity_refreshes_only_its_inactivity_deadline() -> None:
+    now = [100.0]
+    watchdog = TurnWatchdog(
+        idle_timeout=300,
+        tool_grace=30,
+        clock=lambda: now[0],
+    )
+    watchdog.observe(
+        AssistantMessage(
+            content=[ToolUseBlock(id="agent_1", name="Agent", input={})],
+            model="claude-test",
+        )
+    )
+
+    now[0] = 390.0
+    watchdog.observe(
+        AssistantMessage(
+            content=[ToolUseBlock(id="read_1", name="Read", input={})],
+            model="claude-test",
+            parent_tool_use_id="agent_1",
+        )
+    )
+
+    by_id = {tool.tool_use_id: tool for tool in watchdog.active_tools}
+    assert by_id["agent_1"].started_at == 100.0
+    assert by_id["agent_1"].last_activity_at == 390.0
+    deadline, phase = watchdog._deadline(wait_started_at=390.0)
+    assert phase == "tool_running"
+    assert deadline == 720.0
+
+
+def test_unrelated_activity_does_not_refresh_an_agent_deadline() -> None:
+    now = [100.0]
+    watchdog = TurnWatchdog(
+        idle_timeout=300,
+        tool_grace=30,
+        clock=lambda: now[0],
+    )
+    watchdog.observe(
+        AssistantMessage(
+            content=[ToolUseBlock(id="agent_1", name="Agent", input={})],
+            model="claude-test",
+        )
+    )
+
+    now[0] = 390.0
+    watchdog.observe(UserMessage(content="top-level progress"))
+
+    deadline, phase = watchdog._deadline(wait_started_at=390.0)
+    assert phase == "tool_running"
+    assert deadline == 430.0
+
+
+def test_bash_child_activity_does_not_extend_declared_runtime() -> None:
+    now = [100.0]
+    watchdog = TurnWatchdog(
+        idle_timeout=300,
+        tool_grace=30,
+        max_tool_timeout=600,
+        clock=lambda: now[0],
+    )
+    watchdog.observe(
+        AssistantMessage(
+            content=[
+                ToolUseBlock(
+                    id="bash_1",
+                    name="Bash",
+                    input={"command": "sleep", "timeout": 120_000},
+                )
+            ],
+            model="claude-test",
+        )
+    )
+
+    now[0] = 200.0
+    watchdog.observe(UserMessage(content="activity", parent_tool_use_id="bash_1"))
+
+    deadline, phase = watchdog._deadline(wait_started_at=200.0)
+    assert phase == "tool_running"
+    assert deadline == 250.0
+
+
+def test_task_progress_refreshes_workflow_inactivity_deadline() -> None:
+    now = [100.0]
+    watchdog = TurnWatchdog(
+        idle_timeout=300,
+        tool_grace=30,
+        clock=lambda: now[0],
+    )
+    watchdog.observe(
+        AssistantMessage(
+            content=[ToolUseBlock(id="workflow_1", name="Workflow", input={})],
+            model="claude-test",
+        )
+    )
+
+    now[0] = 350.0
+    watchdog.observe(
+        TaskProgressMessage(
+            subtype="task_progress",
+            data={},
+            task_id="task_1",
+            description="still working",
+            usage={},
+            uuid="uuid-1",
+            session_id="session-1",
+            tool_use_id="workflow_1",
+            last_tool_name="Read",
+        )
+    )
+
+    deadline, phase = watchdog._deadline(wait_started_at=350.0)
+    assert phase == "tool_running"
+    assert deadline == 680.0

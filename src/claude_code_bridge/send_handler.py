@@ -128,13 +128,30 @@ class ClaudeSendMixin(ClaudeStreamMixin, ClaudeUsageMixin, ClaudeResultMixin):
         if message is None:
             return
 
+        queue_seq = 0
+
+        def _publish_queue_heartbeat() -> None:
+            nonlocal queue_seq
+            queue_seq += 1
+            self._publish_event(
+                request_id,
+                session_key,
+                queue_seq,
+                kind=AgentEventKind.SYSTEM_NOTE,
+                extra_raw={"turn_health": {"phase": "queued"}},
+            )
+
         if self._session_queue.is_busy(session_key):
             logger.info(
                 "Session %s busy — queuing send request_id=%s",
                 session_key, request_id,
             )
 
-        async with self._session_queue.active(session_key):
+        async with self._session_queue.active(
+            session_key,
+            on_wait=_publish_queue_heartbeat,
+            request_id=request_id,
+        ):
             logger.info(
                 "Handling send: request_id=%s session=%s model=%s system_prompt=%s msg=%.60s...",
                 request_id, session_key, model,

@@ -300,6 +300,18 @@ class ClaudeCommandMixin:
                     self._publisher.publish_rpc_result(
                         request_id, {"ok": False, "error": "missing sessionKey"}
                     )
+            elif method == "chat.cancel":
+                # Transport failures belong to one request, not the whole
+                # session: a queued caller must never abort its running sibling.
+                session_key = params.get("sessionKey", "")
+                target_request_id = params.get("requestId", "")
+                cancelled = bool(target_request_id) and self._session_queue.cancel_request(
+                    session_key, target_request_id,
+                )
+                self._publisher.publish_rpc_result(
+                    request_id,
+                    {"ok": True, "cancelled": cancelled, "request_id": target_request_id},
+                )
             elif method == "chat.abort":
                 session_key = params.get("sessionKey", "")
                 # Three-layer abort:

@@ -3,8 +3,9 @@
 The SDK emits a tool-use message before executing a tool and its tool-result
 message only after execution finishes. A fixed per-message timeout therefore
 cannot distinguish a wedged CLI from a legitimate long-running tool. This
-module tracks that SDK-visible lifecycle and gives active tools a deadline
-based on their declared timeout while preserving the normal idle limit.
+module tracks that SDK-visible lifecycle: ordinary tools use their declared
+runtime limit, while Agent workers use the same limit as an inactivity window
+that refreshes whenever their nested SDK activity arrives.
 """
 
 from __future__ import annotations
@@ -13,11 +14,13 @@ import asyncio
 import logging
 import time
 from collections.abc import AsyncIterator, Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any
 
 from claude_agent_sdk.types import (
     AssistantMessage,
+    TaskProgressMessage,
+    TaskStartedMessage,
     ToolResultBlock,
     ToolUseBlock,
     UserMessage,
@@ -51,6 +54,17 @@ class ActiveTool:
     name: str
     started_at: float
     timeout_seconds: float
+    last_activity_at: float
+
+    @property
+    def progress_aware(self) -> bool:
+        """Long-running orchestrators expose nested SDK activity."""
+        return self.name in {"Agent", "Workflow"}
+
+    @property
+    def deadline_base(self) -> float:
+        """Orchestrators time out on inactivity; other tools on total runtime."""
+        return self.last_activity_at if self.progress_aware else self.started_at
 
 
 class TurnWatchdog:
@@ -87,7 +101,20 @@ class TurnWatchdog:
         return tuple(self._active_tools.values())
 
     def observe(self, message: Any) -> None:
-        """Update tool state from one SDK message."""
+        """Update tool state and refresh active Agent workers on child activity."""
+        now = self._clock()
+        parent_tool_use_id = getattr(message, "parent_tool_use_id", None)
+        if not parent_tool_use_id and isinstance(
+            message, (TaskStartedMessage, TaskProgressMessage)
+        ):
+            parent_tool_use_id = message.tool_use_id
+        if parent_tool_use_id:
+            parent = self._active_tools.get(parent_tool_use_id)
+            if parent is not None and parent.progress_aware:
+                self._active_tools[parent_tool_use_id] = replace(
+                    parent, last_activity_at=now
+                )
+
         if isinstance(message, AssistantMessage):
             for block in message.content:
                 if not isinstance(block, ToolUseBlock):
@@ -95,8 +122,9 @@ class TurnWatchdog:
                 self._active_tools[block.id] = ActiveTool(
                     tool_use_id=block.id,
                     name=block.name,
-                    started_at=self._clock(),
+                    started_at=now,
                     timeout_seconds=self._tool_timeout(block.name, block.input),
+                    last_activity_at=now,
                 )
         elif isinstance(message, UserMessage) and isinstance(message.content, list):
             for block in message.content:
@@ -153,10 +181,14 @@ class TurnWatchdog:
         if not self._active_tools:
             return wait_started_at + self._idle_timeout, "sdk_idle"
         deadlines = [
-            tool.started_at + tool.timeout_seconds + self._tool_grace
+            tool.deadline_base + tool.timeout_seconds + self._tool_grace
             for tool in self._active_tools.values()
         ]
-        return max(deadlines), "tool_running"
+        # The CLI can buffer sibling results behind a long-running Agent.
+        # When that Agent completes, an already-expired sibling must not stop
+        # us from reading its queued result. Allow one bounded drain window
+        # per SDK read; a genuinely silent tool still expires after this grace.
+        return max(max(deadlines), wait_started_at + self._tool_grace), "tool_running"
 
     def _timeout_message(self, phase: str) -> str:
         if phase == "sdk_idle":
@@ -178,9 +210,11 @@ class TurnWatchdog:
         remaining: float,
     ) -> None:
         if phase == "tool_running":
+            now = self._clock()
             details = ",".join(
-                f"{tool.name}:{self._clock() - tool.started_at:.0f}s/"
-                f"{tool.timeout_seconds:.0f}s"
+                f"{tool.name}:runtime={now - tool.started_at:.0f}s/"
+                f"idle={now - tool.last_activity_at:.0f}s/"
+                f"limit={tool.timeout_seconds:.0f}s"
                 for tool in self._active_tools.values()
             )
         else:
@@ -205,6 +239,9 @@ class TurnWatchdog:
                                 "name": tool.name,
                                 "elapsed_seconds": round(
                                     self._clock() - tool.started_at, 1
+                                ),
+                                "idle_seconds": round(
+                                    self._clock() - tool.last_activity_at, 1
                                 ),
                                 "timeout_seconds": tool.timeout_seconds,
                             }
