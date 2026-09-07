@@ -139,6 +139,7 @@ class TurnStreamPublishMixin:
                         prompt=chunk.get("prompt") or "",
                         trigger_message_id=trigger_message_id,
                         session_key=chunk.get("session_key") or None,
+                        session_id=getattr(ctx.request, "session_id", None),
                     )
                     committed = True
                     break

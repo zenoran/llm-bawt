@@ -120,6 +120,9 @@ class RedisPublisher:
     def publish_run_event(self, request_id: str, event: AgentEvent) -> str | None:
         """Publish an event to a per-run response stream for the requesting client."""
         if not self._connected:
+            if event.kind.value == "approval_decision":
+                logger.warning("Bridge decision audit LOST: Redis disconnected request=%s event=%s",
+                               request_id, event.event_id)
             return None
         stream_key = f"{RUN_STREAM_PREFIX}{request_id}"
         self._stamp_provider(event)

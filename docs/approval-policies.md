@@ -1,75 +1,105 @@
 # Approval-Gated Tool Policies
 
-Approval policies are stored in the app and enforced in the Claude Code bridge.
-The storage and API live in
-[src/llm_bawt/approval_policies.py](../src/llm_bawt/approval_policies.py)
-and
-[src/llm_bawt/service/routes/approval_policies.py](../src/llm_bawt/service/routes/approval_policies.py).
+## Architecture and coverage (TASK-861)
 
-## Current scope
+The app owns policies, immutable revisions, decisions, approval requests, MCP
+execution claims and continuation state. `approval_policies.py` is the compatibility
+facade over `approval_models.py`, `approval_policy_store.py`,
+`approval_request_store.py`, `approval_validation.py` and `approval_defaults.py`.
+The pure matcher is `agent_bridge/approval.py`.
 
-- The policy bundle is service-owned and fetched over HTTP.
-- The live gate is implemented in the Claude Code bridge's PreToolUse hook.
-- The app persists approval requests and exposes resolve endpoints.
-- Codex and OpenClaw are not currently enforcing this policy layer.
+- First-party bawthub MCP tools are gated at the app MCP server. The Claude hook
+  stamps trusted invocation context and deliberately skips a second bridge gate.
+- Claude Code native tools and external MCP tools use the PreToolUse bridge gate
+  (and the equivalent permission callback when applicable).
+- Codex, OpenClaw and direct clients do **not** enforce this layer on their native
+  tools. Calling the first-party MCP server still reaches its server gate.
+- AskUserQuestion uses its separate interactive-question path, not this gate.
 
-## Rule model
+## Rules and management
 
-First match wins.
+First enabled match wins, ordered by `(order, id)`; no match allows by design.
+`ops_run` additionally requires approval by default when no rule matches.
+Rules select `backend_scope`, `tool_name`, input `field`, and a matcher
+(`always`, `exact`, `prefix`, `contains`, `glob`, `regex`). Actions are `allow`,
+`deny`, `require_approval`; `severity`, `category`, and `approval_prompt` supply
+operator-facing metadata. MCP-qualified tool names support tail matching.
+Validation rejects invalid matcher/action/severity values and regexes before save.
 
-| Field | Meaning |
-|---|---|
-| `enabled` | Disabled rules are ignored |
-| `backend_scope` | `*` or a backend name such as `claude-code` |
-| `tool_name` | `*` or a specific tool name |
-| `matcher_type` | `always`, `exact`, `prefix`, `contains`, `glob`, or `regex` |
-| `pattern` | Matcher payload |
-| `field` | Input field to inspect; blank uses tool defaults |
-| `action` | `require_approval`, `allow`, or `deny` |
-| `severity` | Operator-facing severity label |
-| `category` | Operator-defined grouping |
-| `approval_prompt` | Optional custom prompt shown to the user |
-| `order` | Lower runs first |
+For Bash, matching uses the command subject, with inert quoted-heredoc bodies
+removed by the matcher. Wrappers and literal text can still cause false positives.
+Changing the subject or whitespace normalization must never loosen authorization:
+Claude grants bind the fully qualified tool, **full JSON input and cwd** exactly.
 
-## Main endpoints
-
-| Method | Path |
-|---|---|
-| `GET` | `/v1/tool-approval-policies` |
-| `POST` | `/v1/tool-approval-policies` |
-| `GET` | `/v1/tool-approval-policies/{id}` |
-| `PATCH` | `/v1/tool-approval-policies/{id}` |
-| `DELETE` | `/v1/tool-approval-policies/{id}` |
-| `POST` | `/v1/tool-approval-policies/seed-defaults` |
-| `GET` | `/v1/tool-approval-policies/bundle` |
-| `POST` | `/v1/admin/reload-tool-approval-policies` |
-| `GET` | `/v1/tool-approval-requests` |
-| `POST` | `/v1/chat/approvals/{request_id}/resolve` |
-
-## Resolve flow
-
-When a tool call is gated:
-
-1. The bridge emits `approval_required`.
-2. The app persists a `tool_approval_requests` row.
-3. The UI or API resolves the request with `approve`, `deny`, `cancel`, or `respond`.
-4. On approval, the app sends a one-shot `approval.grant` command back to the bridge.
-5. The continuation turn can then re-issue the tool call.
-
-## Claude bridge config
-
-| Variable | Default | Purpose |
+| Method | Path | Purpose |
 |---|---|---|
-| `CLAUDE_CODE_APPROVAL_BUNDLE_TTL` | `15` | Bundle refresh TTL in seconds |
-| `CLAUDE_CODE_APPROVAL_FAIL_CLOSED` | unset | Fail closed if the bundle cannot be fetched |
+| GET/POST | `/v1/tool-approval-policies` | List/create rules |
+| GET/PATCH/DELETE | `/v1/tool-approval-policies/{id}` | Read/update/delete |
+| POST | `/v1/tool-approval-policies/seed-defaults` | Insert missing defaults |
+| GET | `/v1/tool-approval-policies/bundle` | Compiled bundle, conditional etag |
+| POST | `/v1/tool-approval-policies/preview` | Evaluate saved/candidate policies without execution |
+| GET | `/v1/tool-approval-policies/status` | Source availability and honest coverage notes |
+| GET | `/v1/tool-approval-policies/{id}/revisions?limit=50&offset=0` | Immutable create/update/delete revisions, real total |
+| GET | `/v1/tool-approval-decisions?limit=50&offset=0` | Decision audit, real total |
+| GET | `/v1/tool-approval-requests` | Gated request lifecycle |
+| POST | `/v1/admin/reload-tool-approval-policies` | Publish cache invalidation |
+| POST | `/v1/chat/approvals/{request_id}/resolve` | Approve/deny/cancel/respond |
 
-## Default seeded rules
+Revision and decision pagination clamp limit to 1–200 and offset to at least zero;
+empty pages retain the full matching total. Revisions survive policy deletion.
+Reload reports `published`/`publish_failed`, `published`, Redis `subscribers`, and
+`bridge_installed: "unknown"`. Zero subscribers is successful Redis publication,
+not delivery or installation. There is no bridge-installed-version ACK protocol.
+Claude also refreshes after `CLAUDE_CODE_APPROVAL_BUNDLE_TTL` (default 15 seconds).
+On fetch failure it keeps cached/empty policies; the optional
+`CLAUDE_CODE_APPROVAL_FAIL_CLOSED` instead pauses tools.
 
-`seed-defaults` currently seeds broad high-risk patterns such as:
+## Decision audit and outage semantics
 
-- recursive or forceful `rm`
-- `sudo`
-- force pushes
-- destructive SQL (`DROP`, `TRUNCATE`)
-- obvious system-destroying shell commands
-- `curl|wget ... | sh`
+Claude emits additive `approval_decision` events on its **existing Redis run
+stream** for allow, deny and require-approval evaluations. A consumed grant emits
+an additional `grant_allowed` outcome; these are evaluations, not tool execution
+receipts. Fail-closed source-unavailable denials have no matched policy/hash.
+Each event carries policy id/version, evaluated bundle etag, exact invocation
+hash and request/session/tool-use identity. The app run consumer adds bot and
+thread-session context and commits into `tool_approval_decisions` independently
+of SSE delivery, including non-streaming calls. Replayed events are deduplicated
+by run/event identity. Bridge policy snapshots are recovered by id/version from
+immutable revisions, not from whatever policy is current at ingest time.
+
+Audit subjects are **fully redacted and bounded**, for both new MCP and bridge
+rows. Arbitrary commands/JSON cannot be reliably secret-scrubbed with regexes.
+No full arguments, cwd, task capability or tool results are added to this audit.
+Existing approval-request storage still retains arguments needed for execution;
+this is not a retroactive scrub of old rows or of ordinary tool/turn logs.
+
+**Durable means the app database commit succeeded**, not merely event emission.
+Bridge emission is best-effort and never adds a per-tool HTTP/DB blocking call.
+The app retries commit three times, logs explicit loss on exhaustion, and does
+not change the gate decision on audit failure. Redis outage, stream expiry,
+consumer timeout, or app death can leave gaps: there is no durable audit outbox
+or guaranteed replay for ordinary turns. MCP audits commit inline at its app
+boundary and a write failure prevents proceeding normally. Do not advertise
+complete all-backend audit coverage or exactly-once execution.
+
+## Resolution and rollout
+
+Resolve atomically chooses a terminal decision once. MCP approval claims execute
+stored arguments (operations use immutable snapshots), record outcomes, and queue
+server-owned continuations. Execution/dispatch uncertainty is represented in the
+persisted state rather than blindly rerunning side effects. Editing or deleting
+an operation/policy does not rewrite an already-approved MCP snapshot; changes
+apply to new evaluations. Claude re-evaluates current rules on retry, so a current
+hard deny still wins over an old grant.
+
+Harness approvals use process-local pending authority bound to the original
+session and approval request. A one-shot grant can be consumed only by the exact
+invocation in its server-owned continuation request; unsolicited, cross-session,
+expired, duplicate, legacy subject-only grants do not authorize execution.
+
+**Rollout requires fresh approvals.** Old unscoped pending approvals cannot be
+promoted to exact authority, and a bridge restart loses process-local pending
+authority safely. Ask the agent to attempt the operation again, creating a fresh
+gated request, then approve that request. Do not replay old approvals or inject
+legacy grant keys. Updating source alone does not install running code: coordinate
+app/bridge deployment externally; do not restart a bridge hosting active agents.

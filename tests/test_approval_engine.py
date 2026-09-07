@@ -17,6 +17,7 @@ from agent_bridge.approval import (
     derive_subject,
     evaluate,
     grant_key,
+    invocation_key,
     matchable_subject,
     strip_inert_heredoc_bodies,
 )
@@ -327,9 +328,9 @@ def test_strip_keeps_an_executed_heredoc_body():
         assert "docker compose down" in strip_inert_heredoc_bodies(cmd), sink
 
 
-def test_strip_handles_tee_sudo_prefixes_and_unquoted_tags():
+def test_strip_preserves_wrapped_unquoted_heredoc():
     cmd = _heredoc("sudo tee -a /etc/hosts", "make rebuild", tag="EOF")
-    assert "make rebuild" not in strip_inert_heredoc_bodies(cmd)
+    assert strip_inert_heredoc_bodies(cmd) == cmd
 
 
 def test_strip_keeps_an_unterminated_body():
@@ -347,10 +348,8 @@ def test_strip_handles_two_heredocs_on_one_line():
         "cat > /tmp/a <<'A'\ndocker compose down\nA\n"
         "cat > /tmp/b <<'B'\nmake rebuild\nB"
     )
-    out = strip_inert_heredoc_bodies(cmd)
-    assert "docker compose down" not in out
-    assert "make rebuild" not in out
-    assert out.count("cat > /tmp/") == 2
+    # Multiple commands are not proven standalone data sinks.
+    assert strip_inert_heredoc_bodies(cmd) == cmd
 
 
 def test_writing_a_fixture_that_mentions_docker_no_longer_gates():
@@ -396,6 +395,91 @@ def test_matchable_subject_is_a_noop_for_non_shell_tools():
     blob = '{"content": "cat <<\'EOF\'\\ndocker compose down\\nEOF"}'
     assert matchable_subject("Write", blob) == blob
     assert matchable_subject("Bash", "") == ""
+
+
+def test_exact_identity_preserves_all_input_and_context():
+    base = {"command": "printf 'a  b'", "timeout": 100, "nested": {"a": [1, 2]}}
+    key = invocation_key("claude-code", "Bash", base, cwd="/repo")
+    assert key == invocation_key("claude-code", "Bash", dict(reversed(list(base.items()))), cwd="/repo")
+    for changed in (
+        {**base, "command": "printf 'a b'"},
+        {**base, "command": base["command"] + "\n"},
+        {**base, "timeout": 101},
+        {**base, "nested": {"a": [2, 1]}},
+        {**base, "extra": None},
+    ):
+        assert key != invocation_key("claude-code", "Bash", changed, cwd="/repo")
+    for backend, tool, cwd in (("codex", "Bash", "/repo"),
+                               ("claude-code", "mcp__one__Bash", "/repo"),
+                               ("claude-code", "Bash", "/other"),
+                               ("claude-code", "Bash", None)):
+        assert key != invocation_key(backend, tool, base, cwd=cwd)
+    assert invocation_key("mcp", "mcp__one__Write", base) != invocation_key("mcp", "mcp__two__Write", base)
+
+
+def test_exact_identity_does_not_use_policy_field_or_trimmed_heredoc():
+    policies = [_pol(tool_name="Write", field="file_path")]
+    original = {"file_path": "x", "content": "old"}
+    changed = {**original, "content": "new"}
+    first = evaluate(policies, "claude-code", "Write", original, exact_invocation=True, cwd="/repo")
+    second = evaluate(policies, "claude-code", "Write", changed, exact_invocation=True, cwd="/repo")
+    assert first.subject == second.subject == "x"
+    assert first.grant_key != second.grant_key
+    for tool, before, after in (
+        ("Bash", {"command": _heredoc("cat > /tmp/x", "first")},
+         {"command": _heredoc("cat > /tmp/x", "second")}),
+        ("ops_run", {"operation": "x", "args": {}, "idempotency_key": "one"},
+         {"operation": "x", "args": {}, "idempotency_key": "two"}),
+    ):
+        assert invocation_key("claude-code", tool, before) != invocation_key("claude-code", tool, after)
+
+
+def test_default_backend_keys_match_subject_contract_on_all_decisions():
+    for policies, tool, arguments in (
+        ([], "Bash", {"command": "ls"}),
+        ([], "ops_run", {"operation": "x"}),
+        ([_pol()], "Bash", {"command": "x  y"}),
+        ([_pol(action="deny")], "Bash", {"command": "x"}),
+        ([_pol(tool_name="Write", field="file_path")], "Write", {"file_path": "x", "content": "y"}),
+    ):
+        decision = evaluate(policies, "claude-code", tool, arguments)
+        assert decision.grant_key == grant_key("claude-code", tool, decision.subject)
+        exact = evaluate(policies, "claude-code", tool, arguments, exact_invocation=True)
+        assert exact.grant_key == invocation_key("claude-code", tool, arguments)
+        assert exact.grant_key != decision.grant_key
+
+
+def test_quoted_standalone_data_heredoc_allowlist():
+    for header in ("cat > /tmp/x <<'EOF'", 'cat <<"EOF" >> "/tmp/a b"',
+                   "tee -a /tmp/x <<'EOF'", "/usr/bin/cat > /tmp/x <<-'EOF'"):
+        command = header + "\ndocker compose down\nEOF\n"
+        assert strip_inert_heredoc_bodies(command) == header + "\nEOF\n"
+        assert evaluate(_live_bash_rules(), "claude-code", "Bash", {"command": command}).is_allowed
+    command = "cat > /tmp/x <<-'EOF'\n\tdocker compose down\n\tEOF"
+    assert strip_inert_heredoc_bodies(command) == "cat > /tmp/x <<-'EOF'\n\tEOF"
+
+
+def test_ambiguous_or_executable_heredocs_are_never_trimmed():
+    commands = [
+        "cat > /tmp/x <<EOF\n$(docker compose down)\nEOF",
+        "cat > /tmp/x <<EOF\n`docker compose down`\nEOF",
+        "cat <<'EOF' | bash\ndocker compose down\nEOF",
+        "tee /tmp/x <<'EOF' | sh\ndocker compose down\nEOF",
+        "cat > /tmp/x <<'EOF'\ndocker compose down\nEOF\nbash /tmp/x",
+        "cat > /tmp/x <<'EOF' # comment\ndocker compose down\nEOF",
+        "# cat > /tmp/x <<'EOF'\ndocker compose down\nEOF",
+        "cat > /tmp/x <<'EOF'\ndocker compose down\n EOF",
+        "cat > /tmp/x <<'EOF'\ndocker compose down\nEOF ",
+        "cat > /tmp/x <<'EOF'\ndocker compose down\n\tEOF",
+        "cat > /tmp/x <<'EOF' <<'OTHER'\ndocker compose down\nEOF\nOTHER",
+        "cat > /tmp/x <<'EOF'\nEOF\ndocker compose down\nEOF",
+        "cat > >(bash) <<'EOF'\ndocker compose down\nEOF",
+        "env cat > /tmp/x <<'EOF'\ndocker compose down\nEOF",
+        "cat > /tmp/x <<'EOF' && bash /tmp/x\ndocker compose down\nEOF",
+    ]
+    for command in commands:
+        assert strip_inert_heredoc_bodies(command) == command, command
+        assert evaluate(_live_bash_rules(), "claude-code", "Bash", {"command": command}).requires_approval, command
 
 
 if __name__ == "__main__":

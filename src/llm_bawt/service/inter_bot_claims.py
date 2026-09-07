@@ -19,6 +19,13 @@ def validate_inter_bot_claim(service: Any, request: Any):
     """Reject spoofed durable authority and return its trusted bot author."""
     from ..message_authorship import AuthorReference
 
+    approval_claim = getattr(request, "_internal_approval_claim", None)
+    if approval_claim is not None:
+        from .approval_continuations import validate_approval_continuation_claim
+
+        validate_approval_continuation_claim(service, request, approval_claim)
+        return None
+
     delivery_id = getattr(request, "inter_bot_delivery_id", None)
     if delivery_id:
         dispatcher = getattr(service, "_inter_bot_dispatcher", None)

@@ -25,7 +25,7 @@ from agent_bridge.mcp_call_context import (
 )
 from mcp.server.fastmcp import FastMCP
 
-from ..approval_policies import ApprovalPersistError
+from ..approval_policies import ApprovalPersistError, ApprovalStoreUnavailable
 from ..task_turn_context import TaskTurnContext, open_task_turn_context
 from .task_association import current_task_turn_capability
 
@@ -56,6 +56,7 @@ class ApprovedCallerContext:
     session_key: str = ""
     backend: str = ""
     approval_request_id: str = ""
+    operations_snapshot: dict[str, Any] | None = None
 
 
 _approved_caller_context: contextvars.ContextVar[ApprovedCallerContext | None] = (
@@ -76,11 +77,13 @@ class ApprovalAwareFastMCP(FastMCP):
         *args,
         approval_store_provider: PolicyProvider | None = None,
         approval_publisher: ApprovalPublisher | None = None,
+        operations_preparer: Callable[[str, dict], dict] | None = None,
         **kwargs,
     ):
         super().__init__(*args, **kwargs)
         self._approval_store_provider = approval_store_provider
         self._approval_publisher = approval_publisher
+        self._operations_preparer = operations_preparer
 
     def _approval_store(self):
         if self._approval_store_provider is not None:
@@ -177,11 +180,24 @@ class ApprovalAwareFastMCP(FastMCP):
             turn_context = open_task_turn_context(capability)
 
         store = self._approval_store()
+        try:
+            bundle = store.compile_bundle()
+        except ApprovalStoreUnavailable:
+            return {"status": "policy_unavailable", "tool": name, "is_error": True,
+                    "message": "Approval policy source unavailable; tool was not executed."}
         decision = evaluate(
-            store.compile_bundle().policies,
+            bundle.policies,
             call_context.backend if call_context else "mcp",
             name,
             received,
+        )
+        store.record_decision(
+            decision=decision, bundle=bundle,
+            backend=call_context.backend if call_context else "mcp", tool_name=name,
+            invocation_hash=canonical_invocation_hash(name, received),
+            bot_id=turn_context.bot_id if turn_context else None,
+            user_id=turn_context.user_id if turn_context else None,
+            turn_id=turn_context.turn_id if turn_context else None,
         )
         if decision.action is PolicyAction.ALLOW:
             return await super().call_tool(name, received)
@@ -211,6 +227,15 @@ class ApprovalAwareFastMCP(FastMCP):
                 "tool_use_id": call_context.tool_use_id,
             }
         try:
+            operations_snapshot = None
+            if name == "ops_run":
+                prepare = self._operations_preparer
+                if prepare is None:
+                    from .ops_tools import _get_ops_service
+                    prepare = _get_ops_service().prepare_invocation
+                operations_snapshot = prepare(received.get("operation", ""), received.get("args") or {})
+                if not isinstance(operations_snapshot, dict):
+                    raise ValueError("Operation preparer must return a snapshot object")
             row = store.record_mcp_request(
                 request_id=request_id,
                 tool_use_id=call_context.tool_use_id if call_context else None,
@@ -227,6 +252,7 @@ class ApprovalAwareFastMCP(FastMCP):
                 severity=decision.severity.value,
                 prompt=decision.prompt,
                 invocation_hash=invocation_hash,
+                operations_snapshot=operations_snapshot,
                 caller_context_json=(
                     json.dumps(caller_context, ensure_ascii=False, sort_keys=True)
                     if caller_context else None

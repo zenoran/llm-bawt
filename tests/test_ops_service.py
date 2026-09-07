@@ -60,6 +60,8 @@ class FakeExecutor(Executor):
 
     def dispatch(self, **kwargs) -> DispatchResult:
         self.dispatch_calls.append(kwargs)
+        if not self._available:
+            raise ExecutorError("not available")
         if self._dispatch_error:
             raise ExecutorError(self._dispatch_error)
         return DispatchResult(
@@ -80,9 +82,8 @@ def _op_data(**over):
         title="Restart Thing",
         description="Test op",
         enabled=True,
-        target_host="nick@host",
-        working_directory="/tmp",
-        command_script="echo hello",
+        target_host="",
+        command_script='{"action":"restart","container_name":"test"}',
         args_schema_json=json.dumps({
             "type": "object", "additionalProperties": False,
             "properties": {"target": {"type": "string", "enum": ["a", "b"]}},
@@ -155,7 +156,7 @@ def test_dispatch_success_records_dispatching_and_unit_name():
         operation_slug="test.restart-thing", args={"target": "a"},
         idempotency_key="k1", caller_bot_id="snark",
     )
-    assert result["state"] == JOB_DISPATCHING
+    assert result["state"] == "accepted"
     assert result["host_unit_name"].startswith("llm-bawt-ops-")
     assert result["operation"] == "test.restart-thing"
     assert result["caller"]["bot_id"] == "snark"
@@ -173,7 +174,7 @@ def test_dispatch_idempotent_on_key():
         idempotency_key="k1",
     )
     second = service.dispatch_job(
-        operation_slug="test.restart-thing", args={"target": "b"},
+        operation_slug="test.restart-thing", args={"target": "a"},
         idempotency_key="k1",
     )
     assert first["id"] == second["id"]
@@ -196,8 +197,8 @@ def test_dispatch_marks_job_failed_when_executor_unavailable():
     # Job row should be FAILED with a useful reason.
     jobs = store.list_jobs(operation_slug="test.restart-thing")
     assert len(jobs) == 1
-    assert jobs[0].state == JOB_FAILED
-    assert "not available" in (jobs[0].error_text or "")
+    assert jobs[0].state == JOB_QUEUED  # Read-only preflight failure; nothing submitted.
+    assert "not available" in jobs[0].error_text
 
 
 def test_dispatch_marks_job_failed_when_executor_raises():
@@ -214,7 +215,7 @@ def test_dispatch_marks_job_failed_when_executor_raises():
         assert exc.code == "dispatch_failed"
         assert "connection refused" in str(exc)
     jobs = store.list_jobs(operation_slug="test.restart-thing")
-    assert jobs[0].state == JOB_FAILED
+    assert jobs[0].state == JOB_DISPATCHING
 
 
 def test_get_job_status_reconciles_running_to_succeeded():
@@ -250,7 +251,7 @@ def test_get_job_status_no_status_file_keeps_state():
     )
     status = service.get_job_status(dispatched["id"])
     # Still DISPATCHING (no state change; touch_reconcile ran).
-    assert status["state"] == JOB_DISPATCHING
+    assert status["state"] == "accepted"
 
 
 def test_get_job_status_terminal_is_no_op():

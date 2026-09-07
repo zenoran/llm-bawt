@@ -1,0 +1,7 @@
+# TASK-861: standalone stdlib-only worker. No app imports, package install, SSH,
+# systemd, source bind mounts, DB credentials, or network access at runtime.
+# Supply an operator-verified Python base image ID/digest already on the daemon.
+ARG OPS_PYTHON_BASE
+FROM ${OPS_PYTHON_BASE}
+COPY src/llm_bawt/ops/worker.py /worker.py
+ENTRYPOINT ["python3", "-I", "/worker.py"]

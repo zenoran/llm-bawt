@@ -1,19 +1,8 @@
-"""Approval-resolve continuation helpers (TASK-639 slice A).
+"""Durable approval continuations and stranded-execution recovery.
 
-Extracted from ``service/routes/approval_policies.py`` so the resolve route
-stays focused on HTTP-shape concerns and the continuation dispatch surface
-has a stable home for TASK-639 Slice F (MCP-kind result-envelope
-continuations and the durable outbox).
-
-Public API (renamed from route-local underscore-prefixed helpers):
-
-- ``spawn_continuation``      — fire-and-forget continuation turn dispatch
-- ``build_continuation_prompt`` — canned prompt for approve/deny outcomes
-- ``build_respond_prompt``    — prompt when the user chose 'respond'
-
-Behavior is intentionally identical to the pre-extraction helpers. Slice F
-will layer an MCP-kind branch and a durable outbox on top; keep the
-signatures byte-stable until that lands so cross-slice diffs stay small.
+MCP results and server-owned harness decisions use the same fenced outbox.
+The legacy spawn helper remains import-compatible but resolve no longer uses
+fire-and-forget dispatch. Generic uncertain side effects are never replayed.
 """
 
 from __future__ import annotations
@@ -21,6 +10,9 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+from datetime import timedelta
+from ..approval_policies import KIND_MCP, REQ_APPROVED, REQ_DENIED, REQ_CANCELLED, REQ_RESPONDED, CONT_DISPATCHING
+from ..approval_models import _as_aware_utc, _utcnow
 from typing import Any
 
 from .dependencies import get_service
@@ -61,53 +53,173 @@ def continuation_payload_from_row(row) -> dict[str, Any]:
     }
 
 
+def _continuation_session(row):
+    if row.caller_context_json:
+        context = json.loads(row.caller_context_json)
+        if not isinstance(context, dict):
+            raise ValueError("Stored caller context is invalid")
+        return context.get("session_id") or None
+    return None
+
+
+def _continuation_identity(row):
+    if not row.continuation_id:
+        raise ValueError("Approval continuation has no durable identity")
+    return {"inter_bot_turn_id": "turn-" + row.continuation_id,
+            "inter_bot_bridge_request_id": "req_delivery_approval_" + row.continuation_id,
+            "user_message_id": "user-" + row.continuation_id,
+            "assistant_message_id": "assistant-" + row.continuation_id}
+
+
+def validate_approval_continuation_claim(service, request, claim):
+    """Reuse existing deterministic transport fields, gated by a Python-only claim."""
+    store = service._tool_approval_policy_store
+    row = store.get_request(claim[0])
+    if (row is None or row.continuation_state != CONT_DISPATCHING
+            or row.continuation_claim_token != claim[1]
+            or row.bot_id != request.bot_id or row.user_id != request.user
+            or row.turn_id != request.parent_turn_id
+            or _continuation_session(row) != request.session_id
+            or request.inter_bot_delivery_id is not None
+            or any(getattr(request, key) != value for key, value in _continuation_identity(row).items())
+            or row.continuation_next_attempt_at is None
+            or _as_aware_utc(row.continuation_next_attempt_at) < _utcnow() - timedelta(seconds=120)):
+        raise ValueError("Invalid or stale approval continuation claim")
+
+
+async def _send_harness_grant(service, store, row):
+    if row.status != REQ_APPROVED or row.grant_state == "sent":
+        return
+    from .routes.approval_policies import _subscriber
+    subscriber = _subscriber()
+    if subscriber is None:
+        store.set_grant_state(row.id, "failed", "Approval bridge unavailable")
+        raise RuntimeError("Approval bridge unavailable; grant not sent")
+    if not store.claim_client_grant(row.id):
+        raise RuntimeError("Approval grant dispatch uncertain; manual reconciliation required")
+    try:
+        await subscriber.send_approval_grant(
+            session_key=row.session_key or "main", grant_key=row.grant_key,
+            backend=row.backend, request_id=row.id)
+    except Exception as exc:
+        store.set_grant_state(row.id, "uncertain", str(exc))
+        raise
+    store.set_grant_state(row.id, "sent")
+    await asyncio.sleep(0.75)
+
+
 async def dispatch_mcp_result_continuation(service, store, row) -> None:
-    """Drive one claimed result continuation through the real chat pipeline."""
+    """Deliver MCP results or harness decisions with a fenced, renewable claim."""
     from .schemas import ChatCompletionRequest, ChatMessage, McpToolResultContinuation
 
-    payload = continuation_payload_from_row(row)
+    token = row.continuation_claim_token
+    identity = _continuation_identity(row)
+    payload = continuation_payload_from_row(row) if row.request_kind == KIND_MCP else None
+    prompt = (build_mcp_result_prompt(payload) if payload else
+              build_respond_prompt(row.resolution_message, row.subject, row.tool_name)
+              if row.status == REQ_RESPONDED else
+              build_continuation_prompt(row.status == REQ_APPROVED, row.subject, row.tool_name,
+                                        tool_arguments_json=row.tool_arguments_json))
     request = ChatCompletionRequest(
-        messages=[ChatMessage(role="user", content=build_mcp_result_prompt(payload))],
-        bot_id=row.bot_id,
-        user=row.user_id,
-        stream=True,
-        parent_turn_id=row.turn_id,
-        continuation_payload=McpToolResultContinuation(**payload),
+        messages=[ChatMessage(role="user", content=prompt)], bot_id=row.bot_id, user=row.user_id,
+        stream=True, parent_turn_id=row.turn_id, session_id=_continuation_session(row),
+        continuation_payload=McpToolResultContinuation(**payload) if payload else None, **identity,
     )
+    request._internal_approval_claim = (row.id, token)
+
+    async def heartbeat():
+        while True:
+            await asyncio.sleep(20)
+            if not await asyncio.to_thread(store.renew_continuation_claim, row.id, token):
+                raise RuntimeError("Approval continuation lease lost")
+
+    async def drive():
+        # A committed successful deterministic turn needs only its outbox ack.
+        turn_store = getattr(service, "_turn_log_store", None)
+        prior = turn_store.get_turn(identity["inter_bot_turn_id"]) if turn_store is not None else None
+        if prior is not None and prior.ended_at is not None:
+            if prior.status in ("ok", "completed") and not prior.error_text:
+                return
+            raise RuntimeError("Previous continuation turn failed; manual reconciliation required")
+        if row.request_kind != KIND_MCP:
+            await _send_harness_grant(service, store, row)
+        async for chunk in service.chat_completion_stream(request):
+            # Some adapters yield an error envelope rather than raising.
+            if isinstance(chunk, str):
+                for line in chunk.splitlines():
+                    if line.startswith("data: ") and line[6:] != "[DONE]":
+                        try:
+                            event = json.loads(line[6:])
+                        except json.JSONDecodeError:
+                            continue
+                        if isinstance(event, dict) and event.get("error"):
+                            raise RuntimeError(str(event["error"]))
+        if turn_store is not None:
+            turn = turn_store.get_turn(identity["inter_bot_turn_id"])
+            if turn is None or turn.ended_at is None:
+                raise RuntimeError("Approval continuation did not finalize")
+            if turn.status not in ("ok", "completed") or turn.error_text:
+                raise RuntimeError(turn.error_text or f"Continuation ended with {turn.status}")
+
+    renewal = asyncio.create_task(heartbeat())
+    driver = asyncio.create_task(drive())
     try:
-        async for _ in service.chat_completion_stream(request):
-            pass
+        done, _ = await asyncio.wait((renewal, driver), return_when=asyncio.FIRST_COMPLETED)
+        if renewal in done:
+            await renewal
+        await driver
+        store.mark_continuation_delivered(row.id, claim_token=token)
     except asyncio.CancelledError:
         raise
-    except Exception as error:  # noqa: BLE001
-        store.mark_continuation_failed(row.id, error=str(error))
+    except Exception as error:
+        store.mark_continuation_failed(row.id, error=str(error), claim_token=token)
         raise
-    else:
-        store.mark_continuation_delivered(row.id)
+    finally:
+        for task in (renewal, driver):
+            task.cancel()
+        await asyncio.gather(renewal, driver, return_exceptions=True)
 
 
-async def run_mcp_continuation_outbox(
-    service,
-    store,
-    *,
-    idle_seconds: float = 2.0,
-) -> None:
-    """Lifespan worker: claim due persisted results and deliver with retry."""
+async def recover_approval_requests(store):
+    """Recover committed approvals, never blindly replay generic side effects."""
+    from .routes.approval_policies import _resolve_mcp_request
+    for row in await asyncio.to_thread(store.find_recoverable_mcp_requests):
+        try:
+            await _resolve_mcp_request(store, row,
+                outcome={REQ_APPROVED: "approve", REQ_DENIED: "deny", REQ_CANCELLED: "cancel", REQ_RESPONDED: "respond"}.get(row.status, "deny"),
+                message=row.resolution_message, resolved_by=row.resolved_by)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            log.exception("Approval execution recovery failed id=%s", row.id)
+    for row in await asyncio.to_thread(store.find_stranded_mcp_results):
+        await asyncio.to_thread(store.enqueue_continuation, row.id)
+    # Repair the approval-commit / enqueue gap for server-owned harness decisions.
+    for row in await asyncio.to_thread(store.find_stranded_harness_continuations):
+        await asyncio.to_thread(store.prepare_harness_continuation, row.id)
+
+
+async def run_mcp_continuation_outbox(service, store, *, idle_seconds: float = 2.0) -> None:
+    """Lifespan recovery and outbox loop; DB outages do not kill the worker."""
     while True:
-        due = await asyncio.to_thread(store.find_pending_continuations, limit=20)
-        if not due:
-            await asyncio.sleep(idle_seconds)
-            continue
-        for pending in due:
-            claimed = await asyncio.to_thread(store.claim_continuation, pending.id)
-            if claimed is None:
-                continue
-            try:
-                await dispatch_mcp_result_continuation(service, store, claimed)
-            except asyncio.CancelledError:
-                raise
-            except Exception:
-                log.exception("MCP result continuation failed id=%s", claimed.id)
+        try:
+            await recover_approval_requests(store)
+            due = await asyncio.to_thread(store.find_pending_continuations, limit=20)
+            for pending in due:
+                claimed = await asyncio.to_thread(store.claim_continuation, pending.id, lease_seconds=120)
+                if claimed is None:
+                    continue
+                try:
+                    await dispatch_mcp_result_continuation(service, store, claimed)
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    log.exception("Approval continuation failed id=%s", claimed.id)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            log.exception("Approval recovery/outbox pass failed; retrying")
+        await asyncio.sleep(idle_seconds)
 
 
 log = logging.getLogger(__name__)
@@ -171,8 +283,17 @@ def spawn_continuation(
         )
 
 
-def build_continuation_prompt(approved: bool, subject: str, tool_name: str) -> str:
-    shown = subject if len(subject) <= 400 else subject[:397] + "…"
+def build_continuation_prompt(
+    approved: bool, subject: str, tool_name: str, *, tool_arguments_json: str | None = None,
+) -> str:
+    # Approved retries must reproduce the complete invocation. Truncating the
+    # command or omitting timeout/cwd options makes the exact grant unusable.
+    shown = subject if approved or len(subject) <= 400 else subject[:397] + "…"
+    if approved and tool_arguments_json:
+        arguments = json.loads(tool_arguments_json)
+        if not isinstance(arguments, dict):
+            raise ValueError("Stored approved tool arguments must be an object")
+        shown = json.dumps(arguments, ensure_ascii=False, sort_keys=True)
     if approved:
         return (
             f"[The user APPROVED the {tool_name} action you requested. Re-issue "

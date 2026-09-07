@@ -23,6 +23,7 @@ Why this exists (TASK-639 invariants):
 
 from .executor import DockerExecutor, Executor, ExecutorError
 from .models import (
+    JOB_ACCEPTED,
     JOB_CANCELLED,
     JOB_DISPATCHING,
     JOB_FAILED,
@@ -50,6 +51,7 @@ __all__ = [
     "DockerExecutor",
     "validate_args",
     "ArgValidationError",
+    "JOB_ACCEPTED",
     "JOB_QUEUED",
     "JOB_DISPATCHING",
     "JOB_RUNNING",

@@ -114,6 +114,39 @@ class AgentBridgeBackend(AgentBackend):
             return explicit
         return "main"
 
+    async def _persist_approval_decision(self, event, config: dict) -> bool:
+        """App persistence boundary, independent of SSE/consumer iteration.
+
+        Commit before draining the next run event. Three bounded attempts; a DB
+        outage never retroactively changes a tool decision. No durable retry
+        outbox exists here: exhaustion/app death can lose audit events.
+        """
+        from ..approval_policies import ToolApprovalPolicyStore
+
+        def commit():
+            store = getattr(self, "_approval_audit_store", None)
+            if store is None or store.engine is None:
+                store = ToolApprovalPolicyStore(self._config)
+                self._approval_audit_store = store
+            store.record_bridge_decision(
+                event, bot_id=config.get("bot_id"), user_id=config.get("user_id"),
+                session_id=config.get("thread_session_id"), turn_id=config.get("turn_id"),
+            )
+
+        for attempt in range(3):
+            try:
+                await asyncio.to_thread(commit)
+                return True
+            except Exception as exc:
+                # Never log SQL parameters or the payload on persistence errors.
+                logger.warning("Bridge decision audit commit failed request=%s event=%s attempt=%d error=%s",
+                               event.run_id, event.event_id, attempt + 1, type(exc).__name__)
+                if attempt < 2:
+                    await asyncio.sleep(0.1 * (attempt + 1))
+        logger.error("Bridge decision audit LOST request=%s event=%s; best-effort retries exhausted",
+                     event.run_id, event.event_id)
+        return False
+
     def stream_raw(
         self,
         prompt: str,
@@ -444,6 +477,11 @@ class AgentBridgeBackend(AgentBackend):
                                     "trigger_message_id": event.trigger_message_id,
                                 })
 
+                            elif event.kind == AgentEventKind.APPROVAL_DECISION:
+                                # Persist in this app-owned run consumer, including
+                                # chat_full() and detached/disconnected UI requests.
+                                await self._persist_approval_decision(event, config)
+
                             elif event.kind == AgentEventKind.APPROVAL_REQUIRED:
                                 logger.info(
                                     "DEBUG-292 agent_bridge: APPROVAL_REQUIRED received tool=%s tuid=%s raw_keys=%s",
@@ -579,6 +617,23 @@ class AgentBridgeBackend(AgentBackend):
                                 pending_error = RuntimeError(
                                     f"{self.name} error: {event.text}"
                                 )
+                    except TimeoutError:
+                        if self.name == "claude-code":
+                            try:
+                                receipt = await local_sub.send_rpc(
+                                    "chat.cancel",
+                                    {"sessionKey": session_key, "requestId": request_id},
+                                    request_id=f"cancel_{request_id}",
+                                    backend=self.name,
+                                )
+                                if not receipt.get("ok"):
+                                    logger.error("Bridge cancellation rejected: %s", receipt)
+                            except Exception:
+                                logger.exception(
+                                    "Could not confirm cancellation of timed-out request %s",
+                                    request_id,
+                                )
+                        raise
                     finally:
                         await local_sub.close()
                     if pending_error is not None:

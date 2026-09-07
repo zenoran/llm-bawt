@@ -51,9 +51,8 @@ def _op_data(**over):
         title="Restart the thing",
         description="A test operation",
         enabled=True,
-        target_host="nick@172.18.0.1",
-        working_directory="/tmp",
-        command_script="#!/usr/bin/env bash\necho hello\n",
+        target_host="",
+        command_script='{"action":"restart","container_name":"test"}',
         args_schema_json='{"type":"object","additionalProperties":false,"properties":{}}',
         args_defaults_json="{}",
         timeout_seconds=60,
@@ -104,7 +103,7 @@ def test_update_operation_bumps_version_and_rehashes_script():
     orig_hash = row.script_hash
     updated = store.update_operation(
         row.id,
-        {"command_script": "#!/usr/bin/env bash\necho new-code\n"},
+        {"command_script": '{"action":"start","container_name":"test"}'},
         actor="nick",
     )
     assert updated.version == 2
@@ -220,7 +219,7 @@ def test_create_job_idempotent_on_idempotency_key():
         idempotency_key="idem-1",
     )
     second = store.create_job(
-        operation=op, args_json='{"a":1}', display_args_json='{"a":1}',
+        operation=op, args_json='{}', display_args_json='{}',
         idempotency_key="idem-1",
     )
     assert first.id == second.id

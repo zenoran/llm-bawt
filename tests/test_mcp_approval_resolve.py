@@ -48,6 +48,7 @@ def _mcp_req(**over):
         "prompt": "Approve restart?",
         "invocation_hash": "deadbeef" * 8,
         "continuation_capable": True,
+        "operations_snapshot": {"operation_slug": "llm-bawt.restart-app", "args": {}},
     }
     base.update(over)
     return base
@@ -201,6 +202,12 @@ def test_ensure_tools_registered_populates_bare_app_process_singleton():
 
     script = """
 import asyncio
+import os
+import psycopg2
+for key in list(os.environ):
+    if any(part in key.upper() for part in ("POSTGRES", "DATABASE", "DB_", "PGHOST", "PGPORT", "PGUSER", "PGPASS", "PGSERVICE")):
+        os.environ.pop(key, None)
+psycopg2.connect = lambda *a, **k: (_ for _ in ()).throw(RuntimeError("Live DB access forbidden in test subprocess"))
 from llm_bawt.mcp_server.registry import mcp, ensure_tools_registered
 
 async def names():

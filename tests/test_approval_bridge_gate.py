@@ -1,29 +1,73 @@
 """Tests for the claude-code bridge approval gate decision logic (TASK-292).
 
 Exercises the bridge's _decide_approval / grant store / _evaluate_tool_gate
-against injected policy bundles and grants — no Redis, no live SDK turn, no
-HTTP. Skips cleanly if claude_agent_sdk isn't importable (i.e. when run outside
-the bridge container).
+against injected policy bundles and grants — no Redis, SDK import, app/DB
+import, or HTTP. AST extraction executes the production mixin with only
+stdlib dependencies and inert permission-result stand-ins.
 
 Runnable under pytest, or standalone: ``python tests/test_approval_bridge_gate.py``.
 """
 
 from __future__ import annotations
 
+import ast
 import asyncio
+import json
+import logging
+import math
 import time
+import types
+from dataclasses import dataclass
+from hashlib import sha256
+from pathlib import Path
 
-from agent_bridge.mcp_call_context import MCP_CALL_CONTEXT_KEY, verify_mcp_call_context
+from agent_bridge.mcp_call_context import (
+    MCP_CALL_CONTEXT_KEY, mint_mcp_call_context, verify_mcp_call_context,
+)
+from agent_bridge.approval import (
+    ApprovalDecision, ApprovalPolicy, MatcherType, PolicyAction, PolicyBundle,
+    evaluate as evaluate_policies, grant_key,
+)
+from agent_bridge.events import AgentEventKind
 
-try:
-    from claude_code_bridge.bridge import ClaudeCodeBridge
-    from claude_agent_sdk.types import PermissionResultAllow, PermissionResultDeny
 
-    _SDK_OK = True
-except Exception:  # noqa: BLE001
-    _SDK_OK = False
+# Extract the actual mixin without importing bridge.py's SDK/app/DB graph.
+# This runs every gate test even in a stdlib-only bridge test environment.
+_ROOT = Path(__file__).resolve().parents[1]
+_SOURCE = _ROOT / "src/claude_code_bridge/approval_ops.py"
+_tree = ast.parse(_SOURCE.read_text())
+_classes = [node for node in _tree.body if isinstance(node, ast.ClassDef)]
 
-from agent_bridge.approval import ApprovalPolicy, MatcherType, PolicyAction, PolicyBundle
+
+@dataclass
+class PermissionResultAllow:
+    pass
+
+
+@dataclass
+class PermissionResultDeny:
+    message: str
+    interrupt: bool = False
+
+
+_namespace = dict(globals(), logger=logging.getLogger(__name__), COMMANDS_STREAM="commands")
+exec(compile(ast.fix_missing_locations(ast.Module(
+    body=[ast.ImportFrom(module="__future__", names=[ast.alias(name="annotations")], level=0), *_classes],
+    type_ignores=[],
+)), str(_SOURCE), "exec"), _namespace)
+_SDK_OK = True
+
+
+class ClaudeCodeBridge(_namespace["ClaudeApprovalMixin"]):
+    def __init__(self, publisher, *, backend_name, app_api_url):
+        self._backend_name = backend_name
+        self._app_api_url = app_api_url
+        self._cwd = "/app"
+        self._policy_bundle_ttl = 60
+        self._approval_fail_closed = False
+        self._policy_fetch_ok = True
+        self._APPROVAL_PENDING_ACK = "Approval pending"
+        self._approval_grants = {}
 
 
 class _FakePub:
@@ -73,17 +117,27 @@ def test_decide_allow_require_deny_default():
     assert b._decide_approval("Bash", {"command": "ls"}).is_allowed
 
 
+def _continuation(approval_id="tuid-1"):
+    return "req_delivery_approval_approval-cont-" + sha256(approval_id.encode()).hexdigest()[:32]
+
+
+def _grant(b, gk, approval_id="tuid-1", session="s", origin="origin"):
+    b._remember_approval(gk, session, approval_id, origin)
+    assert b._grant_approval(gk, 600, session_key=session, request_id=approval_id)
+
+
 def test_grant_one_shot_and_expiry():
-    _skip_if_no_sdk()
     b = _bridge()
     gk = b._decide_approval("Bash", {"command": "rm -rf /home/x"}).grant_key
     assert not b._consume_grant(gk)
-    b._grant_approval(gk, 600)
-    assert b._consume_grant(gk)
-    assert not b._consume_grant(gk)  # one-shot
-    b._approval_grants["k2"] = time.monotonic() - 1  # already expired
-    assert not b._consume_grant("k2")
-    assert "k2" not in b._approval_grants  # pruned
+    _grant(b, gk)
+    assert b._consume_grant(gk, session_key="s", request_id=_continuation())
+    assert not b._consume_grant(gk, session_key="s", request_id=_continuation())
+    _grant(b, "k2", approval_id="tuid-2")
+    b._pending_approvals[("s", "tuid-2")].grant_expires_at = time.monotonic() - 1
+    assert not b._consume_grant("k2", session_key="s", request_id=_continuation("tuid-2"))
+    # An expired activation cannot be refreshed by delayed delivery.
+    assert not b._grant_approval("k2", 600, session_key="s", request_id="tuid-2")
 
 
 def test_gate_allow_deny_require_emits_event():
@@ -117,10 +171,10 @@ def test_gate_granted_reissue_allows():
 
     b._publish_event = lambda *a, **k: None  # type: ignore[assignment]
     gk = b._decide_approval("Bash", {"command": "rm -rf /home/x"}).grant_key
-    b._grant_approval(gk, 600)
+    _grant(b, gk)
 
     async def gate():
-        return await b._evaluate_tool_gate("Bash", {"command": "rm -rf /home/x"}, Ctx(), "r", "s", [0])
+        return await b._evaluate_tool_gate("Bash", {"command": "rm -rf /home/x"}, Ctx(), _continuation(), "s", [0])
 
     assert isinstance(asyncio.run(gate()), PermissionResultAllow)
 
@@ -173,11 +227,11 @@ def test_hook_gate_granted_reissue_allows():
     b = _bridge()
     b._publish_event = lambda *a, **k: None  # type: ignore[assignment]
     gk = b._decide_approval("Bash", {"command": "rm -rf /home/x"}).grant_key
-    b._grant_approval(gk, 600)
+    _grant(b, gk)
 
     async def gate():
         return await b._evaluate_tool_gate_hook(
-            "Bash", {"command": "rm -rf /home/x"}, "tuid-1", "r", "s", [0]
+            "Bash", {"command": "rm -rf /home/x"}, "tuid-1", _continuation(), "s", [0]
         )
 
     # consumed grant → allow (empty dict, no decision)
@@ -299,6 +353,193 @@ def test_pre_tool_use_hook_fails_open_on_unexpected_error():
     # fail-closed posture: gate error blocks instead
     b._approval_fail_closed = True
     assert _hook_decision(asyncio.run(run())) == "deny"
+
+
+def test_grants_require_pending_session_and_approval_id():
+    b = _bridge()
+    gk = b._decide_approval("Bash", {"command": "rm -rf /home/x"}).grant_key
+    assert not b._grant_approval(gk, 600)
+    assert not b._grant_approval(gk, 600, session_key="s", request_id="unknown")
+    b._remember_approval(gk, "s", "a", "origin")
+    for key, session, approval in (("wrong", "s", "a"), (gk, "other", "a"), (gk, "s", "b")):
+        assert not b._grant_approval(key, 600, session_key=session, request_id=approval)
+    assert b._grant_approval(gk, 600, session_key="s", request_id="a")
+    for session, request in (("other", _continuation("a")), ("s", "origin"),
+                             ("s", "unrelated-later-turn"), ("s", _continuation("b"))):
+        assert not b._consume_grant(gk, session_key=session, request_id=request)
+    assert b._consume_grant(gk, session_key="s", request_id=_continuation("a"))
+
+
+def test_duplicate_deliveries_never_extend_or_resurrect_grants():
+    b = _bridge()
+    _grant(b, "g")
+    record = b._pending_approvals[("s", "tuid-1")]
+    expiry = record.grant_expires_at
+    assert not b._grant_approval("g", 9999, session_key="s", request_id="tuid-1")
+    assert record.grant_expires_at == expiry
+    assert b._consume_grant("g", session_key="s", request_id=_continuation())
+    b._remember_approval("g", "s", "tuid-1", "different-origin")
+    assert record.origin_request_id == "origin"
+    assert not b._grant_approval("g", 600, session_key="s", request_id="tuid-1")
+    assert not b._consume_grant("g", session_key="s", request_id=_continuation())
+    # A second explicitly approved request for the identical call is independent.
+    _grant(b, "g", approval_id="second")
+    assert not b._consume_grant("g", session_key="s", request_id=_continuation())
+    assert b._consume_grant("g", session_key="s", request_id=_continuation("second"))
+
+
+def test_invalid_ttl_and_expired_pending_authority_fail_closed():
+    b = _bridge()
+    b._remember_approval("g", "s", "a", "origin")
+    for ttl in (0, -1, float("nan"), float("inf"), -float("inf")):
+        assert not b._grant_approval("g", ttl, session_key="s", request_id="a")
+    b._pending_approvals[("s", "a")].expires_at = time.monotonic() - 1
+    assert not b._grant_approval("g", 600, session_key="s", request_id="a")
+    assert ("s", "a") not in b._pending_approvals
+
+
+def test_live_hook_exact_reissue_and_hard_deny_wins():
+    for hook_gate in (True, False):
+        b = _bridge()
+        b._policy_bundle = PolicyBundle(version=1, etag="all", policies=[
+            ApprovalPolicy(id="all", tool_name="Bash", matcher_type=MatcherType.ALWAYS),
+        ])
+        events = []
+        b._publish_event = lambda *a, **kw: events.append(kw)
+        original = {"command": "rm -rf /home/x", "timeout": 100}
+
+        def gate(arguments, request="origin", session="s", cwd="/repo"):
+            if hook_gate:
+                hook = b._make_pre_tool_use_hook(request_id=request, session_key=session, seq_holder=[0])
+                result = asyncio.run(hook({"tool_name": "Bash", "tool_input": arguments, "cwd": cwd}, "tuid-1", {}))
+                return _hook_decision(result) != "deny"
+            result = asyncio.run(b._evaluate_tool_gate("Bash", arguments, types.SimpleNamespace(tool_use_id="tuid-1"),
+                                                      request, session, [0], cwd=cwd))
+            return isinstance(result, PermissionResultAllow)
+
+        assert not gate(original)
+        gk = events[-1]["extra_raw"]["grant_key"]
+        assert b._grant_approval(gk, 600, session_key="s", request_id="tuid-1")
+        assert not gate(original, request="unrelated")
+        assert not gate(original, request=_continuation(), session="other")
+        assert not gate(original, request=_continuation(), cwd="/elsewhere")
+        assert not gate({**original, "timeout": 101}, request=_continuation())
+        assert not gate({**original, "command": "rm  -rf /home/x"}, request=_continuation())
+        b._policy_bundle.policies.insert(0, ApprovalPolicy(id="hard", order=0, tool_name="Bash",
+            matcher_type=MatcherType.ALWAYS, action=PolicyAction.DENY))
+        assert not gate(original, request=_continuation())
+        assert b._pending_approvals[("s", "tuid-1")].state == "granted"
+        b._policy_bundle.policies.pop(0)
+        assert gate(original, request=_continuation())
+        assert events[-1]["kind"] == AgentEventKind.TOOL_PREAPPROVED
+        assert not gate(original, request=_continuation())
+
+
+def test_legacy_stored_key_cannot_authorize_exact_pending_invocation():
+    b = _bridge()
+    original = {"command": "rm -rf /home/x"}
+    decision = b._decide_approval("Bash", original)
+    legacy = grant_key("claude-code", "Bash", decision.subject)
+    b._approval_grants[legacy] = time.monotonic() + 600
+    b._remember_approval(decision.grant_key, "s", "a", "origin")
+    assert not b._grant_approval(legacy, 600, session_key="s", request_id="a")
+    assert not b._consume_grant(decision.grant_key, session_key="s", request_id=_continuation("a"))
+
+
+def test_invalid_invocation_identity_denies_even_in_fail_open_mode():
+    b = _bridge()
+    hook = b._make_pre_tool_use_hook(request_id="r", session_key="s", seq_holder=[0])
+    circular = {}
+    circular["self"] = circular
+    for arguments in (None, [], circular, {"command": "ls", "bad": object()},
+                      {"command": "ls", "bad": float("nan")},
+                      {"command": "ls", "bad": {1: "value"}},
+                      {"command": "ls", "bad": (1, 2)}):
+        result = asyncio.run(hook({"tool_name": "Bash", "tool_input": arguments}, "t", {}))
+        assert _hook_decision(result) == "deny"
+    for cwd in (None, "", 123, []):
+        result = asyncio.run(hook({"tool_name": "Bash", "tool_input": {"command": "ls"}, "cwd": cwd}, "t", {}))
+        assert _hook_decision(result) == "deny"
+
+
+def test_backend_record_request_preserves_key_and_grant_roundtrip():
+    # The real store method, isolated at its SQL session boundary. No app import
+    # or inherited DB settings can create a live connection during collection.
+    path = _ROOT / "src/llm_bawt/approval_request_store.py"
+    store_class = next(n for n in ast.parse(path.read_text()).body
+                       if isinstance(n, ast.ClassDef) and n.name == "ApprovalRequestStoreMixin")
+    method = next(n for n in store_class.body if isinstance(n, ast.FunctionDef) and n.name == "record_request")
+    rows = {}
+
+    class Session:
+        def __init__(self, engine):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            pass
+
+        def get(self, model, key):
+            return rows.get(key)
+
+        def add(self, row):
+            rows[row.id] = row
+
+        def commit(self):
+            pass
+
+        def refresh(self, row):
+            pass
+
+    namespace = dict(json=json, Session=Session, ToolApprovalRequest=types.SimpleNamespace,
+                     REQ_PENDING="pending", ApprovalPersistError=RuntimeError,
+                     logger=logging.getLogger(__name__))
+    exec(compile(ast.Module(body=[method], type_ignores=[]), str(path), "exec"), namespace)
+    b = _bridge()
+    original = {"command": "rm -rf /home/x", "timeout": 100}
+    decision = b._decide_approval("Bash", original, cwd="/repo")
+    legacy = evaluate_policies(b._policy_bundle.policies, "claude-code", "Bash", original)
+    assert legacy.grant_key == grant_key("claude-code", "Bash", legacy.subject)
+    for request_id, key in (("exact", decision.grant_key), ("legacy", legacy.grant_key)):
+        row = namespace["record_request"](types.SimpleNamespace(engine=object()),
+            request_id=request_id, bot_id="b", user_id="u", turn_id="origin", backend="claude-code",
+            tool_name="Bash", tool_arguments=original, subject=decision.subject, grant_key=key,
+            policy_id="req1", severity="high", prompt="Approve?", session_key="s")
+        assert row.grant_key == key
+        assert json.loads(row.tool_arguments_json) == original
+        b._remember_approval(decision.grant_key, "s", request_id, "origin")
+        accepted = b._grant_approval(row.grant_key, 600, session_key=row.session_key, request_id=row.id)
+        assert accepted == (request_id == "exact")
+    assert b._consume_grant(decision.grant_key, session_key="s", request_id=_continuation("exact"))
+
+
+def test_grant_transport_ack_and_backend_continuation_identity():
+    b = _bridge()
+    b._remember_approval("g", "s", "a", "origin")
+    acks = []
+
+    class Redis:
+        async def xack(self, *args):
+            acks.append(args)
+
+    fields = {"grant_key": "g", "session_key": "s", "request_id": "a", "ttl_seconds": "600"}
+    for message in (fields, fields, {**fields, "ttl_seconds": "garbage"}):
+        asyncio.run(b._handle_approval_grant(message, "msg", Redis()))
+    assert len(acks) == 3
+    # Execute the real backend ID helpers, not a duplicated test formula.
+    namespace = {"sha256": sha256}
+    for relative, symbol in (("llm_bawt/approval_request_store.py", "_continuation_id"),
+                             ("llm_bawt/service/approval_continuations.py", "_continuation_identity")):
+        path = _ROOT / "src" / relative
+        node = next(n for n in ast.parse(path.read_text()).body if isinstance(n, ast.FunctionDef) and n.name == symbol)
+        exec(compile(ast.Module(body=[node], type_ignores=[]), str(path), "exec"), namespace)
+    row = types.SimpleNamespace(continuation_id=namespace["_continuation_id"]("a"))
+    identity = namespace["_continuation_identity"](row)["inter_bot_bridge_request_id"]
+    assert b._consume_grant("g", session_key="s", request_id=identity)
+    asyncio.run(b._handle_approval_grant(fields, "duplicate", Redis()))
+    assert not b._consume_grant("g", session_key="s", request_id=identity)
 
 
 if __name__ == "__main__":

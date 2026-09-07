@@ -61,6 +61,9 @@ class AgentEventKind(str, Enum):
     # tool input), ``tool_use_id`` (the SDK tool_use id), and ``raw`` carries
     # {policy_id, severity, subject, prompt, grant_key, action}.
     APPROVAL_REQUIRED = "approval_required"
+    # Redacted evaluation audit, not an execution receipt or approval grant.
+    # App commits this from the run stream independently of UI delivery.
+    APPROVAL_DECISION = "approval_decision"
     # Emitted on the *continuation* turn when a previously approval-gated tool is
     # re-attempted and a live one-shot grant is consumed (TASK-305). The bridge
     # allows the call and emits this so the UI can mark that specific tool card

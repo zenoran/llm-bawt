@@ -34,6 +34,9 @@ class FakeStore:
         policies = [self.policy] if self.policy else []
         return PolicyBundle(version=1, etag="test", policies=policies)
 
+    def record_decision(self, **kwargs):
+        self.decision = kwargs
+
     def record_mcp_request(self, **kwargs):
         self.order.append("persist")
         row = SimpleNamespace(
@@ -73,6 +76,7 @@ def _server(store, order, executed):
         json_response=True,
         approval_store_provider=lambda: store,
         approval_publisher=publish,
+        operations_preparer=lambda operation, args: {"operation_slug": operation, "args": args},
     )
 
     @mcp.tool(name="ops_run")

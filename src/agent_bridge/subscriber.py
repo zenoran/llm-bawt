@@ -414,18 +414,18 @@ class RedisSubscriber:
             session_key, grant_key[:12], backend or "?", ttl_seconds,
         )
 
-    async def publish_approval_reload(self) -> None:
+    async def publish_approval_reload(self) -> int:
         """Broadcast a policy-bundle reload to every bridge (TASK-291, TASK-293).
 
         Bridges subscribe to ``approval:policies:reload`` and drop their cached
         bundle on any message, so an admin edit propagates without a restart
         and without waiting out the cache TTL.
         """
-        try:
-            await self._pub_redis.publish("approval:policies:reload", "1")
-            logger.info("Published approval:policies:reload")
-        except Exception:  # noqa: BLE001
-            logger.warning("Failed to publish approval:policies:reload", exc_info=True)
+        # Return Redis's recipient count, including zero; never imply a bridge
+        # installed the bundle. Let callers distinguish publication failures.
+        recipients = await self._pub_redis.publish("approval:policies:reload", "1")
+        logger.info("Published approval:policies:reload recipients=%s", recipients)
+        return recipients
 
     async def send_rpc(
         self,

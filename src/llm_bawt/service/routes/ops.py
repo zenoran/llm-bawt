@@ -14,7 +14,7 @@ from __future__ import annotations
 import logging
 from typing import Any
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Query
 from pydantic import BaseModel, Field
 
 from ..dependencies import get_ops_service, get_ops_store, get_service
@@ -42,6 +42,7 @@ def _service():
 # ---------------------------------------------------------------------------
 
 class OperationUpsert(BaseModel):
+    model_config = {"extra": "forbid"}
     slug: str | None = None
     title: str | None = None
     description: str | None = None
@@ -61,14 +62,28 @@ class OperationUpsert(BaseModel):
     category: str | None = None
     approval_prompt_prefix: str | None = None
 
+    actor: str | None = Field(default=None, max_length=128)
+
     def writable(self) -> dict[str, Any]:
-        return {k: v for k, v in self.model_dump().items() if v is not None}
+        return self.model_dump(exclude_unset=True, exclude={"actor"})
+
+
+class EnableRequest(BaseModel):
+    model_config = {"extra": "forbid", "strict": True}
+    enabled: bool = True
+    actor: str | None = Field(default=None, max_length=128)
 
 
 class DispatchRequest(BaseModel):
+    model_config = {"extra": "forbid"}
     operation: str = Field(..., description="Operation slug")
     args: dict[str, Any] = Field(default_factory=dict)
-    idempotency_key: str | None = None
+    idempotency_key: str | None = Field(default=None, max_length=128)
+    actor: str | None = Field(default=None, max_length=128)
+    caller_user_id: str | None = Field(default=None, max_length=128)
+    caller_bot_id: str | None = Field(default=None, max_length=128)
+    caller_turn_id: str | None = Field(default=None, max_length=128)
+    caller_session_key: str | None = Field(default=None, max_length=128)
 
 
 # ---------------------------------------------------------------------------
@@ -76,13 +91,13 @@ class DispatchRequest(BaseModel):
 # ---------------------------------------------------------------------------
 
 @router.get("/v1/ops/operations", tags=["Ops"])
-def list_operations(include_disabled: bool = False, include_soft_deleted: bool = False):
+def list_operations(include_disabled: bool = False, include_soft_deleted: bool = False,
+                    limit: int = Query(50, ge=1, le=200), offset: int = Query(0, ge=0)):
     store = _store()
-    rows = store.list_operations(
-        include_disabled=include_disabled,
-        include_soft_deleted=include_soft_deleted,
-    )
-    return {"operations": [r.to_api(include_script=False) for r in rows], "total": len(rows)}
+    filters = dict(include_disabled=include_disabled, include_soft_deleted=include_soft_deleted)
+    rows = store.list_operations(**filters, limit=limit, offset=offset)
+    return {"operations": [r.to_api(include_script=False) for r in rows],
+            "total": store.count_operations(**filters), "limit": limit, "offset": offset}
 
 
 @router.get("/v1/ops/operations/{slug}", tags=["Ops"])
@@ -94,11 +109,20 @@ def get_operation(slug: str, include_script: bool = True):
     return row.to_api(include_script=include_script)
 
 
+@router.get("/v1/ops/operations/{slug}/revisions", tags=["Ops"])
+def list_revisions(slug: str, limit: int = Query(50, ge=1, le=200), offset: int = Query(0, ge=0)):
+    store = _store()
+    if store.get_operation_by_slug(slug) is None:
+        raise HTTPException(status_code=404, detail=f"operation not found: {slug}")
+    rows, total = store.list_revisions(slug, limit=limit, offset=offset)
+    return {"revisions": [row.to_api() for row in rows], "total": total, "limit": limit, "offset": offset}
+
+
 @router.post("/v1/ops/operations", tags=["Ops"], status_code=201)
 def create_operation(body: OperationUpsert):
     store = _store()
     try:
-        row = store.create_operation(body.writable(), actor="api")
+        row = store.create_operation(body.writable(), actor=body.actor or "api")
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     return row.to_api(include_script=True)
@@ -108,7 +132,7 @@ def create_operation(body: OperationUpsert):
 def update_operation(slug: str, body: OperationUpsert):
     store = _store()
     try:
-        row = store.update_operation(slug, body.writable(), actor="api")
+        row = store.update_operation(slug, body.writable(), actor=body.actor or "api")
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     if row is None:
@@ -117,18 +141,25 @@ def update_operation(slug: str, body: OperationUpsert):
 
 
 @router.post("/v1/ops/operations/{slug}/soft-delete", tags=["Ops"])
-def soft_delete_operation(slug: str):
+def soft_delete_operation(slug: str, actor: str | None = Query(None, max_length=128)):
     store = _store()
-    if not store.soft_delete_operation(slug, actor="api"):
+    try:
+        deleted = store.soft_delete_operation(slug, actor=actor or "api")
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    if not deleted:
         raise HTTPException(status_code=404, detail=f"operation not found: {slug}")
     return {"ok": True, "slug": slug}
 
 
 @router.post("/v1/ops/operations/{slug}/enable", tags=["Ops"])
-def enable_operation(slug: str, body: dict[str, Any] | None = None):
-    enabled = True if body is None else bool(body.get("enabled", True))
+def enable_operation(slug: str, body: EnableRequest | None = None):
+    body = body or EnableRequest()
     store = _store()
-    row = store.update_operation(slug, {"enabled": enabled}, actor="api")
+    try:
+        row = store.update_operation(slug, {"enabled": body.enabled}, actor=body.actor or "api")
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     if row is None:
         raise HTTPException(status_code=404, detail=f"operation not found: {slug}")
     return row.to_api(include_script=False)
@@ -153,12 +184,13 @@ def seed_defaults():
 # ---------------------------------------------------------------------------
 
 @router.get("/v1/ops/jobs", tags=["Ops"])
-def list_jobs(operation: str | None = None, state: str | None = None, limit: int = 50):
+def list_jobs(operation: str | None = None, state: str | None = None,
+              limit: int = Query(50, ge=1, le=200), offset: int = Query(0, ge=0)):
     store = _store()
-    rows = store.list_jobs(
-        operation_slug=operation, state=state, limit=min(max(limit, 1), 200),
-    )
-    return {"jobs": [r.to_api(include_output=False) for r in rows], "total": len(rows)}
+    filters = dict(operation_slug=operation, state=state)
+    rows = store.list_jobs(**filters, limit=limit, offset=offset)
+    return {"jobs": [r.to_api(include_output=False) for r in rows],
+            "total": store.count_jobs(**filters), "limit": limit, "offset": offset}
 
 
 @router.get("/v1/ops/jobs/{job_id}", tags=["Ops"])
@@ -190,26 +222,27 @@ def dispatch_job(body: DispatchRequest):
     from ...ops.service import OpsDispatchError
 
     ops = _service()
-    idem = (body.idempotency_key or "").strip()
-    if not idem:
-        import hashlib
-        import json as _json
-        canonical = _json.dumps(
-            {"op": body.operation, "args": body.args or {}},
-            ensure_ascii=False, sort_keys=True,
-        )
-        idem = "http-" + hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:32]
+    # No explicit key means a genuinely new invocation, not permanent dedup.
+    idem = (body.idempotency_key or "").strip() or None
     try:
         result = ops.dispatch_job(
             operation_slug=body.operation,
             args=body.args or {},
             idempotency_key=idem,
+            caller_actor=body.actor or "api",
+            caller_user_id=body.caller_user_id,
+            caller_bot_id=body.caller_bot_id,
+            caller_turn_id=body.caller_turn_id,
+            caller_session_key=body.caller_session_key,
+            caller_backend="http-operator",
         )
     except OpsDispatchError as exc:
         status = {
             "operation_not_found": 404,
             "operation_disabled": 409,
             "args_invalid": 400,
+            "idempotency_conflict": 409,
+            "snapshot_invalid": 409,
             "executor_unavailable": 503,
             "dispatch_failed": 502,
             "executor_kind_unknown": 500,

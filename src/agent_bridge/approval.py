@@ -28,10 +28,10 @@ Design (TASK-289):
   match → ``require_approval``. Those tools execute operator-authored privileged
   scripts, so the gate must be structural: deleting the catch-all seed row must
   not silently ungate them. An explicit ``allow`` policy still carves exceptions.
-* The **grant key** is a stable hash of (backend, tool, normalized subject). The
-  bridge stores a grant under this key when the app tells it an approval was
-  granted, and consumes it when the model re-issues the identical call on the
-  continuation turn.
+* The default **grant key** retains the backend's subject-key contract. Claude
+  opts into an exact invocation key (fully qualified tool, full JSON input and
+  cwd). Neither key is itself authority: the bridge binds grants to a pending
+  approval, session and continuation request and consumes them only once.
 """
 
 from __future__ import annotations
@@ -138,76 +138,45 @@ _FAIL_CLOSED_TOOLS = frozenset({"ops_run"})
 # inert-data trimming below before a pattern is tested against it.
 _SHELL_TOOLS = frozenset(_DEFAULT_FIELD_BY_TOOL)
 
-# Commands whose heredoc body is *data*, not code: they copy the body to a file
-# or a pipe and never execute it. Everything else (``bash``, ``sh``, ``python``,
-# ``ssh``, ``docker exec … sh``, …) runs what it is fed, so those bodies stay in
-# the matched subject. Basename-compared, so ``/bin/cat`` counts.
-_HEREDOC_DATA_SINKS = frozenset({"cat", "tee"})
-
-# ``<<TAG`` / ``<<'TAG'`` / ``<<-"TAG"``. Deliberately does NOT match the ``<<<``
-# here-string form (that body is a single inline word, not a data block).
-_HEREDOC_START_RE = re.compile(r"<<-?[ \t]*(['\"]?)([A-Za-z_][A-Za-z0-9_]*)\1")
-
-# Tokens that may precede the real command word in a pipeline segment.
-_COMMAND_PREFIXES = frozenset({"sudo", "command", "nohup", "exec", "time", "env"})
-
-
-def _heredoc_body_is_inert(line: str, op_index: int) -> bool:
-    """Is the heredoc opened at ``op_index`` merely written somewhere, not run?
-
-    Looks at the command word owning the redirect — the head of the last
-    pipeline/chain segment before the ``<<``. Unknown or absent command word
-    means "assume it executes", so the gate stays conservative.
-    """
-    segment = re.split(r"\|\||&&|[|;&]", line[:op_index])[-1]
-    for token in segment.split():
-        if re.match(r"^[A-Za-z_][A-Za-z0-9_]*=", token):
-            continue  # VAR=value prefix
-        if token[0] in "-<>" or re.match(r"^\d+[<>]", token):
-            continue  # flag or redirect
-        if token in _COMMAND_PREFIXES:
-            continue
-        return token.rsplit("/", 1)[-1].strip("\"'") in _HEREDOC_DATA_SINKS
-    return False
+# This is deliberately a tiny allowlist grammar, NOT a shell parser. Only one
+# standalone, literal file write may have its quoted heredoc body hidden from
+# policy matching. Pipelines, comments, wrappers, substitutions, multiple
+# redirects/heredocs, and surrounding commands are ambiguous and stay verbatim.
+_LITERAL_PATH = r"(?:[A-Za-z0-9_./~-][A-Za-z0-9_./~-]*|'[A-Za-z0-9_./~ -]+'|\"[A-Za-z0-9_./~ -]+\")"
+_QUOTED_HEREDOC = r"<<(?P<tabs>-?)[ \t]*(?P<quote>['\"])(?P<tag>[A-Za-z_][A-Za-z0-9_]*)(?P=quote)"
+_INERT_HEREDOC_HEADERS = tuple(re.compile(pattern) for pattern in (
+    rf"[ \t]*(?:/bin/|/usr/bin/)?cat[ \t]+>>?[ \t]*{_LITERAL_PATH}[ \t]+{_QUOTED_HEREDOC}[ \t]*",
+    rf"[ \t]*(?:/bin/|/usr/bin/)?cat[ \t]+{_QUOTED_HEREDOC}[ \t]+>>?[ \t]*{_LITERAL_PATH}[ \t]*",
+    rf"[ \t]*(?:/bin/|/usr/bin/)?tee[ \t]+(?:-a[ \t]+)?{_LITERAL_PATH}[ \t]+{_QUOTED_HEREDOC}[ \t]*",
+))
 
 
 def strip_inert_heredoc_bodies(command: str) -> str:
-    """Drop heredoc bodies that are written as data rather than executed.
+    """Trim only a proven quoted, standalone literal file-write heredoc.
 
-    ``cat > file <<'EOF' … EOF`` is a *file write*. Matching a rule's regex
-    against the body means the file's contents get judged as if they were the
-    command — so writing a test fixture that merely mentions
-    ``docker compose restart`` trips the docker rule (TASK-860). The opening
-    line, the terminator, and every executable heredoc body are preserved.
-
-    Pure and total: an unterminated or unrecognised heredoc keeps its body.
+    Unquoted heredocs execute substitutions even when consumed by ``cat``.
+    Quoting the delimiter does not make ``cat <<'EOF' | bash`` inert either.
+    Preserve the entire command on any ambiguity, including comments containing
+    fake delimiters, surrounding shell syntax, and malformed terminators.
     """
     if "<<" not in command:
         return command
     lines = command.split("\n")
-    out: list[str] = []
-    i = 0
-    while i < len(lines):
-        line = lines[i]
-        out.append(line)
-        i += 1
-        opened = [
-            (m.group(2), _heredoc_body_is_inert(line, m.start()))
-            for m in _HEREDOC_START_RE.finditer(line)
-        ]
-        for tag, inert in opened:
-            body: list[str] = []
-            while i < len(lines) and lines[i].strip() != tag:
-                body.append(lines[i])
-                i += 1
-            terminated = i < len(lines)
-            if not inert or not terminated:
-                # Unterminated body may not be a heredoc at all — keep it.
-                out.extend(body)
-            if terminated:
-                out.append(lines[i])
-                i += 1
-    return "\n".join(out)
+    match = next((m for pattern in _INERT_HEREDOC_HEADERS
+                  if (m := pattern.fullmatch(lines[0]))), None)
+    if match is None:
+        return command
+    tag = match.group("tag")
+    for index in range(1, len(lines)):
+        candidate = lines[index].lstrip("\t") if match.group("tabs") else lines[index]
+        if candidate != tag:
+            continue
+        # The FIRST true terminator ends the data. Anything following it could
+        # execute the just-written file or pipe its contents into an interpreter.
+        if any(line for line in lines[index + 1:]):
+            return command
+        return "\n".join([lines[0], *lines[index:]])
+    return command
 
 
 def matchable_subject(tool_name: str, subject: str) -> str:
@@ -227,7 +196,7 @@ def _derive_ops_run_subject(tool_input: Any) -> str:
 
     The operation slug leads so exact/prefix policies stay readable and stable.
     Args use compact sorted JSON; the idempotency key is transport metadata and
-    must not change the approval subject or grant key.
+    must not change the policy subject. The grant key still binds the full input.
     """
     if not isinstance(tool_input, dict):
         return "operation= args={}"
@@ -280,17 +249,6 @@ def derive_subject(tool_name: str, tool_input: Any, field_name: str | None) -> s
         return json.dumps(tool_input, sort_keys=True, ensure_ascii=False, default=str)
     except (TypeError, ValueError):
         return str(tool_input)
-
-
-def _normalize_subject(subject: str) -> str:
-    """Collapse whitespace so grant keys are stable across trivial reformatting.
-
-    The model rarely reproduces a command byte-for-byte on the continuation
-    turn (leading/trailing spaces, doubled spaces). Collapsing runs of
-    whitespace to single spaces keeps the grant key matchable without being so
-    loose that a different command sneaks through.
-    """
-    return re.sub(r"\s+", " ", subject).strip()
 
 
 def humanize_subject(subject: str) -> str:
@@ -394,20 +352,56 @@ def humanize_subject(subject: str) -> str:
 
 
 def grant_key(backend: str, tool_name: str, subject: str) -> str:
-    """Stable hash identifying one approved (backend, tool, command) triple.
+    """Legacy subject fingerprint used by the shared backend/store contract.
 
-    Computed identically by the app (when recording a grant) and the bridge
-    (when consuming it on the continuation turn). Uses the tool *tail* so MCP
-    namespacing doesn't fork the key.
+    This deliberately remains compatible with recorded requests. It must not
+    serve as exact-invocation authorization; Claude uses ``invocation_key``.
     """
-    canonical = "\x1f".join(
-        [
-            (backend or "*").strip().lower(),
-            _tool_tail(tool_name),
-            _normalize_subject(subject),
-        ]
-    )
+    canonical = "\x1f".join([
+        (backend or "*").strip().lower(), _tool_tail(tool_name),
+        re.sub(r"\s+", " ", subject).strip(),
+    ])
     return hashlib.sha256(canonical.encode("utf-8", errors="surrogateescape")).hexdigest()
+
+
+def invocation_key(
+    backend: str, tool_name: str, tool_input: Any, *, cwd: str | None = None,
+) -> str:
+    """Version-2 exact invocation identity, NOT a policy subject fingerprint.
+
+    Keep every input field, string byte, and the full MCP server/tool name.
+    Sorted JSON only canonicalizes object key order; it never rewrites shell
+    whitespace, file contents, args, or idempotency keys. ``cwd`` captures the
+    execution context outside tool input (SDK hook cwd for shell/file tools).
+    Subject-only legacy hashes cannot match these domain-separated keys.
+
+    JSON-incompatible inputs raise rather than acquiring an ambiguous identity
+    via ``default=str``. Callers must never grant on an identity error.
+    """
+    def validate(value: Any) -> None:
+        # json.dumps otherwise coerces non-string mapping keys and tuples,
+        # creating identical identities for different Python invocations.
+        if type(value) is dict:
+            for key, item in value.items():
+                if type(key) is not str:
+                    raise TypeError("Invocation object keys must be strings")
+                validate(item)
+        elif type(value) is list:
+            for item in value:
+                validate(item)
+        elif value is not None and type(value) not in (str, bool, int, float):
+            raise TypeError("Invocation values must be JSON types")
+
+    validate(tool_input)
+    if not isinstance(backend, str) or not isinstance(tool_name, str):
+        raise TypeError("Invocation backend and tool name must be strings")
+    if cwd is not None and (not isinstance(cwd, str) or not cwd):
+        raise TypeError("Invocation cwd must be a nonempty string")
+    canonical = json.dumps(
+        ["approval-invocation-v2", backend, tool_name, tool_input, cwd],
+        sort_keys=True, ensure_ascii=True, separators=(",", ":"), allow_nan=False,
+    )
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
 @dataclass(frozen=True)
@@ -538,13 +532,19 @@ def evaluate(
     backend: str,
     tool_name: str,
     tool_input: Any,
+    *,
+    cwd: str | None = None,
+    exact_invocation: bool = False,
 ) -> ApprovalDecision:
     """Evaluate a tool call against the bundle. First applicable match wins.
 
     Returns an ``allow`` decision when nothing matches (default-allow). The
     returned decision always carries the derived ``subject`` and a precomputed
-    ``grant_key`` so the caller doesn't recompute them.
+    ``grant_key`` so the caller doesn't recompute them. Default subject keys
+    remain compatible with backend callers; the Claude gate explicitly selects
+    ``exact_invocation`` to bind every input field and execution cwd.
     """
+    exact_key = invocation_key(backend, tool_name, tool_input, cwd=cwd) if exact_invocation else None
     subject = ""
     for policy in sorted(policies, key=lambda p: (p.order, p.id)):
         if not policy.applies_to(backend, tool_name):
@@ -559,7 +559,7 @@ def evaluate(
             policy=policy,
             severity=policy.severity,
             prompt=prompt,
-            grant_key=grant_key(backend, tool_name, subject),
+            grant_key=exact_key or grant_key(backend, tool_name, subject),
             label=humanize_subject(subject),
         )
 
@@ -578,14 +578,14 @@ def evaluate(
                 "No approval policy matched this operation, and catalogued "
                 f"operations are gated by default.\n\n{subject}"
             ),
-            grant_key=grant_key(backend, tool_name, subject),
+            grant_key=exact_key or grant_key(backend, tool_name, subject),
             label=humanize_subject(subject),
         )
     return ApprovalDecision(
         action=PolicyAction.ALLOW,
         subject=subject,
         policy=None,
-        grant_key=grant_key(backend, tool_name, subject),
+        grant_key=exact_key or grant_key(backend, tool_name, subject),
         label=humanize_subject(subject),
     )
 

@@ -4,11 +4,9 @@ Two tables:
 
 * ``ops_operations`` — operator-configured operations. ``slug`` is the
   stable identifier the agent references via ``ops_run(operation=slug, ...)``.
-  ``command_script`` is operator-authored bash; the agent never supplies it.
-  Arguments are declared via ``args_schema_json`` (JSON Schema; unknown
-  properties are rejected at validation) and exposed to the script as
-  ``OPS_ARG_<NAME>`` env vars — no string interpolation of agent input into
-  shell text.
+  ``command_script`` is an operator-authored Docker JSON spec; agents never
+  supply it. Arguments are declared via ``args_schema_json``; unknown
+  properties are rejected and dynamic selectors use validated arguments.
 
 * ``ops_jobs`` — one row per invocation. Snapshots the operation version +
   script hash so subsequent catalog edits never mutate an in-flight job.
@@ -61,13 +59,15 @@ EXECUTOR_DOCKER = "docker"
 JOB_QUEUED = "queued"
 # Executor invoked; host unit has not yet been confirmed accepted.
 JOB_DISPATCHING = "dispatching"
-# Host unit is active per systemd; runner has claimed the status file.
+# Docker worker wrote a running receipt immediately before execution.
 JOB_RUNNING = "running"
+# Docker daemon owns the worker; no action result yet.
+JOB_ACCEPTED = "accepted"
 # Terminal: runner wrote exit_code=0 status.
 JOB_SUCCEEDED = "succeeded"
 # Terminal: runner wrote non-zero exit status.
 JOB_FAILED = "failed"
-# Terminal: runner exceeded RuntimeMaxSec / timeout.
+# Terminal: worker's execution deadline elapsed; Docker side effect may be unknown.
 JOB_TIMED_OUT = "timed_out"
 # Terminal: operator/caller cancelled prior to run OR mid-run.
 JOB_CANCELLED = "cancelled"
@@ -119,9 +119,8 @@ class OpsOperation(SQLModel, table=True):
         default=EXECUTOR_DOCKER,
         sa_column=Column(String(32), nullable=False),
     )
-    # Where the systemd unit runs. For LAN work this is "nick@172.18.0.1"
-    # (echo) or another SSH-accessible host. The executor SSHes there; the
-    # app container never runs the command directly.
+    # Legacy columns retained for compatibility. Docker operations require
+    # these empty; TASK-639 explicitly rejects SSH/systemd execution.
     target_host: str = Field(default="", sa_column=Column(String(256), nullable=False))
     run_as_user: str | None = Field(
         default=None, sa_column=Column(String(64), nullable=True)
@@ -129,8 +128,8 @@ class OpsOperation(SQLModel, table=True):
     working_directory: str | None = Field(
         default=None, sa_column=Column(String(1024), nullable=True)
     )
-    # Operator-authored bash. Reads args as ``OPS_ARG_<NAME>`` env vars.
-    # NEVER interpolate agent input into shell text — quote the env var.
+    # Operator-authored Docker JSON action spec; never arbitrary shell.
+    # Dynamic selectors reference validated arguments by name.
     command_script: str = Field(default="", sa_column=Column(Text, nullable=False))
     # JSON Schema for the args dict. Empty {} = no args.
     # ``additionalProperties: false`` is enforced at validation time regardless
@@ -265,10 +264,9 @@ class OpsJob(SQLModel, table=True):
     """One invocation. Rows survive app / bridge / redis restarts so the
     reconciler + approval outbox can recover their state.
 
-    The DB row is authoritative for state transitions; the host-side status
-    file (``.logs/ops-jobs/{job_id}/status.json``) is the source of truth for
-    the exit code, and the reconciler imports it into ``exit_code`` +
-    ``output_tail`` on the next poll.
+    The DB row is canonical metadata; the isolated worker's receipt on the
+    dedicated Docker volume is the source of truth for completion. The
+    independent reconciler imports receipt timestamps, exit code and output.
     """
 
     __tablename__ = "ops_jobs"
@@ -296,6 +294,11 @@ class OpsJob(SQLModel, table=True):
     display_args_json: str = Field(
         default="{}", sa_column=Column(Text, nullable=False)
     )
+
+    # Complete immutable invocation and original input for conflict detection.
+    invocation_snapshot_json: str | None = Field(default=None, sa_column=Column(Text, nullable=True))
+    request_payload_json: str | None = Field(default=None, sa_column=Column(Text, nullable=True))
+    caller_actor: str | None = Field(default=None, sa_column=Column(String(128), nullable=True))
 
     # Caller context (nullable — direct MCP callers may not have all of these).
     caller_bot_id: str | None = Field(
@@ -375,11 +378,13 @@ class OpsJob(SQLModel, table=True):
             args = {}
         row: dict[str, Any] = {
             "id": self.id,
+            "job_id": self.id,
             "operation": self.operation_slug,
             "operation_version": int(self.operation_version or 1),
             "operation_script_hash": self.operation_script_hash,
             "args": args,
             "caller": {
+                "actor": self.caller_actor,
                 "bot_id": self.caller_bot_id,
                 "user_id": self.caller_user_id,
                 "turn_id": self.caller_turn_id,
@@ -409,7 +414,29 @@ class OpsJob(SQLModel, table=True):
         return row
 
 
+class OpsOperationRevision(SQLModel, table=True):
+    """Append-only full catalog history, including enable/delete and attribution."""
+    __tablename__ = "ops_operation_revisions"
+    __table_args__ = (UniqueConstraint("operation_id", "version", name="uq_ops_revision"),)
+    id: str = Field(default_factory=_new_id, primary_key=True)
+    operation_id: str = Field(index=True)
+    operation_slug: str = Field(index=True)
+    version: int
+    snapshot_json: str = Field(sa_column=Column(Text, nullable=False))
+    actor: str | None = None
+    recorded_at: datetime = Field(default_factory=_utcnow, sa_column=Column(DateTime(timezone=True), nullable=False))
+
+    def to_api(self):
+        import json
+        return {"operation_id": self.operation_id, "operation_slug": self.operation_slug,
+                "version": self.version, "actor": self.actor,
+                "recorded_at": self.recorded_at.isoformat(),
+                "operation": json.loads(self.snapshot_json)}
+
+
 __all__ = [
+    "OpsOperationRevision",
+    "JOB_ACCEPTED",
     "OpsOperation",
     "OpsJob",
     "RISK_LOW",

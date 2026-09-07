@@ -1,536 +1,382 @@
-"""Storage layer for the ops catalog + job ledger (TASK-639).
+"""Canonical catalog/history and job ledger with transactional claims and CAS.
 
-CRUD + atomic transitions for :class:`OpsOperation` and :class:`OpsJob`.
-No executor concerns here — the store is pure state; the executor
-(:mod:`.executor`) reads/writes through this store.
-
-Concurrency:
-
-* Job state transitions use ``SELECT ... FOR UPDATE`` under Postgres so
-  reconciler + executor + resolver don't race. Under SQLite (test env) the
-  same code path still works — the store just picks up whichever row was
-  visible at read time; race hazards are covered by the idempotency key
-  constraint and the terminal-state guards.
-* Operation edits bump ``version`` monotonically; job snapshots capture the
-  operation version + script hash so a concurrent edit cannot rewrite an
-  in-flight job.
+No side effects run in a transaction. Operation-row write locks serialize edits
+and concurrency-slot claims in PostgreSQL AND SQLite. Conditional SQL updates
+ensure a stale reconciler cannot overwrite a terminal result.
 """
-
 from __future__ import annotations
 
 import hashlib
 import json
 import logging
+import re
 import uuid
 from datetime import datetime, timezone
 from typing import Any
 
-from sqlalchemy import Column, DateTime, Integer, String, Text, text
+from sqlalchemy import func, inspect, text, update
+from sqlalchemy.exc import IntegrityError
 from sqlmodel import Session, SQLModel, select
 
 from ..utils.config import Config, has_database_credentials
 from ..utils.schema import SchemaBootstrapGuard
-from .models import (
-    EXECUTOR_DOCKER,
-    JOB_CANCELLED,
-    JOB_DISPATCHING,
-    JOB_FAILED,
-    JOB_LOST,
-    JOB_QUEUED,
-    JOB_RUNNING,
-    JOB_SUCCEEDED,
-    JOB_TERMINAL_STATES,
-    JOB_TIMED_OUT,
-    OpsJob,
-    OpsOperation,
-    RISK_MEDIUM,
-)
+from .executor import validate_spec
+from .models import (JOB_ACCEPTED, JOB_DISPATCHING, JOB_QUEUED, JOB_RUNNING,
+                     JOB_TERMINAL_STATES, OpsJob, OpsOperation, OpsOperationRevision)
+from .validation import canonical_json, validate_catalog
 
 logger = logging.getLogger(__name__)
 
 
-def _utcnow() -> datetime:
+def _utcnow():
     return datetime.now(timezone.utc)
 
 
-def _new_id() -> str:
-    return uuid.uuid4().hex
+def _script_hash(script):
+    return hashlib.sha256(script.encode()).hexdigest()
 
 
-def _script_hash(script: str) -> str:
-    """Deterministic content hash used for job snapshots + policy subjects."""
-    return hashlib.sha256((script or "").encode("utf-8")).hexdigest()
-
-
-# Fields a caller may set on create/update. Anything else is ignored.
-_OP_WRITABLE = {
-    "slug",
-    "title",
-    "description",
-    "enabled",
-    "executor_kind",
-    "target_host",
-    "run_as_user",
-    "working_directory",
-    "command_script",
-    "args_schema_json",
-    "args_defaults_json",
-    "timeout_seconds",
-    "start_delay_seconds",
-    "max_output_bytes",
-    "max_concurrent",
-    "risk_level",
-    "category",
-    "approval_prompt_prefix",
-}
+_OP_WRITABLE = {"slug", "title", "description", "enabled", "executor_kind", "target_host",
+                "run_as_user", "working_directory", "command_script", "args_schema_json",
+                "args_defaults_json", "timeout_seconds", "start_delay_seconds", "max_output_bytes",
+                "max_concurrent", "risk_level", "category", "approval_prompt_prefix"}
+_ACTIVE_CLAIMED = (JOB_DISPATCHING, JOB_ACCEPTED, JOB_RUNNING)
 
 
 class OpsStoreUnavailable(RuntimeError):
-    """Raised when the ops store has no DB engine and a caller tried to write."""
+    pass
+
+
+class IdempotencyConflict(ValueError):
+    pass
 
 
 class OpsStore:
-    """DB access for the ops catalog + job ledger."""
-
     _schema_guard = SchemaBootstrapGuard()
 
     def __init__(self, config: Config, engine: Any = None):
-        """``engine`` overrides credential-derived connection resolution.
-
-        Used by the tenant seeder (and tests), which already owns a connected
-        engine and must not re-resolve one from a partial config.
-        """
         self.config = config
-        self.engine = None
+        self.engine = engine
         if engine is not None:
-            self.engine = engine
             self._ensure_tables_exist()
-            return
-        if not has_database_credentials(config):
-            return
-        try:
-            from ..utils.db import get_shared_engine
+        elif has_database_credentials(config):
+            try:
+                from ..utils.db import get_shared_engine
+                self.engine = get_shared_engine(config)
+                self._ensure_tables_exist()
+            except Exception as exc:
+                self.engine = None
+                logger.warning("Ops store DB unavailable: %s", exc)
 
-            self.engine = get_shared_engine(config)
-            if self.engine is None:
-                return
-            self._ensure_tables_exist()
-        except Exception as e:  # noqa: BLE001
-            self.engine = None
-            logger.warning("Ops store DB unavailable: %s", e)
-
-    def _ensure_tables_exist(self) -> None:
+    def _ensure_tables_exist(self):
         if self.engine is None:
             return
-
-        def bootstrap(conn) -> None:
-            SQLModel.metadata.create_all(
-                bind=conn,
-                tables=[OpsOperation.__table__, OpsJob.__table__],
-            )
+        def bootstrap(conn):
+            SQLModel.metadata.create_all(bind=conn, tables=[OpsOperation.__table__, OpsJob.__table__, OpsOperationRevision.__table__])
             self._migrate_add_columns(conn)
+            # Pre-existing rows have only their current revision available.
+            # Never invent historical revisions that were not recorded.
+            with Session(bind=conn) as session:
+                for op in session.exec(select(OpsOperation)).all():
+                    existing = session.exec(select(OpsOperationRevision.id).where(
+                        OpsOperationRevision.operation_id == op.id, OpsOperationRevision.version == op.version)).first()
+                    if existing is None:
+                        self._record_revision(session, op)
+                session.flush()
+                session.commit()  # join the bootstrap connection transaction
+        self._schema_guard.run(self.engine, "ops-store-task861-v1", bootstrap)
 
-        self._schema_guard.run(self.engine, "ops-store", bootstrap)
+    def _migrate_add_columns(self, conn):
+        existing = {c["name"] for c in inspect(conn).get_columns("ops_jobs")}
+        for name, kind in (("invocation_snapshot_json", "TEXT"), ("request_payload_json", "TEXT"), ("caller_actor", "VARCHAR(128)")):
+            if name not in existing:
+                clause = " IF NOT EXISTS" if conn.dialect.name == "postgresql" else ""
+                conn.execute(text(f"ALTER TABLE ops_jobs ADD COLUMN{clause} {name} {kind}"))
 
-    def _migrate_add_columns(self, conn) -> None:
-        """Postgres-only column-add migration for future evolution.
+    def _require(self):
+        if self.engine is None:
+            raise OpsStoreUnavailable("ops store has no DB engine")
 
-        Currently a no-op — the tables are new in TASK-639. New columns land
-        here as they're added so a redeploy against a pre-existing tenant is
-        safe.
-        """
-        if conn.dialect.name != "postgresql":
-            return
-        # Future ADD COLUMN IF NOT EXISTS migrations go here.
+    @staticmethod
+    def _op_filter(include_disabled=False, include_soft_deleted=False):
+        filters = []
+        if not include_disabled:
+            filters.append(OpsOperation.enabled.is_(True))
+        if not include_soft_deleted:
+            filters.append(OpsOperation.soft_deleted_at.is_(None))
+        return filters
 
-    # ---- Operation CRUD ---------------------------------------------------
-
-    def list_operations(
-        self,
-        *,
-        include_disabled: bool = False,
-        include_soft_deleted: bool = False,
-    ) -> list[OpsOperation]:
+    def list_operations(self, *, include_disabled=False, include_soft_deleted=False, limit=None, offset=0):
         if self.engine is None:
             return []
         with Session(self.engine) as session:
-            stmt = select(OpsOperation)
-            if not include_soft_deleted:
-                stmt = stmt.where(OpsOperation.soft_deleted_at.is_(None))
-            if not include_disabled:
-                stmt = stmt.where(OpsOperation.enabled == True)  # noqa: E712
-            stmt = stmt.order_by(OpsOperation.category, OpsOperation.slug)
+            stmt = select(OpsOperation).where(*self._op_filter(include_disabled, include_soft_deleted)).order_by(OpsOperation.category, OpsOperation.slug).offset(offset)
+            if limit is not None:
+                stmt = stmt.limit(limit)
             return list(session.exec(stmt).all())
 
-    def get_operation(self, slug_or_id: str) -> OpsOperation | None:
-        if self.engine is None or not slug_or_id:
+    def count_operations(self, *, include_disabled=False, include_soft_deleted=False):
+        if self.engine is None:
+            return 0
+        with Session(self.engine) as session:
+            return session.exec(select(func.count()).select_from(OpsOperation).where(*self._op_filter(include_disabled, include_soft_deleted))).one()
+
+    def get_operation(self, slug_or_id):
+        if self.engine is None:
             return None
         with Session(self.engine) as session:
-            # Try by id first (uuid.hex is 32 chars, deterministic length).
-            row = session.get(OpsOperation, slug_or_id)
-            if row is not None:
-                return row
-            return session.exec(
-                select(OpsOperation).where(OpsOperation.slug == slug_or_id)
-            ).first()
+            return session.exec(select(OpsOperation).where((OpsOperation.id == slug_or_id) | (OpsOperation.slug == slug_or_id))).first()
 
-    def get_operation_by_slug(self, slug: str) -> OpsOperation | None:
-        if self.engine is None or not slug:
+    def get_operation_by_slug(self, slug):
+        if self.engine is None:
             return None
         with Session(self.engine) as session:
-            return session.exec(
-                select(OpsOperation).where(OpsOperation.slug == slug)
-            ).first()
+            return session.exec(select(OpsOperation).where(OpsOperation.slug == slug)).first()
 
-    def _clean_op(self, data: dict[str, Any]) -> dict[str, Any]:
+    def _clean_op(self, data):
         out = {k: v for k, v in data.items() if k in _OP_WRITABLE}
-        # Ensure JSON columns hold valid JSON strings so downstream loads
-        # never explode. Caller may pass a dict or a string — normalize to
-        # canonical JSON text.
-        for jf in ("args_schema_json", "args_defaults_json"):
-            if jf in out and out[jf] is not None:
-                if isinstance(out[jf], (dict, list)):
-                    out[jf] = json.dumps(out[jf], ensure_ascii=False)
-                else:
-                    # Validate string parses as JSON — reject junk early.
-                    try:
-                        json.loads(out[jf])
-                    except (json.JSONDecodeError, TypeError) as exc:
-                        raise ValueError(f"{jf} is not valid JSON: {exc}") from exc
+        for field in ("args_schema_json", "args_defaults_json"):
+            if field in out and isinstance(out[field], dict):
+                out[field] = canonical_json(out[field])
         return out
 
-    def create_operation(
-        self,
-        data: dict[str, Any],
-        *,
-        actor: str | None = None,
-    ) -> OpsOperation:
-        if self.engine is None:
-            raise OpsStoreUnavailable("ops store has no DB engine")
+    @staticmethod
+    def _validate_op(op):
+        if not isinstance(op.slug, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}", op.slug):
+            raise ValueError("slug must be 1..128 letters, digits, dots, underscores or hyphens")
+        if type(op.enabled) is not bool:
+            raise ValueError("enabled must be boolean")
+        for field, low, high in (("timeout_seconds", 1, 86400), ("start_delay_seconds", 0, 86400),
+                                 ("max_output_bytes", 1, 1048576), ("max_concurrent", 1, 1000)):
+            value = getattr(op, field)
+            if value is None and field == "max_concurrent":
+                continue
+            if type(value) is not int or not low <= value <= high:
+                raise ValueError(f"{field} must be an integer in {low}..{high}")
+        schema, _ = validate_catalog(op.args_schema_json, op.args_defaults_json)
+        if op.executor_kind != "docker":
+            raise ValueError("only docker executor is supported")
+        if op.target_host or op.run_as_user or op.working_directory:
+            raise ValueError("Docker operations do not support target_host/run_as_user/working_directory; no SSH or shell runner")
+        spec = validate_spec(op.command_script)
+        for key in ("container_name_from_arg", "compose_service_from_arg"):
+            if key in spec and schema.get("properties", {}).get(spec[key], {}).get("type") != "string":
+                raise ValueError(f"{key} must reference a declared string argument")
+        for field in ("title", "description", "risk_level"):
+            if not isinstance(getattr(op, field), str):
+                raise ValueError(f"{field} must be a string")
+
+    @staticmethod
+    def _record_revision(session, row):
+        session.add(OpsOperationRevision(operation_id=row.id, operation_slug=row.slug,
+            version=row.version, snapshot_json=canonical_json(row.to_api()), actor=row.updated_by))
+
+    def create_operation(self, data, *, actor=None):
+        self._require()
         clean = self._clean_op(data)
-        slug = str(clean.get("slug") or "").strip()
-        if not slug:
-            raise ValueError("slug is required")
-        # Guard uniqueness at the app layer for a friendly error; DB unique
-        # index is the ultimate authority.
-        if self.get_operation_by_slug(slug) is not None:
-            raise ValueError(f"operation slug already exists: {slug}")
         now = _utcnow()
-        script = str(clean.get("command_script", "") or "")
-        row = OpsOperation(
-            id=_new_id(),
-            slug=slug,
-            title=str(clean.get("title", "") or ""),
-            description=str(clean.get("description", "") or ""),
-            enabled=bool(clean.get("enabled", False)),
-            executor_kind=str(clean.get("executor_kind", EXECUTOR_DOCKER)),
-            target_host=str(clean.get("target_host", "") or ""),
-            run_as_user=clean.get("run_as_user"),
-            working_directory=clean.get("working_directory"),
-            command_script=script,
-            args_schema_json=str(clean.get("args_schema_json", "{}") or "{}"),
-            args_defaults_json=str(clean.get("args_defaults_json", "{}") or "{}"),
-            timeout_seconds=int(clean.get("timeout_seconds", 300) or 300),
-            start_delay_seconds=int(clean.get("start_delay_seconds", 0) or 0),
-            max_output_bytes=int(clean.get("max_output_bytes", 65536) or 65536),
-            max_concurrent=clean.get("max_concurrent"),
-            risk_level=str(clean.get("risk_level", RISK_MEDIUM) or RISK_MEDIUM),
-            category=clean.get("category"),
-            approval_prompt_prefix=clean.get("approval_prompt_prefix"),
-            version=1,
-            script_hash=_script_hash(script),
-            created_at=now,
-            updated_at=now,
-            created_by=actor,
-            updated_by=actor,
-        )
+        row = OpsOperation(id=uuid.uuid4().hex, created_at=now, updated_at=now,
+                           created_by=actor, updated_by=actor, **clean)
+        self._validate_op(row)
+        row.script_hash = _script_hash(row.command_script)
         with Session(self.engine) as session:
             session.add(row)
-            session.commit()
+            self._record_revision(session, row)
+            try:
+                session.commit()
+            except IntegrityError as exc:
+                session.rollback()
+                raise ValueError(f"operation slug already exists: {row.slug}") from exc
             session.refresh(row)
             return row
 
-    def update_operation(
-        self,
-        slug_or_id: str,
-        data: dict[str, Any],
-        *,
-        actor: str | None = None,
-    ) -> OpsOperation | None:
-        if self.engine is None:
-            raise OpsStoreUnavailable("ops store has no DB engine")
+    @staticmethod
+    def _lock_operation(session, slug_or_id):
+        # This UPDATE acquires a write lock BEFORE any read, including SQLite.
+        session.execute(update(OpsOperation).where((OpsOperation.id == slug_or_id) | (OpsOperation.slug == slug_or_id))
+                        .values(version=OpsOperation.version).execution_options(synchronize_session=False))
+        return session.exec(select(OpsOperation).where((OpsOperation.id == slug_or_id) | (OpsOperation.slug == slug_or_id))).first()
+
+    def update_operation(self, slug_or_id, data, *, actor=None, _delete=False):
+        self._require()
         clean = self._clean_op(data)
         with Session(self.engine) as session:
-            row = session.get(OpsOperation, slug_or_id)
+            row = self._lock_operation(session, slug_or_id)
             if row is None:
-                row = session.exec(
-                    select(OpsOperation).where(OpsOperation.slug == slug_or_id)
-                ).first()
-                if row is None:
-                    return None
-            for field in (
-                "title", "description", "enabled", "executor_kind",
-                "target_host", "run_as_user", "working_directory",
-                "command_script", "args_schema_json", "args_defaults_json",
-                "timeout_seconds", "start_delay_seconds", "max_output_bytes",
-                "max_concurrent", "risk_level", "category",
-                "approval_prompt_prefix",
-            ):
-                if field in clean:
-                    setattr(row, field, clean[field])
-            # Slug renames are allowed but they invalidate any lookup by the
-            # old slug — the operator UI warns on this.
+                return None
             if "slug" in clean and clean["slug"] != row.slug:
-                row.slug = str(clean["slug"])
-            # Bump version + refresh script hash whenever the script text moved.
-            row.version = int(row.version or 1) + 1
-            row.script_hash = _script_hash(row.command_script or "")
+                raise ValueError("operation slug is immutable; create a new operation")
+            if row.soft_deleted_at is not None and clean.get("enabled"):
+                raise ValueError("soft-deleted operations cannot be enabled")
+            for field, value in clean.items():
+                setattr(row, field, value)
+            if _delete:
+                if row.soft_deleted_at is not None:
+                    return row
+                row.enabled = False
+                row.soft_deleted_at = _utcnow()
+            self._validate_op(row)
+            row.version += 1
+            row.script_hash = _script_hash(row.command_script)
             row.updated_at = _utcnow()
             row.updated_by = actor
             session.add(row)
+            self._record_revision(session, row)
             session.commit()
             session.refresh(row)
             return row
 
-    def soft_delete_operation(
-        self,
-        slug_or_id: str,
-        *,
-        actor: str | None = None,
-    ) -> bool:
-        """Mark an operation soft-deleted (hidden from list + agent) while
-        preserving audit history. Also flips ``enabled`` off. Idempotent."""
+    def soft_delete_operation(self, slug_or_id, *, actor=None):
+        return self.update_operation(slug_or_id, {}, actor=actor, _delete=True) is not None
+
+    def list_revisions(self, slug, *, limit=50, offset=0):
         if self.engine is None:
-            raise OpsStoreUnavailable("ops store has no DB engine")
+            return [], 0
         with Session(self.engine) as session:
-            row = session.get(OpsOperation, slug_or_id)
-            if row is None:
-                row = session.exec(
-                    select(OpsOperation).where(OpsOperation.slug == slug_or_id)
-                ).first()
-                if row is None:
-                    return False
-            if row.soft_deleted_at is not None:
-                return True
-            row.soft_deleted_at = _utcnow()
-            row.enabled = False
-            row.updated_at = _utcnow()
-            row.updated_by = actor
-            session.add(row)
-            session.commit()
-            return True
+            filters = [OpsOperationRevision.operation_slug == slug]
+            total = session.exec(select(func.count()).select_from(OpsOperationRevision).where(*filters)).one()
+            rows = session.exec(select(OpsOperationRevision).where(*filters).order_by(OpsOperationRevision.version.desc()).offset(offset).limit(limit)).all()
+            return list(rows), total
 
-    # ---- Per-slug seeding -------------------------------------------------
-
-    def seed_operation_if_missing(
-        self,
-        data: dict[str, Any],
-        *,
-        actor: str = "system-seed",
-    ) -> OpsOperation | None:
-        """Insert an operation only if no row with that ``slug`` exists.
-
-        TASK-639 catalog invariant: seed rows are per-slug insert-if-missing,
-        NEVER overwrite operator edits. Returns the created row, or None if
-        an existing row was found.
-        """
-        if self.engine is None:
-            return None
-        slug = str(data.get("slug") or "").strip()
-        if not slug:
-            raise ValueError("seed data missing slug")
-        existing = self.get_operation_by_slug(slug)
-        if existing is not None:
+    def seed_operation_if_missing(self, data, *, actor="system-seed"):
+        if self.engine is None or self.get_operation_by_slug(data.get("slug")):
             return None
         return self.create_operation(data, actor=actor)
 
-    # ---- Job lifecycle ----------------------------------------------------
-
-    def create_job(
-        self,
-        *,
-        operation: OpsOperation,
-        args_json: str,
-        display_args_json: str,
-        idempotency_key: str,
-        caller_bot_id: str | None = None,
-        caller_user_id: str | None = None,
-        caller_turn_id: str | None = None,
-        caller_session_key: str | None = None,
-        caller_backend: str | None = None,
-        approval_request_id: str | None = None,
-    ) -> OpsJob:
-        """Create a queued job. Idempotent on ``idempotency_key`` — a second
-        call with the same key returns the pre-existing job.
-        """
+    def get_job_by_key(self, key):
         if self.engine is None:
-            raise OpsStoreUnavailable("ops store has no DB engine")
-        # Idempotent short-circuit.
+            return None
         with Session(self.engine) as session:
-            existing = session.exec(
-                select(OpsJob).where(OpsJob.idempotency_key == idempotency_key)
-            ).first()
-            if existing is not None:
-                return existing
-        row = OpsJob(
-            id=_new_id(),
-            operation_slug=operation.slug,
-            operation_version=int(operation.version or 1),
-            operation_script_hash=operation.script_hash or "",
-            args_json=args_json or "{}",
-            display_args_json=display_args_json or "{}",
-            caller_bot_id=caller_bot_id,
-            caller_user_id=caller_user_id,
-            caller_turn_id=caller_turn_id,
-            caller_session_key=caller_session_key,
-            caller_backend=caller_backend,
-            approval_request_id=approval_request_id,
-            state=JOB_QUEUED,
-            idempotency_key=idempotency_key,
-            submitted_at=_utcnow(),
-        )
+            return session.exec(select(OpsJob).where(OpsJob.idempotency_key == key)).first()
+
+    @staticmethod
+    def verify_payload(existing, payload_json, snapshot_json=None):
+        if existing.request_payload_json != payload_json:
+            raise IdempotencyConflict("idempotency key is already bound to a different invocation payload")
+        if snapshot_json is not None and existing.invocation_snapshot_json != snapshot_json:
+            raise IdempotencyConflict("idempotency key is already bound to a different approved snapshot")
+
+    def create_job(self, *, operation, args_json, display_args_json, idempotency_key,
+                   invocation_snapshot_json=None, request_payload_json=None, caller_actor=None,
+                   caller_bot_id=None, caller_user_id=None, caller_turn_id=None,
+                   caller_session_key=None, caller_backend=None, approval_request_id=None):
+        self._require()
+        if not isinstance(idempotency_key, str) or not 1 <= len(idempotency_key) <= 128:
+            raise ValueError("idempotency_key must be 1..128 characters")
+        # Legacy/internal callers are also conflict checked by args, not just key.
+        payload = request_payload_json or canonical_json({"operation": operation.slug, "args": json.loads(args_json)})
+        row = OpsJob(id=uuid.uuid4().hex, operation_slug=operation.slug,
+            operation_version=operation.version, operation_script_hash=operation.script_hash,
+            args_json=args_json, display_args_json=display_args_json,
+            invocation_snapshot_json=invocation_snapshot_json, request_payload_json=payload,
+            idempotency_key=idempotency_key, caller_actor=caller_actor, caller_bot_id=caller_bot_id,
+            caller_user_id=caller_user_id, caller_turn_id=caller_turn_id, caller_session_key=caller_session_key,
+            caller_backend=caller_backend, approval_request_id=approval_request_id)
         with Session(self.engine) as session:
             session.add(row)
-            session.commit()
+            try:
+                session.commit()
+            except IntegrityError:
+                session.rollback()
+                existing = self.get_job_by_key(idempotency_key)
+                if existing is None:
+                    raise
+                self.verify_payload(existing, payload, invocation_snapshot_json)
+                return existing
             session.refresh(row)
             return row
 
-    def get_job(self, job_id: str) -> OpsJob | None:
+    def get_job(self, job_id):
         if self.engine is None:
             return None
         with Session(self.engine) as session:
             return session.get(OpsJob, job_id)
 
-    def list_jobs(
-        self,
-        *,
-        operation_slug: str | None = None,
-        state: str | None = None,
-        limit: int = 50,
-    ) -> list[OpsJob]:
+    @staticmethod
+    def _job_filters(operation_slug=None, state=None):
+        return ([OpsJob.operation_slug == operation_slug] if operation_slug else []) + ([OpsJob.state == state] if state else [])
+
+    def list_jobs(self, *, operation_slug=None, state=None, limit=50, offset=0):
         if self.engine is None:
             return []
         with Session(self.engine) as session:
-            stmt = select(OpsJob)
-            if operation_slug:
-                stmt = stmt.where(OpsJob.operation_slug == operation_slug)
-            if state:
-                stmt = stmt.where(OpsJob.state == state)
-            stmt = stmt.order_by(OpsJob.submitted_at.desc()).limit(limit)
-            return list(session.exec(stmt).all())
+            return list(session.exec(select(OpsJob).where(*self._job_filters(operation_slug, state))
+                .order_by(OpsJob.submitted_at.desc(), OpsJob.id.desc()).offset(offset).limit(limit)).all())
 
-    def mark_dispatching(
-        self,
-        job_id: str,
-        *,
-        host_unit_name: str,
-        status_file_path: str | None = None,
-        log_file_path: str | None = None,
-    ) -> OpsJob | None:
-        """QUEUED → DISPATCHING; records the resolved host unit + paths.
-
-        Idempotent on already-dispatching / already-running; refuses to
-        regress a terminal row.
-        """
+    def count_jobs(self, *, operation_slug=None, state=None):
         if self.engine is None:
-            return None
+            return 0
         with Session(self.engine) as session:
-            row = session.get(OpsJob, job_id)
-            if row is None:
-                return None
-            if row.state in JOB_TERMINAL_STATES:
-                return row
-            if row.state == JOB_QUEUED:
-                row.state = JOB_DISPATCHING
-            row.host_unit_name = host_unit_name
-            row.status_file_path = status_file_path
-            row.log_file_path = log_file_path
-            row.dispatched_at = _utcnow()
-            session.add(row)
+            return session.exec(select(func.count()).select_from(OpsJob).where(*self._job_filters(operation_slug, state))).one()
+
+    def claim_job(self, job_id, *, max_concurrent=None):
+        """QUEUED -> DISPATCHING atomically, reserving a per-operation slot."""
+        self._require()
+        job = self.get_job(job_id)
+        if job is None:
+            return False
+        with Session(self.engine) as session:
+            op = self._lock_operation(session, job.operation_slug)
+            if op is None or not op.enabled or op.soft_deleted_at is not None:
+                return False
+            active = session.exec(select(OpsJob).where(OpsJob.operation_slug == job.operation_slug, OpsJob.state.in_(_ACTIVE_CLAIMED))).all()
+            limits = [max_concurrent] if max_concurrent is not None else []
+            for other in active:
+                if other.invocation_snapshot_json:
+                    cap = json.loads(other.invocation_snapshot_json)["execution"].get("max_concurrent")
+                    if cap is not None:
+                        limits.append(cap)
+            if limits and len(active) >= min(limits):
+                return False
+            result = session.execute(update(OpsJob).where(OpsJob.id == job_id, OpsJob.state == JOB_QUEUED)
+                .values(state=JOB_DISPATCHING, dispatched_at=_utcnow(), host_unit_name=f"llm-bawt-ops-{job_id}", error_text=None)
+                .execution_options(synchronize_session=False))
             session.commit()
-            session.refresh(row)
-            return row
+            return result.rowcount == 1
 
-    def mark_running(self, job_id: str) -> OpsJob | None:
-        """DISPATCHING → RUNNING; called by the reconciler when the host
-        unit is confirmed active or when the first status line lands."""
+    def _transition(self, job_id, from_states, values):
         if self.engine is None:
             return None
         with Session(self.engine) as session:
-            row = session.get(OpsJob, job_id)
-            if row is None:
-                return None
-            if row.state in JOB_TERMINAL_STATES:
-                return row
-            if row.state in (JOB_QUEUED, JOB_DISPATCHING):
-                row.state = JOB_RUNNING
-                row.started_at = _utcnow()
-                session.add(row)
-                session.commit()
-                session.refresh(row)
-            return row
+            session.execute(update(OpsJob).where(OpsJob.id == job_id, OpsJob.state.in_(from_states))
+                            .values(**values).execution_options(synchronize_session=False))
+            session.commit()
+        return self.get_job(job_id)
 
-    def mark_terminal(
-        self,
-        job_id: str,
-        *,
-        state: str,
-        exit_code: int | None = None,
-        output_tail: str | None = None,
-        error_text: str | None = None,
-    ) -> OpsJob | None:
-        """Transition to a terminal state. Idempotent — the first terminal
-        transition wins and later calls are no-ops that return the stored row.
+    def mark_dispatching(self, job_id, *, host_unit_name, status_file_path=None, log_file_path=None):
+        # Compatibility for store consumers. Service always claims BEFORE I/O.
+        return self._transition(job_id, (JOB_QUEUED, JOB_DISPATCHING), dict(state=JOB_DISPATCHING,
+            host_unit_name=host_unit_name, status_file_path=status_file_path, log_file_path=log_file_path,
+            dispatched_at=_utcnow()))
 
-        Callers must pass one of :data:`JOB_SUCCEEDED`, :data:`JOB_FAILED`,
-        :data:`JOB_TIMED_OUT`, :data:`JOB_CANCELLED`, :data:`JOB_LOST`.
-        """
+    def mark_accepted(self, job_id, *, host_unit_name=None, status_file_path=None, log_file_path=None):
+        values = {"state": JOB_ACCEPTED}
+        for key, value in (("host_unit_name", host_unit_name), ("status_file_path", status_file_path), ("log_file_path", log_file_path)):
+            if value is not None:
+                values[key] = value
+        return self._transition(job_id, (JOB_DISPATCHING, JOB_ACCEPTED), values)
+
+    def mark_running(self, job_id, *, started_at=None):
+        return self._transition(job_id, (JOB_DISPATCHING, JOB_ACCEPTED), {"state": JOB_RUNNING, "started_at": started_at or _utcnow()})
+
+    def mark_terminal(self, job_id, *, state, exit_code=None, output_tail=None, error_text=None, started_at=None, finished_at=None):
         if state not in JOB_TERMINAL_STATES:
             raise ValueError(f"not a terminal state: {state!r}")
-        if self.engine is None:
-            return None
-        with Session(self.engine) as session:
-            row = session.get(OpsJob, job_id)
-            if row is None:
-                return None
-            if row.state in JOB_TERMINAL_STATES:
-                return row
-            row.state = state
-            row.exit_code = exit_code
-            if output_tail is not None:
-                row.output_tail = output_tail
-            if error_text is not None:
-                row.error_text = error_text
-            row.finished_at = _utcnow()
-            session.add(row)
-            session.commit()
-            session.refresh(row)
-            return row
+        values = dict(state=state, exit_code=exit_code, output_tail=output_tail,
+                      error_text=error_text, finished_at=finished_at or _utcnow())
+        if started_at is not None:
+            values["started_at"] = started_at
+        return self._transition(job_id, (JOB_QUEUED, *_ACTIVE_CLAIMED), values)
 
-    def touch_reconcile(self, job_id: str) -> None:
-        """Record a reconciler poll timestamp so we can detect lost jobs."""
-        if self.engine is None:
-            return
-        with Session(self.engine) as session:
-            row = session.get(OpsJob, job_id)
-            if row is None:
-                return
-            row.last_reconcile_at = _utcnow()
-            session.add(row)
-            session.commit()
+    def note_queued_error(self, job_id, error):
+        return self._transition(job_id, (JOB_QUEUED,), {"error_text": error})
 
-    def find_active_jobs(self, *, limit: int = 100) -> list[OpsJob]:
-        """All jobs in a non-terminal state — the reconciler's work queue."""
+    def touch_reconcile(self, job_id):
+        self._transition(job_id, (JOB_QUEUED, *_ACTIVE_CLAIMED), {"last_reconcile_at": _utcnow()})
+
+    def find_active_jobs(self, *, limit=100, offset=0):
         if self.engine is None:
             return []
         with Session(self.engine) as session:
-            stmt = (
-                select(OpsJob)
-                .where(OpsJob.state.notin_(JOB_TERMINAL_STATES))
-                .order_by(OpsJob.submitted_at)
-                .limit(limit)
-            )
-            return list(session.exec(stmt).all())
-
-
-__all__ = ["OpsStore", "OpsStoreUnavailable"]
+            return list(session.exec(select(OpsJob).where(OpsJob.state.notin_(JOB_TERMINAL_STATES))
+                .order_by(OpsJob.submitted_at, OpsJob.id).offset(offset).limit(limit)).all())

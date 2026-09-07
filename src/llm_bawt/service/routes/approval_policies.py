@@ -15,11 +15,15 @@ from typing import Any
 
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field
+from sqlalchemy.exc import SQLAlchemyError
+from agent_bridge.approval import evaluate
+from ...approval_validation import candidate_policy
+from ..approval_execution import ApprovalExecutionLeaseLost
+from ...approval_policies import ApprovalStoreUnavailable, CONT_DELIVERED, CONT_PENDING, CONT_DISPATCHING
 
 from ..approval_continuations import (
     build_continuation_prompt,
     build_respond_prompt,
-    spawn_continuation,
 )
 from ..dependencies import (
     get_service,
@@ -65,6 +69,7 @@ class PolicyUpsert(BaseModel):
     category: str | None = None
     approval_prompt: str | None = None
     order: int | None = None
+    order_index: int | None = None
 
     def writable(self) -> dict:
         return {k: v for k, v in self.model_dump().items() if v is not None}
@@ -73,7 +78,7 @@ class PolicyUpsert(BaseModel):
 class ResolveRequest(BaseModel):
     decision: str = Field(..., description="'approve', 'deny', 'cancel', or 'respond'")
     bot_id: str = Field("", description="Bot slug (for tab fanout)")
-    user_id: str = Field("nick", description="User id (for tab fanout)")
+    user_id: str = Field("", description="User id (for tab fanout)")
     resolved_by: str | None = None
     # 'respond' only: the user's own guidance sent to the agent instead of the
     # canned refusal. Optional — empty falls back to a neutral "not run" note.
@@ -84,7 +89,7 @@ class ResolveRequest(BaseModel):
     # A client that dispatches its own continuation must pass False to avoid a
     # double turn.
     dispatch_continuation: bool = Field(
-        False, description="Server dispatches the continuation turn (opt-in; the chat card dispatches client-side)",
+        True, description="Server owns continuation by default; chat clients that dispatch must explicitly pass false",
     )
 
 
@@ -104,7 +109,10 @@ def get_bundle(etag: str | None = None):
     """Compiled bundle a bridge fetches. If ``etag`` matches, returns
     ``{unchanged: true}`` so the bridge can skip re-parsing."""
     store = _store()
-    bundle = store.compile_bundle()
+    try:
+        bundle = store.compile_bundle()
+    except (ApprovalStoreUnavailable, SQLAlchemyError) as exc:
+        raise HTTPException(status_code=503, detail="Approval policy database unavailable") from exc
     if etag and etag == bundle.etag:
         return {"unchanged": True, "etag": bundle.etag, "version": bundle.version}
     return bundle.to_dict()
@@ -113,7 +121,10 @@ def get_bundle(etag: str | None = None):
 @router.post("/v1/tool-approval-policies", tags=["Approval Policies"], status_code=201)
 def create_policy(body: PolicyUpsert):
     store = _store()
-    row = store.create(body.writable())
+    try:
+        row = store.create(body.writable())
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
     return row.to_api()
 
 
@@ -122,6 +133,74 @@ def seed_defaults():
     store = _store()
     seeded = store.seed_defaults()
     return {"seeded": seeded, "total": len(store.list_all())}
+
+
+class PolicyPreview(BaseModel):
+    backend: str = Field(min_length=1, max_length=64)
+    tool_name: str = Field(min_length=1, max_length=128)
+    tool_input: dict[str, Any]
+    policies: list[dict[str, Any]] | None = Field(default=None, max_length=1000)
+
+
+@router.post("/v1/tool-approval-policies/preview", tags=["Approval Policies"])
+def preview_policy(body: PolicyPreview):
+    try:
+        policies = (_store().compile_bundle().policies if body.policies is None else
+                    [candidate_policy(item, index) for index, item in enumerate(body.policies)])
+        decision = evaluate(policies, body.backend, body.tool_name, body.tool_input)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except (ApprovalStoreUnavailable, SQLAlchemyError) as exc:
+        raise HTTPException(status_code=503, detail="Approval policy database unavailable") from exc
+    return {"action": decision.action.value, "severity": decision.severity.value,
+            "policy_id": decision.policy.id if decision.policy else None,
+            "subject": decision.subject,
+            "reason": "First matching policy" if decision.policy else f"No matching policy; default {decision.action.value}"}
+
+
+@router.get("/v1/tool-approval-policies/status", tags=["Approval Policies"])
+def policy_status():
+    store = get_tool_approval_policy_store(get_service().config)
+    try:
+        bundle = store.compile_bundle()
+        available, etag = True, bundle.etag
+    except (ApprovalStoreUnavailable, SQLAlchemyError):
+        available, etag = False, None
+    return {
+        "database_available": available, "bundle_etag": etag, "default_action": "allow",
+        "coverage": [
+            {"backend": "mcp", "enforcement": "server", "scope": "first-party bawthub tools", "configured": True},
+            {"backend": "claude-code", "enforcement": "bridge_hooks", "scope": "native tools and external MCP", "configured": None},
+            {"backend": "codex", "enforcement": "unsupported", "configured": None},
+            {"backend": "openclaw", "enforcement": "unsupported", "configured": None},
+            {"backend": "direct", "enforcement": "unsupported", "configured": None},
+        ],
+        "notes": ["Bridge runtime configuration and reload acknowledgements are not reported by this API.",
+                  "Decision audit covers first-party MCP evaluations and Claude bridge gate events; Codex/OpenClaw native tools and direct clients are uncovered.",
+                  "Claude audit uses best-effort Redis delivery and app-side database commits; transport outages, app loss or exhausted persistence retries can leave gaps. Audit failure never changes a bridge gate decision.",
+                  "Audit subjects are fully redacted; invocation hashes correlate exact calls without storing their inputs.",
+                  "Published reload means Redis accepted invalidation, not that any bridge installed this bundle.",
+                  "Policy edits do not rewrite already-approved MCP snapshots; Claude retries re-evaluate current policies and hard deny still wins.",
+                  "Approved operations use immutable snapshots; disabled/deleted operations block new invocations only."],
+    }
+
+
+@router.get("/v1/tool-approval-policies/{policy_id}/revisions", tags=["Approval Policies"])
+def policy_revisions(policy_id: str, limit: int = 50, offset: int = 0):
+    limit, offset = min(max(limit, 1), 200), max(0, offset)
+    try:
+        rows, total = _store().page_revisions(policy_id, limit=limit, offset=offset)
+    except (ApprovalStoreUnavailable, SQLAlchemyError) as exc:
+        raise HTTPException(status_code=503, detail="Approval policy database unavailable") from exc
+    return {"revisions": [row.to_api() for row in rows], "total": total,
+            "limit": limit, "offset": offset}
+
+
+@router.get("/v1/tool-approval-decisions", tags=["Approval Policies"])
+def list_decisions(limit: int = 50, offset: int = 0):
+    limit, offset = min(max(limit, 1), 200), max(0, offset)
+    rows, total = _store().list_decisions(limit=limit, offset=offset)
+    return {"decisions": [row.to_api() for row in rows], "total": total, "limit": limit, "offset": offset}
 
 
 @router.get("/v1/tool-approval-policies/{policy_id}", tags=["Approval Policies"])
@@ -136,7 +215,10 @@ def get_policy(policy_id: str):
 @router.patch("/v1/tool-approval-policies/{policy_id}", tags=["Approval Policies"])
 def update_policy(policy_id: str, body: PolicyUpsert):
     store = _store()
-    row = store.update(policy_id, body.writable())
+    try:
+        row = store.update(policy_id, body.writable())
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
     if row is None:
         raise HTTPException(status_code=404, detail=f"Policy '{policy_id}' not found")
     return row.to_api()
@@ -152,20 +234,28 @@ def delete_policy(policy_id: str):
 
 @router.post("/v1/admin/reload-tool-approval-policies", tags=["Admin"])
 async def reload_policies():
-    """Force every bridge to drop its cached bundle now (no restart).
+    """Publish cache invalidation; delivery is not a bridge installation ACK.
 
-    CRUD edits propagate within the bridge cache TTL on their own; call this to
-    make a change take effect immediately (the admin UI calls it after saves).
+    Claude also refreshes on its cache TTL. Other bridges have no gate here.
     """
     store = _store()
-    bundle = store.compile_bundle()
-    sub = _subscriber()
-    if sub is not None:
-        try:
-            await sub.publish_approval_reload()
-        except Exception:  # noqa: BLE001
-            log.warning("reload publish failed", exc_info=True)
-    return {"status": "reloaded", "etag": bundle.etag, "policies": len(bundle.policies)}
+    try:
+        bundle = store.compile_bundle()
+    except (ApprovalStoreUnavailable, SQLAlchemyError) as exc:
+        raise HTTPException(status_code=503, detail="Approval policy database unavailable") from exc
+    published, subscribers = False, None
+    try:
+        sub = _subscriber()
+        if sub is not None:
+            subscribers = await sub.publish_approval_reload()
+            # None from an older implementation is not proof of publication.
+            published = isinstance(subscribers, int) and not isinstance(subscribers, bool)
+    except Exception:  # noqa: BLE001
+        log.warning("Approval reload publish failed")
+    return {"status": "published" if published else "publish_failed",
+            "published": published, "subscribers": subscribers,
+            "bridge_installed": "unknown", "etag": bundle.etag,
+            "policies": len(bundle.policies)}
 
 
 # ---------------------------------------------------------------------------
@@ -206,6 +296,27 @@ def _normalize_mcp_result(result: Any) -> Any:
     return model_dump() if callable(model_dump) else str(result)
 
 
+def _mcp_result_is_error(result: Any) -> bool:
+    if getattr(result, "isError", False) or getattr(result, "is_error", False):
+        return True
+    if isinstance(result, dict):
+        if (result.get("isError") or result.get("is_error") or result.get("error")
+                or result.get("success") is False or result.get("ok") is False
+                or result.get("status") in ("failed", "error", "denied")
+                or result.get("state") in ("failed", "error", "timed_out", "lost", "cancelled")):
+            return True
+        return any(_mcp_result_is_error(result[key]) for key in ("content", "structuredContent") if key in result)
+    if isinstance(result, (list, tuple)):
+        return any(_mcp_result_is_error(item) for item in result)
+    text = getattr(result, "text", None)
+    if isinstance(text, str):
+        try:
+            return _mcp_result_is_error(json.loads(text))
+        except json.JSONDecodeError:
+            pass
+    return False
+
+
 def _stored_mcp_resolution(row) -> dict[str, Any]:
     result: Any = None
     if row.result_json:
@@ -214,7 +325,7 @@ def _stored_mcp_resolution(row) -> dict[str, Any]:
         except json.JSONDecodeError:
             result = row.result_json
     return {
-        "ok": row.execution_state in (EXEC_SUCCEEDED, EXEC_SKIPPED),
+        "ok": row.execution_state in (EXEC_SUCCEEDED, EXEC_SKIPPED) and not bool(row.result_is_error),
         "detail": "already_resolved",
         "status": row.status,
         "request_id": row.id,
@@ -226,23 +337,29 @@ def _stored_mcp_resolution(row) -> dict[str, Any]:
         "result": result,
         "result_is_error": bool(row.result_is_error),
         "continuation_prompt": None,
-        "server_dispatched": bool(row.continuation_capable),
+        "server_dispatched": row.continuation_state in (CONT_PENDING, CONT_DISPATCHING, CONT_DELIVERED),
         "continuation_status": row.continuation_state,
     }
 
 
 async def _resolve_mcp_request(store, row, *, outcome: str, message: str, resolved_by: str | None):
-    """Resolve + exactly-once execute one MCP-kind approval request."""
+    """Resolve and claim one MCP invocation; replay only idempotent operations."""
     new_status = {
         "approve": REQ_APPROVED,
         "deny": REQ_DENIED,
         "cancel": REQ_CANCELLED,
         "respond": REQ_RESPONDED,
     }[outcome]
-    updated = store.resolve_request(row.id, status=new_status, resolved_by=resolved_by)
+    updated = store.resolve_request(row.id, status=new_status, resolved_by=resolved_by, message=message, continuation_owner="server")
     if updated is None:
         raise HTTPException(status_code=404, detail="Request disappeared during resolve")
 
+    # Concurrent opposing resolvers must obey the persisted winner, not their body.
+    row = updated
+    outcome = {REQ_APPROVED: "approve", REQ_DENIED: "deny", REQ_CANCELLED: "cancel", REQ_RESPONDED: "respond"}.get(row.status, "deny")
+    message = row.resolution_message
+    if row.execution_state in (EXEC_SUCCEEDED, EXEC_FAILED, EXEC_SKIPPED):
+        return _stored_mcp_resolution(row)
     if outcome != "approve":
         if outcome == "cancel":
             payload = {"status": "cancelled", "message": "The MCP call was cancelled."}
@@ -269,6 +386,8 @@ async def _resolve_mcp_request(store, row, *, outcome: str, message: str, resolv
             from ...mcp_server.registry import mcp
 
             stored_args = _decode_stored_args(claimed)
+            if claimed.tool_name == "ops_run" and not claimed.operations_snapshot_json:
+                raise ValueError("Legacy operation approval has no immutable snapshot; create a new approval")
             # Approved ops calls derive job idempotency from the durable approval
             # request. A stale execution lease may be reclaimed after a crash,
             # but the operation service then returns the already-created job.
@@ -276,7 +395,9 @@ async def _resolve_mcp_request(store, row, *, outcome: str, message: str, resolv
                 {"idempotency_key": claimed.id}
                 if claimed.tool_name == "ops_run" else None
             )
-            result = await mcp.call_approved_tool(
+            from ..approval_execution import run_with_execution_lease
+
+            result = await run_with_execution_lease(store, claimed, mcp.call_approved_tool(
                 claimed.tool_name,
                 stored_args,
                 expected_invocation_hash=claimed.invocation_hash or "",
@@ -290,26 +411,25 @@ async def _resolve_mcp_request(store, row, *, outcome: str, message: str, resolv
                     session_key=claimed.session_key or "",
                     backend=claimed.backend or "",
                     approval_request_id=claimed.id,
+                    operations_snapshot=json.loads(claimed.operations_snapshot_json) if claimed.operations_snapshot_json else None,
                 ),
-            )
+            ))
             payload = _normalize_mcp_result(result)
-            completed = store.complete_mcp_execution(
-                row.id,
-                result_json=json.dumps(payload, ensure_ascii=False, default=str),
-                is_error=False,
-            )
+            is_error = _mcp_result_is_error(result) or _mcp_result_is_error(payload)
+            execution_error = "Tool returned an error result" if is_error else None
+        except ApprovalExecutionLeaseLost:
+            raise
         except Exception as error:  # noqa: BLE001
             log.exception("Approved MCP execution failed id=%s", row.id)
             payload = {"status": "failed", "error": str(error)}
-            completed = store.complete_mcp_execution(
-                row.id,
-                result_json=json.dumps(payload, ensure_ascii=False),
-                is_error=True,
-                error=str(error),
-            )
+            is_error, execution_error = True, str(error)
+        # Persistence failures are not tool failures; leave the claim for safe recovery.
+        completed = store.complete_mcp_execution(
+            row.id, result_json=json.dumps(payload, ensure_ascii=False, default=str),
+            is_error=is_error, error=execution_error, claim_token=claimed.execution_claim_token,
+        )
     if completed is None:
         raise HTTPException(status_code=500, detail="Could not persist MCP execution result")
-    completed = store.enqueue_continuation(row.id) or completed
     response = _stored_mcp_resolution(completed)
     response["detail"] = completed.status
     response["already_resolved"] = False
@@ -317,10 +437,20 @@ async def _resolve_mcp_request(store, row, *, outcome: str, message: str, resolv
 
 
 @router.get("/v1/tool-approval-requests", tags=["Approval Policies"])
-def list_requests(status: str | None = None, bot_id: str | None = None, limit: int = 50):
+def list_requests(status: str | None = None, bot_id: str | None = None, limit: int = 50, offset: int = 0):
     store = _store()
-    rows = store.list_requests(status=status, bot_id=bot_id, limit=min(max(limit, 1), 200))
-    return {"requests": [r.to_api() for r in rows], "total": len(rows)}
+    limit, offset = min(max(limit, 1), 200), max(offset, 0)
+    rows = store.list_requests(status=status, bot_id=bot_id, limit=limit, offset=offset)
+    return {"requests": [r.to_api() for r in rows],
+            "total": store.count_requests(status=status, bot_id=bot_id), "limit": limit, "offset": offset}
+
+
+@router.get("/v1/tool-approval-requests/{request_id}/result", tags=["Approval Policies"])
+def request_result(request_id: str):
+    row = _store().get_request(request_id)
+    if row is None:
+        raise HTTPException(status_code=404, detail="Approval request not found")
+    return _stored_mcp_resolution(row)
 
 
 @router.post("/v1/chat/approvals/{request_id}/resolve", tags=["Approval Policies"])
@@ -358,16 +488,13 @@ async def resolve_approval(request_id: str, body: ResolveRequest):
         )
     approved = outcome == "approve"
 
-    subject = row.subject or ""
-    bot_id = body.bot_id or row.bot_id
-    user_id = body.user_id or row.user_id
+    bot_id = row.bot_id
+    user_id = row.user_id
     message = (body.message or "").strip()
 
     if row.request_kind == KIND_MCP:
         # MCP approvals are server-owned: execute the exact stored invocation
         # once, persist its actual result, and never ask the model to re-issue.
-        if row.status != "pending":
-            return _stored_mcp_resolution(row)
         result = await _resolve_mcp_request(
             store,
             row,
@@ -380,98 +507,56 @@ async def resolve_approval(request_id: str, body: ResolveRequest):
         )
         return result
 
-    if row.status != "pending":
-        # Idempotent replay — return the same continuation the first resolve did.
-        # Cancelled requests never carried a continuation, so replay returns none.
-        if row.status == REQ_CANCELLED:
-            prompt = None
-        elif row.status == REQ_RESPONDED:
-            prompt = build_respond_prompt(message, subject, row.tool_name)
-        else:
-            prompt = build_continuation_prompt(row.status == REQ_APPROVED, subject, row.tool_name)
-        return {
-            "ok": True, "detail": "already_resolved", "status": row.status,
-            "request_id": request_id, "bot_id": bot_id,
-            "continuation_prompt": prompt, "parent_turn_id": row.turn_id,
-            "already_resolved": True,
-        }
-
-    new_status = {
-        "approve": REQ_APPROVED,
-        "deny": REQ_DENIED,
-        "cancel": REQ_CANCELLED,
-        "respond": REQ_RESPONDED,
-    }[outcome]
-    updated = store.resolve_request(
-        request_id, status=new_status, resolved_by=body.resolved_by,
+    already_resolved = row.status != "pending"
+    new_status = {"approve": REQ_APPROVED, "deny": REQ_DENIED,
+                  "cancel": REQ_CANCELLED, "respond": REQ_RESPONDED}[outcome]
+    row = store.resolve_request(
+        request_id, status=new_status, resolved_by=body.resolved_by, message=message,
+        continuation_owner="server" if body.dispatch_continuation else "client",
     )
-    if updated is None:
+    if row is None:
         raise HTTPException(status_code=404, detail="Request disappeared during resolve")
-
-    # TASK-305: stamp the tool_call_record so the approval card survives reload.
+    approved = row.status == REQ_APPROVED
+    prompt = (None if row.status == REQ_CANCELLED else
+              build_respond_prompt(row.resolution_message, row.subject, row.tool_name)
+              if row.status == REQ_RESPONDED else
+              build_continuation_prompt(approved, row.subject, row.tool_name))
     try:
-        turn_log_store = get_turn_log_store()
-        turn_log_store.set_approval_status(
-            tool_use_id=request_id,  # approval request id == gated call's tool_use_id
-            approval_request_id=request_id,
-            approval_status=new_status,
-        )
+        get_turn_log_store().set_approval_status(
+            tool_use_id=request_id, approval_request_id=request_id, approval_status=row.status)
     except Exception:
-        log.debug("Could not stamp tool_call_record approval status for %s", request_id, exc_info=True)
+        log.debug("Could not stamp approval tool card %s", request_id, exc_info=True)
 
-    subscriber = _subscriber()
-    if approved and subscriber is not None:
-        # Grant the bridge a one-shot allow BEFORE the client dispatches the
-        # continuation turn, so the re-issued tool call sails through.
-        try:
-            await subscriber.send_approval_grant(
-                session_key=row.session_key or "main",
-                grant_key=row.grant_key,
-                backend=row.backend,
-                request_id=request_id,
-            )
-        except Exception:  # noqa: BLE001
-            log.exception("Failed to send approval.grant for %s", request_id)
-
-    await _fanout_resolved(subscriber, bot_id, user_id, request_id, row.turn_id, new_status)
-
-    # Cancel is silent: no continuation turn, so the agent is never told and
-    # spends no tokens acknowledging. Respond sends the user's own guidance.
-    # Approve/deny return the canned prompt the client dispatches to resume
-    # (approve) or close out (deny) the turn.
-    if outcome == "cancel":
-        prompt = None
-    elif outcome == "respond":
-        prompt = build_respond_prompt(message, subject, row.tool_name)
-    else:
-        prompt = build_continuation_prompt(approved, subject, row.tool_name)
-    # Dispatch the continuation SERVER-SIDE (default) so the bot is reliably
-    # messaged regardless of which surface resolved this. Skipped for cancel
-    # (silent by design) and when the caller opts to dispatch it itself.
-    server_dispatched = False
-    if prompt and body.dispatch_continuation:
-        spawn_continuation(
-            bot_id=bot_id,
-            user_id=user_id,
-            prompt=prompt,
-            parent_turn_id=row.turn_id,
-            # Only an approve carries a one-shot grant that must settle first.
-            grant_settle_s=0.75 if approved else 0.0,
-        )
-        server_dispatched = True
-    log.info(
-        "Approval %s: id=%s bot=%s subject=%r — %s",
-        new_status, request_id, bot_id, subject[:80],
-        "silent cancel (no continuation)" if outcome == "cancel"
-        else "server dispatched continuation" if server_dispatched
-        else "client will dispatch continuation",
-    )
+    if prompt and row.continuation_owner == "server":
+        row = store.prepare_harness_continuation(request_id)
+    elif approved and row.continuation_owner == "client" and row.grant_state != "sent":
+        subscriber = _subscriber()
+        if subscriber is None:
+            store.set_grant_state(request_id, "failed", "Approval bridge unavailable")
+            raise HTTPException(status_code=503, detail="Approval recorded, but bridge grant unavailable; retry resolution")
+        if store.claim_client_grant(request_id):
+            try:
+                await subscriber.send_approval_grant(
+                    session_key=row.session_key or "main", grant_key=row.grant_key,
+                    backend=row.backend, request_id=request_id)
+            except Exception as exc:
+                # Redis may have accepted a send whose response was lost. Never blindly re-grant.
+                store.set_grant_state(request_id, "uncertain", str(exc))
+                raise HTTPException(status_code=503, detail="Approval grant delivery uncertain; manual reconciliation required") from exc
+            store.set_grant_state(request_id, "sent")
+        else:
+            row = store.get_request(request_id)
+            if row.grant_state != "sent":
+                raise HTTPException(status_code=503, detail="Approval grant is dispatching or uncertain; do not dispatch continuation")
+    await _fanout_resolved(_subscriber(), bot_id, user_id, request_id, row.turn_id, row.status)
+    server_owned = row.continuation_owner == "server" and prompt is not None
     return {
-        "ok": True, "detail": new_status, "status": new_status,
-        "request_id": request_id, "bot_id": bot_id,
-        "continuation_prompt": prompt, "parent_turn_id": row.turn_id,
-        "cancelled": outcome == "cancel",
-        "server_dispatched": server_dispatched,
+        "ok": True, "detail": "already_resolved" if already_resolved else row.status,
+        "status": row.status, "request_id": request_id, "bot_id": bot_id,
+        "continuation_prompt": None if server_owned else prompt, "parent_turn_id": row.turn_id,
+        "already_resolved": already_resolved, "cancelled": row.status == REQ_CANCELLED,
+        "server_dispatched": server_owned and row.continuation_state in (CONT_PENDING, CONT_DISPATCHING, CONT_DELIVERED),
+        "continuation_status": row.continuation_state, "continuation_owner": row.continuation_owner,
     }
 
 

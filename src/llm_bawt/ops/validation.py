@@ -1,187 +1,158 @@
-"""Minimal JSON Schema validator for the ops catalog (TASK-639).
+"""Strict, deliberately bounded JSON Schema subset for the operations catalog.
 
-Purpose-built to validate ``ops_run`` args against the operation's stored
-``args_schema_json``. Deliberately does NOT depend on the ``jsonschema``
-package — adding a runtime dep would require rebuilding the app image, and
-this subset is small enough to inline safely.
-
-Supports the JSON Schema constructs the seed catalog actually uses:
-
-* ``type`` — ``"object"``, ``"string"``, ``"integer"``, ``"number"``,
-  ``"boolean"``, ``"null"``, ``"array"``
-* ``additionalProperties: false`` — ALWAYS enforced regardless of the schema,
-  so unknown args are rejected even if the operator omits the flag
-* ``required`` — list of required property names
-* ``properties`` — per-key nested schemas
-* ``enum`` — string enum on a scalar
-* ``minLength`` / ``maxLength`` — for strings
-* ``pattern`` — regex on strings
-
-Any construct the schema uses that isn't in this list is passed through
-without validation (with a debug log). That's acceptable for TASK-639: the
-threat model is "agent supplied wrong args", not "operator supplied malicious
-schema". The operator writes both the script and the schema; a schema they
-wrote to be permissive is their call.
+Unsupported keywords are rejected, not silently ignored. All objects are closed;
+``{}`` at the root means no arguments. No external references or dependencies.
 """
-
 from __future__ import annotations
 
 import json
-import logging
+import math
 import re
 from typing import Any
 
-logger = logging.getLogger(__name__)
-
 
 class ArgValidationError(ValueError):
-    """Raised when the caller-supplied args don't satisfy the operation schema.
-
-    Carries a list of specific violations so the MCP tool response can point
-    the agent at exactly what to fix.
-    """
-
     def __init__(self, violations: list[str]):
         self.violations = list(violations)
-        joined = "; ".join(violations)
-        super().__init__(f"args validation failed: {joined}")
+        super().__init__("args validation failed: " + "; ".join(violations))
 
 
-_PRIMITIVE_TYPES: dict[str, type | tuple[type, ...]] = {
-    "string": str,
-    "integer": int,
-    "number": (int, float),
-    "boolean": bool,
-    "null": type(None),
-    "array": list,
-    "object": dict,
-}
+_TYPES = {"object": dict, "array": list, "string": str, "integer": int,
+          "number": (int, float), "boolean": bool, "null": type(None)}
+_KEYWORDS = {"type", "properties", "required", "additionalProperties", "items",
+             "enum", "minimum", "maximum", "minLength", "maxLength", "pattern",
+             "minItems", "maxItems", "description", "title", "default", "x-sensitive"}
 
 
-def _check_type(value: Any, expected: str) -> str | None:
-    if expected not in _PRIMITIVE_TYPES:
-        return None  # unknown → skip
-    # bool is a subclass of int; JSON Schema treats them separately.
-    if expected == "integer" and isinstance(value, bool):
-        return "expected integer, got boolean"
-    if expected == "number" and isinstance(value, bool):
-        return "expected number, got boolean"
-    expected_types = _PRIMITIVE_TYPES[expected]
-    if not isinstance(value, expected_types):
-        return f"expected {expected}, got {type(value).__name__}"
-    return None
+def canonical_json(value: Any) -> str:
+    return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False)
 
 
-def _validate_scalar(value: Any, schema: dict[str, Any], path: str) -> list[str]:
-    problems: list[str] = []
-    if "type" in schema:
-        err = _check_type(value, schema["type"])
-        if err:
-            problems.append(f"{path}: {err}")
-            return problems  # bail — further checks assume the type is right
-    if "enum" in schema:
-        if value not in schema["enum"]:
-            problems.append(
-                f"{path}: value {value!r} not in enum {list(schema['enum'])}"
-            )
-    if isinstance(value, str):
-        if "minLength" in schema and len(value) < int(schema["minLength"]):
-            problems.append(f"{path}: shorter than minLength {schema['minLength']}")
-        if "maxLength" in schema and len(value) > int(schema["maxLength"]):
-            problems.append(f"{path}: longer than maxLength {schema['maxLength']}")
-        if "pattern" in schema:
-            try:
-                if not re.search(schema["pattern"], value):
-                    problems.append(f"{path}: does not match pattern")
-            except re.error:
-                # Bad schema regex — operator problem, log and continue.
-                logger.debug("Invalid regex in schema at %s: %r", path, schema["pattern"])
-    if isinstance(value, (int, float)) and not isinstance(value, bool):
-        if "minimum" in schema and value < schema["minimum"]:
-            problems.append(f"{path}: below minimum {schema['minimum']}")
-        if "maximum" in schema and value > schema["maximum"]:
-            problems.append(f"{path}: above maximum {schema['maximum']}")
-    return problems
-
-
-def _validate_object(
-    value: Any,
-    schema: dict[str, Any],
-    path: str,
-) -> list[str]:
-    problems: list[str] = []
-    if not isinstance(value, dict):
-        return [f"{path}: expected object, got {type(value).__name__}"]
-    properties: dict[str, Any] = schema.get("properties", {}) or {}
-    required: list[str] = list(schema.get("required", []) or [])
-
-    # TASK-639 invariant: unknown keys are ALWAYS rejected. The schema-level
-    # ``additionalProperties`` flag is enforced regardless of its value —
-    # operators can't accidentally leave the door open.
-    extras = [k for k in value.keys() if k not in properties]
-    for k in extras:
-        problems.append(f"{path}: unknown property {k!r}")
-
-    for req in required:
-        if req not in value:
-            problems.append(f"{path}: required property {req!r} missing")
-
-    for k, subschema in properties.items():
-        if k not in value:
-            continue
-        sub_path = f"{path}.{k}" if path else k
-        if isinstance(subschema, dict) and subschema.get("type") == "object":
-            problems.extend(_validate_object(value[k], subschema, sub_path))
-        else:
-            problems.extend(_validate_scalar(value[k], subschema or {}, sub_path))
-
-    return problems
-
-
-def validate_args(
-    args: dict[str, Any],
-    schema_json: str,
-    defaults_json: str | None = None,
-) -> dict[str, Any]:
-    """Validate ``args`` against ``schema_json``. Returns the merged args
-    (defaults applied where the caller left a key out).
-
-    Raises :class:`ArgValidationError` on any schema violation, listing every
-    specific problem so the MCP tool response can be actionable.
-    """
+def _object_json(raw: str | dict, label: str) -> dict:
     try:
-        schema = json.loads(schema_json or "{}")
-    except (json.JSONDecodeError, TypeError) as exc:
-        raise ArgValidationError([f"operation schema is not valid JSON: {exc}"]) from exc
+        value = json.loads(raw) if isinstance(raw, str) else raw
+        canonical_json(value)
+    except (ValueError, TypeError) as exc:
+        raise ArgValidationError([f"{label} is not valid JSON: {exc}"]) from exc
+    if not isinstance(value, dict):
+        raise ArgValidationError([f"{label} must be an object"])
+    return value
 
-    defaults: dict[str, Any] = {}
-    if defaults_json:
+
+def _check_schema(schema: Any, path: str, *, root: bool = False) -> None:
+    def fail(message):
+        raise ArgValidationError([f"{path}: {message}"])
+    if not isinstance(schema, dict):
+        fail("schema must be an object")
+    unknown = set(schema) - _KEYWORDS
+    if unknown:
+        fail(f"unsupported schema keywords: {sorted(unknown)}")
+    kind = schema.get("type", "object" if root or "properties" in schema else None)
+    if not isinstance(kind, str) or kind not in _TYPES:
+        fail("schema type must be one supported type")
+    if root and kind != "object":
+        fail("root schema type must be object")
+    for keywords, expected in (({"properties", "required", "additionalProperties"}, "object"),
+                               ({"minLength", "maxLength", "pattern"}, "string"),
+                               ({"minItems", "maxItems", "items"}, "array")):
+        if keywords & schema.keys() and kind != expected:
+            fail(f"{sorted(keywords & schema.keys())} requires {expected} type")
+    if {"minimum", "maximum"} & schema.keys() and kind not in ("integer", "number"):
+        fail("numeric bounds require integer or number type")
+    for key in ("description", "title"):
+        if key in schema and not isinstance(schema[key], str):
+            fail(f"{key} must be a string")
+    if "x-sensitive" in schema and type(schema["x-sensitive"]) is not bool:
+        fail("x-sensitive must be boolean")
+    if "additionalProperties" in schema and not isinstance(schema["additionalProperties"], bool):
+        fail("additionalProperties must be boolean (objects are always closed)")
+    if "properties" in schema and kind != "object":
+        fail("properties requires object type")
+    props = schema.get("properties", {})
+    if not isinstance(props, dict):
+        fail("properties must be an object")
+    for key, sub in props.items():
+        _check_schema(sub, f"{path}.{key}")
+    required = schema.get("required", [])
+    if not isinstance(required, list) or any(not isinstance(x, str) or x not in props for x in required):
+        fail("required must list declared property names")
+    if len(set(required)) != len(required):
+        fail("required contains duplicate names")
+    if kind == "array":
+        if "items" not in schema:
+            fail("array schema requires items")
+        _check_schema(schema["items"], path + "[]")
+    elif "items" in schema:
+        fail("items requires array type")
+    for key in ("minLength", "maxLength", "minItems", "maxItems"):
+        if key in schema and (type(schema[key]) is not int or schema[key] < 0):
+            fail(f"{key} must be a nonnegative integer")
+    for key in ("minimum", "maximum"):
+        if key in schema and (type(schema[key]) not in (int, float) or not math.isfinite(schema[key])):
+            fail(f"{key} must be a finite number")
+    for low, high in (("minimum", "maximum"), ("minLength", "maxLength"), ("minItems", "maxItems")):
+        if low in schema and high in schema and schema[low] > schema[high]:
+            fail(f"{low} exceeds {high}")
+    if "pattern" in schema:
         try:
-            defaults = json.loads(defaults_json) or {}
-        except (json.JSONDecodeError, TypeError):
-            defaults = {}
-        if not isinstance(defaults, dict):
-            defaults = {}
+            re.compile(schema["pattern"])
+        except (re.error, TypeError):
+            fail("pattern is not a valid regex")
+    if "enum" in schema and (not isinstance(schema["enum"], list) or not schema["enum"]):
+        fail("enum must be a nonempty array")
+    if "default" in schema:
+        problems = _validate(schema["default"], schema, path + ".default")
+        if problems:
+            raise ArgValidationError(problems)
 
+
+def _validate(value: Any, schema: dict, path: str, *, partial: bool = False) -> list[str]:
+    kind = schema.get("type", "object")
+    if not isinstance(value, _TYPES[kind]) or (kind in ("integer", "number") and isinstance(value, bool)):
+        return [f"{path}: expected {kind}, got {type(value).__name__}"]
+    errors = []
+    if "enum" in schema and not any(canonical_json(value) == canonical_json(x) for x in schema["enum"]):
+        errors.append(f"{path}: value not in enum")
+    if kind == "object":
+        props = schema.get("properties", {})
+        errors += [f"{path}: unknown property {k!r}" for k in value if k not in props]
+        if not partial:
+            errors += [f"{path}: required property {k!r} missing" for k in schema.get("required", []) if k not in value]
+        for k in value.keys() & props.keys():
+            errors += _validate(value[k], props[k], f"{path}.{k}")
+    if kind == "array":
+        for i, item in enumerate(value):
+            errors += _validate(item, schema["items"], f"{path}[{i}]")
+    for low, high, amount in (("minLength", "maxLength", len(value) if kind == "string" else None),
+                              ("minItems", "maxItems", len(value) if kind == "array" else None),
+                              ("minimum", "maximum", value if kind in ("integer", "number") else None)):
+        if amount is not None:
+            if low in schema and amount < schema[low]:
+                errors.append(f"{path}: below {low}")
+            if high in schema and amount > schema[high]:
+                errors.append(f"{path}: above {high}")
+    if kind == "string" and "pattern" in schema and not re.search(schema["pattern"], value):
+        errors.append(f"{path}: does not match pattern")
+    return errors
+
+
+def validate_catalog(schema_json: str, defaults_json: str = "{}") -> tuple[dict, dict]:
+    schema = _object_json(schema_json, "operation schema")
+    defaults = _object_json(defaults_json, "operation defaults")
+    _check_schema(schema, "schema", root=True)
+    errors = _validate(defaults, schema, "defaults", partial=True)
+    if errors:
+        raise ArgValidationError(errors)
+    return schema, defaults
+
+
+def validate_args(args: dict[str, Any], schema_json: str, defaults_json: str | None = None) -> dict[str, Any]:
+    schema, defaults = validate_catalog(schema_json, defaults_json if defaults_json is not None else "{}")
     if not isinstance(args, dict):
         raise ArgValidationError(["args must be an object"])
-
-    # Merge: caller-supplied wins; defaults only fill absent keys AND only
-    # if the key is declared in the schema (defaults for undeclared keys are
-    # a footgun that would defeat additionalProperties=false).
-    properties: dict[str, Any] = schema.get("properties", {}) or {}
-    merged: dict[str, Any] = {}
-    for k, v in defaults.items():
-        if k in properties and k not in args:
-            merged[k] = v
-    merged.update(args)
-
-    problems = _validate_object(merged, schema, path="args") if schema else []
-
-    if problems:
-        raise ArgValidationError(problems)
-
-    return merged
-
-
-__all__ = ["validate_args", "ArgValidationError"]
+    supplied = _object_json(args, "args")
+    merged = {**defaults, **supplied}
+    errors = _validate(merged, schema, "args")
+    if errors:
+        raise ArgValidationError(errors)
+    return json.loads(canonical_json(merged))

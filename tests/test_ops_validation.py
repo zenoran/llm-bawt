@@ -12,6 +12,7 @@ Verifies the minimal in-house JSON Schema validator:
 from __future__ import annotations
 
 import json
+import pytest
 
 from llm_bawt.ops.validation import ArgValidationError, validate_args
 
@@ -72,7 +73,7 @@ def test_integer_type_rejects_boolean():
     try:
         validate_args({"n": True}, schema)
     except ArgValidationError as exc:
-        raised = "boolean" in "; ".join(exc.violations)
+        raised = "bool" in "; ".join(exc.violations)
     assert raised
 
 
@@ -100,13 +101,13 @@ def test_string_length_constraints():
     try:
         validate_args({"s": "x"}, schema)
     except ArgValidationError as exc:
-        raised = "shorter than minLength" in "; ".join(exc.violations)
+        raised = "below minLength" in "; ".join(exc.violations)
     assert raised
     raised = False
     try:
         validate_args({"s": "xxxxxx"}, schema)
     except ArgValidationError as exc:
-        raised = "longer than maxLength" in "; ".join(exc.violations)
+        raised = "above maxLength" in "; ".join(exc.violations)
     assert raised
     assert validate_args({"s": "xxx"}, schema) == {"s": "xxx"}
 
@@ -135,9 +136,9 @@ def test_numeric_bounds():
 def test_defaults_fill_declared_missing_keys_only():
     schema = _schema(properties={"level": {"type": "string"}, "n": {"type": "integer"}})
     defaults = json.dumps({"level": "info", "n": 3, "extra": "nope"})
-    merged = validate_args({"n": 5}, schema, defaults)
-    assert merged == {"level": "info", "n": 5}
-    # 'extra' was not declared → default is NOT smuggled in.
+    with pytest.raises(ArgValidationError, match="unknown property"):
+        validate_args({"n": 5}, schema, defaults)
+    assert validate_args({"n": 5}, schema, '{"level":"info","n":3}') == {"level": "info", "n": 5}
 
 
 def test_multiple_violations_all_reported():
@@ -155,6 +156,12 @@ def test_multiple_violations_all_reported():
         caught = exc
     assert caught is not None
     assert len(caught.violations) >= 2  # bad enum + missing required 'n'
+
+
+@pytest.mark.parametrize("schema", [{"type": []}, {"type": {}}, {"properties": {"x": {"type": ["string", "null"]}}}])
+def test_non_scalar_schema_type_rejected_as_validation_error(schema):
+    with pytest.raises(ArgValidationError):
+        validate_args({}, json.dumps(schema))
 
 
 def test_non_dict_args_rejected():

@@ -79,6 +79,7 @@ def _mcp_req(**over):
         prompt="Approve restart?",
         invocation_hash="deadbeef" * 8,
         continuation_capable=True,
+        operations_snapshot={"operation_slug": "llm-bawt.restart-app", "args": {}},
     )
     base.update(over)
     return base
@@ -395,12 +396,12 @@ def test_mark_continuation_failed_terminates_after_max_attempts():
     for _ in range(5):
         store.claim_continuation("req-mcp-1", lease_seconds=0)
         store.mark_continuation_failed(
-            "req-mcp-1", error="broken", max_attempts=5, backoff_seconds=1,
+            "req-mcp-1", error="broken", max_attempts=5, backoff_seconds=0,
         )
     row = store.claim_continuation("req-mcp-1", lease_seconds=0)  # last claim
     # After hitting max, the mark on the LAST attempt sets CONT_FAILED
     store.mark_continuation_failed(
-        "req-mcp-1", error="broken", max_attempts=5, backoff_seconds=1,
+        "req-mcp-1", error="broken", max_attempts=5, backoff_seconds=0,
     )
     with Session(store.engine) as s:
         final = s.get(ToolApprovalRequest, "req-mcp-1")

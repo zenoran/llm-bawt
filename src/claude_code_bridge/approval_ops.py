@@ -3,12 +3,15 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import math
 import os
 import re
 import time
 import uuid
 from collections.abc import AsyncIterable
+from dataclasses import dataclass
 from datetime import datetime, timezone
+from hashlib import sha256
 from pathlib import Path
 
 import httpx
@@ -71,6 +74,18 @@ from ._bridge_helpers import (
 logger = logging.getLogger("claude_code_bridge.bridge")
 
 
+@dataclass
+class _PendingApproval:
+    """Process-local authority minted only when this bridge gates a real call."""
+
+    grant_key: str
+    origin_request_id: str
+    expires_at: float
+    state: str = "pending"
+    grant_expires_at: float = 0.0
+    continuation_request_id: str = ""
+
+
 class ClaudeApprovalMixin:
     """Claude tool approval gate + permission hooks (TASK-555).
 
@@ -124,37 +139,103 @@ class ClaudeApprovalMixin:
             self._policy_fetch_ok = False
             return self._policy_bundle or PolicyBundle(version=1, etag="", policies=[])
 
-    def _grant_approval(self, grant_key: str, ttl_seconds: float) -> None:
-        if not grant_key:
-            return
-        self._approval_grants[grant_key] = time.monotonic() + max(1.0, ttl_seconds)
-        logger.info("Approval grant stored: %s (ttl=%ss)", grant_key[:12], int(ttl_seconds))
-
-    def _consume_grant(self, grant_key: str) -> bool:
-        """Pop a live grant for this key. Prunes expired grants as a side effect."""
+    def _pending_approval_records(self) -> dict[tuple[str, str], _PendingApproval]:
+        # Separate from the old global key->expiry map: never promote legacy
+        # unscoped grants during a rolling update. Restart loses authority safely.
+        if not hasattr(self, "_pending_approvals"):
+            self._pending_approvals: dict[tuple[str, str], _PendingApproval] = {}
         now = time.monotonic()
-        # prune
-        expired = [k for k, exp in self._approval_grants.items() if exp <= now]
-        for k in expired:
-            self._approval_grants.pop(k, None)
-        exp = self._approval_grants.get(grant_key)
-        if exp is None or exp <= now:
+        for key, record in list(self._pending_approvals.items()):
+            if record.expires_at <= now:
+                del self._pending_approvals[key]
+        return self._pending_approvals
+
+    def _remember_approval(
+        self, grant_key: str, session_key: str, approval_request_id: str,
+        origin_request_id: str,
+    ) -> None:
+        if not all((grant_key, session_key, approval_request_id, origin_request_id)):
+            return
+        records = self._pending_approval_records()
+        key = (session_key, approval_request_id)
+        # Never overwrite granted/consumed records on a duplicate hook/event.
+        # Bounded memory; saturation denies new grants rather than evicting live
+        # replay protection. Expired requests require a freshly gated tool call.
+        if key not in records and len(records) < 10000:
+            records[key] = _PendingApproval(
+                grant_key, origin_request_id, time.monotonic() + 86400,
+            )
+
+    def _grant_approval(
+        self, grant_key: str, ttl_seconds: float, *,
+        session_key: str = "", request_id: str = "",
+    ) -> bool:
+        """Activate the exact original approval request, once, in its session.
+
+        ``request_id`` is the approval/tool-use ID, NOT the continuation turn's
+        agent request ID (the existing Redis producer contract). Duplicate
+        deliveries never extend expiry or resurrect a consumed grant. Missing
+        context, unsolicited grants, and pre-upgrade requests fail closed.
+        """
+        if not all((grant_key, session_key, request_id)) or not math.isfinite(ttl_seconds):
             return False
-        self._approval_grants.pop(grant_key, None)
+        if ttl_seconds <= 0:
+            return False
+        record = self._pending_approval_records().get((session_key, request_id))
+        if record is None or record.state != "pending" or record.grant_key != grant_key:
+            return False
+        # Same durable identity as approval_request_store._continuation_id and
+        # approval_continuations._continuation_identity. The grant transport
+        # carries the approval ID, not an arbitrary future turn's request ID.
+        record.continuation_request_id = (
+            "req_delivery_approval_approval-cont-"
+            + sha256(request_id.encode()).hexdigest()[:32]
+        )
+        record.state = "granted"
+        record.grant_expires_at = min(
+            record.expires_at, time.monotonic() + min(ttl_seconds, 600.0),
+        )
+        logger.info("Approval grant stored: %s session=%s request=%s", grant_key[:12], session_key, request_id)
         return True
 
-    def _decide_approval(self, tool_name: str, tool_input: dict) -> ApprovalDecision:
-        """Pure policy decision for the current cached bundle (TASK-292).
+    def _consume_grant(
+        self, grant_key: str, *, session_key: str = "", request_id: str = "",
+    ) -> bool:
+        """Consume a grant only in its server-owned continuation request.
 
-        Isolated from the SDK/HTTP glue so it's unit-testable: inject a bundle
-        and grants, assert the action. Does NOT consume grants (the caller does,
-        only when it's actually going to allow).
+        Same session and invocation alone do not authorize an unrelated turn.
+        The deterministic continuation ID binds consumption to the approved
+        request; client-owned arbitrary turn IDs fail closed until their
+        producer supplies this same binding. No global/subject-only fallback.
         """
+        if not all((grant_key, session_key, request_id)):
+            return False
+        now = time.monotonic()
+        for (session, _), record in self._pending_approval_records().items():
+            if (session == session_key and record.grant_key == grant_key
+                    and record.state == "granted" and record.grant_expires_at > now
+                    and record.origin_request_id != request_id
+                    and record.continuation_request_id == request_id):
+                record.state = "consumed"
+                return True
+        return False
+
+    def _decide_approval(
+        self, tool_name: str, tool_input: dict, *, cwd: str | None = None,
+    ) -> ApprovalDecision:
+        """Evaluate matching separately from exact input/cwd authorization."""
         bundle = self._policy_bundle or PolicyBundle(version=1, etag="", policies=[])
-        return evaluate_policies(
-            bundle.policies, self._backend_name, tool_name,
-            tool_input if isinstance(tool_input, dict) else {},
-        )
+        try:
+            return evaluate_policies(
+                bundle.policies, self._backend_name, tool_name, tool_input,
+                cwd=cwd if cwd is not None else self._cwd, exact_invocation=True,
+            )
+        except (TypeError, ValueError, RecursionError):
+            # Do not let an unhashable/non-JSON invocation fall through the
+            # generic hook-error default allow or acquire a lossy identity.
+            return ApprovalDecision(
+                action=PolicyAction.DENY, subject="Invalid tool invocation identity",
+            )
 
     async def _evaluate_tool_gate(
         self,
@@ -164,6 +245,8 @@ class ClaudeApprovalMixin:
         request_id: str,
         session_key: str,
         seq_holder: list[int],
+        *,
+        cwd: str | None = None,
     ):
         """Permission decision for a non-question tool (TASK-292).
 
@@ -179,6 +262,11 @@ class ClaudeApprovalMixin:
             logger.warning(
                 "Approval fail-closed: policies unreachable, denying %s", tool_name
             )
+            self._emit_approval_decision(
+                ApprovalDecision(action=PolicyAction.DENY, subject=""),
+                tool_name, (ctx.tool_use_id or "").strip(),
+                request_id, session_key, seq_holder, outcome="policy_unavailable",
+            )
             return PermissionResultDeny(
                 message=(
                     "[Tool execution is paused: the approval-policy service is "
@@ -188,7 +276,11 @@ class ClaudeApprovalMixin:
                 interrupt=False,
             )
 
-        decision = self._decide_approval(tool_name, tool_input)
+        decision = self._decide_approval(tool_name, tool_input, cwd=cwd)
+        self._emit_approval_decision(
+            decision, tool_name, (ctx.tool_use_id or "").strip(),
+            request_id, session_key, seq_holder,
+        )
 
         if decision.action is PolicyAction.ALLOW:
             return PermissionResultAllow()
@@ -208,7 +300,9 @@ class ClaudeApprovalMixin:
             )
 
         # ---- require_approval ----
-        if self._consume_grant(decision.grant_key):
+        if self._consume_grant(
+            decision.grant_key, session_key=session_key, request_id=request_id,
+        ):
             logger.info(
                 "Tool ALLOWED by prior approval grant: %s %r",
                 tool_name, decision.subject[:80],
@@ -237,6 +331,28 @@ class ClaudeApprovalMixin:
         )
         return PermissionResultDeny(message=self._APPROVAL_PENDING_ACK, interrupt=False)
 
+    def _emit_approval_decision(
+        self, decision, tool_name, tool_use_id, request_id, session_key,
+        seq_holder, *, outcome=None,
+    ) -> None:
+        """Existing Redis event transport only; never wait for app HTTP/DB.
+
+        Best-effort emission, not a durable receipt. App commits received events.
+        No arguments, command text, cwd, or capability enters this audit payload.
+        """
+        from agent_bridge.approval_audit import decision_metadata
+        try:
+            seq_holder[0] += 1
+            self._publish_event(
+                request_id, session_key, seq_holder[0],
+                kind=AgentEventKind.APPROVAL_DECISION,
+                tool_name=tool_name, tool_use_id=tool_use_id,
+                extra_raw=decision_metadata(decision, self._policy_bundle, outcome=outcome),
+            )
+        except Exception:
+            logger.warning("Bridge decision audit emission failed request=%s tool_use=%s",
+                           request_id, tool_use_id)
+
     def _emit_approval_required(
         self,
         decision: ApprovalDecision,
@@ -254,6 +370,7 @@ class ClaudeApprovalMixin:
         (_evaluate_tool_gate_hook). Best-effort: a publish failure is logged,
         never raised — the caller still ends the turn with the pending-ack.
         """
+        self._remember_approval(decision.grant_key, session_key, tool_use_id, request_id)
         try:
             seq_holder[0] += 1
             self._publish_event(
@@ -300,6 +417,10 @@ class ClaudeApprovalMixin:
         the client must not re-derive it. Best-effort: a publish failure is
         logged, never raised — the tool still runs.
         """
+        self._emit_approval_decision(
+            decision, tool_name, tool_use_id, request_id, session_key,
+            seq_holder, outcome="grant_allowed",
+        )
         if not tool_use_id:
             return
         try:
@@ -343,6 +464,8 @@ class ClaudeApprovalMixin:
         request_id: str,
         session_key: str,
         seq_holder: list[int],
+        *,
+        cwd: str | None = None,
     ) -> dict:
         """Approval gate as a PreToolUse hook decision (TASK-292).
 
@@ -366,13 +489,22 @@ class ClaudeApprovalMixin:
             logger.warning(
                 "Approval fail-closed: policies unreachable, denying %s", tool_name
             )
+            self._emit_approval_decision(
+                ApprovalDecision(action=PolicyAction.DENY, subject=""),
+                tool_name, tool_use_id, request_id, session_key, seq_holder,
+                outcome="policy_unavailable",
+            )
             return self._hook_deny(
                 "[Tool execution is paused: the approval-policy service is "
                 "unreachable and this bridge is configured fail-closed. "
                 "Acknowledge and end your turn.]"
             )
 
-        decision = self._decide_approval(tool_name, tool_input)
+        decision = self._decide_approval(tool_name, tool_input, cwd=cwd)
+        self._emit_approval_decision(
+            decision, tool_name, tool_use_id,
+            request_id, session_key, seq_holder,
+        )
 
         if decision.action is PolicyAction.ALLOW:
             return {}
@@ -389,7 +521,9 @@ class ClaudeApprovalMixin:
             )
 
         # ---- require_approval ----
-        if self._consume_grant(decision.grant_key):
+        if self._consume_grant(
+            decision.grant_key, session_key=session_key, request_id=request_id,
+        ):
             logger.info(
                 "Tool ALLOWED by prior approval grant: %s %r",
                 tool_name, decision.subject[:80],
@@ -422,7 +556,11 @@ class ClaudeApprovalMixin:
             grant_key = (fields.get("grant_key") or "").strip()
             ttl = float(fields.get("ttl_seconds") or "600")
             if grant_key:
-                self._grant_approval(grant_key, ttl)
+                self._grant_approval(
+                    grant_key, ttl,
+                    session_key=(fields.get("session_key") or "").strip(),
+                    request_id=(fields.get("request_id") or "").strip(),
+                )
         except Exception:
             logger.exception("Failed to handle approval.grant")
         finally:
@@ -616,7 +754,7 @@ class ClaudeApprovalMixin:
                     return {}
                 tool_input = input_data.get("tool_input")
                 if not isinstance(tool_input, dict):
-                    tool_input = {}
+                    return self._hook_deny("[Invalid tool input; tool blocked.]")
                 tuid = (tool_use_id or input_data.get("tool_use_id") or "")
                 # TASK-639: this first-party MCP server is the authoritative
                 # approval interception point. The bridge stamps exact call
@@ -644,9 +782,12 @@ class ClaudeApprovalMixin:
                             "updatedInput": updated_input,
                         }
                     }
+                cwd = input_data.get("cwd")
+                if "cwd" in input_data and (not isinstance(cwd, str) or not cwd):
+                    return self._hook_deny("[Invalid execution cwd; tool blocked.]")
                 return await self._evaluate_tool_gate_hook(
                     tool_name, tool_input, tuid,
-                    request_id, session_key, seq_holder,
+                    request_id, session_key, seq_holder, cwd=cwd,
                 )
             except Exception:
                 logger.exception(

@@ -1,0 +1,30 @@
+# Explicit TASK-861 override. Append LAST to the existing COMPOSE_FILE list.
+# No existing compose files are modified. See docs/OPERATIONS_RUNNER.md.
+services:
+  app:
+    environment:
+      LLM_BAWT_OPS_WORKER_IMAGE: ${LLM_BAWT_OPS_WORKER_IMAGE:?Set immutable worker image ID or digest}
+      LLM_BAWT_OPS_RECEIPT_VOLUME: ${LLM_BAWT_OPS_RECEIPT_VOLUME:?Set dedicated named volume name}
+      LLM_BAWT_OPS_RECEIPT_ROOT: /var/lib/llm-bawt-ops
+    volumes:
+      - ops-receipts:/var/lib/llm-bawt-ops
+
+  ops-reconciler:
+    # Must be the verified existing CPU app image, not a guessed image tag.
+    image: ${LLM_BAWT_OPS_RECONCILER_IMAGE:?Set existing app image ID or digest}
+    entrypoint: ["python", "-m", "llm_bawt.ops.reconciler"]
+    command: []
+    env_file: [./.env]
+    environment:
+      LLM_BAWT_OPS_WORKER_IMAGE: ${LLM_BAWT_OPS_WORKER_IMAGE:?Set immutable worker image ID or digest}
+      LLM_BAWT_OPS_RECEIPT_VOLUME: ${LLM_BAWT_OPS_RECEIPT_VOLUME:?Set dedicated named volume name}
+      LLM_BAWT_OPS_RECEIPT_ROOT: /var/lib/llm-bawt-ops
+    volumes:
+      - ./src:/app/src:ro
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ops-receipts:/var/lib/llm-bawt-ops
+    restart: unless-stopped
+
+volumes:
+  ops-receipts:
+    name: ${LLM_BAWT_OPS_RECEIPT_VOLUME:?Set dedicated named volume name}

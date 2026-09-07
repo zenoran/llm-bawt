@@ -17,7 +17,9 @@ classic bridge-hook policy on ``ops_run``/``ops_job_status`` names.
 
 from __future__ import annotations
 
+import asyncio
 import logging
+import uuid
 from typing import Any
 
 from .registry import mcp
@@ -71,8 +73,8 @@ async def ops_list_operations(include_disabled: bool = False) -> dict:
             args_defaults}``
           - ``total``: count in the list
     """
-    ops = _get_ops_service()
-    rows = ops.list_operations_for_agent(include_disabled=include_disabled)
+    ops = await asyncio.to_thread(_get_ops_service)
+    rows = await asyncio.to_thread(ops.list_operations_for_agent, include_disabled=include_disabled)
     return {"operations": rows, "total": len(rows)}
 
 
@@ -151,28 +153,27 @@ async def ops_run(
 
     if not operation or not isinstance(operation, str):
         raise ValueError("operation slug is required")
-    ops = _get_ops_service()
+    ops = await asyncio.to_thread(_get_ops_service)
+    from .approval_interceptor import current_approved_caller_context
 
-    idem = (idempotency_key or "").strip()
-    if not idem:
-        # A caller with no explicit key still gets deduplicated within a
-        # short window via the (operation, sorted-args) subject. This is a
-        # weaker guarantee than an approval-request-id, and the caller
-        # should prefer supplying an explicit key.
-        import hashlib
-        import json as _json
-        canonical = _json.dumps(
-            {"op": operation, "args": args or {}},
-            ensure_ascii=False, sort_keys=True,
-        )
-        idem = "auto-" + hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:32]
-
+    approved = current_approved_caller_context()
+    # ApprovedCallerContext is minted by the trusted replay path, NEVER from
+    # public tool input. Contextvars propagate across asyncio.to_thread.
+    snapshot = approved.operations_snapshot if approved else None
+    if approved is not None and snapshot is None:
+        raise RuntimeError("[snapshot_invalid] approved operation has no persisted invocation snapshot; request fresh approval")
+    idem = (idempotency_key or "").strip() or (
+        f"approval-{approved.approval_request_id}" if approved and approved.approval_request_id else uuid.uuid4().hex
+    )
+    provenance = _caller_provenance()
     try:
-        result = ops.dispatch_job(
+        result = await asyncio.to_thread(
+            ops.dispatch_job,
             operation_slug=operation,
-            args=args or {},
+            args={} if args is None else args,
             idempotency_key=idem,
-            **_caller_provenance(),
+            approved_snapshot=snapshot,
+            **provenance,
         )
     except OpsDispatchError as exc:
         # Surface a structured error the agent can parse. MCP tools
@@ -180,6 +181,7 @@ async def ops_run(
         # is_error=True and the message text.
         raise RuntimeError(f"[{exc.code}] {exc}") from exc
     return {
+        "id": result["id"],
         "job_id": result["id"],
         "operation": result["operation"],
         "state": result["state"],
@@ -213,8 +215,9 @@ async def ops_job_status(
     """
     if not job_id:
         raise ValueError("job_id is required")
-    ops = _get_ops_service()
-    result = ops.get_job_status(
+    ops = await asyncio.to_thread(_get_ops_service)
+    result = await asyncio.to_thread(
+        ops.get_job_status,
         job_id,
         output_tail_bytes=output_tail_bytes,
         reconcile_if_active=True,

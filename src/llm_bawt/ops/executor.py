@@ -1,92 +1,42 @@
-"""Executor contract + DockerExecutor (TASK-639).
+"""Durable Docker worker dispatch, no app-owned side-effect threads or SSH.
 
-An executor turns a validated :class:`OpsJob` into an actual side effect.
-For llm-bawt today that means "restart / stop / start / pull a container
-in this Docker daemon" — the daemon is reached through the mounted socket
-at ``/var/run/docker.sock``, no SSH and no host-side runner.
-
-Operations describe themselves via a JSON spec stored in
-:attr:`OpsOperation.command_script`. The DockerExecutor parses that spec
-and drives the Docker SDK. Example specs::
-
-    {"action": "restart", "container_name": "llm-bawt-app"}
-
-    {"action": "restart", "compose_project": "llm-bawt", "compose_service": "app"}
-
-    # Service selected from a validated arg:
-    {"action": "restart", "compose_project": "llm-bawt",
-     "compose_service_from_arg": "service"}
-
-Every dispatch is synchronous unless ``start_delay_seconds`` is non-zero
-OR the target container is us. Delayed dispatch spawns a background
-thread that fires after the delay, so the caller's response can drain
-before we (or any container we're restarting) get killed. The
-:class:`DispatchResult` returned in the delayed case carries
-``terminal_state="succeeded"`` immediately — we can't observe the
-outcome from the corpse of the app process, so the "success" refers to
-"the schedule was placed", not "the restart completed."
-
-Deployment prerequisite: ``/var/run/docker.sock`` must be bind-mounted
-into the container (see docker-compose.yml). Until that lands,
-:meth:`DockerExecutor.available` returns False and
-:meth:`OpsService.dispatch` fails cleanly with a clear reason instead of
-pretending the job started.
+The Docker daemon owns a deterministic one-shot worker. The app submits an
+immutable request on a named volume; only a persisted receipt can mean success.
 """
-
 from __future__ import annotations
 
+import fcntl
+import hashlib
 import json
-import logging
 import os
-import threading
-import time
+import re
 from abc import ABC, abstractmethod
-from dataclasses import dataclass, field
-from typing import Any
+from dataclasses import dataclass
+from pathlib import Path
 
-logger = logging.getLogger(__name__)
+from .validation import canonical_json
+from .worker import atomic_json
+
+SUPPORTED_ACTIONS = frozenset({"restart", "start", "stop", "pull"})
 
 
 class ExecutorError(RuntimeError):
-    """Raised when an executor can't dispatch / reconcile a job."""
+    pass
 
 
 @dataclass
 class DispatchResult:
-    """What the executor tells the store after dispatching.
-
-    Docker-side ops complete synchronously in most cases — dispatch
-    returns the final outcome directly via ``terminal_state`` /
-    ``exit_code`` / ``output``. The service marks the job terminal in
-    one shot instead of waiting on a reconciler.
-
-    ``host_unit_name`` is a short human-readable identifier for logs and
-    the BawtHub UI (e.g. ``"docker:restart:llm-bawt-app"``). It uses the
-    existing DB column of that name; the label there has no semantic role
-    beyond display.
-
-    When ``terminal_state`` is ``None`` the store still marks the job
-    ``DISPATCHING`` and relies on ``reconcile()`` — that path is unused
-    by :class:`DockerExecutor` today but preserved for future executors.
-    """
-
     host_unit_name: str
     status_file_path: str = ""
     log_file_path: str = ""
-    terminal_state: str | None = None  # "succeeded" | "failed" | "timed_out"
+    terminal_state: str | None = None  # Compatibility only; never trusted by service.
     exit_code: int | None = None
     output: str | None = None
 
 
 @dataclass
 class ReconcileResult:
-    """What the executor tells the store after polling one job.
-
-    Docker jobs terminal-mark at dispatch time, so this only matters if
-    a future executor needs async polling. Kept for contract stability.
-    """
-
-    state: str | None  # None = no signal, keep current DB state
+    state: str | None
     exit_code: int | None = None
     output_tail: str | None = None
     error: str | None = None
@@ -95,377 +45,284 @@ class ReconcileResult:
 
 
 class Executor(ABC):
-    """Abstract executor contract. All methods are synchronous — call from
-    a threadpool if you need concurrency; ops are I/O-bound but short-lived
-    so a simple executor pool is fine.
-    """
-
     @abstractmethod
     def kind(self) -> str: ...
-
     @abstractmethod
-    def available(self) -> bool:
-        """Return True if this executor can dispatch right now.
-
-        Called before every dispatch so the service can fail cleanly with
-        a clear message instead of surprising the caller mid-dispatch.
-        """
-
+    def available(self) -> bool: ...
     @abstractmethod
-    def dispatch(
-        self,
-        *,
-        job_id: str,
-        operation_slug: str,
-        target_host: str,
-        run_as_user: str | None,
-        working_directory: str | None,
-        command_script: str,
-        env_args: dict[str, Any],
-        timeout_seconds: int,
-        start_delay_seconds: int,
-        max_output_bytes: int,
-    ) -> DispatchResult: ...
-
+    def dispatch(self, **kwargs) -> DispatchResult: ...
     @abstractmethod
-    def reconcile(
-        self,
-        *,
-        job_id: str,
-        target_host: str,
-        status_file_path: str,
-        log_file_path: str,
-        output_tail_bytes: int = 4096,
-    ) -> ReconcileResult: ...
+    def reconcile(self, **kwargs) -> ReconcileResult: ...
+
+    def execution_settings(self) -> dict:
+        return {}
+
+    def preflight(self, snapshot: dict) -> None:
+        """Read-only prerequisite validation; no worker may be created here."""
+        if not self.available():
+            raise ExecutorError("executor not available")
 
 
-# ---------------------------------------------------------------------------
-# DockerExecutor
-# ---------------------------------------------------------------------------
-
-# Supported actions. Extending this = one new elif branch in
-# :meth:`DockerExecutor._fire_action`, and mirrored allowlisting here so the
-# validation error surfaces before we start reaching for containers.
-SUPPORTED_ACTIONS = frozenset({"restart", "start", "stop", "pull"})
+def validate_spec(command_script: str) -> dict:
+    try:
+        spec = json.loads(command_script)
+    except (ValueError, TypeError) as exc:
+        raise ValueError("command_script must be a Docker JSON spec") from exc
+    allowed = {"action", "container_name", "container_name_from_arg", "compose_project",
+               "compose_service", "compose_service_from_arg", "stop_grace_seconds"}
+    if not isinstance(spec, dict) or set(spec) - allowed:
+        raise ValueError("Docker spec must be an object with supported fields only")
+    if not isinstance(spec.get("action"), str) or spec["action"] not in SUPPORTED_ACTIONS:
+        raise ValueError("unsupported Docker action")
+    for k, v in spec.items():
+        if k != "stop_grace_seconds" and (not isinstance(v, str) or not v.strip()):
+            raise ValueError(f"Docker spec {k} must be a nonempty string")
+    names = sum(k in spec for k in ("container_name", "container_name_from_arg"))
+    services = sum(k in spec for k in ("compose_service", "compose_service_from_arg"))
+    if not ((names == 1 and not services and "compose_project" not in spec) or
+            (names == 0 and services == 1 and "compose_project" in spec)):
+        raise ValueError("Docker spec requires exactly one name or project+service selector")
+    grace = spec.get("stop_grace_seconds", 10)
+    if type(grace) is not int or not 0 <= grace <= 3600:
+        raise ValueError("stop_grace_seconds must be an integer in 0..3600")
+    return spec
 
 
 class DockerExecutor(Executor):
-    """Drive Docker via the mounted socket + Python SDK.
-
-    Injectable ``client_factory`` so tests can pass a fake without needing
-    the real docker package or a real socket.
-    """
-
-    def __init__(
-        self,
-        *,
-        client_factory=None,
-        self_container_names: tuple[str, ...] = ("llm-bawt-app", "app"),
-    ) -> None:
+    def __init__(self, *, client_factory=None, worker_image: str | None = None,
+                 receipt_volume: str | None = None, receipt_root: str | None = None):
         self._client_factory = client_factory
         self._client = None
-        # Container names/service labels that identify "this process's
-        # container" — used to force delayed dispatch on self-restart so
-        # the response drains before Docker kills us.
-        self.self_container_names = tuple(self_container_names)
+        self.worker_image = worker_image or os.getenv("LLM_BAWT_OPS_WORKER_IMAGE", "")
+        self.receipt_volume = receipt_volume or os.getenv("LLM_BAWT_OPS_RECEIPT_VOLUME", "")
+        self.receipt_root = receipt_root or os.getenv("LLM_BAWT_OPS_RECEIPT_ROOT", "/var/lib/llm-bawt-ops")
 
-    def kind(self) -> str:
+    def kind(self):
         return "docker"
-
-    # ---- lazy client ------------------------------------------------------
-
-    def _default_factory(self):
-        try:
-            import docker  # type: ignore[import-not-found]
-        except ImportError as exc:  # pragma: no cover - install-time guard
-            raise ExecutorError(
-                "docker executor unavailable: python `docker` package not installed"
-            ) from exc
-        return docker.from_env()
 
     @property
     def client(self):
         if self._client is None:
-            factory = self._client_factory or self._default_factory
-            self._client = factory()
+            if self._client_factory:
+                self._client = self._client_factory()
+            else:
+                import docker
+                self._client = docker.from_env(timeout=15)
         return self._client
 
-    def available(self) -> bool:
+    def execution_settings(self):
+        return {"worker_image": self.worker_image, "receipt_volume": self.receipt_volume,
+                "receipt_root": self.receipt_root}
+
+    def available(self):
         try:
+            self._check_settings(self.execution_settings())
             self.client.ping()
-        except Exception as exc:  # noqa: BLE001
-            logger.debug("docker executor unavailable: %s", exc)
+            return True
+        except Exception:
             return False
-        return True
 
-    # ---- dispatch --------------------------------------------------------
-
-    def dispatch(
-        self,
-        *,
-        job_id: str,
-        operation_slug: str,
-        target_host: str,
-        run_as_user: str | None,
-        working_directory: str | None,
-        command_script: str,
-        env_args: dict[str, Any],
-        timeout_seconds: int,
-        start_delay_seconds: int,
-        max_output_bytes: int,
-    ) -> DispatchResult:
-        if not self.available():
-            raise ExecutorError(
-                "docker executor unavailable: cannot reach /var/run/docker.sock "
-                "(is the socket bind-mounted into this container?)"
-            )
-
-        spec = self._parse_spec(command_script)
-        action = str(spec.get("action") or "").strip().lower()
-        if action not in SUPPORTED_ACTIONS:
-            raise ExecutorError(
-                f"unsupported docker action {action!r} "
-                f"(supported: {sorted(SUPPORTED_ACTIONS)})"
-            )
-
-        selector = self._resolve_selector(spec, env_args)
-        target_label = self._selector_label(selector)
-
-        # Force delayed dispatch when we'd be killing ourselves — the caller
-        # response has to drain before Docker cuts us off.
-        is_self = self._is_self_target(selector)
-        delay = int(start_delay_seconds or 0)
-        if is_self and delay <= 0:
-            delay = 5  # sensible default — enough for SSE to flush
-
-        unit_name = f"docker:{action}:{target_label}"
-        if delay > 0:
-            unit_name += f":delay={delay}s"
-
-        if delay > 0:
-            self._fire_delayed(action, selector, delay, timeout_seconds)
-            return DispatchResult(
-                host_unit_name=unit_name,
-                terminal_state="succeeded",
-                exit_code=0,
-                output=(
-                    f"scheduled: {action} {target_label} in {delay}s "
-                    f"(self-restart)" if is_self else
-                    f"scheduled: {action} {target_label} in {delay}s"
-                ),
-            )
-
-        # Immediate synchronous dispatch.
+    def preflight(self, snapshot):
         try:
-            output = self._fire_action(action, selector, timeout_seconds)
+            self._check_settings(snapshot["execution"])
+            self.client.ping()
         except ExecutorError:
             raise
-        except Exception as exc:  # noqa: BLE001
-            raise ExecutorError(f"docker {action} failed: {exc}") from exc
+        except Exception as exc:
+            raise ExecutorError(f"Docker worker prerequisites unavailable: {exc}") from exc
 
-        return DispatchResult(
-            host_unit_name=unit_name,
-            terminal_state="succeeded",
-            exit_code=0,
-            output=output,
-        )
+    def _check_settings(self, settings):
+        image = settings.get("worker_image", "")
+        if not re.fullmatch(r"(?:sha256:|[^\s]+@sha256:)[0-9a-f]{64}", image):
+            raise ExecutorError("configure LLM_BAWT_OPS_WORKER_IMAGE as immutable image ID or digest")
+        volume = settings.get("receipt_volume", "")
+        root = settings.get("receipt_root", "")
+        if not volume or not root or not Path(root).is_absolute():
+            raise ExecutorError("configure a dedicated Docker receipt volume and absolute app mount path")
+        # Never let Docker implicitly create a misspelled volume. Deployment must
+        # mount this SAME named volume at receipt_root in the app.
+        self.client.volumes.get(volume)
+        self.client.images.get(image)  # No implicit pull at dispatch time.
+        if not Path(root).is_dir():
+            raise ExecutorError("receipt volume is not mounted at configured app path")
+        owner = os.getenv("LLM_BAWT_OPS_APP_CONTAINER") or os.getenv("HOSTNAME", "")
+        if not owner:
+            raise ExecutorError("cannot identify submitting container to verify receipt mount")
+        mounts = self.client.containers.get(owner).attrs.get("Mounts", [])
+        if not any(m.get("Type") == "volume" and m.get("Name") == volume and
+                   m.get("Destination") == root and m.get("RW") for m in mounts):
+            raise ExecutorError("configured receipt path is not the configured writable named volume in this container")
 
-    # ---- reconcile -------------------------------------------------------
+    @staticmethod
+    def worker_name(job_id):
+        if not re.fullmatch(r"[0-9a-f]{32}", job_id):
+            raise ExecutorError("invalid job id")
+        return f"llm-bawt-ops-{job_id}"
 
-    def reconcile(
-        self,
-        *,
-        job_id: str,
-        target_host: str,
-        status_file_path: str,
-        log_file_path: str,
-        output_tail_bytes: int = 4096,
-    ) -> ReconcileResult:
-        # DockerExecutor terminal-marks at dispatch time, so reconcile
-        # is a no-op — service.get_job_status won't call it for terminal
-        # jobs, and there are no non-terminal docker jobs to poll.
-        return ReconcileResult(state=None)
-
-    # ---- internals -------------------------------------------------------
-
-    def _parse_spec(self, command_script: str) -> dict[str, Any]:
-        raw = (command_script or "").strip()
-        if not raw:
-            raise ExecutorError("operation command_script is empty (need JSON spec)")
+    def _get_worker(self, name):
         try:
-            spec = json.loads(raw)
-        except json.JSONDecodeError as exc:
-            raise ExecutorError(
-                f"operation command_script is not valid JSON: {exc}"
-            ) from exc
-        if not isinstance(spec, dict):
-            raise ExecutorError(
-                f"operation command_script must be a JSON object, got {type(spec).__name__}"
-            )
-        return spec
+            return self.client.containers.get(name)
+        except Exception as exc:
+            if getattr(exc, "status_code", None) == 404:
+                return None
+            raise
 
-    def _resolve_selector(
-        self, spec: dict[str, Any], env_args: dict[str, Any]
-    ) -> dict[str, str]:
-        """Return a container-locator dict with keys in
-        {``name``, ``project``, ``service``}. Merges spec-literal fields
-        with ``*_from_arg`` fields that pull from the validated args.
-        """
-        sel: dict[str, str] = {}
-        if "container_name" in spec:
-            sel["name"] = str(spec["container_name"])
-        if "container_name_from_arg" in spec:
-            key = str(spec["container_name_from_arg"])
-            val = env_args.get(key)
-            if val is None:
-                raise ExecutorError(
-                    f"selector references arg {key!r} but it wasn't supplied"
-                )
-            sel["name"] = str(val)
-        if "compose_project" in spec:
-            sel["project"] = str(spec["compose_project"])
-        if "compose_service" in spec:
-            sel["service"] = str(spec["compose_service"])
-        if "compose_service_from_arg" in spec:
-            key = str(spec["compose_service_from_arg"])
-            val = env_args.get(key)
-            if val is None:
-                raise ExecutorError(
-                    f"selector references arg {key!r} but it wasn't supplied"
-                )
-            sel["service"] = str(val)
-        if not sel:
-            raise ExecutorError(
-                "operation spec has no container selector "
-                "(need container_name, compose_project+compose_service, or *_from_arg)"
-            )
-        if "project" in sel and "service" not in sel:
-            raise ExecutorError(
-                "compose_project without compose_service (or compose_service_from_arg)"
-            )
-        return sel
+    def dispatch(self, *, job_id: str, snapshot: dict, **_kwargs):
+        self.worker_name(job_id)
+        self.preflight(snapshot)
+        directory = Path(snapshot["execution"]["receipt_root"]) / job_id
+        directory.mkdir(mode=0o700, exist_ok=True)
+        with (directory / "submission.lock").open("a") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            if (directory / "abandoned.json").exists():
+                raise ExecutorError("submission abandoned by recovery; never replay")
+            return self._dispatch_locked(job_id=job_id, snapshot=snapshot)
 
-    def _selector_label(self, sel: dict[str, str]) -> str:
-        if "name" in sel:
-            return sel["name"]
-        return f"{sel.get('project','?')}/{sel.get('service','?')}"
-
-    def _find_container(self, sel: dict[str, str]):
-        """Resolve selector → docker container object. Raises ExecutorError
-        on any lookup miss so the caller gets a specific reason."""
+    def _dispatch_locked(self, *, job_id: str, snapshot: dict):
+        settings = snapshot["execution"]
         try:
-            import docker.errors as derrs  # type: ignore[import-not-found]
-        except ImportError:  # pragma: no cover
-            derrs = None  # type: ignore[assignment]
+            self._check_settings(settings)
+            directory = Path(settings["receipt_root"]) / job_id
+            directory.mkdir(mode=0o700, exist_ok=True)
+            request = {"job_id": job_id, "snapshot": snapshot}
+            raw = canonical_json(request).encode()
+            path = directory / "request.json"
+            # Create immutable request using hard-link publication (no overwrite
+            # or partially written destination), then fsync its directory.
+            if not path.exists():
+                temp = directory / f"request.{os.getpid()}.{os.urandom(8).hex()}.tmp"
+                with temp.open("xb") as stream:
+                    stream.write(raw)
+                    stream.flush()
+                    os.fsync(stream.fileno())
+                try:
+                    os.link(temp, path)
+                except FileExistsError:
+                    pass
+                finally:
+                    temp.unlink()
+                fd = os.open(directory, os.O_RDONLY | os.O_DIRECTORY)
+                try:
+                    os.fsync(fd)
+                finally:
+                    os.close(fd)
+            if path.read_bytes() != raw:
+                raise ExecutorError("immutable request conflict")
+            digest = hashlib.sha256(raw).hexdigest()
+            name = self.worker_name(job_id)
+            worker = self._get_worker(name)
+            if worker is None:
+                try:
+                    worker = self.client.containers.create(
+                        settings["worker_image"],
+                        command=[f"/receipts/{job_id}/request.json", digest],
+                        name=name, detach=True, network_mode="none", read_only=True,
+                        cap_drop=["ALL"], security_opt=["no-new-privileges:true"],
+                        restart_policy={"Name": "no"}, mem_limit="128m", pids_limit=32,
+                        labels={"llm-bawt.ops.job": job_id, "llm-bawt.ops.request": digest},
+                        volumes={settings["receipt_volume"]: {"bind": "/receipts", "mode": "rw"},
+                                 "/var/run/docker.sock": {"bind": "/var/run/docker.sock", "mode": "rw"}},
+                    )
+                except Exception as exc:
+                    if getattr(exc, "status_code", None) != 409:
+                        raise
+                    worker = self._get_worker(name)
+            self._verify_worker(worker, job_id, digest)
+            self._start_created_once(worker, directory)
+            return DispatchResult(name, str(directory / "receipt.json"))
+        except ExecutorError:
+            raise
+        except Exception as exc:
+            raise ExecutorError(f"Docker worker submission uncertain: {exc}") from exc
 
-        if "name" in sel:
-            try:
-                return self.client.containers.get(sel["name"])
-            except Exception as exc:  # docker.errors.NotFound + friends
-                if derrs and isinstance(exc, derrs.NotFound):
-                    raise ExecutorError(f"container not found: {sel['name']!r}")
-                raise ExecutorError(f"container lookup failed: {exc}") from exc
-
-        # Compose project + service — filter by the standard compose labels.
-        filters = {
-            "label": [
-                f"com.docker.compose.project={sel['project']}",
-                f"com.docker.compose.service={sel['service']}",
-            ]
-        }
-        try:
-            matches = self.client.containers.list(all=True, filters=filters)
-        except Exception as exc:  # noqa: BLE001
-            raise ExecutorError(f"container list failed: {exc}") from exc
-        if not matches:
-            raise ExecutorError(
-                f"no container for compose project={sel['project']!r} "
-                f"service={sel['service']!r}"
-            )
-        if len(matches) > 1:
-            names = ", ".join(c.name for c in matches)
-            raise ExecutorError(
-                f"selector matched multiple containers ({names}); "
-                "narrow it with container_name"
-            )
-        return matches[0]
-
-    def _is_self_target(self, sel: dict[str, str]) -> bool:
-        # If the selector names the app container by name OR by compose service.
-        if sel.get("name") in self.self_container_names:
+    @staticmethod
+    def _start_created_once(worker, directory):
+        # Container.start is not a compare-and-swap. Two observers of 'created'
+        # could otherwise start, then RESTART a fast-exited worker. Serialize
+        # status/start and persist the attempt BEFORE the daemon call. A lost
+        # start response remains uncertain and is never retried blindly.
+        with (directory / "dispatch.lock").open("a") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            worker.reload()
+            if worker.status != "created":
+                return True
+            marker = directory / "start-attempt.json"
+            if marker.exists():
+                return False
+            atomic_json(marker, {"start_attempted": True})
+            worker.start()
             return True
-        if sel.get("service") in self.self_container_names:
-            return True
-        return False
 
-    def _fire_action(
-        self, action: str, sel: dict[str, str], timeout_seconds: int,
-    ) -> str:
-        """Execute one docker action synchronously. Returns a short summary
-        line for the job's ``output_tail``."""
-        container = self._find_container(sel)
-        name = container.name
-        if action == "restart":
-            container.restart(timeout=max(int(timeout_seconds or 30), 10))
-            return f"restarted {name}"
-        if action == "start":
-            container.start()
-            return f"started {name}"
-        if action == "stop":
-            container.stop(timeout=max(int(timeout_seconds or 30), 10))
-            return f"stopped {name}"
-        if action == "pull":
-            image = None
+    @staticmethod
+    def _verify_worker(worker, job_id, digest):
+        labels = worker.labels or {}
+        if labels.get("llm-bawt.ops.job") != job_id or labels.get("llm-bawt.ops.request") != digest:
+            raise ExecutorError("deterministic worker identity conflict")
+
+    def reconcile(self, *, job_id: str, snapshot: dict, output_tail_bytes=4096, **_kwargs):
+        self.worker_name(job_id)
+        root = Path(snapshot["execution"]["receipt_root"])
+        if not root.is_dir():
+            raise ExecutorError("receipt mount unavailable; cannot determine worker outcome")
+        directory = root / job_id
+        directory.mkdir(mode=0o700, exist_ok=True)
+        with (directory / "submission.lock").open("a") as lock:
             try:
-                image = container.image.tags[0] if container.image.tags else None
-            except Exception:  # noqa: BLE001
-                image = None
-            if not image:
-                raise ExecutorError(
-                    f"container {name!r} has no tagged image to pull"
-                )
-            self.client.images.pull(image)
-            return f"pulled {image} (container: {name})"
-        raise ExecutorError(f"unsupported docker action: {action!r}")
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                return ReconcileResult(None)
+            return self._reconcile_locked(job_id=job_id, snapshot=snapshot, output_tail_bytes=output_tail_bytes)
 
-    def _fire_delayed(
-        self,
-        action: str,
-        sel: dict[str, str],
-        delay_seconds: int,
-        timeout_seconds: int,
-    ) -> None:
-        """Fire ``action`` after ``delay_seconds`` in a background daemon
-        thread. Errors are logged (never re-raised) since the caller has
-        already returned by the time this runs — the job row is stamped
-        succeeded at dispatch time on the "schedule placed" contract.
-        """
-
-        label = self._selector_label(sel)
-
-        def _worker() -> None:
-            try:
-                time.sleep(max(int(delay_seconds), 0))
-                self._fire_action(action, sel, timeout_seconds)
-                logger.info("ops delayed dispatch: %s %s done", action, label)
-            except Exception as exc:  # noqa: BLE001
-                logger.warning(
-                    "ops delayed dispatch failed: %s %s: %s", action, label, exc
-                )
-
-        t = threading.Thread(
-            target=_worker,
-            name=f"ops-delayed-{action}-{label}",
-            daemon=True,
-        )
-        t.start()
-
-
-__all__ = [
-    "Executor",
-    "ExecutorError",
-    "DispatchResult",
-    "ReconcileResult",
-    "DockerExecutor",
-    "SUPPORTED_ACTIONS",
-]
+    def _reconcile_locked(self, *, job_id: str, snapshot: dict, output_tail_bytes=4096):
+        directory = Path(snapshot["execution"]["receipt_root"]) / job_id
+        digest = hashlib.sha256(canonical_json({"job_id": job_id, "snapshot": snapshot}).encode()).hexdigest()
+        try:
+            receipt = None
+            path = directory / "receipt.json"
+            if path.exists():
+                if path.stat().st_size > 4 * 1024 * 1024:
+                    raise ExecutorError("oversized worker receipt")
+                receipt = json.loads(path.read_text())
+                if receipt.get("job_id") != job_id or receipt.get("request_hash") != digest:
+                    raise ExecutorError("worker receipt identity conflict")
+                state = receipt.get("state")
+                if state not in {"accepted", "running", "succeeded", "failed", "lost", "timed_out"}:
+                    raise ExecutorError("invalid worker receipt state")
+                if state in {"succeeded", "failed", "lost", "timed_out"}:
+                    if not receipt.get("finished_at"):
+                        raise ExecutorError("terminal worker receipt has no finish timestamp")
+                    if state == "succeeded" and receipt.get("exit_code") != 0:
+                        raise ExecutorError("invalid success receipt")
+                    return ReconcileResult(state, receipt.get("exit_code"),
+                        (receipt.get("output_tail") or "").encode()[-max(1, output_tail_bytes):].decode(errors="replace"),
+                        receipt.get("error"), receipt.get("started_at"), receipt.get("finished_at"))
+            worker = self._get_worker(self.worker_name(job_id))
+            if worker is None:
+                atomic_json(directory / "abandoned.json", {"reason": "worker missing during reconciliation"})
+                return ReconcileResult("lost", error="worker missing; side effects unknown, not replayed")
+            self._verify_worker(worker, job_id, digest)
+            worker.reload()
+            if worker.status == "created":
+                # Creation succeeded but submitter died before start. Safe to
+                # start this SAME never-run identity, never create a replacement.
+                if not directory.is_dir() or not self._start_created_once(worker, directory):
+                    return ReconcileResult("lost", error="worker start previously attempted without confirmation; not replayed")
+                return ReconcileResult("accepted")
+            if worker.status in ("exited", "dead", "removing"):
+                # Receipt publication may have raced our first read, immediately
+                # before Docker reported exit. Re-read once after that observation.
+                if path.exists():
+                    final = json.loads(path.read_text())
+                    if final.get("job_id") != job_id or final.get("request_hash") != digest:
+                        raise ExecutorError("worker receipt identity conflict")
+                    if final.get("state") in {"succeeded", "failed", "lost", "timed_out"}:
+                        return self._reconcile_locked(job_id=job_id, snapshot=snapshot,
+                                                      output_tail_bytes=output_tail_bytes)
+                return ReconcileResult("lost", error="worker exited without terminal receipt; side effects unknown")
+            if receipt and receipt.get("state") == "running":
+                return ReconcileResult("running", started_at=receipt.get("started_at"))
+            return ReconcileResult("accepted")
+        except ExecutorError:
+            raise
+        except Exception as exc:
+            raise ExecutorError(f"worker reconciliation unavailable: {exc}") from exc

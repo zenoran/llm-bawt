@@ -102,6 +102,8 @@ class ChatCompletionRequest(BaseModel):
     # chat path rather than creating a second execution mechanism.
     inter_bot_delivery_id: str | None = Field(default=None, description="Durable inter-bot delivery id (server-generated and claim-validated).")
     _internal_inter_bot_sender_id: str | None = PrivateAttr(default=None)
+    # Python-only authority: never accepted from public request JSON.
+    _internal_approval_claim: tuple[str, str] | None = PrivateAttr(default=None)
     inter_bot_turn_id: str | None = Field(default=None, description="Deterministic reserved turn id for a durable delivery.")
     inter_bot_bridge_request_id: str | None = Field(default=None, description="Deterministic bridge run id used to deduplicate transport retries.")
     inter_bot_claim_token: str | None = Field(default=None, description="Private dispatcher claim token; rejected unless it matches the durable delivery row.")
