@@ -134,6 +134,93 @@ _DEFAULT_FIELD_BY_TOOL = {
 # ``ops_job_status`` are deliberately NOT here — status reads stay ungated.
 _FAIL_CLOSED_TOOLS = frozenset({"ops_run"})
 
+# Tools whose subject is a shell command line, and therefore gets the
+# inert-data trimming below before a pattern is tested against it.
+_SHELL_TOOLS = frozenset(_DEFAULT_FIELD_BY_TOOL)
+
+# Commands whose heredoc body is *data*, not code: they copy the body to a file
+# or a pipe and never execute it. Everything else (``bash``, ``sh``, ``python``,
+# ``ssh``, ``docker exec … sh``, …) runs what it is fed, so those bodies stay in
+# the matched subject. Basename-compared, so ``/bin/cat`` counts.
+_HEREDOC_DATA_SINKS = frozenset({"cat", "tee"})
+
+# ``<<TAG`` / ``<<'TAG'`` / ``<<-"TAG"``. Deliberately does NOT match the ``<<<``
+# here-string form (that body is a single inline word, not a data block).
+_HEREDOC_START_RE = re.compile(r"<<-?[ \t]*(['\"]?)([A-Za-z_][A-Za-z0-9_]*)\1")
+
+# Tokens that may precede the real command word in a pipeline segment.
+_COMMAND_PREFIXES = frozenset({"sudo", "command", "nohup", "exec", "time", "env"})
+
+
+def _heredoc_body_is_inert(line: str, op_index: int) -> bool:
+    """Is the heredoc opened at ``op_index`` merely written somewhere, not run?
+
+    Looks at the command word owning the redirect — the head of the last
+    pipeline/chain segment before the ``<<``. Unknown or absent command word
+    means "assume it executes", so the gate stays conservative.
+    """
+    segment = re.split(r"\|\||&&|[|;&]", line[:op_index])[-1]
+    for token in segment.split():
+        if re.match(r"^[A-Za-z_][A-Za-z0-9_]*=", token):
+            continue  # VAR=value prefix
+        if token[0] in "-<>" or re.match(r"^\d+[<>]", token):
+            continue  # flag or redirect
+        if token in _COMMAND_PREFIXES:
+            continue
+        return token.rsplit("/", 1)[-1].strip("\"'") in _HEREDOC_DATA_SINKS
+    return False
+
+
+def strip_inert_heredoc_bodies(command: str) -> str:
+    """Drop heredoc bodies that are written as data rather than executed.
+
+    ``cat > file <<'EOF' … EOF`` is a *file write*. Matching a rule's regex
+    against the body means the file's contents get judged as if they were the
+    command — so writing a test fixture that merely mentions
+    ``docker compose restart`` trips the docker rule (TASK-860). The opening
+    line, the terminator, and every executable heredoc body are preserved.
+
+    Pure and total: an unterminated or unrecognised heredoc keeps its body.
+    """
+    if "<<" not in command:
+        return command
+    lines = command.split("\n")
+    out: list[str] = []
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        out.append(line)
+        i += 1
+        opened = [
+            (m.group(2), _heredoc_body_is_inert(line, m.start()))
+            for m in _HEREDOC_START_RE.finditer(line)
+        ]
+        for tag, inert in opened:
+            body: list[str] = []
+            while i < len(lines) and lines[i].strip() != tag:
+                body.append(lines[i])
+                i += 1
+            terminated = i < len(lines)
+            if not inert or not terminated:
+                # Unterminated body may not be a heredoc at all — keep it.
+                out.extend(body)
+            if terminated:
+                out.append(lines[i])
+                i += 1
+    return "\n".join(out)
+
+
+def matchable_subject(tool_name: str, subject: str) -> str:
+    """The text a policy pattern is tested against, given a derived subject.
+
+    Identical to ``subject`` for every tool except the shell ones, where inert
+    heredoc bodies are trimmed. The *raw* subject is still what gets recorded,
+    displayed, and hashed into the grant key — only matching sees this.
+    """
+    if not subject or _tool_tail(tool_name) not in _SHELL_TOOLS:
+        return subject
+    return strip_inert_heredoc_bodies(subject)
+
 
 def _derive_ops_run_subject(tool_input: Any) -> str:
     """Canonical policy/audit subject for a catalogued operation call.
@@ -463,7 +550,7 @@ def evaluate(
         if not policy.applies_to(backend, tool_name):
             continue
         subject = derive_subject(tool_name, tool_input, policy.field)
-        if not policy.matches_subject(subject):
+        if not policy.matches_subject(matchable_subject(tool_name, subject)):
             continue
         prompt = policy.approval_prompt or _default_prompt(tool_name, subject)
         return ApprovalDecision(

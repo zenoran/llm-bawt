@@ -17,6 +17,8 @@ from agent_bridge.approval import (
     derive_subject,
     evaluate,
     grant_key,
+    matchable_subject,
+    strip_inert_heredoc_bodies,
 )
 
 
@@ -282,6 +284,118 @@ def test_tolerant_coercion_of_garbage_enum_values():
     assert p.matcher_type is MatcherType.EXACT
     assert p.action is PolicyAction.REQUIRE_APPROVAL
     assert p.severity is Severity.MEDIUM
+
+
+# ---- heredoc false positives (TASK-860) ------------------------------------
+
+# The two live Bash rules, verbatim from tool_approval_policies.
+_GIT_RULE = r"\bgit\s+(checkout\s+-b|switch\s+-c|(checkout|switch)\s+(?!-)(?!main\b)(?!master\b)\S+)"
+_DOCKER_RULE = (
+    r"(\bdocker(-compose|\s+compose)?\b(?!\s+exec\b)[^|&;]*?"
+    r"\b(up|down|restart|stop|start|kill|rm|pause|unpause)\b)"
+    r"|(\bmake\s+(?:up|down|restart|rebuild|build|run|stop|start|prod-mode|"
+    r"dev-mode|snapshot|recreate|docker-dev)\b)"
+)
+
+
+def _live_bash_rules() -> list[ApprovalPolicy]:
+    return [
+        _pol(id="git", order=35, matcher_type="regex", pattern=_GIT_RULE,
+             action="require_approval", severity="high"),
+        _pol(id="docker", order=70, matcher_type="regex", pattern=_DOCKER_RULE,
+             action="require_approval", severity="high"),
+    ]
+
+
+def _heredoc(sink: str, body: str, tag: str = "'EOF'") -> str:
+    return f"{sink} <<{tag}\n{body}\nEOF"
+
+
+def test_strip_leaves_commands_without_heredocs_untouched():
+    cmd = "docker compose restart app && echo done"
+    assert strip_inert_heredoc_bodies(cmd) == cmd
+
+
+def test_strip_drops_a_cat_heredoc_body_but_keeps_the_frame():
+    cmd = _heredoc('cat > "/tmp/x.ts"', "const a = 'docker compose restart app';")
+    assert strip_inert_heredoc_bodies(cmd) == 'cat > "/tmp/x.ts" <<\'EOF\'\nEOF'
+
+
+def test_strip_keeps_an_executed_heredoc_body():
+    for sink in ("bash", "sh -s", "python3", "ssh nick@host bash", "/bin/bash"):
+        cmd = _heredoc(sink, "docker compose down")
+        assert "docker compose down" in strip_inert_heredoc_bodies(cmd), sink
+
+
+def test_strip_handles_tee_sudo_prefixes_and_unquoted_tags():
+    cmd = _heredoc("sudo tee -a /etc/hosts", "make rebuild", tag="EOF")
+    assert "make rebuild" not in strip_inert_heredoc_bodies(cmd)
+
+
+def test_strip_keeps_an_unterminated_body():
+    cmd = "cat > /tmp/x <<'EOF'\ndocker compose down"
+    assert "docker compose down" in strip_inert_heredoc_bodies(cmd)
+
+
+def test_strip_ignores_here_strings():
+    cmd = "cat <<<'docker compose restart app'"
+    assert strip_inert_heredoc_bodies(cmd) == cmd
+
+
+def test_strip_handles_two_heredocs_on_one_line():
+    cmd = (
+        "cat > /tmp/a <<'A'\ndocker compose down\nA\n"
+        "cat > /tmp/b <<'B'\nmake rebuild\nB"
+    )
+    out = strip_inert_heredoc_bodies(cmd)
+    assert "docker compose down" not in out
+    assert "make rebuild" not in out
+    assert out.count("cat > /tmp/") == 2
+
+
+def test_writing_a_fixture_that_mentions_docker_no_longer_gates():
+    call = {"command": _heredoc(
+        'cat > "/home/bridge/dev/bawthub/x.test.ts"',
+        'const cmd = "docker compose restart app";',
+    )}
+    decision = evaluate(_live_bash_rules(), "claude-code", "Bash", call)
+    assert decision.action is PolicyAction.ALLOW
+    assert decision.policy is None
+
+
+def test_writing_a_fixture_that_mentions_git_switch_no_longer_gates():
+    call = {"command": _heredoc("cat > /tmp/notes.md", "we ran git checkout feature/x")}
+    assert evaluate(_live_bash_rules(), "claude-code", "Bash", call).action is PolicyAction.ALLOW
+
+
+def test_a_real_docker_restart_still_gates():
+    call = {"command": "ssh nick@172.18.0.1 'cd ~/dev/llm-bawt && docker compose restart app'"}
+    decision = evaluate(_live_bash_rules(), "claude-code", "Bash", call)
+    assert decision.action is PolicyAction.REQUIRE_APPROVAL
+    assert decision.policy is not None and decision.policy.id == "docker"
+
+
+def test_a_heredoc_piped_into_a_shell_still_gates():
+    call = {"command": _heredoc("bash", "docker compose down")}
+    decision = evaluate(_live_bash_rules(), "claude-code", "Bash", call)
+    assert decision.action is PolicyAction.REQUIRE_APPROVAL
+
+
+def test_recorded_subject_and_grant_key_stay_raw():
+    body = 'const cmd = "docker compose restart app";'
+    command = _heredoc("cat > /tmp/x.ts", body)
+    decision = evaluate([_pol(id="all", matcher_type="always")], "claude-code", "Bash",
+                        {"command": command})
+    # The gate matched on the trimmed text, but the audit trail keeps the truth.
+    assert decision.subject == command
+    assert body in decision.subject
+    assert decision.grant_key == grant_key("claude-code", "Bash", command)
+
+
+def test_matchable_subject_is_a_noop_for_non_shell_tools():
+    blob = '{"content": "cat <<\'EOF\'\\ndocker compose down\\nEOF"}'
+    assert matchable_subject("Write", blob) == blob
+    assert matchable_subject("Bash", "") == ""
 
 
 if __name__ == "__main__":
