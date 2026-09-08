@@ -11,6 +11,7 @@ import asyncio
 import json
 import logging
 from datetime import timedelta
+from uuid import NAMESPACE_URL, uuid5
 from ..approval_policies import KIND_MCP, REQ_APPROVED, REQ_DENIED, REQ_CANCELLED, REQ_RESPONDED, CONT_DISPATCHING
 from ..approval_models import _as_aware_utc, _utcnow
 from typing import Any
@@ -65,10 +66,16 @@ def _continuation_session(row):
 def _continuation_identity(row):
     if not row.continuation_id:
         raise ValueError("Approval continuation has no durable identity")
+    # Message IDs are UUID-sized (VARCHAR(36)); continuation/outbox IDs are
+    # not. Keep turn/request identities unchanged: the exact harness grant is
+    # bound to that request ID, and existing turn receipts must remain visible.
+    def message_id(role):
+        return str(uuid5(NAMESPACE_URL, f"llm-bawt:approval:{row.continuation_id}:{role}"))
+
     return {"inter_bot_turn_id": "turn-" + row.continuation_id,
             "inter_bot_bridge_request_id": "req_delivery_approval_" + row.continuation_id,
-            "user_message_id": "user-" + row.continuation_id,
-            "assistant_message_id": "assistant-" + row.continuation_id}
+            "user_message_id": message_id("user"),
+            "assistant_message_id": message_id("assistant")}
 
 
 def validate_approval_continuation_claim(service, request, claim):

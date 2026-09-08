@@ -1269,6 +1269,15 @@ class MemoryClient:
                 rpc_result = result.get("result")
                 parsed_result = None
                 if isinstance(rpc_result, dict):
+                    if rpc_result.get("isError"):
+                        # MCP tool failures are valid JSON-RPC responses, not
+                        # successful domain values. Never pass their text to
+                        # MessageResult.from_dict (or other typed consumers).
+                        details = "; ".join(
+                            item["text"] for item in (rpc_result.get("content") or [])
+                            if isinstance(item, dict) and isinstance(item.get("text"), str)
+                        )
+                        raise RuntimeError(f"MCP tool {method} failed: {details or 'unknown tool error'}")
                     # Prefer structuredContent which has the actual typed data
                     structured = rpc_result.get("structuredContent")
                     if isinstance(structured, dict) and "result" in structured:

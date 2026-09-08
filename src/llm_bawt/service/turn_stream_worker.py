@@ -541,6 +541,11 @@ class TurnStreamWorker(TurnStreamPublishMixin):
                     # TASK-701: opaque current-turn authority. The client/backend
                     # forwards this request-locally; it is never model-visible.
                     extra_kwargs["task_turn_capability"] = task_turn_capability
+                if is_agent_backend and request.inter_bot_bridge_request_id:
+                    # Validated server-owned continuation identity. Dropping it
+                    # creates a random bridge request that cannot consume the
+                    # exact approval grant bound to this continuation.
+                    extra_kwargs["bridge_request_id"] = request.inter_bot_bridge_request_id
                 stream_iter = llm_bawt.client.stream_raw(
                     messages, stop=adapter_stops or None, **gen_kwargs, **extra_kwargs
                 )

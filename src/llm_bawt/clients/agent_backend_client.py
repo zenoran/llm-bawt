@@ -216,6 +216,7 @@ class AgentBackendClient(LLMClient):
         # TASK-701: opaque trusted current-turn capability. Request-local only;
         # never persist it on shared bot config or expose its identifiers.
         task_turn_capability = kwargs.pop("task_turn_capability", None)
+        bridge_request_id = kwargs.pop("bridge_request_id", None)
 
         # Extract system prompt from messages for backends that support it
         # (e.g. claude-code bridge). Merge into config so the backend can
@@ -233,6 +234,8 @@ class AgentBackendClient(LLMClient):
             config.update(thread_binding)
         if task_turn_capability:
             config["task_turn_capability"] = task_turn_capability
+        if bridge_request_id:
+            config["request_id"] = bridge_request_id
 
         if hasattr(self._backend, "stream_raw"):
             backend_kwargs: dict[str, Any] = {"attachments": attachments}

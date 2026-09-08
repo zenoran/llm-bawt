@@ -529,7 +529,9 @@ def test_grant_transport_ack_and_backend_continuation_identity():
         asyncio.run(b._handle_approval_grant(message, "msg", Redis()))
     assert len(acks) == 3
     # Execute the real backend ID helpers, not a duplicated test formula.
-    namespace = {"sha256": sha256}
+    from uuid import NAMESPACE_URL, uuid5
+
+    namespace = {"sha256": sha256, "uuid5": uuid5, "NAMESPACE_URL": NAMESPACE_URL}
     for relative, symbol in (("llm_bawt/approval_request_store.py", "_continuation_id"),
                              ("llm_bawt/service/approval_continuations.py", "_continuation_identity")):
         path = _ROOT / "src" / relative

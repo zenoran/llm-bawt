@@ -94,6 +94,46 @@ def test_dispatch_delivers_actual_result_envelope_and_marks_done():
     assert persisted.continuation_delivered_at is not None
 
 
+def test_dispatch_requires_persisted_success_before_ack():
+    from types import SimpleNamespace
+    from llm_bawt.service.approval_continuations import _continuation_identity
+
+    store = _store()
+    row = _ready_row(store)
+    identity = _continuation_identity(row)
+
+    class PersistedService(FakeService):
+        def __init__(self):
+            super().__init__()
+            self.turn = None
+            self._turn_log_store = SimpleNamespace(get_turn=lambda key: self.turn)
+
+        async def chat_completion_stream(self, request):
+            assert request.user_message_id == identity["user_message_id"]
+            assert request.assistant_message_id == identity["assistant_message_id"]
+            assert len(request.user_message_id) == len(request.assistant_message_id) == 36
+            self.turn = SimpleNamespace(ended_at=1, status="ok", error_text=None)
+            yield "data: [DONE]\n\n"
+
+    service = PersistedService()
+    asyncio.run(dispatch_mcp_result_continuation(service, store, row))
+    assert store.get_request(row.id).continuation_state == CONT_DELIVERED
+
+
+def test_existing_failed_turn_is_never_replayed():
+    from types import SimpleNamespace
+
+    store = _store()
+    row = _ready_row(store)
+    service = FakeService()
+    service._turn_log_store = SimpleNamespace(get_turn=lambda key: SimpleNamespace(
+        ended_at=1, status="error", error_text="prior persistence failure"))
+    with pytest.raises(RuntimeError, match="manual reconciliation"):
+        asyncio.run(dispatch_mcp_result_continuation(service, store, row))
+    assert not service.requests
+    assert store.get_request(row.id).continuation_state != CONT_DELIVERED
+
+
 def test_dispatch_failure_reschedules_for_retry():
     store = _store()
     row = _ready_row(store)
