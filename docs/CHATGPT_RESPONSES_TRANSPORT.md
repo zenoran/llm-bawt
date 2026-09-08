@@ -22,8 +22,10 @@ Protocol reference: public `openai/codex`, tag `rust-v0.153.4`:
 - Capture `x-codex-turn-state` from upgrade/HTTP headers or `response.metadata`;
   replay in reconnect headers and WS create metadata.
 - Explicit HTTP 426 upgrade rejection selects SSE with the same Lite payload.
-  Authentication, quota, malformed request and server errors are not hidden by
-  fallback. The existing output-aware retry state machine remains authoritative.
+  A successful upgrade that then emits no event within 60 seconds discards the
+  socket and makes the one safe outer retry use Lite over SSE. Authentication,
+  quota, malformed request and server errors are not hidden by fallback. The
+  existing output-aware retry state machine remains authoritative.
 - A valid terminal ends consumption immediately. EOF without terminal errors;
   incomplete responses retain the translator's max-token semantics. No transport
   layer silently retries generation. Never replay after forwarded tool calls.
@@ -36,10 +38,12 @@ request/turn, and model. Parallel requests receive separate sockets; anonymous
 calls cannot reuse a lease. Token rotation cannot reuse an old authenticated socket.
 
 At most 32 active leases and 32 idle entries are retained. Idle entries expire
-after 60 seconds; connect/pool waits are bounded at 15 seconds, sends at 60,
-and upstream-event inactivity at 300 (Codex's default, not the abandoned
-Astra-only 60-second breaker). Cancellation and incomplete/error responses close
-the socket; scoped sticky routing can survive in an idle entry for safe retry.
+after 60 seconds; connect/pool waits are bounded at 15 seconds and sends at 60.
+The first event after `response.create` is bounded at 60 seconds; later event
+inactivity is bounded at 240 seconds. Astra gets one safe proxy retry, keeping
+all proxy-owned waits below the bridge's 600-second watchdog. Cancellation and
+incomplete/error responses close the socket; scoped sticky routing can survive
+for the SSE retry.
 
 Full history is sent each hop. `previous_response_id`/delta optimization is
 intentionally not used: Claude SDK histories can branch and omit upstream
@@ -63,9 +67,19 @@ attestation, or claim of complete Codex runtime parity.
 Nick activated the client by restarting the Claude bridge at
 2026-09-08T00:54:52Z. Normal Loopy chat confirmed WebSocket transport, connection
 reuse on the next tool hop, and 98.5% prompt-cache hits on that follow-up.
-These checks establish activation and protocol compatibility, not proof that
-every historical stall is eliminated. Long-running reliability remains unverified.
-This change does not repair pre-existing orphaned UI turns.
+
+A live Snark turn later exposed a missing bound: request
+`req_f8987b7a0f684e1a9189e0be5c0deae0` completed many WS/Lite tool hops, then a
+reused `response.create` at 2026-09-08T01:34:58Z emitted zero events. The generic
+three-attempt policy could spend 900 seconds on 300-second waits, so the bridge's
+600-second watchdog cancelled it first. The follow-up mitigation adds the
+60-second first-event bound, Lite SSE recovery, Astra's one-retry limit, terminal
+outer-CLI handling at exhaustion, and explicit timeout telemetry. Verification:
+173 proxy/bridge regressions passed; isolated live adapter tool round-trip reached
+`echo_check` at 5.42s and `pong` at 9.47s. This proves the recovery behavior
+hermetically and preserves live protocol compatibility; long-running reliability
+still requires observation after bridge activation. Pre-existing orphaned UI turns
+remain outside this transport scope.
 
 ## Activation
 

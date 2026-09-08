@@ -23,6 +23,7 @@ from typing import ClassVar
 import httpx
 
 from .base import ProviderAdapter
+from .. import retry as retry_mod
 from ..request_context import ProxyRequestContext
 
 logger = logging.getLogger(__name__)
@@ -116,6 +117,14 @@ class OpenAIChatGPTAdapter(ProviderAdapter):
             await self._chatgpt_transport.close()
             self._chatgpt_transport = None
         await super().close()
+
+    def retry_policy(self, upstream_model: str) -> retry_mod.RetryPolicy:
+        policy = super().retry_policy(upstream_model)
+        if upstream_model == "gpt-6-astra":
+            # The bridge watchdog is 600s. Two attempts preserve one safe
+            # reconnect while a dead first-event path remains far below it.
+            policy.max_attempts = 2
+        return policy
 
     # ── broker token resolution ──────────────────────────────────────────
     def _cache_valid(self) -> bool:

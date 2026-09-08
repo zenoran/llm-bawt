@@ -10,7 +10,8 @@ import pytest
 from websockets.exceptions import InvalidStatus
 
 from claude_code_bridge.proxy.chatgpt_transport import (
-    ChatGPTResponsesTransport, LITE_HEADER, TURN_HEADER, lite_request,
+    ChatGPTEventTimeout, ChatGPTResponsesTransport, LITE_HEADER, TURN_HEADER,
+    lite_request,
 )
 from claude_code_bridge.proxy.stream import (
     IncompleteResponseStreamError, responses_to_anthropic_sse,
@@ -121,18 +122,43 @@ def test_parallel_calls_never_share_socket_and_cancel_discards():
     asyncio.run(run())
 
 
-def test_idle_timeout_and_keepalive_expiry():
+def test_first_event_timeout_then_idle_timeout_and_keepalive_expiry():
     async def run():
         socket = Socket()
-        client = ChatGPTResponsesTransport(connector=AsyncMock(return_value=socket),
-                                           idle_timeout=.01, keepalive=.01)
+        client = ChatGPTResponsesTransport(
+            connector=AsyncMock(return_value=socket),
+            first_event_timeout=.01, idle_timeout=.08, keepalive=.01,
+        )
         stream = await client.open(**kwargs())
-        with pytest.raises(TimeoutError, match="idle timeout"):
+        started = asyncio.get_running_loop().time()
+        with pytest.raises(ChatGPTEventTimeout, match="first"):
             await anext(stream)
+        assert asyncio.get_running_loop().time() - started < .06
         await stream.close()
         assert socket.close.await_count == 1
+        await client.close()
+
         socket = Socket()
-        client.connector = AsyncMock(return_value=socket)
+        client = ChatGPTResponsesTransport(
+            connector=AsyncMock(return_value=socket),
+            first_event_timeout=.01, idle_timeout=.08, keepalive=.01,
+        )
+        stream = await client.open(**kwargs())
+        await socket.events.put({"type": "response.created"})
+        assert (await anext(stream)).type == "response.created"
+        started = asyncio.get_running_loop().time()
+        with pytest.raises(ChatGPTEventTimeout, match="next"):
+            await anext(stream)
+        assert asyncio.get_running_loop().time() - started >= .06
+        await stream.close()
+        assert socket.close.await_count == 1
+        await client.close()
+
+        socket = Socket()
+        client = ChatGPTResponsesTransport(
+            connector=AsyncMock(return_value=socket),
+            first_event_timeout=.01, idle_timeout=.08, keepalive=.01,
+        )
         stream = await client.open(**kwargs())
         await socket.events.put(DONE)
         await anext(stream)
@@ -287,6 +313,64 @@ def test_adapter_retry_never_replays_after_tool_use(monkeypatch, committed):
             assert bool(b"event: error" in b"".join(chunks)) == committed
             assert bool(b"message_stop" in b"".join(chunks)) != committed
             assert sockets[0].close.await_count == 1
+        finally:
+            await adapter.close()
+    asyncio.run(run())
+
+
+def test_silent_websocket_recovers_over_http_without_outer_cli_retry(monkeypatch):
+    from claude_code_bridge.proxy.adapters.openai_chatgpt import OpenAIChatGPTAdapter
+    from claude_code_bridge.proxy import retry
+    from claude_code_bridge.proxy.request_context import ProxyRequestContext
+    monkeypatch.setattr(retry, "compute_backoff", lambda *args, **kwargs: 0)
+
+    async def run():
+        socket = Socket()
+        adapter = OpenAIChatGPTAdapter()
+        adapter.authorize = AsyncMock(return_value=("token", "https://example.test"))
+        adapter._chatgpt_transport = ChatGPTResponsesTransport(
+            connector=AsyncMock(return_value=socket),
+            first_event_timeout=.01, idle_timeout=.08,
+        )
+
+        async def events():
+            yield NS(type="response.completed", response=NS(
+                usage=None, status="completed",
+            ))
+
+        http_stream = NS(response=NS(headers={}), close=AsyncMock())
+
+        class HTTPStream:
+            response = http_stream.response
+            close = http_stream.close
+
+            def __aiter__(self):
+                return events()
+
+        body = {
+            "model": "openai_chatgpt/gpt-6-astra", "max_tokens": 128,
+            "messages": [{"role": "user", "content": "test"}],
+        }
+        context = ProxyRequestContext(
+            request_id="turn", provider="openai_chatgpt",
+            conversation_id="test",
+        )
+        request_client = NS(post=AsyncMock(return_value=HTTPStream()))
+        response_client = NS(
+            with_options=lambda **kwargs: request_client,
+            close=AsyncMock(),
+        )
+        adapter._http_client = NS()
+        adapter._responses_client = response_client
+        try:
+            chunks = [chunk async for chunk in adapter.call(
+                body, "gpt-6-astra", context,
+            )]
+            joined = b"".join(chunks)
+            assert adapter._chatgpt_transport.connector.await_count == 1
+            assert socket.close.await_count == 1
+            assert b"message_stop" in joined
+            assert b'"type":"api_error"' not in joined
         finally:
             await adapter.close()
     asyncio.run(run())

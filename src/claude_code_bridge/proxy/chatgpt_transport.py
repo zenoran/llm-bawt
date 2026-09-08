@@ -77,6 +77,16 @@ class _Session:
     timer: asyncio.TimerHandle | None = None
 
 
+class ChatGPTEventTimeout(TimeoutError):
+    """A bounded Responses wait that the proxy retry loop already owns."""
+
+    proxy_retry_owner = True
+
+    def __init__(self, phase: str) -> None:
+        self.phase = phase
+        super().__init__(f"timeout waiting for {phase} ChatGPT Responses event")
+
+
 class ChatGPTResponsesTransport:
     """Bounded, exclusive socket leases scoped to account/conversation/turn/model.
 
@@ -84,9 +94,11 @@ class ChatGPTResponsesTransport:
     cancellation or an unfinished response discards its lease immediately.
     """
 
-    def __init__(self, *, idle_timeout: float = 300, keepalive: float = 60,
+    def __init__(self, *, idle_timeout: float = 240,
+                 first_event_timeout: float = 60, keepalive: float = 60,
                  max_connections: int = 32, connector=connect):
         self.idle_timeout = idle_timeout
+        self.first_event_timeout = first_event_timeout
         self.keepalive = keepalive
         self.max_connections = max_connections
         self.connector = connector
@@ -222,7 +234,7 @@ class ChatGPTStream:
     def __init__(self, owner, key, session):
         self.owner, self.key, self.session = owner, key, session
         self.http = self.http_iterator = self.response = None
-        self.complete = self.closed = False
+        self.complete = self.closed = self.event_seen = False
 
     def __aiter__(self):
         return self
@@ -230,15 +242,20 @@ class ChatGPTStream:
     async def __anext__(self):
         if self.closed or self.complete:
             raise StopAsyncIteration
+        timeout = (
+            self.owner.idle_timeout if self.event_seen
+            else self.owner.first_event_timeout
+        )
         try:
             if self.http is not None:
-                event = await asyncio.wait_for(anext(self.http_iterator), self.owner.idle_timeout)
+                event = await asyncio.wait_for(anext(self.http_iterator), timeout)
             else:
-                raw = await asyncio.wait_for(self.session.socket.recv(), self.owner.idle_timeout)
+                raw = await asyncio.wait_for(self.session.socket.recv(), timeout)
                 payload = json.loads(raw)
                 if not isinstance(payload, dict) or not isinstance(payload.get("type"), str):
                     raise ValueError("Invalid Responses WebSocket event")
                 event = _event_object(payload)
+            self.event_seen = True
             kind = getattr(event, "type", "")
             if kind == "response.metadata" and not self.session.turn_state:
                 headers = getattr(event, "headers", None)
@@ -255,7 +272,19 @@ class ChatGPTStream:
         except (ConnectionClosed, StopAsyncIteration) as exc:
             raise ConnectionError("stream closed before response.completed") from exc
         except asyncio.TimeoutError as exc:
-            raise TimeoutError("idle timeout waiting for ChatGPT Responses event") from exc
+            phase = "next" if self.event_seen else "first"
+            if self.http is None:
+                # A successful upgrade followed by no event is a broken WS
+                # request path. Preserve the scoped session so the safe outer
+                # retry uses Responses Lite over HTTP SSE instead.
+                self.session.http_only = True
+            logger.warning(
+                "chatgpt_transport event_timeout phase=%s timeout_s=%.1f "
+                "fallback=%s",
+                phase, timeout,
+                "sse" if self.session.http_only else "none",
+            )
+            raise ChatGPTEventTimeout(phase) from exc
 
     async def close(self):
         if self.closed:

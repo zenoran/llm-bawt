@@ -148,6 +148,10 @@ class ProviderAdapter(ABC):
         """Transport seam; retry policy and translation remain shared."""
         return await client.responses.create(**body)
 
+    def retry_policy(self, upstream_model: str) -> retry_mod.RetryPolicy:
+        """Return the per-call retry budget; provider adapters may narrow it."""
+        return retry_mod.RetryPolicy()
+
     async def call(
         self,
         anthropic_body: dict,
@@ -198,7 +202,7 @@ class ProviderAdapter(ABC):
         )
 
         state = TranslatorState()
-        policy = retry_mod.RetryPolicy()
+        policy = self.retry_policy(upstream_model)
         # Per Al #4: the on_usage callback wired into context.record_usage
         # fires INSIDE the translator whenever the upstream emits usage. On
         # retry we want the FINAL SUCCESSFUL attempt's usage to win. The
@@ -390,8 +394,16 @@ class ProviderAdapter(ABC):
             if state.open_block is not None:
                 yield _stop_block_frame(state.open_block["index"])
                 state.open_block = None
+            final_error_type = decision.final_error_type or "api_error"
+            if stream_exc is not None and getattr(
+                stream_exc, "proxy_retry_owner", False
+            ):
+                # The proxy has already spent its complete retry budget on this
+                # no-event timeout. Keep the Claude CLI from replaying the whole
+                # /v1/messages request and colliding with the bridge watchdog.
+                final_error_type = "api_error"
             yield _final_error_frame(
-                decision.final_error_type or "api_error",
+                final_error_type,
                 f"Proxy stream failed: {exc_repr}",
             )
             return
