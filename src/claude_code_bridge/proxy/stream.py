@@ -90,6 +90,10 @@ logger = logging.getLogger(__name__)
 # the non-streaming route buffer in routes.py that treats the generator as
 # opaque.
 
+class IncompleteResponseStreamError(ConnectionError):
+    """Upstream stream ended without a Responses terminal event."""
+
+
 @dataclass
 class TranslatorState:
     """Observation of what the translator has yielded so far, for retry decisions."""
@@ -99,6 +103,7 @@ class TranslatorState:
     thinking_yielded: bool = False       # any thinking_delta emitted
     text_delta_yielded: bool = False     # ANY text_delta emitted (partial visible output)
     tool_committed: bool = False         # content_block_start(tool_use) emitted — hard no-retry
+    terminal_event_seen: bool = False    # response.completed / response.incomplete
 
     # ── Block index bookkeeping (Al #1: monotone indexes across a retry splice) ─
     # ``next_block_index`` is the index that WILL be assigned to the next block
@@ -300,6 +305,7 @@ async def responses_to_anthropic_sse(
     # emit on the .done event.
     tool_arg_buffers: dict[str, str] = {}   # item_id → accumulated JSON string
 
+    terminal_event_seen = False
     saw_tool_use = False
     saw_refusal = False
     explicit_stop: str | None = None
@@ -545,6 +551,9 @@ async def responses_to_anthropic_sse(
 
             # ── terminal: success ───────────────────────────────────────────
             if etype == "response.completed":
+                terminal_event_seen = True
+                if state is not None:
+                    state.terminal_event_seen = True
                 resp = getattr(event, "response", None)
                 if resp is not None:
                     input_tokens, output_tokens, cache_read, cache_create = _extract_usage(resp)
@@ -569,10 +578,15 @@ async def responses_to_anthropic_sse(
                     )
                     if raw_stop in _STOP_REASON_MAP:
                         explicit_stop = _STOP_REASON_MAP[raw_stop]
-                continue
+                # Match Codex CLI: the Responses terminal event ends the stream.
+                # Do not wait for transport EOF after a valid completion.
+                break
 
             # ── terminal: incomplete (e.g. hit max_output_tokens) ───────────
             if etype == "response.incomplete":
+                terminal_event_seen = True
+                if state is not None:
+                    state.terminal_event_seen = True
                 resp = getattr(event, "response", None)
                 if resp is not None:
                     input_tokens, output_tokens, cache_read, cache_create = _extract_usage(resp)
@@ -583,7 +597,7 @@ async def responses_to_anthropic_sse(
                     details = getattr(resp, "incomplete_details", None)
                     reason = getattr(details, "reason", "") if details else ""
                     explicit_stop = _STOP_REASON_MAP.get(reason, "max_tokens")
-                continue
+                break
 
             # ── terminal: failure / error ───────────────────────────────────
             # TASK-714 Al #2: in-band terminal errors historically short-circuited
@@ -682,6 +696,14 @@ async def responses_to_anthropic_sse(
             yield _ping()
 
         # ── finalize ────────────────────────────────────────────────────────
+        # Codex CLI treats EOF before response.completed/response.incomplete as
+        # a stream error. Without this guard, a zero-event HTTP 200 becomes a
+        # successful empty Anthropic message and the agent silently stops.
+        if not terminal_event_seen:
+            raise IncompleteResponseStreamError(
+                "stream closed before response.completed"
+            )
+
         # Flush any remaining buffered tool args (e.g. stream cut off before
         # .done event). Emit as-is since we can't guarantee well-formed JSON.
         for item_id, leftover in tool_arg_buffers.items():

@@ -35,7 +35,6 @@ from ..stream import TranslatorState
 
 logger = logging.getLogger(__name__)
 
-
 def _stop_block_frame(index: int) -> bytes:
     """Emit a well-formed content_block_stop frame for the splice (Al #1).
 
@@ -145,6 +144,10 @@ class ProviderAdapter(ABC):
         """
         return responses_body
 
+    async def open_stream(self, *, client, body, headers, bearer, base_url, context):
+        """Transport seam; retry policy and translation remain shared."""
+        return await client.responses.create(**body)
+
     async def call(
         self,
         anthropic_body: dict,
@@ -223,7 +226,10 @@ class ProviderAdapter(ABC):
             try:
                 # ── initial request boundary ────────────────────────────────
                 upstream_started = time.perf_counter()
-                upstream_stream = await client.responses.create(**responses_body)
+                upstream_stream = await self.open_stream(
+                    client=client, body=responses_body, headers=headers or {},
+                    bearer=bearer, base_url=base_url, context=context,
+                )
                 if context is not None and attempt == 1:
                     # Only the FIRST attempt's TTFB is meaningful; later attempts
                     # measure retry latency, not upstream health.
@@ -286,6 +292,7 @@ class ProviderAdapter(ABC):
                         if hasattr(self, "_cached_expires_at"):
                             self._cached_expires_at = 0  # type: ignore[attr-defined]
                         bearer, base_url = await self.authorize()
+                        headers = self.extra_headers(responses_body, context) or None
                         client = self._responses_client.with_options(
                             api_key=bearer, base_url=base_url,
                             set_default_headers=headers,
@@ -304,6 +311,7 @@ class ProviderAdapter(ABC):
             # ── stream iteration boundary ───────────────────────────────────
             stream_exc: BaseException | None = None
             try:
+                state.terminal_event_seen = False
                 async for chunk in stream_mod.responses_to_anthropic_sse(
                     upstream_stream,
                     anthropic_model=anthropic_model_for_translator,
@@ -317,6 +325,10 @@ class ProviderAdapter(ABC):
                 raise
             except BaseException as exc:  # noqa: BLE001
                 stream_exc = exc
+            finally:
+                close_stream = getattr(upstream_stream, "close", None)
+                if close_stream is not None:
+                    await close_stream()
 
             # Clean return path — either translator finished successfully OR
             # populated state.inband_error (Al #2). Same decision path.

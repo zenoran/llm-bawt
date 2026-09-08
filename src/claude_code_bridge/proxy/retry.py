@@ -224,7 +224,7 @@ def classify_initial_exception(exc: BaseException) -> FailureBucket:
     # A: transient network. Everything openai/httpx/httpcore-shaped that
     # isn't a status error, plus OS-level timeouts.
     if module in ("openai", "httpx", "httpcore") or isinstance(
-        exc, (OSError, TimeoutError, asyncio.TimeoutError)
+        exc, (OSError, ConnectionError, TimeoutError, asyncio.TimeoutError)
     ):
         return FailureBucket.A_TRANSIENT_NETWORK
 

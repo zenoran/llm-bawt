@@ -44,10 +44,12 @@ _UNSUPPORTED_PARAMS = ("temperature", "top_p", "max_output_tokens")
 # The codex backend hard-requires a non-empty ``instructions`` field.
 _FALLBACK_INSTRUCTIONS = "You are a helpful coding assistant."
 
-# Reasoning effort for gpt-5.x.
+# Codex's Astra catalog default is low. Other models retain their established
+# high fallback; explicit inbound reasoning and environment overrides win.
 DEFAULT_REASONING_EFFORT = "high"
+_MODEL_REASONING_DEFAULTS = {"gpt-6-astra": "low"}
 REASONING_EFFORT_ENV = "OPENAI_CHATGPT_REASONING_EFFORT"
-_VALID_EFFORT = {"none", "low", "medium", "high", "xhigh"}
+_VALID_EFFORT = {"none", "low", "medium", "high", "xhigh", "max"}
 
 # Cache buffer — re-fetch from the broker when the token is this close to
 # expiry. The app's proactive loop refreshes at exp−20min, so the broker
@@ -92,6 +94,28 @@ class OpenAIChatGPTAdapter(ProviderAdapter):
         self._cached_account_id: str | None = None
         self._cached_expires_at: float | None = None
         self._authorize_lock = asyncio.Lock()
+        self._chatgpt_transport = None
+
+    async def open_stream(self, *, client, body, headers, bearer, base_url, context):
+        if body.get("model") != "gpt-6-astra":
+            return await super().open_stream(
+                client=client, body=body, headers=headers, bearer=bearer,
+                base_url=base_url, context=context,
+            )
+        from ..chatgpt_transport import ChatGPTResponsesTransport
+
+        if self._chatgpt_transport is None:
+            self._chatgpt_transport = ChatGPTResponsesTransport()
+        return await self._chatgpt_transport.open(
+            body=body, headers=headers, bearer=bearer, base_url=base_url,
+            context=context, http_client=client,
+        )
+
+    async def close(self):
+        if self._chatgpt_transport is not None:
+            await self._chatgpt_transport.close()
+            self._chatgpt_transport = None
+        await super().close()
 
     # ── broker token resolution ──────────────────────────────────────────
     def _cache_valid(self) -> bool:
@@ -231,7 +255,10 @@ class OpenAIChatGPTAdapter(ProviderAdapter):
         if "reasoning" not in responses_body:
             effort = (os.getenv(REASONING_EFFORT_ENV) or "").strip().lower()
             if effort not in _VALID_EFFORT:
-                effort = DEFAULT_REASONING_EFFORT
+                effort = _MODEL_REASONING_DEFAULTS.get(
+                    str(responses_body.get("model") or ""),
+                    DEFAULT_REASONING_EFFORT,
+                )
             responses_body["reasoning"] = {"effort": effort}
         responses_body["reasoning"].setdefault("summary", "auto")
         return responses_body
