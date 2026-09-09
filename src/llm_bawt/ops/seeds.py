@@ -88,10 +88,12 @@ _LLM_BAWT_SEEDS: list[dict[str, Any]] = [
         "executor_kind": EXECUTOR_DOCKER,
         "target_host": "",
         "working_directory": None,
+        # The production app has a stable explicit container_name. Prefer it to
+        # Compose labels here: an ops worker image can inherit Compose labels
+        # from its base image and otherwise impersonate the target service.
         "command_script": _spec(
             action="restart",
-            compose_project=_LLM_BAWT_PROJECT,
-            compose_service="app",
+            container_name="llm-bawt-app",
         ),
         "args_schema_json": _no_args_schema(),
         "args_defaults_json": _defaults(),

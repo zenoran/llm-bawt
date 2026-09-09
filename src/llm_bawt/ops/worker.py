@@ -73,6 +73,13 @@ class DockerAPI:
             filters = {"label": [f"com.docker.compose.project={spec['compose_project']}",
                                  f"com.docker.compose.service={service}"]}
             matches = self.request("GET", "/containers/json?" + urlencode({"all": "1", "filters": json.dumps(filters)}))
+            # Images can carry inherited Compose labels. An operation worker
+            # built from such an image must never qualify as its own target,
+            # even if a future dispatcher forgets to neutralize those labels.
+            matches = [
+                row for row in matches
+                if "llm-bawt.ops.job" not in (row.get("Labels") or {})
+            ]
             if len(matches) != 1:
                 raise RuntimeError(f"selector matched {len(matches)} containers, expected one")
             container = self.request("GET", f"/containers/{matches[0]['Id']}/json")

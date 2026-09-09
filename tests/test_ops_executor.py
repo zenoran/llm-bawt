@@ -9,6 +9,7 @@ from types import SimpleNamespace
 import pytest
 
 from llm_bawt.ops.executor import DockerExecutor, ExecutorError, validate_spec
+from llm_bawt.ops.seeds import SEEDS
 from llm_bawt.ops.worker import DockerAPI, atomic_json, run
 
 JOB = "a" * 32
@@ -252,6 +253,66 @@ def test_docker_api_actions_and_separate_grace(action):
     if action in ("restart", "stop"):
         assert calls[-1][1].endswith("?t=7")
     assert "300" not in calls[-1][1]
+
+
+def test_compose_selector_excludes_ops_worker_with_inherited_target_labels():
+    api = DockerAPI(timeout=300)
+    calls = []
+
+    def request(method, path):
+        calls.append((method, path))
+        if method == "GET" and path.startswith("/containers/json?"):
+            return [
+                {
+                    "Id": "worker-id",
+                    "Labels": {
+                        "com.docker.compose.project": "llm-bawt",
+                        "com.docker.compose.service": "app",
+                        "llm-bawt.ops.job": "job-id",
+                    },
+                },
+                {
+                    "Id": "app-id",
+                    "Labels": {
+                        "com.docker.compose.project": "llm-bawt",
+                        "com.docker.compose.service": "app",
+                    },
+                },
+            ]
+        if method == "GET" and path == "/containers/app-id/json":
+            return {"Id": "app-id", "Config": {"Image": "example:tag"}}
+        return None
+
+    api.request = request
+    output = api.execute({
+        "action": "restart",
+        "compose_project": "llm-bawt",
+        "compose_service": "app",
+    }, {})
+
+    assert output == "Docker restart completed for app-id"
+    assert calls[-1] == ("POST", "/containers/app-id/restart?t=10")
+
+
+def test_dispatched_worker_overrides_inherited_compose_identity(tmp_path, monkeypatch):
+    executor, client, snapshot = setup(tmp_path, monkeypatch)
+    executor.dispatch(job_id=JOB, snapshot=snapshot)
+
+    labels = client.containers.creates[0][1]["labels"]
+    assert labels["com.docker.compose.project"] == "llm-bawt-ops-worker"
+    assert labels["com.docker.compose.service"] == "ops-worker"
+    assert labels["llm-bawt.ops.job"] == JOB
+
+
+def test_restart_app_seed_targets_stable_explicit_container_name():
+    operation = next(
+        row for row in SEEDS
+        if row["slug"] == "llm-bawt.restart-app"
+    )
+    assert json.loads(operation["command_script"]) == {
+        "action": "restart",
+        "container_name": "llm-bawt-app",
+    }
 
 
 @pytest.mark.parametrize("spec", [{}, [], {"action": "nuke", "container_name": "x"},

@@ -219,7 +219,18 @@ class DockerExecutor(Executor):
                         name=name, detach=True, network_mode="none", read_only=True,
                         cap_drop=["ALL"], security_opt=["no-new-privileges:true"],
                         restart_policy={"Name": "no"}, mem_limit="128m", pids_limit=32,
-                        labels={"llm-bawt.ops.job": job_id, "llm-bawt.ops.request": digest},
+                        # Docker merges labels inherited from the immutable base
+                        # image with labels supplied here. The current worker
+                        # image was derived from the Compose app image and thus
+                        # carries project=llm-bawt/service=app; override those
+                        # identities so the worker can never select itself as a
+                        # Compose operation target.
+                        labels={
+                            "com.docker.compose.project": "llm-bawt-ops-worker",
+                            "com.docker.compose.service": "ops-worker",
+                            "llm-bawt.ops.job": job_id,
+                            "llm-bawt.ops.request": digest,
+                        },
                         volumes={settings["receipt_volume"]: {"bind": "/receipts", "mode": "rw"},
                                  "/var/run/docker.sock": {"bind": "/var/run/docker.sock", "mode": "rw"}},
                     )
