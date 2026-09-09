@@ -278,6 +278,7 @@ class ApprovalAwareFastMCP(FastMCP):
         await self._publish_approval_required({
             "_type": "tool_approval_required",
             "request_id": row.id,
+            "tool_use_id": row.tool_use_id,
             "turn_id": row.turn_id,
             "trigger_message_id": row.trigger_message_id,
             "bot_id": row.bot_id,

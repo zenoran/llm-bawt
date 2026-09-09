@@ -20,9 +20,10 @@ from .service.providers.crypto import _get_fernet
 
 TASK_TURN_CONTEXT_HEADER = "X-LLM-Bawt-Task-Turn-Context"
 TASK_TURN_CONTEXT_TTL_SECONDS = 6 * 60 * 60
-# Two canonical shapes are minted server-side and both must round-trip through
-# the capability: ordinary chat turns (``turn-<32 hex>``) and synthetic
-# inter-bot delivery turns (``turn-delivery-<32 hex>``, produced by
+# Three canonical shapes are minted server-side and must round-trip through the
+# capability: ordinary chat turns (``turn-<32 hex>``), synthetic approval
+# continuations (``turn-approval-cont-<32 hex>``), and synthetic inter-bot
+# delivery turns (``turn-delivery-<32 hex>``, produced by
 # ``inter_bot_delivery.stable_ids`` for durable dispatch/callbacks). Rejecting
 # the delivery shape silently killed ``tasks_update(associate_current_turn=true)``
 # on every delivery-dispatched claude-code turn (TASK-783) because the mint
@@ -36,17 +37,27 @@ TASK_TURN_CONTEXT_TTL_SECONDS = 6 * 60 * 60
 # filter).
 _TURN_ID_RE = re.compile(r"^turn-[0-9a-f]{32}$")
 _DELIVERY_TURN_ID_RE = re.compile(r"^turn-delivery-[0-9a-f]{32}$")
+_APPROVAL_CONTINUATION_TURN_ID_RE = re.compile(
+    r"^turn-approval-cont-[0-9a-f]{32}$"
+)
 _ACTOR_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9@._:-]{0,63}$")
 
 
 def is_delivery_turn_id(turn_id: str | None) -> bool:
-    """True if ``turn_id`` is a synthetic inter-bot-delivery id.
-
-    Delivery ids are canonical enough to pass the capability validator, but
-    they are NOT chat turn ids and must not be persisted as ``AgentTaskTurn.turnId``
-    on the BawtHub side (see the module docstring on the two shapes).
-    """
+    """True if ``turn_id`` is a synthetic inter-bot-delivery id."""
     return bool(_DELIVERY_TURN_ID_RE.fullmatch(str(turn_id or "")))
+
+
+def is_approval_continuation_turn_id(turn_id: str | None) -> bool:
+    """True if ``turn_id`` is a server-owned approval continuation id."""
+    return bool(
+        _APPROVAL_CONTINUATION_TURN_ID_RE.fullmatch(str(turn_id or ""))
+    )
+
+
+def is_synthetic_turn_id(turn_id: str | None) -> bool:
+    """True for trusted turn identities not valid as canonical task turn IDs."""
+    return is_delivery_turn_id(turn_id) or is_approval_continuation_turn_id(turn_id)
 
 
 class TaskTurnContextError(ValueError):
@@ -83,11 +94,14 @@ def _actor_id(value: str, field: str) -> str:
 
 def _validate_context(context: TaskTurnContext) -> TaskTurnContext:
     turn_id = str(context.turn_id or "").strip()
-    if not (_TURN_ID_RE.fullmatch(turn_id) or _DELIVERY_TURN_ID_RE.fullmatch(turn_id)):
+    if not (
+        _TURN_ID_RE.fullmatch(turn_id)
+        or _DELIVERY_TURN_ID_RE.fullmatch(turn_id)
+        or _APPROVAL_CONTINUATION_TURN_ID_RE.fullmatch(turn_id)
+    ):
         raise TaskTurnContextError(
-            "turn_id must match turn- plus 32 lowercase hex characters "
-            "(or turn-delivery- plus 32 lowercase hex characters "
-            "for synthetic inter-bot delivery turns)"
+            "turn_id must match a canonical ordinary, delivery, or approval "
+            "continuation turn identifier"
         )
     return TaskTurnContext(
         session_id=_canonical_uuid(context.session_id, "session_id"),

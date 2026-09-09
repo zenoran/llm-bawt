@@ -5,6 +5,8 @@ import json
 from types import SimpleNamespace
 
 from agent_bridge.mcp_call_context import canonical_invocation_hash
+from fastapi import FastAPI
+from fastapi.testclient import TestClient
 from sqlalchemy.pool import StaticPool
 from sqlmodel import create_engine
 
@@ -137,6 +139,62 @@ def test_approve_executes_stored_call_once_and_persists_actual_result(monkeypatc
     persisted = store.get_request(row.id)
     assert persisted.status == REQ_APPROVED
     assert persisted.execution_attempts == 1
+
+
+def test_resolve_route_reconciles_original_tool_record_and_fanout(monkeypatch):
+    store = _store()
+    row = _record(store)
+    fake = FakeMcp()
+    from llm_bawt.mcp_server import registry
+    monkeypatch.setattr(registry, "mcp", fake)
+
+    reconciled = []
+    fanout = []
+    monkeypatch.setattr(
+        routes,
+        "get_turn_log_store",
+        lambda: SimpleNamespace(engine=object()),
+    )
+
+    class FakeToolCallStore:
+        def __init__(self, engine):
+            assert engine is not None
+
+        def resolve_approval_result(self, **kwargs):
+            reconciled.append(kwargs)
+            return True
+
+    monkeypatch.setattr(routes, "ToolCallStore", FakeToolCallStore)
+
+    async def capture_fanout(*args, **kwargs):
+        fanout.append((args, kwargs))
+
+    monkeypatch.setattr(routes, "_fanout_resolved", capture_fanout)
+    monkeypatch.setattr(routes, "_subscriber", lambda: object())
+    monkeypatch.setattr(routes, "_store", lambda: store)
+
+    app = FastAPI()
+    app.include_router(routes.router)
+    with TestClient(app) as client:
+        response = client.post(
+            f"/v1/chat/approvals/{row.id}/resolve",
+            json={"decision": "approve", "resolved_by": "nick"},
+        )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert reconciled == [{
+        "tool_use_id": "toolu_01ABC",
+        "approval_request_id": row.id,
+        "approval_status": REQ_APPROVED,
+        "result": payload["result"],
+        "is_error": False,
+    }]
+    assert fanout[0][1] == {
+        "tool_use_id": "toolu_01ABC",
+        "result": payload["result"],
+        "is_error": False,
+    }
 
 
 def test_deny_never_executes_and_stores_refusal(monkeypatch):

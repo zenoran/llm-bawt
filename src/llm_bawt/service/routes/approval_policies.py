@@ -19,6 +19,7 @@ from sqlalchemy.exc import SQLAlchemyError
 from agent_bridge.approval import evaluate
 from ...approval_validation import candidate_policy
 from ..approval_execution import ApprovalExecutionLeaseLost
+from ..tool_call_store import ToolCallStore
 from ...approval_policies import ApprovalStoreUnavailable, CONT_DELIVERED, CONT_PENDING, CONT_DISPATCHING
 
 from ..approval_continuations import (
@@ -329,6 +330,7 @@ def _stored_mcp_resolution(row) -> dict[str, Any]:
         "detail": "already_resolved",
         "status": row.status,
         "request_id": row.id,
+        "tool_use_id": row.tool_use_id,
         "bot_id": row.bot_id,
         "parent_turn_id": row.turn_id,
         "already_resolved": True,
@@ -502,8 +504,26 @@ async def resolve_approval(request_id: str, body: ResolveRequest):
             message=message,
             resolved_by=body.resolved_by,
         )
+        # The SDK call already ended with an ``approval_required`` placeholder.
+        # Replace that exact card's persisted result with the server-owned
+        # execution outcome. Approval IDs and SDK tool-use IDs are distinct on
+        # this path; never assume request_id is the tool identity.
+        try:
+            turn_store = get_turn_log_store()
+            ToolCallStore(turn_store.engine).resolve_approval_result(
+                tool_use_id=row.tool_use_id or "",
+                approval_request_id=request_id,
+                approval_status=result["status"],
+                result=result.get("result"),
+                is_error=bool(result.get("result_is_error")),
+            )
+        except Exception:
+            log.debug("Could not reconcile MCP approval tool card %s", request_id, exc_info=True)
         await _fanout_resolved(
-            _subscriber(), bot_id, user_id, request_id, row.turn_id, result["status"]
+            _subscriber(), bot_id, user_id, request_id, row.turn_id, result["status"],
+            tool_use_id=row.tool_use_id,
+            result=result.get("result"),
+            is_error=bool(result.get("result_is_error")),
         )
         return result
 
@@ -573,8 +593,19 @@ def _subscriber():
         return None
 
 
-async def _fanout_resolved(subscriber, bot_id, user_id, request_id, turn_id, status) -> None:
-    """Fan out an approval_resolved unified event so every tab clears its card."""
+async def _fanout_resolved(
+    subscriber,
+    bot_id,
+    user_id,
+    request_id,
+    turn_id,
+    status,
+    *,
+    tool_use_id=None,
+    result=None,
+    is_error=None,
+) -> None:
+    """Fan out resolution and, for MCP, its terminal original-call result."""
     if subscriber is None:
         return
     try:
@@ -587,6 +618,9 @@ async def _fanout_resolved(subscriber, bot_id, user_id, request_id, turn_id, sta
                 "request_id": request_id,
                 "turn_id": turn_id,
                 "status": status,
+                "tool_use_id": tool_use_id,
+                "result": result,
+                "is_error": is_error,
                 "ts": time.time(),
             }, ensure_ascii=False, default=str)},
             maxlen=5000,

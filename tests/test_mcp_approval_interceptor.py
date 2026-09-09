@@ -41,6 +41,7 @@ class FakeStore:
         self.order.append("persist")
         row = SimpleNamespace(
             id=kwargs["request_id"],
+            tool_use_id=kwargs.get("tool_use_id"),
             turn_id=kwargs["turn_id"],
             trigger_message_id=kwargs.get("trigger_message_id"),
             bot_id=kwargs["bot_id"],

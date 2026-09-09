@@ -39,18 +39,26 @@ def build_mcp_result_prompt(payload: dict[str, Any]) -> str:
     )
 
 
-def continuation_payload_from_row(row) -> dict[str, Any]:
-    try:
-        result = json.loads(row.result_json or "null")
-    except json.JSONDecodeError:
-        result = row.result_json
+def continuation_payload_from_row(row, *, result_override: Any = None) -> dict[str, Any]:
+    if result_override is not None:
+        result = result_override
+    else:
+        try:
+            result = json.loads(row.result_json or "null")
+        except json.JSONDecodeError:
+            result = row.result_json
+    terminal_error = (
+        isinstance(result_override, dict)
+        and result_override.get("state")
+        in {"failed", "error", "timed_out", "lost", "cancelled"}
+    )
     return {
         "kind": "mcp_tool_result",
         "approval_request_id": row.id,
         "original_tool_use_id": row.tool_use_id,
         "tool_name": row.tool_name,
         "result": result,
-        "is_error": bool(row.result_is_error),
+        "is_error": bool(row.result_is_error) or terminal_error,
     }
 
 
@@ -61,6 +69,49 @@ def _continuation_session(row):
             raise ValueError("Stored caller context is invalid")
         return context.get("session_id") or None
     return None
+
+
+def _terminal_ops_result(service, row) -> dict[str, Any] | None:
+    """Return terminal ops receipt, or None while the restart is still active."""
+    if row.request_kind != KIND_MCP or row.tool_name != "ops_run":
+        return {}
+    try:
+        current = json.loads(row.result_json or "null")
+    except json.JSONDecodeError:
+        return {}
+    if not isinstance(current, dict) or not current.get("job_id"):
+        return {}
+    ops = getattr(service, "_ops_service", None)
+    if ops is None:
+        from .dependencies import get_ops_service
+        ops = get_ops_service(service.config)
+    result = ops.get_job_status(
+        str(current["job_id"]), output_tail_bytes=4096, reconcile_if_active=True,
+    )
+    if not result or not result.get("terminal"):
+        return None
+    return result
+
+
+def _persist_terminal_ops_tool_result(service, row, result: dict[str, Any]) -> None:
+    """Make the original tool card agree with the terminal ops receipt."""
+    turn_store = getattr(service, "_turn_log_store", None)
+    engine = getattr(turn_store, "engine", None)
+    if engine is None or not row.tool_use_id:
+        return
+    try:
+        from .tool_call_store import ToolCallStore
+
+        ToolCallStore(engine).resolve_approval_result(
+            tool_use_id=row.tool_use_id,
+            approval_request_id=row.id,
+            approval_status=row.status,
+            result=result,
+            is_error=result.get("state")
+            in {"failed", "error", "timed_out", "lost", "cancelled"},
+        )
+    except Exception:
+        log.exception("Could not persist terminal ops tool result id=%s", row.id)
 
 
 def _continuation_identity(row):
@@ -115,13 +166,18 @@ async def _send_harness_grant(service, store, row):
     await asyncio.sleep(0.75)
 
 
-async def dispatch_mcp_result_continuation(service, store, row) -> None:
+async def dispatch_mcp_result_continuation(
+    service, store, row, *, result_override: Any = None,
+) -> None:
     """Deliver MCP results or harness decisions with a fenced, renewable claim."""
     from .schemas import ChatCompletionRequest, ChatMessage, McpToolResultContinuation
 
     token = row.continuation_claim_token
     identity = _continuation_identity(row)
-    payload = continuation_payload_from_row(row) if row.request_kind == KIND_MCP else None
+    payload = (
+        continuation_payload_from_row(row, result_override=result_override)
+        if row.request_kind == KIND_MCP else None
+    )
     prompt = (build_mcp_result_prompt(payload) if payload else
               build_respond_prompt(row.resolution_message, row.subject, row.tool_name)
               if row.status == REQ_RESPONDED else
@@ -206,22 +262,51 @@ async def recover_approval_requests(store):
         await asyncio.to_thread(store.prepare_harness_continuation, row.id)
 
 
+async def dispatch_due_continuations_once(service, store, *, limit: int = 20) -> None:
+    """Run one recover/dispatch pass for the durable continuation outbox."""
+    await recover_approval_requests(store)
+    due = await asyncio.to_thread(store.find_pending_continuations, limit=limit)
+    for pending in due:
+        # An approved restart starts before its continuation. Claiming the
+        # continuation while the job is active creates an in-flight agent turn
+        # that the restart can kill. Wait for the durable terminal job receipt,
+        # then start a fresh continuation from the recovered app/bridge process
+        # with that final receipt as its result.
+        terminal_ops_result = await asyncio.to_thread(
+            _terminal_ops_result, service, pending,
+        )
+        if terminal_ops_result is None:
+            continue
+        if terminal_ops_result:
+            await asyncio.to_thread(
+                _persist_terminal_ops_tool_result,
+                service,
+                pending,
+                terminal_ops_result,
+            )
+        claimed = await asyncio.to_thread(
+            store.claim_continuation, pending.id, lease_seconds=120,
+        )
+        if claimed is None:
+            continue
+        try:
+            await dispatch_mcp_result_continuation(
+                service,
+                store,
+                claimed,
+                result_override=terminal_ops_result or None,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            log.exception("Approval continuation failed id=%s", claimed.id)
+
+
 async def run_mcp_continuation_outbox(service, store, *, idle_seconds: float = 2.0) -> None:
     """Lifespan recovery and outbox loop; DB outages do not kill the worker."""
     while True:
         try:
-            await recover_approval_requests(store)
-            due = await asyncio.to_thread(store.find_pending_continuations, limit=20)
-            for pending in due:
-                claimed = await asyncio.to_thread(store.claim_continuation, pending.id, lease_seconds=120)
-                if claimed is None:
-                    continue
-                try:
-                    await dispatch_mcp_result_continuation(service, store, claimed)
-                except asyncio.CancelledError:
-                    raise
-                except Exception:
-                    log.exception("Approval continuation failed id=%s", claimed.id)
+            await dispatch_due_continuations_once(service, store)
         except asyncio.CancelledError:
             raise
         except Exception:

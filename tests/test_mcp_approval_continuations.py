@@ -16,6 +16,8 @@ from llm_bawt.approval_policies import (
 )
 from llm_bawt.service.approval_continuations import (
     MCP_RESULT_ENVELOPE_PREFIX,
+    _terminal_ops_result,
+    dispatch_due_continuations_once,
     dispatch_mcp_result_continuation,
 )
 
@@ -31,7 +33,7 @@ def _store():
     return store
 
 
-def _ready_row(store):
+def _ready_row(store, *, tool_name="ops_run", result=None):
     args = {"operation": "llm-bawt.restart-app", "args": {}}
     row = store.record_mcp_request(
         request_id="req-mcp-1",
@@ -41,7 +43,7 @@ def _ready_row(store):
         user_id="nick",
         turn_id="turn-1",
         backend="claude-code",
-        tool_name="ops_run",
+        tool_name=tool_name,
         tool_arguments=args,
         subject="operation=llm-bawt.restart-app args={}",
         grant_key="grant",
@@ -55,7 +57,7 @@ def _ready_row(store):
     store.claim_mcp_execution(row.id)
     store.complete_mcp_execution(
         row.id,
-        result_json=json.dumps({"job_id": "job-1", "state": "queued"}),
+        result_json=json.dumps(result or {"job_id": "job-1", "state": "queued"}),
         is_error=False,
     )
     store.enqueue_continuation(row.id)
@@ -66,12 +68,135 @@ class FakeService:
     def __init__(self, error=None):
         self.requests = []
         self.error = error
+        self.config = None
 
     async def chat_completion_stream(self, request):
         self.requests.append(request)
         if self.error:
             raise self.error
         yield "data: [DONE]\n\n"
+
+
+class FakeOps:
+    def __init__(self, result):
+        self.result = result
+        self.calls = []
+
+    def get_job_status(self, job_id, **kwargs):
+        self.calls.append((job_id, kwargs))
+        return self.result
+
+
+class OpsServiceHost(FakeService):
+    def __init__(self, result):
+        super().__init__()
+        self._ops_service = FakeOps(result)
+
+
+def test_outbox_does_not_claim_ops_continuation_before_job_is_terminal(monkeypatch):
+    store = _store()
+    row = _ready_row(store, result={"job_id": "job-1", "state": "accepted"})
+    # Put the fixture back into a due, unclaimed outbox state.
+    store.mark_continuation_failed(
+        row.id, error="fixture reset", backoff_seconds=0,
+        claim_token=row.continuation_claim_token,
+    )
+    service = OpsServiceHost({"job_id": "job-1", "state": "running", "terminal": False})
+    monkeypatch.setattr(
+        "llm_bawt.service.approval_continuations.recover_approval_requests",
+        lambda _store: asyncio.sleep(0),
+    )
+
+    asyncio.run(dispatch_due_continuations_once(service, store))
+
+    current = store.get_request(row.id)
+    assert current.continuation_state == CONT_PENDING
+    assert service.requests == []
+
+
+def test_outbox_dispatches_ops_continuation_once_after_terminal_receipt(monkeypatch):
+    store = _store()
+    row = _ready_row(store, result={"job_id": "job-1", "state": "accepted"})
+    store.mark_continuation_failed(
+        row.id, error="fixture reset", backoff_seconds=0,
+        claim_token=row.continuation_claim_token,
+    )
+    terminal = {
+        "job_id": "job-1",
+        "operation": "llm-bawt.restart-app",
+        "state": "succeeded",
+        "terminal": True,
+        "exit_code": 0,
+    }
+    service = OpsServiceHost(terminal)
+    monkeypatch.setattr(
+        "llm_bawt.service.approval_continuations.recover_approval_requests",
+        lambda _store: asyncio.sleep(0),
+    )
+
+    asyncio.run(dispatch_due_continuations_once(service, store))
+    asyncio.run(dispatch_due_continuations_once(service, store))
+
+    current = store.get_request(row.id)
+    assert current.continuation_state == CONT_DELIVERED
+    assert len(service.requests) == 1
+    assert service.requests[0].continuation_payload.result == terminal
+
+
+def test_ops_continuation_waits_for_terminal_job_receipt():
+    store = _store()
+    row = _ready_row(store, result={"job_id": "job-1", "state": "accepted"})
+    service = OpsServiceHost({"job_id": "job-1", "state": "running", "terminal": False})
+
+    assert _terminal_ops_result(service, row) is None
+    assert service._ops_service.calls == [(
+        "job-1",
+        {"output_tail_bytes": 4096, "reconcile_if_active": True},
+    )]
+
+
+def test_terminal_ops_receipt_replaces_initial_accepted_result():
+    store = _store()
+    row = _ready_row(store, result={"job_id": "job-1", "state": "accepted"})
+    terminal = {
+        "job_id": "job-1",
+        "operation": "llm-bawt.restart-app",
+        "state": "succeeded",
+        "terminal": True,
+        "exit_code": 0,
+    }
+    service = OpsServiceHost(terminal)
+
+    final = _terminal_ops_result(service, row)
+    assert final == terminal
+    asyncio.run(
+        dispatch_mcp_result_continuation(
+            service, store, row, result_override=final,
+        )
+    )
+    assert service.requests[0].continuation_payload.result == terminal
+    assert service.requests[0].continuation_payload.is_error is False
+    assert '"state": "succeeded"' in service.requests[0].messages[0].content
+
+
+def test_failed_terminal_ops_receipt_marks_continuation_result_error():
+    store = _store()
+    row = _ready_row(store, result={"job_id": "job-1", "state": "accepted"})
+    failed = {
+        "job_id": "job-1",
+        "operation": "llm-bawt.restart-app",
+        "state": "failed",
+        "terminal": True,
+        "error_text": "restart refused",
+    }
+    service = OpsServiceHost(failed)
+
+    asyncio.run(
+        dispatch_mcp_result_continuation(
+            service, store, row, result_override=failed,
+        )
+    )
+    assert service.requests[0].continuation_payload.is_error is True
 
 
 def test_dispatch_delivers_actual_result_envelope_and_marks_done():

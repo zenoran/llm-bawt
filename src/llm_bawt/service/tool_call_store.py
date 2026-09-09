@@ -12,7 +12,7 @@ import os
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING
 
 from sqlalchemy import BigInteger, Boolean, Column, DateTime, Float, Integer, String, Text, text as sa_text
 from sqlmodel import Field, SQLModel, Session, select
@@ -230,6 +230,62 @@ class ToolCallStore:
             session.commit()
             session.refresh(row)
             return row.id
+
+    def resolve_approval_result(
+        self,
+        *,
+        tool_use_id: str,
+        approval_request_id: str,
+        approval_status: str,
+        result: object,
+        is_error: bool,
+    ) -> bool:
+        """Replace an MCP approval placeholder with its server-owned result."""
+        if self.engine is None or not tool_use_id:
+            return False
+        try:
+            with Session(self.engine) as session:
+                row = session.exec(
+                    select(ToolCallRecord)
+                    .where(ToolCallRecord.tool_use_id == tool_use_id)
+                    .order_by(ToolCallRecord.created_at.desc())
+                ).first()
+            if row is None:
+                return False
+
+            record_id, _ = self.save_result(
+                turn_id=row.turn_id,
+                call_id=row.call_id,
+                tool_use_id=row.tool_use_id,
+                tool_name=row.tool_name,
+                bot_id=row.bot_id,
+                user_id=row.user_id,
+                payload=ToolResultPayload.from_value(result),
+                ended_at=row.ended_at or datetime.now(timezone.utc).timestamp(),
+                is_error=is_error,
+                iteration=row.iteration,
+                parent_tool_use_id=row.parent_tool_use_id,
+            )
+            if record_id is None:
+                return False
+            with Session(self.engine) as session:
+                current = session.exec(
+                    select(ToolCallRecord)
+                    .where(ToolCallRecord.tool_use_id == tool_use_id)
+                    .order_by(ToolCallRecord.created_at.desc())
+                ).first()
+                if current is None:
+                    return False
+                current.approval_request_id = approval_request_id
+                current.approval_status = approval_status
+                session.add(current)
+                session.commit()
+            return True
+        except Exception:
+            logger.exception(
+                "Failed to resolve approval result tool_use_id=%s", tool_use_id,
+            )
+            return False
 
     def save_result(
         self,

@@ -12,8 +12,7 @@ import httpx
 from ..task_turn_context import (
     TASK_TURN_CONTEXT_HEADER,
     TaskTurnContext,
-    TaskTurnContextError,
-    is_delivery_turn_id,
+    is_synthetic_turn_id,
     open_task_turn_context,
 )
 
@@ -92,7 +91,7 @@ async def associate_current_task(task_ref: str) -> dict[str, Any]:
     # PUT bodies both filter delivery ids so BawtHub's strict validator can
     # stay strict (``turn-<32 hex>`` only). Null the turnId here instead of
     # letting the PUT 400 the whole association.
-    turn_id_for_put = None if is_delivery_turn_id(context.turn_id) else context.turn_id
+    turn_id_for_put = None if is_synthetic_turn_id(context.turn_id) else context.turn_id
     body = {
         "sessionId": context.session_id,
         "botId": context.bot_id,

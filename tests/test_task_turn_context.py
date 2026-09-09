@@ -74,6 +74,18 @@ def test_mint_accepts_delivery_shape_turn_id(fernet: Fernet) -> None:
     assert codec.is_delivery_turn_id("turn-" + "a" * 32) is False
 
 
+def test_mint_accepts_approval_continuation_turn_id(fernet: Fernet) -> None:
+    values = _values()
+    values["turn_id"] = "turn-approval-cont-" + "c" * 32
+
+    token = codec.mint_task_turn_context(**values)
+    opened = codec.open_task_turn_context(token)
+
+    assert opened.turn_id == values["turn_id"]
+    assert codec.is_approval_continuation_turn_id(opened.turn_id) is True
+    assert codec.is_synthetic_turn_id(opened.turn_id) is True
+
+
 def test_mint_rejects_arbitrary_turn_id_shapes(fernet: Fernet) -> None:
     # The regex loosening for delivery ids must not open the door to arbitrary
     # strings — every non-canonical shape (wrong length, wrong prefix, uppercase
@@ -87,6 +99,9 @@ def test_mint_rejects_arbitrary_turn_id_shapes(fernet: Fernet) -> None:
         "turn-delivery-" + "a" * 31,           # delivery short by one
         "turndelivery-" + "a" * 32,            # missing hyphen
         "turn-delivery-" + "a" * 32 + "-extra",  # trailing junk
+        "turn-approval-cont-" + "A" * 32,      # uppercase continuation
+        "turn-approval-cont-" + "a" * 31,      # continuation short
+        "turn-approval-" + "a" * 32,           # wrong continuation prefix
         "delivery-" + "a" * 32,                # missing turn- prefix
         "",
     ]:
@@ -239,3 +254,45 @@ def test_association_nulls_turn_id_for_delivery_shape(
     finally:
         task_association.reset_current_task_turn_capability(binding)
     assert captured["json"]["turn"]["turnId"] == values["turn_id"]
+
+
+def test_association_nulls_turn_id_for_approval_continuation(
+    fernet: Fernet,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    values = _values()
+    values["turn_id"] = "turn-approval-cont-" + "e" * 32
+    token = codec.mint_task_turn_context(**values)
+    binding = task_association.set_current_task_turn_capability(token)
+    captured: dict = {}
+
+    class FakeResponse:
+        def raise_for_status(self) -> None:
+            return None
+
+        def json(self) -> dict:
+            return {"association": {"task": {"shortId": "TASK-865"}}}
+
+    class FakeClient:
+        def __init__(self, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return None
+
+        async def put(self, path: str, json: dict):
+            captured["json"] = json
+            return FakeResponse()
+
+    monkeypatch.setattr(task_association.httpx, "AsyncClient", FakeClient)
+    try:
+        result = asyncio.run(task_association.associate_current_task("TASK-865"))
+    finally:
+        task_association.reset_current_task_turn_capability(binding)
+
+    assert result["ok"] is True
+    assert captured["json"]["turn"]["triggerMessageId"] == values["trigger_message_id"]
+    assert captured["json"]["turn"]["turnId"] is None
