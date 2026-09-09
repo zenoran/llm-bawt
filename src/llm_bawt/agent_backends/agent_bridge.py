@@ -247,6 +247,7 @@ class AgentBridgeBackend(AgentBackend):
                                 int(config.get("max_turns"))
                                 if config.get("max_turns") is not None else None
                             ),
+                            skill_bundle=config.get("skill_bundle"),
                             subagent_model=(
                                 str(config.get("subagent_model")).strip()
                                 if config.get("subagent_model") else None

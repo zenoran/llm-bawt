@@ -232,7 +232,16 @@ class CodexCommandMixin:
                 fresh_session_retry = False
                 while True:
                     try:
+                        from agent_bridge.skill_selection import guard_resumed_bundle
+                        guard_resumed_bundle(fields.get("skill_bundle"), thread=thread_session_id, resume=resume_id, harness="codex")
                         codex = self._ensure_codex()
+                        if fields.get("skill_bundle") is not None:
+                            from agent_bridge.skill_codex import codex_skill_env
+                            from openai_codex_sdk import Codex
+                            codex = Codex({
+                                "codex_path_override": self._transport._codex_bin,
+                                "env": codex_skill_env(fields["skill_bundle"]),
+                            })
                     except RuntimeError as auth_err:
                         # auth.json missing/invalid at startup — surface to user
                         seq += 1

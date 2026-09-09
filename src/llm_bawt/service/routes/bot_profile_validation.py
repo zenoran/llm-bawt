@@ -65,6 +65,15 @@ def _validate_profile_payload(payload: dict[str, object]) -> None:
     agent_backend = str(payload.get("agent_backend")).strip() if payload.get("agent_backend") is not None else ""
     if resolved_type == "agent" and not agent_backend:
         raise HTTPException(status_code=400, detail="Agent bots require agent_backend")
+    config = payload.get("agent_backend_config")
+    if isinstance(config, dict) and config.get("skill_bundle") is not None:
+        from agent_bridge.skill_registry import _name
+        try:
+            _name(config["skill_bundle"])
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail="skill_bundle must be a lowercase kebab-case registry name") from exc
+        if agent_backend not in {"claude-code", "codex"}:
+            raise HTTPException(status_code=400, detail="skill_bundle requires Claude Code or Codex")
     _normalize_agent_backend_config_model(agent_backend, payload)
     _validate_model_endpoint(payload)
 

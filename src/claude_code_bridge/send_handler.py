@@ -366,6 +366,8 @@ class ClaudeSendMixin(ClaudeStreamMixin, ClaudeUsageMixin, ClaudeResultMixin):
 
                     # TASK-623: ClaudeAgentOptions construction moved to
                     # _build_agent_options (behavior-identical).
+                    from agent_bridge.skill_selection import guard_resumed_bundle
+                    guard_resumed_bundle(req.skill_bundle, thread=req.thread_session_id, resume=resume_id)
                     options = self._build_agent_options(
                         model=model,
                         system_prompt=system_prompt,
@@ -380,6 +382,7 @@ class ClaudeSendMixin(ClaudeStreamMixin, ClaudeUsageMixin, ClaudeResultMixin):
                         post_tool_use_cb=post_tool_use_cb,
                         stderr=_log_stderr,
                         task_turn_capability=task_turn_capability,
+                        skill_bundle=req.skill_bundle,
                     )
 
                     session_persisted = False

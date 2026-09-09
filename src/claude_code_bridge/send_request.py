@@ -51,6 +51,7 @@ class SendRequest:
     # TASK-701: opaque app-signed current-turn authority, forwarded as an MCP
     # HTTP header. The bridge never opens or logs the payload.
     task_turn_capability: str | None = None
+    skill_bundle: str | None = None
 
     @classmethod
     def from_fields(cls, fields: dict) -> "SendRequest":
@@ -190,4 +191,5 @@ class SendRequest:
             thread_resume_id=thread_resume_id,
             explicit_thread=explicit_thread,
             task_turn_capability=task_turn_capability,
+            skill_bundle=fields.get("skill_bundle"),
         )

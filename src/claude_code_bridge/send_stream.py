@@ -213,6 +213,7 @@ class ClaudeStreamMixin:
         post_tool_use_cb,
         stderr,
         task_turn_capability: str | None = None,
+        skill_bundle: str | None = None,
     ) -> ClaudeAgentOptions:
         """Construct per-attempt options with isolated MCP request headers."""
         mcp_servers = copy.deepcopy(self._mcp_servers) if self._mcp_servers else {}
@@ -222,7 +223,10 @@ class ClaudeStreamMixin:
                 headers = dict(bawthub.get("headers") or {})
                 headers["X-LLM-Bawt-Task-Turn-Context"] = task_turn_capability
                 bawthub["headers"] = headers
+        from agent_bridge.skill_selection import claude_skill_options
+
         return ClaudeAgentOptions(
+            **claude_skill_options(skill_bundle),
             model=model,
             # TASK-288: send the system prompt on EVERY turn, resume
             # included. The SDK rebuilds and re-sends systemPrompt on

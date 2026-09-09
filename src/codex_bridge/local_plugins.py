@@ -38,6 +38,19 @@ def _resolve_skill_target(
     codex_home: Path,
     source_skill_entry: Path,
 ) -> Path | None:
+    # A package's own content is authoritative. Name-based lookup exists only
+    # for legacy mapping entries (empty directories), not as an override for
+    # a bundled skill or an explicitly linked source from another repository.
+    if source_skill_entry.is_symlink():
+        resolved = source_skill_entry.resolve(strict=False)
+        if (resolved / "SKILL.md").is_file():
+            return resolved
+        # A broken explicit source must not silently select unrelated content.
+        return None
+
+    if (source_skill_entry / "SKILL.md").is_file():
+        return source_skill_entry
+
     repo_skill_dir = dev_root / "agent-skills" / skill_name
     if (repo_skill_dir / "SKILL.md").exists():
         return repo_skill_dir
@@ -45,14 +58,6 @@ def _resolve_skill_target(
     system_skill_dir = codex_home / "skills" / ".system" / skill_name
     if (system_skill_dir / "SKILL.md").exists():
         return system_skill_dir
-
-    if source_skill_entry.is_symlink():
-        resolved = source_skill_entry.resolve(strict=False)
-        if (resolved / "SKILL.md").exists():
-            return resolved
-
-    if source_skill_entry.is_dir() and (source_skill_entry / "SKILL.md").exists():
-        return source_skill_entry
 
     return None
 

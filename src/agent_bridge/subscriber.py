@@ -160,6 +160,7 @@ class RedisSubscriber:
         thread_resume_id: str | None = None,
         explicit_thread: bool = False,
         task_turn_capability: str | None = None,
+        skill_bundle: str | None = None,
     ) -> None:
         """Publish a chat.send command to the bridge's command stream.
 
@@ -189,6 +190,9 @@ class RedisSubscriber:
             "message": message,
             "request_id": request_id,
         }
+        if skill_bundle is not None:
+            from .skill_registry import _name
+            fields["skill_bundle"] = _name(skill_bundle)
         if attachments:
             fields["attachments"] = json.dumps(attachments, ensure_ascii=False)
         if system_prompt:
