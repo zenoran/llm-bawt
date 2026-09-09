@@ -18,7 +18,9 @@ Protocol reference: public `openai/codex`, tag `rust-v0.153.4`:
 - Move tools to an `additional_tools` developer input item and instructions to a
   developer message. Stable IDs derive from conversation and visible content.
   Disable parallel tool calls; use `reasoning.context=all_turns`; strip image
-  detail fields. Existing explicit reasoning settings win; Astra defaults low.
+  detail fields. Existing explicit reasoning settings win; fallback effort comes
+  from the selected endpoint's `serving_config.reasoning_effort`, with a
+  model-agnostic high safety default when absent.
 - Capture `x-codex-turn-state` from upgrade/HTTP headers or `response.metadata`;
   replay in reconnect headers and WS create metadata.
 - Explicit HTTP 426 upgrade rejection selects SSE with the same Lite payload.

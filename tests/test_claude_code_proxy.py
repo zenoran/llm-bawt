@@ -485,6 +485,27 @@ def test_prepare_request_rejects_unsupported_minimal_effort(monkeypatch) -> None
     assert prepared["reasoning"] == {"effort": "high", "summary": "auto"}
 
 
+def test_prepare_request_has_no_model_specific_low_effort_default(monkeypatch) -> None:
+    monkeypatch.delenv("OPENAI_CHATGPT_REASONING_EFFORT", raising=False)
+    prepared = OpenAIChatGPTAdapter().prepare_request(
+        {"model": "gpt-6-astra", "input": [], "instructions": "stable"}
+    )
+    assert prepared["reasoning"] == {"effort": "high", "summary": "auto"}
+
+
+def test_prepare_request_preserves_explicit_reasoning(monkeypatch) -> None:
+    monkeypatch.setenv("OPENAI_CHATGPT_REASONING_EFFORT", "low")
+    prepared = OpenAIChatGPTAdapter().prepare_request(
+        {
+            "model": "gpt-6-astra",
+            "input": [],
+            "instructions": "stable",
+            "reasoning": {"effort": "high", "summary": "auto"},
+        }
+    )
+    assert prepared["reasoning"] == {"effort": "high", "summary": "auto"}
+
+
 # ── OpenAI platform adapter ───────────────────────────────────────────────────
 def test_openai_platform_registered_under_openai_prefix() -> None:
     from claude_code_bridge.proxy.adapters import lookup

@@ -212,6 +212,22 @@ def test_incompatible_explicit_endpoint_is_rejected():
         catalog.resolve(1, harness="chat")
 
 
+def test_endpoint_reasoning_effort_is_flattened_for_bridge_dispatch():
+    endpoint = _endpoint(
+        21,
+        "astra",
+        "openai-oauth",
+        "openai",
+        "responses",
+        "gpt-6-astra",
+        serving_config={"reasoning_effort": "high"},
+    )
+
+    resolved = ModelCatalog([endpoint]).resolve("astra", harness="claude-proxy")
+
+    assert resolved["reasoning_effort"] == "high"
+
+
 def test_local_serving_config_is_flattened_for_existing_consumers():
     endpoint = _endpoint(
         3,

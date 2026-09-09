@@ -45,10 +45,12 @@ _UNSUPPORTED_PARAMS = ("temperature", "top_p", "max_output_tokens")
 # The codex backend hard-requires a non-empty ``instructions`` field.
 _FALLBACK_INSTRUCTIONS = "You are a helpful coding assistant."
 
-# Codex's Astra catalog default is low. Other models retain their established
-# high fallback; explicit inbound reasoning and environment overrides win.
+# Transport defaults must stay model-agnostic. Per-endpoint policy is resolved
+# from model_endpoints.serving_config by the app and reaches the proxy through
+# the bridge's existing per-turn effort setting. Explicit inbound reasoning and
+# the legacy environment override still win; absent configuration fails safe to
+# high rather than silently reducing model quality.
 DEFAULT_REASONING_EFFORT = "high"
-_MODEL_REASONING_DEFAULTS = {"gpt-6-astra": "low"}
 REASONING_EFFORT_ENV = "OPENAI_CHATGPT_REASONING_EFFORT"
 _VALID_EFFORT = {"none", "low", "medium", "high", "xhigh", "max"}
 
@@ -264,10 +266,7 @@ class OpenAIChatGPTAdapter(ProviderAdapter):
         if "reasoning" not in responses_body:
             effort = (os.getenv(REASONING_EFFORT_ENV) or "").strip().lower()
             if effort not in _VALID_EFFORT:
-                effort = _MODEL_REASONING_DEFAULTS.get(
-                    str(responses_body.get("model") or ""),
-                    DEFAULT_REASONING_EFFORT,
-                )
+                effort = DEFAULT_REASONING_EFFORT
             responses_body["reasoning"] = {"effort": effort}
         responses_body["reasoning"].setdefault("summary", "auto")
         return responses_body

@@ -5,6 +5,7 @@ from unittest.mock import MagicMock
 
 from llm_bawt.service.routes.model_catalog import (
     AccessPathWrite,
+    EndpointWrite,
     ModelWrite,
     _check_endpoint_cas,
     _delete_catalog_model,
@@ -25,6 +26,21 @@ def test_model_write_requires_positive_context_window():
 
     ok = ModelWrite(vendor="xai", display_name="Grok", default_context_window=1000000)
     assert ok.default_context_window == 1000000
+
+
+def test_endpoint_reasoning_effort_is_normalized_and_validated():
+    endpoint = EndpointWrite(
+        serving_config={"reasoning_effort": " HIGH ", "other": True}
+    )
+    assert endpoint.serving_config == {
+        "reasoning_effort": "high",
+        "other": True,
+    }
+
+    with pytest.raises(ValidationError, match="reasoning_effort"):
+        EndpointWrite(serving_config={"reasoning_effort": "minimal"})
+    with pytest.raises(ValidationError, match="reasoning_effort"):
+        EndpointWrite(serving_config={"reasoning_effort": 42})
 
 
 def test_access_path_prompt_overrides_trim_drop_blanks_and_preserve_entries():

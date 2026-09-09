@@ -64,6 +64,21 @@ class EndpointWrite(BaseModel):
     tool_support_override: str | None = None
     pricing: dict[str, Any] | None = None
 
+    @field_validator("serving_config")
+    @classmethod
+    def validate_reasoning_effort(cls, value: dict[str, Any]) -> dict[str, Any]:
+        effort = value.get("reasoning_effort")
+        if effort is None:
+            return value
+        if not isinstance(effort, str) or effort.strip().lower() not in {
+            "low", "medium", "high", "xhigh", "max",
+        }:
+            raise ValueError(
+                "serving_config.reasoning_effort must be one of: "
+                "low, medium, high, xhigh, max"
+            )
+        return {**value, "reasoning_effort": effort.strip().lower()}
+
 
 def _engine():
     engine = get_model_catalog_engine(get_service().config)

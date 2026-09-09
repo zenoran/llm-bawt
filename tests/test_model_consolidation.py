@@ -182,6 +182,46 @@ def test_init_bot_uses_canonical_endpoint_for_ambiguous_proxy_model(monkeypatch)
     assert service.client._bot_config["model"] == "xai/grok-4.5"
 
 
+def test_init_bot_uses_catalog_reasoning_effort_without_bot_override(monkeypatch):
+    bot = SimpleNamespace(
+        agent_backend="claude-code",
+        agent_backend_config={},
+        default_model="astra",
+    )
+    service = _run_init_bot(
+        monkeypatch,
+        bot,
+        {
+            "astra": {
+                "type": "claude-code",
+                "model_id": "openai_chatgpt/gpt-6-astra",
+                "reasoning_effort": "high",
+            }
+        },
+    )
+    assert service.client._bot_config["effort"] == "high"
+
+
+def test_init_bot_preserves_explicit_bot_effort_over_catalog(monkeypatch):
+    bot = SimpleNamespace(
+        agent_backend="claude-code",
+        agent_backend_config={"effort": "xhigh"},
+        default_model="astra",
+    )
+    service = _run_init_bot(
+        monkeypatch,
+        bot,
+        {
+            "astra": {
+                "type": "claude-code",
+                "model_id": "openai_chatgpt/gpt-6-astra",
+                "reasoning_effort": "high",
+            }
+        },
+    )
+    assert service.client._bot_config["effort"] == "xhigh"
+
+
 def test_init_bot_injection_overrides_legacy_config_model(monkeypatch):
     """Catalog model wins over stale agent_backend_config.model."""
     bot = SimpleNamespace(

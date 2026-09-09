@@ -120,6 +120,18 @@ class ServiceLLMBawt(BaseLLMBawt):
                 for field in ("endpoint_id", "harness", "access_path"):
                     if model_def.get(field) is not None:
                         self.client._bot_config[field] = model_def[field]
+                # Per-endpoint reasoning policy belongs to the normalized model
+                # catalog, not provider/model-name branches in bridge transport.
+                # Preserve an explicit per-bot override when present; otherwise
+                # feed the catalog value into the bridge's existing per-turn
+                # effort field.
+                configured_effort = model_def.get("reasoning_effort")
+                if (
+                    "effort" not in self.client._bot_config
+                    and isinstance(configured_effort, str)
+                    and configured_effort.strip()
+                ):
+                    self.client._bot_config["effort"] = configured_effort.strip().lower()
                 provider_system_prompt = model_def.get("provider_system_prompt")
                 if isinstance(provider_system_prompt, str) and provider_system_prompt:
                     self.client._bot_config["provider_system_prompt"] = (
