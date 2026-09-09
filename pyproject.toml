@@ -1,6 +1,6 @@
 [project]
 name = "llm-bawt"
-version = "0.1.29"
+version = "0.1.30"
 description = "llm-bawt - Model-agnostic LLM platform providing a unified, OpenAI-compatible API for configurable chatbots and multi-agent systems across cloud and local models."
 readme = "README.md"
 license = { file = "LICENSE" }
@@ -12,6 +12,7 @@ dependencies = [
     "pydantic-settings>=2.8.1",
     "openai>=1.69.0",
     "pyyaml>=6.0.2",
+    "tomlkit>=0.13.3",  # Preserve operator config when preparing isolated skill homes.
     "pytz>=2025.2",
     "tiktoken>=0.9.0",
     "click>=8.0.0",
