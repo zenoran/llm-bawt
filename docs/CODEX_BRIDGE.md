@@ -21,10 +21,22 @@ and the bridge logic is
 The bridge is OAuth-only. On startup it:
 
 - scrubs `OPENAI_API_KEY` and `CODEX_API_KEY` from the environment
-- validates `CODEX_AUTH_PATH`
-- points `CODEX_HOME` at the directory containing that auth file
+- materializes a container-local OAuth bundle from the app's
+  `GET /v1/providers/openai_chatgpt/bundle` broker endpoint
+- validates that file (`CODEX_AUTH_PATH`, default `/home/bridge/.codex/auth.json`)
+- points `CODEX_HOME` at its containing directory
 
-If OAuth is broken, the recovery path is `codex login` on the host.
+**The host `~/.codex/auth.json` is NOT the deployed bridge credential source.**
+TASK-636 removed its bind mount. A host CLI can fail with stale credentials
+while native Codex bots and the OpenAI proxy both work normally.
+
+Before diagnosing authentication, inspect the actual bridge's CODEX_HOME,
+CODEX_AUTH_PATH, executable and mounts without printing tokens. Test through
+that execution context. An unrelated host probe does not establish a bridge
+failure. Check the app-owned provider connection and broker materialization;
+recover through the provider connection flow only if that path actually fails.
+Do not advise host login, copy/refresh another bundle, or restart a bridge as a
+shortcut. The app owns the refresh chain; do not introduce a second refresher.
 
 ## Important environment variables
 
@@ -55,7 +67,8 @@ If OAuth is broken, the recovery path is `codex login` on the host.
 The main compose stack mounts:
 
 - `${HOME}/dev` at `/home/bridge/dev`
-- `${HOME}/.codex/auth.json` at `/home/bridge/.codex/auth.json`
+- **No host auth.json mount**; the bridge materializes its container-local file
+  from the app broker at startup
 - `${HOME}/.codex/config.toml` at `/home/bridge/.codex/config.toml`
 - `${HOME}/.codex/sessions` at `/home/bridge/.codex/sessions`
 

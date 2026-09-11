@@ -58,8 +58,10 @@ def validate_auth_json(path: Path | None = None) -> dict:
     p = path or auth_path()
     if not p.exists():
         raise RuntimeError(
-            f"Codex auth.json missing at {p}. Run 'codex login' on the host "
-            f"to provision OAuth credentials, then restart the bridge."
+            f"Codex auth.json missing at {p}. Check the app-owned OpenAI ChatGPT "
+            "provider connection and bridge broker materialization. The host "
+            "~/.codex/auth.json is not the deployed bridge credential source; "
+            "do not log in or restart services as a diagnostic shortcut."
         )
     try:
         data = json.loads(p.read_text())
@@ -71,14 +73,16 @@ def validate_auth_json(path: Path | None = None) -> dict:
     if auth_mode and auth_mode != "chatgpt":
         raise RuntimeError(
             f"Codex auth.json auth_mode is {auth_mode!r}; only 'chatgpt' "
-            f"OAuth is supported. Re-run 'codex login' with ChatGPT mode."
+            "OAuth is supported. Check the app-owned provider bundle and "
+            "bridge broker materialization; do not substitute host credentials."
         )
 
     refresh_token = tokens.get("refresh_token") or data.get("refresh_token")
     if not refresh_token:
         raise RuntimeError(
-            f"Codex auth.json at {p} has no refresh_token. Re-run 'codex login' "
-            f"to refresh the OAuth bundle."
+            f"Codex auth.json at {p} has no refresh_token. Check the app-owned "
+            "provider bundle and bridge broker materialization. Recover through "
+            "the provider connection flow, not an unrelated host login."
         )
     return data
 
@@ -89,8 +93,8 @@ class CodexTransport:
     The SDK's ``Codex`` is sync-constructed and spawns a fresh ``codex exec``
     subprocess per turn, so there's no long-lived server to recycle. The
     only state we hold is the SDK handle itself, lazily built on first use
-    (and rebuilt only if explicitly torn down — useful when a fresh
-    ``codex login`` rewrites ``auth.json``).
+    (and rebuilt only if explicitly torn down after the app-owned provider
+    bundle has been recovered/materialized).
     """
 
     def __init__(self, *, codex_bin: str | None = None) -> None:
@@ -120,8 +124,8 @@ class CodexTransport:
     def reset(self) -> None:
         """Drop the cached ``Codex`` so the next ensure rebuilds.
 
-        Used after auth-recovery so a fresh ``codex login`` is picked up
-        without restarting the container. There is no subprocess to tear
+        Used after app-owned auth recovery/materialization so the new bundle
+        is picked up without restarting the container. No subprocess to tear
         down — the next ``run_streamed`` call will spawn a fresh codex
         binary that re-reads ``auth.json``.
         """

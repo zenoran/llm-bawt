@@ -452,7 +452,9 @@ class CodexCommandMixin:
                                 kind=AgentEventKind.ERROR,
                                 text=(
                                     "[credential_expired:codex] "
-                                    "Codex OAuth failed — re-run codex login on echo"
+                                    "Codex OAuth failed — check the app-owned OpenAI ChatGPT "
+                                    "provider connection and bridge broker materialization; "
+                                    "host CLI credentials are a separate path"
                                 ),
                                 model=model,
                             )
