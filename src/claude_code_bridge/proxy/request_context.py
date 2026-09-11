@@ -9,16 +9,21 @@ values in the model prompt.
 from __future__ import annotations
 
 import hashlib
+import logging
 import re
 import time
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from typing import Any, Callable
 
 CONVERSATION_HEADER = "X-LLM-Bawt-Conversation-ID"
 BOT_HEADER = "X-LLM-Bawt-Bot-ID"
 REQUEST_HEADER = "X-LLM-Bawt-Request-ID"
 
 _OPAQUE_ID_RE = re.compile(r"^[a-f0-9]{32}$")
+
+ProxyStatusCallback = Callable[[str, dict[str, Any]], None]
+logger = logging.getLogger(__name__)
 
 
 def durable_conversation_identity(
@@ -62,6 +67,8 @@ class ProxyRequestContext:
     input_tokens: int = 0
     cached_tokens: int = 0
     output_tokens: int = 0
+    attempt: int = 0
+    status_callback: ProxyStatusCallback | None = field(default=None, repr=False)
 
     def __post_init__(self) -> None:
         if not self.started_at:
@@ -83,6 +90,22 @@ class ProxyRequestContext:
         self.input_tokens = input_tokens
         self.output_tokens = output_tokens
         self.cached_tokens = cached_tokens
+
+    def report_status(self, status: dict[str, Any]) -> None:
+        """Publish transient proxy progress without adding assistant text."""
+        if self.status_callback is None:
+            return
+        try:
+            self.status_callback(self.request_id, status)
+        except Exception:
+            # UI progress is best-effort and must never turn successful
+            # upstream recovery into a failed model request.
+            logger.warning(
+                "Proxy status callback failed request_id=%s state=%s",
+                self.request_id,
+                status.get("state"),
+                exc_info=True,
+            )
 
 
 def custom_header_env(context: ProxyRequestContext) -> str:

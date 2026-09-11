@@ -58,6 +58,7 @@ class FailureBucket(Enum):
     D_RATE_LIMIT = "D_rate_limit"                    # retry-after honored with cap
     E_TRANSLATOR_BUG = "E_translator_bug"            # our bug — never retry
     F_AUTH_BROKER = "F_auth_broker"                  # one force-refresh retry allowed
+    G_PROGRESS_STALL = "G_progress_stall"            # supervised Responses liveness failure
 
 
 # ── Translator state — the retry decision needs to know what was yielded ────
@@ -240,6 +241,12 @@ def classify_stream_exception(exc: BaseException) -> FailureBucket:
     the initial-request boundary — the caller has already checked the phase and
     decided whether phase permits any retry at all.
     """
+    # The Responses supervisor marks its own liveness failures. Keep them
+    # distinct from ordinary transport errors: replay is safe before output,
+    # but not after reasoning has already been forwarded to the SDK.
+    if getattr(exc, "proxy_retry_owner", False):
+        return FailureBucket.G_PROGRESS_STALL
+
     # Same table works — mid-stream we just don't get status codes as often,
     # but the openai/httpx/httpcore module test is what carries the weight.
     return classify_initial_exception(exc)
@@ -424,6 +431,16 @@ def decide(
         return RetryDecision(
             retry=False,
             reason=f"text_partial_no_retry bucket={bucket.value}",
+            final_error_type="api_error",
+        )
+
+    # Reasoning is already assistant output on the Anthropic stream. Existing
+    # transient/5xx handling can splice it for compatibility, but a supervised
+    # stall must never replay an attempt after any output has been observed.
+    if bucket is FailureBucket.G_PROGRESS_STALL and phase is RetryPhase.THINKING:
+        return RetryDecision(
+            retry=False,
+            reason="thinking_stall_no_replay",
             final_error_type="api_error",
         )
 

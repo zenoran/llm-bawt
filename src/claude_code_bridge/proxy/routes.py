@@ -368,6 +368,11 @@ async def messages(request: Request) -> JSONResponse | StreamingResponse:
         conversation_id=valid_conversation_identity(
             request_headers.get(CONVERSATION_HEADER)
         ),
+        status_callback=getattr(
+            getattr(getattr(request, "app", None), "state", None),
+            "proxy_status_callback",
+            None,
+        ),
     )
 
     logger.info(

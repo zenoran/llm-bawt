@@ -130,6 +130,15 @@ class TestBucketClassification:
             is retry_mod.FailureBucket.E_TRANSLATOR_BUG
         )
 
+    def test_supervised_stream_timeout_is_bucket_g(self):
+        class SupervisedTimeout(TimeoutError):
+            proxy_retry_owner = True
+
+        assert (
+            retry_mod.classify_stream_exception(SupervisedTimeout("stalled"))
+            is retry_mod.FailureBucket.G_PROGRESS_STALL
+        )
+
 
 class TestInbandClassification:
     """Al addition #2: in-band response.failed / response.error / error payloads."""
@@ -252,6 +261,18 @@ class TestDecideStateMachine:
             policy=policy,
         )
         assert d.retry is True
+
+    def test_thinking_progress_stall_never_replays(self):
+        policy = retry_mod.RetryPolicy(max_attempts=3)
+        policy.start_attempt()
+        d = retry_mod.decide(
+            bucket=retry_mod.FailureBucket.G_PROGRESS_STALL,
+            phase=retry_mod.RetryPhase.THINKING,
+            policy=policy,
+        )
+        assert d.retry is False
+        assert d.final_error_type == "api_error"
+        assert d.reason == "thinking_stall_no_replay"
 
     def test_bucket_c_never_retries_even_pre_output(self):
         policy = retry_mod.RetryPolicy(max_attempts=5)

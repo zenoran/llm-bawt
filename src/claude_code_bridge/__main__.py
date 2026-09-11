@@ -126,7 +126,11 @@ def main() -> None:
     )
     proxy_server: ProxyServer | None = None
     if not proxy_disabled:
-        proxy_server = ProxyServer(host="127.0.0.1", port=proxy_port)
+        proxy_server = ProxyServer(
+            host="127.0.0.1",
+            port=proxy_port,
+            status_callback=bridge.publish_proxy_status,
+        )
 
     logger.info(
         "Starting Claude Code bridge (backend=%s)",

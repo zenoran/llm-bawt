@@ -19,6 +19,9 @@ class AgentEventKind(str, Enum):
     RUN_STARTED = "run_started"
     RUN_COMPLETED = "run_completed"
     SYSTEM_NOTE = "system_note"
+    # Transient provider/proxy liveness state. Structured metadata lives in
+    # ``raw`` and must never be appended to persisted assistant text.
+    UPSTREAM_STATUS = "upstream_status"
     ERROR = "error"
     # Emitted whenever a bridge clears its server-side session — via /new
     # in _handle_send or via the session.reset RPC.  Lets the frontend

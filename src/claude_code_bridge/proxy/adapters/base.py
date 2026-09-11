@@ -215,6 +215,8 @@ class ProviderAdapter(ABC):
 
         while True:
             attempt = policy.start_attempt()
+            if context is not None:
+                context.attempt = attempt
             # Only treat this as a resumed attempt if the PRIOR attempt actually
             # emitted the ``message_start`` envelope downstream. A retry after a
             # CONNECTING failure (initial request never returned; translator
@@ -382,6 +384,27 @@ class ProviderAdapter(ABC):
                     state.open_block = None
                 # Clear the in-band error so the next attempt starts clean.
                 state.inband_error = None
+                fallback_transport = getattr(
+                    stream_exc, "fallback_transport", None
+                )
+                if context is not None and fallback_transport:
+                    context.report_status({
+                        "state": "reconnecting",
+                        "message": "Upstream stalled; reconnecting over HTTPS…",
+                        "provider": context.provider,
+                        "attempt": attempt,
+                        "next_attempt": attempt + 1,
+                        "max_attempts": policy.max_attempts,
+                        "transport": getattr(stream_exc, "transport", "unknown"),
+                        "fallback_transport": fallback_transport,
+                        "stall_phase": getattr(stream_exc, "phase", "unknown"),
+                        "productive_idle_seconds": getattr(
+                            stream_exc, "productive_idle_seconds", None
+                        ),
+                        "elapsed_seconds": getattr(
+                            stream_exc, "elapsed_seconds", None
+                        ),
+                    })
                 await asyncio.sleep(decision.backoff_s)
                 continue
 
@@ -394,6 +417,9 @@ class ProviderAdapter(ABC):
             if state.open_block is not None:
                 yield _stop_block_frame(state.open_block["index"])
                 state.open_block = None
+            discard_stream = getattr(upstream_stream, "discard", None)
+            if discard_stream is not None:
+                await discard_stream()
             final_error_type = decision.final_error_type or "api_error"
             if stream_exc is not None and getattr(
                 stream_exc, "proxy_retry_owner", False

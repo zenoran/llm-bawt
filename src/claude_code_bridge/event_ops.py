@@ -340,6 +340,25 @@ class ClaudeEventMixin:
         )
         self._publish_run_event_with_changed_file(request_id, event)
 
+    def publish_proxy_status(self, request_id: str, status: dict) -> None:
+        """Bridge an in-process proxy status onto the active Redis run."""
+        session_key = self._proxy_request_sessions.get(request_id)
+        if not session_key:
+            logger.debug(
+                "Dropping proxy status for inactive request_id=%s", request_id
+            )
+            return
+        attempt = status.get("attempt")
+        seq = int(attempt) if isinstance(attempt, int) else 0
+        self._publish_event(
+            request_id,
+            session_key,
+            seq,
+            kind=AgentEventKind.UPSTREAM_STATUS,
+            text=str(status.get("message") or "Upstream status changed."),
+            extra_raw={"upstream_status": dict(status)},
+        )
+
     def _publish_session_reset_unified(
         self,
         bot_id: str,

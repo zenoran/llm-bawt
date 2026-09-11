@@ -18,6 +18,7 @@ from fastapi import FastAPI
 
 from .adapters import close_all, start_all
 from .routes import router as messages_router
+from .request_context import ProxyStatusCallback
 
 logger = logging.getLogger(__name__)
 
@@ -33,7 +34,7 @@ async def _lifespan(app: FastAPI):
         logger.info("Proxy app shutting down")
 
 
-def create_app() -> FastAPI:
+def create_app(status_callback: ProxyStatusCallback | None = None) -> FastAPI:
     app = FastAPI(
         title="Claude Code Bridge — Anthropic-compatible proxy",
         description=(
@@ -47,6 +48,7 @@ def create_app() -> FastAPI:
         redoc_url=None,
         openapi_url=None,
     )
+    app.state.proxy_status_callback = status_callback
     app.include_router(messages_router)
 
     @app.get("/healthz")
@@ -62,10 +64,16 @@ class ProxyServer:
     so callers can read ``base_url`` immediately.
     """
 
-    def __init__(self, host: str = "127.0.0.1", port: int = 0) -> None:
+    def __init__(
+        self,
+        host: str = "127.0.0.1",
+        port: int = 0,
+        *,
+        status_callback: ProxyStatusCallback | None = None,
+    ) -> None:
         self._host = host
         self._requested_port = port
-        self._app = create_app()
+        self._app = create_app(status_callback)
         self._server: Optional[uvicorn.Server] = None
         self._serve_task: Optional[asyncio.Task[None]] = None
         self._actual_port: Optional[int] = None

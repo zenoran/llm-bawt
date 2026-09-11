@@ -12,6 +12,7 @@ import copy
 import hashlib
 import json
 import logging
+import time
 from dataclasses import dataclass
 from types import SimpleNamespace
 from urllib.parse import urlsplit, urlunsplit
@@ -26,6 +27,18 @@ LITE_HEADER = "x-openai-internal-codex-responses-lite"
 TURN_HEADER = "x-codex-turn-state"
 WS_BETA = "responses_websockets=2026-02-06"
 TERMINALS = {"response.completed", "response.incomplete"}
+FAILURE_TERMINALS = {"response.failed", "response.error", "error"}
+PRODUCTIVE_DELTAS = {
+    "response.reasoning_text.delta",
+    "response.reasoning_summary_text.delta",
+    "response.output_text.delta",
+    "response.refusal.delta",
+    "response.function_call_arguments.delta",
+    "response.custom_tool_call_input.delta",
+}
+TOOL_ITEM_TYPES = {"function_call", "custom_tool_call"}
+DEFAULT_PRODUCTIVE_IDLE_TIMEOUT = 90.0
+DEFAULT_ATTEMPT_TIMEOUT = 240.0
 
 
 def lite_request(body: dict, scope: str) -> dict:
@@ -82,9 +95,26 @@ class ChatGPTEventTimeout(TimeoutError):
 
     proxy_retry_owner = True
 
-    def __init__(self, phase: str) -> None:
+    def __init__(
+        self,
+        phase: str,
+        *,
+        transport: str,
+        attempt: int,
+        elapsed_seconds: float,
+        productive_idle_seconds: float,
+        fallback_transport: str | None,
+    ) -> None:
         self.phase = phase
-        super().__init__(f"timeout waiting for {phase} ChatGPT Responses event")
+        self.transport = transport
+        self.attempt = attempt
+        self.elapsed_seconds = elapsed_seconds
+        self.productive_idle_seconds = productive_idle_seconds
+        self.fallback_transport = fallback_transport
+        super().__init__(
+            f"timeout waiting for {phase} ChatGPT Responses progress "
+            f"(transport={transport}, attempt={attempt})"
+        )
 
 
 class ChatGPTResponsesTransport:
@@ -96,9 +126,13 @@ class ChatGPTResponsesTransport:
 
     def __init__(self, *, idle_timeout: float = 240,
                  first_event_timeout: float = 60, keepalive: float = 60,
+                 productive_idle_timeout: float = DEFAULT_PRODUCTIVE_IDLE_TIMEOUT,
+                 attempt_timeout: float = DEFAULT_ATTEMPT_TIMEOUT,
                  max_connections: int = 32, connector=connect):
         self.idle_timeout = idle_timeout
         self.first_event_timeout = first_event_timeout
+        self.productive_idle_timeout = productive_idle_timeout
+        self.attempt_timeout = attempt_timeout
         self.keepalive = keepalive
         self.max_connections = max_connections
         self.connector = connector
@@ -135,7 +169,9 @@ class ChatGPTResponsesTransport:
         session = self._idle.pop(key, _Session()) if scoped else _Session()
         if session.timer:
             session.timer.cancel()
-        stream = ChatGPTStream(self, key if scoped else None, session)
+        stream = ChatGPTStream(
+            self, key if scoped else None, session, context=context,
+        )
         self._active.add(stream)
         try:
             request = lite_request(body, headers["session_id"])
@@ -221,6 +257,12 @@ class ChatGPTResponsesTransport:
         finally:
             self._slots.release()
 
+    async def discard(self, stream):
+        """Remove an incomplete attempt's retained routing lease entirely."""
+        if stream.key and self._idle.get(stream.key) is stream.session:
+            self._idle.pop(stream.key, None)
+        await self._disconnect(stream.session)
+
     async def close(self):
         self._closed = True
         await asyncio.gather(*(s.close() for s in list(self._active)))
@@ -231,10 +273,81 @@ class ChatGPTResponsesTransport:
 
 
 class ChatGPTStream:
-    def __init__(self, owner, key, session):
+    def __init__(self, owner, key, session, *, context=None):
         self.owner, self.key, self.session = owner, key, session
+        self.context = context
         self.http = self.http_iterator = self.response = None
         self.complete = self.closed = self.event_seen = False
+        self.attempt = max(1, int(getattr(context, "attempt", 1) or 1))
+        self.started_at = time.monotonic()
+        self.last_transport_activity_at = self.started_at
+        self.last_productive_activity_at = self.started_at
+        self.recovery_reported = False
+
+    @property
+    def transport(self) -> str:
+        return "sse" if self.http is not None else "websocket"
+
+    @staticmethod
+    def _item_type(event) -> str:
+        item = getattr(event, "item", None)
+        if isinstance(item, dict):
+            return str(item.get("type") or "")
+        return str(getattr(item, "type", "") or "")
+
+    @classmethod
+    def _is_productive(cls, event) -> bool:
+        kind = str(getattr(event, "type", "") or "")
+        if kind in TERMINALS or kind in FAILURE_TERMINALS:
+            return True
+        if kind in PRODUCTIVE_DELTAS:
+            delta = getattr(event, "delta", None)
+            return bool(delta) and not (
+                isinstance(delta, str) and not delta.strip()
+            )
+        if kind in {"response.output_item.added", "response.output_item.done"}:
+            return cls._item_type(event) in TOOL_ITEM_TYPES
+        return False
+
+    def _timeout(self, phase: str, now: float) -> ChatGPTEventTimeout:
+        fallback = "sse" if self.http is None else None
+        if fallback:
+            # Preserve sticky turn state, but force the safe outer retry onto a
+            # fresh HTTPS stream. The unfinished WebSocket is closed on release.
+            self.session.http_only = True
+        elapsed = max(0.0, now - self.started_at)
+        productive_idle = max(0.0, now - self.last_productive_activity_at)
+        logger.warning(
+            "chatgpt_transport stall phase=%s transport=%s attempt=%d "
+            "elapsed_s=%.1f productive_idle_s=%.1f fallback=%s",
+            phase, self.transport, self.attempt, elapsed, productive_idle,
+            fallback or "none",
+        )
+        return ChatGPTEventTimeout(
+            phase,
+            transport=self.transport,
+            attempt=self.attempt,
+            elapsed_seconds=elapsed,
+            productive_idle_seconds=productive_idle,
+            fallback_transport=fallback,
+        )
+
+    def _deadline(self, now: float) -> tuple[float, str]:
+        transport_deadline = (
+            self.started_at + self.owner.first_event_timeout
+            if not self.event_seen
+            else self.last_transport_activity_at + self.owner.idle_timeout
+        )
+        candidates = [
+            (transport_deadline, "first" if not self.event_seen else "next"),
+            (
+                self.last_productive_activity_at
+                + self.owner.productive_idle_timeout,
+                "productive",
+            ),
+            (self.started_at + self.owner.attempt_timeout, "absolute"),
+        ]
+        return min(candidates, key=lambda candidate: candidate[0])
 
     def __aiter__(self):
         return self
@@ -242,10 +355,11 @@ class ChatGPTStream:
     async def __anext__(self):
         if self.closed or self.complete:
             raise StopAsyncIteration
-        timeout = (
-            self.owner.idle_timeout if self.event_seen
-            else self.owner.first_event_timeout
-        )
+        now = time.monotonic()
+        deadline, timeout_phase = self._deadline(now)
+        timeout = deadline - now
+        if timeout <= 0:
+            raise self._timeout(timeout_phase, now)
         try:
             if self.http is not None:
                 event = await asyncio.wait_for(anext(self.http_iterator), timeout)
@@ -255,7 +369,9 @@ class ChatGPTStream:
                 if not isinstance(payload, dict) or not isinstance(payload.get("type"), str):
                     raise ValueError("Invalid Responses WebSocket event")
                 event = _event_object(payload)
+            now = time.monotonic()
             self.event_seen = True
+            self.last_transport_activity_at = now
             kind = getattr(event, "type", "")
             if kind == "response.metadata" and not self.session.turn_state:
                 headers = getattr(event, "headers", None)
@@ -268,23 +384,35 @@ class ChatGPTStream:
                             break
             if kind in TERMINALS:
                 self.complete = True
+            productive = self._is_productive(event)
+            if productive:
+                self.last_productive_activity_at = now
+                if (
+                    self.attempt > 1
+                    and not self.recovery_reported
+                    and self.context is not None
+                    and kind not in FAILURE_TERMINALS
+                ):
+                    self.recovery_reported = True
+                    self.context.report_status({
+                        "state": "recovered",
+                        "message": "Upstream connection recovered.",
+                        "provider": self.context.provider,
+                        "attempt": self.attempt,
+                        "transport": self.transport,
+                    })
+            elif now >= self.started_at + self.owner.attempt_timeout:
+                raise self._timeout("absolute", now)
+            elif now >= (
+                self.last_productive_activity_at
+                + self.owner.productive_idle_timeout
+            ):
+                raise self._timeout("productive", now)
             return event
         except (ConnectionClosed, StopAsyncIteration) as exc:
             raise ConnectionError("stream closed before response.completed") from exc
         except asyncio.TimeoutError as exc:
-            phase = "next" if self.event_seen else "first"
-            if self.http is None:
-                # A successful upgrade followed by no event is a broken WS
-                # request path. Preserve the scoped session so the safe outer
-                # retry uses Responses Lite over HTTP SSE instead.
-                self.session.http_only = True
-            logger.warning(
-                "chatgpt_transport event_timeout phase=%s timeout_s=%.1f "
-                "fallback=%s",
-                phase, timeout,
-                "sse" if self.session.http_only else "none",
-            )
-            raise ChatGPTEventTimeout(phase) from exc
+            raise self._timeout(timeout_phase, time.monotonic()) from exc
 
     async def close(self):
         if self.closed:
@@ -297,3 +425,6 @@ class ChatGPTStream:
             await self.owner.release(self)
 
     aclose = close
+
+    async def discard(self):
+        await self.owner.discard(self)

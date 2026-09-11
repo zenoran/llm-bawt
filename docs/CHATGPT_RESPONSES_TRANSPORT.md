@@ -1,4 +1,4 @@
-# ChatGPT Responses transport (TASK-864)
+# ChatGPT Responses transport (TASK-864, TASK-872)
 
 ## Scope
 
@@ -32,6 +32,40 @@ Protocol reference: public `openai/codex`, tag `rust-v0.153.4`:
   incomplete responses retain the translator's max-token semantics. No transport
   layer silently retries generation. Never replay after forwarded tool calls.
 
+### Productive-progress supervision
+
+TASK-872 separates transport activity from model progress. Non-empty reasoning,
+reasoning-summary, text, refusal, and tool-argument deltas are productive. Tool
+output-item creation/completion and terminal success/failure events are also
+productive. Lifecycle frames (`response.created`, `response.in_progress`),
+metadata, pings, empty deltas, and other bookkeeping do not extend the productive
+deadline.
+
+Each sampling attempt is bounded by the earliest applicable deadline:
+
+- 60 seconds to the first transport event;
+- 240 seconds between transport events;
+- 90 seconds without productive model progress; and
+- 240 seconds absolute wall time, regardless of incoming frames.
+
+A stalled WebSocket attempt with no forwarded assistant output is closed and
+retried once over a fresh HTTPS/SSE stream. Before that retry, the proxy emits a
+structured `upstream_status` event (`reconnecting`, transport, fallback,
+attempt, stall phase, elapsed time, and productive-idle time). The first
+non-failure productive event on the fallback emits `recovered`. The bridge
+publishes these onto the active Redis run; the app forwards them on unified SSE;
+the frontend renders the reconnect state inside the in-flight assistant bubble.
+Status text is transient and never enters persisted assistant content.
+
+Reasoning, visible text, and tool commitment all make a supervised replay unsafe.
+A stall after any of them fails upward as `api_error` without retry. If the SSE
+fallback also stalls, it likewise fails immediately without handing the request
+back to the Claude CLI for another replay. In every final stalled path, the
+unfinished routing lease and underlying connection are discarded rather than
+returned to the pool. Structured transport and retry logs record the same stall
+phase, timings, attempt, selected transport, fallback, decision, and final
+disposition.
+
 ## Ownership and bounds
 
 The adapter owns the client and closes it at proxy shutdown. Exclusive leases
@@ -42,10 +76,13 @@ calls cannot reuse a lease. Token rotation cannot reuse an old authenticated soc
 At most 32 active leases and 32 idle entries are retained. Idle entries expire
 after 60 seconds; connect/pool waits are bounded at 15 seconds and sends at 60.
 The first event after `response.create` is bounded at 60 seconds; later event
-inactivity is bounded at 240 seconds. Astra gets one safe proxy retry, keeping
-all proxy-owned waits below the bridge's 600-second watchdog. Cancellation and
+inactivity is bounded at 240 seconds, with the productive and absolute bounds
+above applied independently. Astra gets one safe proxy retry. A fully silent
+WebSocket plus fallback is bounded near 120 seconds; lifecycle chatter plus
+fallback is bounded near 180 seconds, both below the bridge's 300-second SDK
+watchdog and the app's 600-second inactivity watchdog. Cancellation and
 incomplete/error responses close the socket; scoped sticky routing can survive
-for the SSE retry.
+only long enough to select the safe SSE retry.
 
 Full history is sent each hop. `previous_response_id`/delta optimization is
 intentionally not used: Claude SDK histories can branch and omit upstream
@@ -83,11 +120,19 @@ hermetically and preserves live protocol compatibility; long-running reliability
 still requires observation after bridge activation. Pre-existing orphaned UI turns
 remain outside this transport scope.
 
-## Activation
+## TASK-872 verification and activation
 
-No services were restarted while implementing. The source-mounted Claude bridge
-must reload to activate this client for normal chat. Only restart
+Hermetic coverage drives silent and endlessly chattering WebSocket/SSE streams,
+absolute-deadline streams that remain productive, successful fallback recovery,
+fallback exhaustion, and stalls after reasoning/text/tool commitment. Bridge and
+frontend tests cover the structured status path and its transient bubble mapping.
+The exact command receipts live in TASK-872.
+
+No services were restarted while implementing TASK-872. The source-mounted
+Claude bridge must reload to activate the backend supervisor for normal chat.
+Only restart
 `claude-code-bridge` with Nick's explicit approval for that run; do not restart
-other services. No dependency/image rebuild is required (`websockets` is already
-a declared dependency). Rollback is a source revert of TASK-864 plus the same
-approved bridge reload; model profiles and credentials are unchanged.
+other services. The frontend changes are compatible with older event producers
+and unknown event consumers ignore the additive event kind. No dependency/image
+rebuild is required. Rollback is a source revert of the TASK-872 changes plus the
+same approved bridge reload; model profiles and credentials are unchanged.

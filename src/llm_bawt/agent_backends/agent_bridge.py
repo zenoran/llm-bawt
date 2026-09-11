@@ -312,6 +312,24 @@ class AgentBridgeBackend(AgentBackend):
                                         "model": event.model,
                                     })
 
+                            elif event.kind == AgentEventKind.UPSTREAM_STATUS:
+                                meta = event.raw.get("upstream_status", {}) if isinstance(event.raw, dict) else {}
+                                result_queue.put({
+                                    "event": "upstream_status",
+                                    "text": event.text or "",
+                                    "state": meta.get("state"),
+                                    "attempt": meta.get("attempt"),
+                                    "next_attempt": meta.get("next_attempt"),
+                                    "max_attempts": meta.get("max_attempts"),
+                                    "transport": meta.get("transport"),
+                                    "fallback_transport": meta.get("fallback_transport"),
+                                    "stall_phase": meta.get("stall_phase"),
+                                    "productive_idle_seconds": meta.get("productive_idle_seconds"),
+                                    "elapsed_seconds": meta.get("elapsed_seconds"),
+                                    "provider": meta.get("provider") or event.provider,
+                                    "trigger_message_id": event.trigger_message_id,
+                                })
+
                             elif event.kind == AgentEventKind.ASSISTANT_DONE:
                                 # Capture actual upstream model if provided
                                 if event.model:

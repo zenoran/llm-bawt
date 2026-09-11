@@ -184,6 +184,8 @@ class ClaudeSendMixin(ClaudeStreamMixin, ClaudeUsageMixin, ClaudeResultMixin):
                 self._proxy_base_url is not None
                 and self._model_provider_prefix(model) is not None
             )
+            if not direct_anthropic:
+                self._proxy_request_sessions[request_id] = session_key
             interrupted_usage: dict | None = None
             run_done_published = False
             try:
@@ -1039,6 +1041,7 @@ class ClaudeSendMixin(ClaudeStreamMixin, ClaudeUsageMixin, ClaudeResultMixin):
                 self._publisher.publish_run_done(request_id)
             finally:
                 self._discard_changed_file_request(request_id)
+                self._proxy_request_sessions.pop(request_id, None)
                 # Drop the per-run trigger_message_id mapping so we don't leak.
                 self._trigger_message_ids.pop(request_id, None)
                 await async_redis.xack(COMMANDS_STREAM, "claude-code-bridge", msg_id)

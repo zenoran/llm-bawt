@@ -170,6 +170,115 @@ def test_first_event_timeout_then_idle_timeout_and_keepalive_expiry():
     asyncio.run(run())
 
 
+@pytest.mark.parametrize(
+    "kind",
+    ["response.created", "response.in_progress", "response.metadata", "ping", "empty_delta"],
+)
+def test_nonproductive_chatter_hits_productive_progress_deadline(kind):
+    async def run():
+        socket = Socket()
+        client = ChatGPTResponsesTransport(
+            connector=AsyncMock(return_value=socket),
+            first_event_timeout=.1,
+            idle_timeout=.2,
+            productive_idle_timeout=.025,
+            attempt_timeout=.2,
+        )
+        stream = await client.open(**kwargs())
+
+        async def chatter():
+            while True:
+                payload = {
+                    "type": "response.output_text.delta" if kind == "empty_delta" else kind,
+                }
+                if kind == "empty_delta":
+                    payload["delta"] = ""
+                if kind == "response.metadata":
+                    payload["headers"] = {"x-test": "noise"}
+                await socket.events.put(payload)
+                await asyncio.sleep(.002)
+
+        producer = asyncio.create_task(chatter())
+        try:
+            with pytest.raises(ChatGPTEventTimeout) as error:
+                while True:
+                    await anext(stream)
+            assert error.value.phase == "productive"
+            assert error.value.transport == "websocket"
+            assert error.value.fallback_transport == "sse"
+            assert error.value.productive_idle_seconds >= .02
+            assert stream.session.http_only is True
+        finally:
+            producer.cancel()
+            await asyncio.gather(producer, return_exceptions=True)
+            await stream.close()
+            await client.close()
+        assert socket.close.await_count == 1
+
+    asyncio.run(run())
+
+
+def test_productive_stream_still_hits_absolute_attempt_deadline():
+    async def run():
+        socket = Socket()
+        client = ChatGPTResponsesTransport(
+            connector=AsyncMock(return_value=socket),
+            first_event_timeout=.1,
+            idle_timeout=.2,
+            productive_idle_timeout=.2,
+            attempt_timeout=.025,
+        )
+        stream = await client.open(**kwargs())
+
+        async def chatter():
+            while True:
+                await socket.events.put({
+                    "type": "response.output_text.delta",
+                    "delta": "x",
+                })
+                await asyncio.sleep(.002)
+
+        producer = asyncio.create_task(chatter())
+        try:
+            with pytest.raises(ChatGPTEventTimeout) as error:
+                while True:
+                    await anext(stream)
+            assert error.value.phase == "absolute"
+            assert error.value.elapsed_seconds >= .02
+            assert error.value.productive_idle_seconds < .02
+        finally:
+            producer.cancel()
+            await asyncio.gather(producer, return_exceptions=True)
+            await stream.close()
+            await client.close()
+
+    asyncio.run(run())
+
+
+def test_failed_fallback_terminal_does_not_report_recovered():
+    async def run():
+        statuses = []
+        context = NS(
+            conversation_id="test",
+            request_id="turn",
+            attempt=2,
+            report_status=lambda status: statuses.append(status),
+        )
+        socket = Socket()
+        client = ChatGPTResponsesTransport(connector=AsyncMock(return_value=socket))
+        stream = await client.open(**{**kwargs(), "context": context})
+        await socket.events.put({
+            "type": "response.failed",
+            "response": {"error": {"code": "server_error", "message": "failed"}},
+        })
+        assert (await anext(stream)).type == "response.failed"
+        assert statuses == []
+        await stream.close()
+        await client.close()
+
+    asyncio.run(run())
+
+
 @pytest.mark.parametrize("status", [401, 403, 429, 500])
 def test_upgrade_errors_do_not_fallback(status):
     async def run():
@@ -351,9 +460,13 @@ def test_silent_websocket_recovers_over_http_without_outer_cli_retry(monkeypatch
             "model": "openai_chatgpt/gpt-6-astra", "max_tokens": 128,
             "messages": [{"role": "user", "content": "test"}],
         }
+        statuses = []
         context = ProxyRequestContext(
             request_id="turn", provider="openai_chatgpt",
             conversation_id="test",
+            status_callback=lambda request_id, status: statuses.append(
+                (request_id, status)
+            ),
         )
         request_client = NS(post=AsyncMock(return_value=HTTPStream()))
         response_client = NS(
@@ -371,8 +484,178 @@ def test_silent_websocket_recovers_over_http_without_outer_cli_retry(monkeypatch
             assert socket.close.await_count == 1
             assert b"message_stop" in joined
             assert b'"type":"api_error"' not in joined
+            assert [status[1]["state"] for status in statuses] == [
+                "reconnecting", "recovered",
+            ]
+            assert statuses[0][1]["fallback_transport"] == "sse"
+            assert statuses[1][1]["transport"] == "sse"
         finally:
             await adapter.close()
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("committed_kind", ["reasoning", "text", "tool"])
+def test_productive_stall_after_committed_output_never_replays(monkeypatch, committed_kind):
+    from claude_code_bridge.proxy.adapters.openai_chatgpt import OpenAIChatGPTAdapter
+    from claude_code_bridge.proxy import retry
+    from claude_code_bridge.proxy.request_context import ProxyRequestContext
+    monkeypatch.setattr(retry, "compute_backoff", lambda *args, **kwargs: 0)
+
+    async def run():
+        socket = Socket()
+        producer = None
+
+        async def connect(*args, **kw):
+            nonlocal producer
+            if committed_kind == "reasoning":
+                await socket.events.put({
+                    "type": "response.output_item.added",
+                    "item": {"type": "reasoning", "id": "rs_1", "content": []},
+                })
+                await socket.events.put({
+                    "type": "response.reasoning_text.delta", "delta": "thinking",
+                    "item_id": "rs_1", "output_index": 0, "content_index": 0,
+                })
+            elif committed_kind == "text":
+                await socket.events.put({
+                    "type": "response.output_item.added",
+                    "item": {"type": "message", "id": "msg_1", "content": []},
+                })
+                await socket.events.put({
+                    "type": "response.output_text.delta", "delta": "hello",
+                    "item_id": "msg_1", "output_index": 0, "content_index": 0,
+                })
+            else:
+                await socket.events.put({
+                    "type": "response.output_item.added",
+                    "item": {
+                        "type": "function_call", "id": "fc_1",
+                        "call_id": "call_1", "name": "check",
+                    },
+                })
+
+            async def chatter():
+                while True:
+                    await socket.events.put({"type": "response.in_progress"})
+                    await asyncio.sleep(.002)
+
+            producer = asyncio.create_task(chatter())
+            return socket
+
+        statuses = []
+        adapter = OpenAIChatGPTAdapter()
+        adapter.authorize = AsyncMock(return_value=("token", "https://example.test"))
+        adapter._chatgpt_transport = ChatGPTResponsesTransport(
+            connector=AsyncMock(side_effect=connect),
+            first_event_timeout=.1,
+            idle_timeout=.2,
+            productive_idle_timeout=.025,
+            attempt_timeout=.2,
+        )
+        body = {
+            "model": "openai_chatgpt/gpt-6-astra", "max_tokens": 128,
+            "messages": [{"role": "user", "content": "test"}],
+        }
+        context = ProxyRequestContext(
+            request_id="turn", provider="openai_chatgpt",
+            conversation_id="test",
+            status_callback=lambda request_id, status: statuses.append(status),
+        )
+        try:
+            chunks = [chunk async for chunk in adapter.call(
+                body, "gpt-6-astra", context,
+            )]
+            joined = b"".join(chunks)
+            assert adapter._chatgpt_transport.connector.await_count == 1
+            assert b'"type":"api_error"' in joined
+            assert not statuses
+            assert socket.close.await_count == 1
+            assert not adapter._chatgpt_transport._idle
+        finally:
+            if producer is not None:
+                producer.cancel()
+                await asyncio.gather(producer, return_exceptions=True)
+            await adapter.close()
+
+    asyncio.run(run())
+
+
+def test_fallback_stall_fails_promptly_and_discards_lease(monkeypatch):
+    from claude_code_bridge.proxy.adapters.openai_chatgpt import OpenAIChatGPTAdapter
+    from claude_code_bridge.proxy import retry
+    from claude_code_bridge.proxy.request_context import ProxyRequestContext
+    monkeypatch.setattr(retry, "compute_backoff", lambda *args, **kwargs: 0)
+
+    async def run():
+        socket = Socket()
+        ws_producer = None
+        sse_closed = AsyncMock()
+
+        async def connect(*args, **kw):
+            nonlocal ws_producer
+
+            async def chatter():
+                while True:
+                    await socket.events.put({"type": "response.in_progress"})
+                    await asyncio.sleep(.002)
+
+            ws_producer = asyncio.create_task(chatter())
+            return socket
+
+        async def sse_events():
+            while True:
+                yield NS(type="response.in_progress")
+                await asyncio.sleep(.002)
+
+        class HTTPStream:
+            response = NS(headers={})
+            close = sse_closed
+
+            def __aiter__(self):
+                return sse_events()
+
+        statuses = []
+        adapter = OpenAIChatGPTAdapter()
+        adapter.authorize = AsyncMock(return_value=("token", "https://example.test"))
+        adapter._chatgpt_transport = ChatGPTResponsesTransport(
+            connector=AsyncMock(side_effect=connect),
+            first_event_timeout=.1,
+            idle_timeout=.2,
+            productive_idle_timeout=.025,
+            attempt_timeout=.2,
+        )
+        request_client = NS(post=AsyncMock(return_value=HTTPStream()))
+        adapter._http_client = NS()
+        adapter._responses_client = NS(
+            with_options=lambda **kwargs: request_client,
+            close=AsyncMock(),
+        )
+        context = ProxyRequestContext(
+            request_id="turn", provider="openai_chatgpt",
+            conversation_id="test",
+            status_callback=lambda request_id, status: statuses.append(status),
+        )
+        body = {
+            "model": "openai_chatgpt/gpt-6-astra", "max_tokens": 128,
+            "messages": [{"role": "user", "content": "test"}],
+        }
+        try:
+            started = asyncio.get_running_loop().time()
+            chunks = [chunk async for chunk in adapter.call(
+                body, "gpt-6-astra", context,
+            )]
+            assert asyncio.get_running_loop().time() - started < .15
+            assert b'"type":"api_error"' in b"".join(chunks)
+            assert [status["state"] for status in statuses] == ["reconnecting"]
+            assert socket.close.await_count == 1
+            assert sse_closed.await_count == 1
+            assert not adapter._chatgpt_transport._idle
+        finally:
+            if ws_producer is not None:
+                ws_producer.cancel()
+                await asyncio.gather(ws_producer, return_exceptions=True)
+            await adapter.close()
+
     asyncio.run(run())
 
 

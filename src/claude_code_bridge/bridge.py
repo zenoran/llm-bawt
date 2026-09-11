@@ -130,6 +130,9 @@ class ClaudeCodeBridge(
         # assistant_*, etc.) carries the originating message id.  Cleared on
         # _handle_send finally.
         self._trigger_message_ids: dict[str, str] = {}
+        # Proxy status callbacks run in-process and resolve request_id back to
+        # the active Redis run without exposing the session key in HTTP headers.
+        self._proxy_request_sessions: dict[str, str] = {}
         # TASK-269: AskUserQuestion no longer blocks the SDK turn.  can_use_tool
         # emits an AWAIT_TOOL_RESULT event and returns a synthetic "deferred"
         # ack immediately, so the turn ends cleanly and the user's answer comes
@@ -345,7 +348,6 @@ class ClaudeCodeBridge(
     #: - generate_image: Grok Imagine output (TASK-599). The tool already stored
     #:   the identical raw bytes, so this re-upload dedups to the same asset.
     _IMAGE_RESULT_TOOL_TAILS = frozenset({"browser_take_screenshot", "generate_image"})
-
 
 
 
