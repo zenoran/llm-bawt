@@ -79,6 +79,13 @@ def test_agent_global_prompt_requires_durable_manager_callbacks() -> None:
     assert "Never poll as the primary scheduler" in AGENT_GLOBAL_PROMPT
 
 
+def test_agent_global_prompt_makes_canonical_branch_the_explicit_exception() -> None:
+    assert "If on the default branch, branch first" in AGENT_GLOBAL_PROMPT
+    assert "concrete exception to the generic branch-first default" in AGENT_GLOBAL_PROMPT
+    assert "Stay on that branch and commit there" in AGENT_GLOBAL_PROMPT
+    assert "request a commit handoff" in AGENT_GLOBAL_PROMPT
+
+
 def test_inter_bot_docs_do_not_restore_queue_only_contract() -> None:
     repo = Path(__file__).resolve().parents[1]
     authoritative = [
