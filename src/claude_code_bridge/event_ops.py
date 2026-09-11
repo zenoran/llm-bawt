@@ -299,7 +299,10 @@ class ClaudeEventMixin:
     ) -> None:
         text = self._shorten_paths(text)
         tool_result = self._shorten_paths(tool_result)
-        tool_arguments = self._shorten_paths_in_dict(tool_arguments)
+        # Approval arguments are executable replay payloads, not display text.
+        # Prettifying paths changes the exact invocation authorized by the grant.
+        if kind != AgentEventKind.APPROVAL_REQUIRED:
+            tool_arguments = self._shorten_paths_in_dict(tool_arguments)
         event_id = synthesize_event_id(
             session_key, kind.value,
             {"text": text, "tool": tool_name, "seq": seq},

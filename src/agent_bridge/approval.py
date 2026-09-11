@@ -40,6 +40,7 @@ import fnmatch
 import hashlib
 import json
 import re
+import shlex
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any
@@ -179,6 +180,51 @@ def strip_inert_heredoc_bodies(command: str) -> str:
     return command
 
 
+# Recognize only simple command lists and literal rg/grep arguments. Unknown
+# shell syntax stays verbatim; this is not a general shell authorization parser.
+_SEARCH_TOKEN = re.compile(r"\s+|'[^']*'|\"[^\"$`\\]*\"|[;&|]+|[^\s'\";&|$`\\<>(){}]+")
+
+
+def strip_literal_search_arguments(command: str) -> str:
+    """Hide data passed to direct rg/grep, never wrappers or substitutions.
+
+    Abort on unsupported syntax rather than accidentally hiding executable
+    input. Command separators remain visible and every segment is considered.
+    Grants always continue to bind the original, full invocation.
+    """
+    tokens = []
+    end = 0
+    for match in _SEARCH_TOKEN.finditer(command):
+        if match.start() != end:
+            return command
+        tokens.append(match.group())
+        end = match.end()
+    if end != len(command) or "\n" in command or "#" in command:
+        return command
+    # Search output piped to an interpreter and ripgrep command hooks are not
+    # inert. Keep those inputs visible, including quoted option spellings.
+    if any(t in ("|", "||", "&") for t in tokens) or any(
+        t.startswith(("--pre", "--hostname-bin")) for t in shlex.split(command)
+    ):
+        return command
+    result = []
+    at_start = True
+    search = False
+    for token in tokens:
+        if token.isspace():
+            result.append(token)
+        elif token in (";", "&&", "||", "|", "&"):
+            result.append(token)
+            at_start, search = True, False
+        elif at_start:
+            search = token in ("rg", "grep", "/usr/bin/rg", "/usr/bin/grep", "/bin/grep")
+            result.append(token)
+            at_start = False
+        else:
+            result.append("[literal-search-argument]" if search else token)
+    return "".join(result)
+
+
 def matchable_subject(tool_name: str, subject: str) -> str:
     """The text a policy pattern is tested against, given a derived subject.
 
@@ -188,7 +234,7 @@ def matchable_subject(tool_name: str, subject: str) -> str:
     """
     if not subject or _tool_tail(tool_name) not in _SHELL_TOOLS:
         return subject
-    return strip_inert_heredoc_bodies(subject)
+    return strip_literal_search_arguments(strip_inert_heredoc_bodies(subject))
 
 
 def _derive_ops_run_subject(tool_input: Any) -> str:

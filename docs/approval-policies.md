@@ -26,8 +26,14 @@ Rules select `backend_scope`, `tool_name`, input `field`, and a matcher
 operator-facing metadata. MCP-qualified tool names support tail matching.
 Validation rejects invalid matcher/action/severity values and regexes before save.
 
-For Bash, matching uses the command subject, with inert quoted-heredoc bodies
-removed by the matcher. Wrappers and literal text can still cause false positives.
+For Bash, matching uses the command subject, with proven inert quoted-heredoc
+bodies and literal arguments to direct `rg`/`grep` searches removed by the matcher.
+Search handling recognizes a deliberately narrow command-list grammar; wrappers,
+substitutions, pipelines, executable search hooks and ambiguous syntax retain
+literal text and may still cause false positives. This is not a general shell
+parser. Do not add broad `allow` rules for commands merely starting with a search.
+Approval-required events preserve full tool arguments verbatim: home-directory
+shortening is display formatting and must never modify the stored replay payload.
 Changing the subject or whitespace normalization must never loosen authorization:
 Claude grants bind the fully qualified tool, **full JSON input and cwd** exactly.
 
