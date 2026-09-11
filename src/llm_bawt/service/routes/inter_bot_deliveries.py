@@ -16,6 +16,7 @@ from ...agent_context import (
 from ...bots import BotManager
 from ...inter_bot_delivery import submission_result
 from ...message_authorship import AuthorReference, normalize_author
+from ...model_catalog import bot_model_ref
 from ..dependencies import get_service
 
 router = APIRouter()
@@ -69,6 +70,12 @@ def _format_delivery_message(message: str, author: AuthorReference) -> str:
     if author.entity_type == "bot" and author.entity_id != "unknown":
         return f"Message from bot '{author.entity_id}': {message}"
     return message
+
+
+def _target_context_window(config: Any, target_bot: Any) -> int | None:
+    """Resolve context health from the bot's pinned catalog endpoint."""
+    model_ref = bot_model_ref(config, target_bot)
+    return config.get_model_context_window(model_ref) if model_ref else None
 
 
 @router.post("/v1/inter-bot-deliveries", tags=["Inter-Bot Deliveries"], status_code=202)
@@ -131,10 +138,7 @@ async def create_delivery(body: DeliveryCreate):
                     fallback=setting_default("agent_context_critical_percent", 90),
                 ))),
             )
-            ceiling = (
-                get_service().config.get_model_context_window(target_bot.default_model)
-                if target_bot.default_model else None
-            )
+            ceiling = _target_context_window(get_service().config, target_bot)
             health = AgentContextStore(get_service().config).health(
                 bot_id=target,
                 user_id=getattr(get_service().config, "DEFAULT_USER", "nick"),

@@ -20,11 +20,51 @@ from llm_bawt.agent_context import (
 )
 from llm_bawt.service.inter_bot_dispatcher import InterBotDeliveryDispatcher
 from llm_bawt.mcp_server.server import _get_profile_manager
+from llm_bawt.model_catalog import AccessPath, ModelCatalog, ModelEndpoint, ModelIdentity
+from llm_bawt.service.routes.inter_bot_deliveries import _target_context_window
+from llm_bawt.utils.config import Config
 
 
 def test_profile_manager_compatibility_alias_remains_importable():
     assert callable(_get_profile_manager)
 
+
+def test_delivery_context_health_uses_pinned_endpoint_for_ambiguous_model():
+    model = ModelIdentity(
+        id=1,
+        key="claude-opus-5",
+        vendor="anthropic",
+        display_name="Claude Opus 5",
+        default_context_window=200_000,
+    )
+    oauth = AccessPath(
+        id=1,
+        key="anthropic-oauth",
+        vendor="anthropic",
+        protocol="anthropic-messages",
+        base_url=None,
+        auth_mechanism="oauth",
+    )
+    api = AccessPath(
+        id=2,
+        key="anthropic-api",
+        vendor="anthropic",
+        protocol="anthropic-messages",
+        base_url=None,
+        auth_mechanism="api-key",
+    )
+    config = Config()
+    config.install_model_catalog(ModelCatalog([
+        ModelEndpoint(1, model, oauth, "claude-opus-5"),
+        ModelEndpoint(2, model, api, "claude-opus-5", context_window_override=1_000_000),
+    ]))
+    bot = SimpleNamespace(
+        default_model="claude-opus-5",
+        endpoint_id=2,
+        harness="claude-code",
+    )
+
+    assert _target_context_window(config, bot) == 1_000_000
 
 
 
