@@ -5,7 +5,10 @@ from typing import Any
 
 import pytest
 
+from pydantic import TypeAdapter
+
 from llm_bawt.mcp_server import task_tools
+from llm_bawt.mcp_server.task_step_types import STEP_TYPES, TaskStepInput
 
 
 def run(coro: Any) -> Any:
@@ -68,6 +71,54 @@ def test_create_without_flag_preserves_existing_response_shape(
     monkeypatch.setattr(task_tools, "_api_post", fake_post)
 
     assert run(task_tools.create_task("Follow-up")) is created
+
+
+def test_create_step_schema_exposes_canonical_enum() -> None:
+    schema = TypeAdapter(TaskStepInput).json_schema()
+    assert schema["properties"]["type"]["enum"] == list(STEP_TYPES)
+
+
+def test_create_rejects_invalid_step_type_before_http(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def unexpected_post(*args: Any, **kwargs: Any) -> dict:
+        raise AssertionError("invalid step types must not reach BawtHub")
+
+    monkeypatch.setattr(task_tools, "_api_post", unexpected_post)
+
+    result = run(task_tools.create_task(
+        "Follow-up",
+        steps=[{"title": "Run tests", "type": "TEST"}],  # type: ignore[list-item]
+    ))
+
+    assert result == {
+        "error": (
+            "steps[0].type must be one of: PLAN, READ_FILE, EDIT_FILE, "
+            "CREATE_FILE, DELETE_FILE, RUN_COMMAND, SEARCH, ASK_USER, REVIEW"
+        )
+    }
+
+
+def test_create_forwards_valid_typed_steps(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sent: list[dict] = []
+
+    async def fake_post(path: str, json: dict, headers: dict | None = None) -> dict:
+        sent.append(json)
+        return {"id": "task-id", "shortId": "TASK-900"}
+
+    monkeypatch.setattr(task_tools, "_api_post", fake_post)
+
+    result = run(task_tools.create_task(
+        "Follow-up",
+        steps=[{"title": "Run tests", "type": "RUN_COMMAND"}],
+    ))
+
+    assert result["shortId"] == "TASK-900"
+    assert sent[0]["steps"] == [
+        {"title": "Run tests", "type": "RUN_COMMAND"}
+    ]
 
 
 def test_update_can_associate_without_rewriting_task_fields(

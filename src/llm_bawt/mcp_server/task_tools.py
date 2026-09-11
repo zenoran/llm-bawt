@@ -12,6 +12,7 @@ import httpx
 
 from .server import mcp
 from .task_association import associate_current_task
+from .task_step_types import TaskStepInput, validate_step_inputs
 from .task_api import (
     API_PREFIX as _API_PREFIX,
     api_delete as _api_delete,
@@ -450,7 +451,7 @@ async def create_task(
     project_id: str | None = None,
     priority: str = "MEDIUM",
     status: str = "QUEUED",
-    steps: list[dict] | None = None,
+    steps: list[TaskStepInput] | None = None,
     bot_id: str | None = None,
     associate_current_turn: bool = False,
 ) -> dict:
@@ -465,7 +466,8 @@ async def create_task(
         priority: URGENT, HIGH, MEDIUM, LOW, or NONE (default MEDIUM).
         status: Initial status (default QUEUED).
         steps: Optional initial steps. Each dict needs "title" (str)
-               and optional "type" (PLAN, READ_FILE, EDIT_FILE, etc.).
+               and optional "type": PLAN, READ_FILE, EDIT_FILE, CREATE_FILE,
+               DELETE_FILE, RUN_COMMAND, SEARCH, ASK_USER, or REVIEW.
         bot_id: Your bot ID for activity attribution.
         associate_current_turn: Link the newly created task to this trusted
                 current chat session and exact turn immediately after creation.
@@ -485,6 +487,9 @@ async def create_task(
     if project_id is not None:
         body["projectId"] = project_id
     if steps is not None:
+        validation_error = validate_step_inputs(steps)
+        if validation_error:
+            return {"error": validation_error}
         body["steps"] = steps
 
     try:

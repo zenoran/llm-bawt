@@ -11,6 +11,7 @@ from typing import Any
 import httpx
 
 from .server import mcp
+from .task_step_types import TaskStepInput, validate_step_inputs
 from .task_api import (
     api_delete as _api_delete,
     api_patch as _api_patch,
@@ -163,7 +164,7 @@ async def delete_step(
 @mcp.tool(name="steps_add")
 async def add_steps(
     task_id: str,
-    steps: list[dict],
+    steps: list[TaskStepInput],
     bot_id: str | None = None,
 ) -> list[dict]:
     """Add new steps to a task.
@@ -184,6 +185,9 @@ async def add_steps(
         List of created step objects.
     """
     logger.debug("MCP tool invoked: tools/add_steps task=%s count=%d", task_id, len(steps))
+    validation_error = validate_step_inputs(steps)
+    if validation_error:
+        return {"error": validation_error}
     try:
         return await _api_post(
             f"/tasks/{task_id}/steps",
@@ -197,7 +201,7 @@ async def add_steps(
 @mcp.tool(name="steps_set")
 async def set_steps(
     task_id: str,
-    steps: list[dict],
+    steps: list[TaskStepInput],
     bot_id: str | None = None,
 ) -> list[dict]:
     """Replace a task's ENTIRE step list in one atomic call.
@@ -220,6 +224,9 @@ async def set_steps(
         The task's steps in order after the replace.
     """
     logger.debug("MCP tool invoked: tools/set_steps task=%s count=%d", task_id, len(steps))
+    validation_error = validate_step_inputs(steps)
+    if validation_error:
+        return {"error": validation_error}
     try:
         return await _api_put(
             f"/tasks/{task_id}/steps",
