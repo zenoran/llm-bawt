@@ -20,6 +20,7 @@ from .service.providers.crypto import _get_fernet
 
 TASK_TURN_CONTEXT_HEADER = "X-LLM-Bawt-Task-Turn-Context"
 TASK_TURN_CONTEXT_TTL_SECONDS = 6 * 60 * 60
+TASK_TURN_CONTEXT_BACKENDS = frozenset({"claude-code", "codex"})
 # Three canonical shapes are minted server-side and must round-trip through the
 # capability: ordinary chat turns (``turn-<32 hex>``), synthetic approval
 # continuations (``turn-approval-cont-<32 hex>``), and synthetic inter-bot
@@ -41,6 +42,7 @@ _APPROVAL_CONTINUATION_TURN_ID_RE = re.compile(
     r"^turn-approval-cont-[0-9a-f]{32}$"
 )
 _ACTOR_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9@._:-]{0,63}$")
+_SENTINEL_IDENTITIES = {"unknown", "none", "null", "undefined"}
 
 
 def is_delivery_turn_id(turn_id: str | None) -> bool:
@@ -74,6 +76,11 @@ class TaskTurnContext:
     issued_at: int
 
 
+def backend_supports_task_turn_context(backend: str | None) -> bool:
+    """Whether a first-party bridge propagates the trusted turn capability."""
+    return str(backend or "").strip().lower() in TASK_TURN_CONTEXT_BACKENDS
+
+
 def _canonical_uuid(value: str, field: str) -> str:
     try:
         parsed = UUID(str(value))
@@ -87,7 +94,10 @@ def _canonical_uuid(value: str, field: str) -> str:
 
 def _actor_id(value: str, field: str) -> str:
     normalized = str(value or "").strip()
-    if not _ACTOR_ID_RE.fullmatch(normalized):
+    if (
+        not _ACTOR_ID_RE.fullmatch(normalized)
+        or normalized.lower() in _SENTINEL_IDENTITIES
+    ):
         raise TaskTurnContextError(f"{field} has an invalid format")
     return normalized
 

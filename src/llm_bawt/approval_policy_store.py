@@ -1,4 +1,5 @@
 """Approval policy persistence, schema, and compilation."""
+
 from __future__ import annotations
 import json
 import logging
@@ -11,8 +12,12 @@ from sqlmodel import Session, SQLModel, select
 from .approval_models import (
     ApprovalStoreUnavailable,
     CONT_NOT_NEEDED,
+    EXEC_FAILED,
     EXEC_NOT_APPLICABLE,
     KIND_HARNESS,
+    KIND_MCP,
+    REQ_PENDING,
+    REQ_SUPERSEDED,
     ToolApprovalDecision,
     ToolApprovalPolicy,
     ToolApprovalPolicyRevision,
@@ -28,8 +33,17 @@ from .approval_defaults import _DEFAULT_POLICIES, _OPS_DEFAULT_POLICIES
 
 # Fields a caller may set on create/update. Anything else is ignored.
 _POLICY_WRITABLE = {
-    "enabled", "backend_scope", "tool_name", "matcher_type", "pattern",
-    "field", "action", "severity", "category", "approval_prompt", "order",
+    "enabled",
+    "backend_scope",
+    "tool_name",
+    "matcher_type",
+    "pattern",
+    "field",
+    "action",
+    "severity",
+    "category",
+    "approval_prompt",
+    "order",
 }
 
 
@@ -69,6 +83,7 @@ class ToolApprovalPolicyStore(ApprovalRequestStoreMixin):
     def _ensure_tables_exist(self) -> None:
         if self.engine is None:
             return
+
         def bootstrap(conn) -> None:
             SQLModel.metadata.create_all(
                 bind=conn,
@@ -153,17 +168,86 @@ class ToolApprovalPolicyStore(ApprovalRequestStoreMixin):
         for name, sql_type in {
             "resolution_message": "TEXT NOT NULL DEFAULT ''",
             "continuation_owner": "VARCHAR(16) NOT NULL DEFAULT 'client'",
-            "operations_snapshot_json": "TEXT", "execution_claim_token": "VARCHAR(64)",
-            "continuation_claim_token": "VARCHAR(64)", "continuation_id": "VARCHAR(128)",
-            "grant_state": "VARCHAR(24) NOT NULL DEFAULT 'pending'", "grant_error": "TEXT",
+            "operations_snapshot_json": "TEXT",
+            "execution_claim_token": "VARCHAR(64)",
+            "continuation_claim_token": "VARCHAR(64)",
+            "continuation_id": "VARCHAR(128)",
+            "grant_state": "VARCHAR(24) NOT NULL DEFAULT 'pending'",
+            "grant_error": "TEXT",
         }.items():
-            migrations.append(f"ALTER TABLE tool_approval_requests ADD COLUMN IF NOT EXISTS {name} {sql_type}")
-        for name in ("session_key", "session_id", "request_id", "tool_use_id", "outcome"):
+            migrations.append(
+                f"ALTER TABLE tool_approval_requests ADD COLUMN IF NOT EXISTS {name} {sql_type}"
+            )
+        for name in (
+            "session_key",
+            "session_id",
+            "request_id",
+            "tool_use_id",
+            "outcome",
+        ):
             migrations.append(
                 f"ALTER TABLE tool_approval_decisions ADD COLUMN IF NOT EXISTS {name} TEXT"
             )
         for stmt in migrations:
             conn.execute(text(stmt))
+
+        # TASK-873: pre-existing unroutable MCP rows remain as audit records,
+        # but cannot stay actionable. Terminalize them before validating the
+        # database invariant that every new pending MCP approval is routable.
+        invalid_identity = """
+            bot_id IS NULL OR btrim(bot_id) = '' OR lower(btrim(bot_id)) IN ('unknown','none','null','undefined')
+            OR user_id IS NULL OR btrim(user_id) = '' OR lower(btrim(user_id)) IN ('unknown','none','null','undefined')
+            OR turn_id IS NULL OR btrim(turn_id) = '' OR lower(btrim(turn_id)) IN ('unknown','none','null','undefined')
+            OR trigger_message_id IS NULL OR btrim(trigger_message_id) = '' OR lower(btrim(trigger_message_id)) IN ('unknown','none','null','undefined')
+            OR session_key IS NULL OR btrim(session_key) = '' OR lower(btrim(session_key)) IN ('unknown','none','null','undefined')
+            OR backend IS NULL OR btrim(backend) = '' OR lower(btrim(backend)) IN ('unknown','none','null','undefined')
+            OR tool_use_id IS NULL OR btrim(tool_use_id) = '' OR lower(btrim(tool_use_id)) IN ('unknown','none','null','undefined')
+            OR mcp_server IS NULL OR btrim(mcp_server) = '' OR lower(btrim(mcp_server)) IN ('unknown','none','null','undefined')
+            OR invocation_hash IS NULL OR invocation_hash !~ '^[0-9a-f]{64}$'
+            OR caller_context_json IS NULL OR btrim(caller_context_json) = ''
+            OR continuation_capable IS NOT TRUE
+        """
+        conn.execute(
+            text(f"""
+            UPDATE tool_approval_requests
+               SET status = '{REQ_SUPERSEDED}',
+                   resolved_at = COALESCE(resolved_at, NOW()),
+                   resolution_message = CASE WHEN btrim(COALESCE(resolution_message, '')) = ''
+                       THEN 'TASK-873: superseded unroutable legacy MCP approval'
+                       ELSE resolution_message END,
+                   execution_state = '{EXEC_FAILED}',
+                   execution_finished_at = COALESCE(execution_finished_at, NOW()),
+                   execution_error = COALESCE(execution_error,
+                       'Unroutable legacy MCP approval context; execution was blocked')
+             WHERE request_kind = '{KIND_MCP}'
+               AND status = '{REQ_PENDING}'
+               AND ({invalid_identity})
+        """)
+        )
+        conn.execute(
+            text(f"""
+            DO $$
+            BEGIN
+                IF NOT EXISTS (
+                    SELECT 1 FROM pg_constraint
+                     WHERE conname = 'ck_tool_approval_requests_pending_mcp_routable'
+                       AND conrelid = 'tool_approval_requests'::regclass
+                ) THEN
+                    ALTER TABLE tool_approval_requests
+                    ADD CONSTRAINT ck_tool_approval_requests_pending_mcp_routable
+                    CHECK (
+                        request_kind <> '{KIND_MCP}' OR status <> '{REQ_PENDING}' OR NOT ({invalid_identity})
+                    ) NOT VALID;
+                END IF;
+            END $$
+        """)
+        )
+        conn.execute(
+            text("""
+            ALTER TABLE tool_approval_requests
+            VALIDATE CONSTRAINT ck_tool_approval_requests_pending_mcp_routable
+        """)
+        )
 
     # ---- policy CRUD -------------------------------------------------------
 
@@ -194,7 +278,9 @@ class ToolApprovalPolicyStore(ApprovalRequestStoreMixin):
         out = {k: v for k, v in data.items() if k in _POLICY_WRITABLE}
         return out
 
-    def create(self, data: dict[str, Any], actor: str | None = None) -> ToolApprovalPolicy:
+    def create(
+        self, data: dict[str, Any], actor: str | None = None
+    ) -> ToolApprovalPolicy:
         return self._create_with_id(_new_id(), data, actor=actor)
 
     def _create_with_id(
@@ -247,7 +333,11 @@ class ToolApprovalPolicyStore(ApprovalRequestStoreMixin):
             raise RuntimeError("Tool approval policies DB unavailable")
         clean = self._clean(data)
         with Session(self.engine) as session:
-            row = session.exec(select(ToolApprovalPolicy).where(ToolApprovalPolicy.id == policy_id).with_for_update()).first()
+            row = session.exec(
+                select(ToolApprovalPolicy)
+                .where(ToolApprovalPolicy.id == policy_id)
+                .with_for_update()
+            ).first()
             if row is None:
                 return None
             self._revision(session, row, "baseline", row.updated_by)
@@ -287,7 +377,11 @@ class ToolApprovalPolicyStore(ApprovalRequestStoreMixin):
         if self.engine is None:
             raise RuntimeError("Tool approval policies DB unavailable")
         with Session(self.engine) as session:
-            row = session.exec(select(ToolApprovalPolicy).where(ToolApprovalPolicy.id == policy_id).with_for_update()).first()
+            row = session.exec(
+                select(ToolApprovalPolicy)
+                .where(ToolApprovalPolicy.id == policy_id)
+                .with_for_update()
+            ).first()
             if row is None:
                 return False
             self._revision(session, row, "baseline", row.updated_by)
@@ -304,7 +398,9 @@ class ToolApprovalPolicyStore(ApprovalRequestStoreMixin):
         try:
             policies = [row.to_policy() for row in self.list_all()]
         except SQLAlchemyError as exc:
-            raise ApprovalStoreUnavailable("Approval policy database unavailable") from exc
+            raise ApprovalStoreUnavailable(
+                "Approval policy database unavailable"
+            ) from exc
         etag = compute_etag(1, policies)
         return PolicyBundle(version=1, etag=etag, policies=policies)
 
@@ -338,18 +434,28 @@ class ToolApprovalPolicyStore(ApprovalRequestStoreMixin):
     def _revision(self, session, row, change, actor):
         key = f"{row.id}:{row.version}"
         if session.get(ToolApprovalPolicyRevision, key) is None:
-            session.add(ToolApprovalPolicyRevision(
-                id=key, policy_id=row.id, version=row.version, change=change, actor=actor,
-                snapshot_json=json.dumps(row.to_api(), sort_keys=True),
-            ))
+            session.add(
+                ToolApprovalPolicyRevision(
+                    id=key,
+                    policy_id=row.id,
+                    version=row.version,
+                    change=change,
+                    actor=actor,
+                    snapshot_json=json.dumps(row.to_api(), sort_keys=True),
+                )
+            )
 
     def list_revisions(self, policy_id):
         if self.engine is None:
             raise ApprovalStoreUnavailable("Approval policy database unavailable")
         with Session(self.engine) as session:
-            return list(session.exec(select(ToolApprovalPolicyRevision).where(
-                ToolApprovalPolicyRevision.policy_id == policy_id
-            ).order_by(ToolApprovalPolicyRevision.version.desc())).all())
+            return list(
+                session.exec(
+                    select(ToolApprovalPolicyRevision)
+                    .where(ToolApprovalPolicyRevision.policy_id == policy_id)
+                    .order_by(ToolApprovalPolicyRevision.version.desc())
+                ).all()
+            )
 
     def page_revisions(self, policy_id, *, limit=50, offset=0):
         if self.engine is None:
@@ -357,15 +463,25 @@ class ToolApprovalPolicyStore(ApprovalRequestStoreMixin):
         limit, offset = min(max(limit, 1), 200), max(offset, 0)
         predicate = ToolApprovalPolicyRevision.policy_id == policy_id
         with Session(self.engine) as session:
-            total = session.exec(select(func.count()).select_from(
-                ToolApprovalPolicyRevision).where(predicate)).one()
-            rows = list(session.exec(select(ToolApprovalPolicyRevision).where(predicate)
-                .order_by(ToolApprovalPolicyRevision.version.desc())
-                .offset(offset).limit(limit)).all())
+            total = session.exec(
+                select(func.count())
+                .select_from(ToolApprovalPolicyRevision)
+                .where(predicate)
+            ).one()
+            rows = list(
+                session.exec(
+                    select(ToolApprovalPolicyRevision)
+                    .where(predicate)
+                    .order_by(ToolApprovalPolicyRevision.version.desc())
+                    .offset(offset)
+                    .limit(limit)
+                ).all()
+            )
             return rows, total
 
-    def record_bridge_decision(self, event, *, bot_id=None, user_id=None,
-                               session_id=None, turn_id=None):
+    def record_bridge_decision(
+        self, event, *, bot_id=None, user_id=None, session_id=None, turn_id=None
+    ):
         """Commit a redacted run event, idempotent across replay of that event.
 
         No current-bundle lookup: record the version actually evaluated, whose
@@ -374,43 +490,79 @@ class ToolApprovalPolicyStore(ApprovalRequestStoreMixin):
         """
         from hashlib import sha256
         from agent_bridge.approval_audit import audit_subject
+
         if self.engine is None:
             raise ApprovalStoreUnavailable("Approval policy database unavailable")
         meta = event.raw
         if meta.get("action") not in ("allow", "deny", "require_approval"):
             raise ValueError("Invalid bridge audit action")
-        key = sha256(f"bridge-decision:{event.run_id}:{event.event_id}".encode()).hexdigest()
+        key = sha256(
+            f"bridge-decision:{event.run_id}:{event.event_id}".encode()
+        ).hexdigest()
         with Session(self.engine) as session:
             if session.get(ToolApprovalDecision, key) is not None:
                 return
-            session.add(ToolApprovalDecision(
-                id=key, created_at=event.timestamp,
-                backend=event.provider or "claude-code", tool_name=event.tool_name or "",
-                action=meta["action"], outcome=meta.get("outcome"),
-                severity=meta.get("severity") or "medium",
-                subject=audit_subject(meta.get("subject") or ""),
-                policy_id=meta.get("policy_id"), policy_version=meta.get("policy_version"),
-                bundle_etag=meta.get("bundle_etag") or "",
-                invocation_hash=meta.get("invocation_hash") or "",
-                source="bridge", bot_id=bot_id, user_id=user_id, turn_id=turn_id,
-                session_key=event.session_key, session_id=session_id,
-                request_id=event.run_id, tool_use_id=event.tool_use_id,
-            ))
+            session.add(
+                ToolApprovalDecision(
+                    id=key,
+                    created_at=event.timestamp,
+                    backend=event.provider or "claude-code",
+                    tool_name=event.tool_name or "",
+                    action=meta["action"],
+                    outcome=meta.get("outcome"),
+                    severity=meta.get("severity") or "medium",
+                    subject=audit_subject(meta.get("subject") or ""),
+                    policy_id=meta.get("policy_id"),
+                    policy_version=meta.get("policy_version"),
+                    bundle_etag=meta.get("bundle_etag") or "",
+                    invocation_hash=meta.get("invocation_hash") or "",
+                    source="bridge",
+                    bot_id=bot_id,
+                    user_id=user_id,
+                    turn_id=turn_id,
+                    session_key=event.session_key,
+                    session_id=session_id,
+                    request_id=event.run_id,
+                    tool_use_id=event.tool_use_id,
+                )
+            )
             session.commit()
 
-    def record_decision(self, *, decision, bundle, backend, tool_name, invocation_hash,
-                        bot_id=None, user_id=None, turn_id=None, source="mcp"):
+    def record_decision(
+        self,
+        *,
+        decision,
+        bundle,
+        backend,
+        tool_name,
+        invocation_hash,
+        bot_id=None,
+        user_id=None,
+        turn_id=None,
+        source="mcp",
+    ):
         if self.engine is None:
             raise ApprovalStoreUnavailable("Approval policy database unavailable")
         from agent_bridge.approval_audit import audit_subject
+
         policy = decision.policy
         row = ToolApprovalDecision(
-            backend=backend, tool_name=tool_name, action=decision.action.value,
-            severity=decision.severity.value, subject=audit_subject(decision.subject),
-            policy_id=policy.id if policy else None, policy_version=policy.version if policy else None,
-            policy_snapshot_json=json.dumps(policy.to_dict(), sort_keys=True) if policy else None,
-            bundle_etag=bundle.etag, invocation_hash=invocation_hash,
-            bot_id=bot_id, user_id=user_id, turn_id=turn_id, source=source,
+            backend=backend,
+            tool_name=tool_name,
+            action=decision.action.value,
+            severity=decision.severity.value,
+            subject=audit_subject(decision.subject),
+            policy_id=policy.id if policy else None,
+            policy_version=policy.version if policy else None,
+            policy_snapshot_json=json.dumps(policy.to_dict(), sort_keys=True)
+            if policy
+            else None,
+            bundle_etag=bundle.etag,
+            invocation_hash=invocation_hash,
+            bot_id=bot_id,
+            user_id=user_id,
+            turn_id=turn_id,
+            source=source,
         )
         with Session(self.engine) as session:
             session.add(row)
@@ -421,8 +573,17 @@ class ToolApprovalPolicyStore(ApprovalRequestStoreMixin):
             raise ApprovalStoreUnavailable("Approval policy database unavailable")
         limit, offset = min(max(limit, 1), 200), max(offset, 0)
         with Session(self.engine) as session:
-            total = session.exec(select(func.count()).select_from(ToolApprovalDecision)).one()
-            rows = list(session.exec(select(ToolApprovalDecision).order_by(
-                ToolApprovalDecision.created_at.desc(), ToolApprovalDecision.id
-            ).offset(offset).limit(limit)).all())
+            total = session.exec(
+                select(func.count()).select_from(ToolApprovalDecision)
+            ).one()
+            rows = list(
+                session.exec(
+                    select(ToolApprovalDecision)
+                    .order_by(
+                        ToolApprovalDecision.created_at.desc(), ToolApprovalDecision.id
+                    )
+                    .offset(offset)
+                    .limit(limit)
+                ).all()
+            )
             return rows, total

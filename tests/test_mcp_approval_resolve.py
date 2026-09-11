@@ -8,7 +8,7 @@ from agent_bridge.mcp_call_context import canonical_invocation_hash
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from sqlalchemy.pool import StaticPool
-from sqlmodel import create_engine
+from sqlmodel import Session, create_engine
 
 from llm_bawt.approval_policies import (
     EXEC_FAILED,
@@ -17,6 +17,7 @@ from llm_bawt.approval_policies import (
     REQ_APPROVED,
     REQ_DENIED,
     ToolApprovalPolicyStore,
+    ToolApprovalRequest,
 )
 from llm_bawt.service.routes import approval_policies as routes
 
@@ -40,6 +41,8 @@ def _mcp_req(**over):
         "bot_id": "snark",
         "user_id": "nick",
         "turn_id": "turn-1",
+        "trigger_message_id": "message-1",
+        "session_key": "snark:nick",
         "backend": "claude-code",
         "tool_name": "ops_run",
         "tool_arguments": {"operation": "llm-bawt.restart-app", "args": {}},
@@ -53,6 +56,18 @@ def _mcp_req(**over):
         "operations_snapshot": {"operation_slug": "llm-bawt.restart-app", "args": {}},
     }
     base.update(over)
+    base.setdefault("caller_context_json", json.dumps({
+        "session_id": "session-1",
+        "turn_id": base["turn_id"],
+        "trigger_message_id": base["trigger_message_id"],
+        "bot_id": base["bot_id"],
+        "user_id": base["user_id"],
+        "issued_at": 1,
+        "agent_request_id": "agent-request-1",
+        "session_key": base["session_key"],
+        "backend": base["backend"],
+        "tool_use_id": base["tool_use_id"],
+    }))
     return base
 
 
@@ -199,7 +214,15 @@ def test_resolve_route_reconciles_original_tool_record_and_fanout(monkeypatch):
 
 def test_deny_never_executes_and_stores_refusal(monkeypatch):
     store = _store()
-    row = _record(store, continuation_capable=False)
+    row = _record(store)
+    # Legacy unroutable rows can still be inspected/resolved even though the
+    # TASK-873 insertion invariant rejects creating new ones.
+    with Session(store.engine) as session:
+        current = session.get(ToolApprovalRequest, row.id)
+        current.continuation_capable = False
+        session.add(current)
+        session.commit()
+    row = store.get_request(row.id)
     fake = FakeMcp()
     from llm_bawt.mcp_server import registry
     monkeypatch.setattr(registry, "mcp", fake)

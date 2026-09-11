@@ -9,6 +9,8 @@ from typing import Any
 
 import httpx
 
+from agent_bridge.mcp_call_context import MCP_REQUEST_CONTEXT_HEADER
+
 from ..task_turn_context import (
     TASK_TURN_CONTEXT_HEADER,
     TaskTurnContext,
@@ -19,6 +21,7 @@ from ..task_turn_context import (
 logger = logging.getLogger(__name__)
 
 _HEADER_BYTES = TASK_TURN_CONTEXT_HEADER.lower().encode("ascii")
+_REQUEST_CONTEXT_HEADER_BYTES = MCP_REQUEST_CONTEXT_HEADER.lower().encode("ascii")
 _INTERNAL_URL = os.getenv(
     "BAWTHUB_TASK_ASSOCIATION_INTERNAL_URL",
     "http://frontend-prod:3002",
@@ -26,6 +29,10 @@ _INTERNAL_URL = os.getenv(
 _TIMEOUT = 10.0
 _current_capability: ContextVar[str | None] = ContextVar(
     "task_turn_context_capability",
+    default=None,
+)
+_current_mcp_request_context: ContextVar[str | None] = ContextVar(
+    "mcp_request_context",
     default=None,
 )
 
@@ -44,6 +51,20 @@ def current_task_turn_capability() -> str | None:
     return _current_capability.get()
 
 
+def current_mcp_request_context() -> str | None:
+    """Return the request-local signed Codex envelope, if supplied."""
+    return _current_mcp_request_context.get()
+
+
+def set_current_mcp_request_context(value: str | None) -> Token:
+    """Bind one HTTP request's signed bridge envelope for tests/adapters."""
+    return _current_mcp_request_context.set(str(value or "").strip() or None)
+
+
+def reset_current_mcp_request_context(token: Token) -> None:
+    _current_mcp_request_context.reset(token)
+
+
 def current_task_turn_context() -> TaskTurnContext:
     return open_task_turn_context(current_task_turn_capability())
 
@@ -52,15 +73,24 @@ def task_turn_context_header_name() -> str:
     return TASK_TURN_CONTEXT_HEADER
 
 
-def capability_from_asgi_scope(scope: dict[str, Any]) -> str | None:
-    """Extract the single opaque capability header from an ASGI HTTP scope."""
+def _header_from_asgi_scope(scope: dict[str, Any], header: bytes) -> str | None:
     for raw_name, raw_value in scope.get("headers") or []:
-        if raw_name.lower() == _HEADER_BYTES:
+        if raw_name.lower() == header:
             try:
                 return raw_value.decode("ascii").strip() or None
             except UnicodeDecodeError:
                 return None
     return None
+
+
+def capability_from_asgi_scope(scope: dict[str, Any]) -> str | None:
+    """Extract the single opaque capability header from an ASGI HTTP scope."""
+    return _header_from_asgi_scope(scope, _HEADER_BYTES)
+
+
+def request_context_from_asgi_scope(scope: dict[str, Any]) -> str | None:
+    """Extract the signed bridge-request envelope from an ASGI HTTP scope."""
+    return _header_from_asgi_scope(scope, _REQUEST_CONTEXT_HEADER_BYTES)
 
 
 class TaskTurnCapabilityMiddleware:
@@ -74,9 +104,13 @@ class TaskTurnCapabilityMiddleware:
             await self.app(scope, receive, send)
             return
         binding = set_current_task_turn_capability(capability_from_asgi_scope(scope))
+        request_binding = set_current_mcp_request_context(
+            request_context_from_asgi_scope(scope)
+        )
         try:
             await self.app(scope, receive, send)
         finally:
+            reset_current_mcp_request_context(request_binding)
             reset_current_task_turn_capability(binding)
 
 

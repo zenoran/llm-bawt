@@ -41,6 +41,12 @@ def test_round_trip_preserves_all_trusted_identifiers(fernet: Fernet) -> None:
     assert opened.issued_at == 123
 
 
+def test_first_party_agent_backends_support_task_turn_context() -> None:
+    assert codec.backend_supports_task_turn_context("claude-code") is True
+    assert codec.backend_supports_task_turn_context("codex") is True
+    assert codec.backend_supports_task_turn_context("openclaw") is False
+
+
 def test_invalid_or_missing_capability_fails_closed(fernet: Fernet) -> None:
     with pytest.raises(codec.TaskTurnContextError, match="No trusted"):
         codec.open_task_turn_context(None)
@@ -52,6 +58,14 @@ def test_mint_rejects_noncanonical_identifiers(fernet: Fernet) -> None:
     values = _values()
     values["session_id"] = values["session_id"].upper()
     with pytest.raises(codec.TaskTurnContextError, match="canonical lowercase UUID"):
+        codec.mint_task_turn_context(**values)
+
+
+@pytest.mark.parametrize("sentinel", ["unknown", "NONE", " null ", "undefined"])
+def test_mint_rejects_sentinel_actor_ids(fernet: Fernet, sentinel: str) -> None:
+    values = _values()
+    values["bot_id"] = sentinel
+    with pytest.raises(codec.TaskTurnContextError, match="invalid format"):
         codec.mint_task_turn_context(**values)
 
 
@@ -111,10 +125,13 @@ def test_mint_rejects_arbitrary_turn_id_shapes(fernet: Fernet) -> None:
 
 
 def test_asgi_middleware_binds_and_resets_capability() -> None:
-    observed: list[str | None] = []
+    observed: list[tuple[str | None, str | None]] = []
 
     async def app(scope, receive, send):
-        observed.append(task_association._current_capability.get())
+        observed.append((
+            task_association.current_task_turn_capability(),
+            task_association.current_mcp_request_context(),
+        ))
         await send({"type": "http.response.start", "status": 204, "headers": []})
         await send({"type": "http.response.body", "body": b""})
 
@@ -134,6 +151,7 @@ def test_asgi_middleware_binds_and_resets_capability() -> None:
                 "type": "http",
                 "headers": [
                     (b"x-llm-bawt-task-turn-context", b"opaque-value"),
+                    (b"x-llm-bawt-mcp-request-context", b"signed-request"),
                 ],
             },
             receive,
@@ -142,8 +160,9 @@ def test_asgi_middleware_binds_and_resets_capability() -> None:
 
     asyncio.run(run())
 
-    assert observed == ["opaque-value"]
+    assert observed == [("opaque-value", "signed-request")]
     assert task_association._current_capability.get() is None
+    assert task_association.current_mcp_request_context() is None
 
 
 def test_association_posts_only_verified_server_context(
@@ -198,6 +217,58 @@ def test_association_posts_only_verified_server_context(
             "source": "AGENT",
         },
     }
+
+
+def test_codex_request_context_preserves_trusted_task_association(
+    fernet: Fernet,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from agent_bridge.mcp_call_context import mint_mcp_request_context
+
+    values = _values()
+    values["bot_id"] = "codex"
+    capability = codec.mint_task_turn_context(**values)
+    envelope = mint_mcp_request_context(
+        capability=capability,
+        agent_request_id="req-codex",
+        session_key="codex:nick",
+        backend="codex",
+    )
+    captured = {}
+
+    class FakeResponse:
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {"association": {"task": {"shortId": "TASK-873"}}}
+
+    class FakeClient:
+        def __init__(self, **_kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return None
+
+        async def put(self, path, json):
+            captured.update(path=path, json=json)
+            return FakeResponse()
+
+    monkeypatch.setattr(task_association.httpx, "AsyncClient", FakeClient)
+    capability_binding = task_association.set_current_task_turn_capability(capability)
+    request_binding = task_association.set_current_mcp_request_context(envelope)
+    try:
+        result = asyncio.run(task_association.associate_current_task("TASK-873"))
+    finally:
+        task_association.reset_current_mcp_request_context(request_binding)
+        task_association.reset_current_task_turn_capability(capability_binding)
+
+    assert result["ok"] is True
+    assert captured["json"]["botId"] == "codex"
+    assert captured["json"]["turn"]["triggerMessageId"] == values["trigger_message_id"]
 
 
 def test_association_nulls_turn_id_for_delivery_shape(

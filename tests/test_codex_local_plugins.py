@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import tomllib
 from pathlib import Path
 
 from codex_bridge.local_plugins import (
@@ -152,6 +153,13 @@ def test_install_repo_local_plugins_writes_config_toml_entries(
     assert '[plugins."agent-skills@local-agent-skills"]' in contents
     assert "[mcp_servers.bawthub]" in contents
     assert 'url = "http://app:8001/mcp"' in contents
+    assert '"X-LLM-Bawt-Task-Turn-Context" = "LLM_BAWT_TASK_TURN_CONTEXT"' in contents
+    assert '"X-LLM-Bawt-MCP-Request-Context" = "LLM_BAWT_MCP_REQUEST_CONTEXT"' in contents
+    parsed = tomllib.loads(contents)
+    assert parsed["shell_environment_policy"]["filters"] == {
+        "LLM_BAWT_TASK_TURN_CONTEXT": "exclude",
+        "LLM_BAWT_MCP_REQUEST_CONTEXT": "exclude",
+    }
 
 
 def test_install_repo_local_plugins_is_idempotent(monkeypatch, tmp_path: Path):
@@ -210,6 +218,32 @@ def test_install_repo_local_plugins_updates_existing_bawthub_mcp_url(
     assert 'url = "http://bridge-app:8001/mcp"' in contents
     assert "127.0.0.1:8001" not in contents
     assert "[mcp_servers.openaiDeveloperDocs]" in contents
+    assert contents.count("env_http_headers =") == 1
+
+
+def test_context_shell_filter_extends_legacy_excludes(monkeypatch, tmp_path: Path):
+    home, dev_root, codex_home, source_root, _, _ = _build_fixture(tmp_path)
+    monkeypatch.setenv("CODEX_DEV_ROOT", str(dev_root))
+    monkeypatch.setenv("CODEX_LOCAL_PLUGINS_SRC", str(source_root))
+    _write(
+        codex_home / "config.toml",
+        '[shell_environment_policy]\nexclude = ["EXISTING_SECRET"]\n',
+    )
+
+    install_repo_local_plugins(
+        logger=logging.getLogger("test.codex_local_plugins"),
+        codex_home=codex_home,
+        home=home,
+    )
+
+    excluded = tomllib.loads((codex_home / "config.toml").read_text())[
+        "shell_environment_policy"
+    ]["exclude"]
+    assert excluded == [
+        "EXISTING_SECRET",
+        "LLM_BAWT_TASK_TURN_CONTEXT",
+        "LLM_BAWT_MCP_REQUEST_CONTEXT",
+    ]
 
 
 def test_install_repo_local_plugins_adds_bawthub_mcp_when_plugins_disabled(

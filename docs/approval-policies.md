@@ -9,7 +9,9 @@ facade over `approval_models.py`, `approval_policy_store.py`,
 The pure matcher is `agent_bridge/approval.py`.
 
 - First-party bawthub MCP tools are gated at the app MCP server. The Claude hook
-  stamps trusted invocation context and deliberately skips a second bridge gate.
+  stamps exact invocation context; Codex sends a signed request envelope that
+  the server binds to the MCP JSON-RPC request ID. Both deliberately skip a
+  second bridge gate.
 - Claude Code native tools and external MCP tools use the PreToolUse bridge gate
   (and the equivalent permission callback when applicable).
 - Codex, OpenClaw and direct clients do **not** enforce this layer on their native
@@ -87,6 +89,17 @@ consumer timeout, or app death can leave gaps: there is no durable audit outbox
 or guaranteed replay for ordinary turns. MCP audits commit inline at its app
 boundary and a write failure prevents proceeding normally. Do not advertise
 complete all-backend audit coverage or exactly-once execution.
+
+An interactive MCP approval is persisted only with complete verified routing:
+bot, user, turn, trigger message, session, backend, MCP server, tool-use ID,
+invocation hash, caller context, and continuation capability. Blank or sentinel
+identities such as `unknown` are rejected in the domain layer and by a database
+constraint for pending MCP rows. Missing or forged context returns
+`approval_context_missing` / `approval_context_invalid` before persistence or
+fanout. Stable per-invocation IDs make retries idempotent; only the transaction
+that creates the row publishes the live approval event. Legacy unroutable
+pending MCP rows are superseded and retained as terminal audit records during
+schema bootstrap.
 
 ## Resolution and rollout
 

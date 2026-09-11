@@ -16,6 +16,10 @@ _DEFAULT_BAWTHUB_MCP_URL = "http://app:8001/mcp"
 _DEFAULT_CRAWL4AI_MCP_URL = "http://crawl4ai:11235/mcp/sse"
 
 
+class CodexMcpContextConfigError(RuntimeError):
+    """Trusted MCP headers could not be hidden from model shell tools."""
+
+
 def _remove_path(path: Path) -> None:
     if not path.exists() and not path.is_symlink():
         return
@@ -199,8 +203,7 @@ def _upsert_mcp_server_config(
     Args:
         extra_lines: Additional TOML lines to include after the url line
             (e.g. ``['headers = { Authorization = "Bearer tok" }']``).
-            Only written when the section is first created; existing
-            sections only have their ``url`` updated.
+            Existing sections are updated by key without duplicating entries.
     """
     try:
         existing = config_path.read_text() if config_path.exists() else ""
@@ -307,7 +310,62 @@ def ensure_bawthub_mcp_config(
         name="bawthub",
         url=url,
         logger=logger,
+        extra_lines=[
+            "env_http_headers = { "
+            '"X-LLM-Bawt-Task-Turn-Context" = "LLM_BAWT_TASK_TURN_CONTEXT", '
+            '"X-LLM-Bawt-MCP-Request-Context" = "LLM_BAWT_MCP_REQUEST_CONTEXT" '
+            "}",
+        ],
     )
+    _ensure_mcp_context_shell_filter(
+        config_path=codex_home / "config.toml",
+        logger=logger,
+    )
+
+
+def _ensure_mcp_context_shell_filter(
+    *, config_path: Path, logger: logging.Logger
+) -> None:
+    """Keep trusted MCP correlation out of model-invoked shell processes."""
+    try:
+        import tomlkit
+
+        existing = config_path.read_text() if config_path.exists() else ""
+        document = tomlkit.parse(existing)
+        policy = document.get("shell_environment_policy")
+        if policy is None:
+            policy = tomlkit.table()
+            document["shell_environment_policy"] = policy
+
+        names = ["LLM_BAWT_TASK_TURN_CONTEXT", "LLM_BAWT_MCP_REQUEST_CONTEXT"]
+        if "exclude" in policy or "include_only" in policy:
+            excluded = list(policy.get("exclude") or [])
+            for name in names:
+                if name not in excluded:
+                    excluded.append(name)
+            policy["exclude"] = excluded
+        else:
+            filters = policy.get("filters")
+            if filters is None:
+                filters = tomlkit.inline_table()
+                policy["filters"] = filters
+            for name in names:
+                filters[name] = "exclude"
+
+        new_text = tomlkit.dumps(document)
+        if new_text == existing:
+            return
+        config_path.parent.mkdir(parents=True, exist_ok=True)
+        config_path.write_text(new_text)
+    except Exception as exc:  # noqa: BLE001 - security boundary must fail closed
+        logger.error(
+            "Could not exclude trusted MCP context from Codex shell environment in %s: %s",
+            config_path,
+            exc,
+        )
+        raise CodexMcpContextConfigError(
+            "trusted MCP context could not be excluded from shell tools"
+        ) from exc
 
 
 def ensure_crawl4ai_mcp_config(

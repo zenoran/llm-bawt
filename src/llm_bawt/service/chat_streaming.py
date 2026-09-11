@@ -354,7 +354,9 @@ class ChatStreamingMixin(ChatStreamingBridgeMixin):
                 if thread_binding else ""
             )
             backend_name = str(getattr(llm_bawt.bot, "agent_backend", "") or "")
-            if backend_name == "claude-code" and session_id:
+            from ..task_turn_context import backend_supports_task_turn_context
+
+            if backend_supports_task_turn_context(backend_name) and session_id:
                 try:
                     from ..task_turn_context import mint_task_turn_context
 

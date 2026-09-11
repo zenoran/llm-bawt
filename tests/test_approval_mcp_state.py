@@ -16,8 +16,11 @@ test_approval_persist.py.
 
 from __future__ import annotations
 
+import json
 import time
 from datetime import datetime, timedelta, timezone
+
+import pytest
 
 try:
     from sqlmodel import Session, create_engine, select
@@ -69,6 +72,8 @@ def _mcp_req(**over):
         bot_id="snark",
         user_id="nick",
         turn_id="turn-1",
+        trigger_message_id="message-1",
+        session_key="snark:nick",
         backend="claude-code",
         tool_name="ops_run",
         tool_arguments={"operation": "llm-bawt.restart-app", "args": {}},
@@ -82,6 +87,18 @@ def _mcp_req(**over):
         operations_snapshot={"operation_slug": "llm-bawt.restart-app", "args": {}},
     )
     base.update(over)
+    base.setdefault("caller_context_json", json.dumps({
+        "session_id": "session-1",
+        "turn_id": base["turn_id"],
+        "trigger_message_id": base["trigger_message_id"],
+        "bot_id": base["bot_id"],
+        "user_id": base["user_id"],
+        "issued_at": 1,
+        "agent_request_id": "agent-request-1",
+        "session_key": base["session_key"],
+        "backend": base["backend"],
+        "tool_use_id": base["tool_use_id"],
+    }))
     return base
 
 
@@ -93,6 +110,29 @@ def _approve(store, request_id):
         row.status = _APPROVED
         session.add(row)
         session.commit()
+
+
+def test_postgres_migration_terminalizes_orphans_before_enforcing_constraint():
+    class FakeConnection:
+        dialect = type("Dialect", (), {"name": "postgresql"})()
+
+        def __init__(self):
+            self.statements = []
+
+        def execute(self, statement):
+            self.statements.append(str(statement))
+
+    connection = FakeConnection()
+    store = object.__new__(ToolApprovalPolicyStore)
+    store._migrate_add_columns(connection)
+    sql = "\n".join(connection.statements)
+
+    remediation = sql.index("superseded unroutable legacy MCP approval")
+    constraint = sql.index("ck_tool_approval_requests_pending_mcp_routable")
+    assert remediation < constraint
+    assert "continuation_capable IS NOT TRUE" in sql
+    assert "lower(btrim(bot_id)) IN ('unknown','none','null','undefined')" in sql
+    assert "VALIDATE CONSTRAINT ck_tool_approval_requests_pending_mcp_routable" in sql
 
 
 # ---- default policy seeding ------------------------------------------------
@@ -159,11 +199,24 @@ def test_record_mcp_writes_kind_mcp_row_with_pending_execution():
 def test_record_mcp_idempotent_on_request_id():
     store = _store()
     first = store.record_mcp_request(**_mcp_req())
-    second = store.record_mcp_request(**_mcp_req(tool_name="ops_list_operations"))
+    second = store.record_mcp_request(**_mcp_req())
     assert first.id == second.id == "req-mcp-1"
-    assert second.tool_name == "ops_run"  # original preserved
+    assert second.tool_name == "ops_run"
     with Session(store.engine) as s:
         assert len(s.exec(select(ToolApprovalRequest)).all()) == 1
+
+
+def test_record_mcp_reports_creator_and_rejects_id_collision():
+    store = _store()
+    first, first_created = store.record_mcp_request(**_mcp_req(), with_created=True)
+    second, second_created = store.record_mcp_request(**_mcp_req(), with_created=True)
+    assert first.id == second.id
+    assert first_created is True
+    assert second_created is False
+    with pytest.raises(ApprovalPersistError, match="different invocation"):
+        store.record_mcp_request(
+            **_mcp_req(invocation_hash="0" * 64), with_created=True
+        )
 
 
 def test_record_mcp_none_engine_raises():
@@ -282,16 +335,20 @@ def test_complete_execution_is_idempotent_on_terminal():
 
 # ---- continuation outbox ---------------------------------------------------
 
-def test_enqueue_continuation_noop_when_not_capable():
+def test_record_mcp_rejects_unroutable_continuation():
     store = _store()
-    store.record_mcp_request(**_mcp_req(continuation_capable=False))
-    _approve(store, "req-mcp-1")
-    store.claim_mcp_execution("req-mcp-1")
-    store.complete_mcp_execution(
-        "req-mcp-1", result_json='{"a":1}', is_error=False,
-    )
-    row = store.enqueue_continuation("req-mcp-1")
-    assert row.continuation_state == CONT_NOT_NEEDED
+    with pytest.raises(ApprovalPersistError, match="routable continuation"):
+        store.record_mcp_request(**_mcp_req(continuation_capable=False))
+
+
+@pytest.mark.parametrize("field", [
+    "bot_id", "user_id", "turn_id", "trigger_message_id", "session_key",
+    "backend", "tool_use_id",
+])
+def test_record_mcp_rejects_sentinel_identity(field):
+    store = _store()
+    with pytest.raises(ApprovalPersistError, match="missing or invalid"):
+        store.record_mcp_request(**_mcp_req(**{field: "unknown"}))
 
 
 def test_enqueue_continuation_moves_to_pending_when_capable():

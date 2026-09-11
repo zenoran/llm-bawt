@@ -43,12 +43,20 @@ def client(store, monkeypatch):
 
 def record(store, request_id="req-1", tool_name="generic", **kwargs):
     arguments = {"operation": "demo", "args": {}} if tool_name == "ops_run" else {"x": 1}
+    caller_context = {
+        "session_id": "original-session", "turn_id": "turn-1",
+        "trigger_message_id": "message-1", "bot_id": "test-bot",
+        "user_id": "test-user", "issued_at": 1,
+        "agent_request_id": "agent-request-1", "session_key": "test-bot:test-user",
+        "backend": "claude-code", "tool_use_id": "toolu-1",
+    }
     return store.record_mcp_request(
         request_id=request_id, tool_use_id="toolu-1", mcp_server="bawthub", bot_id="test-bot",
-        user_id="test-user", turn_id="turn-1", backend="claude-code", tool_name=tool_name,
+        user_id="test-user", turn_id="turn-1", trigger_message_id="message-1",
+        session_key="test-bot:test-user", backend="claude-code", tool_name=tool_name,
         tool_arguments=arguments, subject="subject", grant_key="g", policy_id=None, severity="high",
         prompt="Approve?", invocation_hash=canonical_invocation_hash(tool_name, arguments),
-        continuation_capable=True, caller_context_json=json.dumps({"session_id": "original-session"}), **kwargs,
+        continuation_capable=True, caller_context_json=json.dumps(caller_context), **kwargs,
     )
 
 
@@ -170,16 +178,17 @@ def test_mcp_allow_and_deny_are_audited_separately(client, store):
     assert store.count_requests() == 0 and executed == ["hello"]
 
 
-def test_snapshot_is_prepared_persisted_and_not_public(store):
+def test_raw_gated_mcp_call_fails_before_snapshot_or_persistence(store):
     store.create({"tool_name": "ops_run"})
     snapshot = {"operation_slug": "demo", "rendered_command": "original", "version": 1}
+    prepared = []
     server = ApprovalAwareFastMCP("test", approval_store_provider=lambda: store,
-        approval_publisher=lambda payload: None, operations_preparer=lambda operation, args: snapshot)
+        approval_publisher=lambda payload: None,
+        operations_preparer=lambda operation, args: prepared.append((operation, args)) or snapshot)
     result = asyncio.run(server.call_tool("ops_run", {"operation": "demo", "args": {}}))
-    row = store.get_request(result["approval_request_id"])
-    snapshot["rendered_command"] = "mutated"
-    assert json.loads(row.operations_snapshot_json)["rendered_command"] == "original"
-    assert json.loads(row.tool_arguments_json) == {"operation": "demo", "args": {}}
+    assert result["status"] == "approval_context_missing"
+    assert prepared == []
+    assert store.count_requests() == 0
 
 
 def test_atomic_completion_enqueues_and_cancel_stays_silent(store):

@@ -12,6 +12,8 @@ and the bridge logic is
 - Persists Codex thread IDs in `agent_backend_config.session_key` and tracks
   the model in `session_model`.
 - Reuses a shared SDK transport and serializes turns per session.
+- Builds a request-scoped SDK handle when trusted MCP correlation is present;
+  the base environment and shared SDK handle are never mutated.
 - Emits provider-aware native Codex tool events instead of pretending they are
   Claude tool names.
 - Stages repo-managed local plugins into the Codex home when enabled.
@@ -55,6 +57,31 @@ shortcut. The app owns the refresh chain; do not introduce a second refresher.
 | `CODEX_LOCAL_PLUGINS_SRC` | `/home/bridge/dev/agent-skills/codex` | Local plugin source root |
 | `CODEX_DEV_ROOT` | `/home/bridge/dev` | Repo root used for local plugin resolution |
 
+## Trusted BawtHub MCP correlation
+
+The app mints `task_turn_capability` for Codex agent turns and carries it through
+the existing Redis command. The bridge creates a fresh subprocess environment
+containing that capability plus a signed request envelope bound to
+`request_id`, `session_key`, and backend. `local_plugins.py` configures Codex's
+`env_http_headers` so only the BawtHub MCP request receives:
+
+- `X-LLM-Bawt-Task-Turn-Context`
+- `X-LLM-Bawt-MCP-Request-Context`
+
+Both source environment variables are excluded from model-invoked shell
+processes through `shell_environment_policy`; they remain available only to the
+Codex process that materializes the MCP HTTP headers.
+
+The MCP server verifies both headers and binds the exact tool name/arguments to
+FastMCP's JSON-RPC request ID. The derived tool-use and approval-request IDs are
+deterministic, so a retry returns the existing row and does not republish the
+approval event. Missing, expired, forged, cross-session, or sentinel context
+fails before tool execution, approval persistence, or event publication.
+
+Raw MCP clients remain able to call tools allowed by policy. If a policy
+requires approval, an uncorrelated raw request returns
+`approval_context_missing` and creates no approval row.
+
 ## Session behavior
 
 - `session_key` stores the Codex thread ID.
@@ -78,4 +105,5 @@ That matches the bridge's expected runtime layout.
 
 - [src/llm_bawt/agent_backends/codex.py](../src/llm_bawt/agent_backends/codex.py)
 - [src/codex_bridge/local_plugins.py](../src/codex_bridge/local_plugins.py)
+- [src/codex_bridge/mcp_context.py](../src/codex_bridge/mcp_context.py)
 - [src/codex_bridge/transport.py](../src/codex_bridge/transport.py)

@@ -9,10 +9,10 @@ field is stripped before FastMCP schema validation/function binding.
 from __future__ import annotations
 
 import contextvars
+import hashlib
 import inspect
 import json
 import logging
-import uuid
 from dataclasses import dataclass
 from typing import Any, Awaitable, Callable
 
@@ -20,14 +20,23 @@ from agent_bridge.approval import PolicyAction, evaluate
 from agent_bridge.mcp_call_context import (
     MCP_CALL_CONTEXT_KEY,
     McpCallContext,
+    McpCallContextError,
     canonical_invocation_hash,
+    derive_mcp_call_context,
     verify_mcp_call_context,
 )
 from mcp.server.fastmcp import FastMCP
 
 from ..approval_policies import ApprovalPersistError, ApprovalStoreUnavailable
-from ..task_turn_context import TaskTurnContext, open_task_turn_context
-from .task_association import current_task_turn_capability
+from ..task_turn_context import (
+    TaskTurnContext,
+    TaskTurnContextError,
+    open_task_turn_context,
+)
+from .task_association import (
+    current_mcp_request_context,
+    current_task_turn_capability,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -35,8 +44,20 @@ PolicyProvider = Callable[[], Any]
 ApprovalPublisher = Callable[[dict[str, Any]], Awaitable[None] | None]
 
 
-def _new_request_id() -> str:
-    return "mcp-appr-" + uuid.uuid4().hex
+def _approval_request_id(call_context: McpCallContext) -> str:
+    identity = f"{call_context.backend}\0{call_context.tool_use_id}\0{call_context.invocation_hash}"
+    return "mcp-appr-" + hashlib.sha256(identity.encode("utf-8")).hexdigest()[:40]
+
+
+def _approval_context_error(
+    tool: str, *, invalid: bool, message: str
+) -> dict[str, Any]:
+    return {
+        "status": "approval_context_invalid" if invalid else "approval_context_missing",
+        "tool": tool,
+        "message": message,
+        "is_error": True,
+    }
 
 
 @dataclass(frozen=True)
@@ -167,24 +188,68 @@ class ApprovalAwareFastMCP(FastMCP):
         received = dict(arguments or {})
         raw_call_context = received.pop(MCP_CALL_CONTEXT_KEY, None)
         capability = current_task_turn_capability()
+        raw_request_context = current_mcp_request_context()
         call_context: McpCallContext | None = None
         turn_context: TaskTurnContext | None = None
 
-        if raw_call_context is not None:
-            call_context = verify_mcp_call_context(
-                capability=capability or "",
-                tool_name=name,
-                tool_input=received,
-                raw_context=raw_call_context,
-            )
-            turn_context = open_task_turn_context(capability)
+        has_any_context = any(
+            value is not None
+            for value in (raw_call_context, capability, raw_request_context)
+        )
+        if has_any_context:
+            if not capability:
+                return _approval_context_error(
+                    name,
+                    invalid=False,
+                    message="Trusted approval context is incomplete; the tool was not executed.",
+                )
+            if (raw_call_context is None) == (raw_request_context is None):
+                return _approval_context_error(
+                    name,
+                    invalid=raw_call_context is not None,
+                    message="Exactly one trusted MCP caller context is required; the tool was not executed.",
+                )
+            try:
+                turn_context = open_task_turn_context(capability)
+                if raw_call_context is not None:
+                    call_context = verify_mcp_call_context(
+                        capability=capability,
+                        tool_name=name,
+                        tool_input=received,
+                        raw_context=raw_call_context,
+                    )
+                else:
+                    protocol_context = self.get_context()
+                    call_context = derive_mcp_call_context(
+                        capability=capability,
+                        raw_request_context=raw_request_context,
+                        protocol_request_id=protocol_context.request_id,
+                        tool_name=name,
+                        tool_input=received,
+                    )
+            except (
+                AttributeError,
+                LookupError,
+                McpCallContextError,
+                RuntimeError,
+                TaskTurnContextError,
+            ) as error:
+                return _approval_context_error(
+                    name,
+                    invalid=True,
+                    message=f"Trusted approval context is invalid: {error}. The tool was not executed.",
+                )
 
         store = self._approval_store()
         try:
             bundle = store.compile_bundle()
         except ApprovalStoreUnavailable:
-            return {"status": "policy_unavailable", "tool": name, "is_error": True,
-                    "message": "Approval policy source unavailable; tool was not executed."}
+            return {
+                "status": "policy_unavailable",
+                "tool": name,
+                "is_error": True,
+                "message": "Approval policy source unavailable; tool was not executed.",
+            }
         decision = evaluate(
             bundle.policies,
             call_context.backend if call_context else "mcp",
@@ -192,8 +257,10 @@ class ApprovalAwareFastMCP(FastMCP):
             received,
         )
         store.record_decision(
-            decision=decision, bundle=bundle,
-            backend=call_context.backend if call_context else "mcp", tool_name=name,
+            decision=decision,
+            bundle=bundle,
+            backend=call_context.backend if call_context else "mcp",
+            tool_name=name,
             invocation_hash=canonical_invocation_hash(name, received),
             bot_id=turn_context.bot_id if turn_context else None,
             user_id=turn_context.user_id if turn_context else None,
@@ -210,40 +277,51 @@ class ApprovalAwareFastMCP(FastMCP):
                 "is_error": True,
             }
 
-        request_id = _new_request_id()
+        if call_context is None or turn_context is None:
+            return _approval_context_error(
+                name,
+                invalid=False,
+                message=(
+                    "Approval is required, but trusted caller correlation is missing; "
+                    "the tool was not executed and no approval was created."
+                ),
+            )
+
+        request_id = _approval_request_id(call_context)
         invocation_hash = canonical_invocation_hash(name, received)
-        caller_context = None
-        if turn_context is not None and call_context is not None:
-            caller_context = {
-                "session_id": turn_context.session_id,
-                "turn_id": turn_context.turn_id,
-                "trigger_message_id": turn_context.trigger_message_id,
-                "bot_id": turn_context.bot_id,
-                "user_id": turn_context.user_id,
-                "issued_at": turn_context.issued_at,
-                "agent_request_id": call_context.agent_request_id,
-                "session_key": call_context.session_key,
-                "backend": call_context.backend,
-                "tool_use_id": call_context.tool_use_id,
-            }
+        caller_context = {
+            "session_id": turn_context.session_id,
+            "turn_id": turn_context.turn_id,
+            "trigger_message_id": turn_context.trigger_message_id,
+            "bot_id": turn_context.bot_id,
+            "user_id": turn_context.user_id,
+            "issued_at": turn_context.issued_at,
+            "agent_request_id": call_context.agent_request_id,
+            "session_key": call_context.session_key,
+            "backend": call_context.backend,
+            "tool_use_id": call_context.tool_use_id,
+        }
         try:
             operations_snapshot = None
             if name == "ops_run":
                 prepare = self._operations_preparer
                 if prepare is None:
                     from .ops_tools import _get_ops_service
+
                     prepare = _get_ops_service().prepare_invocation
-                operations_snapshot = prepare(received.get("operation", ""), received.get("args") or {})
+                operations_snapshot = prepare(
+                    received.get("operation", ""), received.get("args") or {}
+                )
                 if not isinstance(operations_snapshot, dict):
                     raise ValueError("Operation preparer must return a snapshot object")
-            row = store.record_mcp_request(
+            row, created = store.record_mcp_request(
                 request_id=request_id,
-                tool_use_id=call_context.tool_use_id if call_context else None,
+                tool_use_id=call_context.tool_use_id,
                 mcp_server="bawthub",
-                bot_id=turn_context.bot_id if turn_context else "unknown",
-                user_id=turn_context.user_id if turn_context else "unknown",
-                turn_id=turn_context.turn_id if turn_context else "unknown",
-                backend=call_context.backend if call_context else "mcp",
+                bot_id=turn_context.bot_id,
+                user_id=turn_context.user_id,
+                turn_id=turn_context.turn_id,
+                backend=call_context.backend,
                 tool_name=name,
                 tool_arguments=received,
                 subject=decision.subject,
@@ -253,15 +331,13 @@ class ApprovalAwareFastMCP(FastMCP):
                 prompt=decision.prompt,
                 invocation_hash=invocation_hash,
                 operations_snapshot=operations_snapshot,
-                caller_context_json=(
-                    json.dumps(caller_context, ensure_ascii=False, sort_keys=True)
-                    if caller_context else None
+                caller_context_json=json.dumps(
+                    caller_context, ensure_ascii=False, sort_keys=True
                 ),
-                continuation_capable=caller_context is not None,
-                trigger_message_id=(
-                    turn_context.trigger_message_id if turn_context else None
-                ),
-                session_key=call_context.session_key if call_context else None,
+                continuation_capable=True,
+                trigger_message_id=turn_context.trigger_message_id,
+                session_key=call_context.session_key,
+                with_created=True,
             )
         except ApprovalPersistError as error:
             logger.error("Could not persist MCP approval for %s: %s", name, error)
@@ -275,26 +351,29 @@ class ApprovalAwareFastMCP(FastMCP):
                 "is_error": True,
             }
 
-        await self._publish_approval_required({
-            "_type": "tool_approval_required",
-            "request_id": row.id,
-            "tool_use_id": row.tool_use_id,
-            "turn_id": row.turn_id,
-            "trigger_message_id": row.trigger_message_id,
-            "bot_id": row.bot_id,
-            "user_id": row.user_id,
-            "tool_name": row.tool_name,
-            "arguments": received,
-            "subject": row.subject,
-            "label": decision.label,
-            "prompt": row.prompt,
-            "severity": row.severity,
-            "policy_id": row.policy_id,
-            "session_key": row.session_key or "",
-            "provider": row.backend,
-            "request_kind": "mcp",
-            "continuation_capable": bool(row.continuation_capable),
-        })
+        if created:
+            await self._publish_approval_required(
+                {
+                    "_type": "tool_approval_required",
+                    "request_id": row.id,
+                    "tool_use_id": row.tool_use_id,
+                    "turn_id": row.turn_id,
+                    "trigger_message_id": row.trigger_message_id,
+                    "bot_id": row.bot_id,
+                    "user_id": row.user_id,
+                    "tool_name": row.tool_name,
+                    "arguments": received,
+                    "subject": row.subject,
+                    "label": decision.label,
+                    "prompt": row.prompt,
+                    "severity": row.severity,
+                    "policy_id": row.policy_id,
+                    "session_key": row.session_key or "",
+                    "provider": row.backend,
+                    "request_kind": "mcp",
+                    "continuation_capable": bool(row.continuation_capable),
+                }
+            )
         return {
             "status": "approval_required",
             "approval_request_id": row.id,

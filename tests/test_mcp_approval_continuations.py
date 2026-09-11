@@ -35,6 +35,13 @@ def _store():
 
 def _ready_row(store, *, tool_name="ops_run", result=None):
     args = {"operation": "llm-bawt.restart-app", "args": {}}
+    caller_context = {
+        "session_id": "session-1", "turn_id": "turn-1",
+        "trigger_message_id": "message-1", "bot_id": "snark",
+        "user_id": "nick", "issued_at": 1,
+        "agent_request_id": "agent-request-1", "session_key": "snark:nick",
+        "backend": "claude-code", "tool_use_id": "toolu-1",
+    }
     row = store.record_mcp_request(
         request_id="req-mcp-1",
         tool_use_id="toolu-1",
@@ -42,6 +49,8 @@ def _ready_row(store, *, tool_name="ops_run", result=None):
         bot_id="snark",
         user_id="nick",
         turn_id="turn-1",
+        trigger_message_id="message-1",
+        session_key="snark:nick",
         backend="claude-code",
         tool_name=tool_name,
         tool_arguments=args,
@@ -52,6 +61,7 @@ def _ready_row(store, *, tool_name="ops_run", result=None):
         prompt="Approve?",
         invocation_hash=canonical_invocation_hash("ops_run", args),
         continuation_capable=True,
+        caller_context_json=json.dumps(caller_context),
     )
     store.resolve_request(row.id, status=REQ_APPROVED)
     store.claim_mcp_execution(row.id)

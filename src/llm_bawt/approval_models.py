@@ -277,16 +277,15 @@ class ToolApprovalRequest(SQLModel, table=True):
     invocation_hash: str | None = Field(
         default=None, sa_column=Column(String(64), nullable=True)
     )
-    # The signed per-turn caller context stamped by the Claude PreToolUse
-    # hook (bot_id, user_id, turn_id, trigger_message_id, session_key,
-    # backend, tool_use_id). Verified at MCP dispatch and again at resolve.
+    # Verified server-owned caller context (bot/user/turn/trigger/session,
+    # backend, tool_use_id). Claude supplies an exact per-call stamp; Codex
+    # supplies a signed request header bound to the MCP protocol request id.
     caller_context_json: str | None = Field(
         default=None, sa_column=Column(Text, nullable=True)
     )
-    # Some callers (raw MCP clients that don't ride an active agent turn) can
-    # be approved but cannot receive a continuation. When False the outbox
-    # marks itself CONT_NOT_NEEDED and the result is only retrievable via the
-    # approval API / job status endpoints.
+    # Pending MCP approvals are only valid for routable interactive turns.
+    # Raw MCP clients may call non-gated tools but fail closed when a policy
+    # requires approval.
     continuation_capable: bool = Field(
         default=False,
         sa_column=Column(Boolean, nullable=False, server_default="false"),

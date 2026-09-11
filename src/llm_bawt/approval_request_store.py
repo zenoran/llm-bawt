@@ -1,11 +1,14 @@
 """Durable approval request lifecycle and execution claims."""
+
 from __future__ import annotations
 import json
 import logging
+import re
 from datetime import timedelta
 from typing import Any
 from hashlib import sha256
 from sqlalchemy import and_, or_, update, func
+from sqlalchemy.exc import IntegrityError
 from sqlmodel import Session, select
 from .approval_models import (
     ApprovalPersistError,
@@ -37,9 +40,96 @@ from .approval_models import (
 
 logger = logging.getLogger(__name__)
 
+_SENTINEL_IDENTITIES = {"unknown", "none", "null", "undefined"}
+_SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
+
+
+def _required_mcp_identity(value: Any, field: str, *, max_length: int = 256) -> str:
+    normalized = str(value or "").strip()
+    if (
+        not normalized
+        or len(normalized) > max_length
+        or normalized.lower() in _SENTINEL_IDENTITIES
+        or any(ord(char) < 32 or ord(char) == 127 for char in normalized)
+    ):
+        raise ApprovalPersistError(f"MCP approval {field} is missing or invalid")
+    return normalized
+
+
+def _validate_mcp_caller_context(
+    *,
+    caller_context_json: str | None,
+    bot_id: str,
+    user_id: str,
+    turn_id: str,
+    trigger_message_id: str | None,
+    session_key: str | None,
+    backend: str,
+    tool_use_id: str | None,
+) -> str:
+    try:
+        context = json.loads(
+            _required_mcp_identity(
+                caller_context_json, "caller_context_json", max_length=16_384
+            )
+        )
+    except (json.JSONDecodeError, TypeError) as error:
+        raise ApprovalPersistError(
+            "MCP approval caller context is malformed"
+        ) from error
+    if not isinstance(context, dict):
+        raise ApprovalPersistError("MCP approval caller context must be an object")
+    expected = {
+        "bot_id": bot_id,
+        "user_id": user_id,
+        "turn_id": turn_id,
+        "trigger_message_id": trigger_message_id,
+        "session_key": session_key,
+        "backend": backend,
+        "tool_use_id": tool_use_id,
+    }
+    for field, value in expected.items():
+        canonical = _required_mcp_identity(value, field)
+        if (
+            _required_mcp_identity(context.get(field), f"caller_context.{field}")
+            != canonical
+        ):
+            raise ApprovalPersistError(
+                f"MCP approval caller context {field} does not match the row"
+            )
+    for field in ("session_id", "agent_request_id", "issued_at"):
+        _required_mcp_identity(context.get(field), f"caller_context.{field}")
+    return json.dumps(context, ensure_ascii=False, sort_keys=True)
+
 
 def _continuation_id(request_id):
     return "approval-cont-" + sha256(request_id.encode()).hexdigest()[:32]
+
+
+def _mcp_record_result(row: ToolApprovalRequest, created: bool, with_created: bool):
+    return (row, created) if with_created else row
+
+
+def _same_mcp_invocation(
+    row: ToolApprovalRequest,
+    *,
+    tool_use_id: str,
+    invocation_hash: str,
+    bot_id: str,
+    user_id: str,
+    turn_id: str,
+    backend: str,
+) -> bool:
+    return (
+        row.request_kind == KIND_MCP
+        and row.tool_use_id == tool_use_id
+        and row.invocation_hash == invocation_hash
+        and row.bot_id == bot_id
+        and row.user_id == user_id
+        and row.turn_id == turn_id
+        and row.backend == backend
+    )
+
 
 class ApprovalRequestStoreMixin:
     # ---- request lifecycle (audit) -----------------------------------------
@@ -87,12 +177,17 @@ class ApprovalRequestStoreMixin:
                     turn_id=(turn_id or "unknown").strip() or "unknown",
                     trigger_message_id=trigger_message_id or None,
                     session_key=session_key or None,
-                    caller_context_json=json.dumps({"session_id": session_id}) if session_id else None,
+                    caller_context_json=json.dumps({"session_id": session_id})
+                    if session_id
+                    else None,
                     backend=backend or "claude-code",
                     tool_name=tool_name or "",
                     tool_arguments_json=json.dumps(
-                        tool_arguments if isinstance(tool_arguments, dict) else {"value": tool_arguments},
-                        ensure_ascii=False, default=str,
+                        tool_arguments
+                        if isinstance(tool_arguments, dict)
+                        else {"value": tool_arguments},
+                        ensure_ascii=False,
+                        default=str,
                     ),
                     subject=subject or "",
                     grant_key=grant_key or "",
@@ -120,25 +215,47 @@ class ApprovalRequestStoreMixin:
             return session.get(ToolApprovalRequest, request_id)
 
     def resolve_request(
-        self, request_id: str, *, status: str, resolved_by: str | None = None,
-        resolved_turn_id: str | None = None, message: str = "",
+        self,
+        request_id: str,
+        *,
+        status: str,
+        resolved_by: str | None = None,
+        resolved_turn_id: str | None = None,
+        message: str = "",
         continuation_owner: str | None = None,
     ) -> ToolApprovalRequest | None:
         """First terminal decision wins, including message and dispatch ownership."""
         if self.engine is None:
             raise ApprovalStoreUnavailable("Approval database unavailable")
-        if status not in (REQ_APPROVED, REQ_DENIED, REQ_CANCELLED, REQ_RESPONDED, REQ_EXPIRED, REQ_SUPERSEDED):
+        if status not in (
+            REQ_APPROVED,
+            REQ_DENIED,
+            REQ_CANCELLED,
+            REQ_RESPONDED,
+            REQ_EXPIRED,
+            REQ_SUPERSEDED,
+        ):
             raise ValueError("Invalid approval resolution status")
         with Session(self.engine) as session:
-            values = dict(status=status, resolved_at=_utcnow(), resolved_by=resolved_by,
-                          resolved_turn_id=resolved_turn_id, resolution_message=message)
+            values = dict(
+                status=status,
+                resolved_at=_utcnow(),
+                resolved_by=resolved_by,
+                resolved_turn_id=resolved_turn_id,
+                resolution_message=message,
+            )
             if continuation_owner is not None:
                 if continuation_owner not in ("server", "client", "none"):
                     raise ValueError("Invalid continuation owner")
                 values["continuation_owner"] = continuation_owner
-            session.exec(update(ToolApprovalRequest).where(
-                ToolApprovalRequest.id == request_id, ToolApprovalRequest.status == REQ_PENDING,
-            ).values(**values))
+            session.exec(
+                update(ToolApprovalRequest)
+                .where(
+                    ToolApprovalRequest.id == request_id,
+                    ToolApprovalRequest.status == REQ_PENDING,
+                )
+                .values(**values)
+            )
             session.commit()
             return session.get(ToolApprovalRequest, request_id)
 
@@ -167,7 +284,8 @@ class ApprovalRequestStoreMixin:
         continuation_capable: bool = False,
         trigger_message_id: str | None = None,
         session_key: str | None = None,
-    ) -> ToolApprovalRequest:
+        with_created: bool = False,
+    ) -> ToolApprovalRequest | tuple[ToolApprovalRequest, bool]:
         """Persist a new MCP-kind gated request. Idempotent on request_id.
 
         Same durability contract as :meth:`record_request` — raises
@@ -176,6 +294,37 @@ class ApprovalRequestStoreMixin:
         the row is committed. Starts in status=REQ_PENDING (approval flow) +
         execution_state=EXEC_PENDING (MCP execution has not run yet).
         """
+        request_id = _required_mcp_identity(request_id, "request_id", max_length=128)
+        tool_use_id = _required_mcp_identity(tool_use_id, "tool_use_id", max_length=128)
+        mcp_server = _required_mcp_identity(mcp_server, "mcp_server", max_length=128)
+        bot_id = _required_mcp_identity(bot_id, "bot_id", max_length=128)
+        user_id = _required_mcp_identity(user_id, "user_id", max_length=128)
+        turn_id = _required_mcp_identity(turn_id, "turn_id", max_length=128)
+        trigger_message_id = _required_mcp_identity(
+            trigger_message_id, "trigger_message_id", max_length=128
+        )
+        session_key = _required_mcp_identity(session_key, "session_key", max_length=128)
+        backend = _required_mcp_identity(backend, "backend", max_length=64)
+        tool_name = _required_mcp_identity(tool_name, "tool_name", max_length=128)
+        invocation_hash = _required_mcp_identity(
+            invocation_hash, "invocation_hash", max_length=64
+        )
+        if not _SHA256_RE.fullmatch(invocation_hash):
+            raise ApprovalPersistError("MCP approval invocation_hash is invalid")
+        if not continuation_capable:
+            raise ApprovalPersistError(
+                "MCP approval must have a routable continuation context"
+            )
+        caller_context_json = _validate_mcp_caller_context(
+            caller_context_json=caller_context_json,
+            bot_id=bot_id,
+            user_id=user_id,
+            turn_id=turn_id,
+            trigger_message_id=trigger_message_id,
+            session_key=session_key,
+            backend=backend,
+            tool_use_id=tool_use_id,
+        )
         if self.engine is None:
             raise ApprovalPersistError(
                 f"approval store has no DB engine; cannot persist MCP request {request_id}"
@@ -184,19 +333,34 @@ class ApprovalRequestStoreMixin:
             with Session(self.engine) as session:
                 existing = session.get(ToolApprovalRequest, request_id)
                 if existing is not None:
-                    return existing
+                    if not _same_mcp_invocation(
+                        existing,
+                        tool_use_id=tool_use_id,
+                        invocation_hash=invocation_hash,
+                        bot_id=bot_id,
+                        user_id=user_id,
+                        turn_id=turn_id,
+                        backend=backend,
+                    ):
+                        raise ApprovalPersistError(
+                            "approval request id is already bound to a different invocation"
+                        )
+                    return _mcp_record_result(existing, False, with_created)
                 row = ToolApprovalRequest(
                     id=request_id,
-                    bot_id=(bot_id or "unknown").strip() or "unknown",
-                    user_id=(user_id or "unknown").strip() or "unknown",
-                    turn_id=(turn_id or "unknown").strip() or "unknown",
-                    trigger_message_id=trigger_message_id or None,
-                    session_key=session_key or None,
-                    backend=backend or "claude-code",
-                    tool_name=tool_name or "",
+                    bot_id=bot_id,
+                    user_id=user_id,
+                    turn_id=turn_id,
+                    trigger_message_id=trigger_message_id,
+                    session_key=session_key,
+                    backend=backend,
+                    tool_name=tool_name,
                     tool_arguments_json=json.dumps(
-                        tool_arguments if isinstance(tool_arguments, dict) else {"value": tool_arguments},
-                        ensure_ascii=False, default=str,
+                        tool_arguments
+                        if isinstance(tool_arguments, dict)
+                        else {"value": tool_arguments},
+                        ensure_ascii=False,
+                        default=str,
                     ),
                     subject=subject or "",
                     grant_key=grant_key or "",
@@ -206,10 +370,14 @@ class ApprovalRequestStoreMixin:
                     status=REQ_PENDING,
                     request_kind=KIND_MCP,
                     tool_use_id=tool_use_id,
-                    mcp_server=mcp_server or "",
+                    mcp_server=mcp_server,
                     invocation_hash=invocation_hash,
                     caller_context_json=caller_context_json,
-                    operations_snapshot_json=json.dumps(operations_snapshot, sort_keys=True) if operations_snapshot is not None else None,
+                    operations_snapshot_json=json.dumps(
+                        operations_snapshot, sort_keys=True
+                    )
+                    if operations_snapshot is not None
+                    else None,
                     continuation_owner="server",
                     continuation_id=_continuation_id(request_id),
                     continuation_capable=bool(continuation_capable),
@@ -219,9 +387,28 @@ class ApprovalRequestStoreMixin:
                 session.add(row)
                 session.commit()
                 session.refresh(row)
-                return row
+                return _mcp_record_result(row, True, with_created)
         except ApprovalPersistError:
             raise
+        except IntegrityError as exc:
+            # A concurrent transport retry can race the optimistic lookup.
+            # The primary key is the final arbiter; return the winner only
+            # when it represents the exact same trusted invocation.
+            with Session(self.engine) as session:
+                existing = session.get(ToolApprovalRequest, request_id)
+                if existing is not None and _same_mcp_invocation(
+                    existing,
+                    tool_use_id=tool_use_id,
+                    invocation_hash=invocation_hash,
+                    bot_id=bot_id,
+                    user_id=user_id,
+                    turn_id=turn_id,
+                    backend=backend,
+                ):
+                    return _mcp_record_result(existing, False, with_created)
+            raise ApprovalPersistError(
+                f"conflicting insert for MCP approval request {request_id}"
+            ) from exc
         except Exception as exc:  # noqa: BLE001
             logger.exception("Failed to record MCP approval request id=%s", request_id)
             raise ApprovalPersistError(
@@ -282,19 +469,33 @@ class ApprovalRequestStoreMixin:
             if int(result.rowcount or 0) != 1:
                 return None
             row = session.get(ToolApprovalRequest, request_id)
-        if row.execution_attempts > 1 and (row.tool_name != "ops_run" or not row.operations_snapshot_json):
+        if row.execution_attempts > 1 and (
+            row.tool_name != "ops_run" or not row.operations_snapshot_json
+        ):
             self.complete_mcp_execution(
-                request_id, result_json=json.dumps({"status": "failed", "uncertain": True,
-                    "error": "Execution lease expired. Side effects may have occurred; manual reconciliation required. Do not replay."}),
-                is_error=True, error="Uncertain execution; manual reconciliation required",
+                request_id,
+                result_json=json.dumps(
+                    {
+                        "status": "failed",
+                        "uncertain": True,
+                        "error": "Execution lease expired. Side effects may have occurred; manual reconciliation required. Do not replay.",
+                    }
+                ),
+                is_error=True,
+                error="Uncertain execution; manual reconciliation required",
                 claim_token=row.execution_claim_token,
             )
             return None
         return row
 
     def complete_mcp_execution(
-        self, request_id: str, *, result_json: str, is_error: bool,
-        error: str | None = None, skipped: bool = False,
+        self,
+        request_id: str,
+        *,
+        result_json: str,
+        is_error: bool,
+        error: str | None = None,
+        skipped: bool = False,
         claim_token: str | None = None,
     ) -> ToolApprovalRequest | None:
         """CAS result and outbox enqueue in ONE transaction; fence stale workers."""
@@ -309,26 +510,42 @@ class ApprovalRequestStoreMixin:
             if skipped and row.status == REQ_APPROVED:
                 return row
             now = _utcnow()
-            conditions = [ToolApprovalRequest.id == request_id, ToolApprovalRequest.result_json.is_(None)]
+            conditions = [
+                ToolApprovalRequest.id == request_id,
+                ToolApprovalRequest.result_json.is_(None),
+            ]
             if claim_token is not None:
-                conditions.append(ToolApprovalRequest.execution_claim_token == claim_token)
+                conditions.append(
+                    ToolApprovalRequest.execution_claim_token == claim_token
+                )
             if skipped:
                 conditions.append(ToolApprovalRequest.execution_state == EXEC_PENDING)
             else:
                 conditions.append(ToolApprovalRequest.execution_state == EXEC_RUNNING)
             enqueue = bool(row.continuation_capable and row.status != REQ_CANCELLED)
-            result = session.exec(update(ToolApprovalRequest).where(*conditions).values(
-                execution_state=EXEC_SKIPPED if skipped else (EXEC_FAILED if is_error else EXEC_SUCCEEDED),
-                execution_finished_at=now, result_json=result_json, result_is_error=bool(is_error),
-                execution_error=error, execution_claim_token=None,
-                continuation_state=CONT_PENDING if enqueue else CONT_NOT_NEEDED,
-                continuation_next_attempt_at=now if enqueue else None,
-                continuation_id=row.continuation_id or _continuation_id(request_id),
-            ))
+            result = session.exec(
+                update(ToolApprovalRequest)
+                .where(*conditions)
+                .values(
+                    execution_state=EXEC_SKIPPED
+                    if skipped
+                    else (EXEC_FAILED if is_error else EXEC_SUCCEEDED),
+                    execution_finished_at=now,
+                    result_json=result_json,
+                    result_is_error=bool(is_error),
+                    execution_error=error,
+                    execution_claim_token=None,
+                    continuation_state=CONT_PENDING if enqueue else CONT_NOT_NEEDED,
+                    continuation_next_attempt_at=now if enqueue else None,
+                    continuation_id=row.continuation_id or _continuation_id(request_id),
+                )
+            )
             session.commit()
             session.expire_all()
             if int(result.rowcount or 0) != 1:
-                raise ApprovalPersistError("Execution claim lost; result not overwritten")
+                raise ApprovalPersistError(
+                    "Execution claim lost; result not overwritten"
+                )
             return session.get(ToolApprovalRequest, request_id)
 
     def enqueue_continuation(
@@ -381,14 +598,19 @@ class ApprovalRequestStoreMixin:
                 ToolApprovalRequest.id == request_id,
                 ToolApprovalRequest.continuation_delivered_at.is_(None),
                 or_(
-                    and_(ToolApprovalRequest.continuation_state == CONT_PENDING,
-                         or_(ToolApprovalRequest.continuation_next_attempt_at.is_(None),
-                             ToolApprovalRequest.continuation_next_attempt_at <= now)),
+                    and_(
+                        ToolApprovalRequest.continuation_state == CONT_PENDING,
+                        or_(
+                            ToolApprovalRequest.continuation_next_attempt_at.is_(None),
+                            ToolApprovalRequest.continuation_next_attempt_at <= now,
+                        ),
+                    ),
                     and_(
                         ToolApprovalRequest.continuation_state == CONT_DISPATCHING,
                         or_(
                             ToolApprovalRequest.continuation_next_attempt_at.is_(None),
-                            ToolApprovalRequest.continuation_next_attempt_at <= stale_before,
+                            ToolApprovalRequest.continuation_next_attempt_at
+                            <= stale_before,
                         ),
                     ),
                 ),
@@ -410,38 +632,78 @@ class ApprovalRequestStoreMixin:
                 return None
             return session.get(ToolApprovalRequest, request_id)
 
-    def mark_continuation_delivered(self, request_id: str, *, claim_token: str | None = None):
+    def mark_continuation_delivered(
+        self, request_id: str, *, claim_token: str | None = None
+    ):
         return self._finish_continuation(request_id, claim_token=claim_token)
 
-    def mark_continuation_failed(self, request_id: str, *, error: str, max_attempts: int = 5,
-                                 backoff_seconds: int = 30, claim_token: str | None = None):
-        return self._finish_continuation(request_id, claim_token=claim_token, error=error,
-                                        max_attempts=max_attempts, backoff_seconds=backoff_seconds)
+    def mark_continuation_failed(
+        self,
+        request_id: str,
+        *,
+        error: str,
+        max_attempts: int = 5,
+        backoff_seconds: int = 30,
+        claim_token: str | None = None,
+    ):
+        return self._finish_continuation(
+            request_id,
+            claim_token=claim_token,
+            error=error,
+            max_attempts=max_attempts,
+            backoff_seconds=backoff_seconds,
+        )
 
-    def _finish_continuation(self, request_id, *, claim_token=None, error=None,
-                             max_attempts=5, backoff_seconds=30):
+    def _finish_continuation(
+        self,
+        request_id,
+        *,
+        claim_token=None,
+        error=None,
+        max_attempts=5,
+        backoff_seconds=30,
+    ):
         if self.engine is None:
             raise ApprovalStoreUnavailable("Approval database unavailable")
         with Session(self.engine) as session:
             row = session.get(ToolApprovalRequest, request_id)
             if row is None or row.continuation_state != CONT_DISPATCHING:
                 return row
-            expected = claim_token if claim_token is not None else row.continuation_claim_token
+            expected = (
+                claim_token if claim_token is not None else row.continuation_claim_token
+            )
             now = _utcnow()
             failed = error is not None
             terminal_failure = failed and row.continuation_attempts >= max_attempts
             values = dict(
-                continuation_state=(CONT_FAILED if terminal_failure else CONT_PENDING) if failed else CONT_DELIVERED,
+                continuation_state=(CONT_FAILED if terminal_failure else CONT_PENDING)
+                if failed
+                else CONT_DELIVERED,
                 continuation_last_error=str(error)[:2000] if failed else None,
                 continuation_delivered_at=None if failed else now,
                 continuation_claim_token=None,
-                continuation_next_attempt_at=(now + timedelta(seconds=min(backoff_seconds * 2 ** max(0, row.continuation_attempts - 1), 600))) if failed and not terminal_failure else None,
+                continuation_next_attempt_at=(
+                    now
+                    + timedelta(
+                        seconds=min(
+                            backoff_seconds
+                            * 2 ** max(0, row.continuation_attempts - 1),
+                            600,
+                        )
+                    )
+                )
+                if failed and not terminal_failure
+                else None,
             )
-            session.exec(update(ToolApprovalRequest).where(
-                ToolApprovalRequest.id == request_id,
-                ToolApprovalRequest.continuation_state == CONT_DISPATCHING,
-                ToolApprovalRequest.continuation_claim_token == expected,
-            ).values(**values))
+            session.exec(
+                update(ToolApprovalRequest)
+                .where(
+                    ToolApprovalRequest.id == request_id,
+                    ToolApprovalRequest.continuation_state == CONT_DISPATCHING,
+                    ToolApprovalRequest.continuation_claim_token == expected,
+                )
+                .values(**values)
+            )
             session.commit()
             session.expire_all()
             return session.get(ToolApprovalRequest, request_id)
@@ -450,11 +712,15 @@ class ApprovalRequestStoreMixin:
         if self.engine is None:
             raise ApprovalStoreUnavailable("Approval database unavailable")
         with Session(self.engine) as session:
-            result = session.exec(update(ToolApprovalRequest).where(
-                ToolApprovalRequest.id == request_id,
-                ToolApprovalRequest.continuation_state == CONT_DISPATCHING,
-                ToolApprovalRequest.continuation_claim_token == claim_token,
-            ).values(continuation_next_attempt_at=_utcnow()))
+            result = session.exec(
+                update(ToolApprovalRequest)
+                .where(
+                    ToolApprovalRequest.id == request_id,
+                    ToolApprovalRequest.continuation_state == CONT_DISPATCHING,
+                    ToolApprovalRequest.continuation_claim_token == claim_token,
+                )
+                .values(continuation_next_attempt_at=_utcnow())
+            )
             session.commit()
             return int(result.rowcount or 0) == 1
 
@@ -488,7 +754,10 @@ class ApprovalRequestStoreMixin:
                     | (
                         (ToolApprovalRequest.continuation_state == CONT_DISPATCHING)
                         & (ToolApprovalRequest.continuation_delivered_at.is_(None))
-                        & (ToolApprovalRequest.continuation_next_attempt_at <= stale_before)
+                        & (
+                            ToolApprovalRequest.continuation_next_attempt_at
+                            <= stale_before
+                        )
                     )
                 )
                 .order_by(ToolApprovalRequest.continuation_next_attempt_at)
@@ -512,9 +781,14 @@ class ApprovalRequestStoreMixin:
                 stmt = stmt.where(ToolApprovalRequest.status == status)
             if bot_id:
                 stmt = stmt.where(ToolApprovalRequest.bot_id == bot_id)
-            stmt = stmt.order_by(ToolApprovalRequest.created_at.desc(), ToolApprovalRequest.id).offset(max(0, offset)).limit(min(max(1, limit), 200))
+            stmt = (
+                stmt.order_by(
+                    ToolApprovalRequest.created_at.desc(), ToolApprovalRequest.id
+                )
+                .offset(max(0, offset))
+                .limit(min(max(1, limit), 200))
+            )
             return list(session.exec(stmt).all())
-
 
     def count_requests(self, *, status=None, bot_id=None):
         if self.engine is None:
@@ -531,29 +805,52 @@ class ApprovalRequestStoreMixin:
         if self.engine is None:
             raise ApprovalStoreUnavailable("Approval database unavailable")
         with Session(self.engine) as session:
-            return list(session.exec(select(ToolApprovalRequest).where(
-                ToolApprovalRequest.request_kind == KIND_MCP,
-                ToolApprovalRequest.status != REQ_PENDING,
-                ToolApprovalRequest.result_json.is_(None),
-                or_(ToolApprovalRequest.execution_state == EXEC_PENDING,
-                    and_(ToolApprovalRequest.execution_state == EXEC_RUNNING,
-                         or_(ToolApprovalRequest.execution_started_at.is_(None),
-                             ToolApprovalRequest.execution_started_at <= _utcnow() - timedelta(seconds=lease_seconds))))
-            ).order_by(ToolApprovalRequest.created_at).limit(limit)).all())
+            return list(
+                session.exec(
+                    select(ToolApprovalRequest)
+                    .where(
+                        ToolApprovalRequest.request_kind == KIND_MCP,
+                        ToolApprovalRequest.status != REQ_PENDING,
+                        ToolApprovalRequest.result_json.is_(None),
+                        or_(
+                            ToolApprovalRequest.execution_state == EXEC_PENDING,
+                            and_(
+                                ToolApprovalRequest.execution_state == EXEC_RUNNING,
+                                or_(
+                                    ToolApprovalRequest.execution_started_at.is_(None),
+                                    ToolApprovalRequest.execution_started_at
+                                    <= _utcnow() - timedelta(seconds=lease_seconds),
+                                ),
+                            ),
+                        ),
+                    )
+                    .order_by(ToolApprovalRequest.created_at)
+                    .limit(limit)
+                ).all()
+            )
 
     def prepare_harness_continuation(self, request_id):
         """Durably enqueue server-owned continuation without a fire-and-forget gap."""
         if self.engine is None:
             raise ApprovalStoreUnavailable("Approval database unavailable")
         with Session(self.engine) as session:
-            session.exec(update(ToolApprovalRequest).where(
-                ToolApprovalRequest.id == request_id,
-                ToolApprovalRequest.request_kind == KIND_HARNESS,
-                ToolApprovalRequest.status.in_([REQ_APPROVED, REQ_DENIED, REQ_RESPONDED]),
-                ToolApprovalRequest.continuation_owner == "server",
-                ToolApprovalRequest.continuation_state == CONT_NOT_NEEDED,
-            ).values(continuation_state=CONT_PENDING, continuation_next_attempt_at=_utcnow(),
-                     continuation_id=_continuation_id(request_id)))
+            session.exec(
+                update(ToolApprovalRequest)
+                .where(
+                    ToolApprovalRequest.id == request_id,
+                    ToolApprovalRequest.request_kind == KIND_HARNESS,
+                    ToolApprovalRequest.status.in_(
+                        [REQ_APPROVED, REQ_DENIED, REQ_RESPONDED]
+                    ),
+                    ToolApprovalRequest.continuation_owner == "server",
+                    ToolApprovalRequest.continuation_state == CONT_NOT_NEEDED,
+                )
+                .values(
+                    continuation_state=CONT_PENDING,
+                    continuation_next_attempt_at=_utcnow(),
+                    continuation_id=_continuation_id(request_id),
+                )
+            )
             session.commit()
             return session.get(ToolApprovalRequest, request_id)
 
@@ -561,11 +858,17 @@ class ApprovalRequestStoreMixin:
         if self.engine is None:
             raise ApprovalStoreUnavailable("Approval database unavailable")
         with Session(self.engine) as session:
-            allowed_prior = ["pending", "failed"] if state == "failed" else ["dispatching"]
-            session.exec(update(ToolApprovalRequest).where(
-                ToolApprovalRequest.id == request_id,
-                ToolApprovalRequest.grant_state.in_(allowed_prior),
-            ).values(grant_state=state, grant_error=error))
+            allowed_prior = (
+                ["pending", "failed"] if state == "failed" else ["dispatching"]
+            )
+            session.exec(
+                update(ToolApprovalRequest)
+                .where(
+                    ToolApprovalRequest.id == request_id,
+                    ToolApprovalRequest.grant_state.in_(allowed_prior),
+                )
+                .values(grant_state=state, grant_error=error)
+            )
             session.commit()
 
     def claim_client_grant(self, request_id):
@@ -573,10 +876,14 @@ class ApprovalRequestStoreMixin:
         if self.engine is None:
             raise ApprovalStoreUnavailable("Approval database unavailable")
         with Session(self.engine) as session:
-            result = session.exec(update(ToolApprovalRequest).where(
-                ToolApprovalRequest.id == request_id,
-                ToolApprovalRequest.grant_state.in_(["pending", "failed"]),
-            ).values(grant_state="dispatching", grant_error=None))
+            result = session.exec(
+                update(ToolApprovalRequest)
+                .where(
+                    ToolApprovalRequest.id == request_id,
+                    ToolApprovalRequest.grant_state.in_(["pending", "failed"]),
+                )
+                .values(grant_state="dispatching", grant_error=None)
+            )
             session.commit()
             return int(result.rowcount or 0) == 1
 
@@ -584,22 +891,34 @@ class ApprovalRequestStoreMixin:
         if self.engine is None:
             raise ApprovalStoreUnavailable("Approval database unavailable")
         with Session(self.engine) as session:
-            return list(session.exec(select(ToolApprovalRequest).where(
-                ToolApprovalRequest.request_kind == KIND_HARNESS,
-                ToolApprovalRequest.continuation_owner == "server",
-                ToolApprovalRequest.continuation_state == CONT_NOT_NEEDED,
-                ToolApprovalRequest.status.in_([REQ_APPROVED, REQ_DENIED, REQ_RESPONDED]),
-            ).limit(limit)).all())
+            return list(
+                session.exec(
+                    select(ToolApprovalRequest)
+                    .where(
+                        ToolApprovalRequest.request_kind == KIND_HARNESS,
+                        ToolApprovalRequest.continuation_owner == "server",
+                        ToolApprovalRequest.continuation_state == CONT_NOT_NEEDED,
+                        ToolApprovalRequest.status.in_(
+                            [REQ_APPROVED, REQ_DENIED, REQ_RESPONDED]
+                        ),
+                    )
+                    .limit(limit)
+                ).all()
+            )
 
     def renew_mcp_execution_claim(self, request_id, claim_token):
         if self.engine is None:
             raise ApprovalStoreUnavailable("Approval database unavailable")
         with Session(self.engine) as session:
-            result = session.exec(update(ToolApprovalRequest).where(
-                ToolApprovalRequest.id == request_id,
-                ToolApprovalRequest.execution_state == EXEC_RUNNING,
-                ToolApprovalRequest.execution_claim_token == claim_token,
-            ).values(execution_started_at=_utcnow()))
+            result = session.exec(
+                update(ToolApprovalRequest)
+                .where(
+                    ToolApprovalRequest.id == request_id,
+                    ToolApprovalRequest.execution_state == EXEC_RUNNING,
+                    ToolApprovalRequest.execution_claim_token == claim_token,
+                )
+                .values(execution_started_at=_utcnow())
+            )
             session.commit()
             return int(result.rowcount or 0) == 1
 
@@ -607,10 +926,16 @@ class ApprovalRequestStoreMixin:
         if self.engine is None:
             raise ApprovalStoreUnavailable("Approval database unavailable")
         with Session(self.engine) as session:
-            return list(session.exec(select(ToolApprovalRequest).where(
-                ToolApprovalRequest.request_kind == KIND_MCP,
-                ToolApprovalRequest.result_json.is_not(None),
-                ToolApprovalRequest.continuation_capable == True,  # noqa: E712
-                ToolApprovalRequest.continuation_state == CONT_NOT_NEEDED,
-                ToolApprovalRequest.status != REQ_CANCELLED,
-            ).limit(limit)).all())
+            return list(
+                session.exec(
+                    select(ToolApprovalRequest)
+                    .where(
+                        ToolApprovalRequest.request_kind == KIND_MCP,
+                        ToolApprovalRequest.result_json.is_not(None),
+                        ToolApprovalRequest.continuation_capable == True,  # noqa: E712
+                        ToolApprovalRequest.continuation_state == CONT_NOT_NEEDED,
+                        ToolApprovalRequest.status != REQ_CANCELLED,
+                    )
+                    .limit(limit)
+                ).all()
+            )

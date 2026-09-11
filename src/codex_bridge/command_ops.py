@@ -5,6 +5,7 @@ import base64
 import binascii
 import json
 import logging
+import os
 import shutil
 import tempfile
 import time
@@ -18,6 +19,8 @@ from agent_bridge.publisher import COMMANDS_STREAM, RedisPublisher
 from agent_bridge.session_queue import SessionQueue
 
 from .transport import CodexTransport, validate_auth_json
+from .mcp_context import codex_mcp_environment
+from .local_plugins import CodexMcpContextConfigError
 from ._bridge_helpers import (
     CONSUMER_GROUP,
     CONSUMER_NAME,
@@ -131,6 +134,7 @@ class CodexCommandMixin:
         message = fields.get("message", "")
         system_prompt = fields.get("system_prompt") or None
         model = fields.get("model") or self._default_model
+        task_turn_capability = (fields.get("task_turn_capability") or "").strip()
         # Frontend-supplied user-message UUID; stamped on every emitted event
         # so the frontend can bucket tool activity under the originating user
         # message without falling back to turn_id heuristics.
@@ -143,8 +147,10 @@ class CodexCommandMixin:
             except json.JSONDecodeError:
                 pass
 
-        if not request_id or not message:
-            logger.warning("Invalid send command: missing request_id or message")
+        if not request_id or not message or (task_turn_capability and not session_key):
+            logger.warning(
+                "Invalid send command: missing request_id/message or contextual session_key"
+            )
             await async_redis.xack(COMMANDS_STREAM, CONSUMER_GROUP, msg_id)
             return
 
@@ -234,14 +240,38 @@ class CodexCommandMixin:
                     try:
                         from agent_bridge.skill_selection import guard_resumed_bundle
                         guard_resumed_bundle(fields.get("skill_bundle"), thread=thread_session_id, resume=resume_id, harness="codex")
-                        codex = self._ensure_codex()
+                        codex_environment: dict[str, str] | None = None
                         if fields.get("skill_bundle") is not None:
                             from agent_bridge.skill_codex import codex_skill_env
-                            from openai_codex_sdk import Codex
-                            codex = Codex({
-                                "codex_path_override": self._transport._codex_bin,
-                                "env": codex_skill_env(fields["skill_bundle"]),
-                            })
+                            from .local_plugins import ensure_bawthub_mcp_config
+                            codex_environment = codex_skill_env(fields["skill_bundle"])
+                            ensure_bawthub_mcp_config(
+                                logger=logger,
+                                codex_home=Path(codex_environment["CODEX_HOME"]),
+                            )
+                        if task_turn_capability:
+                            codex_environment = codex_mcp_environment(
+                                codex_environment or os.environ,
+                                capability=task_turn_capability,
+                                agent_request_id=request_id,
+                                session_key=session_key,
+                                backend=self._backend_name,
+                            )
+                        codex = (
+                            self._transport.codex_for_environment(codex_environment)
+                            if codex_environment is not None
+                            else self._ensure_codex()
+                        )
+                    except CodexMcpContextConfigError as context_error:
+                        seq += 1
+                        self._publish_event(
+                            request_id, session_key, seq,
+                            kind=AgentEventKind.ERROR,
+                            text=f"Codex MCP context setup failed — {context_error}",
+                            model=model,
+                        )
+                        self._publisher.publish_run_done(request_id)
+                        return
                     except RuntimeError as auth_err:
                         # auth.json missing/invalid at startup — surface to user
                         seq += 1

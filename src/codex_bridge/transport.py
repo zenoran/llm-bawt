@@ -121,6 +121,16 @@ class CodexTransport:
         logger.info("Codex SDK ready (codex_bin=%s)", self._codex_bin or "<bundled>")
         return self._codex
 
+    def codex_for_environment(self, environment: dict[str, str]) -> "Codex":
+        """Build a request-scoped SDK handle without mutating shared state."""
+        validate_auth_json()
+        from openai_codex_sdk import Codex
+
+        opts: dict = {"env": dict(environment)}
+        if self._codex_bin:
+            opts["codex_path_override"] = self._codex_bin
+        return Codex(opts)
+
     def reset(self) -> None:
         """Drop the cached ``Codex`` so the next ensure rebuilds.
 
