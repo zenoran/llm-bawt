@@ -145,8 +145,14 @@ class ProviderAdapter(ABC):
         return responses_body
 
     async def open_stream(self, *, client, body, headers, bearer, base_url, context):
-        """Transport seam; retry policy and translation remain shared."""
-        return await client.responses.create(**body)
+        """Ordinary HTTP, supervised independently of the selected model."""
+        from ..responses_supervisor import ResponsesSSEStream
+
+        stream = ResponsesSSEStream(
+            lambda: client.responses.create(**body), context=context,
+        )
+        await stream.prepare()
+        return stream
 
     def retry_policy(self, upstream_model: str) -> retry_mod.RetryPolicy:
         """Return the per-call retry budget; provider adapters may narrow it."""
@@ -187,6 +193,7 @@ class ProviderAdapter(ABC):
             api_key=bearer,
             base_url=base_url,
             set_default_headers=headers,
+            max_retries=0,
         )
         if context is not None:
             context.local_setup_ms = (
@@ -302,6 +309,7 @@ class ProviderAdapter(ABC):
                         client = self._responses_client.with_options(
                             api_key=bearer, base_url=base_url,
                             set_default_headers=headers,
+                            max_retries=0,
                         )
                     await asyncio.sleep(decision.backoff_s)
                     continue
@@ -364,6 +372,12 @@ class ProviderAdapter(ABC):
                 retry_after_s=retry_after,
                 permanent_error_type=permanent_type,
             )
+            # Bound supervised stalls to one safe reconnect across all models.
+            if getattr(stream_exc, "proxy_retry_owner", False) and attempt >= 2:
+                decision = retry_mod.RetryDecision(
+                    retry=False, reason="progress-stall retry budget exhausted",
+                    final_error_type="api_error",
+                )
             logger.warning(
                 "proxy_retry attempt=%d/%d bucket=%s phase=%s decision=%s "
                 "reason=%r backoff_ms=%.0f detail=%r",

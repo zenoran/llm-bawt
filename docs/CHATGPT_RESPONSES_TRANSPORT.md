@@ -6,6 +6,17 @@ The Claude proxy's `openai_chatgpt/gpt-6-astra` route uses a dedicated
 WebSocket Responses client with Responses Lite payloads. Other ChatGPT models,
 OpenAI API-key routes, and other providers retain their current transports.
 
+TASK-884: transport choice no longer controls liveness protection. Ordinary
+Responses HTTP streams (including Sol and API-key Responses adapters using the
+shared base) use the same first-event, productive-idle, and absolute deadlines
+below. The first-event budget includes waiting for HTTP headers. They keep their
+existing non-Lite payloads and reconnect once over a fresh ordinary SSE stream
+only before output commitment. Underlying SDK automatic retries are disabled so
+the proxy owns the budget; HTTP/auth errors retain their existing classification
+and broker-refresh path. No new WebSocket routing or provider configuration is
+introduced. Passthrough adapters with their own `call()` remain unchanged.
+Cancellation telemetry records status 499 rather than falsely reporting 200.
+
 Protocol reference: public `openai/codex`, tag `rust-v0.153.4`:
 `codex-rs/core/src/client.rs`, `codex-api/src/common.rs`,
 `codex-api/src/endpoint/responses_websocket.rs`, and

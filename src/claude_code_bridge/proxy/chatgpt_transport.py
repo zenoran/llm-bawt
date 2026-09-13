@@ -309,9 +309,13 @@ class ChatGPTStream:
             return cls._item_type(event) in TOOL_ITEM_TYPES
         return False
 
+    @property
+    def fallback_transport(self) -> str | None:
+        return "sse" if self.transport == "websocket" else None
+
     def _timeout(self, phase: str, now: float) -> ChatGPTEventTimeout:
-        fallback = "sse" if self.http is None else None
-        if fallback:
+        fallback = self.fallback_transport
+        if self.transport == "websocket":
             # Preserve sticky turn state, but force the safe outer retry onto a
             # fresh HTTPS stream. The unfinished WebSocket is closed on release.
             self.session.http_only = True

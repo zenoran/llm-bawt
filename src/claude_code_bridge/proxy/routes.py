@@ -8,6 +8,7 @@ in the workflows we care about, so they're not implemented yet.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
@@ -116,6 +117,11 @@ async def _proxy_iter(
             adapter.call(body, upstream_model, context), interval=_PING_INTERVAL
         ):
             yield chunk
+    except (asyncio.CancelledError, GeneratorExit):
+        # Cancellation is not a successful model response. No error frame can
+        # be sent to a departed consumer, but telemetry must retain the outcome.
+        status_code = 499
+        raise
     except RuntimeError as e:
         # Adapter failures (auth errors, upstream HTTP errors, etc.)
         # surface as RuntimeError. Classify them so the SDK handles
