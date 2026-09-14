@@ -275,6 +275,12 @@ def serialize_changed_file(row: TurnChangedFile) -> dict[str, Any]:
         # None = unknown (legacy/fallback rows) — the UI treats only an explicit
         # False as "scratch file, not committable".
         "in_repo": row.in_repo,
+        "created_at": (row.created_at.isoformat() if isinstance(row.created_at, datetime)
+                       else str(row.created_at)),
+        "before_sha256": row.before_sha256,
+        "after_sha256": row.after_sha256,
+        "commit_requested": row.commit_requested_at is not None,
+        "commit_state": "not_applicable" if row.in_repo is False else "unknown",
     }
 
 
@@ -607,10 +613,14 @@ class ChangedFilesStore:
             return {}
         # One trigger message maps to one turn, so use that turn's real id for
         # the summary; per-file entries carry it too.
-        return {
+        from .changed_file_commits import reconcile_files
+
+        summaries = {
             mid: build_turn_summary(rws[0].turn_id, rws)
             for mid, rws in out.items()
         }
+        reconcile_files([file for summary in summaries.values() for file in summary["files"]])
+        return summaries
 
     def summary_for_turn(self, turn_id: str) -> dict[str, Any]:
         return self.summaries_for_turns([turn_id]).get(
@@ -690,7 +700,6 @@ class ChangedFilesStore:
             "  ON message.bot_id = changed.bot_id "
             " AND message.id = changed.trigger_message_id "
             "WHERE changed.bot_id = :bot_id AND changed.user_id = :user_id "
-            "  AND changed.commit_requested_at IS NULL "
             "  AND message.session_id = :session_id "
             "ORDER BY changed.created_at, changed.id"
         )
@@ -702,12 +711,41 @@ class ChangedFilesStore:
             })
             rows = [TurnChangedFile(**dict(row)) for row in result.mappings()]
         current_turn_id = anchor_turn_id or (rows[-1].turn_id if rows else None)
+        from .changed_file_commits import pending_summary, reconcile_files
+
+        history = [serialize_changed_file(row) for row in rows]
+        reconcile_files(history)
+        evidence = {(f["turn_id"], f["repo_key"], f["path"]): f for f in history}
+
+        def aggregate(selected: list[TurnChangedFile]) -> dict[str, Any]:
+            summary = build_uncommitted_summary(selected)
+            for file in summary["files"]:
+                proof = evidence[(file["turn_id"], file["repo_key"], file["path"])]
+                for key in ("commit_state", "commit_reason", "commit_evidence", "commit_requested"):
+                    if key in proof:
+                        file[key] = proof[key]
+            # Capture paths may use ~/dev or the absolute mount spelling. Git's
+            # tracked repo ID + exact relative path is the canonical identity.
+            canonical: dict[tuple[str, str], dict[str, Any]] = {}
+            for file in summary["files"]:
+                proof = file.get("commit_evidence") or {}
+                key = (proof.get("repo_id") or file["repo_key"],
+                       proof.get("repo_path") or file["path"])
+                previous = canonical.get(key)
+                if previous is None or file["created_at"] >= previous["created_at"]:
+                    canonical[key] = file
+            summary["files"] = list(canonical.values())
+            return pending_summary(summary)
+
+        # History remains browsable, including covered snapshots from older turns.
+        # Latest snapshot decides actionable scope; an older unverified version
+        # must not resurrect a file after its newer snapshot was committed.
+        summary = aggregate(rows)
+        summary["history_files"] = history
         other_rows = [row for row in rows if row.turn_id != current_turn_id]
-        return (
-            resolved,
-            build_uncommitted_summary(rows),
-            build_uncommitted_summary(other_rows),
-        )
+        other = aggregate(other_rows)
+        other["history_files"] = [f for f in history if f["turn_id"] != current_turn_id]
+        return resolved, summary, other
 
     def uncommitted_summary_for_session(
         self,

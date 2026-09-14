@@ -57,6 +57,8 @@ def store(tmp_path, monkeypatch):
                 PRIMARY KEY (bot_id, id)
             )
         """))
+    from llm_bawt.service import changed_file_commits
+    monkeypatch.setattr(changed_file_commits, "reconcile_files", lambda files: None)
     s = ChangedFilesStore(engine)
     yield s
     reset_diff_blob_backend()
@@ -375,8 +377,9 @@ def test_commit_requested_advances_only_selected_turns_in_active_session(store):
 
     assert resolved == "session-active"
     assert marked == 1
-    assert remaining["turn_ids"] == ["turn-2"]
-    assert [file["path"] for file in remaining["files"]] == ["two.py"]
+    # A request is not a successful commit; failed/requested scope stays visible.
+    assert remaining["turn_ids"] == ["turn-1", "turn-2"]
+    assert [file["path"] for file in remaining["files"]] == ["one.py", "two.py"]
     assert committed["commit_requested"] is True
 
 
@@ -413,6 +416,58 @@ def test_commit_requested_rejects_turn_from_other_session(store):
 
     assert marked == 0
     assert "commit_requested" not in store.summary_for_turn("turn-b")
+
+
+def test_commit_evidence_reconciles_two_repositories_across_turns(store, monkeypatch):
+    from llm_bawt.service import changed_file_commits
+
+    _conversation(store, session_id="incident")
+    for turn, repo, count in (("older-ui", "bawthub", 5), ("current-backend", "llm-bawt", 6)):
+        _trigger(store, message_id=turn, session_id="incident")
+        store.save_turn_files(
+            turn_id=turn, bot_id="b", user_id="u", trigger_message_id=turn,
+            files=[ChangedFileInput(repo_key="workspace", repo_label=repo,
+                   path=f"~/dev/{repo}/{index}.py", before=b"old", after=b"new")
+                   for index in range(count)],
+        )
+
+    def proof(files):
+        for file in files:
+            file["commit_state"] = "committed"
+            file["commit_evidence"] = {"commit_hash": "4ded2da" if file["repo_label"] == "bawthub" else "e507a58"}
+
+    monkeypatch.setattr(changed_file_commits, "reconcile_files", proof)
+    _, scope, other = store.uncommitted_summaries_for_session(
+        session_id="incident", anchor_turn_id="current-backend", bot_id="b", user_id="u",
+    )
+    assert scope["total_files"] == other["total_files"] == 0
+    assert len(scope["history_files"]) == 11
+    assert len(other["history_files"]) == 5
+    assert {f["commit_evidence"]["commit_hash"] for f in scope["history_files"]} == {"4ded2da", "e507a58"}
+    before, after = store.get_file_content(turn_id="older-ui", repo_key="workspace", path="~/dev/bawthub/0.py")
+    assert (before.text, after.text) == ("old", "new")
+    history = store.summaries_for_triggers(["older-ui", "current-backend"])
+    assert all(f["commit_state"] == "committed" for s in history.values() for f in s["files"])
+
+
+def test_latest_snapshot_controls_action_scope_not_older_unverified_bytes(store, monkeypatch):
+    from llm_bawt.service import changed_file_commits
+
+    _conversation(store, session_id="s")
+    for turn, after in (("old", "v1"), ("new", "v2")):
+        _trigger(store, message_id=turn, session_id="s")
+        store.save_turn_files(turn_id=turn, bot_id="b", user_id="u", trigger_message_id=turn,
+                              files=[_mod("same.py", "base", after)])
+
+    def proof(files):
+        for file in files:
+            file["commit_state"] = "committed" if file["turn_id"] == "new" else "unknown"
+
+    monkeypatch.setattr(changed_file_commits, "reconcile_files", proof)
+    _, scope = store.uncommitted_summary_for_session(session_id="s", bot_id="b", user_id="u")
+    assert scope["total_files"] == 0
+    assert len(scope["history_files"]) == 2
+    assert scope["history_files"][0]["commit_state"] == "unknown"
 
 
 def test_postgres_fallback_when_no_object_store(store, monkeypatch):
