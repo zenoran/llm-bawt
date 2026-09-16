@@ -31,6 +31,7 @@ class PostgreSQLMessageMixin:
         attachments: list[dict] | None = None,
         reasoning: str | None = None,
         author: AuthorReference | None = None,
+        extract_memory: bool = True,
     ) -> None:
         """Add a message through the extracted permanent-row store."""
         self._message_rows.upsert(
@@ -42,6 +43,7 @@ class PostgreSQLMessageMixin:
             attachments=attachments,
             reasoning=reasoning,
             author=author,
+            extract_memory=extract_memory,
         )
 
     def get_unprocessed_messages(self, limit: int = 100) -> list[dict]:

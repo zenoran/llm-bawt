@@ -34,6 +34,7 @@ class JobType(str, Enum):
     MEMORY_EXTRACTION = "memory_extraction"
     MEDIA_GC = "media_gc"
     TOOL_RESULT_GC = "tool_result_gc"
+    SEND_PROMPT = "send_prompt"
 
 
 class ScheduledJob(SQLModel, table=True):
@@ -70,6 +71,8 @@ def create_scheduler_tables(engine) -> None:
     """Create scheduler tables if they don't exist."""
     SQLModel.metadata.create_all(engine, tables=[ScheduledJob.__table__, JobRun.__table__])
     _migrate_postgres_jobtype_enum(engine)
+    from .prompt_schedule_models import PromptOccurrence, PromptSchedule
+    SQLModel.metadata.create_all(engine, tables=[PromptSchedule.__table__, PromptOccurrence.__table__])
 
 
 def _migrate_postgres_jobtype_enum(engine) -> None:
@@ -115,7 +118,7 @@ class JobScheduler:
         await scheduler.stop()
     """
     
-    def __init__(self, engine, task_processor, check_interval: int = 30):
+    def __init__(self, engine, task_processor, check_interval: int = 30, *, prompt_sweep=None):
         """
         Args:
             engine: SQLAlchemy engine for job tables
@@ -127,6 +130,10 @@ class JobScheduler:
         self.check_interval = check_interval
         self._running = False
         self._task: Optional[asyncio.Task] = None
+        # Wired only once the durable delivery consumer is ready (TASK-168).
+        # Do not consume billable occurrences into an unconsumed outbox on upgrade.
+        self._prompt_sweep = prompt_sweep
+        self._prompt_task: Optional[asyncio.Task] = None
     
     async def start(self) -> None:
         """Start the scheduler loop."""
@@ -135,18 +142,28 @@ class JobScheduler:
         
         self._running = True
         self._task = asyncio.create_task(self._run_loop())
+        if self._prompt_sweep is not None:
+            self._prompt_task = asyncio.create_task(self._run_prompt_loop(), name="prompt-scheduler")
         logger.debug(f"Scheduler started (check interval: {self.check_interval}s)")
     
     async def stop(self) -> None:
         """Stop the scheduler loop gracefully."""
         self._running = False
-        if self._task:
-            self._task.cancel()
-            try:
-                await self._task
-            except asyncio.CancelledError:
-                pass
+        tasks = [task for task in (self._task, self._prompt_task) if task is not None]
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
         logger.debug("Scheduler stopped")
+
+    async def _run_prompt_loop(self) -> None:
+        """Independent cadence: maintenance/model processing cannot delay prompts."""
+        while self._running:
+            try:
+                await self._prompt_sweep()
+            except Exception:
+                logger.exception("Prompt scheduler sweep failed; will retry")
+            await asyncio.sleep(5)
     
     async def _run_loop(self) -> None:
         """Main scheduler loop."""
@@ -167,6 +184,7 @@ class JobScheduler:
                 now = datetime.now(timezone.utc)
                 statement = select(ScheduledJob).where(
                     ScheduledJob.enabled.is_(True),
+                    ScheduledJob.job_type != JobType.SEND_PROMPT,
                     (ScheduledJob.next_run_at.is_(None)) | (ScheduledJob.next_run_at <= now)
                 )
                 return session.exec(statement).all()

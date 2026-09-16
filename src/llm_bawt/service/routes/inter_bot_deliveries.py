@@ -229,7 +229,7 @@ async def create_delivery(body: DeliveryCreate):
 @router.get("/v1/inter-bot-deliveries/{delivery_id}", tags=["Inter-Bot Deliveries"])
 def get_delivery(delivery_id: str):
     record = _dispatcher().store.get(delivery_id)
-    if record is None:
+    if record is None or "prompt_schedule" in (record.metadata or {}):
         raise HTTPException(status_code=404, detail="Delivery not found")
     return record.to_api()
 
@@ -246,6 +246,7 @@ def list_deliveries(
         target_bot_id=target_bot_id,
         status=status,
         limit=limit,
+        exclude_prompt_origin=True,
     )
     return {"deliveries": [row.to_api() for row in rows], "total": len(rows)}
 
@@ -254,7 +255,9 @@ def list_deliveries(
 async def cancel_delivery(delivery_id: str):
     dispatcher = _dispatcher()
     before = dispatcher.store.get(delivery_id)
-    if before is None:
+    # Prompt receipts belong exclusively to the owner-scoped scheduling API.
+    # MCP inter-bot tools call this route too; never pass them to store.cancel.
+    if before is None or "prompt_schedule" in (before.metadata or {}):
         raise HTTPException(status_code=404, detail="Delivery not found")
     record = dispatcher.store.cancel(delivery_id)
     if record is None or record.status != "CANCELLED":

@@ -13,7 +13,6 @@ import hashlib
 import json
 import logging
 import uuid
-from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
@@ -21,7 +20,8 @@ from sqlalchemy import text as sa_text
 from sqlalchemy.engine import Connection
 
 from .agent_context import SessionPolicy
-from .message_authorship import AuthorReference, normalize_author
+from .message_authorship import AuthorReference
+from .inter_bot_delivery_record import DeliveryRecord
 from .utils.config import Config
 from .utils.db import get_shared_engine
 from .utils.schema import SchemaBootstrapGuard
@@ -67,145 +67,6 @@ def submission_result(
     return status_code, result
 
 
-@dataclass(frozen=True)
-class DeliveryRecord:
-    id: str
-    sender_bot_id: str
-    author_entity_type: str
-    author_entity_id: str
-    target_bot_id: str
-    message: str
-    user_message_id: str
-    turn_id: str
-    status: str
-    attempt_count: int
-    max_attempts: int
-    idempotency_key: str | None
-    project_id: str | None
-    task_id: str | None
-    message_kind: str | None
-    metadata: dict[str, Any]
-    created_at: datetime
-    updated_at: datetime
-    available_at: datetime
-    dispatch_started_at: datetime | None
-    delivered_at: datetime | None
-    next_retry_at: datetime | None
-    last_error: str | None
-    response_model: str | None
-    response_chars: int | None
-    claim_token: str | None
-    transport_accepted_at: datetime | None
-    target_turn_id: str | None
-    delivery_mode: str | None
-    session_policy: str
-    reset_status: str | None
-    reset_reason: str | None
-    old_session_id: str | None
-    new_session_id: str | None
-    reset_at: datetime | None
-    overflow_recovery_count: int
-
-    @classmethod
-    def from_mapping(cls, row: Any) -> "DeliveryRecord":
-        metadata = row.get("metadata_json")
-        if isinstance(metadata, str):
-            try:
-                metadata = json.loads(metadata)
-            except Exception:
-                metadata = {}
-        return cls(
-            id=row["id"],
-            sender_bot_id=row["sender_bot_id"],
-            author_entity_type=row.get("author_entity_type") or "bot",
-            author_entity_id=row.get("author_entity_id") or row["sender_bot_id"],
-            target_bot_id=row["target_bot_id"],
-            message=row["message"],
-            user_message_id=row["user_message_id"],
-            turn_id=row["turn_id"],
-            status=row["status"],
-            attempt_count=int(row["attempt_count"] or 0),
-            max_attempts=int(row["max_attempts"] or 0),
-            idempotency_key=row.get("idempotency_key"),
-            project_id=row.get("project_id"),
-            task_id=row.get("task_id"),
-            message_kind=row.get("message_kind"),
-            metadata=metadata if isinstance(metadata, dict) else {},
-            created_at=row["created_at"],
-            updated_at=row["updated_at"],
-            available_at=row["available_at"],
-            dispatch_started_at=row.get("dispatch_started_at"),
-            delivered_at=row.get("delivered_at"),
-            next_retry_at=row.get("next_retry_at"),
-            last_error=row.get("last_error"),
-            response_model=row.get("response_model"),
-            response_chars=row.get("response_chars"),
-            claim_token=row.get("claim_token"),
-            transport_accepted_at=row.get("transport_accepted_at"),
-            target_turn_id=row.get("target_turn_id"),
-            delivery_mode=row.get("delivery_mode"),
-            session_policy=row.get("session_policy") or SessionPolicy.CONTINUE.value,
-            reset_status=row.get("reset_status"),
-            reset_reason=row.get("reset_reason"),
-            old_session_id=row.get("old_session_id"),
-            new_session_id=row.get("new_session_id"),
-            reset_at=row.get("reset_at"),
-            overflow_recovery_count=int(row.get("overflow_recovery_count") or 0),
-        )
-
-    @property
-    def author(self) -> AuthorReference:
-        author = normalize_author(self.author_entity_type, self.author_entity_id)
-        if author is None:  # Database constraints keep this unreachable.
-            raise ValueError("delivery author is required")
-        return author
-
-    def to_api(self, *, duplicate: bool = False) -> dict[str, Any]:
-        def iso(value: datetime | None) -> str | None:
-            return value.isoformat() if value else None
-
-        return {
-            "delivery_id": self.id,
-            "status": self.status,
-            "sender_bot_id": self.sender_bot_id,
-            "author": self.author.to_dict(),
-            "target_bot_id": self.target_bot_id,
-            "user_message_id": self.user_message_id,
-            "turn_id": self.turn_id,
-            "target_turn_id": self.target_turn_id,
-            "delivery_mode": self.delivery_mode,
-            "session_policy": self.session_policy,
-            "reset_status": self.reset_status,
-            "reset_reason": self.reset_reason,
-            "old_session_id": self.old_session_id,
-            "new_session_id": self.new_session_id,
-            "reset_at": iso(self.reset_at),
-            "retained_history": (
-                True
-                if self.session_policy == SessionPolicy.RESET_RETAIN_HISTORY.value
-                else False
-                if self.session_policy == SessionPolicy.RESET_WITHOUT_HISTORY.value
-                else None
-            ),
-            "overflow_recovery_count": self.overflow_recovery_count,
-            "attempt_count": self.attempt_count,
-            "max_attempts": self.max_attempts,
-            "idempotency_key": self.idempotency_key,
-            "project_id": self.project_id,
-            "task_id": self.task_id,
-            "message_kind": self.message_kind,
-            "metadata": self.metadata,
-            "created_at": iso(self.created_at),
-            "updated_at": iso(self.updated_at),
-            "available_at": iso(self.available_at),
-            "dispatch_started_at": iso(self.dispatch_started_at),
-            "delivered_at": iso(self.delivered_at),
-            "next_retry_at": iso(self.next_retry_at),
-            "last_error": self.last_error,
-            "response_model": self.response_model,
-            "response_chars": self.response_chars,
-            "duplicate": duplicate,
-        }
 
 
 class InterBotDeliveryStore:
@@ -556,10 +417,18 @@ class InterBotDeliveryStore:
         target_bot_id: str | None = None,
         status: str | None = None,
         limit: int = 50,
+        exclude_prompt_origin: bool = False,
     ) -> list[DeliveryRecord]:
         if self.engine is None:
             return []
         where = ["1=1"]
+        # Filter before LIMIT so private receipts neither leak nor crowd out
+        # ordinary deliveries. Internal scheduling/transport reads stay intact.
+        if exclude_prompt_origin:
+            if self.engine.dialect.name == "postgresql":
+                where.append("NOT (COALESCE(metadata_json, '{}'::jsonb) ? 'prompt_schedule')")
+            else:
+                where.append("json_type(metadata_json, '$.prompt_schedule') IS NULL")
         params: dict[str, Any] = {"limit": max(1, min(int(limit), 200))}
         if sender_bot_id:
             where.append("sender_bot_id=:sender")
@@ -633,12 +502,8 @@ class InterBotDeliveryStore:
                 sa_text("SELECT pg_advisory_xact_lock(hashtext(:target))"),
                 {"target": target},
             )
-            head = conn.execute(sa_text("""
-                SELECT * FROM inter_bot_deliveries
-                WHERE target_bot_id=:target
-                  AND status IN ('QUEUED','STEERING','DISPATCHING')
-                ORDER BY ordinal ASC LIMIT 1 FOR UPDATE
-            """), {"target": target}).mappings().first()
+            from .inter_bot_preclaim import load_claim_head
+            head = load_claim_head(conn, target, self.config)
             if (
                 not head
                 or head["status"] != QUEUED
@@ -857,6 +722,10 @@ class InterBotDeliveryStore:
             """), {"id": delivery_id, "claim": claim_token}).mappings().first()
             if not head:
                 return None
+            # Generic overflow recovery rotates the active personal thread and
+            # changes the logical RPC. Automation must never take that path.
+            if (head.get("metadata_json") or {}).get("prompt_schedule"):
+                return None
             payload = head["payload_json"] if isinstance(head["payload_json"], dict) else {}
             user_id = str(payload.get("user") or getattr(self.config, "DEFAULT_USER", "nick"))
             row = recover_delivery_after_overflow(
@@ -939,6 +808,9 @@ class InterBotDeliveryStore:
                 SELECT * FROM inter_bot_deliveries WHERE id=:id FOR UPDATE
             """), {"id": delivery_id}).mappings().first()
             if not current or current["status"] != QUEUED:
+                return None
+            if ((current.get("metadata_json") or {}).get("prompt_schedule")
+                    and current.get("transport_accepted_at") is not None):
                 return None
             row = conn.execute(sa_text("""
                 UPDATE inter_bot_deliveries SET status='CANCELLED',

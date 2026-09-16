@@ -9,6 +9,7 @@ from unittest.mock import AsyncMock, Mock
 
 import pytest
 
+from llm_bawt.message_authorship import AuthorReference
 from llm_bawt.service.background_service import BackgroundService
 from llm_bawt.service.chat_stream_worker import consume_stream_chunks
 from llm_bawt.service.schemas import ChatCompletionRequest, ChatMessage
@@ -44,7 +45,10 @@ def test_inter_bot_nonstream_turn_publishes_visible_lifecycle(
     service._inter_bot_dispatcher = SimpleNamespace(
         store=SimpleNamespace(
             validate_claim=Mock(return_value=True),
-            get=Mock(return_value=SimpleNamespace(sender_bot_id="snark")),
+            get=Mock(return_value=SimpleNamespace(
+                sender_bot_id="snark",
+                author=AuthorReference.bot("snark"),
+            )),
         )
     )
     subscriber = SimpleNamespace(publish_tool_event=AsyncMock())
@@ -191,7 +195,10 @@ def test_inter_bot_nonstream_turn_start_prefers_request_session_over_archived_se
     service._inter_bot_dispatcher = SimpleNamespace(
         store=SimpleNamespace(
             validate_claim=Mock(return_value=True),
-            get=Mock(return_value=SimpleNamespace(sender_bot_id="snark")),
+            get=Mock(return_value=SimpleNamespace(
+                sender_bot_id="snark",
+                author=AuthorReference.bot("snark"),
+            )),
         )
     )
     subscriber = SimpleNamespace(publish_tool_event=AsyncMock())

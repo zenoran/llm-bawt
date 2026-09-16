@@ -256,6 +256,12 @@ class BackgroundTasksMixin:
                 continue
 
             try:
+                from ..memory.postgresql import PostgreSQLMemoryBackend
+                from ..memory.summary_extraction_policy import summary_allows_extraction
+
+                backend = PostgreSQLMemoryBackend(self.config, bot_id=bot_id)
+                if not summary_allows_extraction(backend, summary_id):
+                    continue
                 facts = extraction_service.extract_from_summary(
                     summary_text=summary_text,
                     session_start=session_start,

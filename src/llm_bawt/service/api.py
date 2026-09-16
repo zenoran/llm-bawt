@@ -102,13 +102,15 @@ async def lifespan(app):
         create_scheduler_tables(pm.engine)
         init_default_jobs(pm.engine, config)
 
+        from .prompt_delivery import PromptDeliveryWorker
+        prompt_worker = PromptDeliveryWorker(pm.engine, service)
         scheduler = JobScheduler(
             engine=pm.engine,
             task_processor=service,
             check_interval=config.SCHEDULER_CHECK_INTERVAL_SECONDS,
+            prompt_sweep=prompt_worker.sweep,
         )
-        await scheduler.start()
-        log.info(f"📅 Scheduler started (interval={config.SCHEDULER_CHECK_INTERVAL_SECONDS}s)")
+        # Start below, after the shared transport and durable dispatcher exist.
 
     # Start the shared Redis agent transport for every bridge harness. OpenClaw,
     # Claude Code, and Codex all depend on this subscriber; OpenClaw-specific
@@ -282,6 +284,10 @@ async def lifespan(app):
     from .inter_bot_dispatcher import InterBotDeliveryDispatcher
     service._inter_bot_dispatcher = InterBotDeliveryDispatcher(service)
     service._inter_bot_dispatcher.start()
+    if scheduler is not None:
+        await scheduler.start()
+        log.info("Scheduler started (maintenance interval=%ss; prompt sweep=5s)",
+                 config.SCHEDULER_CHECK_INTERVAL_SECONDS)
 
     # TASK-861: recover stranded approved MCP claims (uncertain generic calls
     # are not replayed), repair old result/outbox gaps, and deliver MCP results
@@ -326,6 +332,9 @@ async def lifespan(app):
         #         await history_drain_task
         #     except (asyncio.CancelledError, Exception):
         #         pass
+        # Stop the producer before its consumer/Redis transport.
+        if scheduler:
+            await scheduler.stop()
         # Stop durable claims first while Redis is still available. Cancellation
         # leaves the claim leased; the next singleton dispatcher recovers it
         # after the short lease rather than counting orderly shutdown as failure.
@@ -351,8 +360,6 @@ async def lifespan(app):
             from ..agent_backends.agent_bridge import set_agent_subscriber
             set_agent_subscriber(None)
             await redis_subscriber.close()
-        if scheduler:
-            await scheduler.stop()
         await service.shutdown()
         set_service(None)
 

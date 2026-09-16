@@ -22,7 +22,8 @@ from pydantic import BaseModel, Field
 from ...mcp_server.storage import get_storage
 from ..dependencies import get_effective_bot_id, get_service
 from ..logging import get_service_logger
-from ..schemas_history_memory import MessageAuthor
+from ..schemas_history_memory import MessageAuthor, ScheduledMessageOrigin
+from .history_scheduler import hydrate_scheduler_for_page
 
 router = APIRouter()
 log = get_service_logger(__name__)
@@ -63,6 +64,7 @@ class SessionMessage(BaseModel):
     timestamp: float | None = None
     session_id: str | None = None
     author: MessageAuthor
+    scheduler: ScheduledMessageOrigin | None = None
 
 
 class SessionTranscriptResponse(BaseModel):
@@ -357,6 +359,7 @@ async def get_session_messages(
     rows = await get_storage().get_messages(
         bot_id=effective_bot, session_id=session_id, limit=limit
     )
+    scheduler_by_id = hydrate_scheduler_for_page(get_service(), effective_bot, rows, user_id)
     return SessionTranscriptResponse(
         session_id=session_id,
         bot_id=effective_bot,
@@ -367,6 +370,7 @@ async def get_session_messages(
                 content=r.get("content", ""),
                 timestamp=r.get("timestamp"),
                 session_id=r.get("session_id"),
+                scheduler=scheduler_by_id.get(str(r.get("id"))) if r.get("role") == "user" else None,
                 author=(
                     r.get("author")
                     or {"entity_type": None, "entity_id": None, "status": "unknown"}

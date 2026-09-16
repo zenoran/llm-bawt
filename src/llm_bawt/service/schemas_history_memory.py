@@ -23,6 +23,14 @@ class MessageAuthor(BaseModel):
     avatar_render: str | None = None
 
 
+class ScheduledMessageOrigin(BaseModel):
+    """Trusted display-only provenance from a durable prompt occurrence."""
+
+    schedule_id: str
+    occurrence_id: str
+    scheduled_for: str
+
+
 class HistoryMessage(BaseModel):
     """A message in the conversation history.
 
@@ -49,6 +57,7 @@ class HistoryMessage(BaseModel):
     interrupt_source_message_id: str | None = None
     interrupt_content_offset: int | None = None
     author: MessageAuthor
+    scheduler: ScheduledMessageOrigin | None = None
 
 class HistoryResponse(BaseModel):
     """Response for conversation history.

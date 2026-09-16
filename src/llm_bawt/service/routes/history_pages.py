@@ -5,6 +5,7 @@ from fastapi import APIRouter, HTTPException, Query
 from ..dependencies import get_media_asset_store, get_service
 from ..logging import get_service_logger
 from ..schemas import HistoryClearResponse, HistoryMessage, HistoryResponse
+from .history_scheduler import hydrate_scheduler_for_page
 
 read_router = APIRouter()
 mutation_router = APIRouter()
@@ -419,6 +420,7 @@ def _build_history_response(
     has_older: bool | None = None,
     has_newer: bool | None = None,
     anchor_id: str | None = None,
+    origin_user_id: str | None = None,
 ) -> HistoryResponse:
     """Hydrate attachments and assemble a HistoryResponse for a slice.
 
@@ -439,6 +441,9 @@ def _build_history_response(
     interrupt_anchors_by_id = _hydrate_interrupt_anchors_for_page(
         service, effective_bot_id, page_messages
     )
+    scheduler_by_id = hydrate_scheduler_for_page(
+        service, effective_bot_id, page_messages, origin_user_id
+    )
     history_messages = []
     for msg in page_messages:
         message_id = str(msg.get("id") or "")
@@ -454,6 +459,7 @@ def _build_history_response(
             interrupt_source_message_id=(interrupt_anchor[0] if interrupt_anchor else None),
             interrupt_content_offset=(interrupt_anchor[1] if interrupt_anchor else None),
             author=_message_author_payload(msg),
+            scheduler=scheduler_by_id.get(message_id) if msg.get("role") == "user" else None,
         ))
 
     oldest_timestamp = history_messages[0].timestamp if history_messages else None
@@ -485,6 +491,7 @@ def _build_history_response(
 def get_history(
     bot_id: str = Query(None, description="Bot ID (uses default if not specified)"),
     limit: int = Query(50, description="Maximum number of messages to return"),
+    user_id: str | None = Query(None, description="Owner scope for scheduling origin enrichment only"),
     before: str | None = Query(
         None,
         description="Cursor for older history pages (ISO timestamp, unix timestamp, or message ID)",
@@ -575,6 +582,7 @@ def get_history(
             candidate_count=None,
             has_older=has_older,
             has_newer=has_newer,
+            origin_user_id=user_id,
         )
     except HTTPException:
         raise
@@ -589,6 +597,7 @@ def get_history_around(
     message_id: str = Query(..., description="Anchor message ID — window is centered on this row"),
     before: int = Query(30, ge=0, le=200, description="Number of older messages to include"),
     after: int = Query(10, ge=0, le=200, description="Number of newer messages to include"),
+    user_id: str | None = Query(None, description="Owner scope for scheduling origin enrichment only"),
 ):
     """Return a window of messages around an anchor.
 
@@ -628,6 +637,7 @@ def get_history_around(
             has_older=start > 0,
             has_newer=end < len(visible_messages),
             anchor_id=message_id,
+            origin_user_id=user_id,
         )
     except HTTPException:
         raise

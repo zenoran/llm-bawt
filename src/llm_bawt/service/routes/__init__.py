@@ -6,6 +6,7 @@ from .config import router as config_router
 from .health import router as health_router
 from .history import router as history_router
 from .jobs import router as jobs_router
+from .prompt_schedules import router as prompt_schedules_router
 from .llm import router as llm_router
 from .memory import router as memory_router
 from .models import router as models_router
@@ -49,6 +50,7 @@ all_routers = [
     agent_context_router,
     usage_router,
     jobs_router,
+    prompt_schedules_router,
     history_router,
     memory_router,
     prompts_router,

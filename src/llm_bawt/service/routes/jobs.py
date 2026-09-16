@@ -35,7 +35,7 @@ def trigger_job(job_type: str):
 
     engine = _get_scheduler_engine()
 
-    valid_types = {jt.value for jt in JobType}
+    valid_types = {jt.value for jt in JobType if jt != JobType.SEND_PROMPT}
     normalized_job_type = job_type.strip().lower()
     if normalized_job_type not in valid_types:
         raise HTTPException(status_code=400, detail=f"Invalid job_type '{job_type}'")
@@ -72,14 +72,15 @@ def list_scheduled_jobs(
     """List scheduler jobs with latest run status."""
     engine = _get_scheduler_engine()
 
-    valid_job_types = {jt.value for jt in JobType}
+    valid_job_types = {jt.value for jt in JobType if jt != JobType.SEND_PROMPT}
     normalized_job_type = job_type.strip().lower() if job_type else None
     if normalized_job_type and normalized_job_type not in valid_job_types:
         raise HTTPException(status_code=400, detail=f"Invalid job_type '{job_type}'")
 
     normalized_bot_id = bot_id.strip().lower() if bot_id else None
 
-    conditions: list = []
+    # Prompt schedules require the owner-scoped API, not maintenance routes.
+    conditions: list = [ScheduledJob.job_type != JobType.SEND_PROMPT]
     if normalized_job_type:
         conditions.append(ScheduledJob.job_type == normalized_job_type)
     if normalized_bot_id:
@@ -152,7 +153,7 @@ def list_job_runs(
     """List scheduler run history."""
     engine = _get_scheduler_engine()
 
-    valid_job_types = {jt.value for jt in JobType}
+    valid_job_types = {jt.value for jt in JobType if jt != JobType.SEND_PROMPT}
     valid_statuses = {js.value for js in JobStatus}
 
     normalized_job_type = job_type.strip().lower() if job_type else None
@@ -169,7 +170,7 @@ def list_job_runs(
     with Session(engine) as session:
         # Build job-type lookup map (and optional job type filter set).
         job_lookup: dict[str, str] = {}
-        for row in session.exec(select(ScheduledJob)).all():
+        for row in session.exec(select(ScheduledJob).where(ScheduledJob.job_type != JobType.SEND_PROMPT)).all():
             jtype = row.job_type.value if hasattr(row.job_type, "value") else str(row.job_type)
             job_lookup[row.id] = jtype
 
@@ -187,7 +188,9 @@ def list_job_runs(
                     "offset": offset,
                 })
 
-        conditions: list = []
+        conditions: list = [JobRun.job_id.in_(
+            select(ScheduledJob.id).where(ScheduledJob.job_type != JobType.SEND_PROMPT)
+        )]
         if normalized_job_id:
             conditions.append(JobRun.job_id == normalized_job_id)
         if normalized_bot_id:

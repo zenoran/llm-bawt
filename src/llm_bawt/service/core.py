@@ -13,7 +13,7 @@ from rich.console import Console
 from ..clients import LLMClient, GrokClient
 from ..clients.openai_client import OpenAIClient
 from ..core.base import BaseLLMBawt
-from ..utils.config import Config, is_llama_cpp_available, has_database_credentials
+from ..utils.config import Config, has_database_credentials
 from ..utils.history import Message
 from ..tools import query_with_tools
 from .logging import get_service_logger
@@ -102,8 +102,8 @@ class ServiceLLMBawt(BaseLLMBawt):
             # any legacy ``agent_backend_config.model`` (which is migrated to
             # ``session_model`` and no longer user-facing).
             from ..bot_types import agent_backend_for_model_def
-            from ..model_catalog import bot_model_ref, resolve_model_config
-            default_alias = bot_model_ref(self.config, self.bot)
+            from ..model_catalog import resolve_model_config
+            default_alias = self._agent_model_ref()
             if default_alias:
                 model_def = resolve_model_config(
                     self.config,
@@ -154,7 +154,7 @@ class ServiceLLMBawt(BaseLLMBawt):
                 # is pinned (e.g. direct-Anthropic bots).
                 try:
                     window = None
-                    ep_id = getattr(self.bot, "endpoint_id", None)
+                    ep_id = model_def.get("endpoint_id") or getattr(self.bot, "endpoint_id", None)
                     if ep_id is not None:
                         ep_def = self.config.resolve_model(
                             ep_id,
@@ -196,6 +196,14 @@ class ServiceLLMBawt(BaseLLMBawt):
                 if isinstance(local_def, dict):
                     self.client._bot_config["local_model_definition"] = local_def
 
+    def _agent_model_ref(self):
+        from ..model_catalog import bot_model_ref
+        return bot_model_ref(self.config, self.bot)
+
+    def _history_manager_type(self):
+        from ..utils.history import HistoryManager
+        return HistoryManager
+
     def _init_history(self):
         """Ensure history always persists to PostgreSQL, even in local_mode.
 
@@ -222,8 +230,7 @@ class ServiceLLMBawt(BaseLLMBawt):
             except Exception as e:
                 logger.warning("Failed to init history DB backend: %s", e)
 
-        from ..utils.history import HistoryManager
-        self.history_manager = HistoryManager(
+        self.history_manager = self._history_manager_type()(
             client=self.client,
             config=self.config,
             db_backend=db_backend,

@@ -507,11 +507,15 @@ class InterBotDeliveryDispatcher:
             "message_kind": record.message_kind,
             "ts": time.time(),
         }
+        if record.metadata.get("prompt_schedule"):
+            event["user_id"] = record.author_entity_id
+            event["bot_id"] = record.target_bot_id
+            event["prompt_schedule"] = record.metadata["prompt_schedule"]
         subscriber = getattr(self.service, "_redis_subscriber", None)
         if subscriber is not None:
             try:
                 await subscriber.publish_tool_event(
-                    record.sender_bot_id,
+                    event["bot_id"],
                     event["user_id"],
                     event,
                 )

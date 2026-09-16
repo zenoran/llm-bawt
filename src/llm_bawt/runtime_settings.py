@@ -377,6 +377,9 @@ def purge_bot_data(config: Config, slug: str) -> dict[str, Any]:
 
     try:
         with engine.connect() as conn:
+            from .prompt_purge import PromptPurgeGuard
+            prompt_purge = PromptPurgeGuard(conn)
+            prompt_purge.guard({normalized})
             # 1. Delete per-bot rows from the LIST-partitioned parents (TASK-571).
             #    The old ``<bot>_messages`` shard tables no longer exist — dropping
             #    them was a silent no-op that left every message/memory/forgotten
@@ -412,19 +415,8 @@ def purge_bot_data(config: Config, slug: str) -> dict[str, Any]:
             )
             result["deleted_rows"]["entity_profiles"] = r.rowcount
 
-            # 5. job_runs (FK → scheduled_jobs.id, must go first)
-            r = conn.execute(
-                _text("DELETE FROM job_runs WHERE job_id IN (SELECT id FROM scheduled_jobs WHERE bot_id=:s)"),
-                {"s": normalized},
-            )
-            result["deleted_rows"]["job_runs"] = r.rowcount
-
-            # 6. scheduled_jobs
-            r = conn.execute(
-                _text("DELETE FROM scheduled_jobs WHERE bot_id=:s"),
-                {"s": normalized},
-            )
-            result["deleted_rows"]["scheduled_jobs"] = r.rowcount
+            # 5–6. Prompt companions precede the job_runs/scheduled_jobs parents.
+            result["deleted_rows"].update(prompt_purge.delete_jobs(normalized))
 
             # 7. prompt_template_versions
             r = conn.execute(
@@ -528,6 +520,20 @@ def cleanup_orphaned_bot_data(config: Config, dry_run: bool = False) -> dict[str
                 )
             ).fetchall()
             all_tables = {r[0] for r in table_rows}
+            from .prompt_purge import PromptPurgeGuard
+            prompt_purge = PromptPurgeGuard(conn, all_tables)
+            if not dry_run:
+                # Check before dropping history partitions or deleting turn evidence.
+                # Stabilize writers before discovering the orphan targets too.
+                prompt_purge.guard(set())
+                candidates = set()
+                for table, column in (("scheduled_jobs", "bot_id"),
+                                      ("inter_bot_deliveries", "target_bot_id")):
+                    if table in all_tables:
+                        candidates.update(row[0] for row in conn.execute(
+                            _text(f"SELECT DISTINCT {column} FROM {table}")
+                        ) if row[0] and row[0] != "*" and row[0].strip().lower() not in known_slugs)
+                prompt_purge.guard(candidates)
 
             # TASK-571: per-bot data lives in LIST partitions named
             # ``<parent>_p_<bot>`` — dropping the partition drops the bot's
@@ -618,13 +624,11 @@ def cleanup_orphaned_bot_data(config: Config, dry_run: bool = False) -> dict[str
                 orphans = _find_orphan_ids(table, id_col, extra)
                 orphan_ids |= orphans
                 if not dry_run and orphans:
-                    # job_runs must be cleaned before scheduled_jobs
                     if table == "scheduled_jobs":
                         for oid in orphans:
-                            conn.execute(
-                                _text("DELETE FROM job_runs WHERE job_id IN (SELECT id FROM scheduled_jobs WHERE bot_id=:v)"),
-                                {"v": oid},
-                            )
+                            for child, count in prompt_purge.delete_jobs(oid).items():
+                                result["deleted_rows"][child] = result["deleted_rows"].get(child, 0) + count
+                        continue
                     cnt = _delete_orphans(table, id_col, orphans, extra)
                     result["deleted_rows"][table] = result["deleted_rows"].get(table, 0) + cnt
                 elif dry_run:

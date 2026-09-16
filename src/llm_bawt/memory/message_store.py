@@ -201,6 +201,7 @@ class MessageRowStore:
         attachments: list[dict] | None = None,
         reasoning: str | None = None,
         author: AuthorReference | None = None,
+        extract_memory: bool = True,
     ) -> None:
         """Insert one row or refresh mutable payload fields on an existing id."""
         if not content or content.isspace():
@@ -214,6 +215,11 @@ class MessageRowStore:
                 ).first()
                 if existing:
                     values: dict = {"content": content, "timestamp": timestamp}
+                    if not extract_memory:
+                        values["processed"] = True
+                        values["summary_metadata"] = {
+                            **(existing.summary_metadata or {}), "extract_memory": False,
+                        }
                     if attachments is not None:
                         values["attachments"] = attachments
                     if reasoning is not None:
@@ -238,7 +244,11 @@ class MessageRowStore:
                             reasoning=reasoning,
                             author_entity_type=(author.entity_type if author else None),
                             author_entity_id=(author.entity_id if author else None),
-                            processed=False,
+                            processed=not extract_memory,
+                            # Reuse existing message metadata for durable exclusion
+                            # provenance; processed alone also means "extracted".
+                            **({"summary_metadata": {"extract_memory": False}}
+                               if not extract_memory else {}),
                             created_at=datetime.now(timezone.utc),
                         )
                     )

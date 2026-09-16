@@ -35,7 +35,8 @@ def cap_seed_contents(
 
 
 def build_context_seed(
-    bot_id: str, model: str | None, service, session_id: str | None = None
+    bot_id: str, model: str | None, service, session_id: str | None = None,
+    *, llm_bawt=None,
 ) -> dict:
     """Build the context-seed payload for a fresh Claude Code SDK session.
 
@@ -62,12 +63,17 @@ def build_context_seed(
     # e.g. seeding chat-harness 'mira' (grok-4.3) with the service default
     # grok-4.5@xai-responses, a responses-only endpoint incompatible with
     # harness=chat → hard failure. TASK-620.
-    model_alias, _ = service._resolve_request_model(
-        model, effective_bot_id, local_mode=False
-    )
-    llm_bawt = service._get_llm_bawt(
-        model_alias, effective_bot_id, service.config.DEFAULT_USER
-    )
+    if llm_bawt is None:
+        model_alias, _ = service._resolve_request_model(
+            model, effective_bot_id, local_mode=False
+        )
+        llm_bawt = service._get_llm_bawt(
+            model_alias, effective_bot_id, service.config.DEFAULT_USER
+        )
+    else:
+        # Automation already owns an isolated, owner-scoped instance. Never
+        # resolve DEFAULT_USER or touch the personal model/cache during seeding.
+        model_alias = llm_bawt.resolved_model_alias
     # Load fresh so we never serve a stale in-memory transcript.
     # ``session_id`` (TASK-252): scoped seed for hydrating an explicitly
     # opened thread — pool becomes that thread's raw + rolling summaries.

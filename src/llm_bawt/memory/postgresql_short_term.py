@@ -467,26 +467,39 @@ class PostgreSQLShortTermManager:
         """
         target_bot = self.bot_id if bot_id is None else bot_id
         target_user = self.user_id if user_id is None else user_id
-        new_id = str(uuid.uuid4())
-        meta_json = json.dumps(session_metadata) if session_metadata else None
         with self._backend.engine.begin() as conn:
-            conn.execute(
-                text("""
-                    INSERT INTO sessions
-                        (id, bot_id, user_id, started_at, ended_at,
-                         archived_at, status, session_metadata)
-                    VALUES
-                        (:id, :bot_id, :user_id, CURRENT_TIMESTAMP,
-                         CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, 'archived',
-                         CAST(:meta AS JSONB))
-                """),
-                {
-                    "id": new_id,
-                    "bot_id": target_bot,
-                    "user_id": target_user,
-                    "meta": meta_json,
-                },
+            return self.create_inactive_session_row(
+                conn, bot_id=target_bot, user_id=target_user,
+                session_metadata=session_metadata,
             )
+
+    @staticmethod
+    def create_inactive_session_row(
+        conn, *, bot_id: str, user_id: str | None,
+        session_metadata: dict | None = None, session_id: str | None = None,
+    ) -> str:
+        """Born-archived primitive, composable with an outbox transaction.
+
+        A caller-supplied deterministic identity is retry-safe, but may never
+        take over another owner's thread or resurrect a deleted session.
+        """
+        new_id = session_id or str(uuid.uuid4())
+        meta = json.dumps(session_metadata) if session_metadata else None
+        # SQLite is used only by hermetic tests, not as a production backend.
+        meta_expr = "CAST(:meta AS JSONB)" if conn.dialect.name == "postgresql" else ":meta"
+        conn.execute(text(f"""
+            INSERT INTO sessions
+                (id, bot_id, user_id, started_at, ended_at,
+                 archived_at, status, session_metadata)
+            VALUES (:id, :bot_id, :user_id, CURRENT_TIMESTAMP,
+                    CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, 'archived', {meta_expr})
+            ON CONFLICT (id) DO NOTHING
+        """), {"id": new_id, "bot_id": bot_id, "user_id": user_id, "meta": meta})
+        row = conn.execute(text(
+            "SELECT bot_id, user_id, status FROM sessions WHERE id=:id"
+        ), {"id": new_id}).mappings().one()
+        if row["bot_id"] != bot_id or row["user_id"] != user_id or row["status"] == "deleted":
+            raise ValueError("Dedicated session identity is not an available owned thread")
         return new_id
 
     def activate_session(
@@ -643,6 +656,7 @@ class PostgreSQLShortTermManager:
         reasoning: str | None = None,
         session_id: str | None = None,
         author: AuthorReference | None = None,
+        extract_memory: bool = True,
     ) -> str:
         """Add a message to the current session.
 
@@ -674,6 +688,7 @@ class PostgreSQLShortTermManager:
             attachments=attachments,
             reasoning=reasoning,
             author=author,
+            **({"extract_memory": False} if not extract_memory else {}),
         )
 
         return mid

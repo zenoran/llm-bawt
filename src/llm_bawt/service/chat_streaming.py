@@ -95,8 +95,15 @@ class ChatStreamingMixin(ChatStreamingBridgeMixin):
 
         # Resolve model using shared bot/config logic
         # Agent-backend bots resolve to their virtual model (e.g. "openclaw")
+        from .prompt_execution import prompt_delivery_record, create_prompt_instance
+        prompt_record = prompt_delivery_record(self, request)
+        prompt_instance = None
         try:
-            model_alias, model_warnings = self._resolve_request_model(request.model, bot_id, local_mode)
+            if prompt_record:
+                model_alias, prompt_instance = create_prompt_instance(self, request)
+                model_warnings = []
+            else:
+                model_alias, model_warnings = self._resolve_request_model(request.model, bot_id, local_mode)
         except Exception as e:
             log.api_error(ctx, str(e), 400)
             raise
@@ -106,7 +113,7 @@ class ChatStreamingMixin(ChatStreamingBridgeMixin):
 
         # Get cached LLMBawt instance
         try:
-            llm_bawt = self._get_llm_bawt(model_alias, bot_id, user_id, local_mode)
+            llm_bawt = prompt_instance or self._get_llm_bawt(model_alias, bot_id, user_id, local_mode)
         except Exception as e:
             log.api_error(ctx, str(e), 500)
             warning_data = {
@@ -265,21 +272,8 @@ class ChatStreamingMixin(ChatStreamingBridgeMixin):
             else f"turn-{uuid.uuid4().hex}"
         )
 
-        # Resolve agent session_key for abort support.
-        #
-        # The bridge tracks active streams keyed by the chat.send command's
-        # ``session_key`` field. chat.abort RPC must arrive with the same
-        # key or the bridge can't find the active controller (results in
-        # "no_active_task" and the abort is a no-op server-side).
-        #
-        # claude-code and codex both produce the routing key as
-        # ``f"{bot_id}:{user_id}"`` in their respective backends — match that
-        # here. The persisted ``session_key`` in their agent_backend_config
-        # is the SDK-internal thread/session id, NOT a routing key.
-        #
-        # OpenClaw (and any other backend) keeps using its persisted
-        # session_key (e.g. ``agent:main:main``), which IS the routing key
-        # for that backend.
+        # Abort routing retains the ordinary per-bot/user bridge key; explicit
+        # SDK transcript identity is carried separately by thread_binding.
         oc_session_key: str | None = None
         # TASK-501: seed history the app pre-assembles and pushes to the bridge
         # so it need not call back to /v1/history/context-seed. Stays None
@@ -313,6 +307,8 @@ class ChatStreamingMixin(ChatStreamingBridgeMixin):
             # ACTIVE thread so seed/resume decisions use canonical per-thread
             # metadata rather than the retired bot scalar.
             thread_binding = self._bind_agent_thread(llm_bawt, request)
+            if prompt_record and (not thread_binding or not thread_binding.get("explicit_thread")):
+                raise ValueError("Scheduled prompt could not bind its isolated thread")
             if thread_binding is None:
                 thread_binding = self._resolve_active_thread_binding(llm_bawt)
 
@@ -324,10 +320,14 @@ class ChatStreamingMixin(ChatStreamingBridgeMixin):
             )
             from .routes.history import maybe_build_session_seed
             from .dependencies import get_service
-            inject_seed_messages = maybe_build_session_seed(
-                llm_bawt, bot_id, model_alias, user_prompt, get_service(),
-                thread_binding=thread_binding,
-            )
+            if prompt_record:
+                from .prompt_execution import build_prompt_seed
+                inject_seed_messages = build_prompt_seed(self, llm_bawt, thread_binding)
+            else:
+                inject_seed_messages = maybe_build_session_seed(
+                    llm_bawt, bot_id, model_alias, user_prompt, get_service(),
+                    thread_binding=thread_binding,
+                )
             # Rotate the durable DB thread on /new — AFTER the seed is built
             # so the seed captured the outgoing thread's raw messages.
             self._maybe_rotate_agent_session(
@@ -442,14 +442,6 @@ class ChatStreamingMixin(ChatStreamingBridgeMixin):
         # if the SSE generator is cancelled (client disconnect / page refresh).
         _redis_sub = getattr(self, "_redis_subscriber", None)
 
-        # TASK-622: the per-turn streaming worker plus its Redis-publish and
-        # turn-persistence helpers were extracted from this monolith into
-        # TurnStreamWorker / TurnStreamPublishMixin (turn_stream_worker.py,
-        # turn_stream_publish.py). chat_completion_stream stays the coordinator:
-        # request parsing, context assembly, and the async SSE consumer loop
-        # below. All shared per-turn state is threaded through TurnStreamContext
-        # BY REFERENCE, so the holder-list mutations and the approval/await guard
-        # sets remain visible here exactly as when these were nested closures.
         _approval_handled: set[str] = set()
         _await_handled: set[str] = set()
         _upstream_model = [None]  # Actual model reported by agent backend
@@ -614,63 +606,8 @@ class ChatStreamingMixin(ChatStreamingBridgeMixin):
             )
             oc_tool_call_index = 0  # OpenClaw agent backend tool call index
 
-            # TASK-367: release-at-boundary buffer for agent-backend assistant
-            # text. Holds the still-forming tail of the response so the SSE wire
-            # only ever advances delta.content to a CLEAN boundary (sentence /
-            # clause punctuation, newline, or — as a safety valve — a word
-            # boundary once the tail grows long). A tool card anchors at the
-            # client's running content length; if that length can end mid-word,
-            # the tool slices a half-typed token into its own bubble that only
-            # heals a frame later — the live-only split Nick keeps seeing.
-            # Boundary-gating the wire makes that length always land on a real
-            # boundary, so the split can't form — independent of whether the
-            # authoritative text_offset reached the client. Buffers ONLY the
-            # wire; _text_chars, persisted tool offsets and Redis events are
-            # produced upstream in the worker thread and stay untouched, so the
-            # DB-refresh render is unchanged and the live render converges to it.
-            _content_buf: list[str] = []
-            _CONTENT_MAX_HOLD = 120  # force a word-boundary release past this
-            _HARD_BOUNDARY = frozenset(".!?…\n")       # sentence / hard stops
-            _SOFT_BOUNDARY = frozenset(",;:)]}\"'’”")   # clause / closing punct
-
-            def _content_release_cut(s: str) -> int:
-                """Slice index: release s[:cut], hold s[cut:]. 0 ⇒ hold all."""
-                # Release through the last hard boundary (sentence end / newline).
-                for i in range(len(s) - 1, -1, -1):
-                    if s[i] in _HARD_BOUNDARY:
-                        return i + 1
-                # Else through the last clause-closing punctuation.
-                for i in range(len(s) - 1, -1, -1):
-                    if s[i] in _SOFT_BOUNDARY:
-                        return i + 1
-                # No punctuation yet: keep holding until we've buffered enough
-                # that a long, punctuation-free run (code, URLs, lists) would
-                # stall — then release up to the last whitespace so we never
-                # leave a mid-word tail on the wire.
-                if len(s) >= _CONTENT_MAX_HOLD:
-                    ws = s.rfind(" ")
-                    return ws + 1 if ws > 0 else len(s)
-                return 0
-
-            def _drain_content_buf(flush_all: bool):
-                """SSE line for releasable buffered content, or None. Mutates buf."""
-                if not _content_buf:
-                    return None
-                s = "".join(_content_buf)
-                cut = len(s) if flush_all else _content_release_cut(s)
-                if cut <= 0:
-                    return None
-                _content_buf.clear()
-                if cut < len(s):
-                    _content_buf.append(s[cut:])
-                data = {
-                    "id": response_id,
-                    "object": "chat.completion.chunk",
-                    "created": created,
-                    "model": model_alias,
-                    "choices": [{"index": 0, "delta": {"content": s[:cut]}, "finish_reason": None}],
-                }
-                return f"data: {json.dumps(data)}\n\n"
+            from .chat_stream_buffer import content_buffer
+            _content_buf, _drain_content_buf = content_buffer(response_id, created, model_alias)
 
             # Send service warnings (e.g. model fallback) before content
             if model_warnings:
