@@ -61,6 +61,8 @@ selects the strategy on read / delete.
 from __future__ import annotations
 
 import base64
+import hashlib
+import re
 import logging
 import os
 from datetime import datetime
@@ -218,8 +220,13 @@ class MediaStore:
         *,
         filename: Optional[str] = None,
         kind: AssetKind | str | None = None,
+        replace_key: str | None = None,
     ) -> MediaAsset:
         """Prepare, deduplicate, and persist an upload of any kind.
+
+        ``replace_key`` explicitly opts file uploads into one mutable named slot:
+        successive uploads replace its bytes and reuse its asset ID/row. Callers
+        must serialize usage (including consumers); normal uploads stay immutable.
 
         ``kind`` defaults to :func:`kind_for_mime` — the four Pillow-safe
         image MIMEs take the normalising image pipeline, everything else is
@@ -238,6 +245,26 @@ class MediaStore:
                 f"source must be one of {ALLOWED_SOURCES!r}, got {source!r}"
             )
         strategy = self._resolve_kind(kind, original_mime)
+        if replace_key is not None:
+            # Internal opt-in, never accepted from the public upload route.
+            # Namespace prevents overwriting immutable content-addressed blobs.
+            if (not re.fullmatch(r"[a-zA-Z0-9_-]+(?:/[a-zA-Z0-9_.-]+)*", replace_key)
+                    or any(p in {".", ".."} for p in replace_key.split("/"))):
+                raise ValueError("replace_key must be a safe relative object name")
+            if strategy.name != "file" or expires_at is not None:
+                raise ValueError("Named replacement requires a file without expiration")
+            if self.db is None:
+                raise ValueError("Named replacement requires the asset registry")
+            prepared = strategy.prepare(raw_bytes, original_mime)
+            key = "named/" + replace_key
+            row = self.db.replace_named(
+                storage_key=key, sha256=prepared.sha256, mime_type=prepared.mime_type,
+                original_mime_type=normalize_mime(original_mime) or None,
+                size_bytes=prepared.size_bytes, filename=filename, source=source,
+                owner_user_id=owner_user_id,
+                write_blob=lambda: self.backend.replace(key, raw_bytes, prepared.mime_type),
+            )
+            return _row_to_asset(row)
 
         # Step 1: prepare. For images this is the only place we hold the
         # full decoded image; everything else just shuffles bytes around.
@@ -369,7 +396,8 @@ class MediaStore:
         """
         row = self._require_row(asset_id)
         strategy = kind_for_row(row)
-        key = strategy.blob_key(variant, row["sha256"])
+        strategy.require_variant(variant)
+        key = row.get("storage_key") or strategy.blob_key(variant, row["sha256"])
         try:
             data = self.backend.get(key)
         except BlobNotFound as e:
@@ -379,6 +407,8 @@ class MediaStore:
             raise FileNotFoundError(
                 f"MediaStore blob missing for asset={asset_id} variant={variant} key={key}"
             ) from e
+        if row.get("storage_key") and hashlib.sha256(data).hexdigest() != row["sha256"]:
+            raise BlobBackendUnavailable("Named asset replacement is not yet consistent; retry")
         # Image rows store VARIANT_MIME; file rows store the declared MIME.
         # Legacy rows always have mime_type set, so the fallback is only
         # for hand-built test fakes.
@@ -442,7 +472,8 @@ class MediaStore:
             return  # nothing to do
 
         strategy = kind_for_row(row)
-        for key in strategy.all_keys(row["sha256"]):
+        keys = [row["storage_key"]] if row.get("storage_key") else strategy.all_keys(row["sha256"])
+        for key in keys:
             self.backend.delete(key)
 
         self.db.delete(asset_id)

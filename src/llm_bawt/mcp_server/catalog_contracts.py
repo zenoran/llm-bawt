@@ -91,6 +91,11 @@ TOOL_SUMMARIES: dict[str, str] = {
     "media_history": "Read recent downloads/imports/failures. kind: all|movie|series; event: grabbed|imported|failed or omit for all.",
     "media_pipeline_status": "Trace one title through library, downloader, and recent events. kind: auto|movie|series.",
     "media_library_stats": "Read compact library counts and downloader health/queue summary.",
+    "home_audio_devices": "List allowed Home Assistant speakers/displays, state, and voice catalog URL. Read-only.",
+    "speech_generate": "Generate a stored WAV; no playback. Uses voice or bot default, never substitutes voices. Returns asset_id for home_audio_enqueue.",
+    "home_audio_enqueue": "Audible: queue text or a generated WAV asset_id to an explicit target. Shared FIFO, waits for idle, expires after five minutes. Reuse idempotency_key; queued is not played.",
+    "home_audio_status": "Read announcement state and errors. completed means observed playback completion; interrupted/failed may have played partially and are never auto-replayed.",
+    "home_audio_cancel": "Cancel only a queued announcement. Does not stop preparing/playing jobs; inspect returned status.",
     "generate_image": "Generate or edit an image; provider: grok (default)|openai. reference_asset_id reuses an image. Returns inline image and asset_id/URLs for iteration.",
     "web_search": "Search current web sources; provider: brave|reddit|tavily|duckduckgo, or omit for configured fan-out. max_results is per provider. Use crawl4ai for page content.",
 }
@@ -101,7 +106,7 @@ REFERENCE_GROUPS: dict[str, tuple[str, ...]] = {
     "tasks": ("tasks_", "steps_", "projects_", "activity_"),
     "memory-history": ("memory_", "messages_", "context_", "facts_", "system_", "profile"),
     "sessions-delivery": ("sessions_", "bots_", "agent_", "self_"),
-    "ops-media": ("ops_", "media_", "generate_", "web_"),
+    "ops-media": ("ops_", "media_", "generate_", "web_", "speech_", "home_audio_"),
 }
 
 

@@ -52,7 +52,7 @@ ALLOWED_KINDS = ("image", "file")
 CREATE_TABLE_SQL = f"""
 CREATE TABLE IF NOT EXISTS {TABLE_NAME} (
     id                  TEXT PRIMARY KEY,
-    sha256              TEXT NOT NULL UNIQUE,
+    sha256              TEXT NOT NULL,
     mime_type           TEXT NOT NULL,
     original_mime_type  TEXT,
     size_bytes          INTEGER NOT NULL,
@@ -60,6 +60,7 @@ CREATE TABLE IF NOT EXISTS {TABLE_NAME} (
     height              INTEGER,
     kind                TEXT NOT NULL DEFAULT 'image',
     filename            TEXT,
+    storage_key         TEXT,
     source              TEXT NOT NULL,
     owner_user_id       TEXT,
     created_at          TIMESTAMPTZ NOT NULL DEFAULT NOW(),
@@ -76,6 +77,12 @@ CREATE TABLE IF NOT EXISTS {TABLE_NAME} (
 ALTER_TABLE_SQL = [
     f"ALTER TABLE {TABLE_NAME} ADD COLUMN IF NOT EXISTS kind TEXT NOT NULL DEFAULT 'image'",
     f"ALTER TABLE {TABLE_NAME} ADD COLUMN IF NOT EXISTS filename TEXT",
+    f"ALTER TABLE {TABLE_NAME} ADD COLUMN IF NOT EXISTS storage_key TEXT",
+    # Named mutable slots and immutable assets can contain identical bytes.
+    # Preserve dedup uniqueness for immutable assets only, before dropping the old constraint.
+    f"CREATE UNIQUE INDEX IF NOT EXISTS idx_media_assets_immutable_sha ON {TABLE_NAME}(sha256) WHERE storage_key IS NULL",
+    f"ALTER TABLE {TABLE_NAME} DROP CONSTRAINT IF EXISTS media_assets_sha256_key",
+    f"CREATE UNIQUE INDEX IF NOT EXISTS idx_media_assets_storage_key ON {TABLE_NAME}(storage_key)",
 ]
 
 # Listing assets for a given user, newest-first, is the dominant access
@@ -162,7 +169,7 @@ class MediaAssetStore:
             for idx_sql in CREATE_INDEXES_SQL:
                 conn.execute(text(idx_sql))
 
-        self._schema_guard.run(self.engine, "media-assets-store", bootstrap)
+        self._schema_guard.run(self.engine, "media-assets-named-slots-v1", bootstrap)
 
     # ------------------------------------------------------------------
     # Insert
@@ -240,6 +247,34 @@ class MediaAssetStore:
             conn.commit()
             return dict(row) if row else {}
 
+    def replace_named(self, *, storage_key: str, write_blob, **metadata) -> dict[str, Any]:
+        """Serialize named writes and update one row, never immutable dedup rows.
+
+        This short DB transaction spans the blob write intentionally: a slot's
+        bytes and metadata must not be published by concurrent writers out of
+        order. Failed writes roll back metadata; failed commits leave reads
+        failing closed on checksum mismatch until a later replacement heals it.
+        """
+        with self.engine.begin() as conn:
+            conn.execute(text("SELECT pg_advisory_xact_lock(hashtextextended(:key, 0))"),
+                         {"key": "media-slot:" + storage_key})
+            row = conn.execute(text(f"""
+                INSERT INTO {TABLE_NAME}
+                    (id, storage_key, sha256, mime_type, original_mime_type, size_bytes,
+                     kind, filename, source, owner_user_id)
+                VALUES (:id, :storage_key, :sha256, :mime_type, :original_mime_type,
+                        :size_bytes, 'file', :filename, :source, :owner_user_id)
+                ON CONFLICT (storage_key) DO UPDATE SET
+                    sha256 = EXCLUDED.sha256, mime_type = EXCLUDED.mime_type,
+                    original_mime_type = EXCLUDED.original_mime_type,
+                    size_bytes = EXCLUDED.size_bytes, filename = EXCLUDED.filename,
+                    source = EXCLUDED.source, owner_user_id = EXCLUDED.owner_user_id,
+                    expires_at = NULL
+                RETURNING *
+            """), {"id": new_asset_id(), "storage_key": storage_key, **metadata}).mappings().one()
+            write_blob()
+            return dict(row)
+
     # ------------------------------------------------------------------
     # Query
     # ------------------------------------------------------------------
@@ -272,7 +307,7 @@ class MediaAssetStore:
             return [dict(r) for r in rows]
 
     def get_by_sha256(self, sha256: str) -> dict[str, Any] | None:
-        sql = text(f"SELECT * FROM {TABLE_NAME} WHERE sha256 = :sha")
+        sql = text(f"SELECT * FROM {TABLE_NAME} WHERE sha256 = :sha AND storage_key IS NULL")
         with self.engine.connect() as conn:
             row = conn.execute(sql, {"sha": sha256}).mappings().first()
             return dict(row) if row else None
@@ -332,7 +367,8 @@ class MediaAsset(SQLModel, table=True):
     __table_args__ = {"extend_existing": True}
 
     id: str = Field(default_factory=new_asset_id, primary_key=True)
-    sha256: str = Field(index=True, unique=True)
+    sha256: str = Field(index=True)
+    storage_key: Optional[str] = Field(default=None, unique=True)
     mime_type: str
     original_mime_type: Optional[str] = Field(default=None)
     size_bytes: int = Field(sa_column=Column(Integer, nullable=False))

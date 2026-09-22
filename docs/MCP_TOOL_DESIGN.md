@@ -66,8 +66,13 @@ index and a fully loaded tool catalog have different costs.
 TASK-888 baseline: 87 tools, 19,070 tokens; descriptions 8,705, schemas 7,904.
 First compatibility-preserving refactor: 10,250 total (-46.25%); descriptions
 2,916 (-66.50%), schemas 5,693 (-27.97%). No functionality removed.
-Regression budget: 10,500 total for this catalog. Increasing limits requires an
-explicit explanation with measurements; do not delete warnings to meet a budget.
+Regression budget: 11,200 total for this catalog. The home-audio addition adds five
+tools (discovery, silent generation, enqueue, status, cancel), approximately 600
+tokens; measured combined working-tree catalog: 93 tools / 11,081 tokens,
+3,152 description tokens. This also includes the independently added initiative
+tool. Read/mutate boundaries and audible/asynchronous warnings remain intact.
+Increasing limits requires an explicit explanation with measurements; do not
+delete warnings to meet a budget.
 
 ## Provider loading caveat
 

@@ -312,6 +312,9 @@ class BlobBackend(Protocol):
         :raises BlobBackendUnavailable: backend unreachable or refused.
         """
 
+    def replace(self, key: str, data: bytes, content_type: str) -> None:
+        """Atomically replace one named object, even if its key already exists."""
+
     def get(self, key: str) -> bytes:
         """Return the full body at ``key``.
 
@@ -393,6 +396,23 @@ class FsBlobBackend:
     def put(self, key: str, data: bytes, content_type: str) -> None:
         del content_type  # FS layer has no use for the MIME hint
         _write_idempotent(self._abs(key), data)
+
+    def replace(self, key: str, data: bytes, content_type: str) -> None:
+        import tempfile
+
+        path = self._abs(key)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = None
+        try:
+            with tempfile.NamedTemporaryFile(dir=path.parent, delete=False) as out:
+                temporary = Path(out.name)
+                out.write(data)
+                out.flush()
+                os.fsync(out.fileno())
+            os.replace(temporary, path)
+        finally:
+            if temporary is not None:
+                temporary.unlink(missing_ok=True)
 
     def get(self, key: str) -> bytes:
         path = self._abs(key)
@@ -608,6 +628,10 @@ class S3BlobBackend:
         except BotoCoreError as e:
             raise BlobBackendUnavailable(f"S3 PUT {key!r} transport error: {e}") from e
 
+    def replace(self, key: str, data: bytes, content_type: str) -> None:
+        # S3 PUT publishes the whole replacement object atomically.
+        self.put(key, data, content_type)
+
     def get(self, key: str) -> bytes:
         from botocore.exceptions import BotoCoreError, ClientError
 
@@ -729,6 +753,9 @@ class FallbackReadBlobBackend:
 
     def put(self, key: str, data: bytes, content_type: str) -> None:
         self.primary.put(key, data, content_type)
+
+    def replace(self, key: str, data: bytes, content_type: str) -> None:
+        self.primary.replace(key, data, content_type)
 
     def get(self, key: str) -> bytes:
         try:

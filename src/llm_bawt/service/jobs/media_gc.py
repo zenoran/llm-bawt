@@ -143,14 +143,14 @@ def _find_orphan_assets(
         )
         SELECT a.id, a.sha256, a.size_bytes
         FROM media_assets a
-        WHERE
+        WHERE a.storage_key IS NULL AND (
             (a.expires_at IS NOT NULL AND a.expires_at < NOW())
          OR (
             a.created_at < NOW() - make_interval(days => :grace_days)
             AND NOT EXISTS (
                 SELECT 1 FROM referenced r WHERE r.asset_id = a.id
             )
-         )
+         ))
         ORDER BY a.created_at ASC
         """
     )

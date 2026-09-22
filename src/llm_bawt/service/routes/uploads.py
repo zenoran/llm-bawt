@@ -430,7 +430,9 @@ def _serve_variant(
     asset = store.stat(asset_id)
     etag = f'"{asset.sha256}"' if asset is not None else None
 
-    if etag and _etag_matches(if_none_match, etag):
+    mutable = bool(asset is not None and asset.storage_key)
+    cache_control = "no-store" if mutable else CACHE_CONTROL
+    if not mutable and etag and _etag_matches(if_none_match, etag):
         return Response(
             status_code=304,
             headers={"ETag": etag, "Cache-Control": CACHE_CONTROL},
@@ -460,12 +462,12 @@ def _serve_variant(
     mime = mime or RESPONSE_MIME
     disposition = "attachment" if (download or mime in FORCE_ATTACHMENT_MIMES) else "inline"
     headers = {
-        "Cache-Control": CACHE_CONTROL,
+        "Cache-Control": cache_control,
         "Content-Disposition": _content_disposition(
             disposition, _display_filename(asset, mime, variant)
         ),
     }
-    if etag:
+    if etag and not mutable:
         headers["ETag"] = etag
 
     return Response(content=data, media_type=mime, headers=headers)

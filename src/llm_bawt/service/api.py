@@ -322,9 +322,16 @@ async def lifespan(app):
     from .usage.codex_oauth import proactive_refresh_loop as _codex_loop
     service._codex_refresh_task = asyncio.create_task(_codex_loop())
 
+    # Durable speech playback belongs to the app, not a short-lived MCP call.
+    from ..integrations.home_audio_store import HomeAudioStore
+    from ..integrations.home_audio_worker import HomeAudioWorker
+    home_audio_worker = HomeAudioWorker(config, HomeAudioStore(model_engine))
+    home_audio_worker.start()
+
     try:
         yield
     finally:
+        await home_audio_worker.stop()
         # DEACTIVATED: history drain task (see above)
         # if history_drain_task:
         #     history_drain_task.cancel()
