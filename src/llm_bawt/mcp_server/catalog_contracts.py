@@ -54,6 +54,7 @@ TOOL_SUMMARIES: dict[str, str] = {
     "tasks_associate_current": "Link this trusted turn when actually starting/resuming a task, never from a mention alone. Supply UUID or TASK-N; unsupported caller context fails closed.",
     "tasks_create": "Create a task with optional steps. Pass your bot_id; associate_current_turn=true links work started now using trusted server context.",
     "tasks_update": "Patch provided task fields. Finish at REVIEW, never COMPLETED; agents cannot leave BUG. Pass bot_id (default REVIEW owner); associate_current_turn links actual work.",
+    "initiative_state": "Read, acquire an expiring lease, or CAS-checkpoint recurring task state; trusted turn identity owns writes and stale owners conflict.",
     "tasks_delete": "Permanently delete task and steps. Prefer tasks_update status=CANCELLED to retain history.",
     "tasks_add_dependency": "Make task_id wait for depends_on_id (UUID or TASK-N). Self-dependencies and cycles are rejected.",
     "tasks_remove_dependency": "Remove depends_on_id as a prerequisite of task_id; UUID or TASK-N accepted.",
@@ -98,15 +99,16 @@ TOOL_SUMMARIES: dict[str, str] = {
     "home_audio_cancel": "Cancel only a queued announcement. Does not stop preparing/playing jobs; inspect returned status.",
     "generate_image": "Generate or edit an image; provider: grok (default)|openai. reference_asset_id reuses an image. Returns inline image and asset_id/URLs for iteration.",
     "web_search": "Search current web sources; provider: brave|reddit|tavily|duckduckgo, or omit for configured fan-out. max_results is per provider. Use crawl4ai for page content.",
+    "x_search": "Paid X search: last 7 days, newest first, 10–100 posts/page. ISO time bounds; next_token pagination. Requires X connection; no fallback.",
 }
 
 # A compact pointer on every tool works even when discovery loads one schema only.
 # Group references are loaded on demand, not injected with the whole catalog.
 REFERENCE_GROUPS: dict[str, tuple[str, ...]] = {
-    "tasks": ("tasks_", "steps_", "projects_", "activity_"),
+    "tasks": ("tasks_", "steps_", "projects_", "activity_", "initiative_"),
     "memory-history": ("memory_", "messages_", "context_", "facts_", "system_", "profile"),
     "sessions-delivery": ("sessions_", "bots_", "agent_", "self_"),
-    "ops-media": ("ops_", "media_", "generate_", "web_", "speech_", "home_audio_"),
+    "ops-media": ("ops_", "media_", "generate_", "web_", "x_", "speech_", "home_audio_"),
 }
 
 

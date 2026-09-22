@@ -15,6 +15,7 @@ from typing import AsyncIterator
 import redis.asyncio as aioredis
 from redis.asyncio import BlockingConnectionPool
 
+from .command_publisher import CommandPublisherMixin
 from .events import AgentEvent
 from .publisher import (
     COMMANDS_STREAM,
@@ -28,7 +29,7 @@ from .publisher import (
 logger = logging.getLogger(__name__)
 
 
-class RedisSubscriber:
+class RedisSubscriber(CommandPublisherMixin):
     def __init__(self, redis_url: str) -> None:
         # socket_timeout=None: redis-py 8.0 changed the default to 5s, which
         # races our blocking XREADGROUP(block=5000) reads — every idle poll
@@ -137,149 +138,6 @@ class RedisSubscriber:
                         from .events import AgentEventKind
                         if event.kind in (AgentEventKind.RUN_COMPLETED, AgentEventKind.ERROR):
                             return
-
-    async def send_command(
-        self,
-        session_key: str,
-        message: str,
-        request_id: str,
-        attachments: list | None = None,
-        system_prompt: str | None = None,
-        model: str | None = None,
-        backend: str | None = None,
-        bot_id: str | None = None,
-        trigger_message_id: str | None = None,
-        effort: str | None = None,
-        max_turns: int | None = None,
-        subagent_model: str | None = None,
-        disallowed_tools: list[str] | None = None,
-        inject_messages: list | None = None,
-        context_window: int | None = None,
-        mcp_tool_timeout_ms: int | None = None,
-        thread_session_id: str | None = None,
-        thread_resume_id: str | None = None,
-        explicit_thread: bool = False,
-        task_turn_capability: str | None = None,
-        skill_bundle: str | None = None,
-    ) -> None:
-        """Publish a chat.send command to the bridge's command stream.
-
-        ``inject_messages`` (TASK-501): history the app pre-assembles and
-        pushes down so the bridge can seed a fresh SDK session WITHOUT calling
-        back to the app's ``/v1/history/context-seed`` endpoint. List of
-        ``{role, content}`` dicts; JSON-encoded into the flat command fields
-        like ``attachments``. Only claude-code-bridge consumes it.
-
-        ``trigger_message_id`` is the frontend-supplied user-message UUID
-        (or ``local-user-*`` placeholder).  Bridges stamp it on every
-        ``tool_start`` / ``tool_end`` event they emit so the frontend can
-        bucket activity under the originating user message without relying
-        on the brittle ``turn_id`` / ``activeStreamMessageId`` fallback chain.
-
-        ``effort``, ``max_turns``, and ``disallowed_tools`` are Claude SDK
-        options forwarded to bridges that understand them. Today only the
-        claude-code bridge consumes them; codex/openclaw silently ignore them.
-        ``effort`` must be one of {"low","medium","high","xhigh","max"}
-        (validated at the bridge); ``max_turns`` caps the agent loop; the tool
-        policy is JSON-encoded so an explicit empty list remains distinguishable
-        from an absent field.
-        """
-        fields: dict = {
-            "action": "chat.send",
-            "session_key": session_key,
-            "message": message,
-            "request_id": request_id,
-        }
-        if skill_bundle is not None:
-            from .skill_registry import _name
-            fields["skill_bundle"] = _name(skill_bundle)
-        if attachments:
-            fields["attachments"] = json.dumps(attachments, ensure_ascii=False)
-        if system_prompt:
-            fields["system_prompt"] = system_prompt
-        if model:
-            fields["model"] = model
-        if backend:
-            fields["backend"] = backend
-        if bot_id:
-            fields["bot_id"] = bot_id
-        if trigger_message_id:
-            fields["trigger_message_id"] = trigger_message_id
-        if effort:
-            fields["effort"] = effort
-        if max_turns is not None:
-            fields["max_turns"] = str(max_turns)
-        if subagent_model:
-            fields["subagent_model"] = subagent_model
-        if context_window is not None and context_window > 0:
-            # TASK-609: app-resolved catalog window. The claude-code bridge
-            # consumes it to report the true context window for proxy-routed
-            # models the CLI defaults to 200k. Other bridges ignore it.
-            fields["context_window"] = str(context_window)
-        if mcp_tool_timeout_ms is not None and mcp_tool_timeout_ms > 0:
-            # TASK-618: app-resolved, DB-backed Claude MCP client timeout.
-            # Other bridges safely ignore this field.
-            fields["mcp_tool_timeout_ms"] = str(mcp_tool_timeout_ms)
-        if disallowed_tools is not None:
-            fields["disallowed_tools"] = json.dumps(
-                disallowed_tools, ensure_ascii=False
-            )
-        if inject_messages is not None:
-            fields["inject_messages"] = json.dumps(inject_messages, ensure_ascii=False)
-        if thread_session_id:
-            fields["thread_session_id"] = thread_session_id
-            if thread_resume_id:
-                fields["thread_resume_id"] = thread_resume_id
-            if explicit_thread:
-                fields["explicit_thread"] = "1"
-        if task_turn_capability:
-            # Opaque server-minted authority; only a bridge capable of setting
-            # request-local MCP headers consumes this field.
-            fields["task_turn_capability"] = task_turn_capability
-        # Stable request ids make bridge transport retries idempotent. The Lua
-        # script atomically records the request id and appends the command; a
-        # duplicate caller simply subscribes to the existing agent:run stream.
-        # All ordinary calls already mint unique req_* ids, so applying this
-        # universally changes no normal semantics and covers every bridge.
-        dedupe_key = f"agent:command:request:{request_id}"
-        flat_fields: list[str] = []
-        for key, value in fields.items():
-            flat_fields.extend((str(key), str(value)))
-        script = """
-            local prior = redis.call('GET', KEYS[1])
-            if prior then return {0, prior} end
-            local args = {}
-            for i = 3, #ARGV do table.insert(args, ARGV[i]) end
-            local stream_id = redis.call(
-                'XADD', KEYS[2], 'MAXLEN', '~', ARGV[1], '*', unpack(args)
-            )
-            local ttl = 86400
-            if string.sub(ARGV[2], 1, 13) == 'req_delivery_' then ttl = 604800 end
-            redis.call('SET', KEYS[1], stream_id, 'EX', ttl)
-            return {1, stream_id}
-        """
-        import inspect
-        eval_fn = getattr(self._pub_redis, "eval", None)
-        if callable(eval_fn):
-            eval_result = eval_fn(
-                script, 2, dedupe_key, COMMANDS_STREAM, "1000", request_id, *flat_fields
-            )
-            if inspect.isawaitable(eval_result):
-                published, stream_id = await eval_result
-            else:
-                published, stream_id = eval_result
-        else:
-            # Compatibility for lightweight Redis test doubles that implement
-            # only xadd. Production redis.asyncio always provides async eval.
-            stream_id = await self._pub_redis.xadd(
-                COMMANDS_STREAM, fields, maxlen=1000, approximate=True
-            )
-            published = 1
-        logger.debug(
-            "%s command: request_id=%s stream_id=%s session=%s attachments=%d",
-            "Sent" if int(published) else "Reused",
-            request_id, stream_id, session_key, len(attachments or []),
-        )
 
     async def send_steer(
         self,

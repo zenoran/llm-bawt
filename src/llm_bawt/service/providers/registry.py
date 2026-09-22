@@ -15,6 +15,7 @@ from .github import GitHubAdapter
 from .openai_key import OpenAIKeyAdapter
 from .openrouter import OpenRouterAdapter
 from .xai import XaiAdapter
+from .x import XAdapter
 
 # Adapter classes keyed by provider id. Extend here as providers are added.
 # TASK-635: the single `claude` adapter supersedes the old claude-sub +
@@ -30,6 +31,7 @@ _ADAPTER_CLASSES: dict[str, type[ProviderAdapter]] = {
     XaiAdapter.id: XaiAdapter,
     OpenAIKeyAdapter.id: OpenAIKeyAdapter,
     AnthropicKeyAdapter.id: AnthropicKeyAdapter,
+    XAdapter.id: XAdapter,
 }
 
 

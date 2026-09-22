@@ -17,6 +17,7 @@ from claude_code_bridge.proxy.request_context import (
     BOT_HEADER,
     CONVERSATION_HEADER,
     REQUEST_HEADER,
+    RESPONSES_TRANSPORT_HEADER,
     ProxyRequestContext,
     custom_header_env,
     durable_conversation_identity,
@@ -168,6 +169,7 @@ def test_custom_header_channel_carries_only_opaque_metadata() -> None:
         provider="openai_chatgpt",
         bot_id="snark",
         conversation_id=conversation_id,
+        responses_transport="sse",
     )
 
     headers = dict(
@@ -177,6 +179,7 @@ def test_custom_header_channel_carries_only_opaque_metadata() -> None:
         CONVERSATION_HEADER: conversation_id,
         BOT_HEADER: "snark",
         REQUEST_HEADER: "request-1",
+        RESPONSES_TRANSPORT_HEADER: "sse",
     }
     serialized = json.dumps(headers)
     assert "nick" not in serialized
@@ -196,6 +199,7 @@ def test_sdk_env_threads_durable_identity_into_proxy_headers() -> None:
         session_key="snark:nick",
         thread_session_id="thread-1",
         request_id="request-1",
+        responses_transport="sse",
     )
     headers = dict(
         line.split(": ", 1) for line in env["ANTHROPIC_CUSTOM_HEADERS"].splitlines()
@@ -203,6 +207,7 @@ def test_sdk_env_threads_durable_identity_into_proxy_headers() -> None:
     assert headers[CONVERSATION_HEADER] == _conversation("snark", "nick", "thread-1")
     assert headers[BOT_HEADER] == "snark"
     assert headers[REQUEST_HEADER] == "request-1"
+    assert headers[RESPONSES_TRANSPORT_HEADER] == "sse"
 
 
 def test_proxy_route_extracts_request_local_metadata(monkeypatch) -> None:
@@ -222,6 +227,7 @@ def test_proxy_route_extracts_request_local_metadata(monkeypatch) -> None:
             CONVERSATION_HEADER: conversation_id,
             BOT_HEADER: "snark",
             REQUEST_HEADER: "request-1",
+            RESPONSES_TRANSPORT_HEADER: "lite_ws",
         }
 
         async def json(self):
@@ -244,6 +250,7 @@ def test_proxy_route_extracts_request_local_metadata(monkeypatch) -> None:
     assert captured[0].request_id == "request-1"
     assert captured[0].bot_id == "snark"
     assert captured[0].conversation_id == conversation_id
+    assert captured[0].responses_transport == "lite_ws"
 
 
 def test_session_and_prompt_cache_use_same_durable_identity() -> None:

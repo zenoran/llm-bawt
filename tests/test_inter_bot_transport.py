@@ -229,6 +229,27 @@ def test_empty_seed_is_serialized_as_explicit_decision():
     assert parsed.inject_messages == []
 
 
+def test_responses_transport_is_serialized_into_bridge_command():
+    subscriber = RedisSubscriber("redis://localhost:6379/0")
+    fake = MagicMock()
+    commands = []
+
+    async def eval_script(_script, _numkeys, _dedupe, _stream, _maxlen, _request, *flat):
+        commands.append(dict(zip(flat[::2], flat[1::2])))
+        return [1, "1-0"]
+
+    fake.eval = eval_script
+    subscriber._pub_redis = fake
+    _run(subscriber.send_command(
+        session_key="snark:nick",
+        message="parallel",
+        request_id="req-transport",
+        responses_transport="sse",
+    ))
+
+    assert commands[0]["responses_transport"] == "sse"
+
+
 def test_agent_client_preserves_empty_seed_per_call():
     from llm_bawt.clients.agent_backend_client import AgentBackendClient
 

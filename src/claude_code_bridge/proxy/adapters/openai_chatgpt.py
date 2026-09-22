@@ -25,6 +25,11 @@ import httpx
 from .base import ProviderAdapter
 from .. import retry as retry_mod
 from ..request_context import ProxyRequestContext
+from ..transport_policy import (
+    DEFAULT_RESPONSES_TRANSPORT,
+    RESPONSES_TRANSPORT_LITE_WS,
+    normalize_responses_transport,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -99,8 +104,15 @@ class OpenAIChatGPTAdapter(ProviderAdapter):
         self._authorize_lock = asyncio.Lock()
         self._chatgpt_transport = None
 
+    @staticmethod
+    def _responses_transport(context: ProxyRequestContext | None) -> str:
+        configured = (
+            context.responses_transport if context is not None else None
+        )
+        return normalize_responses_transport(configured) or DEFAULT_RESPONSES_TRANSPORT
+
     async def open_stream(self, *, client, body, headers, bearer, base_url, context):
-        if body.get("model") != "gpt-6-astra":
+        if self._responses_transport(context) != RESPONSES_TRANSPORT_LITE_WS:
             return await super().open_stream(
                 client=client, body=body, headers=headers, bearer=bearer,
                 base_url=base_url, context=context,
@@ -120,9 +132,13 @@ class OpenAIChatGPTAdapter(ProviderAdapter):
             self._chatgpt_transport = None
         await super().close()
 
-    def retry_policy(self, upstream_model: str) -> retry_mod.RetryPolicy:
-        policy = super().retry_policy(upstream_model)
-        if upstream_model == "gpt-6-astra":
+    def retry_policy(
+        self,
+        upstream_model: str,
+        context: ProxyRequestContext | None = None,
+    ) -> retry_mod.RetryPolicy:
+        policy = super().retry_policy(upstream_model, context)
+        if self._responses_transport(context) == RESPONSES_TRANSPORT_LITE_WS:
             # The bridge watchdog is 600s. Two attempts preserve one safe
             # reconnect while a dead first-event path remains far below it.
             policy.max_attempts = 2
@@ -269,4 +285,11 @@ class OpenAIChatGPTAdapter(ProviderAdapter):
                 effort = DEFAULT_REASONING_EFFORT
             responses_body["reasoning"] = {"effort": effort}
         responses_body["reasoning"].setdefault("summary", "auto")
+        # Reasoning continuity is not Lite-specific. With store=false the
+        # encrypted item must be returned and replayed on later tool hops. Keep
+        # these ordinary Responses fields on supervised SSE too.
+        responses_body["reasoning"].setdefault("context", "all_turns")
+        responses_body.setdefault("include", [])
+        if "reasoning.encrypted_content" not in responses_body["include"]:
+            responses_body["include"].append("reasoning.encrypted_content")
         return responses_body

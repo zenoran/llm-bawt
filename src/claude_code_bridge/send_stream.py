@@ -122,6 +122,7 @@ class ClaudeStreamMixin:
         thread_session_id: str | None,
         request_id: str,
         context_window: int | None = None,
+        responses_transport: str | None = None,
     ) -> dict:
         """Build the environment dict handed to ``ClaudeAgentOptions(env=...)``."""
         sdk_env = {}
@@ -163,6 +164,7 @@ class ClaudeStreamMixin:
                     provider=model.partition("/")[0],
                     bot_id=bot_id,
                     conversation_id=conversation_id,
+                    responses_transport=responses_transport,
                 )
             )
             # TASK-546: Override every internal/subagent model selector with a

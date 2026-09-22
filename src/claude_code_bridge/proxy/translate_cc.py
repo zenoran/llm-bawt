@@ -43,6 +43,7 @@ import logging
 from typing import Any
 
 from .translate import _SERVER_TOOL_TYPE_RE, _flatten_system, image_block_to_url
+from .tool_discovery import model_tool_description
 
 logger = logging.getLogger(__name__)
 
@@ -226,8 +227,8 @@ def _tools_to_cc(tools: list[dict] | None) -> list[dict] | None:
             )
             continue
         fn: dict[str, Any] = {"name": tool.get("name") or ""}
-        if "description" in tool:
-            fn["description"] = tool["description"]
+        if "description" in tool or tool.get("name") == "ToolSearch":
+            fn["description"] = model_tool_description(tool)
         params = tool.get("input_schema") or tool.get("parameters")
         if params is not None:
             fn["parameters"] = params

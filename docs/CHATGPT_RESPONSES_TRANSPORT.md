@@ -1,10 +1,23 @@
-# ChatGPT Responses transport (TASK-864, TASK-872)
+# ChatGPT Responses transport (TASK-864, TASK-872, TASK-896)
 
 ## Scope
 
-The Claude proxy's `openai_chatgpt/gpt-6-astra` route uses a dedicated
-WebSocket Responses client with Responses Lite payloads. Other ChatGPT models,
-OpenAI API-key routes, and other providers retain their current transports.
+ChatGPT Responses transport is endpoint policy owned by
+`model_endpoints.serving_config.responses_transport`, not inferred from a model
+name. Supported values are:
+
+- `sse` — ordinary supervised Responses HTTP streaming (the safe default);
+- `lite_ws` — the dedicated WebSocket client with Responses Lite payloads.
+
+The selected scalar follows the resolved endpoint through app bot config, the
+Redis `chat.send` command, and the Claude CLI custom-header channel into the
+proxy request context. The ChatGPT adapter resolves it once and uses that same
+policy for both stream selection and retry budget. Missing or invalid bridge
+metadata falls back to `sse`; catalog writes reject invalid values.
+
+Endpoint `gpt-6-astra@openai-oauth` is configured as `sse`. This enables native
+parallel tool calls while retaining the ordinary Responses stream supervisor.
+No proxy code branches on `gpt-6-astra` or any other model identity.
 
 TASK-884: transport choice no longer controls liveness protection. Ordinary
 Responses HTTP streams (including Sol and API-key Responses adapters using the
@@ -26,12 +39,17 @@ Protocol reference: public `openai/codex`, tag `rust-v0.153.4`:
   account/session headers; beta `responses_websockets=2026-02-06`.
 - Send flattened `response.create`, with Lite enabled by
   `x-openai-internal-codex-responses-lite: true` and corresponding request metadata.
-- Move tools to an `additional_tools` developer input item and instructions to a
-  developer message. Stable IDs derive from conversation and visible content.
-  Disable parallel tool calls; use `reasoning.context=all_turns`; strip image
-  detail fields. Existing explicit reasoning settings win; fallback effort comes
+- In `lite_ws` mode, move tools to an `additional_tools` developer input item
+  and instructions to a developer message. Stable IDs derive from conversation
+  and visible content. Lite requires parallel tool calls to be disabled and also
+  strips image detail fields.
+- Both transports use `reasoning.context=all_turns` and request
+  `reasoning.encrypted_content`, preserving reasoning continuity under
+  `store:false`. Existing explicit reasoning settings win; fallback effort comes
   from the selected endpoint's `serving_config.reasoning_effort`, with a
   model-agnostic high safety default when absent.
+- Ordinary `sse` does not force `parallel_tool_calls=false`; the upstream can
+  batch independent calls in one response.
 - Capture `x-codex-turn-state` from upgrade/HTTP headers or `response.metadata`;
   replay in reconnect headers and WS create metadata.
 - Explicit HTTP 426 upgrade rejection selects SSE with the same Lite payload.

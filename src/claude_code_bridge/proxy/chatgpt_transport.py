@@ -67,10 +67,6 @@ def lite_request(body: dict, scope: str) -> dict:
                     if isinstance(part, dict) and part.get("type") == "input_image":
                         part.pop("detail", None)
     body["parallel_tool_calls"] = False
-    body.setdefault("reasoning", {})["context"] = "all_turns"
-    body.setdefault("include", [])
-    if "reasoning.encrypted_content" not in body["include"]:
-        body["include"].append("reasoning.encrypted_content")
     return body
 
 

@@ -47,11 +47,14 @@ def kwargs(**changes):
 
 
 def test_lite_payload_is_stable_scoped_and_does_not_mutate():
-    original = copy.deepcopy(BODY)
-    a = lite_request(BODY, "one")
-    assert BODY == original
-    assert a == lite_request(BODY, "one")
-    assert a["input"][0]["id"] != lite_request(BODY, "two")["input"][0]["id"]
+    from claude_code_bridge.proxy.adapters.openai_chatgpt import OpenAIChatGPTAdapter
+
+    prepared = OpenAIChatGPTAdapter().prepare_request(copy.deepcopy(BODY))
+    original = copy.deepcopy(prepared)
+    a = lite_request(prepared, "one")
+    assert prepared == original
+    assert a == lite_request(prepared, "one")
+    assert a["input"][0]["id"] != lite_request(prepared, "two")["input"][0]["id"]
     assert "tools" not in a and "instructions" not in a
     assert a["input"][0]["type"] == "additional_tools"
     assert a["input"][1]["role"] == "developer"
@@ -389,6 +392,59 @@ def test_pool_isolates_identity_dimensions(field):
     asyncio.run(run())
 
 
+def test_adapter_transport_policy_is_catalog_driven(monkeypatch):
+    from claude_code_bridge.proxy.adapters.openai_chatgpt import OpenAIChatGPTAdapter
+    from claude_code_bridge.proxy.request_context import ProxyRequestContext
+
+    async def run():
+        adapter = OpenAIChatGPTAdapter()
+        ordinary = AsyncMock(return_value="ordinary-sse")
+        lite = AsyncMock(return_value="lite-ws")
+        monkeypatch.setattr(
+            "claude_code_bridge.proxy.adapters.base.ProviderAdapter.open_stream",
+            ordinary,
+        )
+        adapter._chatgpt_transport = NS(open=lite, close=AsyncMock())
+        common = dict(
+            client=NS(),
+            body={"model": "gpt-6-astra"},
+            headers={},
+            bearer="token",
+            base_url="https://example.test",
+        )
+
+        sse_context = ProxyRequestContext(
+            request_id="sse", provider="openai_chatgpt",
+            responses_transport="sse",
+        )
+        assert await adapter.open_stream(**common, context=sse_context) == "ordinary-sse"
+        ordinary.assert_awaited_once()
+        lite.assert_not_awaited()
+        assert adapter.retry_policy("gpt-6-astra", sse_context).max_attempts == 3
+
+        lite_context = ProxyRequestContext(
+            request_id="lite", provider="openai_chatgpt",
+            responses_transport="lite_ws",
+        )
+        assert await adapter.open_stream(**common, context=lite_context) == "lite-ws"
+        lite.assert_awaited_once()
+        assert adapter.retry_policy("some-other-model", lite_context).max_attempts == 2
+
+        await adapter.close()
+
+    asyncio.run(run())
+
+
+def test_ordinary_sse_keeps_reasoning_continuity_and_parallel_tools():
+    from claude_code_bridge.proxy.adapters.openai_chatgpt import OpenAIChatGPTAdapter
+
+    body = OpenAIChatGPTAdapter().prepare_request(copy.deepcopy(BODY))
+
+    assert body["reasoning"]["context"] == "all_turns"
+    assert "reasoning.encrypted_content" in body["include"]
+    assert body.get("parallel_tool_calls") is not False
+
+
 @pytest.mark.parametrize("committed", [False, True])
 def test_adapter_retry_never_replays_after_tool_use(monkeypatch, committed):
     from claude_code_bridge.proxy.adapters.openai_chatgpt import OpenAIChatGPTAdapter
@@ -415,7 +471,10 @@ def test_adapter_retry_never_replays_after_tool_use(monkeypatch, committed):
         adapter._chatgpt_transport = ChatGPTResponsesTransport(connector=connect)
         body = {"model": "openai_chatgpt/gpt-6-astra", "max_tokens": 128,
                 "messages": [{"role": "user", "content": "test"}]}
-        context = ProxyRequestContext(request_id="turn", provider="openai_chatgpt", conversation_id="test")
+        context = ProxyRequestContext(
+            request_id="turn", provider="openai_chatgpt", conversation_id="test",
+            responses_transport="lite_ws",
+        )
         try:
             chunks = [chunk async for chunk in adapter.call(body, "gpt-6-astra", context)]
             assert len(sockets) == (1 if committed else 2)
@@ -464,6 +523,7 @@ def test_silent_websocket_recovers_over_http_without_outer_cli_retry(monkeypatch
         context = ProxyRequestContext(
             request_id="turn", provider="openai_chatgpt",
             conversation_id="test",
+            responses_transport="lite_ws",
             status_callback=lambda request_id, status: statuses.append(
                 (request_id, status)
             ),
@@ -559,6 +619,7 @@ def test_productive_stall_after_committed_output_never_replays(monkeypatch, comm
         context = ProxyRequestContext(
             request_id="turn", provider="openai_chatgpt",
             conversation_id="test",
+            responses_transport="lite_ws",
             status_callback=lambda request_id, status: statuses.append(status),
         )
         try:
@@ -633,6 +694,7 @@ def test_fallback_stall_fails_promptly_and_discards_lease(monkeypatch):
         context = ProxyRequestContext(
             request_id="turn", provider="openai_chatgpt",
             conversation_id="test",
+            responses_transport="lite_ws",
             status_callback=lambda request_id, status: statuses.append(status),
         )
         body = {

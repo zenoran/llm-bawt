@@ -50,6 +50,8 @@ import logging
 import re
 from typing import Any
 
+from .tool_discovery import model_tool_description
+
 logger = logging.getLogger(__name__)
 
 # Anthropic server-side / built-in tool types carry a versioned suffix
@@ -320,8 +322,8 @@ def _tools_to_responses(tools: list[dict] | None) -> list[dict] | None:
             "type": "function",
             "name": tool.get("name") or "",
         }
-        if "description" in tool:
-            item["description"] = tool["description"]
+        if "description" in tool or tool.get("name") == "ToolSearch":
+            item["description"] = model_tool_description(tool)
         # ``input_schema`` is the Anthropic name; some callers already use
         # ``parameters`` so honor both.
         params = tool.get("input_schema") or tool.get("parameters")

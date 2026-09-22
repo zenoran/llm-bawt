@@ -797,6 +797,7 @@ from .profile_tools import _get_profile_manager, profile  # noqa: E402,F401
 # Task system tools (registered via import side-effect)
 # ---------------------------------------------------------------------------
 
+from . import initiative_tools as _initiative_tools  # noqa: F401, E402
 from . import project_tools as _project_tools  # noqa: F401, E402
 from . import step_tools as _step_tools  # noqa: F401, E402
 from . import task_tools as _task_tools  # noqa: F401, E402

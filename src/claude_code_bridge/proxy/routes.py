@@ -28,9 +28,11 @@ from .request_context import (
     BOT_HEADER,
     CONVERSATION_HEADER,
     REQUEST_HEADER,
+    RESPONSES_TRANSPORT_HEADER,
     ProxyRequestContext,
     valid_conversation_identity,
 )
+from .transport_policy import normalize_responses_transport
 
 # Seconds of upstream silence before the proxy injects a keepalive ping.
 # Override with CLAUDE_CODE_BRIDGE_PROXY_PING_INTERVAL (0 disables).
@@ -373,6 +375,9 @@ async def messages(request: Request) -> JSONResponse | StreamingResponse:
         bot_id=(request_headers.get(BOT_HEADER) or "").strip() or None,
         conversation_id=valid_conversation_identity(
             request_headers.get(CONVERSATION_HEADER)
+        ),
+        responses_transport=normalize_responses_transport(
+            request_headers.get(RESPONSES_TRANSPORT_HEADER)
         ),
         status_callback=getattr(
             getattr(getattr(request, "app", None), "state", None),

@@ -88,6 +88,7 @@ def test_redis_command_carries_db_derived_claude_timeout() -> None:
 
     subscriber = RedisSubscriber("redis://localhost:6379/0")
     subscriber._pub_redis = MagicMock()
+    subscriber._pub_redis.eval = None
     captured: dict[str, Any] = {}
 
     async def fake_xadd(_stream, fields, **_kwargs):
@@ -118,6 +119,25 @@ def test_claude_request_parses_mcp_timeout() -> None:
     })
 
     assert request.mcp_tool_timeout_ms == 330_000
+
+
+def test_claude_request_normalizes_catalog_transport_policy() -> None:
+    from claude_code_bridge.send_request import SendRequest
+
+    fields = {
+        "request_id": "req-1",
+        "session_key": "snark:nick",
+        "bot_id": "snark",
+        "message": "hello",
+        "model": "openai_chatgpt/gpt-6-astra",
+    }
+
+    assert SendRequest.from_fields({
+        **fields, "responses_transport": " SSE ",
+    }).responses_transport == "sse"
+    assert SendRequest.from_fields({
+        **fields, "responses_transport": "unknown",
+    }).responses_transport is None
 
 
 def test_claude_timeout_is_not_configured_by_environment() -> None:

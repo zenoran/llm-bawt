@@ -97,8 +97,9 @@ async def test_catalog_token_budgets():
     assert sum(descriptions) <= 3200
     definitions = [{"name": f"mcp__bawthub__{t.name}", "description": t.description or "", "input_schema": t.inputSchema} for t in tools]
     total = len(encoder.encode(json.dumps(definitions, ensure_ascii=False, separators=(",", ":"))))
-    # Five home-audio tools add ~600 tokens; measured full catalog 11,081.
-    assert total <= 11200, f"Catalog grew to {total} tokens; see docs/MCP_TOOL_DESIGN.md"
+    # TASK-900: explicit X search adds ~160 tokens; measured catalog 11,239.
+    # Keep its paid-call warning and typed time/pagination fields intact.
+    assert total <= 11400, f"Catalog grew to {total} tokens; see docs/MCP_TOOL_DESIGN.md"
     assert all("Args:" not in (tool.description or "") for tool in tools)
 
 

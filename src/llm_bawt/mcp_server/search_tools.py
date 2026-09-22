@@ -20,6 +20,42 @@ from .server import mcp
 logger = logging.getLogger(__name__)
 
 
+@mcp.tool(name="x_search")
+async def x_search(
+    query: str,
+    max_results: int = 10,
+    start_time: str | None = None,
+    end_time: str | None = None,
+    next_token: str | None = None,
+) -> dict:
+    """Search public X posts from the last seven days, newest first.
+
+    Paid, explicit-only search: one request, 10–100 posts (default 10).
+    Supports X operators such as from:BlizzardCS and -is:retweet.
+    Optional start_time/end_time are ISO-8601 timestamps with timezone.
+    next_token fetches another paid page; never automatically paginates.
+    Returns full post text, timestamps, author IDs and original links.
+    Requires X connected in BawtHub provider accounts; never falls back to web search.
+    """
+    import asyncio
+
+    from llm_bawt.integrations.x_api import XApiError, recent_search
+    from llm_bawt.utils.config import config
+
+    try:
+        return await asyncio.to_thread(
+            recent_search, config, query, max_results=max_results,
+            start_time=start_time, end_time=end_time, next_token=next_token,
+        )
+    except XApiError as exc:
+        return {"provider": "x", "query": query, "count": 0, "results": [],
+                "error_code": exc.code, "error": str(exc)}
+    except Exception:
+        logger.warning("X search failed unexpectedly")
+        return {"provider": "x", "query": query, "count": 0, "results": [],
+                "error_code": "internal_error", "error": "X search failed unexpectedly; check service health."}
+
+
 @mcp.tool(name="web_search")
 async def web_search(
     query: str,

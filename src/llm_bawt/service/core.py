@@ -132,6 +132,11 @@ class ServiceLLMBawt(BaseLLMBawt):
                     and configured_effort.strip()
                 ):
                     self.client._bot_config["effort"] = configured_effort.strip().lower()
+                responses_transport = model_def.get("responses_transport")
+                if isinstance(responses_transport, str) and responses_transport.strip():
+                    self.client._bot_config["responses_transport"] = (
+                        responses_transport.strip().lower()
+                    )
                 provider_system_prompt = model_def.get("provider_system_prompt")
                 if isinstance(provider_system_prompt, str) and provider_system_prompt:
                     self.client._bot_config["provider_system_prompt"] = (

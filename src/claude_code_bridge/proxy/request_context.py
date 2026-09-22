@@ -19,6 +19,7 @@ from typing import Any, Callable
 CONVERSATION_HEADER = "X-LLM-Bawt-Conversation-ID"
 BOT_HEADER = "X-LLM-Bawt-Bot-ID"
 REQUEST_HEADER = "X-LLM-Bawt-Request-ID"
+RESPONSES_TRANSPORT_HEADER = "X-LLM-Bawt-Responses-Transport"
 
 _OPAQUE_ID_RE = re.compile(r"^[a-f0-9]{32}$")
 
@@ -57,6 +58,7 @@ class ProxyRequestContext:
     provider: str
     bot_id: str | None = None
     conversation_id: str | None = None
+    responses_transport: str | None = None
     started_at: float = 0.0
     account_hash: str = "default"
     active_provider: int = 0
@@ -115,4 +117,8 @@ def custom_header_env(context: ProxyRequestContext) -> str:
         f"{BOT_HEADER}: {context.bot_id or 'unknown'}",
         f"{REQUEST_HEADER}: {context.request_id}",
     ]
+    if context.responses_transport:
+        lines.append(
+            f"{RESPONSES_TRANSPORT_HEADER}: {context.responses_transport}"
+        )
     return "\n".join(lines)

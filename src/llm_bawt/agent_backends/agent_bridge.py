@@ -262,6 +262,10 @@ class AgentBridgeBackend(AgentBackend):
                                 int(config.get("context_window"))
                                 if config.get("context_window") else None
                             ),
+                            responses_transport=(
+                                str(config.get("responses_transport")).strip()
+                                if config.get("responses_transport") else None
+                            ),
                             mcp_tool_timeout_ms=(
                                 int(config.get("mcp_tool_timeout_ms"))
                                 if config.get("mcp_tool_timeout_ms") else None

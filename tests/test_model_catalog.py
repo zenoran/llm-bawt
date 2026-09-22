@@ -220,12 +220,16 @@ def test_endpoint_reasoning_effort_is_flattened_for_bridge_dispatch():
         "openai",
         "responses",
         "gpt-6-astra",
-        serving_config={"reasoning_effort": "high"},
+        serving_config={
+            "reasoning_effort": "high",
+            "responses_transport": "sse",
+        },
     )
 
     resolved = ModelCatalog([endpoint]).resolve("astra", harness="claude-proxy")
 
     assert resolved["reasoning_effort"] == "high"
+    assert resolved["responses_transport"] == "sse"
 
 
 def test_local_serving_config_is_flattened_for_existing_consumers():

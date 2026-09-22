@@ -33,7 +33,7 @@ from .send_errors import (
     classify_terminal_error,
     result_message_error,
 )
-from .send_request import SendRequest
+from .send_preflight import prepare_send
 from .send_result import ClaudeResultMixin
 from .send_stream import ClaudeStreamMixin
 from .send_usage import ClaudeUsageMixin, LiveUsagePublisher
@@ -53,80 +53,28 @@ class ClaudeSendMixin(ClaudeStreamMixin, ClaudeUsageMixin, ClaudeResultMixin):
     async def _handle_send(
         self, fields: dict, msg_id: str, async_redis,
     ) -> None:
-        # TASK-623: field parsing / validation / normalization extracted into
-        # SendRequest.from_fields (behavior-identical). Unpack into locals so
-        # the rest of this method — which mutates ``message`` on /new — reads
-        # exactly as before.
-        req = SendRequest.from_fields(fields)
+        preflight = await prepare_send(self, fields, msg_id, async_redis)
+        if preflight is None:
+            return
+        req = preflight.request
+        message = preflight.message
+        reset_requested = preflight.reset_requested
         request_id = req.request_id
         session_key = req.session_key
         bot_slug = req.bot_slug
-        message = req.message
         system_prompt = req.system_prompt
         model = req.model
         inject_messages = req.inject_messages
-        trigger_message_id = req.trigger_message_id
         bot_effort = req.bot_effort
         bot_max_turns = req.bot_max_turns
         subagent_model = req.subagent_model
         bot_context_window = req.bot_context_window
+        responses_transport = req.responses_transport
         mcp_tool_timeout_ms = req.mcp_tool_timeout_ms
         configured_disallowed_tools = req.configured_disallowed_tools
         attachments = req.attachments
         thread_session_id = req.thread_session_id
-        explicit_thread = req.explicit_thread
         task_turn_capability = req.task_turn_capability
-
-        if not request_id or not message:
-            logger.warning("Invalid send command: missing request_id or message")
-            await async_redis.xack(COMMANDS_STREAM, "claude-code-bridge", msg_id)
-            return
-
-        if not model:
-            # No silent fallback. The caller MUST pass an explicit model. Surface
-            # the failure both to the log and to the originating chat so the user
-            # immediately sees which bot's config is missing a model.
-            err = (
-                f"Claude Code bridge: missing 'model' field for bot={bot_slug or '?'} "
-                f"session={session_key}. Set the bot's Model (default_model) to a "
-                f"claude-code catalog entry on the bot's profile."
-            )
-            logger.error(err)
-            self._publish_event(
-                request_id, session_key, 1,
-                kind=AgentEventKind.ERROR,
-                text=err,
-            )
-            self._publisher.publish_run_done(request_id)
-            await async_redis.xack(COMMANDS_STREAM, "claude-code-bridge", msg_id)
-            return
-
-        if trigger_message_id:
-            self._trigger_message_ids[request_id] = trigger_message_id
-
-        # The app normally rotates unscoped /new turns to a fresh durable
-        # thread. Force cold-start independently of that best-effort DB step:
-        # even if rotation failed, /new must never resume the old SDK transcript.
-        reset_requested = (
-            not explicit_thread and message.lstrip().startswith("/new")
-        )
-        # Bare /new is fully handled here; /new <message> returns the trailing
-        # prompt and enters the normal one-time cold-start path.
-        message = await self._preprocess_new_command(
-            message,
-            explicit_thread=explicit_thread,
-            bot_slug=bot_slug,
-            session_key=session_key,
-            request_id=request_id,
-            model=model,
-            context_window=bot_context_window,
-            inject_messages=inject_messages,
-            thread_session_id=thread_session_id,
-            msg_id=msg_id,
-            async_redis=async_redis,
-        )
-        if message is None:
-            return
 
         queue_seq = 0
 
@@ -311,6 +259,7 @@ class ClaudeSendMixin(ClaudeStreamMixin, ClaudeUsageMixin, ClaudeResultMixin):
                         model=model,
                         subagent_model=subagent_model,
                         context_window=bot_context_window,
+                        responses_transport=responses_transport,
                         force_refresh=auth_retry.attempted,
                         bot_id=bot_slug,
                         session_key=session_key,

@@ -154,7 +154,11 @@ class ProviderAdapter(ABC):
         await stream.prepare()
         return stream
 
-    def retry_policy(self, upstream_model: str) -> retry_mod.RetryPolicy:
+    def retry_policy(
+        self,
+        upstream_model: str,
+        context: ProxyRequestContext | None = None,
+    ) -> retry_mod.RetryPolicy:
         """Return the per-call retry budget; provider adapters may narrow it."""
         return retry_mod.RetryPolicy()
 
@@ -209,7 +213,7 @@ class ProviderAdapter(ABC):
         )
 
         state = TranslatorState()
-        policy = self.retry_policy(upstream_model)
+        policy = self.retry_policy(upstream_model, context)
         # Per Al #4: the on_usage callback wired into context.record_usage
         # fires INSIDE the translator whenever the upstream emits usage. On
         # retry we want the FINAL SUCCESSFUL attempt's usage to win. The

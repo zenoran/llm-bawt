@@ -202,6 +202,26 @@ def test_init_bot_uses_catalog_reasoning_effort_without_bot_override(monkeypatch
     assert service.client._bot_config["effort"] == "high"
 
 
+def test_init_bot_threads_catalog_responses_transport_to_bridge(monkeypatch):
+    bot = SimpleNamespace(
+        agent_backend="claude-code",
+        agent_backend_config={},
+        default_model="astra",
+    )
+    service = _run_init_bot(
+        monkeypatch,
+        bot,
+        {
+            "astra": {
+                "type": "claude-code",
+                "model_id": "openai_chatgpt/gpt-6-astra",
+                "responses_transport": "sse",
+            }
+        },
+    )
+    assert service.client._bot_config["responses_transport"] == "sse"
+
+
 def test_init_bot_preserves_explicit_bot_effort_over_catalog(monkeypatch):
     bot = SimpleNamespace(
         agent_backend="claude-code",

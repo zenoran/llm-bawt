@@ -13,6 +13,7 @@ import logging
 from dataclasses import dataclass, field
 
 from ._bridge_helpers import _bot_slug_from_session_key
+from .proxy.transport_policy import normalize_responses_transport
 
 # Keep the original logger name so log lines are byte-identical to the
 # pre-split monolith (which logged under ``claude_code_bridge.bridge``).
@@ -37,6 +38,7 @@ class SendRequest:
     bot_max_turns: int | None
     subagent_model: str | None
     bot_context_window: int | None
+    responses_transport: str | None
     mcp_tool_timeout_ms: int | None
     configured_disallowed_tools: object
     attachments: list[dict] = field(default_factory=list)
@@ -129,6 +131,17 @@ class SendRequest:
                     cw_raw, bot_slug,
                 )
 
+        # TASK-896: app-resolved endpoint transport policy. The model catalog is
+        # authoritative; absent/invalid values fall back to ordinary supervised
+        # SSE in the adapter rather than guessing from the model name.
+        transport_raw = fields.get("responses_transport")
+        responses_transport = normalize_responses_transport(transport_raw)
+        if transport_raw and responses_transport is None:
+            logger.warning(
+                "Ignoring invalid responses_transport=%r for %s",
+                transport_raw, bot_slug,
+            )
+
         # TASK-618: app-resolved DB setting plus 30s headroom, expressed in the
         # milliseconds the Claude CLI expects. Invalid/absent -> CLI default.
         mcp_timeout_raw = (fields.get("mcp_tool_timeout_ms") or "").strip()
@@ -184,6 +197,7 @@ class SendRequest:
             bot_max_turns=bot_max_turns,
             subagent_model=subagent_model,
             bot_context_window=bot_context_window,
+            responses_transport=responses_transport,
             mcp_tool_timeout_ms=mcp_tool_timeout_ms,
             configured_disallowed_tools=configured_disallowed_tools,
             attachments=attachments,

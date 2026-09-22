@@ -9,6 +9,11 @@ from fastapi import APIRouter, HTTPException, Query
 from pydantic import BaseModel, Field, field_validator
 from sqlalchemy import text
 
+from claude_code_bridge.proxy.transport_policy import (
+    VALID_RESPONSES_TRANSPORTS,
+    normalize_responses_transport,
+)
+
 from ...model_catalog import AccessPath, ProtocolCompatibility
 from ..dependencies import get_model_catalog_engine, get_service
 
@@ -66,18 +71,30 @@ class EndpointWrite(BaseModel):
 
     @field_validator("serving_config")
     @classmethod
-    def validate_reasoning_effort(cls, value: dict[str, Any]) -> dict[str, Any]:
-        effort = value.get("reasoning_effort")
-        if effort is None:
-            return value
-        if not isinstance(effort, str) or effort.strip().lower() not in {
-            "low", "medium", "high", "xhigh", "max",
-        }:
-            raise ValueError(
-                "serving_config.reasoning_effort must be one of: "
-                "low, medium, high, xhigh, max"
-            )
-        return {**value, "reasoning_effort": effort.strip().lower()}
+    def normalize_serving_config(cls, value: dict[str, Any]) -> dict[str, Any]:
+        normalized = dict(value)
+        effort = normalized.get("reasoning_effort")
+        if effort is not None:
+            if not isinstance(effort, str) or effort.strip().lower() not in {
+                "low", "medium", "high", "xhigh", "max",
+            }:
+                raise ValueError(
+                    "serving_config.reasoning_effort must be one of: "
+                    "low, medium, high, xhigh, max"
+                )
+            normalized["reasoning_effort"] = effort.strip().lower()
+
+        transport = normalized.get("responses_transport")
+        if transport is not None:
+            canonical_transport = normalize_responses_transport(transport)
+            if canonical_transport is None:
+                choices = ", ".join(sorted(VALID_RESPONSES_TRANSPORTS))
+                raise ValueError(
+                    "serving_config.responses_transport must be one of: "
+                    f"{choices}"
+                )
+            normalized["responses_transport"] = canonical_transport
+        return normalized
 
 
 def _engine():

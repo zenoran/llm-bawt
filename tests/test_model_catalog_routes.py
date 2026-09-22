@@ -28,12 +28,17 @@ def test_model_write_requires_positive_context_window():
     assert ok.default_context_window == 1000000
 
 
-def test_endpoint_reasoning_effort_is_normalized_and_validated():
+def test_endpoint_serving_config_is_normalized_and_validated():
     endpoint = EndpointWrite(
-        serving_config={"reasoning_effort": " HIGH ", "other": True}
+        serving_config={
+            "reasoning_effort": " HIGH ",
+            "responses_transport": " SSE ",
+            "other": True,
+        }
     )
     assert endpoint.serving_config == {
         "reasoning_effort": "high",
+        "responses_transport": "sse",
         "other": True,
     }
 
@@ -41,6 +46,10 @@ def test_endpoint_reasoning_effort_is_normalized_and_validated():
         EndpointWrite(serving_config={"reasoning_effort": "minimal"})
     with pytest.raises(ValidationError, match="reasoning_effort"):
         EndpointWrite(serving_config={"reasoning_effort": 42})
+    with pytest.raises(ValidationError, match="responses_transport"):
+        EndpointWrite(serving_config={"responses_transport": "websocket"})
+    with pytest.raises(ValidationError, match="responses_transport"):
+        EndpointWrite(serving_config={"responses_transport": True})
 
 
 def test_access_path_prompt_overrides_trim_drop_blanks_and_preserve_entries():
