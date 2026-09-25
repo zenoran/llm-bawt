@@ -20,6 +20,17 @@ from .server import mcp
 logger = logging.getLogger(__name__)
 
 
+def _x_error(query: str, exc: Exception) -> dict:
+    from llm_bawt.integrations.x_api import XApiError
+
+    if isinstance(exc, XApiError):
+        return {"provider": "x", "query": query, "count": 0, "results": [],
+                "error_code": exc.code, "error": str(exc)}
+    logger.warning("X request failed unexpectedly")
+    return {"provider": "x", "query": query, "count": 0, "results": [],
+            "error_code": "internal_error", "error": "X request failed unexpectedly; check service health."}
+
+
 @mcp.tool(name="x_search")
 async def x_search(
     query: str,
@@ -27,33 +38,57 @@ async def x_search(
     start_time: str | None = None,
     end_time: str | None = None,
     next_token: str | None = None,
+    sort_order: str = "recency",
+    include_authors: bool = False,
 ) -> dict:
-    """Search public X posts from the last seven days, newest first.
+    """Search public X posts from the last seven days (paid, one page per call).
 
-    Paid, explicit-only search: one request, 10–100 posts (default 10).
-    Supports X operators such as from:BlizzardCS and -is:retweet.
-    Optional start_time/end_time are ISO-8601 timestamps with timezone.
-    next_token fetches another paid page; never automatically paginates.
-    Returns full post text, timestamps, author IDs and original links.
-    Requires X connected in BawtHub provider accounts; never falls back to web search.
+    sort_order: recency (newest first) or relevancy (X-ranked; best for summaries).
+    Operators: from:, -is:retweet, -is:reply, lang:en, has:links, is:verified,
+    min_likes:N, min_reposts:N (API names; min_faves/min_retweets are rejected).
+    Results carry like/repost/reply/quote counts. include_authors adds usernames
+    and follower counts (extra billed user reads). Never falls back to web search.
     """
     import asyncio
 
-    from llm_bawt.integrations.x_api import XApiError, recent_search
+    from llm_bawt.integrations import x_api
     from llm_bawt.utils.config import config
 
     try:
         return await asyncio.to_thread(
-            recent_search, config, query, max_results=max_results,
+            x_api.recent_search, config, query, max_results=max_results,
+            start_time=start_time, end_time=end_time, next_token=next_token,
+            sort_order=sort_order, include_authors=include_authors,
+        )
+    except Exception as exc:  # noqa: BLE001 - mapped to a structured, token-free error
+        return _x_error(query, exc)
+
+
+@mcp.tool(name="x_counts")
+async def x_counts(
+    query: str,
+    granularity: str = "hour",
+    start_time: str | None = None,
+    end_time: str | None = None,
+    next_token: str | None = None,
+) -> dict:
+    """Count X posts matching a query per minute|hour|day over the last seven days.
+
+    Returns no posts: use it to size a topic and find peaks, then x_search those
+    windows with sort_order=relevancy. Same operators and time rules as x_search.
+    """
+    import asyncio
+
+    from llm_bawt.integrations import x_api
+    from llm_bawt.utils.config import config
+
+    try:
+        return await asyncio.to_thread(
+            x_api.recent_counts, config, query, granularity=granularity,
             start_time=start_time, end_time=end_time, next_token=next_token,
         )
-    except XApiError as exc:
-        return {"provider": "x", "query": query, "count": 0, "results": [],
-                "error_code": exc.code, "error": str(exc)}
-    except Exception:
-        logger.warning("X search failed unexpectedly")
-        return {"provider": "x", "query": query, "count": 0, "results": [],
-                "error_code": "internal_error", "error": "X search failed unexpectedly; check service health."}
+    except Exception as exc:  # noqa: BLE001
+        return _x_error(query, exc)
 
 
 @mcp.tool(name="web_search")

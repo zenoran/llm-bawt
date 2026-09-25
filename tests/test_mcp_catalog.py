@@ -94,12 +94,14 @@ async def test_catalog_token_budgets():
     tools = await mcp.list_tools()
     descriptions = [len(encoder.encode(tool.description or "")) for tool in tools]
     assert max(descriptions) <= 100
-    assert sum(descriptions) <= 3200
+    # x_counts + x_search relevancy/operator hints: measured 3,251 (was <=3,200).
+    assert sum(descriptions) <= 3260
     definitions = [{"name": f"mcp__bawthub__{t.name}", "description": t.description or "", "input_schema": t.inputSchema} for t in tools]
     total = len(encoder.encode(json.dumps(definitions, ensure_ascii=False, separators=(",", ":"))))
     # TASK-900: explicit X search adds ~160 tokens; measured catalog 11,239.
     # Keep its paid-call warning and typed time/pagination fields intact.
-    assert total <= 11400, f"Catalog grew to {total} tokens; see docs/MCP_TOOL_DESIGN.md"
+    # x_counts tool + x_search sort_order/include_authors: measured 11,425.
+    assert total <= 11500, f"Catalog grew to {total} tokens; see docs/MCP_TOOL_DESIGN.md"
     assert all("Args:" not in (tool.description or "") for tool in tools)
 
 

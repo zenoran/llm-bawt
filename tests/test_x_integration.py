@@ -171,3 +171,62 @@ def test_x_not_a_first_bot_provider_or_automatic_search_target(store):
     from llm_bawt.search.multi import available_providers
     assert "x" not in [p.provider_id for p in FIRST_BOT_PROVIDERS]
     assert "x" not in [p.value for p in available_providers(SimpleNamespace())]
+
+
+def test_search_relevancy_metrics_and_opt_in_authors(monkeypatch):
+    monkeypatch.setattr("llm_bawt.service.providers.api_key.resolve_api_key", lambda *a: "token")
+    calls = []
+    data = {
+        "data": [
+            {"id": "1", "text": "a", "author_id": "42", "public_metrics": {"like_count": 9, "retweet_count": 3, "reply_count": 1, "quote_count": 0}},
+            {"id": "2", "text": "b", "author_id": "99"},
+        ],
+        "includes": {"users": [{"id": "42", "username": "Reuters", "name": "Reuters", "verified": True, "public_metrics": {"followers_count": 25000000}}]},
+        "meta": {"result_count": 2},
+    }
+    monkeypatch.setattr(x_api.httpx, "get", lambda url, **kw: calls.append(kw) or response(data=data))
+    result = x_api.recent_search(SimpleNamespace(), "iran min_reposts:50", sort_order="relevancy", include_authors=True)
+    params = calls[0]["params"]
+    assert params["sort_order"] == "relevancy"
+    assert params["expansions"] == "author_id"
+    assert "public_metrics" in params["tweet.fields"]
+    first, second = result["results"]
+    assert (first["likes"], first["reposts"], first["replies"]) == (9, 3, 1)
+    assert first["author"]["username"] == "Reuters" and first["author"]["followers"] == 25000000
+    assert first["url"] == "https://x.com/Reuters/status/1"
+    assert "author" not in second and second["url"] == "https://x.com/i/status/2"
+    assert result["sort_order"] == "relevancy"
+
+
+def test_counts_buckets_peaks_and_params(monkeypatch):
+    monkeypatch.setattr("llm_bawt.service.providers.api_key.resolve_api_key", lambda *a: "token")
+    calls = []
+    data = {"data": [{"start": f"s{i}", "end": f"e{i}", "tweet_count": c} for i, c in enumerate([5, 50, 7])], "meta": {"total_tweet_count": 62}}
+    monkeypatch.setattr(x_api.httpx, "get", lambda url, **kw: calls.append((url, kw)) or response(data=data))
+    result = x_api.recent_counts(SimpleNamespace(), "iran -is:retweet", granularity="day")
+    url, kw = calls[0]
+    assert url.endswith("/tweets/counts/recent")
+    assert kw["params"]["granularity"] == "day"
+    assert result["total"] == 62
+    assert result["peaks"][0] == {"start": "s1", "end": "e1", "count": 50}
+    assert len(result["buckets"]) == 3
+
+
+@pytest.mark.parametrize("call", [
+    lambda: x_api.recent_search(SimpleNamespace(), "q", sort_order="popular"),
+    lambda: x_api.recent_counts(SimpleNamespace(), "q", granularity="week"),
+    lambda: x_api.recent_counts(SimpleNamespace(), ""),
+    lambda: x_api.recent_counts(SimpleNamespace(), "q", start_time="2020-01-01T00:00:00Z"),
+])
+def test_invalid_choices_never_make_paid_request(monkeypatch, call):
+    monkeypatch.setattr(x_api.httpx, "get", lambda *a, **kw: pytest.fail("must reject before API call"))
+    with pytest.raises(x_api.XApiError) as err:
+        call()
+    assert err.value.code == "invalid_request"
+
+
+def test_mcp_counts_error_is_structured(monkeypatch):
+    from llm_bawt.mcp_server.search_tools import x_counts
+    monkeypatch.setattr(x_api, "recent_counts", lambda *a, **kw: (_ for _ in ()).throw(x_api.XApiError("rate_limited", "wait")))
+    result = asyncio.run(x_counts("outage"))
+    assert result["error_code"] == "rate_limited"

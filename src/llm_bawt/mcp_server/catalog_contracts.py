@@ -99,7 +99,8 @@ TOOL_SUMMARIES: dict[str, str] = {
     "home_audio_cancel": "Cancel only a queued announcement. Does not stop preparing/playing jobs; inspect returned status.",
     "generate_image": "Generate or edit an image; provider: grok (default)|openai. reference_asset_id reuses an image. Returns inline image and asset_id/URLs for iteration.",
     "web_search": "Search current web sources; provider: brave|reddit|tavily|duckduckgo, or omit for configured fan-out. max_results is per provider. Use crawl4ai for page content.",
-    "x_search": "Paid X search: last 7 days, newest first, 10–100 posts/page. ISO time bounds; next_token pagination. Requires X connection; no fallback.",
+    "x_search": "Paid X search, last 7 days, 10–100 posts/page. sort_order=relevancy for summaries; min_likes:/min_reposts: (not min_faves). include_authors adds handles at extra cost.",
+    "x_counts": "Paid X post counts per minute|hour|day, last 7 days. Find peaks, then x_search them.",
 }
 
 # A compact pointer on every tool works even when discovery loads one schema only.

@@ -63,23 +63,17 @@ def _time(value: str, name: str, now: datetime) -> datetime:
     return parsed
 
 
-def recent_search(
-    config,
-    query: str,
-    *,
-    max_results: int = 10,
-    start_time: str | None = None,
-    end_time: str | None = None,
-    next_token: str | None = None,
-) -> dict:
-    """One paid page, newest first; credential resolved fresh for disconnect/rotation."""
+SORT_ORDERS = ("recency", "relevancy")
+GRANULARITIES = ("minute", "hour", "day")
+
+
+def _prepare(config, query: str, start_time: str | None, end_time: str | None, next_token: str | None) -> tuple[str, dict[str, Any]]:
+    """Shared validation for every paid X read; rejects before resolving or spending."""
     from ..service.providers.api_key import resolve_api_key
 
     query = (query or "").strip()
     if not query or len(query) > 512:
         raise XApiError("invalid_request", "X search query must contain 1–512 characters.")
-    if isinstance(max_results, bool) or not isinstance(max_results, int) or not 10 <= max_results <= 100:
-        raise XApiError("invalid_request", "max_results must be an integer from 10 to 100 (X's minimum page size is 10).")
     now = datetime.now(timezone.utc)
     start = _time(start_time, "start_time", now) if start_time else None
     end = _time(end_time, "end_time", now) if end_time else None
@@ -90,37 +84,91 @@ def recent_search(
     token = resolve_api_key(config, "x")
     if not token:
         raise XApiError("not_connected", "Connect X (Twitter) in BawtHub provider accounts using an app-only bearer token.")
-    params: dict[str, Any] = {
-        "query": query,
-        "max_results": max_results,
-        "sort_order": "recency",
-        "tweet.fields": "created_at,author_id",
-    }
+    params: dict[str, Any] = {"query": query}
     for name, value in (("start_time", start), ("end_time", end)):
         if value:
             params[name] = value.isoformat().replace("+00:00", "Z")
     if next_token:
         params["next_token"] = next_token
+    return token, params
+
+
+def _choice(value: str, name: str, allowed: tuple[str, ...]) -> str:
+    if value not in allowed:
+        raise XApiError("invalid_request", f"{name} must be one of: {', '.join(allowed)}.")
+    return value
+
+
+def recent_search(
+    config,
+    query: str,
+    *,
+    max_results: int = 10,
+    start_time: str | None = None,
+    end_time: str | None = None,
+    next_token: str | None = None,
+    sort_order: str = "recency",
+    include_authors: bool = False,
+) -> dict:
+    """One paid page; credential resolved fresh for disconnect/rotation.
+
+    Engagement metrics are post fields (no extra resource). Author expansion is
+    opt-in because X bills returned user objects separately.
+    """
+    if isinstance(max_results, bool) or not isinstance(max_results, int) or not 10 <= max_results <= 100:
+        raise XApiError("invalid_request", "max_results must be an integer from 10 to 100 (X's minimum page size is 10).")
+    _choice(sort_order, "sort_order", SORT_ORDERS)
+    token, params = _prepare(config, query, start_time, end_time, next_token)
+    params.update({
+        "max_results": max_results,
+        "sort_order": sort_order,
+        "tweet.fields": "created_at,author_id,public_metrics",
+    })
+    if include_authors:
+        params["expansions"] = "author_id"
+        params["user.fields"] = "username,name,verified,public_metrics"
     data = request_x(token, "tweets/search/recent", params)
     posts = data.get("data", [])
     meta = data.get("meta")
     if not isinstance(posts, list) or not isinstance(meta, dict) or "result_count" not in meta:
         raise XApiError("invalid_response", "X search returned an incomplete response.")
+    users = {}
+    if include_authors:
+        for user in (data.get("includes") or {}).get("users") or []:
+            if isinstance(user, dict) and user.get("id"):
+                users[str(user["id"])] = {
+                    "username": user.get("username"),
+                    "name": user.get("name"),
+                    "verified": user.get("verified"),
+                    "followers": (user.get("public_metrics") or {}).get("followers_count"),
+                }
     results = []
     for post in posts:
         if not isinstance(post, dict) or not str(post.get("id", "")).isdigit() or not isinstance(post.get("text"), str):
             raise XApiError("invalid_response", "X search returned an invalid post.")
-        results.append({
+        metrics = post.get("public_metrics") or {}
+        item = {
             "id": post["id"],
             "text": post["text"],
             "url": f"https://x.com/i/status/{post['id']}",
             "created_at": post.get("created_at"),
             "author_id": post.get("author_id"),
+            "likes": metrics.get("like_count"),
+            "reposts": metrics.get("retweet_count"),
+            "replies": metrics.get("reply_count"),
+            "quotes": metrics.get("quote_count"),
             "source": "x",
-        })
+        }
+        author = users.get(str(post.get("author_id")))
+        if author:
+            item["author"] = author
+            if author.get("username"):
+                item["url"] = f"https://x.com/{author['username']}/status/{post['id']}"
+        results.append(item)
     result = {
-        "query": query,
+        "query": query.strip(),
         "provider": "x",
+        "sort_order": sort_order,
         "count": len(results),
         "results": results,
         "next_token": meta.get("next_token"),
@@ -128,3 +176,38 @@ def recent_search(
     if data.get("errors"):
         result["warning"] = "X returned partial results; some requested data could not be retrieved."
     return result
+
+
+def recent_counts(
+    config,
+    query: str,
+    *,
+    granularity: str = "hour",
+    start_time: str | None = None,
+    end_time: str | None = None,
+    next_token: str | None = None,
+) -> dict:
+    """Post volume per bucket (last 7 days) without returning posts: find spikes, then search them."""
+    _choice(granularity, "granularity", GRANULARITIES)
+    token, params = _prepare(config, query, start_time, end_time, next_token)
+    params["granularity"] = granularity
+    data = request_x(token, "tweets/counts/recent", params)
+    buckets = data.get("data", [])
+    meta = data.get("meta")
+    if not isinstance(buckets, list) or not isinstance(meta, dict):
+        raise XApiError("invalid_response", "X counts returned an incomplete response.")
+    rows = []
+    for bucket in buckets:
+        if not isinstance(bucket, dict) or not isinstance(bucket.get("tweet_count"), int):
+            raise XApiError("invalid_response", "X counts returned an invalid bucket.")
+        rows.append({"start": bucket.get("start"), "end": bucket.get("end"), "count": bucket["tweet_count"]})
+    peaks = sorted(rows, key=lambda r: r["count"], reverse=True)[:5]
+    return {
+        "query": query.strip(),
+        "provider": "x",
+        "granularity": granularity,
+        "total": meta.get("total_tweet_count", sum(r["count"] for r in rows)),
+        "peaks": peaks,
+        "buckets": rows,
+        "next_token": meta.get("next_token"),
+    }
