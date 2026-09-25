@@ -4,6 +4,7 @@ from .botchat import router as botchat_router
 from .chat import router as chat_router
 from .config import router as config_router
 from .health import router as health_router
+from .google_home_probe import router as google_home_probe_router
 from .history import router as history_router
 from .jobs import router as jobs_router
 from .prompt_schedules import router as prompt_schedules_router
@@ -16,6 +17,7 @@ from .nextcloud import router as nextcloud_router
 from .prompts import router as prompts_router
 from .profiles import router as profiles_router
 from .providers import router as providers_router
+from .integrations import router as integrations_router
 from .settings import router as settings_router
 from .setup import router as setup_router
 from .sessions import router as sessions_router
@@ -36,6 +38,7 @@ from .uploads import router as uploads_router
 
 all_routers = [
     health_router,
+    google_home_probe_router,
     ha_weather_router,
     nextcloud_router,
     models_router,
@@ -55,6 +58,7 @@ all_routers = [
     memory_router,
     prompts_router,
     providers_router,
+    integrations_router,
     settings_router,
     setup_router,
     sessions_router,
