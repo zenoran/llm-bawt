@@ -329,6 +329,49 @@ class MediaAssetStore:
             rows = conn.execute(sql, params).mappings().all()
             return [dict(r) for r in rows]
 
+    def browse(
+        self, *, q: str = "", kind: str | None = None,
+        source: str | None = None, limit: int = 48, offset: int = 0,
+    ) -> dict[str, Any]:
+        """Browse the tenant's registry, not raw S3 keys or image variants.
+
+        Bound parameters and literal substring matching keep filenames containing
+        SQL LIKE wildcards searchable. Stable ordering breaks timestamp ties.
+        """
+        if not 1 <= limit <= 100 or offset < 0:
+            raise ValueError("Invalid pagination")
+        if kind is not None and kind not in ALLOWED_KINDS:
+            raise ValueError("Invalid asset kind")
+        if source is not None and source not in ALLOWED_SOURCES:
+            raise ValueError("Invalid asset source")
+        clauses = []
+        params: dict[str, Any] = {"limit": limit, "offset": offset}
+        if q.strip():
+            escaped = q.strip().lower().replace("!", "!!").replace("%", "!%").replace("_", "!_")
+            params["query"] = f"%{escaped}%"
+            clauses.append("(" + " OR ".join(
+                f"LOWER(COALESCE({column}, '')) LIKE :query ESCAPE '!'"
+                for column in ("id", "filename", "mime_type", "storage_key", "owner_user_id")
+            ) + ")")
+        if kind:
+            clauses.append("kind = :kind")
+            params["kind"] = kind
+        if source:
+            clauses.append("source = :source")
+            params["source"] = source
+        where = " WHERE " + " AND ".join(clauses) if clauses else ""
+        with self.engine.connect() as conn:
+            totals = conn.execute(text(
+                f"SELECT COUNT(*) AS total, COALESCE(SUM(size_bytes), 0) AS total_bytes "
+                f"FROM {TABLE_NAME}{where}"
+            ), params).mappings().one()
+            rows = conn.execute(text(
+                f"SELECT * FROM {TABLE_NAME}{where} "
+                "ORDER BY created_at DESC, id DESC LIMIT :limit OFFSET :offset"
+            ), params).mappings().all()
+        return {"items": [dict(row) for row in rows], "total": totals["total"],
+                "total_bytes": totals["total_bytes"], "limit": limit, "offset": offset}
+
     # ------------------------------------------------------------------
     # Delete
     # ------------------------------------------------------------------

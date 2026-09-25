@@ -60,7 +60,7 @@ import logging
 import mimetypes
 import os
 import re
-from typing import Optional
+from typing import Literal, Optional
 from urllib.parse import quote
 
 from fastapi import APIRouter, File, Header, HTTPException, Query, Request, Response, UploadFile
@@ -471,6 +471,35 @@ def _serve_variant(
         headers["ETag"] = etag
 
     return Response(content=data, media_type=mime, headers=headers)
+
+
+@router.get("/v1/uploads")
+def list_assets(
+    q: str = Query(default="", max_length=200),
+    kind: Optional[Literal["image", "file"]] = None,
+    source: Optional[Literal["chat_upload", "tool_generated", "agent_attachment"]] = None,
+    limit: int = Query(default=48, ge=1, le=100),
+    offset: int = Query(default=0, ge=0),
+):
+    """Tenant media registry for the admin browser; deletion remains owner-scoped.
+
+    The internal service is LAN-trusted, like the existing asset GET routes.
+    No S3 credentials or raw blob listing are exposed.
+    """
+    from ...media.serializers import asset_row_to_attachment_dict, public_urls
+
+    store = _store()
+    if store.db is None or getattr(store.db, "engine", None) is None:
+        raise HTTPException(status_code=503, detail="Media registry unavailable")
+    page = store.db.browse(q=q, kind=kind, source=source, limit=limit, offset=offset)
+    page["items"] = [
+        {**asset_row_to_attachment_dict(row),
+         "source": row["source"], "owner_user_id": row.get("owner_user_id"),
+         "created_at": row["created_at"], "storage_key": row.get("storage_key"),
+         "public_url": public_urls(row["id"], row.get("kind") or "image").get("url")}
+        for row in page["items"]
+    ]
+    return page
 
 
 @router.get("/v1/uploads/{asset_id}")
