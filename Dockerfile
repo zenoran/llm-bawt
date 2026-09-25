@@ -63,6 +63,10 @@ RUN if [ "$WITH_CUDA" = "true" ]; then \
         echo "Skipping vLLM install (requires CUDA)"; \
     fi
 
+# Wan 2.2 video pipeline. The worker imports this lazily; chat and embeddings do
+# not load video weights. Keep the dependency in this GPU image, not the app.
+RUN uv pip install 'diffusers==0.40.0' 'ftfy>=6.0' 'imageio>=2.30' 'imageio-ffmpeg>=0.5.1'
+
 # NOW copy source code and other files needed for project install
 # Changes to src/ won't invalidate the venv/deps layer above
 COPY src/ ./src/
@@ -93,6 +97,7 @@ RUN apt-get update && apt-get install -y \
     gcc \
     g++ \
     python3-dev \
+    ffmpeg \
     && rm -rf /var/lib/apt/lists/*
 
 # Install uv

@@ -195,6 +195,10 @@ def main() -> None:
             bridge_task.add_done_callback(_supervise("inference-bridge"))
         embed_task = asyncio.create_task(serve_embed(embed_port))
         embed_task.add_done_callback(_supervise("embed"))
+        from .video_server import serve_video
+
+        video_task = asyncio.create_task(serve_video(int(os.getenv("LOCAL_MODEL_VIDEO_PORT", "8685"))))
+        video_task.add_done_callback(_supervise("video"))
         if embed_only:
             logger.info("EMBED-ONLY mode: app/Redis inference bridge NOT started")
 
@@ -205,6 +209,7 @@ def main() -> None:
             bridge_task.cancel()
         health_task.cancel()
         embed_task.cancel()
+        video_task.cancel()
         if not embed_only:
             await bridge.stop()
 

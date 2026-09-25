@@ -364,6 +364,9 @@ services:
       # MiniLM is tiny and this keeps embeddings off the contended GPU and
       # independent of NVML/CUDA state.
       - LOCAL_MODEL_BRIDGE_EMBED_PORT=8684
+      - LOCAL_MODEL_VIDEO_PORT=8685
+      # Prevent a second persistent Xet chunk cache for large video weights.
+      - HF_HUB_DISABLE_XET=1
       - LOCAL_MODEL_EMBED_DEVICE=${LOCAL_MODEL_EMBED_DEVICE:-cpu}
       - LOCAL_MODEL_BRIDGE_REQUEST_TIMEOUT=${LOCAL_MODEL_BRIDGE_REQUEST_TIMEOUT:-1800}
       # Load all layers onto the GPU by default (matches the app's prior local

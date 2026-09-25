@@ -7,6 +7,7 @@ from typing import Callable
 
 from .base import MediaClient
 from .grok_media import GrokMediaClient
+from .local_video import LocalVideoClient
 from .openai_images import OpenAIImageClient
 
 
@@ -133,6 +134,21 @@ def build_default_registry() -> MediaProviderRegistry:
         ),
         GrokMediaClient,
         aliases=("xai",),
+    )
+    registry.register(
+        MediaProviderCapabilities(
+            provider="local-video",
+            label="Local (Wan 2.2)",
+            media_types=("video",),
+            default_models={"video": "wan2.2-ti2v-5b"},
+            models={"video": ("wan2.2-ti2v-5b",)},
+            image_input=True,
+            aspect_ratios={"video": ("16:9", "9:16", "1:1")},
+            resolutions={"video": ("480p", "720p")},
+            default_aspect_ratios={"video": "16:9"},
+            default_resolutions={"video": "480p"},
+        ),
+        LocalVideoClient,
     )
     registry.register(
         MediaProviderCapabilities(

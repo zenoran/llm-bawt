@@ -162,7 +162,7 @@ async def _poll_video_job(gen_id: str) -> None:
 
     logger.info("Starting poll loop for generation %s (job %s)", gen_id, provider_job_id)
 
-    max_polls = 120  # 120 * 5s = 10 minutes max
+    max_polls = 720 if row.get("provider") == "local-video" else 120  # Local offloading can take up to an hour.
     transient_errors = 0
     max_transient_errors = 5
 
@@ -197,7 +197,7 @@ async def _poll_video_job(gen_id: str) -> None:
                 break
         else:
             # Exhausted all polls
-            store.update(gen_id, {"status": "failed", "error": "Generation timed out after 10 minutes"})
+            store.update(gen_id, {"status": "failed", "error": f"Generation timed out after {max_polls * 5 // 60} minutes"})
             logger.error("Generation %s timed out", gen_id)
             return
 
@@ -239,6 +239,11 @@ async def _poll_video_job(gen_id: str) -> None:
                 updates["thumbnail_path"] = thumb_path
 
         store.update(gen_id, updates)
+        if row.get("provider") == "local-video" and hasattr(client, "remove_job"):
+            try:
+                await client.remove_job(provider_job_id)
+            except Exception:
+                logger.warning("Could not remove local video staging file for %s", gen_id, exc_info=True)
         logger.info("Generation %s completed: %s (%d bytes)", gen_id, rel_path, len(video_data))
 
     except asyncio.CancelledError:
@@ -287,6 +292,21 @@ async def list_media_providers(media_type: str | None = Query(default=None)):
         for capability in media_provider_registry.list_capabilities(media_type)
     ]
     return MediaProviderListResponse(providers=providers, default_provider="grok")
+
+
+@router.get("/v1/media/local-video/model")
+async def local_video_model_status():
+    return await _get_video_client("local-video").model_status()
+
+
+@router.post("/v1/media/local-video/model/install")
+async def install_local_video_model():
+    return await _get_video_client("local-video").install_model()
+
+
+@router.delete("/v1/media/local-video/model")
+async def remove_local_video_model():
+    return await _get_video_client("local-video").remove_model()
 
 
 @router.post("/v1/media/generations", response_model=MediaGenerationResponse)
