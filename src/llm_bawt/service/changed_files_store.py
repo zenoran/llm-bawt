@@ -145,8 +145,9 @@ class TurnChangedFile(SQLModel, table=True):
 
     # Optional provenance: tool_use ids that produced this change.
     source_tool_call_ids: str | None = Field(default=None, sa_column=Column(Text, nullable=True))
-    # Durable boundary for conversation-level commit aggregation. A click marks
-    # every row in the selected scope, so reloads do not resurrect old work.
+    # User dismissal binds to this snapshot version, not the path forever.
+    ignored_version: str | None = Field(default=None, sa_column=Column(String(64), nullable=True))
+    # A request records intent, never proof that Git committed the change.
     commit_requested_at: datetime | None = Field(
         default=None,
         sa_column=Column(DateTime(timezone=True), nullable=True, index=True),
@@ -253,6 +254,9 @@ def _decode_b64(value: Any) -> bytes | None:
 def serialize_changed_file(row: TurnChangedFile) -> dict[str, Any]:
     """Metadata-only shape for one changed file. No bytes; the client fetches
     content lazily by (turn_id, repo_key, path)."""
+    from .changed_file_decisions import snapshot_version
+
+    version = snapshot_version(row)
     has_before = bool(row.before_blob_key or row.before_sha256)
     has_after = bool(row.after_blob_key or row.after_sha256)
     return {
@@ -279,6 +283,8 @@ def serialize_changed_file(row: TurnChangedFile) -> dict[str, Any]:
                        else str(row.created_at)),
         "before_sha256": row.before_sha256,
         "after_sha256": row.after_sha256,
+        "snapshot_version": version,
+        "ignored": row.ignored_version == version,
         "commit_requested": row.commit_requested_at is not None,
         "commit_state": "not_applicable" if row.in_repo is False else "unknown",
     }
@@ -383,6 +389,10 @@ class ChangedFilesStore:
                 "CREATE INDEX IF NOT EXISTS ix_turn_changed_files_owner_created"
                 " ON turn_changed_files (bot_id, user_id, created_at)"
             ))
+            if "ignored_version" not in legacy_columns:
+                conn.execute(sa_text(
+                    "ALTER TABLE turn_changed_files ADD COLUMN ignored_version VARCHAR(64)"
+                ))
             if "in_repo" not in legacy_columns:
                 conn.execute(sa_text(
                     "ALTER TABLE turn_changed_files ADD COLUMN in_repo BOOLEAN"
@@ -506,6 +516,10 @@ class ChangedFilesStore:
                     row.source_tool_call_ids = (
                         json.dumps(combined_sources) if combined_sources else None
                     )
+                    if row.ignored_version:
+                        from .changed_file_decisions import snapshot_version
+                        if snapshot_version(row) != row.ignored_version:
+                            row.ignored_version = None
                     session.add(row)
                     saved += 1
                 session.commit()

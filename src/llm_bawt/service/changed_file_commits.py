@@ -59,6 +59,7 @@ def reconcile_files(files: list[dict[str, Any]]) -> None:
 def pending_summary(summary: dict[str, Any]) -> dict[str, Any]:
     """Keep unknown actionable; requests do not prove commit completion."""
     files = [file for file in summary["files"] if file.get("commit_state") != "committed"
+             and not file.get("ignored")
              and not (file.get("in_repo") is False and file.get("commit_requested"))]
     return {**summary, "files": files,
             "total_files": len(files),

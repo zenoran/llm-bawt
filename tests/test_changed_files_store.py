@@ -31,7 +31,8 @@ def store(tmp_path, monkeypatch):
     monkeypatch.setenv("LLM_BAWT_DIFFBLOBS_FS_ROOT", str(tmp_path / "diffs"))
     monkeypatch.setenv("LLM_BAWT_STORAGE_BACKEND", "fs")
     reset_diff_blob_backend()
-    engine = create_engine("sqlite://")
+    from sqlalchemy.pool import StaticPool
+    engine = create_engine("sqlite://", connect_args={"check_same_thread": False}, poolclass=StaticPool)
     SQLModel.metadata.create_all(
         engine,
         tables=[

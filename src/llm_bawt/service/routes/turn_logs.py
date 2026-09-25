@@ -780,6 +780,8 @@ def get_uncommitted_changed_files(
     )
     if session_id and not resolved:
         raise HTTPException(status_code=404, detail="Conversation not found")
+    for scope in (summary, other_summary):
+        scope.update(bot_id=bot_id.strip().lower(), user_id=user_id.strip().lower())
     return {
         "session_id": resolved,
         "summary": summary,
@@ -800,6 +802,45 @@ def mark_changed_files_commit_requested(payload: CommitChangedFilesRequest):
         turn_ids=payload.turn_ids,
     )
     if payload.session_id and not resolved:
+        raise HTTPException(status_code=404, detail="Conversation not found")
+    return {"session_id": resolved, "marked_files": marked}
+
+
+class ChangedFileDecisionTarget(BaseModel):
+    turn_id: str = Field(min_length=1)
+    repo_key: str = Field(min_length=1)
+    path: str = Field(min_length=1)
+    snapshot_version: str = Field(pattern=r"^[0-9a-f]{64}$")
+
+
+class ChangedFileDecisionRequest(BaseModel):
+    session_id: str | None = None
+    bot_id: str = Field(min_length=1)
+    user_id: str = Field(min_length=1)
+    files: list[ChangedFileDecisionTarget] = Field(min_length=1, max_length=2000)
+    ignored: bool
+
+
+@router.post("/v1/turn-changed-files/decision", tags=["History"])
+def set_changed_file_decision(payload: ChangedFileDecisionRequest):
+    from ..changed_file_decisions import ChangedFileDecisionConflict, ChangedFileDecisionsStore
+
+    engine = get_turn_log_store().engine
+    if engine is None:
+        raise HTTPException(status_code=503, detail="Turn logs DB unavailable")
+    store = ChangedFileDecisionsStore(engine)
+    store.ensure_schema()
+    try:
+        resolved, marked = store.set_decision(
+            session_id=payload.session_id, bot_id=payload.bot_id.strip().lower(),
+            user_id=payload.user_id.strip().lower(), ignored=payload.ignored,
+            files=[file.model_dump() for file in payload.files],
+        )
+    except ChangedFileDecisionConflict as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except LookupError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    if not resolved:
         raise HTTPException(status_code=404, detail="Conversation not found")
     return {"session_id": resolved, "marked_files": marked}
 
