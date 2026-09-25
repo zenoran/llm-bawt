@@ -1,0 +1,74 @@
+# TASK-902 — DRAFT ONLY. Add ONLY to app.bawthub.com's NPM advanced_config,
+# preserving all existing fields/config. Do not put this in global server_proxy.conf.
+# Backend checks SSO cookies itself for authorization; token/fulfillment use OAuth.
+# API 401s must remain 401s, not become inherited browser login redirects.
+location = /integrations/google-home/authorize {
+    auth_request off;
+    limit_except GET POST { deny all; }
+    client_max_body_size 8k;
+    client_body_buffer_size 8k;
+    client_body_timeout 10s;
+    limit_req zone=google_home_probe burst=10 nodelay;
+    limit_req_status 429;
+    access_log /config/log/proxy-host-37_access.log google_home_probe;
+    proxy_intercept_errors off;
+    proxy_pass http://10.0.0.101:8642;
+    proxy_http_version 1.1;
+    proxy_set_header Connection "";
+    proxy_set_header Host app.bawthub.com;
+    proxy_set_header X-Forwarded-Proto https;
+    proxy_set_header X-Forwarded-For $remote_addr;
+    proxy_set_header Authorization "";
+    proxy_set_header X-Auth-Request-Email "";
+    proxy_set_header X-Forwarded-Email "";
+    proxy_set_header Remote-Email "";
+    proxy_connect_timeout 5s;
+    proxy_read_timeout 15s;
+    proxy_send_timeout 15s;
+    proxy_cache off;
+}
+location = /integrations/google-home/token {
+    auth_request off;
+    limit_except POST { deny all; }
+    client_max_body_size 8k;
+    client_body_buffer_size 8k;
+    client_body_timeout 10s;
+    limit_req zone=google_home_probe burst=10 nodelay;
+    limit_req_status 429;
+    access_log /config/log/proxy-host-37_access.log google_home_probe;
+    proxy_intercept_errors off;
+    proxy_pass http://10.0.0.101:8642;
+    proxy_http_version 1.1;
+    proxy_set_header Connection "";
+    proxy_set_header Host app.bawthub.com;
+    proxy_set_header X-Forwarded-Proto https;
+    proxy_set_header X-Forwarded-For $remote_addr;
+    proxy_set_header Cookie "";
+    proxy_connect_timeout 5s;
+    proxy_read_timeout 15s;
+    proxy_send_timeout 15s;
+    proxy_cache off;
+}
+location = /integrations/google-home/fulfillment {
+    auth_request off;
+    limit_except POST { deny all; }
+    client_max_body_size 32k;
+    client_body_buffer_size 32k;
+    client_body_timeout 10s;
+    limit_req zone=google_home_probe burst=10 nodelay;
+    limit_req_status 429;
+    access_log /config/log/proxy-host-37_access.log google_home_probe;
+    proxy_intercept_errors off;
+    proxy_pass http://10.0.0.101:8642;
+    proxy_http_version 1.1;
+    proxy_set_header Connection "";
+    proxy_set_header Host app.bawthub.com;
+    proxy_set_header X-Forwarded-Proto https;
+    proxy_set_header X-Forwarded-For $remote_addr;
+    proxy_set_header Cookie "";
+    proxy_connect_timeout 5s;
+    proxy_read_timeout 15s;
+    proxy_send_timeout 15s;
+    proxy_cache off;
+}
+# No wildcard forwarding of /integrations/, /v1/, /docs, /openapi.json or :8642.

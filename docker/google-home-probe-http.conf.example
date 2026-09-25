@@ -1,0 +1,4 @@
+# TASK-902 — DRAFT ONLY. Merge into NPM's persistent http_top.conf at activation.
+# No API payload, query string, token, cookie or redirect response logging.
+limit_req_zone $binary_remote_addr zone=google_home_probe:1m rate=2r/s;
+log_format google_home_probe '$remote_addr $request_method $uri $status';
